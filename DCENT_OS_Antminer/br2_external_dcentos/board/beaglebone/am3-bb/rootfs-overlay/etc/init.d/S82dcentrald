@@ -1,0 +1,38 @@
+#!/bin/sh
+# Generic AM3-BB image: typed, non-activating runtime refusal.
+#
+# This base image lacks the exact carrier/ASIC identity required for fixed
+# GPIO, PWM, and mining mutations. The am3-bb-s19jpro overlay replaces this
+# file with the evidence-backed supervisor on that exact target.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+DCENT_RUNTIME_OWNER_POLICY=not-implemented-refusal
+BOARD_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null || printf unknown)
+
+refuse() {
+    echo "  [FAIL] runtime hardware ownership NOT IMPLEMENTED; daemon start refused" >&2
+    echo "  [FAIL] Generic AM3-BB target '$BOARD_TARGET' has no typed hardware custodian; refusing activation" >&2
+    return 1
+}
+
+case "${1:-}" in
+    start|restart|safety|boot-safety) refuse; exit $? ;;
+    stop)
+        if pidof dcentrald >/dev/null 2>&1; then
+            echo "  [FAIL] Live dcentrald owner exists; generic AM3-BB image will not signal an unverified process" >&2
+            exit 1
+        fi
+        echo "  [OK] No dcentrald process observed; no hardware disposition claimed"
+        ;;
+    status)
+        if pidof dcentrald >/dev/null 2>&1; then
+            echo "dcentrald: running (unsupported generic AM3-BB target)"
+            exit 1
+        fi
+        echo "dcentrald: stopped (generic AM3-BB activation unavailable)"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|safety|boot-safety}" >&2
+        exit 64
+        ;;
+esac

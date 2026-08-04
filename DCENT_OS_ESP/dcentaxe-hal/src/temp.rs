@@ -10,6 +10,7 @@
 
 use crate::i2c::{I2cBus, I2cError};
 use crate::temp_decode::{decode_external_temp, EMC2101_STATUS_EXT_FAULT};
+use crate::tmp1075_convert;
 use log::*;
 use serde::{Deserialize, Serialize};
 
@@ -413,6 +414,48 @@ impl Tmp1075 {
         Self::new(i2c, TMP1075_ADDR_SECONDARY, "chip2")
     }
 
+    /// Initialize a strapped device by index (`0x48 + index`, `index < 4`).
+    ///
+    /// The Hex pair above is the `index = 2` / `index = 3` case of this; the
+    /// Nerd multi-ASIC boards populate the full `0x48..=0x4B` range and cannot
+    /// be described by a fixed primary/secondary pair.
+    ///
+    /// ⚠ On a Nerd board **index 1 (0x49) is the voltage-regulator sensor**, not
+    /// an ASIC sensor. Use [`new_nerd_asic`](Self::new_nerd_asic) to address ASIC
+    /// sensors by logical position so the VR device cannot be published as a die
+    /// temperature; see [`crate::tmp1075_convert`] for the topology.
+    pub fn new_indexed(
+        i2c: &mut I2cBus,
+        index: u8,
+        label: &'static str,
+    ) -> Result<Self, TempError> {
+        let addr =
+            tmp1075_convert::address_for_device(index).map_err(|_| TempError::SensorNotFound)?;
+        Self::new(i2c, addr, label)
+    }
+
+    /// Initialize the `logical`-th ASIC sensor on a Nerd board.
+    ///
+    /// Skips the voltage-regulator device, so `logical` 0/1/2 map to strapped
+    /// devices 0/2/3. A four-ASIC Nerd board exposes three ASIC sensors.
+    pub fn new_nerd_asic(
+        i2c: &mut I2cBus,
+        logical: u8,
+        label: &'static str,
+    ) -> Result<Self, TempError> {
+        let index = tmp1075_convert::nerd_asic_device_index(logical)
+            .map_err(|_| TempError::SensorNotFound)?;
+        Self::new_indexed(i2c, index, label)
+    }
+
+    /// Initialize the Nerd voltage-regulator sensor (0x49).
+    ///
+    /// Deliberately a separate constructor: this reading measures the regulator,
+    /// and must not be fed to a path expecting a die temperature.
+    pub fn new_nerd_vr(i2c: &mut I2cBus) -> Result<Self, TempError> {
+        Self::new(i2c, tmp1075_convert::nerd_vr_address(), "vr")
+    }
+
     /// Read temperature in degrees Celsius.
     ///
     /// TMP1075 temperature register is 12-bit, 2's complement, left-justified
@@ -420,17 +463,16 @@ impl Tmp1075 {
     pub fn read_temp(&self, i2c: &mut I2cBus) -> Result<f32, TempError> {
         let raw = i2c.read_reg_u16_be(self.addr, TMP1075_REG_TEMP)?;
 
-        // Temperature is in the upper 12 bits, 2's complement
-        // Shift right by 4, then multiply by 0.0625
-        let raw_signed = (raw as i16) >> 4;
-        let temp = raw_signed as f32 * 0.0625;
-
-        if temp < -40.0 || temp > 200.0 {
-            warn!("TMP1075 {} temp out of range: {:.1}C", self.label, temp);
-            return Err(TempError::ReadingOutOfRange(temp));
+        // Decode + availability live in the host-pure core so the signed shift
+        // and the reject bound are pinned by the host gate.
+        match tmp1075_convert::decode_available_temp(raw) {
+            Some(temp) => Ok(temp),
+            None => {
+                let temp = tmp1075_convert::decode_temp(raw);
+                warn!("TMP1075 {} temp out of range: {:.1}C", self.label, temp);
+                Err(TempError::ReadingOutOfRange(temp))
+            }
         }
-
-        Ok(temp)
     }
 
     /// Get the sensor label.

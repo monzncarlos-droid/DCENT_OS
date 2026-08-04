@@ -44,12 +44,14 @@ pub mod fpga_chain_backend;
 pub mod fpga_uart_relay;
 pub mod glitch_monitor;
 pub mod gpio;
+pub mod gpio_name_resolver; // UB-23: by-name (DT gpio-line-names) resolution; name-first, integer-fallback
 pub mod i2c;
 pub mod ina226;
 pub mod led;
 pub mod led_patterns;
 pub mod libgpiod;
 pub mod platform;
+pub mod pmbus;
 pub mod psu;
 pub mod psu_apw12_plus;
 pub mod psu_apw12_smbus;
@@ -59,6 +61,8 @@ pub mod psu_gpio_gate;
 pub mod psu_gpio_i2c;
 pub mod serial;
 pub mod serial_chain;
+/// G32: pure stock BC SetConfig plan → register I/O execute (T9+ VIL order).
+pub mod stock_bc_execute;
 pub mod stock_fpga;
 /// W13.B5 (2026-05-10): IOCTL adapter is gated behind the `axi-ioctl-debug`
 /// Cargo feature. Production `dcentrald` does NOT enable this feature, so
@@ -71,6 +75,8 @@ pub mod stock_fpga_axi_ioctl;
 pub mod stock_fpga_axi_mmap;
 pub mod stock_fpga_iic;
 pub mod stock_fpga_work;
+/// Pure TransportOp → Bm1397PlusChainBackend execute adapter (P1-3).
+pub mod transport_op_execute;
 // W13.B1 (2026-05-10): `uart_relay` module DELETED. The `UartRelayReg`
 // typed bitfield moved to `dcentrald_asic::bm1362::uart_relay` (BM1362
 // ASIC reg 0x2C candidate evidence; production writes remain lab-gated
@@ -210,6 +216,12 @@ pub enum HalError {
     /// PSU framed-I2C protocol error with runtime context.
     #[error("PSU protocol error: {0}")]
     PsuProtocolOwned(String),
+
+    /// Both evidence-backed APW heartbeat opcodes failed with ordinary wire
+    /// errors. This is retryable by the owning heartbeat loop, unlike generic
+    /// runtime protocol errors, which may represent a policy or dialect bug.
+    #[error("PSU heartbeat wire exhaustion: primary {primary}; fallback {fallback}")]
+    PsuHeartbeatExhausted { primary: String, fallback: String },
 
     /// A boot failed after power could have been enabled and exactly one
     /// worker-owned rollback was attempted. Both outcomes stay structured so

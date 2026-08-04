@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "producers": [
-    {"board_target":"am1-s9","build_target":"s9","artifact_filename":"dcentos-sysupgrade-118.tar","install_contract":"managed_s9_install"},
+    {"board_target":"am1-s9","build_target":"s9","artifact_filename":"dcentos-unit.tar","install_contract":"managed_s9_install"},
     {"board_target":"am2-s19j","build_target":"am2-s19jpro","artifact_filename":"dcentos-sysupgrade-am2-s19jpro.tar","install_contract":"guarded_am2_self_update"},
     {"board_target":"am2-s19pro","build_target":"am2-s19pro","artifact_filename":"dcentos-sysupgrade-am2-s19pro.tar","install_contract":"guarded_am2_self_update"},
     {"board_target":"am2-s17p","build_target":"am2-s17pro","artifact_filename":"dcentos-sysupgrade-am2-s17pro.tar","install_contract":"guarded_am2_self_update"},

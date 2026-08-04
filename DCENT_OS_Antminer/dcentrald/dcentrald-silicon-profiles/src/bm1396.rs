@@ -1,4 +1,17 @@
-//! BM1396 data-only silicon profile for S17+ / T17+.
+//! BM1396 data-only silicon profile.
+//!
+//! 2026-08-03 mapping correction (W8-G): BM1396 hosts **S17e / T17e**, not
+//! S17+ / T17+ (those carry BM1397, `0x1397`). PR-056's reversed attribution
+//! is retracted — see the correction banner in
+//! .
+//!
+//! CARRY-FORWARD DEFECT: the five `BM1396_PROFILES` rows and the two
+//! `BM1396_CHIPS_PER_CHAIN_*` constants below were harvested as *plus-family*
+//! (S17+/T17+) vendor data under the old attribution, so they are filed under
+//! the wrong chip. Their VALUES are untouched (chip counts are a separate fact
+//! and must not change). Re-homing that vendor curve to `bm1397.rs` /
+//! `operating_points::{S17_PLUS,T17_PLUS}` and sourcing real S17e/T17e anchors
+//! is follow-up work; nothing outside `platform::sim` consumes them today.
 //!
 //! BM1396 is intentionally not registered as a runtime chip driver. The rows
 //! below are vendor-extracted operating-point anchors for UI/autotuner catalog

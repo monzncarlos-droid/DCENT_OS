@@ -232,7 +232,10 @@ mod tests {
         assert!(!c.enabled);
         assert_eq!(c.role(), RelayRole::Router);
         assert!(!c.is_provisioned());
-        assert!(!c.solo_mesh_empty_active(), "solo mesh fail-closed by default");
+        assert!(
+            !c.solo_mesh_empty_active(),
+            "solo mesh fail-closed by default"
+        );
         assert_eq!(c.mining_source, "off");
         assert_eq!(c.solo_chain, "regtest");
         assert_eq!(c.owner_key(), None);

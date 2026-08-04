@@ -267,18 +267,20 @@ mod safety_guards {
 
     // ── XPSAFE-1: hook installed BEFORE any rail enable ──────────────────────
     // Substitute for the un-host-runnable main(): assert the install CALL's byte
-    // offset precedes the first real `enable_buck(true)` call. We match the call
-    // sites, not the banner comments: the install call is the only
-    // `install_fail_closed_panic_hook();` (the fn def ends `() {`), and the rail
-    // enable is `.enable_buck(true)` (doc comments write `` `enable_buck(true)` ``
-    // with no leading dot).
+    // offset precedes the real `enable_buck(true)` call. We match the call
+    // sites, not the banner comments — and `.enable_buck(true)` is NOT specific
+    // enough for that, because a doc comment writes `` `gpio_ctrl.enable_buck(true)` ``
+    // WITH the leading dot, ~1000 lines earlier. Anchor on the full statement:
+    // the install call is the only `install_fail_closed_panic_hook();` (the fn
+    // def ends `() {`), and the rail enable is the sole `if let Err(e) =
+    // gpio_ctrl.enable_buck(true) {`, which `rail_bringup_wiring` pins as unique.
     #[test]
     fn panic_hook_installed_before_buck_enable() {
         let install = MAIN_RS
             .find("install_fail_closed_panic_hook();")
             .expect("main.rs must CALL install_fail_closed_panic_hook() (XPSAFE-1)");
         let enable = MAIN_RS
-            .find(".enable_buck(true)")
+            .find("if let Err(e) = gpio_ctrl.enable_buck(true) {")
             .expect("main.rs must call enable_buck(true) to bring up the rail");
         assert!(
             install < enable,
@@ -380,6 +382,518 @@ mod safety_guards {
         assert!(
             AUTOTUNER_RS.contains("hw_err_over_ceiling_streak"),
             "autotuner.rs must persist the consecutive-over-ceiling streak across ticks"
+        );
+    }
+}
+
+/// XPSAFE-5: structural guards over the rail bring-up dispatch and the panic
+/// hook's PMBus rail cut.
+///
+/// `BoardConfig::rail_bringup()` is host-tested in `dcentaxe-hal`, but a
+/// classifier that nothing consumes changes no behaviour — that is exactly how
+/// three fully-registered boards stayed unable to mine while the whole test
+/// suite was green. `main.rs` is espidf-only and cannot be host-built, so these
+/// pin the CONSUMER against its source text: that the rail step dispatches on
+/// the classification instead of on a bare `enable_buck` error, that a board
+/// with no enable GPIO is refused unless its regulator can cut the rail, and
+/// that the panic hook removes power before it adds airflow.
+#[cfg(test)]
+mod rail_bringup_wiring {
+    const MAIN_RS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcentaxe/src/main.rs"
+    ));
+    const POWER_RS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcentaxe-hal/src/power.rs"
+    ));
+
+    const FXL6408_CONVERT_RS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcentaxe-hal/src/fxl6408_convert.rs"
+    ));
+
+    /// The hook's expander constants match the driver's register map.
+    ///
+    /// The hook cannot call the driver — it is alloc-free and captures no
+    /// handles — so it carries its own copies of `OUTPUT_STATE` and the all-low
+    /// payload. This pins them equal to the source of truth, exactly as
+    /// `pmbus_panic_constants_match_the_hal` does for `OPERATION`. A hook that
+    /// writes the wrong register does not fail loudly; it silently does nothing
+    /// while reporting a rail cut.
+    #[test]
+    fn expander_panic_constants_match_the_hal() {
+        assert!(
+            FXL6408_CONVERT_RS.contains("pub const OUTPUT_STATE: u8 = 0x05;"),
+            "fxl6408_convert::reg::OUTPUT_STATE moved — the panic hook's copy is now wrong"
+        );
+        assert!(
+            MAIN_RS.contains("const PANIC_EXPANDER_OUTPUT_STATE: u8 = 0x05;"),
+            "the hook's OUTPUT_STATE copy must equal the driver's"
+        );
+        assert!(
+            MAIN_RS.contains("const PANIC_EXPANDER_ALL_LOW: u8 = 0x00;"),
+            "the panic payload must drive every expander output LOW — ASIC reset \
+             asserted, VREG off, LDO off"
+        );
+    }
+
+    /// The expander arm publishes its address LAST, like the other two.
+    #[test]
+    fn the_expander_arm_publishes_its_address_last() {
+        let body = MAIN_RS
+            .split("fn arm_panic_expander_rail_cut(port: i32, addr: u8) {")
+            .nth(1)
+            .expect("arm_panic_expander_rail_cut must exist");
+        let port = body.find("PANIC_EXPANDER_PORT.store").expect("port store");
+        let addr = body.find("PANIC_EXPANDER_ADDR.store").expect("addr store");
+        assert!(
+            port < addr,
+            "the address is the hook's armed-gate and must be stored last"
+        );
+    }
+
+    /// The expander cut runs BEFORE the fan write, like every other rail cut.
+    ///
+    /// Power removal outranks airflow: a rail that is off needs no cooling, but
+    /// cooling cannot save a rail that stays on.
+    #[test]
+    fn the_hook_cuts_the_expander_rail_before_it_adds_airflow() {
+        let hook = MAIN_RS
+            .find("std::panic::set_hook(Box::new(|_panic_info| {")
+            .expect("panic hook must exist");
+        let body = &MAIN_RS[hook..];
+        let expander = body
+            .find("PANIC_EXPANDER_ADDR.load(Ordering::Acquire)")
+            .expect("hook must read the expander arm");
+        let fan = body
+            .find("PANIC_FAN_ADDR.load(Ordering::Acquire)")
+            .expect("hook must read the fan arm");
+        assert!(
+            expander < fan,
+            "the expander rail cut must precede the fan write"
+        );
+    }
+
+    /// The panic cut is armed BEFORE the expander rail can be raised.
+    ///
+    /// The arm is the only actuator these boards have. Raising VREG first would
+    /// leave a window in which a panic energizes the chain with nothing able to
+    /// bring it down — the precise gap XPSAFE-5 was written to close for the
+    /// PMBus boards.
+    #[test]
+    fn the_expander_cut_is_armed_before_its_rail_can_rise() {
+        let arm = MAIN_RS
+            .find("arm_panic_expander_rail_cut(0, addr);")
+            .expect("main.rs must arm the expander rail cut");
+        let assertion = MAIN_RS
+            .find("Rail bring-up: expander VREG enable asserted")
+            .expect("main.rs must assert the expander VREG enable");
+        assert!(
+            arm < assertion,
+            "the panic cut must be armed before the expander VREG enable is asserted"
+        );
+    }
+
+    /// The normal fail-closed path cuts an expander rail too.
+    ///
+    /// Without this a Q-series board survives a POWER FAULT with its rail up:
+    /// `enable_buck(false)` errors (no ESP pin) and `PowerManager::disable`
+    /// returns `RequiresBuckCut` because a TPS5364x cannot switch its own
+    /// output. Neither step touches the only actuator the board has.
+    #[test]
+    fn the_fail_closed_path_cuts_an_expander_rail() {
+        let body = MAIN_RS
+            .split("fn fail_closed_power_off(")
+            .nth(1)
+            .expect("fail_closed_power_off must exist");
+        assert!(
+            body.contains("PANIC_EXPANDER_ADDR.load(Ordering::Acquire)"),
+            "fail_closed_power_off must cut an expander rail when one is armed"
+        );
+        assert!(
+            body.contains("PANIC_EXPANDER_ALL_LOW"),
+            "the fail-closed expander cut must drive every output LOW"
+        );
+    }
+
+    /// A TPS5364x reports that it cannot power itself off.
+    ///
+    /// `PowerManager::disable` used to fall through to `Ok(())` for this part —
+    /// reporting a successful power-off to the fail-closed path while doing
+    /// nothing, because its `ON_OFF_CONFIG` leaves `OPERATION` inert. On a board
+    /// with an enable GPIO the rail still came down and only the log lied; on a
+    /// board without one, nothing cut the rail at all.
+    #[test]
+    fn a_tps5364x_admits_it_cannot_switch_its_own_output() {
+        let body = POWER_RS
+            .split("    pub fn disable(&self, i2c: &mut I2cBus) -> Result<(), PowerError> {")
+            .nth(2)
+            .expect("PowerManager::disable must exist (second `disable` in the file)");
+        let head = &body[..body.find("\n    }").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.tps5364x.is_some()"),
+            "PowerManager::disable must branch on a TPS5364x rather than falling \
+             through to Ok(())"
+        );
+        assert!(
+            head.contains("RequiresBuckCut"),
+            "a TPS5364x disable must return RequiresBuckCut — the caller already \
+             handles it by proceeding to the real actuator"
+        );
+    }
+
+    /// Every GPIO tuple `board.rs` calls bindable is really an arm in `main.rs`.
+    ///
+    /// `board_gpio_tuple_is_bindable_for_every_model` checks each board against
+    /// a hardcoded `SUPPORTED` list, which is only as good as its agreement
+    /// with the binder. Nothing previously compared the two, so `SUPPORTED`
+    /// could gain an entry the binder never grew — and a board matching only
+    /// that phantom entry would reach the `pins => panic!` fallback, which is
+    /// `panic = abort`, which is a boot loop.
+    ///
+    /// This checks the direction that matters: every tuple `board.rs` promises
+    /// is bindable must literally appear in the binder.
+    #[test]
+    fn every_supported_gpio_tuple_is_a_real_binder_arm() {
+        const BOARD_RS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcentaxe-hal/src/board.rs"
+        ));
+        let list_start = BOARD_RS
+            .find("const SUPPORTED: [(i32, i32, i32, i32); ")
+            .expect("board.rs must declare the bindable-tuple list");
+        let list_end = BOARD_RS[list_start..]
+            .find("];")
+            .map(|o| list_start + o)
+            .expect("SUPPORTED list must terminate");
+        let list = &BOARD_RS[list_start..list_end];
+
+        let tuples: Vec<&str> = list
+            .match_indices('(')
+            .skip(1) // the `[(i32, i32, i32, i32); N]` type itself
+            .filter_map(|(i, _)| list[i..].find(')').map(|e| &list[i..=i + e]))
+            .collect();
+        assert!(
+            tuples.len() >= 6,
+            "parsed only {} tuples out of SUPPORTED — the parse is wrong, so the \
+             assertions below would be vacuous",
+            tuples.len()
+        );
+        for tuple in tuples {
+            assert!(
+                MAIN_RS.contains(&format!("{tuple} =>")),
+                "board.rs lists {tuple} as bindable, but main.rs has no such \
+                 binder arm — a board with that tuple would hit `pins => panic!`"
+            );
+        }
+    }
+
+    /// The ASIC LDO must be raised BEFORE the core regulator is configured.
+    ///
+    /// Upstream `NerdQaxePlus::initAsics` is explicit: `LDO_enable()`, 100 ms,
+    /// then `m_tps->init()`. Our equivalent of that init is
+    /// `PowerManager::new`, so the LDO step has to appear earlier in the file.
+    /// Inverting the order leaves the dies without their IO supply while the
+    /// core rail is programmed — a chain that never answers on a rail that
+    /// looks perfect from the regulator's side.
+    #[test]
+    fn the_ldo_comes_up_before_the_core_regulator_is_configured() {
+        let ldo = MAIN_RS
+            .find("match gpio_ctrl.enable_ldo(true) {")
+            .expect("main.rs must raise the ASIC LDO during bring-up");
+        let regulator = MAIN_RS
+            .find("PowerManager::new(")
+            .expect("main.rs must construct a PowerManager");
+        assert!(
+            ldo < regulator,
+            "the ASIC LDO enable must precede PowerManager::new — upstream's own \
+             order is LDO_enable() then m_tps->init()"
+        );
+    }
+
+    /// The LDO step asks `has_ldo()` instead of reading `enable_ldo`'s `Err`.
+    ///
+    /// `enable_ldo` returns `Err` on a board that HAS no LDO pin, which is a
+    /// topology report and not an actuation failure. Reading it as a failure is
+    /// the exact defect that left three boards permanently unable to mine in
+    /// Wave 21; this pins the shape that cannot repeat it.
+    #[test]
+    fn an_absent_ldo_is_asked_about_rather_than_failed_into() {
+        assert!(
+            MAIN_RS.contains("if mining_permitted && gpio_ctrl.has_ldo() {"),
+            "the LDO bring-up must be guarded on has_ldo(), so a board with no \
+             LDO rail is skipped rather than blocked"
+        );
+    }
+
+    /// The LDO comes down AFTER the core rail, with upstream's settle.
+    ///
+    /// `NerdQaxePlus::shutdown` is `setVoltage(0.0)` -> 500 ms ->
+    /// `LDO_disable()`. Dropping the IO supply first would leave it below a
+    /// still-discharging core rail.
+    #[test]
+    fn the_fail_closed_path_drops_the_ldo_after_the_core_rail() {
+        let buck = MAIN_RS
+            .find("if let Err(e) = gpio_ctrl.enable_buck(false) {")
+            .expect("fail_closed_power_off must cut the buck");
+        let ldo = MAIN_RS
+            .find("if let Err(e) = gpio_ctrl.enable_ldo(false) {")
+            .expect("fail_closed_power_off must drop the ASIC LDO");
+        assert!(
+            buck < ldo,
+            "the ASIC LDO must be dropped after the core rail is cut"
+        );
+        assert!(
+            MAIN_RS.contains("const LDO_SHUTDOWN_SETTLE_MS: u64 = 500;"),
+            "the core-rail-to-LDO settle must match upstream's 500 ms"
+        );
+    }
+
+    /// The panic hook does NOT drop the ASIC LDO, and that is deliberate.
+    ///
+    /// The hook has no budget for the 500 ms settle upstream observes between
+    /// cutting the core rail and dropping the LDO, and an IO rail left up over
+    /// a collapsing core rail is exactly the state that settle holds. Adding an
+    /// LDO write to the hook would invert a sequence the vendor is explicit
+    /// about, so this pins the omission as a decision rather than a gap.
+    #[test]
+    fn the_panic_hook_leaves_the_ldo_alone() {
+        let hook = MAIN_RS
+            .find("std::panic::set_hook(Box::new(|_panic_info| {")
+            .expect("main.rs must install the fail-closed panic hook");
+        let hook_end = MAIN_RS[hook..]
+            .find("\nfn ")
+            .map(|o| hook + o)
+            .unwrap_or(MAIN_RS.len());
+        let body = &MAIN_RS[hook..hook_end];
+        // Positive anchors FIRST. A negative assertion over a computed slice
+        // passes for two reasons — the thing is absent, or the slice is empty —
+        // and only one of them is the invariant. These make an empty or
+        // mis-cut body fail loudly instead of silently satisfying the test.
+        assert!(
+            body.contains("PANIC_BUCK_GPIO.load(Ordering::Acquire)"),
+            "hook body slice did not capture the buck cut — the slice is wrong, \
+             so the negative assertion below would be vacuous"
+        );
+        assert!(
+            body.contains("PANIC_FAN_ADDR.load(Ordering::Acquire)"),
+            "hook body slice did not capture the fan write — slice is too short"
+        );
+        assert!(
+            !body.contains("PANIC_LDO"),
+            "the panic hook must not act on the ASIC LDO — see LDO_SHUTDOWN_SETTLE_MS"
+        );
+    }
+
+    /// The rail step must ask WHY there is no enable pin, not just that there
+    /// isn't one. Reverting to a single unconditional `enable_buck(true)` — the
+    /// shape that blocked NerdAxe-gamma, BitForge Nano and BitAxe Naja — fails
+    /// here.
+    #[test]
+    fn rail_enable_dispatches_on_the_classification() {
+        assert!(
+            MAIN_RS.contains("match board_config.rail_bringup() {"),
+            "main.rs must dispatch the rail step on RailBringup, not on the \
+             bare Err from an absent buck-enable pin"
+        );
+        for arm in [
+            "dcentaxe_hal::board::RailBringup::EnableGpio =>",
+            "dcentaxe_hal::board::RailBringup::RegulatorOnly =>",
+            "dcentaxe_hal::board::RailBringup::NoActuator =>",
+        ] {
+            assert!(MAIN_RS.contains(arm), "main.rs is missing the `{arm}` arm");
+        }
+    }
+
+    /// `enable_buck(true)` must live INSIDE the `EnableGpio` arm — the only
+    /// class of board that has a pin to drive.
+    #[test]
+    fn the_rail_is_only_driven_by_gpio_on_boards_that_have_one() {
+        // Anchor on the STATEMENT, not on `.enable_buck(true)`: that substring
+        // also occurs in four doc/banner comments, so a bare `find` for it
+        // lands ~1000 lines above the real call site.
+        const CALL_SITE: &str = "if let Err(e) = gpio_ctrl.enable_buck(true) {";
+        assert_eq!(
+            MAIN_RS.matches(CALL_SITE).count(),
+            1,
+            "there must be exactly ONE rail-enable call site to reason about"
+        );
+        let enable_gpio_arm = MAIN_RS
+            .find("dcentaxe_hal::board::RailBringup::EnableGpio =>")
+            .expect("EnableGpio arm");
+        let regulator_arm = MAIN_RS
+            .find("dcentaxe_hal::board::RailBringup::RegulatorOnly =>")
+            .expect("RegulatorOnly arm");
+        let enable_call = MAIN_RS.find(CALL_SITE).expect("enable_buck");
+        assert!(
+            enable_gpio_arm < enable_call && enable_call < regulator_arm,
+            "enable_buck(true) (byte {enable_call}) must sit between the \
+             EnableGpio arm (byte {enable_gpio_arm}) and the RegulatorOnly arm \
+             (byte {regulator_arm}) — driving a pin a board does not have is \
+             what this whole dispatch exists to stop"
+        );
+    }
+
+    /// Skipping the GPIO step is only safe while something else can cut the
+    /// rail. A probed DS4432U cannot (`disable()` returns `RequiresBuckCut`),
+    /// nor can a TPS5364x (it ignores `OPERATION`), and on these boards there is
+    /// no buck GPIO to fall back on. See
+    /// `the_rail_cut_check_asks_for_a_capability_not_a_part` for why this is
+    /// phrased as a capability rather than the part name it started as.
+    #[test]
+    fn a_board_with_no_enable_gpio_is_refused_unless_its_regulator_can_cut() {
+        assert!(
+            MAIN_RS.contains("power_mgr.regulator_type().can_cut_rail_over_i2c()"),
+            "main.rs must verify the PROBED regulator can cut the rail before \
+             letting a board with no enable GPIO energize"
+        );
+        let check = MAIN_RS
+            .find("power_mgr.regulator_type().can_cut_rail_over_i2c()")
+            .expect("regulator capability check");
+        let raise = MAIN_RS
+            .find("power_mgr.set_voltage(&mut i2c, config.target_voltage_mv)")
+            .expect("main.rs must raise the rail with set_voltage");
+        assert!(
+            check < raise,
+            "the regulator identity check (byte {check}) must run BEFORE the \
+             rail is raised (byte {raise})"
+        );
+    }
+
+    /// The hook's PMBus command bytes must be the driver's, not a guess.
+    #[test]
+    fn pmbus_panic_constants_match_the_hal() {
+        assert!(
+            POWER_RS.contains("pub const OPERATION: u8 = 0x01;"),
+            "power::pmbus::OPERATION moved — the panic hook's mirror is stale"
+        );
+        assert!(
+            POWER_RS.contains("pub const OPERATION_OFF: u8 = 0x00;"),
+            "power::pmbus::OPERATION_OFF moved — the panic hook's mirror is stale"
+        );
+        assert!(
+            MAIN_RS.contains("const PANIC_PMBUS_OPERATION: u8 = 0x01;"),
+            "the hook must write the same OPERATION register the driver does"
+        );
+        assert!(
+            MAIN_RS.contains("const PANIC_PMBUS_OPERATION_OFF: u8 = 0x00;"),
+            "the hook must write the same OFF payload the driver does"
+        );
+        // OPERATION_ON is 0x80; writing it from the hook would ENERGIZE the rail
+        // during a panic. The mirrored OFF payload must never drift to it.
+        assert!(
+            POWER_RS.contains("pub const OPERATION_ON: u8 = 0x80;"),
+            "OPERATION_ON moved; re-check that the hook's payload is still OFF"
+        );
+        assert!(
+            !MAIN_RS.contains("const PANIC_PMBUS_OPERATION_OFF: u8 = 0x80;"),
+            "the hook's payload is OPERATION_ON — a panic would energize the rail"
+        );
+    }
+
+    /// Power off outranks cooling: a rail that is off needs no airflow, but
+    /// airflow cannot save a rail that stays on. Both are bounded by the same
+    /// I2C tick budget so neither can wedge the abort path.
+    #[test]
+    fn the_panic_hook_removes_power_before_it_adds_airflow() {
+        let pmbus = MAIN_RS
+            .find("let pmbus_addr = PANIC_PMBUS_ADDR.load(Ordering::Acquire);")
+            .expect("hook must read the armed PMBus address");
+        let fan = MAIN_RS
+            .find("let fan_addr = PANIC_FAN_ADDR.load(Ordering::Acquire);")
+            .expect("hook must read the armed fan address");
+        assert!(
+            pmbus < fan,
+            "the PMBus rail cut (byte {pmbus}) must run before the fan write \
+             (byte {fan})"
+        );
+        assert!(
+            MAIN_RS.contains("const PANIC_I2C_TICKS: u32 = 20;"),
+            "both hook I2C writes must share one bounded tick budget"
+        );
+        // The count is the point: it is what noticed XPSAFE-5d adding a fourth
+        // write. Any new actuator in the hook must arrive WITH its bounded
+        // timeout, or this fails rather than letting an unbounded I2C call
+        // reach the abort path.
+        assert_eq!(
+            MAIN_RS.matches("PANIC_I2C_TICKS,").count(),
+            4,
+            "every i2c_master_write_to_device in the hook (1 PMBus + 1 expander \
+             + 2 fan registers) must pass the bounded timeout"
+        );
+    }
+
+    /// The rail-cut test must be a CAPABILITY, not a part name.
+    ///
+    /// A TPS5364x speaks PMBus fluently and still cannot switch its own output
+    /// (its `ON_OFF_CONFIG` leaves the CMD bit clear), so `== Tps546` and "can
+    /// cut the rail" stopped being the same question the moment that part was
+    /// wired up. Naming the part again would silently let a TPS5364x board with
+    /// no enable GPIO energize a rail nothing can bring down.
+    #[test]
+    fn the_rail_cut_check_asks_for_a_capability_not_a_part() {
+        assert!(
+            MAIN_RS.contains("power_mgr.regulator_type().can_cut_rail_over_i2c()"),
+            "main.rs must gate on the capability, not on a regulator part name"
+        );
+        assert!(
+            !MAIN_RS.contains("regulator_type() == dcentaxe_hal::power::PowerIcType::Tps546"),
+            "the part-name comparison must be gone, not merely supplemented"
+        );
+        assert!(
+            POWER_RS.contains("Self::Ds4432u | Self::Tps5364x => false,"),
+            "neither the DS4432U nor the TPS5364x can cut a rail over I2C"
+        );
+        assert!(
+            POWER_RS.contains("Self::Tps546 => true,"),
+            "the TPS546 is the one regulator whose OPERATION_OFF switches the stage"
+        );
+    }
+
+    /// A regulator that must be configured before EN is asserted, is.
+    ///
+    /// The deferred assertion has to land in the window between
+    /// `PowerManager::new` (which programs phases, current-sense full scale and
+    /// the OT limits) and `set_voltage` (which commands the rail). Outside that
+    /// window it is either the bug it replaced or a rail commanded before it is
+    /// enabled.
+    #[test]
+    fn the_deferred_enable_lands_between_regulator_init_and_the_first_setpoint() {
+        let deferred = MAIN_RS
+            .find("XPSAFE-5b: the deferred enable")
+            .expect("main.rs must defer the enable for RegulatorBeforeGpio boards");
+        let init = MAIN_RS
+            .find("PowerManager::new(&mut i2c, &board_config)")
+            .expect("PowerManager::new call site");
+        let setpoint = MAIN_RS
+            .find("power_mgr.set_voltage(&mut i2c, config.target_voltage_mv)")
+            .expect("first setpoint");
+        assert!(
+            init < deferred && deferred < setpoint,
+            "deferred enable (byte {deferred}) must sit between PowerManager::new \
+             (byte {init}) and the first set_voltage (byte {setpoint})"
+        );
+        assert!(
+            MAIN_RS.contains("RailEnableOrder::RegulatorBeforeGpio"),
+            "main.rs must dispatch on the declared order, not on a board list"
+        );
+    }
+
+    /// Arming publishes the address LAST, so the hook can never fire on a
+    /// half-written pair and write OPERATION_OFF to whatever port 0 happens to
+    /// be. Same discipline as `arm_panic_fan`.
+    #[test]
+    fn the_pmbus_arm_publishes_its_address_last() {
+        let body = MAIN_RS
+            .split("fn arm_panic_pmbus_rail_cut(port: i32, addr: u8) {")
+            .nth(1)
+            .expect("arm_panic_pmbus_rail_cut must exist");
+        let port = body.find("PANIC_PMBUS_PORT.store").expect("port store");
+        let addr = body.find("PANIC_PMBUS_ADDR.store").expect("addr store");
+        assert!(
+            port < addr,
+            "the address is the hook's armed-gate and must be stored last"
         );
     }
 }
@@ -980,6 +1494,181 @@ mod mainapi_guards {
         assert!(
             collapsed.contains("per_chip .get(i)") || collapsed.contains("per_chip.get(i)"),
             "MAINAPI-1: the loop must use per_chip.get(i) as a degrade"
+        );
+    }
+
+    // ── LV08 9-chip scaling (SPEC §5) ─────────────────────────────────────────
+    //
+    // The `.min(MAX_CHIPS)` clamp above is still required — but on its own it is
+    // no longer sufficient, and on a 9-chip board it used to be the thing that
+    // TRUNCATED telemetry. The clamp is only safe while `MAX_CHIPS` is at least
+    // as wide as the widest board. These contracts pin the capacity side of that
+    // pair against the real production sources.
+    //
+    // `dcentaxe-core` cannot depend on `dcentaxe-mining` (it is a host test
+    // harness for the `dcentaxe`/`dcentaxe-hal` sources), so `MAX_CHIPS` is read
+    // out of the `stats.rs` TEXT. Note this deliberately reads OTHER files —
+    // never this one — so the assertions cannot be self-satisfied by their own
+    // needle strings. The compile-linked counterpart lives in
+    // `dcentaxe-mining` (`stats::tests::max_chips_covers_the_largest_supported_board`).
+
+    const STATS_RS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcentaxe-mining/src/stats.rs"
+    ));
+    const SELF_TEST_RS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcentaxe/src/self_test.rs"
+    ));
+
+    /// Parse the integer literal `stats.rs` declares for `MAX_CHIPS`.
+    fn declared_max_chips() -> usize {
+        let needle = "pub const MAX_CHIPS: usize = ";
+        let at = STATS_RS
+            .find(needle)
+            .expect("stats.rs must declare `pub const MAX_CHIPS: usize`");
+        let rest = &STATS_RS[at + needle.len()..];
+        let end = rest
+            .find(';')
+            .expect("the MAX_CHIPS declaration must terminate with ';'");
+        rest[..end]
+            .trim()
+            .parse::<usize>()
+            .expect("MAX_CHIPS must be a plain integer literal")
+    }
+
+    /// SPEC §5: `MAX_CHIPS` is a CAPACITY that must exceed the widest supported
+    /// chain. The Lucky LV08 is 9× BM1366, and the BM1366 `asic_nr` decode at a
+    /// 9-chip address interval (28) yields 9 — one past the last real chip — for
+    /// raw nonce bytes 252..=255. So the array must be strictly wider than 9.
+    #[test]
+    fn max_chips_capacity_covers_the_widest_supported_chain() {
+        let max_chips = declared_max_chips();
+        assert!(
+            max_chips > 9,
+            "MAX_CHIPS is {max_chips}: it must be STRICTLY greater than the 9-chip \
+             LV08 chain so the one-past `asic_nr = 9` decode has a slot. At 9 or \
+             fewer, `main.rs`'s `.min(MAX_CHIPS)` clamp silently truncates live \
+             chips out of telemetry and the self-test can never see a full chain."
+        );
+        assert_ne!(
+            max_chips, 6,
+            "MAX_CHIPS regressed to the pre-LV08 6-slot array — chips 6..8 would \
+             be silently dropped while hashrate still counted them"
+        );
+    }
+
+    /// `LARGEST_SUPPORTED_ASIC_COUNT` must be the ACTUAL largest chain in the
+    /// board registry, not a number someone remembered to bump.
+    ///
+    /// `dcentaxe-mining` pins `MAX_CHIPS > LARGEST_SUPPORTED_ASIC_COUNT`, but it
+    /// cannot see `dcentaxe-hal` — so if a new board landed with more chips than
+    /// the constant claims, that check would compare `MAX_CHIPS` against a stale
+    /// figure and pass while the real chain overflowed. This is the only place
+    /// that can compare the constant to the registry it is supposed to describe.
+    /// It is what caught nothing when the LV08 was 9 and everything went to 12
+    /// with the NerdEKO.
+    #[test]
+    fn the_largest_supported_chain_constant_matches_the_board_registry() {
+        let needle = "pub const LARGEST_SUPPORTED_ASIC_COUNT: usize = ";
+        let at = STATS_RS
+            .find(needle)
+            .expect("stats.rs must declare `pub const LARGEST_SUPPORTED_ASIC_COUNT`");
+        let rest = &STATS_RS[at + needle.len()..];
+        let end = rest
+            .find(';')
+            .expect("the LARGEST_SUPPORTED_ASIC_COUNT declaration must terminate with ';'");
+        let declared: u8 = rest[..end]
+            .trim()
+            .parse()
+            .expect("LARGEST_SUPPORTED_ASIC_COUNT must be a plain integer literal");
+
+        let actual = dcentaxe_hal::board::BoardVersionProfile::ALL
+            .iter()
+            .map(|p| p.model.asic_count())
+            .max()
+            .expect("the board registry is never empty");
+
+        assert_eq!(
+            declared, actual,
+            "LARGEST_SUPPORTED_ASIC_COUNT says {declared} but the widest board in \
+             the registry has {actual} chips. Bump the constant in stats.rs — and \
+             check MAX_CHIPS still exceeds it, because the per-chip telemetry \
+             arrays are that wide and nothing else notices when a chain outgrows \
+             them."
+        );
+        assert!(
+            declared_max_chips() > actual as usize,
+            "MAX_CHIPS ({}) must stay strictly wider than the widest real chain \
+             ({actual}) so the one-past `asic_nr` decode has a slot",
+            declared_max_chips()
+        );
+    }
+
+    /// The clamp in `main.rs` must keep clamping against the SHARED constant, not
+    /// a locally re-declared number that could drift away from `stats.rs`.
+    #[test]
+    fn main_clamps_against_the_shared_max_chips_constant() {
+        assert!(
+            MAIN_RS.contains("dcentaxe_mining::stats::MAX_CHIPS"),
+            "main.rs must reference the shared stats::MAX_CHIPS, never a local copy"
+        );
+        assert!(
+            !MAIN_RS.contains("const MAX_CHIPS"),
+            "main.rs must not re-declare its own MAX_CHIPS (drift from stats.rs)"
+        );
+    }
+
+    /// SPEC §5 / H-4: the self-test ASIC-chain step must bound its `per_chip`
+    /// scan to the board's declared chip count.
+    ///
+    /// `self_test.rs` is compiled only in the esp-idf `dcentaxe` binary, so its
+    /// own `#[cfg(test)]` module never runs in the host gate — this text contract
+    /// is the host-verifiable proof. Two directions are pinned:
+    ///  * it must NOT scan the whole fixed array (a phantom one-past slot would
+    ///    stand in for a dark chip ⇒ false PASS), and
+    ///  * the width helper must exist and be fed the expected count (an unbounded
+    ///    or hardcoded width is what made a healthy 9-chip board fail forever).
+    #[test]
+    fn self_test_asic_chain_scan_is_bounded_to_expected_chips() {
+        // Slice to the PRODUCTION region: everything before the file's first
+        // `#[cfg(test)]`. Without this, `self_test.rs`'s own unit tests (which
+        // legitimately mention `.take(scan)`) would satisfy these assertions and
+        // the contract would silently self-pass after the production bound was
+        // deleted.
+        let prod = &SELF_TEST_RS[..SELF_TEST_RS
+            .find("#[cfg(test)]")
+            .expect("self_test.rs must still have a #[cfg(test)] module boundary")];
+        assert!(
+            prod.contains("fn asic_chain_scan_width("),
+            "self_test.rs must define the pure asic_chain_scan_width() bound"
+        );
+        assert!(
+            prod.contains("let scan = asic_chain_scan_width(expected);"),
+            "the asic_chain step must derive its scan width from `expected`"
+        );
+        // The scan-width helper must clamp against the shared capacity constant.
+        assert!(
+            prod.contains("dcentaxe_mining::stats::MAX_CHIPS"),
+            "asic_chain_scan_width must clamp against the shared stats::MAX_CHIPS"
+        );
+        // Both counters (healthy and error-only) go through the bound.
+        assert_eq!(
+            prod.matches(".take(scan)").count(),
+            2,
+            "both the healthy and the error-only per_chip scans must be bounded \
+             by .take(scan) — an unbounded one re-opens the phantom-slot false PASS"
+        );
+        // The old unbounded whole-array scan must be gone. Compare with ALL
+        // whitespace removed so a reformat cannot make this vacuously true.
+        let despaced: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            despaced.contains(".take(scan).filter(|c|c.nonces>0)"),
+            "the healthy-chip scan must be bounded BEFORE it filters"
+        );
+        assert!(
+            !despaced.contains("s.per_chip.iter().filter(|c|c.nonces>0).count()"),
+            "the unbounded whole-array healthy-chip scan must not come back"
         );
     }
 

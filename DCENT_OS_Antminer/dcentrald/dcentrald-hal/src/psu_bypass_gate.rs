@@ -20,7 +20,7 @@
 //! (~13.7 V setpoint on am2) — that stays a separate `[mining].voltage_mv`
 //! concern and is never derived from this value.
 
-use crate::psu_gpio_gate::PsuGpioGate;
+use crate::psu_gpio_gate::{PsuGpioGate, PsuGpioSafeOffReceipt};
 use crate::Result;
 
 /// Scoped PSU-bypass guard: asserts `PWR_CONTROL` and records the
@@ -86,6 +86,12 @@ impl PsuBypassGate {
     /// Restore `PWR_CONTROL` to its pre-asserted state (idempotent).
     pub fn deassert(&mut self) -> Result<()> {
         self.gate.deassert()
+    }
+
+    /// Terminally drive `PWR_CONTROL` OFF with readback and retire the
+    /// ordinary pre-assert-state restoration performed by `Drop`.
+    pub fn force_safe_off_verified(&mut self) -> Result<PsuGpioSafeOffReceipt> {
+        self.gate.force_safe_off_verified()
     }
 }
 

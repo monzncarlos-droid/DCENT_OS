@@ -124,6 +124,110 @@ fn finite_temperature(reading: Option<f32>) -> Option<f32> {
     reading.filter(|temp| temp.is_finite())
 }
 
+/// A sweep of per-ASIC die readings from a multiplexed sensor, with the number
+/// of dies actually measured **counted** rather than inferred.
+///
+/// A muxed board reads one die at a time: the NerdOCTAXE-γ fans two TMP451s
+/// across four analog mux channels to reach eight BM1370 diodes. Any subset of
+/// those reads can fail on its own (an open-circuit diode, an I2C NAK, a
+/// one-shot that never clears BUSY) while the rest keep answering perfectly.
+///
+/// This type exists because folding such a sweep with `max` alone is a
+/// **fail-open**, and upstream demonstrates the exact bug:
+///
+/// ```text
+/// m_chipTempMax = intChipTempMax ? intChipTempMax : tmp1075Max;
+/// ```
+///
+/// A NAN channel contributes `0.0` to their max, so one live channel at 45 C
+/// with three dead ones yields a truthy `45.0`, silently discards the TMP1075
+/// fallback, and reports a board whose other three dies are **unmeasured** as
+/// a healthy 45 C. On a board where every die shares one rail and one fan, an
+/// unmeasured die is an unprotected die: the seven you can see tell you nothing
+/// about the one you cannot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MuxedDieFold {
+    /// Hottest finite per-ASIC reading in the sweep, or `None` when the whole
+    /// sweep failed. Still fed to the fold so a hot die that *was* measured can
+    /// trip the overtemp cut even while coverage is incomplete.
+    pub hottest: Option<f32>,
+    /// How many dies returned a finite reading this sweep.
+    pub covered: u8,
+    /// How many dies the board declares. Coverage is complete only at equality.
+    pub expected: u8,
+}
+
+impl MuxedDieFold {
+    /// Every declared die was measured this sweep.
+    ///
+    /// Deliberately `covered == expected`, not `>=`: a caller handing more
+    /// readings than the board declares has a channel→ASIC map that disagrees
+    /// with the board row, and that mismatch must fail closed rather than
+    /// round up to "complete". `expected == 0` is never complete — a board with
+    /// no declared dies should not be folding a die sweep at all.
+    pub fn is_complete(&self) -> bool {
+        self.expected > 0 && self.covered == self.expected
+    }
+}
+
+/// Fold a per-ASIC sweep, counting how many dies actually answered.
+///
+/// `readings` is indexed by ASIC, in the order the caller swept them; a failed
+/// read is `None`. Non-finite values are treated as failures, exactly as
+/// [`evaluate_thermal`] treats them — a NAN must never count as coverage.
+pub fn fold_muxed_die_readings(readings: &[Option<f32>], expected: u8) -> MuxedDieFold {
+    let mut hottest: Option<f32> = None;
+    let mut covered: u8 = 0;
+
+    for reading in readings.iter().copied().filter_map(finite_temperature) {
+        hottest = Some(match hottest {
+            Some(current) => current.max(reading),
+            None => reading,
+        });
+        covered = covered.saturating_add(1);
+    }
+
+    MuxedDieFold {
+        hottest,
+        covered,
+        expected,
+    }
+}
+
+/// [`evaluate_thermal`] for a board whose die readings come from a mux sweep.
+///
+/// Identical to the unmuxed path except that **incomplete coverage is itself
+/// blindness**. Without this, a sweep that measured one die out of eight would
+/// hand `evaluate_thermal` a perfectly valid `chip_temp`, satisfy
+/// `have_die_reading`, and report the board as fully sighted — the fail-open
+/// this whole type exists to refuse.
+///
+/// Note the two flags are independent and both are honoured: `max_temp` still
+/// carries the hottest die that *was* measured, so the ordinary overtemp cut
+/// can fire on it, while `die_reading_blind` tells the supervisor it cannot
+/// trust that number to represent the board.
+pub fn evaluate_thermal_muxed(
+    die: MuxedDieFold,
+    board_temp: Option<f32>,
+    inlet_temp: Option<f32>,
+    outlet_temp: Option<f32>,
+    vreg_temp: Option<f32>,
+    chip_die_expected: bool,
+) -> ThermalAssessment {
+    let mut assessment = evaluate_thermal(
+        die.hottest,
+        None,
+        board_temp,
+        inlet_temp,
+        outlet_temp,
+        vreg_temp,
+        chip_die_expected,
+    );
+
+    assessment.die_reading_blind |= chip_die_expected && !die.is_complete();
+    assessment
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +440,176 @@ mod tests {
         );
         assert!(!a.die_reading_blind, "we have a die reading → not blind");
         assert_eq!(a.max_temp, 75.0, "fold still surfaces the hottest reading");
+    }
+
+    // ── Muxed per-ASIC sweeps: coverage is COUNTED, never inferred ───────────
+    // A muxed board reads one die at a time, so a sweep can half-succeed. The
+    // whole point of these tests is that a half-successful sweep is BLIND.
+
+    const OCTAXE_ASICS: u8 = 8; // NerdOCTAXE-γ: 2 TMP451s x 4 mux channels
+
+    fn all_measured(temp: f32, n: usize) -> Vec<Option<f32>> {
+        vec![Some(temp); n]
+    }
+
+    #[test]
+    fn fold_counts_coverage_and_picks_the_hottest_die() {
+        let f = fold_muxed_die_readings(
+            &[Some(70.0), Some(91.5), None, Some(68.0)],
+            4, // expected
+        );
+        assert_eq!(f.hottest, Some(91.5), "hottest measured die");
+        assert_eq!(f.covered, 3, "three dies answered");
+        assert_eq!(f.expected, 4);
+        assert!(!f.is_complete(), "3 of 4 is not coverage");
+    }
+
+    #[test]
+    fn fold_does_not_count_non_finite_readings_as_coverage() {
+        // A NAN is the exact value upstream folds into its max as 0.0.
+        let f = fold_muxed_die_readings(
+            &[Some(45.0), Some(f32::NAN), Some(f32::NAN), Some(f32::NAN)],
+            4,
+        );
+        assert_eq!(f.covered, 1, "NAN is a failed read, not a measured die");
+        assert_eq!(f.hottest, Some(45.0));
+        assert!(!f.is_complete());
+    }
+
+    #[test]
+    fn complete_sweep_is_not_blind_and_surfaces_the_hottest_die() {
+        let mut readings = all_measured(72.0, OCTAXE_ASICS as usize);
+        readings[5] = Some(96.0); // one die running hot
+        let f = fold_muxed_die_readings(&readings, OCTAXE_ASICS);
+        assert!(f.is_complete(), "8 of 8 measured");
+
+        let a = evaluate_thermal_muxed(f, Some(60.0), None, None, Some(70.0), CHIP_EXPECTED);
+        assert!(!a.die_reading_blind, "full coverage → sighted");
+        assert!(a.any_temp_valid);
+        assert_eq!(a.max_temp, 96.0, "the hot die drives the fold");
+    }
+
+    #[test]
+    fn partial_sweep_of_cool_dies_is_blind_even_though_every_reading_looks_fine() {
+        // THE upstream defect, in our own shape: 7 of 8 dies read a comfortable
+        // 65 C. Nothing about those seven readings is suspicious. The eighth is
+        // unmeasured, shares the rail and the fan, and could be anywhere.
+        let mut readings = all_measured(65.0, OCTAXE_ASICS as usize);
+        readings[3] = None;
+        let f = fold_muxed_die_readings(&readings, OCTAXE_ASICS);
+
+        let a = evaluate_thermal_muxed(f, Some(55.0), None, None, None, CHIP_EXPECTED);
+        assert!(
+            a.die_reading_blind,
+            "7 of 8 dies is not coverage — an unmeasured die is an unprotected die"
+        );
+        assert_eq!(f.covered, 7);
+        assert!(!f.is_complete());
+    }
+
+    #[test]
+    fn partial_sweep_still_folds_the_measured_dies_into_max_temp() {
+        // Blindness must not suppress a real overtemp: the die we DID measure is
+        // at 108 C, and the cut has to be able to fire on it.
+        let mut readings = vec![None; OCTAXE_ASICS as usize];
+        readings[0] = Some(108.0);
+        let f = fold_muxed_die_readings(&readings, OCTAXE_ASICS);
+
+        let a = evaluate_thermal_muxed(f, Some(60.0), None, None, None, CHIP_EXPECTED);
+        assert!(a.die_reading_blind, "1 of 8 is blind");
+        assert_eq!(
+            a.max_temp, 108.0,
+            "the measured die must still reach the overtemp cut"
+        );
+        assert!(a.any_temp_valid);
+    }
+
+    #[test]
+    fn partial_sweep_does_not_discard_the_proxy_the_way_upstream_does() {
+        // Upstream's `intChipTempMax ? intChipTempMax : tmp1075Max` throws the
+        // TMP1075 away the moment ONE channel is truthy. Ours folds both.
+        let f = fold_muxed_die_readings(&[Some(45.0), None, None, None], 4);
+        let a = evaluate_thermal_muxed(
+            f,
+            None,
+            None,
+            None,
+            Some(88.0), // proxy is hotter than the one die we reached
+            CHIP_EXPECTED,
+        );
+        assert_eq!(a.max_temp, 88.0, "the proxy is still in the fold");
+        assert!(a.die_reading_blind);
+    }
+
+    #[test]
+    fn totally_failed_sweep_with_a_proxy_is_blind() {
+        let f = fold_muxed_die_readings(&[None; 8], OCTAXE_ASICS);
+        assert_eq!(f.hottest, None);
+        assert_eq!(f.covered, 0);
+
+        let a = evaluate_thermal_muxed(f, Some(70.0), None, None, None, CHIP_EXPECTED);
+        assert!(a.die_reading_blind, "no die reading at all → blind");
+        assert!(a.any_temp_valid, "the proxy still reads");
+    }
+
+    #[test]
+    fn totally_failed_sweep_with_no_proxy_is_the_all_sensors_failed_path() {
+        let f = fold_muxed_die_readings(&[None; 8], OCTAXE_ASICS);
+        let a = evaluate_thermal_muxed(f, None, None, None, None, CHIP_EXPECTED);
+        assert!(!a.any_temp_valid, "all-None → existing THERMAL-BLIND path");
+        assert_eq!(a.max_temp, 0.0);
+    }
+
+    #[test]
+    fn more_readings_than_the_board_declares_fails_closed() {
+        // A channel→ASIC map that disagrees with the board row. Rounding this up
+        // to "complete" would trust a map we know is wrong.
+        let f = fold_muxed_die_readings(&all_measured(60.0, 9), OCTAXE_ASICS);
+        assert_eq!(f.covered, 9);
+        assert!(
+            !f.is_complete(),
+            "covered > expected is a map mismatch, not extra credit"
+        );
+
+        let a = evaluate_thermal_muxed(f, None, None, None, Some(50.0), CHIP_EXPECTED);
+        assert!(a.die_reading_blind);
+    }
+
+    #[test]
+    fn a_board_declaring_no_dies_is_never_complete() {
+        let f = fold_muxed_die_readings(&[Some(60.0)], 0);
+        assert!(
+            !f.is_complete(),
+            "expected == 0 means this board should not be sweeping dies at all"
+        );
+    }
+
+    #[test]
+    fn incomplete_coverage_on_a_chipless_board_is_not_a_false_kill() {
+        // Same no-false-kill guarantee as the unmuxed path: a board that is not
+        // expected to carry die sensors must never be blinded by their absence.
+        let f = fold_muxed_die_readings(&[None; 4], 4);
+        let a = evaluate_thermal_muxed(f, None, None, None, Some(65.0), NO_CHIP);
+        assert!(!a.die_reading_blind, "chipless board must never be blinded");
+        assert_eq!(a.max_temp, 65.0);
+    }
+
+    #[test]
+    fn muxed_path_agrees_with_the_unmuxed_path_when_coverage_is_complete() {
+        // The muxed wrapper must add blindness and nothing else — same fold,
+        // same any_temp_valid, for an identical set of inputs.
+        let f = fold_muxed_die_readings(&all_measured(80.0, 4), 4);
+        let muxed =
+            evaluate_thermal_muxed(f, Some(60.0), Some(30.0), Some(50.0), None, CHIP_EXPECTED);
+        let unmuxed = evaluate_thermal(
+            Some(80.0),
+            None,
+            Some(60.0),
+            Some(30.0),
+            Some(50.0),
+            None,
+            CHIP_EXPECTED,
+        );
+        assert_eq!(muxed, unmuxed);
     }
 }

@@ -17,7 +17,7 @@
 use crate::i2c::{
     I2cBus, I2cMutationLabel, I2cOperationIntent, I2cServiceHandle, I2cTransactionStep,
 };
-use crate::psu_gpio_gate::PsuGpioGate;
+use crate::psu_gpio_gate::{PsuGpioGate, PsuGpioSafeOffReceipt};
 use crate::psu_gpio_i2c::GpioBitBangI2c;
 use crate::HalError;
 use crate::Result;
@@ -75,6 +75,40 @@ enum ApwIo {
     Kernel(I2cBus),
     Gpio(GpioBitBangI2c),
     Service(I2cServiceHandle),
+}
+
+/// Add APW operation context only to ordinary wire failures. Typed service
+/// control-flow and outcome errors must retain their class so callers never
+/// retry a superseded mutation or duplicate a SafeOff with unknown outcome.
+fn contextualize_apw_io_error(
+    error: HalError,
+    bus: u8,
+    addr: u8,
+    operation: &'static str,
+) -> HalError {
+    match error {
+        error @ HalError::I2c { .. } => HalError::I2c {
+            bus,
+            addr,
+            detail: format!("{operation}: {error}"),
+        },
+        typed => typed,
+    }
+}
+
+fn apw_ordinary_wire_failure(error: &HalError) -> bool {
+    matches!(error, HalError::I2c { .. })
+}
+
+fn accumulate_apw_flush_read(result: Result<usize>, total_drained: &mut u32) -> Result<()> {
+    match result {
+        Ok(bytes) => {
+            *total_drained = (*total_drained).saturating_add(bytes as u32);
+            Ok(())
+        }
+        Err(error) if apw_ordinary_wire_failure(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// I2C bus backend — either kernel `/dev/i2c-N` or GPIO bit-bang.
@@ -230,7 +264,7 @@ impl PsuController {
                 i2c.set_slave(self.address)?;
                 // Send each byte with delay
                 for &byte in &frame {
-                    i2c.write(&[byte])?;
+                    i2c.write_exact(&[byte], "legacy PSU query byte")?;
                     std::thread::sleep(std::time::Duration::from_millis(BYTE_DELAY_MS));
                 }
                 // Wait for PSU to process
@@ -263,7 +297,7 @@ impl PsuController {
             PsuBus::Kernel(i2c) => {
                 i2c.set_slave(self.address)?;
                 for &byte in &frame {
-                    i2c.write(&[byte])?;
+                    i2c.write_exact(&[byte], "legacy PSU mutation byte")?;
                     std::thread::sleep(std::time::Duration::from_millis(BYTE_DELAY_MS));
                     // Read echo (for write commands 0x81, 0x83, 0x86)
                     let mut echo = [0u8; 1];
@@ -436,6 +470,102 @@ pub const APW12_HEARTBEAT_MS: u64 = 1000;
 /// Mirrors the PIC deferred-voltage-stability gate
 ///.
 pub const APW12_STABLE_TICKS_GATE: u64 = 5;
+
+const APW12_CANCELLABLE_WAIT_QUANTUM: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ApwWriteOnlyBootStep {
+    AssertGate,
+    FlushBuffer,
+    Disable { attempt: u8 },
+    SetVoltage { target_v: f64 },
+    Enable,
+    Heartbeat,
+}
+
+fn require_apw_boot_active(
+    is_cancelled: &mut dyn FnMut() -> bool,
+    stage: &'static str,
+) -> Result<()> {
+    if is_cancelled() {
+        return Err(HalError::Other(format!(
+            "APW operation cancelled before {stage}"
+        )));
+    }
+    Ok(())
+}
+
+fn wait_apw_boot_active(
+    duration: std::time::Duration,
+    wait_quantum: std::time::Duration,
+    stage: &'static str,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<()> {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        require_apw_boot_active(is_cancelled, stage)?;
+        let chunk = remaining.min(wait_quantum);
+        sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    require_apw_boot_active(is_cancelled, stage)
+}
+
+// clippy::type_complexity: the APW write-only boot-step executor is a callback taking a cancel probe and a
+// sleep hook; naming it via  would hide the exact closure contract callers
+// must satisfy on an energization path.
+#[allow(clippy::type_complexity)]
+fn run_apw_write_only_boot_plan(
+    target_v: f64,
+    wait_quantum: std::time::Duration,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    execute: &mut dyn FnMut(
+        ApwWriteOnlyBootStep,
+        &mut dyn FnMut() -> bool,
+        &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()>,
+) -> Result<()> {
+    require_apw_boot_active(is_cancelled, "PWR_CONTROL assertion")?;
+    execute(ApwWriteOnlyBootStep::AssertGate, is_cancelled, sleep)?;
+    require_apw_boot_active(is_cancelled, "stale-buffer flush")?;
+    execute(ApwWriteOnlyBootStep::FlushBuffer, is_cancelled, sleep)?;
+
+    for attempt in 1..=3 {
+        require_apw_boot_active(is_cancelled, "PSU disable")?;
+        execute(
+            ApwWriteOnlyBootStep::Disable { attempt },
+            is_cancelled,
+            sleep,
+        )?;
+        wait_apw_boot_active(
+            std::time::Duration::from_secs(1),
+            wait_quantum,
+            "post-disable stabilization",
+            is_cancelled,
+            sleep,
+        )?;
+    }
+
+    require_apw_boot_active(is_cancelled, "PSU voltage set")?;
+    execute(
+        ApwWriteOnlyBootStep::SetVoltage { target_v },
+        is_cancelled,
+        sleep,
+    )?;
+    wait_apw_boot_active(
+        std::time::Duration::from_millis(300),
+        wait_quantum,
+        "post-voltage stabilization",
+        is_cancelled,
+        sleep,
+    )?;
+    require_apw_boot_active(is_cancelled, "PSU enable")?;
+    execute(ApwWriteOnlyBootStep::Enable, is_cancelled, sleep)?;
+    require_apw_boot_active(is_cancelled, "initial PSU heartbeat")?;
+    execute(ApwWriteOnlyBootStep::Heartbeat, is_cancelled, sleep)
+}
 
 /// NAK byte that aborts a read phase (per BIBLE and Agent A spec).
 const APW12_NAK_BYTE: u8 = 0xF5;
@@ -912,6 +1042,17 @@ enum ApwHeartbeatMode {
     WatchdogTick81,
 }
 
+fn apw_heartbeat_opcode_fallback_allowed(error: &HalError) -> bool {
+    apw_ordinary_wire_failure(error)
+}
+
+fn apw_initial_heartbeat_can_defer(error: &HalError) -> bool {
+    matches!(
+        error,
+        HalError::I2c { .. } | HalError::PsuHeartbeatExhausted { .. }
+    )
+}
+
 impl Apw121215a {
     fn with_io(io: ApwIo, bus: u8, addr: u8) -> Self {
         Self {
@@ -979,6 +1120,23 @@ impl Apw121215a {
     /// Whether the GPIO gate is currently asserted on this PSU instance.
     pub fn is_gate_asserted(&self) -> bool {
         self.gpio_gate.as_ref().is_some_and(|g| g.is_asserted())
+    }
+
+    /// Terminally drive the owned AM2 `PWR_CONTROL` gate OFF and retire its
+    /// ordinary scope-exit restoration.
+    ///
+    /// `None` means this PSU instance never acquired a GPIO gate. Hybrid AM2
+    /// teardown treats that as missing authority when a smart-PSU gate was
+    /// expected; other platforms can continue to operate without a gate.
+    pub fn force_psu_gate_safe_off_verified(&mut self) -> Result<Option<PsuGpioSafeOffReceipt>> {
+        let Some(gate) = self.gpio_gate.as_mut() else {
+            return Ok(None);
+        };
+        let receipt = gate.force_safe_off_verified()?;
+        // The successful transition marks the guard inactive, so taking and
+        // dropping it cannot restore the inherited pre-assert state later.
+        drop(self.gpio_gate.take());
+        Ok(Some(receipt))
     }
 
     /// Open the APW121215a on the default bus/address (S19j Pro am2 wiring).
@@ -1376,22 +1534,46 @@ impl Apw121215a {
     /// dcentrald exited uncleanly. Fix per Phase 5 investigation Agent 20
     ///.
     ///
-    /// Best-effort: up to 8 × 32-byte reads with 10 ms between drains. Errors
-    /// are swallowed (we're DRAINING, not reading for content). Returns Ok
-    /// even when bus NACKs every drain — that's the expected "buffer clean"
-    /// exit state.
+    /// Best-effort: up to 8 × 32-byte reads with 10 ms between drains. Ordinary
+    /// wire errors are swallowed (we're DRAINING, not reading for content), but
+    /// typed ownership, safety-generation, and service-control errors return
+    /// immediately instead of masquerading as a clean buffer.
     pub fn flush_buffer(&mut self) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.flush_buffer_guarded(
+            "stale-buffer flush",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    /// Drain stale response bytes while checking cancellation before every
+    /// transport request and during every inter-read delay. One already-started
+    /// transport request may finish; cancellation forbids all later reads.
+    fn flush_buffer_guarded(
+        &mut self,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
         let mut total_drained = 0u32;
         match &mut self.io {
             ApwIo::Kernel(i2c) => {
                 i2c.set_slave(self.addr)?;
                 for _ in 0..8 {
+                    require_apw_boot_active(is_cancelled, stage)?;
                     let mut buf = [0u8; 32];
-                    match i2c.read(&mut buf) {
-                        Ok(n) if n > 0 => total_drained += n as u32,
-                        _ => {}
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    accumulate_apw_flush_read(i2c.read(&mut buf), &mut total_drained)?;
+                    wait_apw_boot_active(
+                        std::time::Duration::from_millis(10),
+                        wait_quantum,
+                        stage,
+                        is_cancelled,
+                        sleep,
+                    )?;
                 }
             }
             ApwIo::Gpio(gpio) => {
@@ -1401,31 +1583,52 @@ impl Apw121215a {
                 // 32-byte bulk drain.
                 if self.loki_per_byte_mode {
                     for _ in 0..8 {
+                        require_apw_boot_active(is_cancelled, stage)?;
                         let mut buf = [0u8; 8];
-                        match gpio.read_apw12_loki_response(self.addr, &mut buf) {
-                            Ok(n) if n > 0 => total_drained += n as u32,
-                            _ => {}
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        accumulate_apw_flush_read(
+                            gpio.read_apw12_loki_response(self.addr, &mut buf),
+                            &mut total_drained,
+                        )?;
+                        wait_apw_boot_active(
+                            std::time::Duration::from_millis(10),
+                            wait_quantum,
+                            stage,
+                            is_cancelled,
+                            sleep,
+                        )?;
                     }
                 } else {
                     for _ in 0..8 {
+                        require_apw_boot_active(is_cancelled, stage)?;
                         let mut buf = [0u8; 32];
-                        match gpio.read_from(self.addr, &mut buf) {
-                            Ok(n) if n > 0 => total_drained += n as u32,
-                            _ => {}
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        accumulate_apw_flush_read(
+                            gpio.read_from(self.addr, &mut buf),
+                            &mut total_drained,
+                        )?;
+                        wait_apw_boot_active(
+                            std::time::Duration::from_millis(10),
+                            wait_quantum,
+                            stage,
+                            is_cancelled,
+                            sleep,
+                        )?;
                     }
                 }
             }
             ApwIo::Service(service) => {
                 for _ in 0..8 {
-                    match service.read_bytes(self.addr, 32) {
-                        Ok(buf) if !buf.is_empty() => total_drained += buf.len() as u32,
-                        _ => {}
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    require_apw_boot_active(is_cancelled, stage)?;
+                    accumulate_apw_flush_read(
+                        service.read_bytes(self.addr, 32).map(|buf| buf.len()),
+                        &mut total_drained,
+                    )?;
+                    wait_apw_boot_active(
+                        std::time::Duration::from_millis(10),
+                        wait_quantum,
+                        stage,
+                        is_cancelled,
+                        sleep,
+                    )?;
                 }
             }
         }
@@ -1493,16 +1696,11 @@ impl Apw121215a {
         let n = match &mut self.io {
             ApwIo::Kernel(i2c) => {
                 i2c.set_slave(self.addr)?;
-                i2c.write(&frame).map_err(|e| HalError::I2c {
-                    bus,
-                    addr,
-                    detail: format!("txrx write: {}", e),
-                })?;
+                i2c.write_exact(&frame, "APW framed observation request")
+                    .map_err(|error| contextualize_apw_io_error(error, bus, addr, "txrx write"))?;
                 std::thread::sleep(std::time::Duration::from_millis(APW12_REPLY_DELAY_MS));
-                i2c.read(&mut header).map_err(|e| HalError::I2c {
-                    bus,
-                    addr,
-                    detail: format!("txrx read header: {}", e),
+                i2c.read(&mut header).map_err(|error| {
+                    contextualize_apw_io_error(error, bus, addr, "txrx read header")
                 })?
             }
             ApwIo::Gpio(gpio) => {
@@ -1525,10 +1723,13 @@ impl Apw121215a {
                     // (it already tolerates trailing padding past the advertised
                     // LEN). This mirrors the Service branch's `ReadFrame` shape.
                     gpio.write_apw12_loki_frame(self.addr, &frame)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx loki-per-byte write(bitbang): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(
+                                error,
+                                bus,
+                                addr,
+                                "txrx loki-per-byte write(bitbang)",
+                            )
                         })?;
                     std::thread::sleep(std::time::Duration::from_millis(APW12_REPLY_DELAY_MS));
                     // Read a full frame in ONE accumulate call. 64 matches the
@@ -1536,10 +1737,13 @@ impl Apw121215a {
                     let mut full = vec![0u8; 64];
                     let nfull = gpio
                         .read_apw12_loki_response(self.addr, &mut full)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx loki-per-byte read frame(bitbang): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(
+                                error,
+                                bus,
+                                addr,
+                                "txrx loki-per-byte read frame(bitbang)",
+                            )
                         })?;
                     full.truncate(nfull);
                     // Loop-accumulate guarantees buf[0..]==preamble-aligned on
@@ -1567,19 +1771,13 @@ impl Apw121215a {
                     }
                     return parse_apw12_reply(cmd, &full);
                 } else {
-                    gpio.write_to(self.addr, &frame)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx write(bitbang): {}", e),
-                        })?;
+                    gpio.write_to(self.addr, &frame).map_err(|error| {
+                        contextualize_apw_io_error(error, bus, addr, "txrx write(bitbang)")
+                    })?;
                     std::thread::sleep(std::time::Duration::from_millis(APW12_REPLY_DELAY_MS));
-                    gpio.read_from(self.addr, &mut header)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx read header(bitbang): {}", e),
-                        })?
+                    gpio.read_from(self.addr, &mut header).map_err(|error| {
+                        contextualize_apw_io_error(error, bus, addr, "txrx read header(bitbang)")
+                    })?
                 }
             }
             ApwIo::Service(service) => {
@@ -1598,10 +1796,8 @@ impl Apw121215a {
                             },
                         ],
                     )
-                    .map_err(|e| HalError::I2c {
-                        bus,
-                        addr,
-                        detail: format!("txrx transaction(service): {}", e),
+                    .map_err(|error| {
+                        contextualize_apw_io_error(error, bus, addr, "txrx transaction(service)")
                     })?;
                 let full = reads.into_iter().next().unwrap_or_default();
                 if full.len() == 1 && full[0] == APW12_NAK_BYTE {
@@ -1693,11 +1889,9 @@ impl Apw121215a {
         let remaining = (len as usize) - 1;
         let mut tail = vec![0u8; remaining];
         let n2 = match &mut self.io {
-            ApwIo::Kernel(i2c) => i2c.read(&mut tail).map_err(|e| HalError::I2c {
-                bus,
-                addr,
-                detail: format!("txrx read tail: {}", e),
-            })?,
+            ApwIo::Kernel(i2c) => i2c
+                .read(&mut tail)
+                .map_err(|error| contextualize_apw_io_error(error, bus, addr, "txrx read tail"))?,
             ApwIo::Gpio(gpio) => {
                 if loki_per_byte {
                     // UNREACHABLE for the Loki path post-: the Loki
@@ -1706,28 +1900,24 @@ impl Apw121215a {
                     // accumulate — it would re-align to the preamble). Kept for
                     // signature stability / non-loki defensiveness only.
                     gpio.read_apw12_loki_response(self.addr, &mut tail)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx loki-per-byte read tail(bitbang): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(
+                                error,
+                                bus,
+                                addr,
+                                "txrx loki-per-byte read tail(bitbang)",
+                            )
                         })?
                 } else {
-                    gpio.read_from(self.addr, &mut tail)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("txrx read tail(bitbang): {}", e),
-                        })?
+                    gpio.read_from(self.addr, &mut tail).map_err(|error| {
+                        contextualize_apw_io_error(error, bus, addr, "txrx read tail(bitbang)")
+                    })?
                 }
             }
             ApwIo::Service(service) => {
-                let buf = service
-                    .read_bytes(self.addr, tail.len())
-                    .map_err(|e| HalError::I2c {
-                        bus,
-                        addr,
-                        detail: format!("txrx read tail(service): {}", e),
-                    })?;
+                let buf = service.read_bytes(self.addr, tail.len()).map_err(|error| {
+                    contextualize_apw_io_error(error, bus, addr, "txrx read tail(service)")
+                })?;
                 let n = buf.len().min(tail.len());
                 tail[..n].copy_from_slice(&buf[..n]);
                 n
@@ -1780,7 +1970,7 @@ impl Apw121215a {
                     last_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     // Best-effort: drain any partial bytes the PSU already emitted.
-                    let _ = self.flush_buffer();
+                    self.flush_buffer()?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1836,11 +2026,8 @@ impl Apw121215a {
         match &mut self.io {
             ApwIo::Kernel(i2c) => {
                 i2c.set_slave(self.addr)?;
-                i2c.write(&frame).map_err(|e| HalError::I2c {
-                    bus,
-                    addr,
-                    detail: format!("tx write: {}", e),
-                })?;
+                i2c.write_exact(&frame, "APW framed mutation")
+                    .map_err(|error| contextualize_apw_io_error(error, bus, addr, "tx write"))?;
             }
             ApwIo::Gpio(gpio) => {
                 if loki_per_byte {
@@ -1848,28 +2035,31 @@ impl Apw121215a {
                     // bosminer ground-truth. N transactions of
                     // `[addr_W, 0x11, byte]` with 8 ms gap.
                     gpio.write_apw12_loki_frame(self.addr, &frame)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("tx loki-per-byte(bitbang): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(
+                                error,
+                                bus,
+                                addr,
+                                "tx loki-per-byte(bitbang)",
+                            )
                         })?;
                 } else {
-                    gpio.write_to(self.addr, &frame)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("tx write(bitbang): {}", e),
-                        })?;
+                    gpio.write_to(self.addr, &frame).map_err(|error| {
+                        contextualize_apw_io_error(error, bus, addr, "tx write(bitbang)")
+                    })?;
                 }
             }
             ApwIo::Service(service) => {
                 if intent == I2cOperationIntent::SafeOff {
                     service
                         .write_bytes_with_intent(intent, self.addr, &frame)
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("reserved safe-off tx(service): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(
+                                error,
+                                bus,
+                                addr,
+                                "reserved safe-off tx(service)",
+                            )
                         })?;
                     std::thread::sleep(std::time::Duration::from_millis(APW12_REPLY_DELAY_MS));
                 } else {
@@ -1882,10 +2072,8 @@ impl Apw121215a {
                                 I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
                             ],
                         )
-                        .map_err(|e| HalError::I2c {
-                            bus,
-                            addr,
-                            detail: format!("tx transaction(service): {}", e),
+                        .map_err(|error| {
+                            contextualize_apw_io_error(error, bus, addr, "tx transaction(service)")
                         })?;
                 }
             }
@@ -1902,9 +2090,40 @@ impl Apw121215a {
         cmd: u8,
         payload: &[u8],
     ) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.tx_with_intent_guarded(
+            intent,
+            cmd,
+            payload,
+            "framed mutation",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    /// Send one framed mutation with admission checked at every physical
+    /// frame-attempt boundary. A frame whose transport call has already begun
+    /// may complete, but cancellation prevents every retry and later verb.
+    // clippy::too_many_arguments: same rationale as the I2C worker enqueue — each
+    // argument is a distinct guard input on a PSU transaction; a bundling struct
+    // would make a half-built guard representable.
+    #[allow(clippy::too_many_arguments)]
+    fn tx_with_intent_guarded(
+        &mut self,
+        intent: I2cOperationIntent,
+        cmd: u8,
+        payload: &[u8],
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
         self.require_fw71_dialect("framed mutation")?;
         let mut last_err: Option<HalError> = None;
         for attempt in 1..=3 {
+            require_apw_boot_active(is_cancelled, stage)?;
             match self.tx_once_with_intent(intent, cmd, payload) {
                 Ok(()) => return Ok(()),
                 Err(e @ HalError::I2c { .. }) if attempt < 3 => {
@@ -1914,8 +2133,14 @@ impl Apw121215a {
                         "APW121215a tx I²C error — retrying in 100 ms"
                     );
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let _ = self.flush_buffer();
+                    wait_apw_boot_active(
+                        std::time::Duration::from_millis(100),
+                        wait_quantum,
+                        stage,
+                        is_cancelled,
+                        sleep,
+                    )?;
+                    self.flush_buffer_guarded(stage, wait_quantum, is_cancelled, sleep)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -1952,14 +2177,37 @@ impl Apw121215a {
 
     /// Enable / disable PSU watchdog (0x81). Payload: `0x00`=disable, `!0`=enable.
     pub fn watchdog(&mut self, enable: bool) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.watchdog_guarded(
+            enable,
+            "PSU watchdog control",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn watchdog_guarded(
+        &mut self,
+        enable: bool,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
         // Standalone watchdog control is neutral policy, not SafeOff
         // privilege. Only the coordinated minimum-ramp + disarm plan may use
         // the reserved lane, because disarming alone can remove a cutoff.
         let intent = I2cOperationIntent::NeutralControl;
-        self.tx_with_intent(
+        self.tx_with_intent_guarded(
             intent,
             APW12_CMD_WATCHDOG,
             &[if enable { 0x01 } else { 0x00 }],
+            stage,
+            wait_quantum,
+            is_cancelled,
+            sleep,
         )?;
         self.watchdog_armed = enable;
         Ok(())
@@ -1981,6 +2229,39 @@ impl Apw121215a {
     /// the 5-stable-ticks `set_voltage` gate opens as it would on a real PSU —
     /// otherwise the no-SMBus rail could never reach the voltage-set stage.
     pub fn heartbeat(&mut self) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.heartbeat_guarded(
+            "PSU heartbeat",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    /// Runtime heartbeat with cancellation checked before every frame attempt,
+    /// opcode fallback, retry, flush read, and bounded retry delay. A single
+    /// already-started transport request may finish, but cancellation prevents
+    /// all subsequent keep-alive or drain requests.
+    pub fn heartbeat_cancellable(&mut self, is_cancelled: impl FnMut() -> bool) -> Result<()> {
+        let mut is_cancelled = is_cancelled;
+        let mut sleep = std::thread::sleep;
+        self.heartbeat_guarded(
+            "runtime PSU heartbeat",
+            APW12_CANCELLABLE_WAIT_QUANTUM,
+            &mut is_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn heartbeat_guarded(
+        &mut self,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
+        require_apw_boot_active(is_cancelled, stage)?;
         if self.no_smbus_peer {
             self.heartbeat_ticks.fetch_add(1, Ordering::Relaxed);
             tracing::trace!(
@@ -1991,12 +2272,24 @@ impl Apw121215a {
             return Ok(());
         }
         let primary = match self.heartbeat_mode {
-            ApwHeartbeatMode::Primary84 => {
-                self.tx_with_intent(I2cOperationIntent::KeepAlive, APW12_CMD_HEARTBEAT, &[])
-            }
-            ApwHeartbeatMode::WatchdogTick81 => {
-                self.tx_with_intent(I2cOperationIntent::KeepAlive, APW12_CMD_WATCHDOG, &[0x02])
-            }
+            ApwHeartbeatMode::Primary84 => self.tx_with_intent_guarded(
+                I2cOperationIntent::KeepAlive,
+                APW12_CMD_HEARTBEAT,
+                &[],
+                stage,
+                wait_quantum,
+                is_cancelled,
+                sleep,
+            ),
+            ApwHeartbeatMode::WatchdogTick81 => self.tx_with_intent_guarded(
+                I2cOperationIntent::KeepAlive,
+                APW12_CMD_WATCHDOG,
+                &[0x02],
+                stage,
+                wait_quantum,
+                is_cancelled,
+                sleep,
+            ),
         };
 
         match primary {
@@ -2004,11 +2297,19 @@ impl Apw121215a {
                 self.heartbeat_ticks.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(primary_err) if matches!(self.heartbeat_mode, ApwHeartbeatMode::Primary84) => {
-                match self.tx_with_intent(
+            Err(primary_err)
+                if matches!(self.heartbeat_mode, ApwHeartbeatMode::Primary84)
+                    && apw_heartbeat_opcode_fallback_allowed(&primary_err) =>
+            {
+                require_apw_boot_active(is_cancelled, stage)?;
+                match self.tx_with_intent_guarded(
                     I2cOperationIntent::KeepAlive,
                     APW12_CMD_WATCHDOG,
                     &[0x02],
+                    stage,
+                    wait_quantum,
+                    is_cancelled,
+                    sleep,
                 ) {
                     Ok(()) => {
                         self.heartbeat_mode = ApwHeartbeatMode::WatchdogTick81;
@@ -2019,16 +2320,22 @@ impl Apw121215a {
                         );
                         Ok(())
                     }
-                    Err(fallback_err) => {
+                    Err(fallback_err) if !apw_heartbeat_opcode_fallback_allowed(&fallback_err) => {
                         self.heartbeat_ticks.store(0, Ordering::Relaxed);
-                        Err(HalError::PsuProtocolOwned(format!(
-                            "APW heartbeat failed on 0x84 ({}) and 0x81/[0x02] ({})",
-                            primary_err, fallback_err
-                        )))
+                        Err(fallback_err)
+                    }
+                    Err(fallback_err) => {
+                        require_apw_boot_active(is_cancelled, stage)?;
+                        self.heartbeat_ticks.store(0, Ordering::Relaxed);
+                        Err(HalError::PsuHeartbeatExhausted {
+                            primary: format!("0x84: {primary_err}"),
+                            fallback: format!("0x81/[0x02]: {fallback_err}"),
+                        })
                     }
                 }
             }
             Err(e) => {
+                require_apw_boot_active(is_cancelled, stage)?;
                 self.heartbeat_ticks.store(0, Ordering::Relaxed);
                 Err(e)
             }
@@ -2098,6 +2405,24 @@ impl Apw121215a {
     /// made the enable/disable pair asymmetric — `enable()` skipped but
     /// `disable()` still EIO'd on the Loki teardown path.
     pub fn disable(&mut self) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.disable_guarded(
+            "PSU disable",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn disable_guarded(
+        &mut self,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
+        require_apw_boot_active(is_cancelled, stage)?;
         if self.no_smbus_peer {
             tracing::info!(
                 addr = format_args!("0x{:02X}", self.addr),
@@ -2108,7 +2433,7 @@ impl Apw121215a {
             self.watchdog_armed = false;
             return Ok(());
         }
-        self.watchdog(false)
+        self.watchdog_guarded(false, stage, wait_quantum, is_cancelled, sleep)
     }
 
     /// Enable PSU (watchdog re-armed + heartbeat assumed running).
@@ -2122,6 +2447,24 @@ impl Apw121215a {
     /// "armed" locally so the heartbeat loop's 5-stable-tick accounting and any
     /// `watchdog_armed` callers behave as if enable succeeded.
     pub fn enable(&mut self) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.enable_guarded(
+            "PSU enable",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn enable_guarded(
+        &mut self,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
+        require_apw_boot_active(is_cancelled, stage)?;
         if self.no_smbus_peer {
             tracing::info!(
                 addr = format_args!("0x{:02X}", self.addr),
@@ -2132,7 +2475,7 @@ impl Apw121215a {
             self.watchdog_armed = true;
             return Ok(());
         }
-        self.watchdog(true)
+        self.watchdog_guarded(true, stage, wait_quantum, is_cancelled, sleep)
     }
 
     /// Env gate: opt into the byte-exact per-PSU-version DAC formula
@@ -2240,6 +2583,26 @@ impl Apw121215a {
     /// described in Agent A's spec: `3× Disable → Ramping → Enable` — never
     /// from the runtime autotuner. Logged at WARN so it's visible in logs.
     pub fn set_voltage_init_bypass(&mut self, voltage_v: f64) -> Result<()> {
+        let mut never_cancelled = || false;
+        let mut sleep = std::thread::sleep;
+        self.set_voltage_init_bypass_guarded(
+            voltage_v,
+            "PSU voltage set",
+            std::time::Duration::MAX,
+            &mut never_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn set_voltage_init_bypass_guarded(
+        &mut self,
+        voltage_v: f64,
+        stage: &'static str,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
+        require_apw_boot_active(is_cancelled, stage)?;
         let v = voltage_v.clamp(11.96, 15.20);
         let dac = self.voltage_to_dac_gated(v);
         tracing::warn!(
@@ -2247,7 +2610,15 @@ impl Apw121215a {
             voltage = format_args!("{:.3}V", v),
             "APW121215a SetVoltage (INIT BYPASS — 5-tick gate skipped)",
         );
-        self.tx_with_intent(I2cOperationIntent::Energize, APW12_CMD_SET_VOLTAGE, &[dac])?;
+        self.tx_with_intent_guarded(
+            I2cOperationIntent::Energize,
+            APW12_CMD_SET_VOLTAGE,
+            &[dac],
+            stage,
+            wait_quantum,
+            is_cancelled,
+            sleep,
+        )?;
         self.dac = Some(dac);
         Ok(())
     }
@@ -2317,7 +2688,7 @@ impl Apw121215a {
     pub fn probe(&mut self) -> Result<PsuModel> {
         // Drain stale buffer bytes first (Agent 20 Phase 5 investigation):
         // without this, PSU NACKs first real command after unclean prior-daemon exit.
-        let _ = self.flush_buffer();
+        self.flush_buffer()?;
 
         let (fw, ascii) = self.get_fw_version()?;
         self.fw_byte = Some(fw);
@@ -2357,6 +2728,59 @@ impl Apw121215a {
         target_init_v: f64,
         assumed_fw: u8,
     ) -> Result<()> {
+        self.cold_boot_sequence_write_only_with_policy(
+            target_init_v,
+            assumed_fw,
+            std::time::Duration::MAX,
+            || false,
+        )
+    }
+
+    /// Cancellation-aware write-only bootstrap. The callback is evaluated
+    /// immediately before every APW frame attempt and at bounded intervals
+    /// during stabilization waits. A transaction already admitted to the
+    /// kernel/service/GPIO transport may finish, but once cancellation is
+    /// observed no retry or later SetVoltage, Enable, or heartbeat frame can
+    /// be admitted.
+    pub fn cold_boot_sequence_write_only_cancellable(
+        &mut self,
+        target_init_v: f64,
+        assumed_fw: u8,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
+        self.cold_boot_sequence_write_only_with_policy(
+            target_init_v,
+            assumed_fw,
+            APW12_CANCELLABLE_WAIT_QUANTUM,
+            is_cancelled,
+        )
+    }
+
+    fn cold_boot_sequence_write_only_with_policy(
+        &mut self,
+        target_init_v: f64,
+        assumed_fw: u8,
+        wait_quantum: std::time::Duration,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
+        let mut sleep = std::thread::sleep;
+        self.cold_boot_sequence_write_only_with_runtime(
+            target_init_v,
+            assumed_fw,
+            wait_quantum,
+            &mut is_cancelled,
+            &mut sleep,
+        )
+    }
+
+    fn cold_boot_sequence_write_only_with_runtime(
+        &mut self,
+        target_init_v: f64,
+        assumed_fw: u8,
+        wait_quantum: std::time::Duration,
+        is_cancelled: &mut dyn FnMut() -> bool,
+        sleep: &mut dyn FnMut(std::time::Duration),
+    ) -> Result<()> {
         self.assume_fw_byte(assumed_fw);
         tracing::warn!(
             fw = format_args!("0x{:02X}", assumed_fw),
@@ -2364,42 +2788,64 @@ impl Apw121215a {
             transport = self.transport_name(),
             "APW write-only bootstrap active (experimental am2 path)"
         );
-
-        // Step 0 (gate): same fail-closed PWR_CONTROL gate assertion as
-        // `cold_boot_sequence_gated` — if a spec was set via
-        // `set_psu_gate_spec`/`with_psu_gate_spec` we honor it here so the
-        // gpio_bitbang transport gets the same gate ownership semantics
-        // as the kernel-I²C transport. No-op when no spec is set.
-        self.try_assert_psu_gate()?;
-
-        let _ = self.flush_buffer();
-
-        // The retired  path emitted fw71 opcode 0x06 under a
-        // "ReadCalibration" name. Firmware disassembly proves 0x06 is a
-        // voltage mutation, so observational cold-wake experiments may never
-        // emit it. Preserve the established three-disable bootstrap only.
-        for i in 0..3 {
-            self.disable()?;
-            tracing::info!(step = i + 1, "PSU: Disable (watchdog off, write-only)");
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
-        tracing::info!(
-            target = format_args!("{:.3}V", target_init_v),
-            "PSU: Ramping voltage via write-only bootstrap"
-        );
-        self.set_voltage_init_bypass(target_init_v)?;
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        self.enable()?;
-        tracing::info!("PSU: Enable (watchdog armed, write-only)");
-        match self.heartbeat() {
-            Ok(()) => tracing::info!("PSU: Heartbeat after enable (write-only)"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "PSU heartbeat immediately after enable failed — heartbeat thread will retry"
-            ),
-        }
-        Ok(())
+        run_apw_write_only_boot_plan(
+            target_init_v,
+            wait_quantum,
+            is_cancelled,
+            sleep,
+            &mut |step, is_cancelled, sleep| match step {
+                // Honor any configured fail-closed PWR_CONTROL gate before
+                // the first PSU I²C write. No-op when no gate spec is set.
+                ApwWriteOnlyBootStep::AssertGate => self.try_assert_psu_gate(),
+                ApwWriteOnlyBootStep::FlushBuffer => self.flush_buffer(),
+                // Firmware disassembly proves retired opcode 0x06 was a
+                // voltage mutation. Preserve only the established 3x disable.
+                ApwWriteOnlyBootStep::Disable { attempt } => {
+                    self.disable_guarded("PSU disable", wait_quantum, is_cancelled, sleep)?;
+                    tracing::info!(step = attempt, "PSU: Disable (watchdog off, write-only)");
+                    Ok(())
+                }
+                ApwWriteOnlyBootStep::SetVoltage { target_v } => {
+                    tracing::info!(
+                        target = format_args!("{:.3}V", target_v),
+                        "PSU: Ramping voltage via write-only bootstrap"
+                    );
+                    self.set_voltage_init_bypass_guarded(
+                        target_v,
+                        "PSU voltage set",
+                        wait_quantum,
+                        is_cancelled,
+                        sleep,
+                    )
+                }
+                ApwWriteOnlyBootStep::Enable => {
+                    self.enable_guarded("PSU enable", wait_quantum, is_cancelled, sleep)?;
+                    tracing::info!("PSU: Enable (watchdog armed, write-only)");
+                    Ok(())
+                }
+                ApwWriteOnlyBootStep::Heartbeat => {
+                    match self.heartbeat_guarded(
+                        "initial PSU heartbeat",
+                        wait_quantum,
+                        is_cancelled,
+                        sleep,
+                    ) {
+                        Ok(()) => tracing::info!("PSU: Heartbeat after enable (write-only)"),
+                        Err(e) => {
+                            if !apw_initial_heartbeat_can_defer(&e) {
+                                return Err(e);
+                            }
+                            require_apw_boot_active(is_cancelled, "initial PSU heartbeat")?;
+                            tracing::warn!(
+                                error = %e,
+                                "PSU heartbeat immediately after enable failed — heartbeat thread will retry"
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+            },
+        )
     }
 
     // -----------------------------------------------------------------
@@ -2490,6 +2936,7 @@ impl Apw121215a {
             ));
         }
         let addr = self.addr;
+        let bus = self.bus;
         //  Patch 5 (2026-05-26) — BYTE-EXACT  ground-truth.
         //
         // `build_apw12_frame` uses `LEN = 3 + payload_len` (gives LEN=0x05
@@ -2517,14 +2964,9 @@ impl Apw121215a {
              about to call write_apw12_loki_frame"
         );
         let write_result = match &mut self.io {
-            ApwIo::Gpio(gpio) => {
-                gpio.write_apw12_loki_frame(addr, &frame)
-                    .map_err(|e| HalError::I2c {
-                        bus: 1,
-                        addr,
-                        detail: format!("Wave-55b init-frame prefixed write: {}", e),
-                    })
-            }
+            ApwIo::Gpio(gpio) => gpio.write_apw12_loki_frame(addr, &frame).map_err(|error| {
+                contextualize_apw_io_error(error, bus, addr, "Wave-55b init-frame prefixed write")
+            }),
             _ => Err(HalError::PsuUnsupported(
                 "Wave-55b loki_cold_wake_init_frame requires ApwIo::Gpio transport".to_string(),
             )),
@@ -2589,6 +3031,7 @@ impl Apw121215a {
             ));
         }
         let addr = self.addr;
+        let bus = self.bus;
         //  Patch 5 (2026-05-26) — BYTE-EXACT  ground-truth.
         //
         // Same LEN-formula bug as init-frame: `build_apw12_frame` produced
@@ -2610,14 +3053,16 @@ impl Apw121215a {
              about to call write_apw12_loki_frame_bare"
         );
         let write_result = match &mut self.io {
-            ApwIo::Gpio(gpio) => {
-                gpio.write_apw12_loki_frame_bare(addr, &frame)
-                    .map_err(|e| HalError::I2c {
-                        bus: 1,
+            ApwIo::Gpio(gpio) => gpio
+                .write_apw12_loki_frame_bare(addr, &frame)
+                .map_err(|error| {
+                    contextualize_apw_io_error(
+                        error,
+                        bus,
                         addr,
-                        detail: format!("Wave-55b follow-up-frame bare write: {}", e),
-                    })
-            }
+                        "Wave-55b follow-up-frame bare write",
+                    )
+                }),
             _ => Err(HalError::PsuUnsupported(
                 "Wave-55b loki_cold_wake_follow_frame requires ApwIo::Gpio transport".to_string(),
             )),
@@ -2675,6 +3120,7 @@ impl Apw121215a {
             ));
         }
         let addr = self.addr;
+        let bus = self.bus;
         let mut nak_count = 0usize;
         let mut first_non_nak: Option<u8> = None;
         for i in 0..max_reads {
@@ -2731,13 +3177,24 @@ impl Apw121215a {
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::trace!(
-                            read_index = i + 1,
-                            max_reads,
-                            error = %e,
-                            "Wave-55b: cold-wake poll read error (continuing)"
+                    Err(error) => {
+                        let error = contextualize_apw_io_error(
+                            error,
+                            bus,
+                            addr,
+                            "Wave-55b cold-wake poll read",
                         );
+                        match error {
+                            error @ HalError::I2c { .. } => {
+                                tracing::trace!(
+                                    read_index = i + 1,
+                                    max_reads,
+                                    error = %error,
+                                    "Wave-55b: cold-wake poll wire error (continuing)"
+                                );
+                            }
+                            error => return Err(error),
+                        }
                     }
                 },
                 _ => {
@@ -3042,13 +3499,12 @@ impl Apw121215a {
                     "Wave-55f: Loki SetVoltage(13700) opcode 0x83 ACK — chip-rail \
                      engagement requested (CRC + byte-level audit via wave55c_crc_diagnostic)"
                 ),
-                Err(e) => {
-                    // Non-fatal: log loudly so operator/RE team see the failure,
-                    // but don't escalate — the caller (Phase 0) still gets a
-                    // PSU object back and can proceed with the rest of bring-up
-                    // (chain enum may still succeed if the rail engaged via
-                    // other means; if it didn't, chain-enum will return 0
-                    // chips and the run aborts there instead of here).
+                Err(e) if apw_ordinary_wire_failure(&e) => {
+                    // An ordinary experimental wire failure remains non-fatal:
+                    // chain enumeration can establish whether another mechanism
+                    // engaged the rail. Typed ownership, terminal-generation,
+                    // and policy failures are returned by the other arm because
+                    // proceeding would misrepresent control-plane authority.
                     tracing::error!(
                         target: "wave55f_loki_setvoltage_chip_rail",
                         target_mv = WAVE55F_CHIP_RAIL_TARGET_MV,
@@ -3060,6 +3516,7 @@ impl Apw121215a {
                          exact bytes."
                     );
                 }
+                Err(e) => return Err(e),
             }
         } else {
             tracing::debug!(
@@ -3166,8 +3623,9 @@ impl Apw121215a {
     /// loop starts.
     fn cold_boot_sequence_inner(&mut self, target_init_v: f64) -> Result<()> {
         // Step 1: drain stale PSU send buffer (bosminer literal
-        // `PSU: Flushing PSU buffer`). Best-effort; ignore errors.
-        let _ = self.flush_buffer();
+        // `PSU: Flushing PSU buffer`). Ordinary wire errors are best-effort;
+        // typed ownership and terminal-generation errors propagate.
+        self.flush_buffer()?;
 
         // Step 2: probe PSU FW version with 3× retry at 100 ms apart
         // (bosminer `Failed to detect PSU version with any known protocol`
@@ -3183,7 +3641,7 @@ impl Apw121215a {
                     probe_err = None;
                     break;
                 }
-                Err(e) => {
+                Err(e) if apw_ordinary_wire_failure(&e) => {
                     tracing::warn!(
                         attempt,
                         error = %e,
@@ -3192,8 +3650,9 @@ impl Apw121215a {
                     probe_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     // Re-drain between tries.
-                    let _ = self.flush_buffer();
+                    self.flush_buffer()?;
                 }
+                Err(e) => return Err(e),
             }
         }
         if let Some(e) = probe_err {
@@ -3222,13 +3681,14 @@ impl Apw121215a {
                 Ok(()) => {
                     tracing::info!(step = i + 1, "PSU: Disable (watchdog off)");
                 }
-                Err(e) => {
+                Err(e) if apw_ordinary_wire_failure(&e) => {
                     tracing::warn!(
                         step = i + 1,
                         error = %e,
                         "PSU: Disable (watchdog off) failed — continuing"
                     );
                 }
+                Err(e) => return Err(e),
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
@@ -3250,10 +3710,11 @@ impl Apw121215a {
         tracing::info!("PSU: Enable (watchdog armed)");
         match self.heartbeat() {
             Ok(()) => tracing::info!("PSU: Heartbeat after enable"),
-            Err(e) => tracing::warn!(
+            Err(e) if apw_initial_heartbeat_can_defer(&e) => tracing::warn!(
                 error = %e,
                 "PSU heartbeat immediately after enable failed — heartbeat thread will retry"
             ),
+            Err(e) => return Err(e),
         }
         Ok(())
     }
@@ -3307,6 +3768,906 @@ impl PsuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sim-hal")]
+    struct AlwaysShortApwServiceBackend {
+        identity: usize,
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl AlwaysShortApwServiceBackend {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            let namespace = &NEXT_ID as *const _ as usize;
+            Self {
+                identity: namespace
+                    ^ NEXT_ID
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_mul(0x9E37_79B1),
+                writes: std::sync::Mutex::new(Vec::new()),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl crate::i2c::I2cSimBackend for AlwaysShortApwServiceBackend {
+        fn write(&self, _bus: u8, _addr: u8, data: &[u8]) -> Result<usize> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len().saturating_sub(1))
+        }
+
+        fn read(&self, _bus: u8, _addr: u8, _buf: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+
+        fn write_read(
+            &self,
+            _bus: u8,
+            _addr: u8,
+            _write_data: &[u8],
+            _read_buf: &mut [u8],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn service_identity(&self) -> Option<usize> {
+            Some(self.identity)
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    struct ColdBootTypedErrorBackend {
+        identity: usize,
+        ordinary_writes_before_typed: usize,
+        writes: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl ColdBootTypedErrorBackend {
+        fn new(ordinary_writes_before_typed: usize) -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            let namespace = &NEXT_ID as *const _ as usize;
+            Self {
+                identity: namespace
+                    ^ NEXT_ID
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_mul(0x517C_C1B7),
+                ordinary_writes_before_typed,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(feature = "sim-hal")]
+    impl crate::i2c::I2cSimBackend for ColdBootTypedErrorBackend {
+        fn write(&self, bus: u8, addr: u8, _data: &[u8]) -> Result<usize> {
+            let attempt = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.ordinary_writes_before_typed {
+                return Err(HalError::I2c {
+                    bus,
+                    addr,
+                    detail: format!("injected ordinary wire failure {attempt}"),
+                });
+            }
+            Err(HalError::I2cSafetySuperseded {
+                bus,
+                addr,
+                detail: "injected terminal generation".to_string(),
+            })
+        }
+
+        fn read(&self, _bus: u8, _addr: u8, _buf: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+
+        fn write_read(
+            &self,
+            _bus: u8,
+            _addr: u8,
+            _write_data: &[u8],
+            _read_buf: &mut [u8],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn service_identity(&self) -> Option<usize> {
+            Some(self.identity)
+        }
+    }
+
+    #[test]
+    fn cancellable_apw_boot_never_sets_voltage_or_enables_after_warmup_cancel() {
+        let cancelled = std::cell::Cell::new(false);
+        let mut observed = Vec::new();
+        let error = run_apw_write_only_boot_plan(
+            13.7,
+            APW12_CANCELLABLE_WAIT_QUANTUM,
+            &mut || cancelled.get(),
+            &mut |_| cancelled.set(true),
+            &mut |step, _, _| {
+                observed.push(step);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(
+            observed,
+            vec![
+                ApwWriteOnlyBootStep::AssertGate,
+                ApwWriteOnlyBootStep::FlushBuffer,
+                ApwWriteOnlyBootStep::Disable { attempt: 1 },
+            ]
+        );
+        assert!(!observed.iter().any(|step| matches!(
+            step,
+            ApwWriteOnlyBootStep::SetVoltage { .. } | ApwWriteOnlyBootStep::Enable
+        )));
+    }
+
+    #[test]
+    fn legacy_apw_boot_preserves_single_sleep_per_stabilization_window() {
+        let mut sleeps = Vec::new();
+        run_apw_write_only_boot_plan(
+            13.7,
+            std::time::Duration::MAX,
+            &mut || false,
+            &mut |duration| sleeps.push(duration),
+            &mut |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(300),
+            ]
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum GuardedApwMutationCase {
+        Disable,
+        SetVoltage,
+        Enable,
+        Heartbeat,
+    }
+
+    fn assert_cancelled_fault_admits_no_apw_retry(
+        case: GuardedApwMutationCase,
+        expected_frame: Vec<u8>,
+    ) {
+        let (handle, request_rx) = crate::i2c::I2cServiceHandle::for_unit_tests();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_cancelled = std::sync::Arc::clone(&cancelled);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+
+        let operation = std::thread::spawn(move || {
+            let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR);
+            psu.assume_fw_byte(0x71);
+            if matches!(case, GuardedApwMutationCase::Disable) {
+                psu.watchdog_armed = true;
+            }
+            let mut is_cancelled = || operation_cancelled.load(Ordering::SeqCst);
+            let mut no_sleep = |_: std::time::Duration| {};
+            let result = match case {
+                GuardedApwMutationCase::Disable => psu.disable_guarded(
+                    "PSU disable",
+                    APW12_CANCELLABLE_WAIT_QUANTUM,
+                    &mut is_cancelled,
+                    &mut no_sleep,
+                ),
+                GuardedApwMutationCase::SetVoltage => psu.set_voltage_init_bypass_guarded(
+                    13.7,
+                    "PSU voltage set",
+                    APW12_CANCELLABLE_WAIT_QUANTUM,
+                    &mut is_cancelled,
+                    &mut no_sleep,
+                ),
+                GuardedApwMutationCase::Enable => psu.enable_guarded(
+                    "PSU enable",
+                    APW12_CANCELLABLE_WAIT_QUANTUM,
+                    &mut is_cancelled,
+                    &mut no_sleep,
+                ),
+                GuardedApwMutationCase::Heartbeat => psu.heartbeat_guarded(
+                    "initial PSU heartbeat",
+                    APW12_CANCELLABLE_WAIT_QUANTUM,
+                    &mut is_cancelled,
+                    &mut no_sleep,
+                ),
+            };
+            outcome_tx
+                .send((
+                    result.map_err(|error| error.to_string()),
+                    psu.dac,
+                    psu.watchdog_armed,
+                    psu.heartbeat_ticks(),
+                ))
+                .unwrap();
+        });
+
+        let request = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first APW mutation attempt");
+        let crate::i2c::I2cRequest::Transaction {
+            addr,
+            steps,
+            reply_tx,
+        } = request
+        else {
+            panic!("expected one APW compound transaction for {case:?}")
+        };
+        assert_eq!(addr, APW12_FRAMED_ADDR);
+        assert_eq!(
+            steps,
+            vec![
+                I2cTransactionStep::Write(expected_frame),
+                I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+            ]
+        );
+
+        cancelled.store(true, Ordering::SeqCst);
+        reply_tx
+            .send(Err(HalError::I2c {
+                bus: 0,
+                addr,
+                detail: "scripted first-attempt transport fault".into(),
+            }))
+            .unwrap();
+
+        let outcome = outcome_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let (result, dac, watchdog_armed, heartbeat_ticks) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                drop(request_rx);
+                operation.join().unwrap();
+                panic!("{case:?} did not return after cancellation: {error}");
+            }
+        };
+        let error = result.expect_err("cancellation after the fault must stop the operation");
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "{case:?} admitted a retry or heartbeat fallback after cancellation"
+        );
+        match case {
+            GuardedApwMutationCase::Disable => assert!(watchdog_armed),
+            GuardedApwMutationCase::SetVoltage => assert_eq!(dac, None),
+            GuardedApwMutationCase::Enable => assert!(!watchdog_armed),
+            GuardedApwMutationCase::Heartbeat => assert_eq!(heartbeat_ticks, 0),
+        }
+        operation.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_transport_fault_admits_no_disable_voltage_enable_or_heartbeat_retry() {
+        for (case, frame) in [
+            (
+                GuardedApwMutationCase::Disable,
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]),
+            ),
+            (
+                GuardedApwMutationCase::SetVoltage,
+                build_apw12_frame(APW12_CMD_SET_VOLTAGE, &[0x6C]),
+            ),
+            (
+                GuardedApwMutationCase::Enable,
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x01]),
+            ),
+            (
+                GuardedApwMutationCase::Heartbeat,
+                build_apw12_frame(APW12_CMD_HEARTBEAT, &[]),
+            ),
+        ] {
+            assert_cancelled_fault_admits_no_apw_retry(case, frame);
+        }
+    }
+
+    #[test]
+    fn cancellable_heartbeat_stops_during_retry_flush_before_second_read() {
+        let (handle, request_rx) = crate::i2c::I2cServiceHandle::for_unit_tests();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_cancelled = std::sync::Arc::clone(&cancelled);
+
+        let operation = std::thread::spawn(move || {
+            let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR);
+            psu.assume_fw_byte(0x71);
+            psu.heartbeat_cancellable(|| operation_cancelled.load(Ordering::SeqCst))
+        });
+
+        let first = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first APW heartbeat frame");
+        let crate::i2c::I2cRequest::Transaction { reply_tx, .. } = first else {
+            panic!("expected the first APW heartbeat transaction");
+        };
+        reply_tx
+            .send(Err(HalError::I2c {
+                bus: 0,
+                addr: APW12_FRAMED_ADDR,
+                detail: "scripted heartbeat fault before retry flush".into(),
+            }))
+            .unwrap();
+
+        let first_flush = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first retry-flush read");
+        let crate::i2c::I2cRequest::ReadBytes {
+            addr,
+            len,
+            reply_tx,
+        } = first_flush
+        else {
+            panic!("expected one APW retry-flush read");
+        };
+        assert_eq!(addr, APW12_FRAMED_ADDR);
+        assert_eq!(len, 32);
+
+        // Cancellation races an already-started service call. That call may
+        // complete, but the guarded flush must not admit its second read.
+        cancelled.store(true, Ordering::SeqCst);
+        reply_tx.send(Ok(Vec::new())).unwrap();
+
+        let error = operation
+            .join()
+            .unwrap()
+            .expect_err("cancelled heartbeat must stop during its retry flush");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "cancellation admitted a second flush read or heartbeat retry"
+        );
+    }
+
+    #[test]
+    fn uncancelled_transport_fault_preserves_one_exact_apw_retry() {
+        let (handle, request_rx) = crate::i2c::I2cServiceHandle::for_unit_tests();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let operation = std::thread::spawn(move || {
+            let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR);
+            psu.assume_fw_byte(0x71);
+            let mut never_cancelled = || false;
+            let mut no_sleep = |_: std::time::Duration| {};
+            let result = psu.enable_guarded(
+                "PSU enable",
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut no_sleep,
+            );
+            outcome_tx
+                .send((
+                    result.map_err(|error| error.to_string()),
+                    psu.watchdog_armed,
+                ))
+                .unwrap();
+        });
+
+        let expected_steps = vec![
+            I2cTransactionStep::Write(build_apw12_frame(APW12_CMD_WATCHDOG, &[0x01])),
+            I2cTransactionStep::SleepMs(APW12_REPLY_DELAY_MS),
+        ];
+        let first = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first APW enable attempt");
+        let crate::i2c::I2cRequest::Transaction {
+            addr,
+            steps,
+            reply_tx,
+        } = first
+        else {
+            panic!("expected first APW enable transaction")
+        };
+        assert_eq!(steps, expected_steps);
+        reply_tx
+            .send(Err(HalError::I2c {
+                bus: 0,
+                addr,
+                detail: "scripted recoverable fault".into(),
+            }))
+            .unwrap();
+
+        for _ in 0..8 {
+            let crate::i2c::I2cRequest::ReadBytes { reply_tx, .. } = request_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("APW retry buffer drain")
+            else {
+                panic!("expected only buffer-drain reads before the retry")
+            };
+            reply_tx.send(Ok(Vec::new())).unwrap();
+        }
+
+        let second = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second APW enable attempt");
+        let crate::i2c::I2cRequest::Transaction {
+            steps, reply_tx, ..
+        } = second
+        else {
+            panic!("expected second APW enable transaction")
+        };
+        assert_eq!(steps, expected_steps);
+        reply_tx.send(Ok(Vec::new())).unwrap();
+
+        let (result, watchdog_armed) = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("APW retry completion");
+        result.unwrap();
+        assert!(watchdog_armed);
+        assert!(request_rx.try_recv().is_err());
+        operation.join().unwrap();
+    }
+
+    #[test]
+    fn write_only_boot_success_uses_exact_serialized_frame_order_and_state() {
+        let (handle, request_rx) = crate::i2c::I2cServiceHandle::for_unit_tests();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let operation = std::thread::spawn(move || {
+            let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 0, APW12_FRAMED_ADDR);
+            let mut never_cancelled = || false;
+            let mut no_sleep = |_: std::time::Duration| {};
+            let result = psu.cold_boot_sequence_write_only_with_runtime(
+                13.7,
+                0x71,
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut no_sleep,
+            );
+            outcome_tx
+                .send((
+                    result.map_err(|error| error.to_string()),
+                    psu.fw_byte,
+                    psu.dac,
+                    psu.watchdog_armed,
+                    psu.heartbeat_ticks(),
+                ))
+                .unwrap();
+        });
+
+        let mut frames = Vec::new();
+        for _ in 0..14 {
+            match request_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("write-only APW bootstrap request")
+            {
+                crate::i2c::I2cRequest::ReadBytes {
+                    addr,
+                    len,
+                    reply_tx,
+                } => {
+                    assert_eq!(addr, APW12_FRAMED_ADDR);
+                    assert_eq!(len, 32);
+                    reply_tx.send(Ok(Vec::new())).unwrap();
+                }
+                crate::i2c::I2cRequest::Transaction {
+                    addr,
+                    steps,
+                    reply_tx,
+                } => {
+                    assert_eq!(addr, APW12_FRAMED_ADDR);
+                    let [I2cTransactionStep::Write(frame), I2cTransactionStep::SleepMs(delay)] =
+                        steps.as_slice()
+                    else {
+                        panic!("APW mutation must be one write followed by one bounded dwell")
+                    };
+                    assert_eq!(*delay, APW12_REPLY_DELAY_MS);
+                    frames.push(frame.clone());
+                    reply_tx.send(Ok(Vec::new())).unwrap();
+                }
+                request => panic!("unexpected APW bootstrap request: {request:?}"),
+            }
+        }
+
+        let (result, fw, dac, watchdog_armed, heartbeat_ticks) = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("write-only APW bootstrap completion");
+        result.unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]),
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]),
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]),
+                build_apw12_frame(APW12_CMD_SET_VOLTAGE, &[0x6C]),
+                build_apw12_frame(APW12_CMD_WATCHDOG, &[0x01]),
+                build_apw12_frame(APW12_CMD_HEARTBEAT, &[]),
+            ]
+        );
+        assert_eq!(fw, Some(0x71));
+        assert_eq!(dac, Some(0x6C));
+        assert!(watchdog_armed);
+        assert_eq!(heartbeat_ticks, 1);
+        operation.join().unwrap();
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn serialized_apw_service_rejects_positive_short_frame_before_later_boot_verbs() {
+        let backend = std::sync::Arc::new(AlwaysShortApwServiceBackend::new());
+        let handle = crate::i2c::spawn_sim_i2c_service(246, backend.clone(), Vec::new()).unwrap();
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 246, APW12_FRAMED_ADDR);
+        let mut never_cancelled = || false;
+        let mut no_sleep = |_: std::time::Duration| {};
+
+        let error = psu
+            .cold_boot_sequence_write_only_with_runtime(
+                13.7,
+                0x71,
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut no_sleep,
+            )
+            .expect_err("positive short completion must fail the APW boot plan");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("expected 6 byte(s), wrote 5"),
+            "{rendered}"
+        );
+        let disable = build_apw12_frame(APW12_CMD_WATCHDOG, &[0x00]);
+        assert_eq!(
+            backend.writes(),
+            vec![disable.clone(), disable.clone(), disable],
+            "only the three bounded attempts of the first disable may reach the backend"
+        );
+        assert_eq!(psu.fw_byte, Some(0x71));
+        assert_eq!(psu.dac, None);
+        assert!(!psu.watchdog_armed);
+        assert_eq!(psu.heartbeat_ticks(), 0);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn terminally_superseded_apw_service_mutation_has_zero_retry_or_buffer_drain() {
+        let backend = std::sync::Arc::new(AlwaysShortApwServiceBackend::new());
+        let handle = crate::i2c::spawn_sim_i2c_service(245, backend.clone(), Vec::new()).unwrap();
+        let transition = handle.latch_terminal_safe_off();
+        assert!(transition.no_controller_mutation_stage_in_flight());
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 245, APW12_FRAMED_ADDR);
+        psu.assume_fw_byte(0x71);
+        let mut never_cancelled = || false;
+        let mut sleeps = Vec::new();
+
+        let error = psu
+            .enable_guarded(
+                "PSU enable",
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut |duration| sleeps.push(duration),
+            )
+            .expect_err("terminally superseded APW enable must be refused");
+
+        assert!(matches!(error, HalError::I2cSafetySuperseded { .. }));
+        assert!(error.to_string().contains("terminal safe-off is latched"));
+        assert!(backend.writes().is_empty());
+        assert_eq!(backend.read_count(), 0, "safety refusal must not flush");
+        assert!(
+            sleeps.is_empty(),
+            "safety refusal must not enter retry dwell"
+        );
+        assert!(!psu.watchdog_armed);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn terminally_superseded_apw_heartbeat_has_no_opcode_fallback_retry_or_state_change() {
+        let backend = std::sync::Arc::new(AlwaysShortApwServiceBackend::new());
+        let handle = crate::i2c::spawn_sim_i2c_service(244, backend.clone(), Vec::new()).unwrap();
+        let transition = handle.latch_terminal_safe_off();
+        assert!(transition.no_controller_mutation_stage_in_flight());
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 244, APW12_FRAMED_ADDR);
+        psu.assume_fw_byte(0x71);
+        let mut never_cancelled = || false;
+        let mut sleeps = Vec::new();
+
+        let error = psu
+            .heartbeat_guarded(
+                "initial PSU heartbeat",
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut |duration| sleeps.push(duration),
+            )
+            .expect_err("terminally superseded APW heartbeat must be refused");
+
+        assert!(matches!(error, HalError::I2cSafetySuperseded { .. }));
+        assert!(error.to_string().contains("terminal safe-off is latched"));
+        assert!(backend.writes().is_empty());
+        assert_eq!(backend.read_count(), 0, "safety refusal must not flush");
+        assert!(
+            sleeps.is_empty(),
+            "safety refusal must not retry or enter fallback dwell"
+        );
+        assert!(matches!(psu.heartbeat_mode, ApwHeartbeatMode::Primary84));
+        assert_eq!(psu.heartbeat_ticks(), 0);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn dual_ordinary_wire_heartbeat_exhaustion_has_a_dedicated_retryable_type() {
+        let backend = std::sync::Arc::new(ColdBootTypedErrorBackend::new(usize::MAX));
+        let handle = crate::i2c::spawn_sim_i2c_service(242, backend.clone(), Vec::new()).unwrap();
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 242, APW12_FRAMED_ADDR);
+        psu.assume_fw_byte(0x71);
+        let mut never_cancelled = || false;
+        let mut sleeps = Vec::new();
+
+        let error = psu
+            .heartbeat_guarded(
+                "PSU heartbeat",
+                APW12_CANCELLABLE_WAIT_QUANTUM,
+                &mut never_cancelled,
+                &mut |duration| sleeps.push(duration),
+            )
+            .expect_err("both ordinary-wire opcode attempts must be typed as exhaustion");
+
+        match error {
+            HalError::PsuHeartbeatExhausted { primary, fallback } => {
+                assert!(primary.contains("0x84"));
+                assert!(primary.contains("injected ordinary wire failure"));
+                assert!(fallback.contains("0x81/[0x02]"));
+                assert!(fallback.contains("injected ordinary wire failure"));
+            }
+            other => panic!("unexpected heartbeat exhaustion class: {other}"),
+        }
+        assert_eq!(
+            backend.write_count(),
+            6,
+            "each heartbeat opcode owns exactly three bounded wire attempts"
+        );
+        // Two opcodes x three bounded attempts leaves four retries, and
+        // `tx_with_intent_guarded` follows each one with a 100 ms dwell AND a
+        // `flush_buffer_guarded` that drains eight stale reply reads 10 ms
+        // apart. The dwell splits into the caller's cancellable quantum; the
+        // 10 ms inter-read delay is already shorter than that quantum and so
+        // cannot be split further. Asserting the whole `sleeps` vector equals
+        // only the dwells silently denies that the reflush happens at all --
+        // and the reflush is first-class behaviour, pinned in the negative by
+        // `legacy_cold_boot_returns_typed_probe_error_without_outer_retry_or_reflush`.
+        const RETRIES: usize = 4;
+        // 100 ms dwell / 25 ms quantum.
+        const DWELL_QUANTA_PER_RETRY: usize = 4;
+        const FLUSH_READS_PER_RETRY: usize = 8;
+        const FLUSH_INTER_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+        assert_eq!(
+            sleeps
+                .iter()
+                .filter(|d| **d == APW12_CANCELLABLE_WAIT_QUANTUM)
+                .count(),
+            RETRIES * DWELL_QUANTA_PER_RETRY,
+            "each 100 ms retry dwell stays split into cancellable 25 ms quanta: {sleeps:?}"
+        );
+        assert_eq!(
+            sleeps
+                .iter()
+                .filter(|d| **d == FLUSH_INTER_READ_DELAY)
+                .count(),
+            RETRIES * FLUSH_READS_PER_RETRY,
+            "every retry reflushes the stale reply buffer before re-sending: {sleeps:?}"
+        );
+        assert_eq!(
+            sleeps.len(),
+            RETRIES * (DWELL_QUANTA_PER_RETRY + FLUSH_READS_PER_RETRY),
+            "no unaccounted sleep may enter the guarded heartbeat path: {sleeps:?}"
+        );
+        // The invariant that actually matters, and that the old whole-vector
+        // equality only implied by accident: no single sleep may exceed the
+        // caller's quantum, because that bound IS the cancellation latency this
+        // parameter exists to cap. A future wait that ignored the quantum would
+        // pass a count-based check but must fail here.
+        assert!(
+            sleeps.iter().all(|d| *d <= APW12_CANCELLABLE_WAIT_QUANTUM),
+            "no single sleep may exceed the cancellable quantum: {sleeps:?}"
+        );
+        assert!(matches!(psu.heartbeat_mode, ApwHeartbeatMode::Primary84));
+        assert_eq!(psu.heartbeat_ticks(), 0);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn legacy_cold_boot_returns_typed_probe_error_without_outer_retry_or_reflush() {
+        let backend = std::sync::Arc::new(ColdBootTypedErrorBackend::new(0));
+        let handle = crate::i2c::spawn_sim_i2c_service(243, backend.clone(), Vec::new()).unwrap();
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 243, APW12_FRAMED_ADDR);
+
+        let error = psu
+            .cold_boot_sequence_inner(13.7)
+            .expect_err("typed probe refusal must terminate legacy cold boot");
+
+        assert!(matches!(error, HalError::I2cSafetySuperseded { .. }));
+        assert_eq!(backend.write_count(), 1, "typed probe error was retried");
+        assert_eq!(
+            backend.read_count(),
+            16,
+            "typed probe error triggered an outer best-effort reflush"
+        );
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn cached_legacy_cold_boot_returns_typed_disable_error_after_only_wire_probe_retries() {
+        // Each probe owns three inner wire retries. Nine ordinary failures
+        // exhaust all three outer probes; the tenth write is the first Disable.
+        let backend = std::sync::Arc::new(ColdBootTypedErrorBackend::new(9));
+        let handle = crate::i2c::spawn_sim_i2c_service(242, backend.clone(), Vec::new()).unwrap();
+        let mut psu = Apw121215a::with_io(ApwIo::Service(handle), 242, APW12_FRAMED_ADDR);
+        psu.assume_fw_byte(0x71);
+
+        let error = psu
+            .cold_boot_sequence_inner(13.7)
+            .expect_err("typed Disable refusal must terminate cached legacy cold boot");
+
+        assert!(matches!(error, HalError::I2cSafetySuperseded { .. }));
+        assert_eq!(
+            backend.write_count(),
+            10,
+            "typed Disable error was swallowed or retried"
+        );
+        assert_eq!(
+            backend.read_count(),
+            104,
+            "only ordinary inner/outer probe failures may trigger reflushes"
+        );
+    }
+
+    #[test]
+    fn apw_error_classification_preserves_fabric_ownership_and_defers_only_wire_exhaustion() {
+        let fabric_error = HalError::I2cFabricUnavailable {
+            fabric: dcentrald_fabric_lease::PhysicalI2cFabricId::linux_adapter(244),
+            detail: "injected competing controller owner".to_string(),
+        };
+        let preserved =
+            contextualize_apw_io_error(fabric_error, 244, APW12_FRAMED_ADDR, "tx write(bitbang)");
+        assert!(matches!(preserved, HalError::I2cFabricUnavailable { .. }));
+        assert!(!apw_ordinary_wire_failure(&preserved));
+        assert!(!apw_heartbeat_opcode_fallback_allowed(&preserved));
+        assert!(!apw_initial_heartbeat_can_defer(&preserved));
+
+        let wire = contextualize_apw_io_error(
+            HalError::I2c {
+                bus: 0,
+                addr: APW12_FRAMED_ADDR,
+                detail: "injected data NAK".to_string(),
+            },
+            244,
+            APW12_FRAMED_ADDR,
+            "tx write(bitbang)",
+        );
+        assert!(apw_heartbeat_opcode_fallback_allowed(&wire));
+        assert!(apw_ordinary_wire_failure(&wire));
+        assert!(apw_initial_heartbeat_can_defer(&wire));
+        assert!(wire.to_string().contains("tx write(bitbang)"));
+
+        let exhausted = HalError::PsuHeartbeatExhausted {
+            primary: "injected 0x84 wire failure".to_string(),
+            fallback: "injected 0x81/[0x02] wire failure".to_string(),
+        };
+        assert!(!apw_heartbeat_opcode_fallback_allowed(&exhausted));
+        assert!(apw_initial_heartbeat_can_defer(&exhausted));
+        assert!(!apw_initial_heartbeat_can_defer(
+            &HalError::PsuProtocolOwned("unrelated runtime protocol error".to_string())
+        ));
+
+        let mut drained = 0;
+        accumulate_apw_flush_read(
+            Err(HalError::I2c {
+                bus: 244,
+                addr: APW12_FRAMED_ADDR,
+                detail: "injected drain NAK".to_string(),
+            }),
+            &mut drained,
+        )
+        .unwrap();
+        let typed_flush = accumulate_apw_flush_read(
+            Err(HalError::I2cSafetySuperseded {
+                bus: 244,
+                addr: APW12_FRAMED_ADDR,
+                detail: "injected terminal generation".to_string(),
+            }),
+            &mut drained,
+        )
+        .unwrap_err();
+        assert!(matches!(typed_flush, HalError::I2cSafetySuperseded { .. }));
+    }
+
+    #[test]
+    fn higher_level_apw_boot_wrappers_defer_only_ordinary_wire_failures() {
+        let source = include_str!("psu.rs");
+        let ignored_flush = ["let _ = self.", "flush_buffer()"].concat();
+        assert!(!source.contains(&ignored_flush));
+
+        let legacy = source
+            .split_once("    fn cold_boot_sequence_inner(&mut self")
+            .expect("legacy APW cold boot")
+            .1
+            .split_once("// Factory: pick the right driver for this platform.")
+            .expect("legacy APW cold-boot boundary")
+            .0;
+        assert!(legacy.matches("if apw_ordinary_wire_failure(&e)").count() >= 2);
+        assert!(legacy.matches("Err(e) => return Err(e)").count() >= 2);
+
+        let loki = source
+            .split_once("    pub fn cold_boot_sequence_loki_standalone(")
+            .expect("standalone Loki cold boot")
+            .1
+            .split_once("    /// Run the opening cold-boot init sequence")
+            .expect("standalone Loki cold-boot boundary")
+            .0;
+        assert!(loki.contains("Err(e) if apw_ordinary_wire_failure(&e)"));
+        assert!(loki.contains("Err(e) => return Err(e)"));
+    }
+
+    #[test]
+    fn every_raw_apw_observation_and_loki_cold_wake_path_preserves_typed_errors() {
+        let source = include_str!("psu.rs");
+        let observation = source
+            .split_once("    fn txrx_once(&mut self")
+            .expect("raw APW observation implementation")
+            .1
+            .split_once("    fn txrx_observation(&mut self")
+            .expect("raw APW observation boundary")
+            .0;
+        assert!(observation.contains("contextualize_apw_io_error"));
+        assert!(!observation.contains("map_err(|e| HalError::I2c"));
+        assert!(!observation.contains("map_err(|error| HalError::I2c"));
+
+        for (start, end) in [
+            (
+                "    pub fn loki_cold_wake_init_frame(&mut self)",
+                "    pub fn loki_cold_wake_follow_frame(&mut self)",
+            ),
+            (
+                "    pub fn loki_cold_wake_follow_frame(&mut self)",
+                "    pub fn loki_cold_wake_poll(&mut self",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {start}"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {end}"))
+                .0;
+            assert!(body.contains("contextualize_apw_io_error"));
+            assert!(!body.contains("bus: 1"));
+        }
+
+        let poll = source
+            .split_once("    pub fn loki_cold_wake_poll(&mut self")
+            .expect("Loki cold-wake poll")
+            .1
+            .split_once("    pub fn loki_cold_wake_full_cycle(&mut self")
+            .expect("Loki cold-wake poll boundary")
+            .0;
+        assert!(poll.contains("contextualize_apw_io_error"));
+        assert!(poll.contains("error @ HalError::I2c { .. }"));
+        assert!(poll.contains("error => return Err(error)"));
+    }
 
     #[test]
     fn gpio_fallback_is_limited_to_proven_kernel_adapter_absence() {

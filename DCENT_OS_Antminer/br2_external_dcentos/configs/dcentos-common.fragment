@@ -117,6 +117,8 @@ BR2_PACKAGE_LIBOPENSSL_BIN=y
 # seed-entropy  : one-time saved-seed consumption and rotation in native code.
 # =============================================================================
 BR2_PACKAGE_DCENTOS_TOOLS=y
+BR2_PACKAGE_DCENTOS_DEPLOY_LOCK=y
+BR2_PACKAGE_DCENTOS_DEPLOY_PATH=y
 BR2_PACKAGE_SEED_ENTROPY=y
 
 # =============================================================================

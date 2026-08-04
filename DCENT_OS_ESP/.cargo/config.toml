@@ -22,7 +22,10 @@ ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
 # partition table filename in sdkconfig is resolved relative to that generated
 # project, so stage the repo-owned CSV before CMake evaluates sdkconfig.
 ESP_IDF_GLOB_PROJECT_BASE = { value = ".", relative = true }
-ESP_IDF_GLOB_PROJECT_PARTITIONS = "partitions.csv"
+# Glob stages BOTH partition CSVs into the generated project; sdkconfig picks
+# which filename is used (default sdkconfig.defaults -> partitions.csv; the
+# Hammer overlay sdkconfig.defaults.hammer-16mb -> partitions-hammer-16mb.csv).
+ESP_IDF_GLOB_PROJECT_PARTITIONS = "partitions*.csv"
 # Cross-compiler for secp256k1-sys (libsecp256k1 C code) on xtensa
 CC_xtensa_esp32s3_espidf = "xtensa-esp32s3-elf-gcc"
 # -mlongcalls needed for large C libraries (secp256k1) on xtensa — CALL8 range is limited

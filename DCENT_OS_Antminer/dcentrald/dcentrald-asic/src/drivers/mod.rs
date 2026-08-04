@@ -14,6 +14,10 @@
 //!   0x1368 -> BM1368 (S21)
 //!   0x1370 -> BM1370 (S21 Pro)
 //!   0x1373 -> BM1373 (S23) [SCAFFOLD — pre-hardware]
+//!   0x1485 -> BM1485 (L3 / L3+ / L3++ Scrypt) [SCAFFOLD — refuses to
+//!     energize. ⚠ SYNTHETIC key: real BM1485 silicon has no readable
+//!     CHIP_ID (`bm1485::CHIP_ID_IS_SILICON_READABLE == false`), so this id
+//!     can never arrive from a live enumeration.]
 //!   0x1489 -> BM1489 (L7 / L9 Scrypt) [SCAFFOLD — simulator only,
 //!     wave-7 W7-F. AML S11board byte-identical with S19j Pro/S21 per
 //!      §1.1.]
@@ -35,16 +39,43 @@
 //!   thresholds).
 //!
 //! For most chip families the two values are identical (BM1387=114,
-//! BM1366=894, BM1368=1280, BM1370=1280). **BM1362 is the exception**:
-//! `cores_per_chip = 4` big engines, `nonce_attribution_cores = 894` slots
-//! per chip. Mixing the two breaks hashrate prediction by an order of
-//! magnitude on BM1362 and by 30% on BM1368 (the legacy autotuner
-//! constant of 894 was wrong for BM1368).
+//! BM1366=894, BM1368=1280). **BM1362 is the exception**:
+//! `cores_per_chip = 4` big engines vs a much larger slot count. Mixing
+//! the two breaks hashrate prediction by an order of magnitude on BM1362
+//! and by 30% on BM1368 (the legacy autotuner constant of 894 was wrong
+//! for BM1368).
+//!
+//! ## SG-1 corrected slot counts (rank 24, 2026-08-02 hardware-enablement queue)
+//!
+//! Two `nonce_attribution_cores` rows are internally inconsistent with the
+//! same profile's own `ghs_per_mhz` (identity: `slots ≈ ghs_per_mhz ×
+//! 1000`, see `expected_nps`):
+//!
+//! - **BM1362**: declared 894, our own `ghs_per_mhz = 0.550` implies ~550.
+//!   Corrected value **514** (7.0% from our own implied value, inside the
+//!   rank-3 gate's 10% bar; 894 is 38.5% off and over-predicts, so a
+//!   healthy chain ratios ~0.615 < `min_hashrate_ratio` 0.70 → permanent
+//!   `step_down_freq` throttling of healthy S19j Pro silicon).
+//! - **BM1370**: declared 1280 (copied from BM1368, never measured), our
+//!   own `ghs_per_mhz = 2.286` implies ~2286. Corrected value **2040**,
+//!   independently held in OUR OWN live-mining ESP tree (Bitaxe Gamma
+//!   BM1370: `dcentos-esp/dcentaxe/src/{api.rs:992, capabilities.rs:237,
+//!   main.rs:853}`). 2040 is 12.06% from the implied 2286 — outside the
+//!   10% bar — because 2286 stands on the PLACEHOLDER 525 MHz spec
+//!   frequency; the residual is pinned, not hidden, in
+//!   `tests/profile_core_ghs_consistency_gate.rs`.
+//!
+//! The corrected values ship behind the **default-OFF** env flag
+//! [`SG1_CORRECTED_NONCE_CORES_ENV`]; with the flag unset, every declared
+//! field and every prediction is byte-identical to the pre-rank-24 tree.
+//! Prediction paths consume [`MinerProfile::nonce_attribution_cores_effective`]
+//! (or `expected_nps`, which routes through it); the raw field remains the
+//! declared legacy default and is what the rank-3 consistency gate pins.
 //!
 //! Single source of truth: `dcentrald-autotuner` consumes
-//! `MinerProfile::nonce_attribution_cores` directly. Per-chip core
-//! constants in `dcentrald-autotuner::chip_geometry` were deleted in W6.8
-//! and the offline CI gate `chip_geometry_drift_check` rejects their
+//! `MinerProfile::nonce_attribution_cores_effective` directly. Per-chip
+//! core constants in `dcentrald-autotuner::chip_geometry` were deleted in
+//! W6.8 and the offline CI gate `chip_geometry_drift_check` rejects their
 //! reintroduction.
 
 pub mod bm1362;
@@ -52,12 +83,22 @@ pub mod bm1366;
 pub mod bm1368;
 pub mod bm1370;
 pub mod bm1373;
+/// BM1385 (Antminer S7 — 28 nm, pre-S9 generation) jig-verified scaffold.
+/// Fail-closed: no live S7 on the fleet. Carries the byte-extracted 124-entry
+/// `freq_pll_1385[]` table + Gen-1 FIL protocol facts. See module docs.
+pub mod bm1385;
 pub mod bm1387;
 pub mod bm1391;
 pub mod bm1396;
 pub mod bm1397;
 pub mod bm1398;
 pub mod bm139x;
+/// BM1485 (L3 / L3+ / L3++ Scrypt) — Scaffold, refuses to energize. Keyed on a
+/// SYNTHETIC id because the chip has no readable CHIP_ID
+/// (`bm1485::CHIP_ID_IS_SILICON_READABLE == false`). Carries the primary
+/// citation for the register map `bm1489.rs` inherits, plus the fail-closed
+/// encoding of the unresolved operational baud.
+pub mod bm1485;
 pub mod bm1489;
 /// ScryptL7 (L7 / BM1489 Litecoin Scrypt) — DCENT_OS's first non-SHA256 chip
 /// driver. Default-OFF: only compiled under the `scrypt-l7` Cargo feature so
@@ -75,6 +116,58 @@ use dcentrald_hal::fpga_chain::FpgaChain;
 
 /// Lab-only environment flag for registering simulator/pre-hardware ASIC drivers.
 pub const ALLOW_SCAFFOLD_ASIC_DRIVERS_ENV: &str = "DCENT_ALLOW_SCAFFOLD_ASIC_DRIVERS";
+
+/// Default-OFF opt-in for the SG-1 corrected `nonce_attribution_cores`
+/// values (rank 24, 2026-08-02 hardware-enablement queue). Set to `1` to
+/// make hashrate-prediction paths use the corrected slot counts from
+/// [`sg1_corrected_nonce_attribution_cores`] (BM1362 894→514, BM1370
+/// 1280→2040). Unset (the default), runtime behaviour is byte-identical
+/// to the pre-rank-24 tree. See the module docs §"SG-1 corrected slot
+/// counts" for the full derivation from our own `ghs_per_mhz`.
+pub const SG1_CORRECTED_NONCE_CORES_ENV: &str = "DCENT_SG1_CORRECTED_NONCE_CORES";
+
+/// SG-1 (rank 24) corrected nonce-attribution slot counts, as pure data.
+///
+/// Every value here must trace to evidence:
+///
+/// - `0x1362` (BM1362 / S19j Pro) → **514**. Our own profile's
+///   `ghs_per_mhz = 0.550` (104 TH/s / 378 chips / 500 MHz, this file)
+///   implies `0.550 × 1000 ≈ 550` slots by the `expected_nps` identity;
+///   514 sits 7.0% from that — inside the rank-3 gate's 10% bar — while
+///   the legacy 894 sits 38.5% off and would imply a physically
+///   impossible ~169 TH/s S19j Pro (894 × 500 MHz × 378 chips). ePIC's
+///   transcription supplied the 514 candidate; OUR ghs_per_mhz is the
+///   authority that admits it.
+/// - `0x1370` (BM1370 / S21 Pro) → **2040**. Our own live-mining ESP tree
+///   (Bitaxe Gamma, BM1370) declares 2040 small cores in five places
+///   (`dcentos-esp/dcentaxe/src/api.rs:992`, `capabilities.rs:237`,
+///   `cgminer_tcp.rs:641`, `main.rs:853`, `derived_metrics.rs:123-124`);
+///   ePIC corroborates. Our profile's `ghs_per_mhz = 2.286` implies
+///   ~2286 — a 12.06% residual vs 2040 that is attributable to the
+///   PLACEHOLDER 525 MHz spec frequency in that derivation and is pinned
+///   (not hidden) by `tests/profile_core_ghs_consistency_gate.rs`. The
+///   legacy 1280 was copied from BM1368 ("same geometry" — asserted,
+///   never measured) and under-predicts by 44%, masking degradation.
+///
+/// Chips NOT listed here have no SG-1 correction: their declared
+/// `nonce_attribution_cores` either passes the rank-3 consistency gate
+/// (BM1387, BM1366, BM1368) or is a pinned allowlisted divergence whose
+/// resolution is owned elsewhere (BM1397/BM1398 — see the gate test).
+pub const fn sg1_corrected_nonce_attribution_cores(chip_id: u16) -> Option<u32> {
+    match chip_id {
+        0x1362 => Some(514),
+        0x1370 => Some(2040),
+        _ => None,
+    }
+}
+
+/// True when the operator opted into the SG-1 corrected slot counts.
+/// Mirrors the `== "1"` parse of [`ALLOW_SCAFFOLD_ASIC_DRIVERS_ENV`].
+pub fn sg1_corrected_nonce_cores_enabled() -> bool {
+    std::env::var(SG1_CORRECTED_NONCE_CORES_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
 
 /// Chip ID (`0x1390`) for a genuinely RE-pending future Bitmain SHA-256
 /// die. It must not silently map to any production driver until the
@@ -99,6 +192,11 @@ pub const fn is_scaffold_driver_chip(chip_id: u16) -> bool {
         || chip_id == bm1373::ENUM_CHIP_ID
         || chip_id == bm1489::CHIP_ID
         || chip_id == bm1391::CHIP_ID
+        // BM1485 (L3/L3+/L3++). Note this key is SYNTHETIC — real BM1485
+        // silicon never reports it — so no live enumeration can reach this
+        // branch today. It is registered so the scaffold is reachable for
+        // offline/simulator work and so the fail-closed assertions cover it.
+        || chip_id == bm1485::CHIP_ID
 }
 
 pub const fn is_re_pending_chip(chip_id: u16) -> bool {
@@ -267,22 +365,64 @@ impl MinerProfile {
     /// Get the PLL frequency table for a given ASIC chip ID.
     ///
     /// Returns the chip-specific discrete frequency table for autotuner
-    /// binary search. Falls back to BM1387 table for unknown chip IDs.
+    /// binary search. **Unknown chip IDs return an empty slice** — never a
+    /// silent BM1387 fallback (decade backlog P1-4). Programming the wrong
+    /// silicon's PLL table is worse than refusing to tune.
+    ///
+    /// Prefer [`Self::try_pll_frequencies_for_chip`] when the caller must
+    /// distinguish "known empty scaffold" from "unknown chip".
     pub fn pll_frequencies_for_chip(chip_id: u16) -> &'static [u16] {
+        Self::try_pll_frequencies_for_chip(chip_id).unwrap_or(&[])
+    }
+
+    /// PLL table for a known chip ID, or `None` if the chip is not registered.
+    ///
+    /// Fail-closed: unknown IDs do **not** inherit BM1387 / S9 frequencies.
+    pub fn try_pll_frequencies_for_chip(chip_id: u16) -> Option<&'static [u16]> {
         match chip_id {
-            0x1387 => bm1387::pll_frequencies(),
-            0x1397 => bm1397::pll_frequencies(),
-            0x1398 => bm1398::pll_frequencies(),
-            0x1362 => bm1362::pll_frequencies(),
-            0x1366 => bm1366::pll_frequencies(),
-            0x1368 => bm1368::pll_frequencies(),
-            0x1370 => bm1370::pll_frequencies(),
+            0x1387 => Some(bm1387::pll_frequencies()),
+            0x1397 => Some(bm1397::pll_frequencies()),
+            0x1398 => Some(bm1398::pll_frequencies()),
+            0x1362 => Some(bm1362::pll_frequencies()),
+            0x1366 => Some(bm1366::pll_frequencies()),
+            0x1368 => Some(bm1368::pll_frequencies()),
+            0x1370 => Some(bm1370::pll_frequencies()),
             // BM1373/S23 dual-key: 0x1372 (enumerated) + 0x1373 (canonical) —
             // operator decision 2026-07-08 (see `is_scaffold_driver_chip`).
-            0x1372 | 0x1373 => bm1373::pll_frequencies(),
-            0x1489 => bm1489::pll_frequencies(),
-            _ => bm1387::pll_frequencies(), // fallback
+            0x1372 | 0x1373 => Some(bm1373::pll_frequencies()),
+            0x1489 => Some(bm1489::pll_frequencies()),
+            _ => None,
         }
+    }
+
+    /// True when a discrete PLL table is registered for this chip ID.
+    pub fn has_pll_table(chip_id: u16) -> bool {
+        Self::try_pll_frequencies_for_chip(chip_id).is_some_and(|t| !t.is_empty())
+    }
+
+    /// Snap `target_mhz` down to the nearest registered PLL entry (inclusive floor).
+    ///
+    /// Returns `None` when the table is empty (unknown chip — P1-4 fail-closed).
+    /// Never panics on an empty table. Callers that need a numeric fallback must
+    /// pass a known floor explicitly rather than indexing `pll[0]`.
+    pub fn snap_pll_floor(pll_table: &[u16], target_mhz: u16) -> Option<u16> {
+        if pll_table.is_empty() {
+            return None;
+        }
+        pll_table
+            .iter()
+            .rev()
+            .find(|&&f| f <= target_mhz)
+            .copied()
+            .or_else(|| pll_table.first().copied())
+    }
+
+    /// Next PLL entry strictly above `current_mhz` (boost / step-up).
+    ///
+    /// Returns `None` when the table is empty or `current_mhz` is already at
+    /// or above the highest table entry.
+    pub fn snap_pll_next_above(pll_table: &[u16], current_mhz: u16) -> Option<u16> {
+        pll_table.iter().copied().find(|&f| f > current_mhz)
     }
 
     /// Estimated hashrate for a single chip at a given frequency (GH/s).
@@ -300,19 +440,82 @@ impl MinerProfile {
         self.chain_count as f64 * self.chain_hashrate_ghs(freq_mhz) / 1000.0
     }
 
+    /// Nominal device hashrate in GH/s for SV2 OpenStandardMiningChannel /
+    /// pool difficulty seeding (decade backlog P2-9).
+    ///
+    /// Prefer this over a hard-coded S9 `13500.0` when a [`MinerProfile`] is
+    /// known. Returns `None` for unknown chips or non-positive geometry so
+    /// callers refuse to advertise a fabricated multi-TH rate.
+    ///
+    /// Pure math SSOT: [`dcentrald_common::nominal_hashrate_ghs_from_geometry`]
+    /// with profile `chain_count × chips_per_chain`. Live enum should prefer
+    /// that helper with **responding** chip totals when partial boards exist.
+    pub fn nominal_hashrate_ghs(&self, freq_mhz: u16) -> Option<f32> {
+        let total = dcentrald_common::total_chips_from_profile_geometry(
+            self.chain_count,
+            self.chips_per_chain,
+        )?;
+        dcentrald_common::nominal_hashrate_ghs_from_geometry(total, freq_mhz, self.ghs_per_mhz)
+    }
+
+    /// Look up profile + nominal GH/s for a chip ID at `freq_mhz`.
+    pub fn nominal_hashrate_ghs_for_chip(chip_id: u16, freq_mhz: u16) -> Option<f32> {
+        Self::for_chip(chip_id)?.nominal_hashrate_ghs(freq_mhz)
+    }
+
+    /// Nonce-attribution slot count with an explicit SG-1 correction choice.
+    ///
+    /// Pure function for tests and callers that already resolved the flag:
+    /// `corrected = true` returns the rank-24 corrected value from
+    /// [`sg1_corrected_nonce_attribution_cores`] when one exists for this
+    /// chip, otherwise (and always with `corrected = false`) the declared
+    /// `nonce_attribution_cores` field.
+    pub fn nonce_attribution_cores_with_correction(&self, corrected: bool) -> u32 {
+        if corrected {
+            if let Some(cores) = sg1_corrected_nonce_attribution_cores(self.chip_id) {
+                return cores;
+            }
+        }
+        self.nonce_attribution_cores
+    }
+
+    /// Nonce-attribution slot count honouring the default-OFF
+    /// [`SG1_CORRECTED_NONCE_CORES_ENV`] flag. This is what every
+    /// hashrate/nonces-per-second prediction path must consume; with the
+    /// flag unset it is exactly the declared `nonce_attribution_cores`.
+    pub fn nonce_attribution_cores_effective(&self) -> u32 {
+        self.nonce_attribution_cores_with_correction(sg1_corrected_nonce_cores_enabled())
+    }
+
     /// Expected nonces per second per chip at a given frequency and difficulty.
     ///
-    /// Uses `nonce_attribution_cores` (the count of distinct nonce-attribution
-    /// slots), NOT the driver-facing `cores_per_chip`. For BM1362 these
-    /// differ: `cores_per_chip = 4` big engines, `nonce_attribution_cores =
-    /// 894` slots. Autotuner hashrate prediction depends on the slot count.
+    /// Uses the effective nonce-attribution slot count (the count of distinct
+    /// nonce-attribution slots, honouring the default-OFF SG-1 correction
+    /// flag), NOT the driver-facing `cores_per_chip`. For BM1362 these
+    /// differ: `cores_per_chip = 4` big engines vs 894 declared (514
+    /// SG-1-corrected) slots. Autotuner hashrate prediction depends on the
+    /// slot count.
     pub fn expected_nps(&self, freq_mhz: u16, difficulty: u32) -> f64 {
+        self.expected_nps_with_correction(freq_mhz, difficulty, sg1_corrected_nonce_cores_enabled())
+    }
+
+    /// [`Self::expected_nps`] with an explicit SG-1 correction choice —
+    /// the pure form used by tests so they need not mutate the process
+    /// environment. `expected_nps` delegates here with the env-resolved
+    /// flag, so this IS the production formula.
+    pub fn expected_nps_with_correction(
+        &self,
+        freq_mhz: u16,
+        difficulty: u32,
+        corrected: bool,
+    ) -> f64 {
         let diff = if difficulty == 0 {
             self.hardware_difficulty
         } else {
             difficulty
         };
-        (freq_mhz as f64 * self.nonce_attribution_cores as f64 * 1e6) / (diff as f64 * 4.294e9)
+        (freq_mhz as f64 * self.nonce_attribution_cores_with_correction(corrected) as f64 * 1e6)
+            / (diff as f64 * 4.294e9)
     }
 }
 
@@ -458,12 +661,22 @@ pub static MINER_PROFILES: &[MinerProfile] = &[
         default_voltage_mv: 13700,
         max_freq_mhz: 700,
         cores_per_chip: 4,
-        // BM1362: 4 big SHA-256 engines per chip, BUT each engine exposes
-        // ~894 distinct nonce-attribution slots to the FPGA (small-die
-        // BM139x variant — same nonce-space partitioning as BM1366). The
-        // autotuner needs the slot count for hashrate prediction; the
-        // driver uses the big-engine count for open-core / engine-state
-        // bookkeeping. W6.8 (DCENT_Perf, 2026-05-07).
+        // BM1362: 4 big SHA-256 engines per chip; the FPGA additionally
+        // attributes nonces to per-chip slots. The autotuner needs the slot
+        // count for hashrate prediction; the driver uses the big-engine
+        // count for open-core / engine-state bookkeeping. W6.8
+        // (DCENT_Perf, 2026-05-07).
+        //
+        // ⚠ SG-1 (rank 24, 2026-08-02): 894 appears borrowed from BM1366
+        // and is inconsistent with this profile's OWN `ghs_per_mhz = 0.550`
+        // a few fields below (implies ~550 slots; 894 is 38.5% off and
+        // would mean a ~169 TH/s S19j Pro). The corrected value 514 ships
+        // behind the default-OFF `DCENT_SG1_CORRECTED_NONCE_CORES=1` flag —
+        // see `sg1_corrected_nonce_attribution_cores`. This declared field
+        // stays 894 so flag-off behaviour is byte-identical; it is pinned
+        // by `tests/profile_core_ghs_consistency_gate.rs` and the W6.8
+        // autotuner pins, all of which must move together when the default
+        // eventually flips.
         nonce_attribution_cores: 894,
         hardware_difficulty: 256,
         // S19j Pro reference: ~29.5 J/TH, 104 TH/s, ~3068W, 378 chips.
@@ -561,7 +774,21 @@ pub static MINER_PROFILES: &[MinerProfile] = &[
         default_voltage_mv: 12000,
         max_freq_mhz: 750,
         cores_per_chip: 1280,
-        // BM1370: same 1280-slot geometry as BM1368.
+        // ⚠ SG-1 (2026-08-02 hardware-enablement queue): the 1280 value was
+        // COPIED from the BM1368 row ("same geometry" — asserted, never
+        // measured on BM1370 silicon). This profile's own `ghs_per_mhz:
+        // 2.286` (234 TH/s / 195 chips / 525 MHz spec, a few fields below)
+        // implies ~2286 slots (−44% prediction error at 1280). Rank 24
+        // shipped the corrected value 2040 — held in OUR OWN live-mining ESP
+        // tree (Bitaxe Gamma BM1370, `dcentos-esp/dcentaxe/src/api.rs:992`
+        // et al.), ePIC-corroborated — behind the default-OFF
+        // `DCENT_SG1_CORRECTED_NONCE_CORES=1` flag; see
+        // `sg1_corrected_nonce_attribution_cores` for the 12.06% residual
+        // vs the placeholder-frequency-derived 2286. This declared field
+        // stays 1280 so flag-off behaviour is byte-identical; pinned
+        // byte-exact by `tests/profile_core_ghs_consistency_gate.rs` — DO
+        // NOT change it without updating that gate's allowlist in the same
+        // commit.
         nonce_attribution_cores: 1280,
         hardware_difficulty: 256,
         // S21 Pro spec: ~15 J/TH, 234 TH/s, ~3510W, 195 chips
@@ -920,17 +1147,39 @@ impl ChipRecognition {
 /// Sealed proof that the active registry policy admits execution for one exact
 /// chip identity.  Callers can inspect the identity but cannot construct this
 /// value without crossing [`ChipRegistry::admit`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The proof is deliberately move-only. It may be transferred into one
+/// measured hardware-composition session, but it cannot be copied or cloned
+/// into a second execution owner.
+///
+/// ```compile_fail
+/// use dcentrald_asic::drivers::ChipRegistry;
+///
+/// let registry = ChipRegistry::production();
+/// let admission = registry.admit(0x1387).unwrap();
+/// let moved = admission;
+/// let _ = admission.chip_id();
+/// drop(moved);
+/// ```
+///
+/// ```compile_fail
+/// use dcentrald_asic::drivers::ChipRegistry;
+///
+/// let registry = ChipRegistry::production();
+/// let admission = registry.admit(0x1387).unwrap();
+/// let _duplicate = admission.clone();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChipDriverAdmission {
     recognition: ChipRecognition,
 }
 
 impl ChipDriverAdmission {
-    pub const fn recognition(self) -> ChipRecognition {
+    pub const fn recognition(&self) -> ChipRecognition {
         self.recognition
     }
 
-    pub const fn chip_id(self) -> u16 {
+    pub const fn chip_id(&self) -> u16 {
         self.recognition.chip_id
     }
 }
@@ -993,6 +1242,10 @@ struct ChipDriverEntry {
 pub struct ChipRegistry {
     entries: HashMap<u16, ChipDriverEntry>,
     execution_policy: ChipDriverExecutionPolicy,
+    /// When present, this registry was created by consuming one move-only
+    /// admission and may expose only that exact executable driver. It may not
+    /// mint successor admissions.
+    execution_scope_chip_id: Option<u16>,
 }
 
 impl ChipRegistry {
@@ -1029,6 +1282,7 @@ impl ChipRegistry {
         let mut registry = Self {
             entries: HashMap::new(),
             execution_policy: ChipDriverExecutionPolicy::production_only(),
+            execution_scope_chip_id: None,
         };
         registry.register(Box::new(bm1387::Bm1387Driver::new()));
         registry.register_with_maturity(
@@ -1042,7 +1296,10 @@ impl ChipRegistry {
         registry.register(Box::new(bm1362::Bm1362Driver::new()));
         registry.register(Box::new(bm1366::Bm1366Driver::new()));
         registry.register(Box::new(bm1368::Bm1368Driver::new()));
-        registry.register(Box::new(bm1370::Bm1370Driver::new()));
+        registry.register_with_maturity(
+            Box::new(bm1370::Bm1370Driver::new()),
+            ChipDriverMaturity::Experimental,
+        );
         registry.register_scaffold_drivers();
         registry
     }
@@ -1050,6 +1307,28 @@ impl ChipRegistry {
     pub fn with_execution_policy(execution_policy: ChipDriverExecutionPolicy) -> Self {
         let mut registry = Self::production();
         registry.execution_policy = execution_policy;
+        registry
+    }
+
+    /// Consume one move-only driver admission into an exact runtime registry.
+    ///
+    /// The returned registry can resolve only the admitted chip and cannot mint
+    /// another [`ChipDriverAdmission`]. This is the terminal transition used by
+    /// a measured execution owner after all discovery/configuration stages have
+    /// completed.
+    pub fn from_admission(admission: ChipDriverAdmission) -> Self {
+        let recognition = admission.recognition;
+        let execution_policy = match recognition.maturity {
+            ChipDriverMaturity::Production => ChipDriverExecutionPolicy::production_only(),
+            ChipDriverMaturity::Experimental => {
+                ChipDriverExecutionPolicy::with_experimental_chip(recognition.chip_id)
+            }
+            ChipDriverMaturity::Scaffold => {
+                ChipDriverExecutionPolicy::production_only().with_scaffold()
+            }
+        };
+        let mut registry = Self::with_execution_policy(execution_policy);
+        registry.execution_scope_chip_id = Some(recognition.chip_id);
         registry
     }
 
@@ -1090,6 +1369,24 @@ impl ChipRegistry {
             Box::new(bm1391::Bm1391Driver::new()),
             ChipDriverMaturity::Scaffold,
         );
+        // BM1485 (L3 / L3+ / L3++ Scrypt) — rank 44. Scaffold: EVERY hardware
+        // method returns Err (operational baud, chain address stride, PLL
+        // register encoding and nonce field layout are all unresolved), and
+        // its registry key is synthetic because the chip has no readable
+        // CHIP_ID. Registered so the previously-stranded silicon profile has a
+        // driver behind it for offline work.
+        self.register_with_maturity(
+            Box::new(bm1485::Bm1485Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
+        // BM1385 (Antminer S7 — pre-S9 28 nm generation) — jig-verified Gen-1
+        // FIL protocol + byte-extracted 124-entry freq_pll_1385[] table, but
+        // fail-closed (no live S7 on the fleet). init_chain refuses live
+        // bring-up regardless.
+        self.register_with_maturity(
+            Box::new(bm1385::Bm1385Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
         // ScryptL7 (W3-B): when the default-OFF `scrypt-l7` feature is compiled,
         // the W3-A-accurate driver SUPERSEDES the older `bm1489.rs` scaffold for
         // chip-id 0x1489 (registered LAST so it overrides the HashMap slot). It
@@ -1101,8 +1398,12 @@ impl ChipRegistry {
         );
     }
 
-    /// Register a chip driver.
-    pub fn register(&mut self, driver: Box<dyn ChipDriver>) {
+    /// Register a production chip driver inside the sealed catalog.
+    ///
+    /// This is deliberately private: exposing it let any consumer re-register
+    /// an Experimental implementation (for example BM1398) as Production and
+    /// bypass `ChipDriverExecutionPolicy` entirely.
+    fn register(&mut self, driver: Box<dyn ChipDriver>) {
         self.register_with_maturity(driver, ChipDriverMaturity::Production);
     }
 
@@ -1135,10 +1436,6 @@ impl ChipRegistry {
     /// `0x1373` — operator decision 2026-07-08 to resolve BOTH ids to the same
     /// fail-closed BM1373 scaffold until a live S23 confirms which is real. The
     /// driver still reports its own canonical `chip_id()` regardless of the key.
-    pub fn register_alias(&mut self, chip_id: u16, driver: Box<dyn ChipDriver>) {
-        self.register_alias_with_maturity(chip_id, driver, ChipDriverMaturity::Production);
-    }
-
     fn register_alias_with_maturity(
         &mut self,
         chip_id: u16,
@@ -1167,6 +1464,9 @@ impl ChipRegistry {
     /// Mint executable authority for one exact chip identity under this
     /// registry's immutable policy.
     pub fn admit(&self, chip_id: u16) -> Option<ChipDriverAdmission> {
+        if self.execution_scope_chip_id.is_some() {
+            return None;
+        }
         let recognition = self.recognize(chip_id)?;
         self.execution_policy
             .allows(recognition)
@@ -1177,6 +1477,12 @@ impl ChipRegistry {
     ///
     /// Returns None if no driver is registered for the given chip ID.
     pub fn detect(&self, chip_id: u16) -> Option<&dyn ChipDriver> {
+        if self
+            .execution_scope_chip_id
+            .is_some_and(|admitted_chip_id| admitted_chip_id != chip_id)
+        {
+            return None;
+        }
         self.entries.get(&chip_id).and_then(|entry| {
             self.execution_policy
                 .allows(entry.recognition)
@@ -1188,7 +1494,11 @@ impl ChipRegistry {
     pub fn list_drivers(&self) -> Vec<(u16, &'static str)> {
         self.entries
             .iter()
-            .filter(|(_, entry)| self.execution_policy.allows(entry.recognition))
+            .filter(|(chip_id, entry)| {
+                self.execution_scope_chip_id
+                    .is_none_or(|admitted_chip_id| admitted_chip_id == **chip_id)
+                    && self.execution_policy.allows(entry.recognition)
+            })
             .map(|(&chip_id, entry)| (chip_id, entry.recognition.chip_name))
             .collect()
     }
@@ -1258,7 +1568,6 @@ mod tests {
             bm1362::CHIP_ID,
             bm1366::CHIP_ID,
             bm1368::CHIP_ID,
-            bm1370::CHIP_ID,
         ]
         .into_iter()
         .collect();
@@ -1288,6 +1597,24 @@ mod tests {
     }
 
     #[test]
+    fn bm1370_is_inertly_recognized_and_requires_exact_experimental_policy() {
+        let production = ChipRegistry::production();
+        let recognition = production
+            .recognize(bm1370::CHIP_ID)
+            .expect("BM1370 identity evidence remains catalogued");
+        assert_eq!(recognition.chip_name(), "BM1370");
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
+        assert!(production.detect(bm1370::CHIP_ID).is_none());
+
+        let exact = ChipRegistry::with_experimental_driver(bm1370::CHIP_ID);
+        assert!(exact.detect(bm1370::CHIP_ID).is_some());
+
+        let unrelated = ChipRegistry::with_experimental_driver(bm1398::CHIP_ID);
+        assert!(unrelated.detect(bm1370::CHIP_ID).is_none());
+        assert!(unrelated.detect(bm1368::CHIP_ID).is_some());
+    }
+
+    #[test]
     fn bm1397_is_recognized_but_not_executable_without_exact_experimental_policy() {
         let production = ChipRegistry::production();
         let recognition = production
@@ -1301,6 +1628,26 @@ mod tests {
         assert!(ChipRegistry::with_experimental_driver(bm1398::CHIP_ID)
             .detect(bm1397::CHIP_ID)
             .is_none());
+    }
+
+    #[test]
+    fn consumed_admission_creates_an_exact_non_reminting_runtime_registry() {
+        let policy = ChipDriverExecutionPolicy::with_experimental_chip(bm1398::CHIP_ID);
+        let admission = ChipRegistry::with_execution_policy(policy)
+            .admit(bm1398::CHIP_ID)
+            .expect("exact experimental policy must mint one BM1398 admission");
+
+        let runtime = ChipRegistry::from_admission(admission);
+        assert!(runtime.detect(bm1398::CHIP_ID).is_some());
+        assert_eq!(runtime.list_drivers(), vec![(bm1398::CHIP_ID, "BM1398")]);
+        assert!(
+            runtime.detect(bm1387::CHIP_ID).is_none(),
+            "a consumed BM1398 admission must not expose even a Production driver"
+        );
+        assert!(
+            runtime.admit(bm1398::CHIP_ID).is_none(),
+            "a terminal runtime registry must not remint the consumed admission"
+        );
     }
 
     #[test]
@@ -1356,6 +1703,16 @@ mod tests {
                 driver_above_catalog_reason: None,
             },
             Case {
+                source_file: "bm1385.rs",
+                driver_name: bm1385::Bm1385Driver::new().chip_name(),
+                driver_max_baud: bm1385::Bm1385Driver::new().max_baud(),
+                catalog_chip: None,
+                catalog_absence_reason: Some(
+                    "BM1385/S7 is a pre-S9 generation with no AsicChip catalog row; the jig-verified scaffold is fail-closed and unregistered in production",
+                ),
+                driver_above_catalog_reason: None,
+            },
+            Case {
                 source_file: "bm1387.rs",
                 driver_name: bm1387::Bm1387Driver::new().chip_name(),
                 driver_max_baud: bm1387::Bm1387Driver::new().max_baud(),
@@ -1392,6 +1749,14 @@ mod tests {
                 driver_above_catalog_reason: None,
             },
             Case {
+                source_file: "bm1485.rs",
+                driver_name: bm1485::Bm1485Driver::new().chip_name(),
+                driver_max_baud: bm1485::Bm1485Driver::new().max_baud(),
+                catalog_chip: None,
+                catalog_absence_reason: Some("BM1485 is a Scrypt scaffold outside asics.rs"),
+                driver_above_catalog_reason: None,
+            },
+            Case {
                 source_file: "bm1489.rs",
                 driver_name: bm1489::Bm1489Driver::new().chip_name(),
                 driver_max_baud: bm1489::Bm1489Driver::new().max_baud(),
@@ -1403,9 +1768,23 @@ mod tests {
 
         assert_eq!(
             cases.len(),
-            10,
+            12,
             "this pin must cover every concrete driver file with max_baud()"
         );
+
+        // Rank 44: BM1485's operational baud is UNRESOLVED (bm1485.md gives
+        // BOTH bt8d=7 -> 390625 and bt8d=1 -> 1562500 for the post-upgrade
+        // rate, and no held L3+ binary contains either literal). The driver
+        // therefore refuses to raise baud at all — max == the enumeration
+        // rate. Raising this without a bench UART capture landing in the same
+        // commit violates the standing "never raise a driver baud without
+        // bench proof" rule.
+        assert_eq!(bm1485::Bm1485Driver::new().max_baud(), 115_200);
+        assert_eq!(
+            bm1485::Bm1485Driver::new().max_baud(),
+            bm1485::Bm1485Driver::new().default_baud(),
+        );
+        assert!(bm1485::OPERATIONAL_BAUD.is_none());
 
         for case in cases {
             match case.catalog_chip {
@@ -1475,6 +1854,13 @@ mod tests {
                 profile_absence_reason: None,
             },
             Case {
+                source_file: "bm1385.rs",
+                driver: Box::new(bm1385::Bm1385Driver::new()),
+                profile_absence_reason: Some(
+                    "BM1385/S7 has no MinerProfile: the held jig proves 50 cores and the 45-chip board, but the S7 control board is a pre-Zynq Bitmain design with no uio/gpio/i2c values in any held artifact, c_eff is uncalibrated, and ghs_per_mhz has no measured source",
+                ),
+            },
+            Case {
                 source_file: "bm1387.rs",
                 driver: Box::new(bm1387::Bm1387Driver::new()),
                 profile_absence_reason: None,
@@ -1497,6 +1883,13 @@ mod tests {
                 profile_absence_reason: None,
             },
             Case {
+                source_file: "bm1485.rs",
+                driver: Box::new(bm1485::Bm1485Driver::new()),
+                profile_absence_reason: Some(
+                    "BM1485/L3+ has no MinerProfile: its control board is an AM335x BeagleBone with kernel /dev/ttyO UARTs and no FPGA, so the Zynq-shaped uio/gpio/i2c fields have no honest values, and c_eff is uncalibrated",
+                ),
+            },
+            Case {
                 source_file: "bm1489.rs",
                 driver: Box::new(bm1489::Bm1489Driver::new()),
                 profile_absence_reason: None,
@@ -1505,7 +1898,7 @@ mod tests {
 
         assert_eq!(
             cases.len(),
-            10,
+            12,
             "this pin must cover every concrete driver file with cores_per_chip()"
         );
 
@@ -1535,19 +1928,46 @@ mod tests {
 
         let bm1362 = MinerProfile::for_chip(bm1362::CHIP_ID).expect("BM1362 profile registered");
         assert_eq!(bm1362.cores_per_chip, 4);
+        // Declared field = flag-off default (SG-1 rank 24: 894 stays the
+        // declared legacy value until the default flips).
         assert_eq!(bm1362.nonce_attribution_cores, 894);
+        // SG-1 rank-24 corrected value, pure path (no env): 514, derived
+        // from this profile's own ghs_per_mhz 0.550 → ~550 implied slots.
+        assert_eq!(bm1362.nonce_attribution_cores_with_correction(false), 894);
+        assert_eq!(bm1362.nonce_attribution_cores_with_correction(true), 514);
+        assert!(
+            514 >= bm1362.cores_per_chip,
+            "corrected slot count must not be smaller than the engine count"
+        );
 
         let bm1366 = MinerProfile::for_chip(bm1366::CHIP_ID).expect("BM1366 profile registered");
         assert_eq!(bm1366.cores_per_chip, 894);
         assert_eq!(bm1366.nonce_attribution_cores, 894);
+        // BM1366 has no SG-1 correction — 894 is consistent with its own
+        // ghs_per_mhz (0.848 → ~848, within the 10% gate bar).
+        assert_eq!(bm1366.nonce_attribution_cores_with_correction(true), 894);
 
         let bm1368 = MinerProfile::for_chip(bm1368::CHIP_ID).expect("BM1368 profile registered");
         assert_eq!(bm1368.cores_per_chip, 1280);
         assert_eq!(bm1368.nonce_attribution_cores, 1280);
+        // BM1368's 1280 is measured (80×16, S21 fixture RE 2026-04-12, live
+        // S21 `a lab unit`) — exempt from SG-1; the correction table must not
+        // touch it.
+        assert_eq!(bm1368.nonce_attribution_cores_with_correction(true), 1280);
 
         let bm1370 = MinerProfile::for_chip(bm1370::CHIP_ID).expect("BM1370 profile registered");
         assert_eq!(bm1370.cores_per_chip, 1280);
+        // Declared field = flag-off default (SG-1 rank 24: 1280 stays the
+        // declared legacy value until the default flips).
         assert_eq!(bm1370.nonce_attribution_cores, 1280);
+        // SG-1 rank-24 corrected value, pure path: 2040 (our own ESP-tree
+        // Bitaxe Gamma evidence; ePIC-corroborated).
+        assert_eq!(bm1370.nonce_attribution_cores_with_correction(false), 1280);
+        assert_eq!(bm1370.nonce_attribution_cores_with_correction(true), 2040);
+        assert!(
+            2040 >= bm1370.cores_per_chip,
+            "corrected slot count must not be smaller than the engine count"
+        );
 
         let bm1398 = MinerProfile::for_chip(bm1398::CHIP_ID).expect("BM1398 profile registered");
         assert_eq!(
@@ -1567,6 +1987,19 @@ mod tests {
             ChipRegistry::production().detect(bm1391::CHIP_ID).is_none(),
             "BM1391's unresolved core geometry must stay scaffold-gated"
         );
+
+        // Rank 44: BM1485's 12 cores/chip is the one well-attested BM1485
+        // number (cgminer-ltc `BM1485_CORE_NUM`), and the driver and silicon
+        // layers must not drift apart.
+        assert_eq!(
+            bm1485::Bm1485Driver::new().cores_per_chip(),
+            dcentrald_silicon_profiles::bm1485::BM1485_CORES_PER_CHIP,
+        );
+        assert!(MinerProfile::for_chip(bm1485::CHIP_ID).is_none());
+        assert!(
+            ChipRegistry::production().detect(bm1485::CHIP_ID).is_none(),
+            "BM1485 must stay scaffold-gated"
+        );
     }
 
     #[test]
@@ -1579,6 +2012,8 @@ mod tests {
         // BM1391 (S11) is a jig-verified-but-fail-closed scaffold — excluded
         // from production until a live S11 validates it.
         assert!(registry.detect(bm1391::CHIP_ID).is_none());
+        // BM1485 (L3/L3+) — rank 44 scaffold, unresolved baud/stride/PLL.
+        assert!(registry.detect(bm1485::CHIP_ID).is_none());
     }
 
     #[test]
@@ -1587,6 +2022,43 @@ mod tests {
         assert!(registry.detect(bm1373::CHIP_ID).is_some());
         assert!(registry.detect(bm1489::CHIP_ID).is_some());
         assert!(registry.detect(bm1391::CHIP_ID).is_some());
+        assert!(registry.detect(bm1485::CHIP_ID).is_some());
+    }
+
+    /// Rank 44: the BM1485 scaffold exists ONLY to give the previously
+    /// stranded silicon profile a driver, and it must never look executable.
+    ///
+    /// Note the asymmetry versus every other entry in the registry: BM1485's
+    /// key is SYNTHETIC (`CHIP_ID_IS_SILICON_READABLE == false`), because
+    /// `bm1485.md:24` records that the chip has no verified readable CHIP_ID
+    /// and cgminer-ltc detects L3 chains by chain length instead. So even in
+    /// the double-env-gated scaffold registry, no LIVE enumeration can ever
+    /// produce `0x1485` — the entry is reachable from offline code only.
+    #[test]
+    fn bm1485_is_scaffold_only_and_keyed_on_a_synthetic_id() {
+        assert!(!bm1485::CHIP_ID_IS_SILICON_READABLE);
+        assert!(is_scaffold_driver_chip(bm1485::CHIP_ID));
+
+        let prod = ChipRegistry::production();
+        assert!(prod.detect(bm1485::CHIP_ID).is_none());
+        assert!(prod.admit(bm1485::CHIP_ID).is_none());
+        let recognition = prod
+            .recognize(bm1485::CHIP_ID)
+            .expect("BM1485 identity stays catalogued as inert recognition");
+        assert_eq!(recognition.chip_name(), "BM1485");
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Scaffold);
+
+        // An Experimental policy for BM1485 must NOT unlock it — scaffold
+        // authority is a separate decision.
+        assert!(ChipRegistry::with_experimental_driver(bm1485::CHIP_ID)
+            .detect(bm1485::CHIP_ID)
+            .is_none());
+
+        // No PLL table: unknown/unproven silicon must not inherit another
+        // chip's frequency ladder.
+        assert!(MinerProfile::try_pll_frequencies_for_chip(bm1485::CHIP_ID).is_none());
+        assert!(!MinerProfile::has_pll_table(bm1485::CHIP_ID));
+        assert!(MinerProfile::pll_frequencies_for_chip(bm1485::CHIP_ID).is_empty());
     }
 
     /// Operator decision 2026-07-08: the BM1373/S23 scaffold is keyed under BOTH
@@ -1629,6 +2101,94 @@ mod tests {
             MinerProfile::pll_frequencies_for_chip(0x1372),
             bm1373::pll_frequencies()
         );
+    }
+
+    /// P1-4: unknown chip IDs must never inherit the BM1387 PLL table.
+    ///
+    /// A silent S9 fallback would program the wrong dividers on any future
+    /// silicon that enumerates an unregistered ID — refuse instead.
+    #[test]
+    fn unknown_chip_pll_does_not_silently_use_bm1387() {
+        let bm1387_table = bm1387::pll_frequencies();
+        assert!(
+            !bm1387_table.is_empty(),
+            "BM1387 table must exist for contrast"
+        );
+
+        // RE-pending sentinel and a few never-registered IDs.
+        for unknown in [0x0000u16, 0xFFFF, BM1390_RE_PENDING_CHIP_ID, 0x1234, 0xABCD] {
+            assert!(
+                MinerProfile::try_pll_frequencies_for_chip(unknown).is_none(),
+                "chip 0x{unknown:04X} must not resolve a PLL table"
+            );
+            let table = MinerProfile::pll_frequencies_for_chip(unknown);
+            assert!(
+                table.is_empty(),
+                "chip 0x{unknown:04X} must return empty PLL slice, not BM1387"
+            );
+            assert_ne!(
+                table.as_ptr(),
+                bm1387_table.as_ptr(),
+                "chip 0x{unknown:04X} must not alias the BM1387 table pointer"
+            );
+            assert!(
+                !MinerProfile::has_pll_table(unknown),
+                "chip 0x{unknown:04X} has_pll_table must be false"
+            );
+        }
+
+        // Known production chips still resolve.
+        for known in [0x1387u16, 0x1362, 0x1368, 0x1370, 0x1397, 0x1398] {
+            assert!(
+                MinerProfile::has_pll_table(known),
+                "chip 0x{known:04X} must keep a registered PLL table"
+            );
+            assert!(!MinerProfile::pll_frequencies_for_chip(known).is_empty());
+        }
+    }
+
+    #[test]
+    fn snap_pll_floor_is_empty_safe_and_floors() {
+        assert_eq!(MinerProfile::snap_pll_floor(&[], 500), None);
+        let table = bm1387::pll_frequencies();
+        assert!(!table.is_empty());
+        let floor = MinerProfile::snap_pll_floor(table, 640).expect("non-empty");
+        assert!(floor <= 640);
+        assert!(table.contains(&floor));
+        // Below entire table → lowest entry
+        let lowest = *table.first().unwrap();
+        assert_eq!(
+            MinerProfile::snap_pll_floor(table, lowest.saturating_sub(1)),
+            Some(lowest)
+        );
+    }
+
+    #[test]
+    fn snap_pll_next_above_is_empty_safe() {
+        assert_eq!(MinerProfile::snap_pll_next_above(&[], 400), None);
+        let table = bm1387::pll_frequencies();
+        let mid = table[table.len() / 2];
+        let next = MinerProfile::snap_pll_next_above(table, mid).expect("has higher");
+        assert!(next > mid);
+        let top = *table.last().unwrap();
+        assert_eq!(MinerProfile::snap_pll_next_above(table, top), None);
+    }
+
+    /// P2-9: SV2 nominal GH/s comes from profile geometry, not a silent S9 constant.
+    #[test]
+    fn nominal_hashrate_ghs_scales_with_profile_and_refuses_unknown() {
+        let s9 = MinerProfile::for_chip(0x1387).expect("S9 profile");
+        let s9_ghs = s9.nominal_hashrate_ghs(650).expect("S9 rate");
+        // ~3 chains × 63 chips × 650 × 0.114 ≈ 13.5e3 GH/s order of magnitude
+        assert!(s9_ghs > 10_000.0 && s9_ghs < 20_000.0, "s9_ghs={s9_ghs}");
+
+        let s19j = MinerProfile::for_chip(0x1362).expect("BM1362 profile");
+        let s19_ghs = s19j.nominal_hashrate_ghs(525).expect("S19j rate");
+        // Multi-TH class must not look like S9 default
+        assert!(s19_ghs > 50_000.0, "s19_ghs={s19_ghs} should dwarf S9");
+
+        assert!(MinerProfile::nominal_hashrate_ghs_for_chip(0xFFFF, 500).is_none());
+        assert!(s9.nominal_hashrate_ghs(0).is_none());
     }
 
     // W22 (parity #9): scaffold drivers register only when BOTH the lab

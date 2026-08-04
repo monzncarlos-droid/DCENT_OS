@@ -90,8 +90,8 @@ class HardwareContractGateTests(unittest.TestCase):
         self.assertTrue(any("product build target" in error for error in self.errors()))
 
     def test_unsafe_board_enable_default_is_rejected(self) -> None:
-        self.mutate(contract.BOOT_SETUP, "gpio_set_out 59 0 0", "gpio_set_out 59 1 0")
-        self.assertTrue(any("fail-safe GPIO" in error for error in self.errors()))
+        self.mutate(contract.DAEMON_INIT, "gpio_set_out 59 0 0", "gpio_set_out 59 1 0")
+        self.assertTrue(any("board-enable" in error for error in self.errors()))
 
     def test_uncataloged_dts_is_rejected(self) -> None:
         extra = self.root / "br2_external_dcentos/board/beaglebone/new-board/new.dts"
@@ -113,14 +113,25 @@ class HardwareContractGateTests(unittest.TestCase):
         self.mutate(script, '[ -n "$DTB_SOURCE" ] || {', 'if [ -n "$DTB_SOURCE" ]; then')
         self.assertTrue(any("--artifacts requires" in error for error in self.errors()))
 
-    def test_docker_artifact_refusal_must_dominate_docker_invocation(self) -> None:
+    def test_docker_disable_guard_removal_is_rejected(self) -> None:
         script = Path("scripts/build_am3_bb_s19jpro.sh")
         self.mutate(
             script,
-            'if [ -n "$ARTIFACT_DIR" ]; then',
-            '# Docker artifact refusal accidentally removed',
+            "Docker fallback is disabled because am3-bb-s19jpro has no authenticated capsule",
+            "Docker fallback accidentally re-enabled",
         )
-        self.assertTrue(any("must dominate" in error for error in self.errors()))
+        self.assertTrue(
+            any("Docker fallback is explicitly disabled" in error for error in self.errors())
+        )
+
+    def test_docker_route_reintroduction_is_rejected(self) -> None:
+        script = self.root / Path("scripts/build_am3_bb_s19jpro.sh")
+        with script.open("a", encoding="utf-8") as handle:
+            handle.write('\nelif command -v docker >/dev/null 2>&1; then\n')
+            handle.write('    "$SCRIPT_DIR/build_in_docker.sh" --target "$BUILD_TARGET"\n')
+        self.assertTrue(
+            any("Docker packaging route" in error for error in self.errors())
+        )
 
     def test_packager_cannot_duplicate_carrier_marker_parser(self) -> None:
         path = self.root / "scripts/build_am3_bb_s19jpro.sh"
@@ -224,8 +235,8 @@ class HardwareContractGateTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertNotEqual(0, result.returncode)
-        self.assertIn(b"--artifacts is not supported by Docker packaging", result.stderr)
-        self.assertFalse(sentinel.exists(), "Docker must not run before artifact refusal")
+        self.assertIn(b"Docker fallback is disabled", result.stderr)
+        self.assertFalse(sentinel.exists(), "Docker must never be invoked by the AM3-BB wrapper")
 
     def test_missing_catalog_key_returns_error_not_exception(self) -> None:
         self.rewrite_catalog(lambda data: data.pop("gpio"))

@@ -272,6 +272,30 @@ pub const fn voltage_within_driver_ceiling(voltage_mv: u16, ceiling_mv: u16) -> 
     voltage_mv <= ceiling_mv
 }
 
+/// Derive the REGULATOR RAIL voltage (volts) from a PER-ASIC setpoint (mV) and
+/// the board's series-connected domain count.
+///
+/// Board profiles store per-ASIC voltage ONLY; the rail is always derived, never
+/// stored. On series-stacked boards the regulator output is the sum across the
+/// stack — e.g. Hammer BC04 is 4 x BM1370 at ~1.20 V/chip = a 4.8 V rail, and
+/// Hammer DC06 is 6 x MSBT0501 at 0.635 V/chip = a 3.81 V rail. Boards with a
+/// single domain are unaffected (`domains == 1` returns the per-ASIC value).
+///
+/// This exists as a standalone pure function, rather than inline in
+/// `Tps546::set_voltage_mv`, because that method needs a live `I2cBus` and so
+/// cannot be exercised on the host. Deleting the multiply there previously left
+/// the entire host suite green while every board's rail silently collapsed to
+/// the per-ASIC value — the profile rows pinned the DATA (`voltage_domains: 6`)
+/// but nothing pinned the CONSUMER. Keep the arithmetic here and keep it tested.
+///
+/// Note this is deliberately NOT the place to enforce a ceiling: the per-ASIC
+/// value is checked against `DRIVER_VOLTAGE_CEILING_MV` BEFORE this multiply, so
+/// that a legitimate multi-domain rail (4.8 V) is allowed while a stack value
+/// smuggled in as a per-ASIC setpoint is refused.
+pub fn rail_voltage_v(per_asic_mv: u16, voltage_domains: u16) -> f32 {
+    (per_asic_mv as f32 / 1000.0) * voltage_domains as f32
+}
+
 // ─── HALPWR-6: HAL-level non-zero fan floor while mining ──────────────────────
 //
 // `Emc2302::set_fan_speed`/`_float` (emc2302.rs) wrote raw PWM with NO lower
@@ -575,6 +599,47 @@ mod tests {
         // legitimate setpoint on the highest board is never refused.
         // Max=1550, Ultra=1400 (board.rs ceilings); 1600 covers them.
         assert!(DRIVER_VOLTAGE_CEILING_MV >= 1550);
+    }
+
+    #[test]
+    fn rail_voltage_is_per_asic_times_domains_for_every_shipped_topology() {
+        // Single-domain boards: the rail IS the per-ASIC value.
+        assert!((rail_voltage_v(1200, 1) - 1.200).abs() < 1e-6);
+        assert!((rail_voltage_v(1550, 1) - 1.550).abs() < 1e-6);
+
+        // Hammer BC0x — SHA-256, ~1.20 V/chip in series.
+        assert!((rail_voltage_v(1200, 2) - 2.400).abs() < 1e-6, "BC02");
+        assert!((rail_voltage_v(1200, 4) - 4.800).abs() < 1e-6, "BC04");
+
+        // Hammer DC0x — Scrypt, 0.635 V/chip in series. These reconstruct the
+        // vendor's own rail figures exactly, which is what proves the model
+        // number is the series count: 1.27 / 2.54 / 3.81 V.
+        assert!((rail_voltage_v(635, 2) - 1.270).abs() < 1e-6, "DC02");
+        assert!((rail_voltage_v(635, 4) - 2.540).abs() < 1e-6, "DC04");
+        assert!((rail_voltage_v(635, 6) - 3.810).abs() < 1e-6, "DC06");
+
+        // BitAxe GT / Hex: 3 series domains.
+        assert!((rail_voltage_v(1220, 3) - 3.660).abs() < 1e-6, "Hex/GT");
+    }
+
+    #[test]
+    fn rail_voltage_actually_multiplies_and_is_not_the_identity() {
+        // Mutation guard. Deleting the `* voltage_domains` in the production
+        // consumer previously left the ENTIRE host suite green while every
+        // multi-domain rail silently collapsed to the per-ASIC value. Assert the
+        // multiply is observable, not merely that some number comes back.
+        for domains in 2u16..=8 {
+            let rail = rail_voltage_v(635, domains);
+            let per_asic = rail_voltage_v(635, 1);
+            assert!(
+                rail > per_asic,
+                "rail for {domains} domains must exceed the single-domain value"
+            );
+            assert!(
+                (rail / per_asic - domains as f32).abs() < 1e-4,
+                "rail/per-asic must equal the domain count ({domains})"
+            );
+        }
     }
 
     #[test]

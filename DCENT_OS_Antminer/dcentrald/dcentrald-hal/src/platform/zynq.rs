@@ -3,7 +3,8 @@
 //! Supports the Xilinx Zynq 7010/7020 control boards used in Antminer S9, S17,
 //! and S19 series miners. FPGA UART FIFOs are accessed via UIO devices.
 //!
-//! Two Zynq sub-platforms exist:
+//! Three Zynq miner families exist. S17 and S19 share the AM2 FPGA topology,
+//! so UIO enumeration alone cannot distinguish their product identity.
 //!
 //! **S9 (am1-s9):**
 //!   - 3 hash chains (6, 7, 8) with 4 UIO devices each
@@ -12,7 +13,7 @@
 //!   - I2C bus 0 for PIC controllers (0x55-0x57)
 //!   - UIO names: "chain6-common", "chain7-cmd", etc.
 //!
-//! **S19 (am2-s17 control board):**
+//! **AM2 S17/S19 fabric:**
 //!   - 4 hash chains (1, 2, 3, 4) with 4 UIO devices each (only 3 physical boards)
 //!   - 1 fan controller UIO device (uio16)
 //!   - 1 board-control UIO device (uio17)
@@ -21,18 +22,20 @@
 //!   - UIO names: "chain1-common", "chain2-cmd-rx", etc.
 //!   - Additional PL UARTs at 0x41001000-0x41031000
 //!
-//! Auto-discovery: scan /sys/class/uio/uioN/name for device names.
-//! The chain naming pattern ("chain6" vs "chain1") determines the sub-platform.
+//! Auto-discovery scans `/sys/class/uio/uioN/name`. Exact `chain6..8` roles
+//! identify S9 capabilities. Exact `chain1..4` roles identify the shared AM2
+//! fabric, but product identity must come from `board_target` or device-tree
+//! evidence because S17 and S19 cannot be separated by their UIO census.
 
 use std::collections::HashMap;
 use std::fs;
 
 use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform, VoltageControllerKind};
 use crate::board_control::BoardControl;
-use crate::fan::{FanController, FanVariant};
+use crate::fan::{Am2FanModePolicy, FanController, FanVariant};
 use crate::fpga_chain::FpgaChain;
 use crate::glitch_monitor::BraiinsGlitchMonitor;
-use crate::gpio::GpioController;
+use crate::gpio::{GpioController, GpioLayout};
 use crate::i2c::I2cBus;
 use crate::{HalError, Result};
 
@@ -45,16 +48,9 @@ const AM2_S17_PSU_ENABLE_GPIO: u32 = 907;
 /// Chain IDs used on S9 boards (match physical connector labels).
 const S9_CHAIN_IDS: [u8; 3] = [6, 7, 8];
 
-/// Chain IDs used on S17 boards. The S17 control board is the original
-/// am1-s17 SKU — it physically reuses the S9 18-pin hash-board connector
-/// and BraiinsOS s9io-style FPGA UIO map, with chains numbered 6/7/8 to
-/// match the silkscreen on the control board. Disambiguation from S9 is
-/// done via `/etc/dcentos/board_target` ("am1-s17") + dsPIC33EP16GS202
-/// detection, NOT chain numbering.
-const S17_CHAIN_IDS: [u8; 3] = [6, 7, 8];
-
-/// Chain IDs used on S19/am2-s17 boards (1-indexed, 4 slots in FPGA).
-const S19_CHAIN_IDS: [u8; 4] = [1, 2, 3, 4];
+/// AM2 chain IDs proven by held S17 and S19-family UIO censuses. All four
+/// logical groups exist even when only three physical hashboards are fitted.
+const AM2_CHAIN_IDS: [u8; 4] = [1, 2, 3, 4];
 
 /// Zynq sub-platform type (detected from UIO device names + board_target).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,31 +58,29 @@ pub enum ZynqVariant {
     /// S9 (am1-s9): 3×63 BM1387 chains numbered 6/7/8.
     /// PIC16F1704 voltage controllers at I2C 0x55-0x57. 512 MB RAM.
     S9,
-    /// S17 (`board_target` token "am1-s17"): 3×48 BM1397 chains numbered
-    /// 6/7/8. dsPIC33EP16GS202 voltage controllers (NOT PIC16F1704). 228 MB
+    /// S17 (`board_target` token "am2-s17p"): three populated 48-chip BM1397
+    /// chains in a four-slot FPGA topology numbered 1/2/3/4. 256 MB
     /// RAM — significantly less than S9, so the daemon must run with a
     /// tighter tokio worker pool and blocking-thread budget.
-    /// Disambiguated from S9 via `/etc/dcentos/board_target` ("am1-s17").
+    /// Disambiguated through exact product identity, normally the installed
+    /// `/etc/dcentos/board_target` token `am2-s17p`.
     ///
     /// SoC classification (CANONICAL — see memory rule
     /// ): the S17 control
     /// board is a **Zynq 7007S = `am2`** board, NOT `am1` (7010). The
     /// `am1-s17` `board_target` token does NOT assert an am1 SoC — it is a
     /// legacy label meaning "S9-lineage chain layout / s9io-style FPGA UIO
-    /// map" (S17 physically reuses the S9 18-pin hash-board connector and
-    /// s9io bitstream lineage, hence chains 6/7/8). The Buildroot side of
+    /// map". Held live evidence supersedes that naming inference: S17 exposes
+    /// the AM2 chain1..4 fabric. The Buildroot side of
     /// S17 belongs to the `am2-s17pro-zynq` variant family — there is
     /// deliberately NO `am1-s17` Buildroot defconfig (that would be the
     /// am1/am2 inversion the canonical rule exists to prevent). The
     /// `am1-s17` string is retained only for backward compatibility with
     /// the post-build evidence file + toolbox route keys + the unit tests
     /// below; renaming it is tracked naming debt, not a correctness bug.
-    /// XXX: confirm against live S17 — UIO naming pattern is assumed
-    /// identical to S9 (chain6/7/8) based on shared 18-pin connector +
-    /// s9io bitstream lineage; live UIO scan needed for first S17 unit.
     S17,
-    /// S19 (am2-s17 control board): 4 chains numbered 1/2/3/4, UIO names "chain1-*" through "chain4-*"
-    /// (also covers Zynq variant of S19j Pro .139)
+    /// S19 family on the shared AM2 fabric: 4 logical chains numbered 1/2/3/4,
+    /// UIO names `chain1-*` through `chain4-*` (also the Zynq S19j Pro lane).
     S19,
 }
 
@@ -95,21 +89,30 @@ impl ZynqVariant {
     pub fn fan_variant(self) -> FanVariant {
         match self {
             ZynqVariant::S9 => FanVariant::Am1S9,
-            // S17 reuses the s9io fan-control IP (am1-class layout — 2 PWM
-            // outputs, 2 tach channels). XXX: confirm against live S17.
-            ZynqVariant::S17 => FanVariant::Am1S9,
+            ZynqVariant::S17 => FanVariant::Am2Uio16,
             ZynqVariant::S19 => FanVariant::Am2Uio16,
+        }
+    }
+
+    /// Whether opening the fan block may rewrite board-control into C52 mode.
+    pub fn fan_mode_policy(self) -> Am2FanModePolicy {
+        match self {
+            // The C52 write is proven on bounded S19-family captures. The S17
+            // capture proves the four-channel fan layout but not equivalent
+            // semantics for board-control +0x04, so preserve it.
+            ZynqVariant::S19 => Am2FanModePolicy::EnableC52,
+            ZynqVariant::S9 | ZynqVariant::S17 => Am2FanModePolicy::Preserve,
         }
     }
 
     /// Whether this variant has an am2 board-control IP at 0x42810000.
     pub fn has_board_control_ip(self) -> bool {
-        matches!(self, ZynqVariant::S19)
+        matches!(self, ZynqVariant::S17 | ZynqVariant::S19)
     }
 
     /// Whether this variant has an am2 glitch-monitor IP at 0x43D00000.
     pub fn has_glitch_monitor_ip(self) -> bool {
-        matches!(self, ZynqVariant::S19)
+        matches!(self, ZynqVariant::S17 | ZynqVariant::S19)
     }
 
     /// Tokio worker-thread count recommended for this variant.
@@ -161,16 +164,46 @@ pub struct ZynqPlatform {
     glitch_monitor_uio: Option<u8>,
     /// UIO base numbers for each chain (chain_id -> uio_base).
     chain_uio_bases: HashMap<u8, u8>,
-    /// Detected Zynq sub-platform (S9 vs S19).
+    /// Detected Zynq product/capability route (S9, S17, or S19 family).
     variant: ZynqVariant,
 }
 
 impl ZynqPlatform {
+    /// Open exact S19/AM2 cooling custody and require the independent
+    /// board-control C52 transition to be observed. Generic `Platform::open_fan`
+    /// remains compatible, while hardware-owning S19 routes use this narrower
+    /// fail-closed constructor before energizing hashboards.
+    ///
+    /// Home-profile admission is the pure [`dcentrald_common::admit_home_am2_s19_c52`]
+    /// policy (P1-7); this constructor always requires the C52 receipt because
+    /// it is the hardware-owning S19 path used before rail energize.
+    pub fn open_am2_s19_fan_controller_checked(&self) -> Result<FanController> {
+        if self.variant != ZynqVariant::S19 {
+            return Err(HalError::Fan(format!(
+                "checked AM2 S19 fan custody requires ZynqVariant::S19, got {:?}",
+                self.variant
+            )));
+        }
+        let fan = FanController::open_with_variant_and_mode_policy(
+            self.fan_uio,
+            FanVariant::Am2Uio16,
+            Am2FanModePolicy::EnableC52,
+        )?;
+        let receipt_low = fan
+            .am2_c52_fan_mode_status()
+            .map(|s| (s.after & 0xff) as u8);
+        // Fail-closed via the shared pure policy (home AM2-S19). Lab soft-prefer
+        // is intentionally not used here: this API is the energize custody gate.
+        dcentrald_common::admit_home_am2_s19_c52(receipt_low)
+            .map_err(|e| HalError::Fan(format!("AM2 S19 C52 cooling custody refused: {e}")))?;
+        Ok(fan)
+    }
+
     /// Create a new Zynq platform instance.
     ///
-    /// Scans UIO devices and builds the device map. Auto-detects whether this
-    /// is an S9 (am1-s9) or S19 (am2-s17) control board based on UIO device
-    /// naming patterns and device count.
+    /// Scans UIO devices and builds the device map. Product identity is taken
+    /// from the installed target or device tree before topology evidence; UIO
+    /// names alone intentionally cannot choose between S17 and S19 on AM2.
     pub fn new() -> Result<Self> {
         let devices = scan_uio_devices()?;
         tracing::info!(count = devices.len(), "Discovered UIO devices");
@@ -179,10 +212,9 @@ impl ZynqPlatform {
             tracing::debug!(uio = dev.number, name = %dev.name, "UIO device");
         }
 
-        // Detect Zynq sub-platform from UIO naming pattern.
-        // S19/am2-s17 uses 1-indexed chain names ("chain1-common", "chain2-cmd-rx")
-        // S9 uses connector-numbered chain names ("chain6-common", "chain7-cmd")
-        // Also: S19 has 19 UIO devices, S9 has ~14.
+        // Detect the product route from exact identity first. UIO topology is
+        // only a capability fallback: chain6..8 is S9-specific, while the
+        // chain1..4 AM2 fabric is shared by held S17 and S19-family censuses.
         let variant = detect_zynq_variant(&devices).ok_or_else(|| {
             HalError::Platform(
                 "Zynq variant detection inconclusive; refusing to default to S9".into(),
@@ -192,20 +224,19 @@ impl ZynqPlatform {
 
         let chain_ids: &[u8] = match variant {
             ZynqVariant::S9 => &S9_CHAIN_IDS,
-            ZynqVariant::S17 => &S17_CHAIN_IDS,
-            ZynqVariant::S19 => &S19_CHAIN_IDS,
+            ZynqVariant::S17 | ZynqVariant::S19 => &AM2_CHAIN_IDS,
         };
 
         // Find fan controller
-        let fan_uio = find_uio_by_pattern(&devices, "fan")
+        let fan_uio = find_uio_by_name(&devices, "fan-control")
             .ok_or_else(|| HalError::Platform("fan controller UIO not found".into()))?;
 
         // am2-only IP blocks — optional (absent on S9 am1-s9 bitstream).
-        let board_control_uio = find_uio_by_pattern(&devices, "board-control");
-        let glitch_monitor_uio = find_uio_by_pattern(&devices, "glitch-monitor")
-            .or_else(|| find_uio_by_pattern(&devices, "glitch"));
+        let board_control_uio = find_uio_by_name(&devices, "board-control");
+        let glitch_monitor_uio = find_uio_by_name(&devices, "miner-glitch-monitor")
+            .or_else(|| find_uio_by_name(&devices, "glitch-monitor"));
 
-        if variant == ZynqVariant::S19 {
+        if variant.has_board_control_ip() {
             if board_control_uio.is_none() {
                 tracing::warn!(
                     "am2 variant detected but no 'board-control' UIO device found — \
@@ -220,73 +251,7 @@ impl ZynqPlatform {
             }
         }
 
-        // Find chain UIO bases.
-        // UIO names contain "chain<N>" where N is the chain ID.
-        // Each chain has 4 UIO devices: common, cmd(-rx), work-rx, work-tx.
-        // The lowest UIO number in the group is the base.
-        let mut chain_uio_bases = HashMap::new();
-
-        for &chain_id in chain_ids {
-            let pattern = format!("chain{}", chain_id);
-            let chain_devices: Vec<&UioInfo> = devices
-                .iter()
-                .filter(|d| d.name.contains(&pattern))
-                .collect();
-
-            if chain_devices.len() >= 4 {
-                let mut sorted: Vec<u8> = chain_devices.iter().map(|d| d.number).collect();
-                sorted.sort();
-                chain_uio_bases.insert(chain_id, sorted[0]);
-                tracing::info!(
-                    chain_id,
-                    uio_base = sorted[0],
-                    "Mapped chain to UIO devices"
-                );
-            } else if !chain_devices.is_empty() {
-                tracing::warn!(
-                    chain_id,
-                    found = chain_devices.len(),
-                    "Incomplete chain UIO devices"
-                );
-            }
-        }
-
-        // Fallback: if name-based discovery fails, use positional mapping
-        if chain_uio_bases.is_empty() {
-            match variant {
-                ZynqVariant::S9 if devices.len() >= 12 => {
-                    tracing::warn!("Name-based UIO discovery failed, using S9 positional fallback");
-                    chain_uio_bases.insert(6, 0);
-                    chain_uio_bases.insert(7, 4);
-                    chain_uio_bases.insert(8, 8);
-                }
-                // S17 shares the s9io am1-class UIO layout (3 chains × 4 UIO
-                // devices each). XXX: confirm against live S17 — fallback
-                // assumes identical positional mapping to S9.
-                ZynqVariant::S17 if devices.len() >= 12 => {
-                    tracing::warn!(
-                        "Name-based UIO discovery failed, using S17 positional fallback"
-                    );
-                    chain_uio_bases.insert(6, 0);
-                    chain_uio_bases.insert(7, 4);
-                    chain_uio_bases.insert(8, 8);
-                }
-                ZynqVariant::S19 if devices.len() >= 16 => {
-                    tracing::warn!(
-                        "Name-based UIO discovery failed, using S19 positional fallback"
-                    );
-                    chain_uio_bases.insert(1, 0);
-                    chain_uio_bases.insert(2, 4);
-                    chain_uio_bases.insert(3, 8);
-                    chain_uio_bases.insert(4, 12);
-                }
-                _ => {}
-            }
-        }
-
-        if chain_uio_bases.is_empty() {
-            return Err(HalError::Platform("no hash chain UIO devices found".into()));
-        }
+        let chain_uio_bases = admit_chain_uio_topology(&devices, variant, chain_ids)?;
 
         Ok(Self {
             fan_uio,
@@ -405,25 +370,31 @@ impl Platform for ZynqPlatform {
         // 2-channel layout; am2-s17 uses the dedicated 4-channel fan-control
         // IP at 0x42800000 uio16.
         let fan_variant = self.variant.fan_variant();
-        let fan = FanController::open_with_variant(self.fan_uio, fan_variant)?;
+        let fan_mode_policy = self.variant.fan_mode_policy();
+        let fan = FanController::open_with_variant_and_mode_policy(
+            self.fan_uio,
+            fan_variant,
+            fan_mode_policy,
+        )?;
         tracing::info!(
             uio = self.fan_uio,
             variant = ?fan_variant,
+            mode_policy = ?fan_mode_policy,
             "Opened fan controller with detected variant"
         );
         Ok(Box::new(fan))
     }
 
     fn open_gpio(&self) -> Result<Box<dyn GpioAccess>> {
-        // CE-005: wrap the existing AXI-GPIO `/dev/mem` controller (gpio.rs).
-        // The Zynq bitstream exposes hash-board plug-detect (input bank
-        // 0x41200000 bits 5-7) and per-chain RESET (output bank 0x41210000
-        // bits 9-11) as memory-mapped AXI GPIO. `GpioController::new()` mmaps
-        // both banks; this just adapts it to the `GpioAccess` trait. Reads are
-        // always safe; the only write path is `set_board_reset`, which RMWs a
-        // single reset bit (never touches the PWR_CONTROL/PSU gate — that lives
-        // on a different bank and is owned by the PSU module).
-        let controller = GpioController::new()?;
+        // Both families expose the same AXI-GPIO base addresses, but the bit
+        // assignments differ materially. S9 uses plug 5..7/reset 9..11;
+        // held S17 and S19 AM2 evidence uses plug/reset 0..2. An explicit
+        // layout prevents a correct address from masking a wrong-pin write.
+        let layout = match self.variant {
+            ZynqVariant::S9 => GpioLayout::Am1S9,
+            ZynqVariant::S17 | ZynqVariant::S19 => GpioLayout::Am2,
+        };
+        let controller = GpioController::new_with_layout(layout)?;
         Ok(Box::new(ZynqGpioAccess { controller }))
     }
 
@@ -441,9 +412,8 @@ impl Platform for ZynqPlatform {
 /// `GpioAccess` adapter over the AXI-GPIO `/dev/mem` controller.
 ///
 /// Bridges the platform-neutral [`GpioAccess`] trait to [`GpioController`]
-/// (gpio.rs). The chain index is the GpioController 0/1/2 convention (0=J6,
-/// 1=J7, 2=J8), matching the `set_board_enable` mapping — NOT the FPGA UIO
-/// chain IDs (6/7/8 on S9, 1-4 on am2).
+/// (gpio.rs). The chain argument is a physical-board index 0/1/2, not the
+/// FPGA's external chain label (6/7/8 on S9 or logical slot 1..4 on AM2).
 struct ZynqGpioAccess {
     controller: GpioController,
 }
@@ -559,6 +529,18 @@ impl FanAccess for FanController {
         FanController::set_speed(self, pwm);
     }
 
+    fn set_speed_checked(&self, pwm: u8) -> Result<super::FanCommandReceipt> {
+        let requested = pwm.min(crate::fan::PWM_MAX);
+        FanController::set_speed(self, requested);
+        let (rear, front) = FanController::get_speed_pwm_channels(self);
+        if rear != front {
+            return Err(HalError::Fan(format!(
+                "Zynq fan PWM channels disagree after command: rear={rear}, front={front}"
+            )));
+        }
+        super::FanCommandReceipt::from_matching_readback(requested, rear)
+    }
+
     fn get_rpm(&self) -> u32 {
         FanController::get_rpm(self)
     }
@@ -572,8 +554,7 @@ impl FanAccess for FanController {
     }
 
     fn fan_count(&self) -> u8 {
-        // Dynamic: matches get_per_fan_rpm() which skips Fan 0 if not connected
-        self.get_per_fan_rpm().len() as u8
+        self.variant().physical_fan_count()
     }
 }
 
@@ -608,12 +589,210 @@ fn scan_uio_devices() -> Result<Vec<UioInfo>> {
     Ok(devices)
 }
 
-/// Find a UIO device number by name pattern.
-fn find_uio_by_pattern(devices: &[UioInfo], pattern: &str) -> Option<u8> {
+/// Find a UIO device number by its exact kernel sysfs name.
+fn find_uio_by_name(devices: &[UioInfo], name: &str) -> Option<u8> {
     devices
         .iter()
-        .find(|d| d.name.to_lowercase().contains(pattern))
+        .filter(|device| device.name.trim() == name)
+        .min_by_key(|device| device.number)
         .map(|d| d.number)
+}
+
+/// Return the fixed role index for an exact `chain<N>-<role>` UIO name.
+fn chain_role(name: &str, chain_id: u8) -> Option<usize> {
+    let prefix = format!("chain{chain_id}-");
+    match name.strip_prefix(&prefix)? {
+        "common" => Some(0),
+        "cmd" | "cmd-rx" => Some(1),
+        "work-rx" => Some(2),
+        "work-tx" => Some(3),
+        _ => None,
+    }
+}
+
+/// Map every complete chain-UIO group present on this fabric.
+///
+/// **Partial population is the NORMAL live case, not an error.** Requiring all
+/// `chain_ids.len()` groups contradicts our own captured evidence and would
+/// take live-proven units offline at platform construction:
+///
+///   * `a lab unit` (XIL S19j Pro) exposes only TWO complete groups — uio4-7 =
+///     `chain2-*` and uio12-15 = `chain4-*`
+///.
+///   * `a lab unit` unbinds `43c03000.chain1-work-tx` to free IRQ 165 for `of_serial`
+///     in exactly the configuration that produced the proven standalone mining
+///     run.
+///
+/// Exactness is still enforced PER GROUP by [`discover_chain_uio_base`] (roles
+/// unique AND contiguous). Only the *count* is relaxed: an unpopulated or
+/// deliberately-unbound slot is the absence of a chain, never evidence of a
+/// corrupt fabric. A fabric with zero usable chains still fails closed.
+///
+/// Pure over a device census so the live topologies above are host-testable.
+fn admit_chain_uio_topology(
+    devices: &[UioInfo],
+    variant: ZynqVariant,
+    chain_ids: &[u8],
+) -> Result<HashMap<u8, u8>> {
+    // Substring counting is unsafe: `chain1` also matches `chain10`, and four
+    // arbitrary matches do not prove the required
+    // common/cmd-rx/work-rx/work-tx role ordering.
+    let mut chain_uio_bases = HashMap::new();
+
+    for &chain_id in chain_ids {
+        if let Some(base) = discover_chain_uio_base(devices, chain_id) {
+            chain_uio_bases.insert(chain_id, base);
+            tracing::info!(chain_id, uio_base = base, "Mapped chain to UIO devices");
+        } else if devices
+            .iter()
+            .any(|device| chain_role(&device.name, chain_id).is_some())
+        {
+            tracing::warn!(
+                chain_id,
+                "Incomplete, duplicated, or non-contiguous chain UIO roles"
+            );
+        }
+    }
+
+    // Fallback: if name-based discovery fails entirely, use positional mapping.
+    if chain_uio_bases.is_empty() {
+        match variant {
+            ZynqVariant::S9 if devices.len() >= 12 => {
+                // Bases 1/5/9, NOT 0/4/8.
+                //
+                // The live S9 census is uio0 `fan-control`, uio1-4 `chain6-*`,
+                // uio5-8 `chain7-*`, uio9-12 `chain8-*`, uio13
+                // `miner-glitch-monitor`
+                // (:97-106`,
+                // corroborated by `LIVE_RECON_FLEET.md`). The canonical driver
+                // table agrees: `dcentrald-asic/src/drivers/mod.rs` pins
+                // `uio_bases: &[1, 5, 9]` for BM1387/S9.
+                //
+                // The previous 0/4/8 mapping was off by one and put chain6 on
+                // uio0 — the FAN-CONTROL block. Since `FpgaChain::open` maps
+                // `base..base+3`, that fallback would have issued hash-chain
+                // command/FIFO writes into the fan controller. Only reachable
+                // when name-based discovery fails entirely, which is why it
+                // survived unnoticed.
+                tracing::warn!("Name-based UIO discovery failed, using S9 positional fallback");
+                chain_uio_bases.insert(6, 1);
+                chain_uio_bases.insert(7, 5);
+                chain_uio_bases.insert(8, 9);
+            }
+            _ => {}
+        }
+    }
+
+    if chain_uio_bases.is_empty() {
+        return Err(HalError::Platform(format!(
+            "no complete hash-chain UIO group found for {variant:?}: expected exact \
+             common/cmd-rx/work-rx/work-tx roles for any of {chain_ids:?}"
+        )));
+    }
+
+    let missing: Vec<u8> = chain_ids
+        .iter()
+        .copied()
+        .filter(|id| !chain_uio_bases.contains_key(id))
+        .collect();
+    if !missing.is_empty() {
+        tracing::info!(
+            variant = ?variant,
+            mapped = chain_uio_bases.len(),
+            slots = chain_ids.len(),
+            ?missing,
+            "Partially populated chain-UIO topology (unpopulated or deliberately \
+             unbound slots); continuing with the complete groups"
+        );
+    }
+
+    Ok(chain_uio_bases)
+}
+
+/// Discover one chain only when all four named roles are unique and occupy a
+/// contiguous UIO group in hardware order.
+fn discover_chain_uio_base(devices: &[UioInfo], chain_id: u8) -> Option<u8> {
+    let mut role_numbers = [None; 4];
+    for device in devices {
+        let Some(role) = chain_role(&device.name, chain_id) else {
+            continue;
+        };
+        if role_numbers[role].replace(device.number).is_some() {
+            return None;
+        }
+    }
+
+    let base = role_numbers[0]?;
+    for (role, number) in role_numbers.into_iter().enumerate() {
+        if number != base.checked_add(role as u8) {
+            return None;
+        }
+    }
+    Some(base)
+}
+
+/// Product-independent FPGA fabric topology proven from complete, exact UIO
+/// role groups. Unlike [`ZynqVariant`], this observation never consults an
+/// installed target marker or device-tree product string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZynqFabricTopology {
+    S9,
+    Am2,
+}
+
+fn exact_zynq_fabric_topology(devices: &[UioInfo]) -> Option<ZynqFabricTopology> {
+    let has_any_s9_role = S9_CHAIN_IDS.iter().any(|&chain_id| {
+        devices
+            .iter()
+            .any(|device| chain_role(&device.name, chain_id).is_some())
+    });
+    let has_any_am2_role = AM2_CHAIN_IDS.iter().any(|&chain_id| {
+        devices
+            .iter()
+            .any(|device| chain_role(&device.name, chain_id).is_some())
+    });
+    // At least ONE exact complete group proves the fabric — not all of them.
+    //
+    // This must agree with `admit_chain_uio_topology`, or the availability
+    // failure is merely RELOCATED instead of fixed. This function feeds
+    // `detect_exact_zynq_fabric_topology` -> `detect_control_board` ->
+    // `PlatformIdentitySnapshot::observed_control_board`, which both
+    // `admit_s19j_hybrid_route` and `admit_am2_bm1362_serial_route` compare
+    // against `OBSERVED_CONTROL_BOARD_ZYNQ_AM2`. Requiring all four groups here
+    // resolves `a lab unit`/`a lab unit` to "Zynq ambiguous" and REFUSES AM2 route admission
+    // whenever mining is enabled — a harder gate than the one in
+    // `ZynqPlatform::new()`.
+    //
+    // Exclusivity below is unchanged and still fail-closed: a census with any
+    // role from BOTH families, or with roles but no complete group at all,
+    // resolves to `None`.
+    let complete_s9 = S9_CHAIN_IDS
+        .iter()
+        .any(|&chain_id| discover_chain_uio_base(devices, chain_id).is_some());
+    let complete_am2 = AM2_CHAIN_IDS
+        .iter()
+        .any(|&chain_id| discover_chain_uio_base(devices, chain_id).is_some());
+
+    match (complete_s9, complete_am2, has_any_s9_role, has_any_am2_role) {
+        (true, false, true, false) => Some(ZynqFabricTopology::S9),
+        (false, true, false, true) => Some(ZynqFabricTopology::Am2),
+        _ => None,
+    }
+}
+
+/// Passively prove the live FPGA fabric without opening UIO or MMIO devices.
+///
+/// A stale/cross-flashed board target must not authorize AM1 devmem access on
+/// an AM2 fabric. The caller receives an error for incomplete, duplicated,
+/// unnamed, or mixed role evidence rather than a positional/count fallback.
+pub fn detect_exact_zynq_fabric_topology() -> Result<ZynqFabricTopology> {
+    let devices = scan_uio_devices()?;
+    exact_zynq_fabric_topology(&devices).ok_or_else(|| {
+        HalError::Platform(
+            "exact Zynq FPGA fabric topology is incomplete, mixed, duplicated, or unnamed"
+                .to_string(),
+        )
+    })
 }
 
 fn normalize_model_token(model: &str) -> String {
@@ -625,18 +804,15 @@ fn normalize_model_token(model: &str) -> String {
         .collect()
 }
 
-/// Detect whether this Zynq board is an S9 (am1-s9), S17 (am1-s17),
-/// or S19 (am2-s17 control board, includes Zynq-variant S19j Pro).
+/// Detect whether this Zynq board is an S9, S17, or S19-family target.
 ///
 /// Detection strategy (in priority order):
 /// 1. `/etc/dcentos/board_target` (Buildroot post-build evidence — most
 ///    authoritative; `am1-s9` / `am1-s17` / `am2-s19j`).
-/// 2. UIO device names + count: S19 has "chain1-*" through "chain4-*"
-///    (≥19 UIO devices); S9 / S17 have "chain6-*"/"chain7-*"/"chain8-*"
-///    (~12-14 UIO devices). UIO names alone CANNOT distinguish S9 from S17
-///    because both reuse the same s9io bitstream layout — the disambiguator
-///    is `board_target` or the device-tree model.
-/// 3. Device-tree model string: "am1-s9", "am1-s17", "am2-s17", etc.
+/// 2. Device-tree model string when it contains product evidence.
+/// 3. Exact UIO role names: chain6..8 can identify S9, but chain1..4 only
+///    identifies the shared AM2 capability fabric and remains ambiguous
+///    between S17 and S19-family products.
 ///
 /// Returns `None` when detection is ambiguous so the constructor refuses
 /// chain init instead of routing to a default fan/voltage backend.
@@ -656,36 +832,8 @@ fn detect_zynq_variant_from_evidence(
         return Some(v);
     }
 
-    // Check UIO names: S19 uses "chain1-*", S9/S17 use "chain6-*".
-    let has_chain1 = devices.iter().any(|d| d.name.contains("chain1"));
-    let has_chain6 = devices.iter().any(|d| d.name.contains("chain6"));
-
-    if has_chain1 && !has_chain6 {
-        tracing::info!(source = "uio_chain1", "Zynq variant detected: S19");
-        return Some(ZynqVariant::S19);
-    }
-
-    if has_chain1 {
-        tracing::warn!(
-            source = "uio_chain1_conflict",
-            "Zynq variant detected as S19 from am2 chain UIO names despite mixed chain evidence"
-        );
-        return Some(ZynqVariant::S19);
-    }
-
-    // Check device count: S19 has 19 UIO devices (4 chains * 4 + 3 system).
-    if devices.len() >= 19 {
-        tracing::info!(
-            source = "uio_count",
-            count = devices.len(),
-            "Zynq variant detected: S19"
-        );
-        return Some(ZynqVariant::S19);
-    }
-
-    // Try device tree model string. Note: am2-s17 control boards (S19/S19j)
-    // also report "S17" so we must check the am2/am1 prefix BEFORE the
-    // chip-family token. Order matters here.
+    // Device-tree product identity is stronger than the shared AM2 chain
+    // topology. A live S17 Pro and S19-family boards both expose chain1..4.
     if let Some(model) = dt_model {
         let model = model.trim().trim_end_matches('\0');
         let normalized = normalize_model_token(model);
@@ -695,9 +843,31 @@ fn detect_zynq_variant_from_evidence(
         }
     }
 
+    // UIO names can uniquely identify S9's chain6..8 topology, but chain1..4
+    // identifies only AM2 capabilities—not whether the attached miner is S17
+    // or S19. Mixed evidence is contradictory and must not be resolved by
+    // preference.
+    let has_chain1 = devices.iter().any(|d| chain_role(&d.name, 1).is_some());
+    let has_chain6 = devices.iter().any(|d| chain_role(&d.name, 6).is_some());
+
+    if has_chain1 && has_chain6 {
+        tracing::warn!(
+            source = "uio_chain_conflict",
+            "mixed S9 and AM2 chain UIO evidence; refusing variant selection"
+        );
+        return None;
+    }
+
     if has_chain6 {
         tracing::info!(source = "uio_chain6", "Zynq variant detected: S9");
         return Some(ZynqVariant::S9);
+    }
+    if has_chain1 {
+        tracing::warn!(
+            source = "uio_am2_ambiguous",
+            "AM2 chain1..4 topology cannot distinguish S17 from S19; exact identity required"
+        );
+        return None;
     }
     tracing::warn!("Zynq variant detection inconclusive; refusing default route");
     None
@@ -771,12 +941,15 @@ fn detect_zynq_variant_from_board_target(target: Option<&str>) -> Option<ZynqVar
 /// Pure helper: map a normalized device-tree model token to a `ZynqVariant`.
 ///
 /// `model` is expected to be lowercased + alnum-only (see `normalize_model_token`).
-/// Order: am2 prefix wins (it's the S19-class control board even when the
-/// silkscreen says "S17"); then am1-s17; then am1-s9; then chip-family
-/// fallbacks (S19/T19 → S19, S17/T17 → S17, S9/T9 → S9).
+/// Exact product evidence wins over carrier naming. A bare `am2` model, or the
+/// historically overloaded `am2-s17` combination, is ambiguous and cannot
+/// authorize S19-only behavior when installed target identity is absent.
 fn detect_zynq_variant_from_dt_model(model: &str) -> Option<ZynqVariant> {
     if model.contains("am2") {
-        return Some(ZynqVariant::S19);
+        if model.contains("s19") || model.contains("t19") {
+            return Some(ZynqVariant::S19);
+        }
+        return None;
     }
     if model.contains("am1s17") {
         return Some(ZynqVariant::S17);
@@ -807,6 +980,85 @@ mod tests {
             number,
             name: name.to_string(),
         }
+    }
+
+    fn chain_group(chain_id: u8, base: u8) -> Vec<UioInfo> {
+        vec![
+            uio(base, &format!("chain{chain_id}-common")),
+            uio(base + 1, &format!("chain{chain_id}-cmd-rx")),
+            uio(base + 2, &format!("chain{chain_id}-work-rx")),
+            uio(base + 3, &format!("chain{chain_id}-work-tx")),
+        ]
+    }
+
+    #[test]
+    fn exact_fabric_topology_requires_every_named_role_and_rejects_mixed_census() {
+        let mut s9 = Vec::new();
+        for (chain_id, base) in [(6, 1), (7, 5), (8, 9)] {
+            s9.extend(chain_group(chain_id, base));
+        }
+        assert_eq!(
+            exact_zynq_fabric_topology(&s9),
+            Some(ZynqFabricTopology::S9)
+        );
+
+        let mut am2 = Vec::new();
+        for (chain_id, base) in [(1, 0), (2, 4), (3, 8), (4, 12)] {
+            am2.extend(chain_group(chain_id, base));
+        }
+        assert_eq!(
+            exact_zynq_fabric_topology(&am2),
+            Some(ZynqFabricTopology::Am2)
+        );
+
+        // Partial population resolves the fabric: chain8 is incomplete but
+        // chain6/chain7 remain exact, which is a normal 2-populated S9. This
+        // MUST match `admit_chain_uio_topology`, otherwise the availability
+        // failure is relocated into route admission instead of fixed.
+        let mut partially_populated = s9.clone();
+        partially_populated.retain(|device| device.name != "chain8-work-tx");
+        assert_eq!(
+            exact_zynq_fabric_topology(&partially_populated),
+            Some(ZynqFabricTopology::S9)
+        );
+
+        // Relaxing the COUNT must not relax EXACTNESS: roles present but no
+        // single complete group anywhere still fails closed.
+        let mut no_complete_group = Vec::new();
+        for (chain_id, base) in [(6, 1), (7, 5), (8, 9)] {
+            let mut group = chain_group(chain_id, base);
+            group.retain(|device| !device.name.ends_with("work-tx"));
+            no_complete_group.extend(group);
+        }
+        assert_eq!(exact_zynq_fabric_topology(&no_complete_group), None);
+
+        let mut mixed = s9;
+        mixed.extend(chain_group(1, 20));
+        assert_eq!(exact_zynq_fabric_topology(&mixed), None);
+    }
+
+    /// The two live AM2 censuses must resolve to `Am2` here as well, not just
+    /// in `admit_chain_uio_topology` — otherwise `detect_control_board` reports
+    /// "Zynq ambiguous" and AM2 route admission refuses to mine.
+    #[test]
+    fn live_partial_am2_censuses_resolve_the_fabric_for_route_admission() {
+        // `a lab unit`: only chain2 (uio4-7) and chain4 (uio12-15) are complete.
+        let mut xil_109 = Vec::new();
+        xil_109.extend(chain_group(2, 4));
+        xil_109.extend(chain_group(4, 12));
+        assert_eq!(
+            exact_zynq_fabric_topology(&xil_109),
+            Some(ZynqFabricTopology::Am2)
+        );
+
+        // `a lab unit`: chain1-work-tx unbound to free IRQ 165 for `of_serial`.
+        let mut xil_25 = chain_group(1, 0);
+        xil_25.retain(|d| !d.name.ends_with("work-tx"));
+        xil_25.extend(chain_group(2, 4));
+        assert_eq!(
+            exact_zynq_fabric_topology(&xil_25),
+            Some(ZynqFabricTopology::Am2)
+        );
     }
 
     #[test]
@@ -936,10 +1188,14 @@ mod tests {
 
     #[test]
     fn test_zynq_variant_dt_model_disambiguation() {
-        // am2 prefix wins over chip family — S19/S19j control boards report
-        // both "am2" and "S17" in their device-tree model strings.
+        // The overloaded AM2+S17 carrier/model string is not product identity.
         assert_eq!(
             detect_zynq_variant_from_dt_model("am2s17minercontrolboard"),
+            None
+        );
+        assert_eq!(detect_zynq_variant_from_dt_model("am2controlboard"), None);
+        assert_eq!(
+            detect_zynq_variant_from_dt_model("am2s19minercontrolboard"),
             Some(ZynqVariant::S19)
         );
         assert_eq!(
@@ -963,17 +1219,24 @@ mod tests {
     }
 
     #[test]
-    fn zynq_uio_chain1_routes_to_s19_fan_controller() {
+    fn zynq_uio_chain1_topology_alone_is_product_ambiguous() {
         let devices = [uio(1, "chain1-common"), uio(16, "fan-control")];
 
         let variant = detect_zynq_variant_from_evidence(&devices, None, None);
 
-        assert_eq!(variant, Some(ZynqVariant::S19));
-        assert_eq!(variant.unwrap().fan_variant(), FanVariant::Am2Uio16);
+        assert_eq!(variant, None);
+        assert_eq!(
+            detect_zynq_variant_from_evidence(&devices, Some("am2-s19pro"), None),
+            Some(ZynqVariant::S19)
+        );
+        assert_eq!(
+            detect_zynq_variant_from_evidence(&devices, None, Some("Antminer S17 Pro")),
+            Some(ZynqVariant::S17)
+        );
     }
 
     #[test]
-    fn zynq_mixed_chain_evidence_prefers_am2_over_s9_default() {
+    fn zynq_mixed_chain_evidence_fails_closed() {
         let devices = [
             uio(1, "chain1-common"),
             uio(6, "chain6-common"),
@@ -982,7 +1245,17 @@ mod tests {
 
         assert_eq!(
             detect_zynq_variant_from_evidence(&devices, None, None),
-            Some(ZynqVariant::S19)
+            None
+        );
+    }
+
+    #[test]
+    fn zynq_chain10_name_does_not_alias_chain1_product_evidence() {
+        let devices = [uio(6, "chain6-common"), uio(10, "chain10-common")];
+
+        assert_eq!(
+            detect_zynq_variant_from_evidence(&devices, None, None),
+            Some(ZynqVariant::S9)
         );
     }
 
@@ -1025,22 +1298,139 @@ mod tests {
 
     #[test]
     fn test_fan_variant_per_zynq_variant() {
-        // S17 reuses am1-class fan-control IP (s9io bitstream lineage).
-        // XXX: confirm against live S17.
         assert_eq!(ZynqVariant::S9.fan_variant(), FanVariant::Am1S9);
-        assert_eq!(ZynqVariant::S17.fan_variant(), FanVariant::Am1S9);
+        assert_eq!(ZynqVariant::S17.fan_variant(), FanVariant::Am2Uio16);
         assert_eq!(ZynqVariant::S19.fan_variant(), FanVariant::Am2Uio16);
+        assert_eq!(
+            ZynqVariant::S17.fan_mode_policy(),
+            Am2FanModePolicy::Preserve
+        );
+        assert_eq!(
+            ZynqVariant::S19.fan_mode_policy(),
+            Am2FanModePolicy::EnableC52
+        );
     }
 
     #[test]
-    fn test_am2_specific_ips_only_on_s19() {
+    fn test_am2_specific_ips_exist_on_s17_and_s19() {
         // board-control + glitch-monitor IPs are am2 bitstream-only.
         assert!(!ZynqVariant::S9.has_board_control_ip());
-        assert!(!ZynqVariant::S17.has_board_control_ip());
+        assert!(ZynqVariant::S17.has_board_control_ip());
         assert!(ZynqVariant::S19.has_board_control_ip());
 
         assert!(!ZynqVariant::S9.has_glitch_monitor_ip());
-        assert!(!ZynqVariant::S17.has_glitch_monitor_ip());
+        assert!(ZynqVariant::S17.has_glitch_monitor_ip());
         assert!(ZynqVariant::S19.has_glitch_monitor_ip());
+    }
+
+    #[test]
+    fn held_s17_uio_census_maps_all_four_logical_slots_exactly() {
+        let mut devices = Vec::new();
+        for (chain_id, base) in [(1, 0), (2, 4), (3, 8), (4, 12)] {
+            devices.extend(chain_group(chain_id, base));
+        }
+        assert_eq!(discover_chain_uio_base(&devices, 1), Some(0));
+        assert_eq!(discover_chain_uio_base(&devices, 2), Some(4));
+        assert_eq!(discover_chain_uio_base(&devices, 3), Some(8));
+        assert_eq!(discover_chain_uio_base(&devices, 4), Some(12));
+        assert_eq!(discover_chain_uio_base(&devices, 6), None);
+    }
+
+    #[test]
+    fn exact_chain_roles_reject_aliases_duplicates_and_noncontiguous_groups() {
+        let chain10 = chain_group(10, 0);
+        assert_eq!(discover_chain_uio_base(&chain10, 1), None);
+
+        let mut duplicate = chain_group(1, 0);
+        duplicate.push(uio(20, "chain1-common"));
+        assert_eq!(discover_chain_uio_base(&duplicate, 1), None);
+
+        let mut noncontiguous = chain_group(1, 0);
+        noncontiguous[3].number = 9;
+        assert_eq!(discover_chain_uio_base(&noncontiguous, 1), None);
+
+        let s9 = chain_group(6, 0);
+        assert_eq!(discover_chain_uio_base(&s9, 6), Some(0));
+        assert_eq!(discover_chain_uio_base(&s9, 1), None);
+    }
+
+    /// LOAD-BEARING availability regression.
+    ///
+    /// A strict "all four groups must be present" rule takes both live-proven
+    /// XIL units offline inside `ZynqPlatform::new()` — *before* power
+    /// admission, so it is a hard abort rather than a degrade. Pin the two
+    /// captured censuses directly.
+    #[test]
+    fn partially_populated_am2_censuses_from_live_units_are_admitted() {
+        // `a lab unit` live census (probe-report.md): ONLY chain2 (uio4-7) and
+        // chain4 (uio12-15) are complete. chain1/chain3 are absent entirely.
+        let mut xil_109 = Vec::new();
+        xil_109.extend(chain_group(2, 4));
+        xil_109.extend(chain_group(4, 12));
+        xil_109.push(uio(16, "fan-control"));
+        xil_109.push(uio(17, "board-control"));
+        xil_109.push(uio(18, "miner-glitch-monitor"));
+
+        let mapped = admit_chain_uio_topology(&xil_109, ZynqVariant::S19, &AM2_CHAIN_IDS)
+            .expect("`a lab unit` two-complete-group census must be admitted, not refused");
+        assert_eq!(mapped.len(), 2, "only the complete groups are mapped");
+        assert_eq!(mapped.get(&2), Some(&4));
+        assert_eq!(mapped.get(&4), Some(&12));
+        assert_eq!(mapped.get(&1), None);
+
+        // `a lab unit` in its proven standalone-mining configuration: chain1-work-tx
+        // (uio3) is deliberately unbound to free IRQ 165 for `of_serial`, so
+        // chain1 is structurally incomplete while chain2 stays whole.
+        let mut xil_25 = chain_group(1, 0);
+        xil_25.retain(|d| !d.name.ends_with("work-tx"));
+        xil_25.extend(chain_group(2, 4));
+        xil_25.push(uio(16, "fan-control"));
+
+        let mapped = admit_chain_uio_topology(&xil_25, ZynqVariant::S19, &AM2_CHAIN_IDS)
+            .expect("`a lab unit` unbound work-tx census must be admitted, not refused");
+        assert_eq!(
+            mapped.get(&1),
+            None,
+            "an incomplete group must not be mapped"
+        );
+        assert_eq!(
+            mapped.get(&2),
+            Some(&4),
+            "the surviving complete group must still be usable"
+        );
+    }
+
+    /// The S9 positional fallback must never place a chain on uio0, which the
+    /// live census shows is `fan-control`. `FpgaChain::open` maps
+    /// `base..base+3`, so an off-by-one here writes hash-chain commands into
+    /// the fan controller.
+    #[test]
+    fn s9_positional_fallback_uses_live_bases_and_never_maps_a_chain_onto_fan_control() {
+        // 14 unnamed devices: name-based discovery finds nothing, so the
+        // positional fallback is the only path that can populate the map.
+        let unnamed: Vec<UioInfo> = (0..14).map(|n| uio(n, "unknown-ip")).collect();
+        let mapped = admit_chain_uio_topology(&unnamed, ZynqVariant::S9, &S9_CHAIN_IDS)
+            .expect("S9 positional fallback must still apply for a >=12 device census");
+
+        assert_eq!(mapped.get(&6), Some(&1), "chain6 base is uio1, not uio0");
+        assert_eq!(mapped.get(&7), Some(&5));
+        assert_eq!(mapped.get(&8), Some(&9));
+        assert!(
+            !mapped.values().any(|&base| base == 0),
+            "uio0 is fan-control on live S9 — no chain may be mapped onto it"
+        );
+    }
+
+    #[test]
+    fn a_fabric_with_no_complete_chain_group_still_fails_closed() {
+        // Relaxing the count must not relax exactness: roles present but
+        // non-contiguous yields zero complete groups and must refuse.
+        let mut broken = chain_group(1, 0);
+        broken[3].number = 9;
+        broken.push(uio(16, "fan-control"));
+        assert!(
+            admit_chain_uio_topology(&broken, ZynqVariant::S19, &AM2_CHAIN_IDS).is_err(),
+            "zero complete groups must fail closed"
+        );
     }
 }

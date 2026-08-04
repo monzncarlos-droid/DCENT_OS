@@ -16,6 +16,7 @@ use log::warn;
 use sha2::{Digest, Sha256};
 
 use crate::types::{StratumJob, MAX_EXTRANONCE2_SIZE, PDIFF1_TARGET};
+use dcentaxe_asic::common::PowAlgorithm;
 
 // ---------------------------------------------------------------------------
 // MiningWork — the ASIC-ready work unit
@@ -61,6 +62,11 @@ pub struct MiningWork {
 
     /// Pool share target (32 bytes, big-endian).
     pub share_target: [u8; 32],
+
+    /// Proof-of-work algorithm this work unit is mined under (P1 Scrypt seam).
+    /// Always `Sha256d` on every shipping path today; `Scrypt1024` work is
+    /// fail-closed (empty midstates, reject-all share_target) until P2.
+    pub algorithm: PowAlgorithm,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,17 +91,40 @@ pub struct WorkBuilder {
 
     /// Current pool difficulty.
     difficulty: f64,
+
+    /// Proof-of-work algorithm every emitted [`MiningWork`] is stamped with.
+    /// `Sha256d` unless the production caller (the dispatcher, from
+    /// `DispatcherConfig::algorithm`) selects otherwise.
+    algorithm: PowAlgorithm,
 }
 
 impl WorkBuilder {
     pub fn new(extranonce1: &str, extranonce2_size: usize) -> Self {
+        Self::new_for_algorithm(extranonce1, extranonce2_size, PowAlgorithm::Sha256d)
+    }
+
+    /// Algorithm-explicit constructor (P1 Scrypt seam). The dispatcher's
+    /// production WorkBuilder construction sites use this with
+    /// `DispatcherConfig::algorithm`, so the algorithm threads
+    /// config → builder → `MiningWork` without any hidden default.
+    pub fn new_for_algorithm(
+        extranonce1: &str,
+        extranonce2_size: usize,
+        algorithm: PowAlgorithm,
+    ) -> Self {
         Self {
             extranonce1: hex::decode(extranonce1).unwrap_or_default(),
             extranonce2_size: extranonce2_size.clamp(1, MAX_EXTRANONCE2_SIZE),
             extranonce2_counter: 0,
             version_mask: 0,
             difficulty: 1.0,
+            algorithm,
         }
+    }
+
+    /// The algorithm this builder stamps on emitted work.
+    pub fn pow_algorithm(&self) -> PowAlgorithm {
+        self.algorithm
     }
 
     /// Update extranonce1 (e.g., after mining.set_extranonce).
@@ -183,45 +212,51 @@ impl WorkBuilder {
         // First 28 bytes of merkle root
         header_prefix[36..64].copy_from_slice(&merkle_root[0..28]);
 
-        // Step 7: Compute midstate(s)
+        // Step 7: Compute midstate(s) — SHA-256d ONLY. Midstates are a SHA-256
+        // block-boundary concept; scrypt cannot be split at a midstate (design
+        // §2.2), so `Scrypt1024` emits header fields only (empty vec). The
+        // Sha256d branch below is byte-identical to the pre-seam code.
         let mut midstates = Vec::with_capacity(4);
 
-        // Midstate 0: original version
-        midstates.push(compute_midstate(&header_prefix));
+        if self.algorithm == PowAlgorithm::Sha256d {
+            // Midstate 0: original version
+            midstates.push(compute_midstate(&header_prefix));
 
-        // If version rolling is active, compute up to 3 additional midstates for
-        // DISTINCT rolled versions. `increment_bitmask` advances the masked bits
-        // like a counter, so a mask with fewer than 2 free bits in the roll
-        // region cycles with a short period (a 1-bit mask has period 2). Emitting
-        // the duplicate rolls anyway wasted ASICBoost midstate slots hashing an
-        // identical search space AND caused duplicate-share rejects (a nonce
-        // found under one slot is re-found under its clone). Stop at the first
-        // repeat so only distinct midstates are sent: the BM1397 driver honors
-        // `midstates.len()` (num_midstates) and the dispatcher reconstructs the
-        // version by midstate index via this same `increment_bitmask` chain, so
-        // the reduced count stays exactly consistent end-to-end.
-        if self.version_mask != 0 {
-            let mut rolled_version = version;
-            let mut seen = [version, 0, 0, 0];
-            let mut distinct = 1usize;
-            for _ in 0..3 {
-                rolled_version = increment_bitmask(rolled_version, self.version_mask);
-                if seen[..distinct].contains(&rolled_version) {
-                    break;
+            // If version rolling is active, compute up to 3 additional midstates for
+            // DISTINCT rolled versions. `increment_bitmask` advances the masked bits
+            // like a counter, so a mask with fewer than 2 free bits in the roll
+            // region cycles with a short period (a 1-bit mask has period 2). Emitting
+            // the duplicate rolls anyway wasted ASICBoost midstate slots hashing an
+            // identical search space AND caused duplicate-share rejects (a nonce
+            // found under one slot is re-found under its clone). Stop at the first
+            // repeat so only distinct midstates are sent: the BM1397 driver honors
+            // `midstates.len()` (num_midstates) and the dispatcher reconstructs the
+            // version by midstate index via this same `increment_bitmask` chain, so
+            // the reduced count stays exactly consistent end-to-end.
+            if self.version_mask != 0 {
+                let mut rolled_version = version;
+                let mut seen = [version, 0, 0, 0];
+                let mut distinct = 1usize;
+                for _ in 0..3 {
+                    rolled_version = increment_bitmask(rolled_version, self.version_mask);
+                    if seen[..distinct].contains(&rolled_version) {
+                        break;
+                    }
+                    seen[distinct] = rolled_version;
+                    distinct += 1;
+                    header_prefix[0..4].copy_from_slice(&rolled_version.to_le_bytes());
+                    midstates.push(compute_midstate(&header_prefix));
                 }
-                seen[distinct] = rolled_version;
-                distinct += 1;
-                header_prefix[0..4].copy_from_slice(&rolled_version.to_le_bytes());
-                midstates.push(compute_midstate(&header_prefix));
             }
-        }
+        } // end Sha256d-only midstate computation
 
         // Step 8: Extract merkle4 (last 4 bytes of merkle root)
         let mut merkle4 = [0u8; 4];
         merkle4.copy_from_slice(&merkle_root[28..32]);
 
-        // Step 9: Compute share target from difficulty
-        let share_target = difficulty_to_target(self.difficulty);
+        // Step 9: Compute share target from difficulty (algorithm-dispatched;
+        // Sha256d is byte-identical to the pre-seam difficulty_to_target).
+        let share_target = difficulty_to_target_for(self.algorithm, self.difficulty);
 
         MiningWork {
             midstates,
@@ -235,6 +270,7 @@ impl WorkBuilder {
             job_id: job.job_id.clone(),
             extranonce2: extranonce2_hex,
             share_target,
+            algorithm: self.algorithm,
         }
     }
 
@@ -650,6 +686,90 @@ pub fn validate_full_header(header: &[u8; 80], share_target: &[u8; 32]) -> f64 {
     }
 }
 
+/// Algorithm-dispatched form of [`validate_full_header`] (P1 Scrypt seam).
+///
+/// `Sha256d` is byte-identical to [`validate_full_header`]. `Scrypt1024` is
+/// FAIL-CLOSED: every header is invalid (0.0) until P2 lands the host scrypt
+/// core — never guess Scrypt difficulty semantics here.
+pub fn validate_full_header_for(
+    algorithm: PowAlgorithm,
+    header: &[u8; 80],
+    share_target: &[u8; 32],
+) -> f64 {
+    let (difficulty, meets_target) =
+        full_header_difficulty_and_target_for(algorithm, header, share_target);
+    if meets_target {
+        difficulty
+    } else {
+        0.0
+    }
+}
+
+/// Algorithm-dispatched form of [`full_header_difficulty_and_target`]
+/// (P1 Scrypt seam, filled in by P2). The hot dispatcher validation entry
+/// point.
+///
+/// - `Sha256d`: byte-identical to [`full_header_difficulty_and_target`] — one
+///   SHA-256d over the header, microseconds.
+/// - `Scrypt1024`: one full `scrypt(N=1024, r=1, p=1)` over the header using
+///   the shared 128 KiB scratchpad (design §2.5 policy A: verify every nonce,
+///   off the RX-drain path). If the scratchpad is unavailable this FAILS
+///   CLOSED `(0.0, false)` — an unverifiable nonce is never submitted.
+///
+/// ⚠ Cost asymmetry: the Scrypt arm is ~10^4 times more expensive than the
+/// SHA-256d arm. Callers must not run it inside a UART drain loop; the
+/// dispatcher calls it from `handle_nonce`, after the driver has drained the
+/// RX buffer.
+pub fn full_header_difficulty_and_target_for(
+    algorithm: PowAlgorithm,
+    header: &[u8; 80],
+    share_target: &[u8; 32],
+) -> (f64, bool) {
+    match algorithm {
+        PowAlgorithm::Sha256d => full_header_difficulty_and_target(header, share_target),
+        PowAlgorithm::Scrypt1024 => scrypt_header_difficulty_and_target(header, share_target),
+    }
+}
+
+/// Scrypt equivalent of [`full_header_difficulty_and_target`].
+///
+/// Difficulty is measured against the SCRYPT diff-1 constant
+/// (`SCRYPT_PDIFF1_TARGET` = Bitcoin's x 65536), so an "achieved difficulty"
+/// reported here is on the same scale as the pool's `mining.set_difficulty`
+/// for a scrypt pool — mixing the two scales would misreport hashrate by
+/// 65536x (design §4.6).
+pub fn scrypt_header_difficulty_and_target(
+    header: &[u8; 80],
+    share_target: &[u8; 32],
+) -> (f64, bool) {
+    let hash = match crate::scrypt::ltc_pow_hash(header) {
+        Ok(h) => h,
+        Err(e) => {
+            // Fail CLOSED: no scratchpad => no verification => no share.
+            warn!("Scrypt verification unavailable ({e}); refusing the nonce fail-closed");
+            return (0.0, false);
+        }
+    };
+
+    // Same convention as SHA-256d: the PoW digest is a LITTLE-endian 256-bit
+    // integer; reverse to big-endian before comparing with the target.
+    let mut hash_be = [0u8; 32];
+    for i in 0..32 {
+        hash_be[i] = hash[31 - i];
+    }
+
+    let difficulty = hash_to_difficulty_with(&hash_be, PowAlgorithm::Scrypt1024.pdiff1_log2());
+    let meets_target = hash_be.as_slice() <= share_target.as_slice();
+    (difficulty, meets_target)
+}
+
+/// Algorithm-dispatched form of [`header_difficulty`] (P1 Scrypt seam).
+/// `Scrypt1024` is FAIL-CLOSED (0.0) until P2.
+pub fn header_difficulty_for(algorithm: PowAlgorithm, header: &[u8; 80]) -> f64 {
+    let (difficulty, _) = full_header_difficulty_and_target_for(algorithm, header, &[0u8; 32]);
+    difficulty
+}
+
 /// Compute achieved difficulty and target match for a full 80-byte block
 /// header with a single SHA256d pass.
 ///
@@ -749,10 +869,22 @@ pub fn header_difficulty(header: &[u8; 80]) -> f64 {
     difficulty
 }
 
-/// Convert a 256-bit hash (big-endian) to its approximate pool difficulty.
+/// Convert a 256-bit hash (big-endian) to its approximate pool difficulty on
+/// the **Bitcoin** scale.
 ///
 /// difficulty = pdiff_1_target / hash_value = (2^224 - 1) / hash_value
 fn hash_to_difficulty(hash: &[u8; 32]) -> f64 {
+    hash_to_difficulty_with(hash, PowAlgorithm::Sha256d.pdiff1_log2())
+}
+
+/// Convert a 256-bit hash (big-endian) to its approximate pool difficulty on
+/// the scale of a diff-1 target of `2^diff1_log2`.
+///
+/// `diff1_log2` is `224` for Bitcoin and `240` for the ltc-scale scrypt
+/// convention (`dcentaxe_asic::common::SCRYPT_DIFF1_SCALE_VS_BITCOIN`). Using
+/// the wrong exponent misreports achieved difficulty — and therefore the
+/// derived hashrate — by exactly the scale factor.
+fn hash_to_difficulty_with(hash: &[u8; 32], diff1_log2: i32) -> f64 {
     let leading_zeros = hash.iter().take_while(|&&b| b == 0).count();
     if leading_zeros >= 32 {
         return f64::INFINITY;
@@ -775,12 +907,153 @@ fn hash_to_difficulty(hash: &[u8; 32]) -> f64 {
         return f64::INFINITY;
     }
 
-    (2.0_f64).powi(224) / hash_f64
+    (2.0_f64).powi(diff1_log2) / hash_f64
 }
 
 // ---------------------------------------------------------------------------
 // Difficulty / Target Conversion
 // ---------------------------------------------------------------------------
+
+/// Algorithm-dispatched difficulty → target conversion (P1 Scrypt seam,
+/// filled in by P2).
+///
+/// - `Sha256d`: routed to [`difficulty_to_target`], which is UNTOUCHED — the
+///   proven Bitcoin path, STRATUM-2 sub-1 floor semantics byte-identical.
+/// - `Scrypt1024`: `SCRYPT_PDIFF1_TARGET / difficulty`, honouring pool
+///   difficulties down to `PowAlgorithm::min_pool_difficulty()` instead of
+///   flooring everything below 1.0 (the STRATUM-2 note's
+///   "algorithm-conditional" requirement). The dispatcher's
+///   `mining.set_difficulty` floor uses the SAME function, so the two sites
+///   can never drift apart.
+pub fn difficulty_to_target_for(algorithm: PowAlgorithm, difficulty: f64) -> [u8; 32] {
+    match algorithm {
+        PowAlgorithm::Sha256d => difficulty_to_target(difficulty),
+        PowAlgorithm::Scrypt1024 => difficulty_to_target_generic(
+            &PowAlgorithm::Scrypt1024.pdiff1_target(),
+            PowAlgorithm::Scrypt1024.pdiff1_log2(),
+            PowAlgorithm::Scrypt1024.min_pool_difficulty(),
+            difficulty,
+        ),
+    }
+}
+
+/// Algorithm-agnostic `diff1_target / difficulty`, 32 bytes big-endian.
+///
+/// This is the generalised form of [`difficulty_to_target`]. The Bitcoin path
+/// deliberately does NOT route through it (`difficulty_to_target` is left
+/// byte-for-byte untouched, because it is the live-proven money path); instead
+/// `difficulty_to_target_generic_matches_the_proven_bitcoin_path` sweeps the
+/// two against each other so this generalisation is proven faithful rather
+/// than assumed.
+///
+/// - `diff1_target`: the algorithm's difficulty-1 target.
+/// - `diff1_log2`: `log2` of that target, for the IEEE-754 fractional solver.
+/// - `min_difficulty`: values below this are raised to it (STRATUM-2 floor,
+///   per-algorithm). `1.0` reproduces the historical SHA-256 behaviour.
+///
+/// Fail-closed arms (all return the all-zero reject-all target, NEVER the
+/// all-0xFF loosest target, which would share-flood a pool):
+/// non-positive difficulty, NaN/infinite difficulty, and a quotient that does
+/// not fit in 256 bits.
+pub fn difficulty_to_target_generic(
+    diff1_target: &[u8; 32],
+    diff1_log2: i32,
+    min_difficulty: f64,
+    difficulty: f64,
+) -> [u8; 32] {
+    // NaN fails both comparisons below, so test it explicitly first.
+    if !difficulty.is_finite() || difficulty <= 0.0 {
+        return [0u8; 32];
+    }
+
+    // STRATUM-2, algorithm-conditional: clamp UP to the algorithm's floor.
+    // Clamping up tightens the target, so it can only ever reduce the share
+    // rate — never flood a pool.
+    let difficulty = if difficulty < min_difficulty {
+        min_difficulty
+    } else {
+        difficulty
+    };
+
+    if (difficulty - 1.0).abs() < f64::EPSILON {
+        return *diff1_target;
+    }
+
+    if difficulty.fract() == 0.0 && difficulty <= u64::MAX as f64 {
+        return divide_target_by_u64(diff1_target, difficulty as u64);
+    }
+
+    let mut target = [0u8; 32];
+
+    // IEEE 754 double-precision: target ≈ 2^diff1_log2 / difficulty.
+    let value_f64 = (2.0_f64).powi(diff1_log2) / difficulty;
+    if !value_f64.is_finite() {
+        return [0u8; 32];
+    }
+
+    let bits = value_f64.to_bits();
+    let ieee_exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+    let ieee_mantissa = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000;
+
+    // Overflow guard: a quotient needing >= 2^256 cannot be represented and
+    // truncating it silently would emit an ARBITRARY (possibly maximally
+    // loose) target. Fail closed instead. Unreachable on the SHA-256 path
+    // (difficulty >= 1 and diff1_log2 = 224 keeps this far below 256).
+    if ieee_exp >= 256 {
+        return [0u8; 32];
+    }
+
+    let lsb_bit_pos = ieee_exp - 52;
+
+    if lsb_bit_pos < -7 {
+        return [0u8; 32];
+    }
+
+    let byte_offset = if lsb_bit_pos >= 0 {
+        lsb_bit_pos / 8
+    } else {
+        (lsb_bit_pos - 7) / 8
+    };
+    let bit_shift = (lsb_bit_pos - byte_offset * 8) as u32;
+
+    for i in 0..8 {
+        let src_byte = ((ieee_mantissa >> (i * 8)) & 0xFF) as u8;
+        let target_byte_idx = 31i32 - (byte_offset + i as i32);
+
+        if (0..32).contains(&target_byte_idx) {
+            let shifted_lo = (src_byte as u16) << bit_shift;
+            target[target_byte_idx as usize] |= (shifted_lo & 0xFF) as u8;
+
+            if bit_shift > 0 {
+                let carry = (shifted_lo >> 8) as u8;
+                if carry != 0 && target_byte_idx > 0 {
+                    target[(target_byte_idx - 1) as usize] |= carry;
+                }
+            }
+        }
+    }
+
+    target
+}
+
+/// Long-divide a 32-byte big-endian target by a `u64`.
+fn divide_target_by_u64(diff1_target: &[u8; 32], divisor: u64) -> [u8; 32] {
+    if divisor == 0 {
+        return [0u8; 32];
+    }
+
+    let mut target = [0u8; 32];
+    let mut remainder = 0u128;
+    let divisor = divisor as u128;
+
+    for (i, byte) in diff1_target.iter().enumerate() {
+        let value = (remainder << 8) | (*byte as u128);
+        target[i] = (value / divisor) as u8;
+        remainder = value % divisor;
+    }
+
+    target
+}
 
 /// Convert pool difficulty (pdiff) to a 256-bit share target.
 ///
@@ -1410,6 +1683,354 @@ mod tests {
         let tx_hex = "0100000000ffffffff";
         let tx = hex::decode(tx_hex).unwrap();
         assert!(parse_coinbase(&tx).is_none());
+    }
+
+    // ── P1 Scrypt seam pins ────────────────────────────────────────────────
+
+    #[test]
+    fn pow_algorithm_pdiff1_parity_with_stratum_constant() {
+        // Single-source guard: the enum's Sha256d constant must stay
+        // byte-identical to the crate's PDIFF1_TARGET. Compile-linked, so the
+        // two cannot drift silently.
+        assert_eq!(PowAlgorithm::Sha256d.pdiff1_target(), PDIFF1_TARGET);
+    }
+
+    #[test]
+    fn difficulty_to_target_for_sha256d_is_byte_identical_to_legacy() {
+        // The Sha256d arm must be the EXACT legacy function — sweep the
+        // interesting shapes (fail-closed, sub-1 floor, integer fast path,
+        // fractional IEEE path, non-finite).
+        for d in [
+            -1.0,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            256.0,
+            511.5,
+            65536.0,
+            1_048_576.0,
+            4.2e9,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            assert_eq!(
+                difficulty_to_target_for(PowAlgorithm::Sha256d, d),
+                difficulty_to_target(d),
+                "Sha256d arm diverged from legacy at diff={d}"
+            );
+        }
+    }
+
+    // ── P2 Scrypt target math ──────────────────────────────────────────────
+
+    #[test]
+    fn difficulty_to_target_generic_matches_the_proven_bitcoin_path() {
+        // `difficulty_to_target` (the live-proven money path) is deliberately
+        // NOT refactored to call the generic. This sweep is what proves the
+        // generalisation faithful instead: same diff-1 constant, same 2^224
+        // exponent, same 1.0 floor => byte-identical output everywhere,
+        // including every fail-closed arm.
+        for d in [
+            -1.0,
+            0.0,
+            1e-12,
+            0.5,
+            0.999_999,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            255.0,
+            256.0,
+            511.0,
+            511.5,
+            1024.0,
+            65536.0,
+            1_048_576.0,
+            4.2e9,
+            1.234_5e12,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                difficulty_to_target_generic(&PDIFF1_TARGET, 224, 1.0, d),
+                difficulty_to_target(d),
+                "generic target solver diverged from the proven Bitcoin path at diff={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrypt_diff1_target_is_the_ltc_scaled_constant_not_bitcoins() {
+        // The single most consequential number in the Scrypt lane. At
+        // difficulty 1 the target must be the ltc-scale constant (Bitcoin's
+        // x 65536), NOT Bitcoin's — a x65536 error here is silent on the wire.
+        let t = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1.0);
+        assert_eq!(t, dcentaxe_asic::common::SCRYPT_PDIFF1_TARGET);
+        assert_ne!(t, PDIFF1_TARGET, "must not reuse the Bitcoin diff-1 target");
+        // …and it must be LOOSER (numerically larger) by exactly the scale.
+        assert_eq!(
+            difficulty_to_target_for(
+                PowAlgorithm::Scrypt1024,
+                dcentaxe_asic::common::SCRYPT_DIFF1_SCALE_VS_BITCOIN as f64
+            ),
+            PDIFF1_TARGET,
+            "scrypt difficulty 65536 must be exactly Bitcoin difficulty 1"
+        );
+    }
+
+    #[test]
+    fn scrypt_target_scales_inversely_with_difficulty() {
+        let d1 = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1.0);
+        let d2 = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 2.0);
+        let d1024 = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1024.0);
+        assert!(
+            d2.as_slice() < d1.as_slice(),
+            "higher diff => tighter target"
+        );
+        assert!(d1024.as_slice() < d2.as_slice());
+        // Integer fast path: diff-1 halved must be the exact long division.
+        let mut halved = [0u8; 32];
+        let mut rem = 0u16;
+        for i in 0..32 {
+            let v = (rem << 8) | d1[i] as u16;
+            halved[i] = (v / 2) as u8;
+            rem = v % 2;
+        }
+        assert_eq!(d2, halved);
+    }
+
+    #[test]
+    fn scrypt_honours_sub_one_difficulty_but_floors_below_the_btc_scale_equivalent() {
+        // STRATUM-2 made algorithm-conditional (design §2.3): a btc-scale
+        // Scrypt pool legitimately sends fractional difficulty, so 0<d<1 must
+        // LOOSEN the target rather than collapse to diff-1 (which is what the
+        // SHA-256 path does and must keep doing).
+        let at_1 = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1.0);
+        let at_half = difficulty_to_target_for(PowAlgorithm::Scrypt1024, 0.5);
+        assert!(
+            at_half.as_slice() > at_1.as_slice(),
+            "sub-1 scrypt difficulty must loosen the target, not be floored to diff-1"
+        );
+        // SHA-256 keeps the historical collapse — proof the change is scoped.
+        assert_eq!(
+            difficulty_to_target_for(PowAlgorithm::Sha256d, 0.5),
+            PDIFF1_TARGET
+        );
+
+        // …but only down to the floor. Below it, everything clamps to the same
+        // target as the floor itself — no unbounded loosening.
+        let floor = PowAlgorithm::Scrypt1024.min_pool_difficulty();
+        let at_floor = difficulty_to_target_for(PowAlgorithm::Scrypt1024, floor);
+        assert_eq!(
+            difficulty_to_target_for(PowAlgorithm::Scrypt1024, floor / 1024.0),
+            at_floor,
+            "below the floor the target must clamp, never keep loosening"
+        );
+        assert_eq!(
+            difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1e-30),
+            at_floor
+        );
+    }
+
+    #[test]
+    fn scrypt_target_fails_closed_on_garbage_difficulty() {
+        // Reject-all ([0;32]), never the loosest all-0xFF target: a pool that
+        // sends 0/negative/NaN must stop shares, not flood them.
+        for d in [0.0, -1.0, -1e9, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                difficulty_to_target_for(PowAlgorithm::Scrypt1024, d),
+                [0u8; 32],
+                "scrypt target must fail CLOSED at diff={d}"
+            );
+        }
+        // The 256-bit overflow guard also fails closed rather than truncating
+        // into an arbitrary (possibly maximally loose) target.
+        assert_eq!(
+            difficulty_to_target_generic(
+                &dcentaxe_asic::common::SCRYPT_PDIFF1_TARGET,
+                240,
+                1e-30,
+                1e-9
+            ),
+            [0u8; 32]
+        );
+    }
+
+    #[test]
+    fn scrypt_validator_runs_real_scrypt_and_reports_ltc_scale_difficulty() {
+        let header = [0u8; 80];
+        // A reject-all target must never pass, whatever the hash is.
+        let (_d, meets_zero) =
+            full_header_difficulty_and_target_for(PowAlgorithm::Scrypt1024, &header, &[0u8; 32]);
+        assert!(!meets_zero, "the reject-all target must reject");
+
+        // The loosest possible target passes, and the reported difficulty is
+        // real (non-zero, finite) — i.e. the arm is no longer the P1 stub.
+        let (diff, meets) =
+            full_header_difficulty_and_target_for(PowAlgorithm::Scrypt1024, &header, &[0xFFu8; 32]);
+        assert!(meets);
+        assert!(diff > 0.0 && diff.is_finite(), "got {diff}");
+
+        // Difficulty is on the LTC scale: the same hash scored on the Bitcoin
+        // scale would be exactly 65536x smaller.
+        let hash = crate::scrypt::ltc_pow_hash(&header).expect("scrypt");
+        let mut be = [0u8; 32];
+        for i in 0..32 {
+            be[i] = hash[31 - i];
+        }
+        let btc_scale = hash_to_difficulty_with(&be, 224);
+        let ratio = diff / btc_scale;
+        assert!(
+            (ratio - 65536.0).abs() < 1.0,
+            "scrypt difficulty must be reported on the ltc scale (ratio={ratio})"
+        );
+
+        // `validate_full_header_for` / `header_difficulty_for` agree with it.
+        assert_eq!(
+            validate_full_header_for(PowAlgorithm::Scrypt1024, &header, &[0xFFu8; 32]),
+            diff
+        );
+        assert_eq!(
+            header_difficulty_for(PowAlgorithm::Scrypt1024, &header),
+            diff
+        );
+    }
+
+    #[test]
+    fn scrypt_and_sha256d_validators_disagree_on_the_same_header() {
+        // Guards against an arm accidentally falling through to SHA-256d: the
+        // two PoW functions must produce different digests for one header.
+        let header = [0x11u8; 80];
+        let sha = header_difficulty_for(PowAlgorithm::Sha256d, &header);
+        let scr = header_difficulty_for(PowAlgorithm::Scrypt1024, &header);
+        assert_ne!(sha, scr, "Scrypt arm must not be running SHA-256d");
+    }
+
+    #[test]
+    fn full_header_for_sha256d_matches_legacy() {
+        let header_vec = hex::decode(concat!(
+            "01000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a",
+            "29ab5f49",
+            "ffff001d",
+            "1dac2b7c",
+        ))
+        .unwrap();
+        let mut header = [0u8; 80];
+        header.copy_from_slice(&header_vec);
+        let target = difficulty_to_target(1.0);
+        assert_eq!(
+            full_header_difficulty_and_target_for(PowAlgorithm::Sha256d, &header, &target),
+            full_header_difficulty_and_target(&header, &target)
+        );
+        assert_eq!(
+            header_difficulty_for(PowAlgorithm::Sha256d, &header),
+            header_difficulty(&header)
+        );
+        assert_eq!(
+            validate_full_header_for(PowAlgorithm::Sha256d, &header, &target),
+            validate_full_header(&header, &target)
+        );
+    }
+
+    #[test]
+    fn workbuilder_default_is_sha256d_and_stamps_work() {
+        let job = dedup_test_job();
+        let mut wb = WorkBuilder::new("aabbccdd", 4);
+        assert_eq!(wb.pow_algorithm(), PowAlgorithm::Sha256d);
+        let work = wb.next_work(&job);
+        assert_eq!(work.algorithm, PowAlgorithm::Sha256d);
+        assert!(
+            !work.midstates.is_empty(),
+            "Sha256d path must keep computing midstates"
+        );
+    }
+
+    #[test]
+    fn scrypt_workbuilder_emits_failclosed_header_only_work() {
+        // Design §4.3: Scrypt1024 skips ALL midstate computation and emits
+        // header fields only. P2 update: the share_target is now the REAL
+        // ltc-scale target for the builder's difficulty (was the P1 reject-all
+        // placeholder) — the fail-closed posture moved to where it belongs
+        // (the refusing LT0051 driver + the DC0x board rows), not to a
+        // permanently-wrong number in the target math.
+        let job = dedup_test_job();
+        let mut wb = WorkBuilder::new_for_algorithm("aabbccdd", 4, PowAlgorithm::Scrypt1024);
+        wb.set_version_mask(0x1FFF_E000); // must NOT produce rolled midstates
+        wb.set_difficulty(1024.0);
+        let work = wb.next_work(&job);
+        assert_eq!(work.algorithm, PowAlgorithm::Scrypt1024);
+        assert!(
+            work.midstates.is_empty(),
+            "midstates are a SHA-256 concept; Scrypt work must carry none"
+        );
+        assert_eq!(
+            work.share_target,
+            difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1024.0),
+            "Scrypt share_target must come from the ltc-scale diff-1 constant"
+        );
+        assert_ne!(
+            work.share_target,
+            difficulty_to_target_for(PowAlgorithm::Sha256d, 1024.0),
+            "Scrypt work must NOT be targeted with the Bitcoin diff-1 constant"
+        );
+        // Header fields still populated (the reusable coinbase/merkle path).
+        assert_eq!(work.version, 0x20000000);
+        assert_eq!(work.nbits, 0x1d00ffff);
+    }
+
+    #[test]
+    fn next_work_sha256d_golden_vector() {
+        // P1 golden pin: freezes the exact Sha256d next_work outputs for a
+        // fixed job BEFORE any real Scrypt code exists, so any later change to
+        // the seam that perturbs the proven SHA-256 path is bisectable to that
+        // change. Values captured from the P1 seam build whose full pre-seam
+        // test suite (genesis + block-125552 pipeline pins) passed unchanged.
+        let job = StratumJob {
+            job_id: "golden".into(),
+            prev_hash: "ab02cd818b9e567ee21793cddef299feb29ad444a41b85b8000008a300000000".into(),
+            coinbase1: "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008".into(),
+            coinbase2: "072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000".into(),
+            merkle_branches: vec![],
+            version: "20000000".into(),
+            nbits: "1a44b9f2".into(),
+            block_height: 125552,
+            ntime: "4dd7f5c7".into(),
+            clean_jobs: false,
+        };
+        let mut wb = WorkBuilder::new("aabbccdd", 4);
+        wb.set_difficulty(256.0);
+        wb.set_version_mask(0x1FFF_E000);
+        let work = wb.next_work(&job);
+
+        assert_eq!(work.algorithm, PowAlgorithm::Sha256d);
+        assert_eq!(work.extranonce2, "00000000");
+        assert_eq!(work.version, 0x2000_0000);
+        assert_eq!(work.ntime, 0x4dd7_f5c7);
+        assert_eq!(work.nbits, 0x1a44_b9f2);
+        assert_eq!(work.version_mask, 0x1FFF_E000);
+        assert_eq!(work.midstates.len(), 4, "full 4-midstate ASICBoost set");
+        assert_eq!(
+            hex::encode(work.prev_block_hash),
+            "81cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000"
+        );
+        assert_eq!(work.share_target, difficulty_to_target(256.0));
+        // Midstates are deterministic functions of the header prefix; pin the
+        // first one fully and the rest by distinctness.
+        let mut header_prefix = [0u8; 64];
+        header_prefix[0..4].copy_from_slice(&work.version.to_le_bytes());
+        header_prefix[4..36].copy_from_slice(&work.prev_block_hash);
+        header_prefix[36..64].copy_from_slice(&work.merkle_root[0..28]);
+        assert_eq!(work.midstates[0], compute_midstate(&header_prefix));
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                assert_ne!(work.midstates[i], work.midstates[j]);
+            }
+        }
     }
 
     #[test]

@@ -127,7 +127,8 @@ impl ChipHealthTracker {
     pub fn new(profiles: &HashMap<u8, TuningProfile>) -> Self {
         let mut chain_chip_ids = HashMap::new();
         for profile in profiles.values() {
-            let chip_id = crate::chip_id_from_type(&profile.chip_type).unwrap_or(0x1387);
+            // G4: never silent-default to BM1387 PLL identity.
+            let chip_id = crate::chip_id_for_pll_policy(&profile.chip_type);
             chain_chip_ids.insert(profile.chain_id, chip_id);
         }
         Self::new_with_chain_chip_ids(profiles, chain_chip_ids)
@@ -209,11 +210,12 @@ impl ChipHealthTracker {
                 // BM1387: expected_nps = (freq_mhz × 1e6 × 114_cores) / (diff × 2^32)
                 // Uses actual difficulty from snapshot instead of hardcoded 256.
                 if nonces > 0 && data.current_freq_mhz > 0 && snapshot.window_duration_s > 0.0 {
+                    // Unknown chain → chip_id 0 → empty-safe expected_nps (not silent BM1387).
                     let chip_id = self
                         .chain_chip_ids
                         .get(&snapshot.chain_id)
                         .copied()
-                        .unwrap_or(0x1387);
+                        .unwrap_or(0);
                     let expected_nps = crate::chip_geometry::expected_nps_for_chip(
                         chip_id,
                         data.current_freq_mhz,

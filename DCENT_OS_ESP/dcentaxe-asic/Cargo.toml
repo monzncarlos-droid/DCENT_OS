@@ -15,6 +15,14 @@ asic-bm1373-research = []
 # UNTESTED — produces zero nonces in upstream fork. Do not enable in
 # production builds.
 asic-kf1950 = []
+# MSBT0501 / LT0051 — the Scrypt ASIC in the Hammer DC0x line (DC02/DC04/DC06).
+# Compiles the `lt0051` module: real, host-tested frame builders/parsers behind
+# an AsicDriver impl that refuses EVERY operation (two protocol residuals are
+# open — see the module header and MSBT0501_PROTOCOL.md §3.4/§4.3). Default OFF.
+# NOTE: `AsicModel::Lt0051` itself is NOT gated, so the NVS "MSBT0501" string
+# always resolves to its own (refusing) driver instead of falling through to the
+# BM1366 fallback.
+asic-lt0051 = []
 # Canaan Avalon A-series shim driver. Used by `projects/dcentaxe-avalon/` and
 # `DCENT_OS_AvalonMiner/` to plug the K230 mm_pkg shim into the same
 # AsicDriver trait + dispatcher used by Bitmain BM-family chips. Phase 1 talks

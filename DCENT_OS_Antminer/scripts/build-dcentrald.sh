@@ -8,7 +8,6 @@
 #   zynq      - Antminer S9/S17/S19 Zynq boards (ARMv7-A, Cortex-A9)  [default]
 #   amlogic   - Antminer S19XP/S21+ Amlogic A113D boards (AArch64, Cortex-A53)
 #   beaglebone - Antminer S19j BeagleBone AM335x boards (ARMv7-A, Cortex-A8)
-#   cvitek    - CV1835 Cortex-A53 hardware, ARMv7 hard-float compatibility ABI
 #   native    - Build for the host machine (development/testing)
 #
 # Requires Docker Desktop running.
@@ -507,22 +506,6 @@ case "$TARGET" in
         ARCH_FLAGS="-C target-cpu=cortex-a8"
         echo "Building for BeagleBone AM335x (S19j) — ARMv7-A Cortex-A8"
         ;;
-    cvitek)
-        # CVitek CV1835 hardware is dual-core Cortex-A53/AArch64. The retained
-        # vendor kernel is AArch64 with CONFIG_COMPAT; DCENT_OS deliberately
-        # builds an ARMv7 hard-float compatibility userspace while tuning for
-        # the real Cortex-A53 cores.
-        TRIPLE="armv7-unknown-linux-musleabihf"
-        CROSS_PKG=""
-        CROSS_LINKER="rust-lld"
-        CROSS_CC="/usr/local/bin/zig-cc-target-musl"
-        CROSS_AR="/usr/local/bin/zig-ar"
-        MUSL_ZIG_BUILDER=1
-        ZIG_CC_FLAGS="-target arm-linux-musleabihf -mcpu=cortex_a53 -mfloat-abi=hard -mfpu=neon-vfpv4"
-        BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
-        ARCH_FLAGS="-C target-cpu=cortex-a53 -C target-feature=+crt-static"
-        echo "Building for CVitek CV1835 (S19j Pro) — Cortex-A53 hardware, ARMv7 compatibility userspace (musl, static)"
-        ;;
     native)
         echo "Building for host (native)"
         cd "$DCENTRALD_DIR"
@@ -557,7 +540,7 @@ case "$TARGET" in
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Valid targets: zynq, amlogic, beaglebone, cvitek, native"
+        echo "Valid targets: zynq, amlogic, beaglebone, native"
         exit 1
         ;;
 esac

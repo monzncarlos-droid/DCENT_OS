@@ -16,7 +16,7 @@ const BOARD_TARGET_PATH: &str = "/etc/dcentos/board_target";
 // Exact marker written by br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh.
 // Historical xil aliases are feature fingerprints, not image identity, and
 // deliberately cannot mint controller authority here.
-const AM2_CONTROLLER_BOARD_TARGET: &str = "am2-s19j";
+const AM2_S19J_CONTROLLER_BOARD_TARGET: &str = "am2-s19j";
 const EEPROM_PREAMBLE: [u8; 2] = [0x04, 0x11];
 const GET_VERSION_FRAMED: [u8; 6] = [0x55, 0xAA, 0x04, 0x17, 0x00, 0x1B];
 const GET_VERSION_SHORT: [u8; 3] = [0x55, 0xAA, 0x17];
@@ -98,7 +98,7 @@ fn plan_from_observations(
     serial_devices: &[String],
 ) -> Result<Am2ControllerPlan> {
     let board_target = board_target.map(str::trim).unwrap_or_default();
-    if board_target != AM2_CONTROLLER_BOARD_TARGET {
+    if board_target != AM2_S19J_CONTROLLER_BOARD_TARGET {
         return Err(HalError::Platform(format!(
             "exact AM2 controller board target is not admitted: {}",
             if board_target.is_empty() {
@@ -113,7 +113,6 @@ fn plan_from_observations(
             "AM2 controller plan has no chain UARTs".into(),
         ));
     }
-
     let mut contexts = Vec::with_capacity(serial_devices.len());
     for serial_device in serial_devices {
         let slot = slot_for_uart(serial_device).ok_or_else(|| {
@@ -158,13 +157,13 @@ fn try_plan_from_observations(
     board_target: Option<&str>,
     serial_devices: &[String],
 ) -> Result<Option<Am2ControllerPlan>> {
-    if board_target.map(str::trim) != Some(AM2_CONTROLLER_BOARD_TARGET) {
+    if board_target.map(str::trim) != Some(AM2_S19J_CONTROLLER_BOARD_TARGET) {
         return Ok(None);
     }
     plan_from_observations(board_target, serial_devices).map(Some)
 }
 
-/// Try to bind the exact `am2-s19j` production image to its closed AM2
+/// Try to bind an exact supported AM2 production image to its closed
 /// topology. Non-target images return `None` so legacy/other-platform routes
 /// retain their existing behavior. Once the exact marker is present, invalid
 /// UARTs and duplicate slots fail closed through the strict planner.
@@ -381,7 +380,7 @@ fn observe_supported_firmware(i2c: &I2cServiceHandle, address: u8) -> Result<u8>
 /// firmware revision. The GET_VERSION transaction is the address ACK proof;
 /// no additional probe is emitted.
 fn validate_am2_controller_presence(presence: &Am2HashboardPresence) -> Result<()> {
-    if presence.board_target != AM2_CONTROLLER_BOARD_TARGET
+    if presence.board_target != AM2_S19J_CONTROLLER_BOARD_TARGET
         || uart_for_slot(presence.slot) != Some(presence.serial_device.as_str())
         || dspic_address_for_slot(presence.slot) != Some(presence.address)
         || presence.eeprom_bytes.get(..2) != Some(EEPROM_PREAMBLE.as_slice())
@@ -443,7 +442,7 @@ mod tests {
     #[test]
     fn exact_targets_bind_only_canonical_uart_slot_address_tuples() {
         let plan = plan_from_observations(
-            Some(AM2_CONTROLLER_BOARD_TARGET),
+            Some(AM2_S19J_CONTROLLER_BOARD_TARGET),
             &devices(&["/dev/ttyS1", "/dev/ttyS3", "/dev/ttyS4"]),
         )
         .unwrap();
@@ -453,6 +452,16 @@ mod tests {
         assert_eq!(plan.contexts[1].address(), 0x22);
         assert_eq!(plan.contexts[2].slot(), 3);
         assert_eq!(plan.contexts[2].address(), 0x23);
+    }
+
+    #[test]
+    fn am2_s19pro_is_not_admitted_without_independent_physical_identity() {
+        let canonical = devices(&["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"]);
+        assert!(plan_from_observations(Some("am2-s19pro"), &canonical).is_err());
+        assert_eq!(
+            try_plan_from_observations(Some("am2-s19pro"), &canonical).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -486,12 +495,12 @@ mod tests {
             );
         }
         assert!(try_plan_from_observations(
-            Some(AM2_CONTROLLER_BOARD_TARGET),
+            Some(AM2_S19J_CONTROLLER_BOARD_TARGET),
             &devices(&["/dev/ttyZ9"]),
         )
         .is_err());
         assert!(try_plan_from_observations(
-            Some(AM2_CONTROLLER_BOARD_TARGET),
+            Some(AM2_S19J_CONTROLLER_BOARD_TARGET),
             &devices(&["/dev/ttyS2", "/dev/ttyS2"]),
         )
         .is_err());
@@ -499,9 +508,11 @@ mod tests {
 
     #[test]
     fn eeprom_presence_binding_requires_plan_membership_and_exact_bhb42_preamble() {
-        let plan =
-            plan_from_observations(Some(AM2_CONTROLLER_BOARD_TARGET), &devices(&["/dev/ttyS2"]))
-                .unwrap();
+        let plan = plan_from_observations(
+            Some(AM2_S19J_CONTROLLER_BOARD_TARGET),
+            &devices(&["/dev/ttyS2"]),
+        )
+        .unwrap();
         let context = &plan.contexts()[0];
         let presence =
             bind_am2_hashboard_presence(&plan, context, vec![0x04, 0x11, 0x42, 0x60, 0x01])
@@ -523,9 +534,11 @@ mod tests {
 
     #[test]
     fn retained_firmware_reply_binds_endpoint_without_widening_parser_grammar() {
-        let plan =
-            plan_from_observations(Some(AM2_CONTROLLER_BOARD_TARGET), &devices(&["/dev/ttyS2"]))
-                .unwrap();
+        let plan = plan_from_observations(
+            Some(AM2_S19J_CONTROLLER_BOARD_TARGET),
+            &devices(&["/dev/ttyS2"]),
+        )
+        .unwrap();
         let context = &plan.contexts()[0];
         let presence =
             bind_am2_hashboard_presence(&plan, context, vec![0x04, 0x11, 0x42, 0x60, 0x01])

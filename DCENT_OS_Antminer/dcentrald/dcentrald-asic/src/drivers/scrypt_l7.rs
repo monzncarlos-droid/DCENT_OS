@@ -348,9 +348,11 @@ impl ChipDriver for ScryptL7Driver {
     fn ticket_mask(&self, difficulty: u32) -> u32 {
         // NO hardware ticket-mask for LTC on this firmware: `ChipSetting_ticket_
         // mask_*` exists only for CKB/VBK, NOT LTC — Scrypt difficulty filtering
-        // is host-side by nonce-rate. This value is effectively a no-op for L7;
-        // returned as `difficulty - 1` only to satisfy the trait. W3-A §5.
-        difficulty.saturating_sub(1)
+        // is host-side by nonce-rate. Trait satisfy via pure plain encode (G25).
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

@@ -654,6 +654,7 @@ name = "dcentrald-silicon-profiles"
 version = "0.9.0"
 dependencies = [
  "dcentrald-api-types",
+ "dcentrald-common",
  "proptest",
  "serde",
  "serde_json",
@@ -690,6 +691,7 @@ name = "dcentrald-thermal"
 version = "0.9.0"
 dependencies = [
  "dcentrald-api-types",
+ "dcentrald-common",
  "dcentrald-hal",
  "proptest",
  "serde",

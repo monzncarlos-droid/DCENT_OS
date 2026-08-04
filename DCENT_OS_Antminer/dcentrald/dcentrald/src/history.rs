@@ -200,6 +200,9 @@ impl Default for HistoryBuffer {
 
 /// Resolve the on-device history storage path.
 pub fn storage_path() -> PathBuf {
+    if crate::runtime_policy::ephemeral_runtime_enabled() {
+        return PathBuf::from("/tmp/dcent/history.json");
+    }
     if Path::new("/data").exists() {
         PathBuf::from("/data/dcent/history.json")
     } else {

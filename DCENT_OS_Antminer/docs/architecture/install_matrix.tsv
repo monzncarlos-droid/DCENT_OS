@@ -1,5 +1,7 @@
 board_target	family	storage_topology	update_mechanism	update_maturity	install_authorization	recovery_maturity	artifact_kind	artifact_maturity	public_beta_install	persistent_update_allowed	transport
 am1-s9	zynq	redundant_slots	zynq_ubi_fw_setenv	experimental	public_beta	not_implemented	sysupgrade	experimental	1	1	fpga_uio
+am1-s15	zynq	redundant_slots	zynq_ubi_fw_setenv	not_implemented	denied	not_implemented	none	not_implemented	0	0	none
+am1-t15	zynq	redundant_slots	zynq_ubi_fw_setenv	not_implemented	denied	not_implemented	none	not_implemented	0	0	none
 am2-s19j	zynq	redundant_slots	zynq_ubi_fw_setenv	experimental	public_beta	not_implemented	sysupgrade	experimental	0	1	zynq_hybrid
 am2-s19pro	zynq	redundant_slots	zynq_ubi_fw_setenv	experimental	lab_only	not_implemented	sysupgrade	experimental	0	1	zynq_hybrid
 am2-s17p	zynq	redundant_slots	zynq_ubi_fw_setenv	experimental	lab_only	not_implemented	sysupgrade	experimental	0	1	zynq_hybrid

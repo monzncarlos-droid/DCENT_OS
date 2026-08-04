@@ -20,6 +20,10 @@
 use crate::drivers::{ChipDriver, MinerProfile, MiningWork, NonceResult, PllConfig};
 use crate::pic::PicController;
 use crate::Result;
+// Pure LM90-family (TMP451/ADT7461/NCT218/TMP42x) temperature decode + the
+// mandatory extended-range refusal gate. Single source of decode truth — the
+// driver must not re-implement signed/fraction/config semantics locally.
+use dcentrald_api_types::remote_temp_sensor as lm90;
 use dcentrald_hal::fpga_chain::{self, FpgaChain};
 
 /// BM1387 chip ID.
@@ -102,16 +106,45 @@ pub mod regs {
 const SENSOR_I2C_ADDRESSES: [u8; 3] = [0x98, 0x9A, 0x9C];
 
 /// Sensor identification registers (SMBus standard).
-const REG_MANUFACTURER_ID: u8 = 0xFE;
-const REG_DEVICE_ID: u8 = 0xFF;
+/// Values bound to the canonical `dcentrald-api-types` LM90 register map so the
+/// driver cannot drift from the pure decoder (pinned by a test below).
+const REG_MANUFACTURER_ID: u8 = lm90::reg::MANUFACTURER_ID;
+const REG_DEVICE_ID: u8 = lm90::reg::DEVICE_ID;
 
 /// Temperature register — local sensor (die temp of the sensor chip itself).
-/// Present on TMP451, ADT7461, NCT218, TMP42x.
-const REG_LOCAL_TEMP: u8 = 0x00;
+/// Present on TMP451, ADT7461, NCT218, TMP42x. Signed two's-complement °C in
+/// standard mode (the only mode this driver accepts — see the config gate in
+/// `read_board_temp`).
+const REG_LOCAL_TEMP: u8 = lm90::reg::LOCAL_TEMP;
 
-/// Temperature register — remote sensor (measures the BM1387 die via external diode).
-/// Present on TMP451, ADT7461, NCT218.
-const REG_REMOTE_TEMP: u8 = 0x01;
+/// Temperature register — remote sensor high byte (measures the BM1387 die via
+/// external diode on TEMP_P/TEMP_N). Signed two's-complement °C in standard mode.
+const REG_REMOTE_TEMP: u8 = lm90::reg::REMOTE_TEMP_HIGH;
+
+/// Remote temperature low byte — 0.125 °C/LSB fraction in bits [7:5], added
+/// (unsigned) onto the signed high byte.
+const REG_REMOTE_TEMP_LOW: u8 = lm90::reg::REMOTE_TEMP_LOW;
+
+/// Which sensor register family a decoded board temperature came from — used so
+/// log/telemetry labelling stays truthful (a PCB-proxy local reading must never
+/// be presented as the ASIC-diode die temperature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoardTempSource {
+    /// Remote channel: the BM1387 die measured via the TEMP_P/TEMP_N diode.
+    RemoteDiode,
+    /// Local channel: the sensor IC's own die — a PCB-temperature proxy, used
+    /// only when the remote diode is absent/faulted/implausible.
+    LocalSensor,
+}
+
+impl BoardTempSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            BoardTempSource::RemoteDiode => "remote/ASIC diode",
+            BoardTempSource::LocalSensor => "local/PCB sensor (remote diode unavailable)",
+        }
+    }
+}
 
 /// BM1387 PLL frequency lookup table.
 ///
@@ -125,81 +158,18 @@ const REG_REMOTE_TEMP: u8 = 0x01;
 ///
 /// Formula: freq = 25 MHz * FBDIV / REFDIV / POSTDIV1 / POSTDIV2
 ///
-/// Values verified against:
-///   - BraiinsOS braiins_bm1387.rs PllReg tests (500M=0x500221, 650M=0x680221)
-///   - freq_pll_1485[] table (same PLL layout, confirmed 0x420221=412M, 0x500221=500M)
-///
-/// CRITICAL BUG FIX (2026-03-17): Previous table used bmminer-mix values with WRONG
-/// frequency labels. 0x00420221 was labeled "500 MHz" but actually produces 412 MHz
-/// (fbdiv=0x42=66, 25*66/2/2/1 = 412.5 MHz). This caused ~18% hashrate loss.
-///
-/// Format: (freq_mhz, pll_reg_value)
-pub const BM1387_PLL_TABLE: &[(u16, u32)] = &[
-    // Low frequencies: postdiv1=4, postdiv2=1 (÷4 total post-division)
-    // freq = 25 * fbdiv / 2 / 4 / 1 = 3.125 * fbdiv
-    (100, 0x0020_0241), // fbdiv=32:  25*32/2/4/1 = 100
-    (125, 0x0028_0241), // fbdiv=40:  25*40/2/4/1 = 125
-    (150, 0x0030_0241), // fbdiv=48:  25*48/2/4/1 = 150
-    (175, 0x0038_0241), // fbdiv=56:  25*56/2/4/1 = 175
-    (200, 0x0040_0241), // fbdiv=64:  25*64/2/4/1 = 200
-    (225, 0x0048_0241), // fbdiv=72:  25*72/2/4/1 = 225
-    (250, 0x0050_0241), // fbdiv=80:  25*80/2/4/1 = 250
-    (275, 0x0058_0241), // fbdiv=88:  25*88/2/4/1 = 275
-    (300, 0x0060_0241), // fbdiv=96:  25*96/2/4/1 = 300
-    (325, 0x0068_0241), // fbdiv=104: 25*104/2/4/1 = 325
-    (350, 0x0070_0241), // fbdiv=112: 25*112/2/4/1 = 350
-    (375, 0x0078_0241), // fbdiv=120: 25*120/2/4/1 = 375
-    // Mid frequencies: postdiv1=2, postdiv2=1 (÷2 total post-division)
-    // freq = 25 * fbdiv / 2 / 2 / 1 = 6.25 * fbdiv
-    (400, 0x0040_0221), // fbdiv=64:  25*64/2/2/1 = 400
-    (425, 0x0044_0221), // fbdiv=68:  25*68/2/2/1 = 425
-    (450, 0x0048_0221), // fbdiv=72:  25*72/2/2/1 = 450
-    (462, 0x004A_0221), // fbdiv=74:  25*74/2/2/1 = 462.5
-    (475, 0x004C_0221), // fbdiv=76:  25*76/2/2/1 = 475
-    (500, 0x0050_0221), // fbdiv=80:  25*80/2/2/1 = 500  *** WAS 0x0042_0221 (=412M!) ***
-    (525, 0x0054_0221), // fbdiv=84:  25*84/2/2/1 = 525
-    (550, 0x0058_0221), // fbdiv=88:  25*88/2/2/1 = 550
-    (575, 0x005C_0221), // fbdiv=92:  25*92/2/2/1 = 575
-    (600, 0x0060_0221), // fbdiv=96:  25*96/2/2/1 = 600
-    (625, 0x0064_0221), // fbdiv=100: 25*100/2/2/1 = 625
-    (650, 0x0068_0221), // fbdiv=104: 25*104/2/2/1 = 650  (matches BraiinsOS test)
-    // High frequencies: still postdiv1=2 up to 800 MHz (fbdiv max ~128 per BraiinsOS)
-    // freq = 25 * fbdiv / 2 / 2 / 1 = 6.25 * fbdiv
-    (700, 0x0070_0221), // fbdiv=112: 25*112/2/2/1 = 700
-    (725, 0x0074_0221), // fbdiv=116: 25*116/2/2/1 = 725
-    (750, 0x0078_0221), // fbdiv=120: 25*120/2/2/1 = 750
-    (775, 0x007C_0221), // fbdiv=124: 25*124/2/2/1 = 775
-    (800, 0x0080_0221), // fbdiv=128: 25*128/2/2/1 = 800
-    // Very high frequencies: postdiv1=1, postdiv2=1 (÷1 total post-division)
-    // freq = 25 * fbdiv / 2 / 1 / 1 = 12.5 * fbdiv
-    // WARNING: fbdiv > 128 is outside BraiinsOS tested range
-    (825, 0x0042_0211), // fbdiv=66:  25*66/2/1/1  = 825
-    (850, 0x0044_0211), // fbdiv=68:  25*68/2/1/1  = 850
-    (875, 0x0046_0211), // fbdiv=70:  25*70/2/1/1  = 875
-    (900, 0x0048_0211), // fbdiv=72:  25*72/2/1/1  = 900
-];
+/// **G16 pure SSOT:** table + nearest-neighbor lookup live in
+/// `dcentrald_common::BM1387_PLL_TABLE` / `resolve_bm1387_pll`.
+/// Braiins goldens: 500 MHz → `0x00500221`, 650 MHz → `0x00680221`.
+/// Re-export for external callers that imported the driver constant.
+pub use dcentrald_common::BM1387_PLL_TABLE;
 
-/// Look up the PLL register value for a target frequency.
+/// Look up the PLL register value for a target frequency (pure SSOT thin-wrap).
 ///
 /// Returns (pll_reg_value, actual_frequency_mhz).
-/// If the exact frequency isn't in the table, the nearest entry is used.
 fn bm1387_pll_lookup(target_mhz: u16) -> (u32, u16) {
-    // Clamp to table range
-    let target = target_mhz.clamp(100, 900);
-
-    // Find the closest entry
-    let mut best = BM1387_PLL_TABLE[0];
-    let mut best_diff = (target as i32 - best.0 as i32).unsigned_abs();
-
-    for &entry in &BM1387_PLL_TABLE[1..] {
-        let diff = (target as i32 - entry.0 as i32).unsigned_abs();
-        if diff < best_diff {
-            best = entry;
-            best_diff = diff;
-        }
-    }
-
-    (best.1, best.0)
+    let sol = dcentrald_common::resolve_bm1387_pll(target_mhz);
+    (sol.register_value, sol.actual_freq_mhz)
 }
 
 /// BM1387 driver implementation.
@@ -217,15 +187,9 @@ const NUM_CORES_ON_CHIP: u32 = 114;
 
 /// Get the sorted list of discrete PLL frequencies the BM1387 can generate (MHz).
 ///
-/// Use this instead of duplicating the frequency table. The autotuner uses
-/// this for binary search bounds and step-down calculations.
+/// Pure SSOT: `dcentrald_common::bm1387_pll_frequencies` (G16).
 pub fn pll_frequencies() -> &'static [u16] {
-    // Extract just the MHz values from the PLL table.
-    // This is a compile-time static slice matching BM1387_PLL_TABLE entries.
-    &[
-        100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 462, 475, 500,
-        525, 550, 575, 600, 625, 650, 700, 725, 750, 775, 800, 825, 850, 875, 900,
-    ]
+    dcentrald_common::bm1387_pll_frequencies()
 }
 
 impl Bm1387Driver {
@@ -376,22 +340,39 @@ impl Bm1387Driver {
     /// If left in I2C mode, chip 0's hash output (RO pin) is repurposed as SDA,
     /// blocking nonce output for the ENTIRE chain (daisy-chain through chip 0).
     ///
-    /// Writes MiscCtrl 3 times with delays to maximize reliability.
-    /// CMD register readback does NOT work on BM1387 via FPGA CMD FIFO
-    /// (chip 0 never responds to register reads — tested 2026-04-19,
-    /// 100% timeout on all 3 chains, all attempts). The nonce stall
-    /// detector in work_dispatcher.rs is the real safety net.
+    /// Cadence + value + reg: pure `plan_bm1387_misc_ctrl_i2c_off_chip0`
+    /// (P1-1 residual). CMD register readback does NOT work on BM1387 via FPGA
+    /// CMD FIFO (chip 0 never responds to register reads — tested 2026-04-19,
+    /// 100% timeout on all 3 chains, all attempts). The nonce stall detector
+    /// in work_dispatcher.rs is the real safety net. Triple-write is the only
+    /// reliable approach — never fire-and-forget a single write.
     fn disable_i2c_on_chip0(chain: &mut FpgaChain) {
         use crate::protocol::*;
+        use dcentrald_common::{
+            plan_bm1387_misc_ctrl_i2c_off_chip0, Bm1387MiscCtrlCadenceOp,
+            BM1387_MISC_CTRL_I2C_OFF_MINING, MISC_CTRL_REG_BM1387,
+        };
 
+        // QA-002 pin: local literal must remain 0x4020_0180 (75s zero-nonce safety net).
+        // Pure SSOT equals this value; plan owns cadence ×3 / 5 ms / reg 0x1C.
         const MISC_CTRL_MINING_I2C_OFF: u32 = 0x4020_0180;
-
-        for _ in 0..3u8 {
-            let (w0, w1) =
-                fifo_cmd_write_reg_full(0x00, regs::MISC_CONTROL, MISC_CTRL_MINING_I2C_OFF);
-            chain.write_cmd(w0);
-            chain.write_cmd(w1);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        debug_assert_eq!(MISC_CTRL_MINING_I2C_OFF, BM1387_MISC_CTRL_I2C_OFF_MINING);
+        debug_assert_eq!(regs::MISC_CONTROL, MISC_CTRL_REG_BM1387);
+        for op in plan_bm1387_misc_ctrl_i2c_off_chip0() {
+            match op {
+                Bm1387MiscCtrlCadenceOp::Write(w) => {
+                    debug_assert_eq!(w.reg, regs::MISC_CONTROL);
+                    debug_assert_eq!(w.value, MISC_CTRL_MINING_I2C_OFF);
+                    let (w0, w1) = fifo_cmd_write_reg_full(w.chip_addr, w.reg, w.value);
+                    chain.write_cmd(w0);
+                    chain.write_cmd(w1);
+                }
+                Bm1387MiscCtrlCadenceOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                    }
+                }
+            }
         }
         // Drain any stale CMD RX data after the writes
         while chain.cmd_rx_has_data() {
@@ -399,7 +380,7 @@ impl Bm1387Driver {
         }
         tracing::debug!(
             chain_id = chain.chain_id,
-            "I2C passthrough disabled — 3x MiscCtrl write (0x4020_0180)"
+            "I2C passthrough disabled — pure MiscCtrl triple-write plan (0x4020_0180)"
         );
     }
 
@@ -553,25 +534,100 @@ impl Bm1387Driver {
         None
     }
 
+    /// Pure decode policy for one board-temp passthrough window (host-testable).
+    ///
+    /// Inputs are the raw register bytes gathered in ONE chip-0 I2C passthrough
+    /// window (`None` = that register read failed/timed out). Returns the board
+    /// temperature in °C plus which register family produced it (honest log
+    /// labelling), or `None` — an honest refusal. On refusal the caller
+    /// publishes nothing; the daemon's thermal path then falls back to the XADC
+    /// die temp, labelled `soc_die_fallback` by
+    /// `dcentrald_api_types::thermal_model::assemble_chain_published_temp`.
+    /// This function NEVER fabricates a value (and in particular never returns
+    /// `0.0` for a failed read — a fabricated 0 °C reads as "cold" and defeats
+    /// throttling): every returned number decodes bytes the sensor produced.
+    ///
+    /// Policy, in order:
+    ///   1. **Config gate (MANDATORY).** An unreadable config byte or the RANGE
+    ///      bit set (extended +64 °C offset-binary mode) refuses the WHOLE
+    ///      reading — remote AND local, since extended mode re-encodes every
+    ///      temperature register. The signed decoders below are only correct in
+    ///      standard two's-complement mode; a blind decode would be wrong by
+    ///      64 °C on a thermal-safety path. Refuse — never guess or compensate.
+    ///   2. **Remote** (ASIC die via TEMP_P/TEMP_N diode): signed high byte plus
+    ///      the 0.125 °C/LSB fraction from the low byte. `0x7F` is the family's
+    ///      open-circuit/fault latch and is rejected by value because +127 °C is
+    ///      inside the plausibility window. A missing low byte degrades to
+    ///      whole-degree resolution (under-reads by at most 0.875 °C) instead of
+    ///      dropping a real reading.
+    ///   3. **Local fallback** (sensor die ≈ PCB temp, signed) when the remote
+    ///      value is absent, faulted, or implausible.
+    ///   4. **Plausibility window** −40..=150 °C on whichever value is used —
+    ///      a sanity filter for bus garbage, not a safety limit.
+    fn decode_board_temp_registers(
+        config: Option<u8>,
+        remote_high: Option<u8>,
+        remote_low: Option<u8>,
+        local: Option<u8>,
+    ) -> Option<(f32, BoardTempSource)> {
+        let cfg = config?;
+        if lm90::is_extended_range(cfg) {
+            return None;
+        }
+
+        if let Some(high) = remote_high {
+            if high != lm90::REMOTE_OPEN_CIRCUIT_HIGH {
+                let t = lm90::decode_remote_temp(high, remote_low.unwrap_or(0));
+                if lm90::PLAUSIBLE_REMOTE_C.contains(&t) {
+                    return Some((t, BoardTempSource::RemoteDiode));
+                }
+            }
+        }
+
+        let l = local?;
+        if l == lm90::REMOTE_OPEN_CIRCUIT_HIGH {
+            // +127 °C is the fault-latch value on the local register too.
+            return None;
+        }
+        let t = f32::from(lm90::decode_local_temp(l));
+        if lm90::PLAUSIBLE_REMOTE_C.contains(&t) {
+            Some((t, BoardTempSource::LocalSensor))
+        } else {
+            None
+        }
+    }
+
     /// Read hash board temperature via BM1387 I2C passthrough (register 0x20).
     ///
     /// Reads from chip 0's I2C passthrough to the on-board temp sensor.
-    /// Returns temperature in degrees Celsius, or None if sensor not detected.
+    /// Returns temperature in degrees Celsius, or None if the sensor is not
+    /// detected or the reading must be refused (see below). A `None` is an
+    /// honest "no board temperature" — callers keep the die-temp fallback and
+    /// must never substitute a fabricated number.
     ///
-    /// The sensor's "remote" temperature (REG_REMOTE_TEMP = 0x01) measures the
-    /// BM1387 die temperature via an external diode connected to the ASIC's
-    /// TEMP_P/TEMP_N pins. This is the actual chip temperature.
+    /// The sensor's "remote" temperature (REG_REMOTE_TEMP = 0x01 high byte +
+    /// REG_REMOTE_TEMP_LOW = 0x10 fraction) measures the BM1387 die temperature
+    /// via an external diode connected to the ASIC's TEMP_P/TEMP_N pins. This is
+    /// the actual chip temperature. The sensor's "local" temperature
+    /// (REG_LOCAL_TEMP = 0x00) measures the sensor IC's own die temperature,
+    /// which approximates PCB temperature; it is the fallback when the remote
+    /// diode is open/faulted.
     ///
-    /// The sensor's "local" temperature (REG_LOCAL_TEMP = 0x00) measures the
-    /// sensor IC's own die temperature, which approximates PCB temperature.
-    ///
-    /// We read the remote temperature as it's more relevant for thermal control.
-    /// If remote read fails (open circuit / no diode), fall back to local temp.
+    /// Decode is SIGNED two's-complement via `dcentrald_api_types::
+    /// remote_temp_sensor` (0xF6 = −10 °C; 0 °C is a valid reading). Before any
+    /// temperature is trusted, the sensor's Configuration Register 1 is read in
+    /// the SAME passthrough window and the reading is REFUSED when the
+    /// extended-range (+64 °C offset-binary) bit is set or the config byte is
+    /// unreadable — a blind decode would be wrong by 64 °C on the thermal-safety
+    /// path. The config pointer is part-aware (0x09 on TMP42x, 0x03 otherwise).
     ///
     /// IMPORTANT: This temporarily reconfigures chip 0's MiscCtrl to enable I2C.
-    /// While I2C is active, chip 0 cannot report nonces (RF pin is SDA, not RO).
-    /// The function restores mining mode before returning. Total disruption is
-    /// ~100-200ms per read, acceptable at 5-second intervals.
+    /// While I2C is active, chip 0 cannot report nonces (RF pin is SDA, not RO),
+    /// so EVERY register above is read inside this one window — opening extra
+    /// windows would multiply the ~100-200 ms nonce-suppression cost, while an
+    /// extra byte read inside the window costs only ~3-5 ms typical. Total
+    /// disruption stays ~100-250 ms per read, acceptable at 5-second intervals.
+    /// The function restores mining mode before returning.
     pub fn read_board_temp(chain: &mut FpgaChain) -> Option<f32> {
         // Step 1: Enable I2C passthrough on chip 0
         if !Self::enable_i2c_on_chip0(chain) {
@@ -584,46 +640,72 @@ impl Bm1387Driver {
         // cache the sensor address per chain.
         let sensor = Self::probe_sensor(chain);
 
-        let result = if let Some((addr, _man_id, _dev_id)) = sensor {
-            // Step 3: Read remote temperature (BM1387 die temp via external diode)
-            let remote = Self::i2c_read_byte(chain, addr, REG_REMOTE_TEMP);
+        let result = if let Some((addr, man_id, dev_id)) = sensor {
+            // Step 3: MANDATORY extended-range gate, same passthrough window.
+            let config_reg = lm90::config_register_for(man_id, dev_id);
+            let config = Self::i2c_read_byte(chain, addr, config_reg);
 
-            match remote {
-                Some(temp) if temp < 127 && temp > 0 => {
-                    // Valid remote temp (0-126C range, 127 = open circuit / error)
+            // Step 4: temperature registers — read ONLY when the config byte
+            // permits a standard-mode decode (skips wasted bus traffic on
+            // refusal), still inside the same window.
+            //
+            // The remote FRACTION pointer is part-aware for the same reason the
+            // config pointer is. On TMP42x the low byte at 0x10 belongs to the
+            // LOCAL channel (remote-1's is 0x11, and it is a 4-bit field), so
+            // the classic read would pair a remote whole-degree value with the
+            // local channel's fraction. remote_low_register_for returns None
+            // there and we degrade honestly to whole degrees.
+            let remote_low_reg = lm90::remote_low_register_for(man_id, dev_id);
+            let (remote_high, remote_low, local) = match config {
+                Some(cfg) if !lm90::is_extended_range(cfg) => (
+                    Self::i2c_read_byte(chain, addr, REG_REMOTE_TEMP),
+                    remote_low_reg.and_then(|reg| Self::i2c_read_byte(chain, addr, reg)),
+                    Self::i2c_read_byte(chain, addr, REG_LOCAL_TEMP),
+                ),
+                _ => (None, None, None),
+            };
+
+            let decoded = Self::decode_board_temp_registers(config, remote_high, remote_low, local);
+
+            match (config, decoded) {
+                (None, _) => {
+                    tracing::warn!(
+                        chain_id = chain.chain_id,
+                        config_reg = format_args!("0x{:02X}", config_reg),
+                        "Board temp REFUSED: sensor config register unreadable — \
+                         cannot prove standard-mode encoding (die-temp fallback applies)"
+                    );
+                }
+                (Some(cfg), _) if lm90::is_extended_range(cfg) => {
+                    tracing::warn!(
+                        chain_id = chain.chain_id,
+                        config = format_args!("0x{:02X}", cfg),
+                        "Board temp REFUSED: sensor is in extended (+64 °C offset) \
+                         range mode — refusing rather than guessing a compensation \
+                         (die-temp fallback applies)"
+                    );
+                }
+                (_, Some((t, source))) => {
                     tracing::debug!(
                         chain_id = chain.chain_id,
-                        remote_temp_c = temp,
-                        "Board temp (remote/ASIC diode): {}C",
-                        temp,
+                        temp_c = t,
+                        source = source.as_str(),
+                        "Board temp: {:.3}C",
+                        t,
                     );
-                    Some(temp as f32)
                 }
-                _ => {
-                    // Remote temp failed or out of range — try local temp as fallback
-                    let local = Self::i2c_read_byte(chain, addr, REG_LOCAL_TEMP);
-                    match local {
-                        Some(temp) if temp < 127 => {
-                            tracing::debug!(
-                                chain_id = chain.chain_id,
-                                local_temp_c = temp,
-                                "Board temp (local/PCB sensor): {}C (remote diode unavailable)",
-                                temp,
-                            );
-                            Some(temp as f32)
-                        }
-                        _ => {
-                            tracing::warn!(
-                                chain_id = chain.chain_id,
-                                "Sensor found but temp read failed (remote={:?}, local={:?})",
-                                remote,
-                                local,
-                            );
-                            None
-                        }
-                    }
+                (_, None) => {
+                    tracing::warn!(
+                        chain_id = chain.chain_id,
+                        "Sensor found but no usable temp (remote_high={:?}, \
+                         remote_low={:?}, local={:?})",
+                        remote_high,
+                        remote_low,
+                        local,
+                    );
                 }
             }
+            decoded.map(|(t, _source)| t)
         } else {
             tracing::debug!(
                 chain_id = chain.chain_id,
@@ -632,7 +714,7 @@ impl Bm1387Driver {
             None
         };
 
-        // Step 4: ALWAYS restore mining mode, even if temp read failed
+        // Step 5: ALWAYS restore mining mode, even if temp read failed
         // Triple-write MiscCtrl (no readback — BM1387 CMD reads always timeout)
         Self::disable_i2c_on_chip0(chain);
 
@@ -1419,9 +1501,14 @@ impl ChipDriver for Bm1387Driver {
     }
 
     fn set_voltage(&self, pic: &mut PicController, voltage_mv: u16) -> Result<()> {
-        let pic_value = PicController::voltage_to_pic(voltage_mv as f64 / 1000.0);
-        pic.set_voltage(pic_value)?;
-        Ok(())
+        // P1-2: ChipDriver → VoltageRail facet (Pic16 admit + pic16_mv_to_dac).
+        let addr = pic.address();
+        crate::voltage_rail_adapters::chip_driver_set_voltage_via_pic16_rail(
+            dcentrald_common::AsicProtocolIdentity::Bm1387,
+            pic,
+            voltage_mv,
+        )
+        .map_err(|e| crate::voltage_rail_adapters::voltage_rail_error_as_asic(e, addr))
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -1616,11 +1703,11 @@ impl ChipDriver for Bm1387Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BraiinsOS encoding: (difficulty - 1).reverse_bits().swap_bytes()
-        // For difficulty 256: 255 -> 0xFF000000 (reverse) -> 0x000000FF (swap) = 0xFF
-        // Same result as simple `255` for power-of-2 difficulties, but correct for
-        // arbitrary values (the ASIC compares bit-reversed nonce prefix against this mask).
-        difficulty.saturating_sub(1).reverse_bits().swap_bytes()
+        // G24 pure SSOT: BraiinsOS bit-reversed encode (same as BM1397 jig).
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::BitReversed,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {
@@ -1698,5 +1785,114 @@ mod tests {
         );
         assert_eq!(NUM_MIDSTATES, 4);
         assert_eq!(WORK_WORDS, 36);
+    }
+
+    // ---  R10: LM90 board-temp decode policy (pure, host-testable) -------
+    //
+    // `decode_board_temp_registers(config, remote_high, remote_low, local)`
+    // is the complete decision logic for one passthrough window. These tests pin
+    // the signed decode, the MANDATORY extended-range refusal, and the
+    // fail-safe "unreadable -> None, never 0.0" contract.
+
+    /// Shorthand: standard-mode config byte (RANGE bit clear).
+    const CFG_STD: Option<u8> = Some(0x00);
+
+    fn decode(
+        config: Option<u8>,
+        remote_high: Option<u8>,
+        remote_low: Option<u8>,
+        local: Option<u8>,
+    ) -> Option<f32> {
+        Bm1387Driver::decode_board_temp_registers(config, remote_high, remote_low, local)
+            .map(|(t, _)| t)
+    }
+
+    #[test]
+    fn driver_register_map_is_bound_to_the_canonical_lm90_map() {
+        assert_eq!(REG_LOCAL_TEMP, 0x00);
+        assert_eq!(REG_REMOTE_TEMP, 0x01);
+        assert_eq!(REG_REMOTE_TEMP_LOW, 0x10);
+        assert_eq!(REG_MANUFACTURER_ID, 0xFE);
+        assert_eq!(REG_DEVICE_ID, 0xFF);
+        assert_eq!(lm90::reg::CONFIG_READ, 0x03);
+        assert_eq!(lm90::reg::TMP42X_CONFIG_1, 0x09);
+    }
+
+    #[test]
+    fn negative_remote_temp_round_trips_signed() {
+        // 0xF6 = -10 °C two's complement. The pre-R10 unsigned decode read this
+        // as 246 and silently discarded it.
+        assert_eq!(decode(CFG_STD, Some(0xF6), Some(0x00), None), Some(-10.0));
+        // LM90 fraction adds toward positive: -10 °C + 4/8 = -9.5 °C.
+        assert_eq!(decode(CFG_STD, Some(0xF6), Some(0x80), None), Some(-9.5));
+        // Fractional resolution on a positive temp: 60 °C + 7/8.
+        assert_eq!(decode(CFG_STD, Some(60), Some(0xE0), None), Some(60.875));
+    }
+
+    #[test]
+    fn zero_celsius_is_a_valid_reading() {
+        // The pre-R10 filter `temp > 0` rejected a real 0 °C (winter cold-start).
+        assert_eq!(decode(CFG_STD, Some(0x00), Some(0x00), None), Some(0.0));
+    }
+
+    #[test]
+    fn extended_range_mode_is_refused_not_compensated() {
+        // RANGE bit (0x04) set: every register is +64 °C offset binary and the
+        // standard decode would be wrong by 64 °C. Refusal covers remote AND
+        // local — no compensation, no fallback within the same reading.
+        assert_eq!(decode(Some(0x04), Some(94), Some(0x00), Some(40)), None);
+        assert_eq!(decode(Some(0x05), Some(94), Some(0x00), Some(40)), None);
+        assert_eq!(decode(Some(0xFF), Some(94), Some(0x00), Some(40)), None);
+        // Non-RANGE config bits must not refuse.
+        assert_eq!(decode(Some(0xFB), Some(94), Some(0x00), None), Some(94.0));
+    }
+
+    #[test]
+    fn unreadable_config_refuses_the_whole_reading() {
+        // Without the config byte, standard-mode encoding is unproven — refuse
+        // even though the temperature registers read back fine.
+        assert_eq!(decode(None, Some(65), Some(0x00), Some(40)), None);
+    }
+
+    #[test]
+    fn unreadable_sensor_yields_none_never_zero() {
+        // All temperature reads failed: None. NEVER a fabricated 0.0 — on a
+        // thermal path a fake 0 °C reads as "cold" and defeats throttling.
+        assert_eq!(decode(CFG_STD, None, None, None), None);
+        // Open-circuit remote + dead local: still None.
+        assert_eq!(decode(CFG_STD, Some(0x7F), Some(0x00), None), None);
+        // Both channels latched at the +127 fault value: None.
+        assert_eq!(decode(CFG_STD, Some(0x7F), None, Some(0x7F)), None);
+    }
+
+    #[test]
+    fn open_circuit_remote_falls_back_to_local_signed() {
+        // 0x7F (+127 °C) is the diode-fault latch and sits INSIDE the
+        // plausibility window, so it must be rejected by value.
+        assert_eq!(
+            decode(CFG_STD, Some(0x7F), Some(0x00), Some(45)),
+            Some(45.0)
+        );
+        // Local decode is signed too: 0xFB = -5 °C.
+        assert_eq!(decode(CFG_STD, None, None, Some(0xFB)), Some(-5.0));
+    }
+
+    #[test]
+    fn implausible_remote_falls_back_to_local() {
+        // 0x9E = -98 °C: below the -40 °C plausibility floor (bus garbage /
+        // extended-mode bytes leaking through), so use the local channel.
+        assert_eq!(
+            decode(CFG_STD, Some(0x9E), Some(0x00), Some(50)),
+            Some(50.0)
+        );
+        // Implausible local as well -> None.
+        assert_eq!(decode(CFG_STD, Some(0x9E), Some(0x00), Some(0x9E)), None);
+    }
+
+    #[test]
+    fn missing_fraction_byte_degrades_to_whole_degrees() {
+        // A timed-out low byte must not drop a real high-byte reading; the cost
+        // is bounded (-0.875 °C worst-case under-read at 0.125 °C/LSB).
+        assert_eq!(decode(CFG_STD, Some(60), None, None), Some(60.0));
     }
 }

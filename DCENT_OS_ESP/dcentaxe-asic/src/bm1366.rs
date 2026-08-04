@@ -18,6 +18,64 @@ use crate::AsicDriver;
 const CHIP_ID: u16 = 0x1366;
 const CHIP_ID_RESPONSE_LENGTH: usize = 11;
 
+// ── SPEC §6: fail-closed chain enumeration ──────────────────────────────────
+//
+// Partial enumeration used to be a `log::warn!` and mining proceeded. On a
+// multi-chip chain that is a real hazard, not a cosmetic one: a chip that
+// missed enumeration consumes no SETADDRESS frame, never receives its per-chip
+// init, sits at default address 0 — and still receives every GROUP_ALL
+// broadcast (frequency ramp, difficulty mask, jobs). It therefore hashes chip
+// 0's nonce partition, producing duplicate work that the dedup ring quietly
+// absorbs, while drawing full power and full heat. On a 140 W nine-chip board
+// (Lucky LV08) that is an unaccounted thermal load behind a board that reports
+// "7 chips OK". The Lucky vendor fork refuses to mine on a count mismatch; we
+// adopt the same posture.
+
+/// Whether the operator compiled in the explicit unsafe lab safety bypass
+/// (`DCENTAXE_UNSAFE_LAB_SAFETY_BYPASS=1` at build time).
+///
+/// COMPILE-TIME ONLY, mirroring `main.rs::unsafe_lab_safety_bypass_enabled` and
+/// `dcentaxe_hal::safety::lab_safety_bypass_enabled` (XPSAFE-4): there is no
+/// runtime `std::env::var` arm, so every safety layer reads the SAME gate and
+/// a shipped image cannot be talked out of the refusal at runtime.
+fn lab_safety_bypass_enabled() -> bool {
+    option_env!("DCENTAXE_UNSAFE_LAB_SAFETY_BYPASS") == Some("1")
+}
+
+/// Pure enumeration-acceptance policy (SPEC §6).
+///
+/// `true` means the chain may proceed to mining with `detected` chips given the
+/// board's declared `expected` count.
+///
+/// **Scope is deliberately narrow — multi-chip boards only.**
+///
+/// * `expected <= 1` — single-ASIC boards (BitAxe Ultra and any board whose
+///   config declares one BM1366) keep the historical warn-only posture
+///   verbatim. These are the live-proven, in-the-field boards; a detection
+///   quirk there must not newly refuse to mine. Detecting exactly 1 on a
+///   1-chip board is, of course, not a mismatch at all.
+/// * `expected >= 2` — the count must match EXACTLY. Both directions are
+///   refused: fewer detected means unaddressed live chips duplicating chip 0
+///   at full heat; more detected means the board identity is wrong and the
+///   per-chip init / address plan was computed for the wrong chain.
+///
+/// `detected == 0` deliberately returns `true` here: a wholly dark chain is the
+/// caller's pre-existing `NoAsicsFound` refusal (`init` returns it immediately),
+/// and it is still fail-closed. Owning it here too would only replace a precise
+/// "no chips on the bus" diagnostic with a vaguer "count mismatch" one.
+pub fn enumeration_count_is_acceptable(expected: u8, detected: u8) -> bool {
+    if detected == 0 {
+        // Dark chain — `NoAsicsFound` owns this case.
+        return true;
+    }
+    if expected <= 1 {
+        // Historical behaviour, untouched.
+        true
+    } else {
+        detected == expected
+    }
+}
+
 /// Register map: register address -> RegisterType
 /// Matches the C static const REGISTER_MAP[]
 fn register_type_for(addr: u8) -> RegisterType {
@@ -318,11 +376,48 @@ impl BM1366 {
         }
 
         if chip_counter != expected_count {
-            log::warn!(
-                "{} chip(s) detected on the chain, expected {}",
-                chip_counter,
-                expected_count
-            );
+            if enumeration_count_is_acceptable(expected_count, chip_counter) {
+                // Single-ASIC boards: historical warn-only posture, unchanged.
+                log::warn!(
+                    "{} chip(s) detected on the chain, expected {}",
+                    chip_counter,
+                    expected_count
+                );
+            } else if lab_safety_bypass_enabled() {
+                log::warn!(
+                    "BM1366 enumeration mismatch: {} of {} chip(s) answered CHIP_ID — \
+                     proceeding ONLY because DCENTAXE_UNSAFE_LAB_SAFETY_BYPASS=1 was \
+                     compiled in. Unaddressed chips will duplicate chip 0's nonce \
+                     range at full power.",
+                    chip_counter,
+                    expected_count
+                );
+            } else {
+                log::error!(
+                    "BM1366 enumeration mismatch: {} of {} chip(s) answered CHIP_ID — \
+                     refusing to mine (SPEC §6 fail-closed)",
+                    chip_counter,
+                    expected_count
+                );
+                let why = if chip_counter < expected_count {
+                    format!(
+                        "the {} unenumerated chip(s) would stay at default address 0, \
+                         duplicate chip 0's nonce range on every broadcast job, and draw \
+                         full power outside the board's accounted thermal envelope",
+                        expected_count - chip_counter
+                    )
+                } else {
+                    format!(
+                        "{} more chip(s) answered than this board declares — the address \
+                         plan and per-chip init were computed for the wrong chain",
+                        chip_counter - expected_count
+                    )
+                };
+                return Err(AsicError::InitFailed(format!(
+                    "BM1366 chain enumeration mismatch: detected {chip_counter}, \
+                     expected {expected_count}. Refusing to mine — {why}."
+                )));
+            }
         }
 
         Ok(chip_counter)
@@ -994,6 +1089,135 @@ mod tests {
         assert!(
             driver.send_hash_frequency(10.0).is_err(),
             "below-min target must error, not write fb_divider=0"
+        );
+    }
+
+    // ── SPEC §6: fail-closed chain enumeration ───────────────────────────────
+
+    /// Build a CRC5-valid 11-byte BM1366 CHIP_ID response frame.
+    /// Layout mirrors what `count_chips` parses: preamble, CHIP_ID, core-num,
+    /// address, then padding whose final byte carries the CRC5.
+    fn chip_id_frame(addr: u8) -> [u8; 11] {
+        with_valid_crc5(
+            [
+                0xAA,
+                0x55, // preamble
+                (CHIP_ID >> 8) as u8,
+                (CHIP_ID & 0xff) as u8,
+                0x00, // CORE_NUM
+                addr, // chip address
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // CRC filled by helper
+            ],
+            false,
+        )
+    }
+
+    /// Drive `count_chips` end-to-end with `detected` injected CHIP_ID frames.
+    /// This exercises the real production wiring, not just the pure policy fn.
+    fn count_chips_with(detected: u8, expected: u8) -> Result<u8, AsicError> {
+        let mut serial = SerialPort::new();
+        serial.init().unwrap();
+        for i in 0..detected {
+            serial.push_rx(&chip_id_frame(i));
+        }
+        let mut driver = BM1366::new(serial);
+        driver.count_chips(expected)
+    }
+
+    /// The pure policy: multi-chip boards demand an exact match; single-chip
+    /// boards are untouched.
+    #[test]
+    fn enumeration_policy_is_multi_chip_only() {
+        // Single-ASIC boards (Ultra and friends) keep the warn-only posture.
+        assert!(enumeration_count_is_acceptable(1, 1));
+        assert!(enumeration_count_is_acceptable(1, 0));
+        assert!(enumeration_count_is_acceptable(1, 2));
+        assert!(enumeration_count_is_acceptable(0, 3));
+        // Multi-chip boards: exact match only.
+        assert!(enumeration_count_is_acceptable(6, 6)); // Hex Ultra, full
+        assert!(enumeration_count_is_acceptable(9, 9)); // LV08, full
+        assert!(enumeration_count_is_acceptable(2, 2)); // LV07, full
+        assert!(!enumeration_count_is_acceptable(9, 7)); // the R4 H-5 hazard
+        assert!(!enumeration_count_is_acceptable(9, 8));
+        assert!(!enumeration_count_is_acceptable(6, 5));
+        assert!(!enumeration_count_is_acceptable(2, 1));
+        // Over-detection is refused too: the address plan would be wrong.
+        assert!(!enumeration_count_is_acceptable(6, 7));
+        assert!(!enumeration_count_is_acceptable(9, 10));
+        // A wholly dark chain stays with the caller's NoAsicsFound refusal so
+        // the "nothing on the bus" diagnostic is not replaced by a vaguer one.
+        assert!(enumeration_count_is_acceptable(9, 0));
+        assert!(enumeration_count_is_acceptable(6, 0));
+    }
+
+    /// WIRING: a full 9-chip LV08 chain enumerates cleanly.
+    #[test]
+    fn count_chips_accepts_a_full_nine_chip_chain() {
+        assert_eq!(count_chips_with(9, 9).expect("9 of 9 must be accepted"), 9);
+    }
+
+    /// WIRING: 7 of 9 must be REFUSED, not warned. This is the exact fail-open
+    /// the LV08 wave closes — two unaddressed live chips duplicating chip 0's
+    /// nonce range at full heat inside a 140 W envelope.
+    #[test]
+    fn count_chips_refuses_partial_nine_chip_enumeration() {
+        let err = count_chips_with(7, 9).expect_err("7 of 9 must be refused");
+        match err {
+            AsicError::InitFailed(msg) => {
+                assert!(
+                    msg.contains("enumeration mismatch"),
+                    "refusal must name the cause, got: {msg}"
+                );
+                assert!(msg.contains('7') && msg.contains('9'));
+            }
+            other => panic!("expected InitFailed, got {other:?}"),
+        }
+    }
+
+    /// WIRING: the refusal is not LV08-specific — a 5-of-6 Hex Ultra chain is
+    /// refused on the same rule.
+    #[test]
+    fn count_chips_refuses_partial_six_chip_enumeration() {
+        assert!(count_chips_with(5, 6).is_err(), "5 of 6 must be refused");
+        assert_eq!(count_chips_with(6, 6).expect("6 of 6 ok"), 6);
+    }
+
+    /// WIRING / NO REGRESSION: a single-chip board detecting its one chip is
+    /// completely unaffected, and a single-chip board that detects nothing
+    /// still returns `Ok(0)` so the caller's distinct `NoAsicsFound` refusal
+    /// (not this one) fires.
+    #[test]
+    fn count_chips_leaves_single_chip_boards_alone() {
+        assert_eq!(count_chips_with(1, 1).expect("1 of 1 ok"), 1);
+        assert_eq!(
+            count_chips_with(0, 1).expect("dark single-chip chain still Ok(0)"),
+            0
+        );
+    }
+
+    /// A dark multi-chip chain also returns `Ok(0)`, preserving the caller's
+    /// `NoAsicsFound` diagnostic instead of masking it with the mismatch error.
+    #[test]
+    fn count_chips_keeps_no_asics_found_distinct_from_partial() {
+        assert_eq!(
+            count_chips_with(0, 9).expect("dark chain must stay Ok(0)"),
+            0
+        );
+    }
+
+    /// The refusal is compiled in for stock images: the lab bypass must be OFF
+    /// unless an operator deliberately built with it.
+    #[test]
+    fn lab_safety_bypass_is_off_in_a_stock_build() {
+        assert!(
+            !lab_safety_bypass_enabled(),
+            "DCENTAXE_UNSAFE_LAB_SAFETY_BYPASS must not be compiled into the \
+             default test/CI build — the fail-closed enumeration gate would be \
+             inert"
         );
     }
 }

@@ -22,9 +22,21 @@
 //! | Byte 0 | Byte 1   | Variant       | Hashboard families                  |
 //! |--------|----------|---------------|-------------------------------------|
 //! | `0x04` | `0x11`   | x19_plain/x19_J | BHB42xxx (S19/S19j Pro/T19; BM1398/BM1362) |
-//! | `0x05` | `0x11`   | edf_v5_xxtea  | BHB56xxx, BHB68xxx, A3HB7xxxx (BM1366/68/70) |
+//! | `0x05` | `0x11`   | edf_v5_xxtea  | BHB56xxx, BHB68xxx (BM1366/BM1368)  |
+//! | `0x01` | `0x41`   | format1 (not dispatched here) | A3HB4xxxx / A3HB7xxxx (S21 Pro/XP; BM1370) |
 //! | `'B'`  | `'r'`    | braiinsminer  | BMM100/BMM101                       |
 //! | other  | other    | UnknownPreamble | rejected with parse error         |
+//!
+//! **Format 1 note (2026-08-02):** A3HB-prefixed boards are format 1, NOT
+//! format 5. Their header is `0x01 0x41`, where `0x41` is `board_name[0]`
+//! (`'A'`), NOT a key-version selector — `board_name` sits in a 16-byte
+//! plaintext header. Format 1 is not dispatched by `dispatch()` here (the
+//! enciphered-body decode is a separate item); it currently falls to
+//! `UnknownPreamble`, but the plaintext SKU still resolves board identity via
+//! `scan_known_sku`. Evidence:
+//! evidence/epic-eeprom-matched-samples-20.json` (A3HB70501/70601/70701
+//! `fmt=1|keyver=65`). **Dispatch is always on `raw[0]`; never map a SKU to a
+//! format** (`BHB56801` appears as both format 4 and 5).
 //!
 //! HAL-free; pure logic. Tests cover synthetic plaintext + the JSON shape
 //! verified against `a lab unit` `hb0/hb1/hb2.parsed.json` evidence in the
@@ -45,8 +57,9 @@ pub enum EepromRecord {
     /// BHB428xx (later S19j Pro), XXTEA-encrypted with explicit PT1/PT2
     /// + sensor rows. KDF unknown.
     X19J(X19JRecord),
-    /// BHB56xxx / BHB68xxx / A3HB7xxxx (BM1366/68/70), EDF v5 header
-    /// with XXTEA algorithm and explicit key index.
+    /// BHB56xxx / BHB68xxx (BM1366/BM1368), EDF v5 header with XXTEA
+    /// algorithm and explicit key index. (A3HB-prefixed S21 Pro/XP boards
+    /// are format 1 `0x01 0x41`, NOT this variant — see module docs.)
     EdfV5Xxtea(EdfV5XxteaRecord),
     /// Legacy structured plaintext helper retained for callers that already
     /// converted a BHB56/BHB68 blob into field-like data.
@@ -447,6 +460,13 @@ fn scan_known_sku(raw: &[u8]) -> Option<String> {
     None
 }
 
+/// Resolve a board name to its catalog row — **first match wins**.
+///
+/// ⚠ ORDER IS LOAD-BEARING. [`BHB_SKU_CATALOG`] mixes exact `model_id` rows
+/// with prefix patterns, and this is a linear `find`. Every exact row MUST be
+/// listed **before** any prefix that would also match it, or the prefix
+/// answers first and the exact row becomes dead. Pinned by
+/// `exact_rows_precede_the_prefix_catch_all_they_correct`.
 pub fn catalog_entry_for_sku(b_name: &str) -> Option<&'static BhbSkuCatalogEntry> {
     let sku = b_name.trim();
     BHB_SKU_CATALOG
@@ -459,7 +479,10 @@ fn sku_matches_catalog_pattern(sku: &str, pattern: &str) -> bool {
         "BHB426xx" => sku.starts_with("BHB426"),
         "BHB428xx" => sku.starts_with("BHB428"),
         "BHB568xx / BHB569xx" => sku.starts_with("BHB568") || sku.starts_with("BHB569"),
-        "BHB68xxx" => sku.starts_with("BHB68"),
+        // W8 rank-9 (2026-08-03): there is deliberately NO `BHB68` prefix arm.
+        // BHB68 SKUs resolve only through their 8 exact roster rows; an
+        // unknown `BHB68…` is `None` (fail closed), never a guessed family.
+        "A3HB4xxxx" => sku.starts_with("A3HB4"),
         "A3HB7xxxx" => sku.starts_with("A3HB7"),
         _ => sku == pattern,
     }
@@ -515,12 +538,42 @@ pub struct BhbSkuCatalogEntry {
 /// Known BHB/A3HB SKU-to-chip-family catalog.
 ///
 /// Source anchors:
-/// - RE notes secs 1.5-1.11 classify `BHB42801`, `BHB42811`, `BHB42821`,
-///   `BHB42831`, and `BHB42841` as S19 XP / S19j XP BM1366 profile rows.
-/// - The board-set table lists the same `BHB428xx` SKUs in the BM1366 set.
+/// -  secs 1.5-1.11
+///   classifies `BHB42801`, `BHB42811`, `BHB42821`, `BHB42831`, and
+///   `BHB42841` as S19 XP / S19j XP BM1366 profile rows.
+/// -  line 278
+///   lists the same `BHB428xx` SKUs in the BM1366 board set.
 ///
 /// Keep `BHB428xx -> BM1366` load-bearing; older model notes contained a
 /// stale `BHB42801 -> BM1362` line.
+///
+/// ## Prefer EXACT `model_id` rows; prefixes are the legacy shape (UB-26)
+///
+/// The `*xx` patterns here are **prefix** matchers. A prefix answers for SKUs
+/// nobody has ever examined, which is how `BHB68xxx -> BM1370` came to give a
+/// wrong-family answer for six BM1368 boards. New rows are therefore EXACT
+/// `model_id` keys, and [`catalog_entry_for_sku`] is a first-match-wins linear
+/// scan, so **an exact row must be listed before any prefix that would also
+/// match it**.
+///
+/// **W8 rank-9 (2026-08-03): the `BHB68xxx -> BM1370` catch-all is RETIRED.**
+/// An unknown `BHB68…` SKU now resolves to `None` — fail closed, never a
+/// guessed family. Rationale: every one of the 8 `BHB68xxx` boards in the held
+/// ePIC v1.22.0 roster is `asic_id BM1368`/`asic_addr 0x1368`; zero BHB68
+/// boards anywhere in any held corpus are BM1370 (the roster's 13 BM1370
+/// boards are all `A3HB*`, format 1); and the DCENT-held s21 `BHB68606` page
+/// plus the three held format-5 BHB68 pages all carry the BM1368 lot-code
+/// letter `'V'` (W5-RANK-13 §2). A catch-all in EITHER direction is a guess:
+/// `-> BM1370` mis-labels the likely-BM1368 unknown, `-> BM1368` would
+/// mis-label a future genuine BM1370 `BHB68…`. Neither is evidence, so an
+/// unknown must be `None` (per-SKU evidence adds a new EXACT row). The
+/// remaining `BHB426xx`/`BHB428xx`/`BHB568xx/BHB569xx` prefixes are separate
+/// adjudications with their own evidence base and are unchanged here.
+///
+/// The exact-keyed, roster-complete counterpart (50 SKUs, with per-row
+/// provenance and no prefix matching at all) is
+/// `dcentrald-silicon-profiles::hashboard_catalog`. It cannot live here —
+/// this crate is HAL-free and deliberately upstream of silicon-profiles.
 pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
     BhbSkuCatalogEntry {
         pattern: "BHB426xx",
@@ -530,6 +583,25 @@ pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
         confidence: "high",
         source: " secs 1.1-1.4",
         note: "BHB426xx rows cover the S19j Pro BM1362 family.",
+    },
+    // UB-26 (2026-08-03): EXACT row. `BHB42701` starts with `BHB427`, so no
+    // pattern in this table matched it and `chip_family_for_sku("BHB42701")`
+    // returned `None` — a catalogued board with no resolvable family (H3 §1.4
+    // records the same refusal). Two independent sources say BM1362: our own
+    // `dcentrald-silicon-profiles::hashboards` catalog row (`BHB42701`, 108
+    // chips/chain, efficiency-optimised, with a per-SKU BM1362 PVT table) and
+    // the ePIC jig DB (`asic_id BM1362`, `asic_addr 0x1362`, 108 chips).
+    // Exact key, deliberately NOT a new `BHB427xx` prefix.
+    BhbSkuCatalogEntry {
+        pattern: "BHB42701",
+        chip_family: "BM1362",
+        model_family: "S19j",
+        eeprom_variant: "x19_plain",
+        confidence: "high",
+        source: "silicon-profiles::hashboards BHB42701 catalog row + bm1362 PVT table; \
+                 epic-jig-hashboard-db-50models.json (BM1362/0x1362, 108 chips)",
+        note: "Exact row: BHB42701 matched no pattern before UB-26 and resolved to None. \
+               Held page observed as format 4 (0x04 0x11); dispatch is still always on raw[0].",
     },
     BhbSkuCatalogEntry {
         pattern: "BHB428xx",
@@ -576,24 +648,169 @@ pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
         source: " lines 539-540; wave6-vnish-decrypted/BHB_INVENTORY.md",
         note: "BHB68606 is documented as S21-class BM1368, not the broad BM1370 fallback.",
     },
+    // ------------------------------------------------------------------
+    // UB-26 (2026-08-03): the six remaining EXACT `BHB68xxx` rows.
+    //
+    // The broad `BHB68xxx -> BM1370` row below is a **prefix catch-all** whose
+    // only cited basis is a *preamble* table (`BOSMINER_EEPROM_PARSERS_RE.md`)
+    // — and a preamble is a family hint that provably cannot determine an ASIC
+    // generation (`0x05 0x11` spans BM1366 AND BM1368). It therefore answered
+    // "BM1370" for six SKUs nobody had ever looked at. The ePIC UMC OS v1.22.0
+    // jig DB declares all EIGHT `BHB68xxx` roster rows as `asic_id BM1368` /
+    // `asic_addr 0x1368` / 108 chips per chain — no `BHB68xxx` board in that
+    // roster is BM1370 (the BM1370 boards are the 13 `A3HB*` rows). Four of the
+    // six are independently corroborated as 108-chip S21-generation boards by
+    // the VNish 1.2.7 model matrix (`BHB68701`/`BHB68703` = Antminer T21,
+    // `BHB68707`/`BHB68709` = Antminer S19 XP+).
+    //
+    // Caveat 3 stands: the ePIC DB is Bitmain-derived but ePIC-TRANSCRIBED and
+    // never outranks a DCENT measurement. It is not overruling one here — the
+    // value it corrects is a doc inference from a preamble table, not a
+    // measurement. Confidence is therefore `medium`, not `high`.
+    //
+    // These are EXACT keys, never a `BHB687xx` prefix, and they change nothing
+    // about admission: `hashboard_eeprom::DEPLOYED_SKU_IDENTITY_POLICY` has no
+    // row for any of them, so `observed_protocol_for_deployed_board_name` still
+    // refuses all six (pinned by `deployed_bhb68_prefix_never_mints_bm1368`
+    // there and by `new_exact_rows_do_not_widen_deployed_admission` here).
+    //
+    // W8 rank-9 (2026-08-03): the `BHB68xxx -> BM1370` catch-all that used to
+    // sit after these rows is REMOVED (see the catalog doc comment above). An
+    // unknown `BHB68…` SKU resolves to `None`; only the 8 exact roster rows
+    // (BHB68601/68603[-]/68606/68701/68703/68705/68707/68709) answer.
+    // ------------------------------------------------------------------
     BhbSkuCatalogEntry {
-        pattern: "BHB68xxx",
-        chip_family: "BM1370",
-        model_family: "S21 Pro / S21 XP family",
+        pattern: "BHB68601",
+        chip_family: "BM1368",
+        model_family: "S21-generation BM1368 board; no held corpus names its product",
         eeprom_variant: "edf_v5_xxtea_key1",
         confidence: "medium",
-        source: "BOSMINER_EEPROM_PARSERS_RE.md preamble table;  lines 539+",
-        note:
-            "Cataloged as S21-class EDF v5 EEPROM; exact per-SKU silicon remains corpus-dependent.",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips; ePIC-transcribed, caveat 3)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all. No held \
+               page for this SKU, so the eeprom_variant is the family's observed class, \
+               not an attested format — always dispatch on raw[0].",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB68701",
+        chip_family: "BM1368",
+        model_family: "T21",
+        eeprom_variant: "edf_v5_xxtea_key1",
+        confidence: "medium",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips); \
+                 VNish 1.2.7 model matrix (Antminer T21, 108 chips); \
+                 epic-eeprom-matched-samples-20.json (held page, format 5)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB68703",
+        chip_family: "BM1368",
+        model_family: "T21",
+        eeprom_variant: "edf_v5_xxtea_key1",
+        confidence: "medium",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips); \
+                 VNish 1.2.7 model matrix (Antminer T21, 108 chips)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all. No held \
+               page for this SKU; always dispatch on raw[0].",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB68705",
+        chip_family: "BM1368",
+        model_family: "S21-generation BM1368 board; no held corpus names its product",
+        eeprom_variant: "edf_v5_xxtea_key1",
+        confidence: "medium",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips; ePIC-transcribed, caveat 3)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all. No held \
+               page for this SKU; always dispatch on raw[0].",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB68707",
+        chip_family: "BM1368",
+        model_family: "S19 XP+",
+        eeprom_variant: "edf_v5_xxtea_key1",
+        confidence: "medium",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips); \
+                 VNish 1.2.7 model matrix (Antminer S19 XP+, 108 chips)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all. No held \
+               page for this SKU; always dispatch on raw[0].",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB68709",
+        chip_family: "BM1368",
+        model_family: "S19 XP+",
+        eeprom_variant: "edf_v5_xxtea_key1",
+        confidence: "medium",
+        source: "epic-jig-hashboard-db-50models.json (BM1368/0x1368, 108 chips); \
+                 VNish 1.2.7 model matrix (Antminer S19 XP+, 108 chips)",
+        note: "Exact row: was swept into the broad BHB68xxx -> BM1370 catch-all. No held \
+               page for this SKU; always dispatch on raw[0].",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "A3HB4xxxx",
+        chip_family: "BM1370",
+        model_family: "S21 Pro / S21 XP class",
+        eeprom_variant: "format1_plaintext_name",
+        confidence: "low",
+        source: "epic-jig-hashboard-db-50models.json (A3HB40601 -> BM1370; ePIC-transcribed, caveat 3)",
+        note: "A3HB40601 was silently unresolved before this row. Format 1 \
+               (0x01 0x41) inferred from the A3HB7 sibling family; no held page \
+               for A3HB4, so treat the format as unconfirmed and always dispatch \
+               on raw[0].",
     },
     BhbSkuCatalogEntry {
         pattern: "A3HB7xxxx",
         chip_family: "BM1370",
-        model_family: "S21 XP variant",
-        eeprom_variant: "edf_v5_xxtea_key1",
-        confidence: "medium",
-        source: "BOSMINER_EEPROM_PARSERS_RE.md preamble table",
-        note: "Non-BHB S21 XP-style board name retained for EEPROM consumers.",
+        model_family: "S21 Pro / S21 XP class",
+        // Format 1 (0x01 0x41), NOT edf_v5. Ground truth: three held pages
+        // A3HB70501/70601/70701 decode as format_version=1, keyver=0x41 =
+        // board_name[0] 'A' (plaintext), NOT a key selector.
+        eeprom_variant: "format1_plaintext_name",
+        confidence: "high",
+        source: "epic-eeprom-matched-samples-20.json (A3HB70501/70601/70701 fmt=1|keyver=65)",
+        note: "Corrects the stale A3HB7xxxx -> edf_v5_xxtea (0x05) label; A3HB7 \
+               is format 1 (0x01 0x41), board_name in plaintext, enciphered body \
+               key unrecovered. Dispatch on raw[0], never map SKU -> format.",
+    },
+    // ------------------------------------------------------------------
+    // UB-26 (2026-08-03): the two non-`model_id` jig records. Neither matched
+    // any pattern, so both resolved to `None`.
+    //
+    // These are the strongest-evidenced rows in this table: we RE'd `NBP1901`
+    // from a completely different source (`bm1398_protocol.rs`'s
+    // `S19_PRO_NBP1901_CHAIN_SPEC`, jig-recovered 2026-07-24: 114 chips,
+    // 38 voltage domains x 3) and the ePIC DB independently reproduces it
+    // exactly; `NBS1902`'s 76 = 38 x 2 likewise matches
+    // `projects/dcent-hashboards/HASHBOARD_TARGET_MATRIX.md:45`.
+    //
+    // IDENTITY LABEL ONLY. Native BM1398 remains NOT IMPLEMENTED and refused:
+    // `hashboard_eeprom::DEPLOYED_SKU_IDENTITY_POLICY` declares no BM1398 row,
+    // a row only ever admits its OWN identity, and the `0x04`-never-admits-
+    // BM1398 invariant is unchanged. Pinned by
+    // `new_exact_rows_do_not_widen_deployed_admission`.
+    // ------------------------------------------------------------------
+    BhbSkuCatalogEntry {
+        pattern: "NBP1901",
+        chip_family: "BM1398",
+        model_family: "S19 Pro",
+        // No held page for either NB* SKU, so the on-page format is UNKNOWN.
+        // Do not guess a family default here — dispatch is on raw[0] anyway.
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "high",
+        source: "bm1398_protocol.rs S19_PRO_NBP1901_CHAIN_SPEC (jig-recovered 2026-07-24: \
+                 114 chips / 38 domains x 3); epic-jig-hashboard-db-50models.json (BM1398P/0x1398, \
+                 114 chips, chain_domain_num 38) — two independent sources agreeing exactly",
+        note: "Exact row: NBP1901 matched no pattern before UB-26 and resolved to None. \
+               Identity label only; native BM1398 stays refused by the admission policy.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "NBS1902",
+        chip_family: "BM1398",
+        model_family: "S19",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "high",
+        source: "epic-jig-hashboard-db-50models.json (BM1398P/0x1398, 76 chips, 38 domains x 2); \
+                 projects/dcent-hashboards/HASHBOARD_TARGET_MATRIX.md:45 (S19: 76 = 38 x 2)",
+        note: "Exact row: NBS1902 matched no pattern before UB-26 and resolved to None. \
+               Identity label only; native BM1398 stays refused by the admission policy.",
     },
 ];
 
@@ -730,9 +947,195 @@ mod tests {
         assert_eq!(chip_family_for_sku("BHB68603"), Some("BM1368"));
         assert_eq!(chip_family_for_sku("BHB68603-"), Some("BM1368"));
         assert_eq!(chip_family_for_sku("BHB68606"), Some("BM1368"));
-        assert_eq!(chip_family_for_sku("BHB68123"), Some("BM1370"));
+        // W8 rank-9: no BHB68 catch-all — an off-roster BHB68 SKU is None.
+        assert_eq!(chip_family_for_sku("BHB68123"), None);
+        // A3HB40601 was silently unresolved before the A3HB4 pattern was added.
+        assert_eq!(chip_family_for_sku("A3HB40601"), Some("BM1370"));
+        assert_eq!(chip_family_for_sku("A3HB70501"), Some("BM1370"));
+        assert_eq!(chip_family_for_sku("A3HB70601"), Some("BM1370"));
+        assert_eq!(chip_family_for_sku("A3HB70701"), Some("BM1370"));
         assert_eq!(chip_family_for_sku("UNKNOWN-XX"), None);
         assert_eq!(chip_family_for_sku(""), None);
+    }
+
+    #[test]
+    fn a3hb_boards_are_format1_not_edf_v5() {
+        // Ground truth: A3HB70501/70601/70701 decode as format_version=1
+        // (header 0x01 0x41), NOT format 5 (0x05 0x11). The catalog must not
+        // relabel them edf_v5. Evidence:
+        //
+        //   epic-eeprom-matched-samples-20.json
+        for sku in ["A3HB40601", "A3HB70501", "A3HB70601", "A3HB70701"] {
+            let entry = catalog_entry_for_sku(sku).expect("A3HB catalog entry");
+            assert_eq!(entry.chip_family, "BM1370");
+            assert_eq!(entry.eeprom_variant, "format1_plaintext_name");
+            assert_ne!(entry.eeprom_variant, "edf_v5_xxtea_key1");
+        }
+    }
+
+    #[test]
+    fn a3hb40601_format1_page_resolves_identity_without_edf_v5() {
+        // A real format-1 page: header 0x01 0x41 then the plaintext board name
+        // (0x41 = board_name[0] = 'A'). dispatch() does not handle 0x01 (that
+        // is a separate enciphered-body item), so the preamble reads as
+        // UnknownPreamble — but the plaintext SKU must still resolve identity.
+        let mut raw = vec![0u8; RAW_EEPROM_BLOB_LEN];
+        raw[0] = 0x01;
+        raw[1] = 0x41;
+        raw[1..1 + b"A3HB40601".len()].copy_from_slice(b"A3HB40601");
+
+        let report = decode_raw_256_blob(&raw);
+        // 0x01 0x41 is not a dispatched preamble here.
+        assert_eq!(report.status, RawEepromDecodeStatus::UnknownPreamble);
+        // ...but the plaintext SKU resolves board identity via scan_known_sku.
+        assert_eq!(report.metadata.board_sku.as_deref(), Some("A3HB40601"));
+        assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1370"));
+        assert!(report.metadata.read_only);
+        assert!(!report.metadata.writes_performed);
+    }
+
+    /// UB-26 + W8 rank-9. The eight `BHB68xxx` roster SKUs resolve to BM1368
+    /// by EXACT key, and the broad `BHB68xxx -> BM1370` catch-all is GONE.
+    ///
+    /// All eight `BHB68xxx` rows in the held ePIC v1.22.0 roster declare
+    /// `asic_id BM1368` / `asic_addr 0x1368` / 108 chips; no roster `BHB68xxx`
+    /// board is BM1370 (the 13 BM1370 roster boards are all `A3HB*`). Four are
+    /// independently corroborated by the VNish 1.2.7 matrix (T21 / S19 XP+,
+    /// 108 chips), and the held format-5 BHB68 pages (ePIC BHB68603/68606/
+    /// 68701 + the DCENT-held s21 `BHB68606` dump) all decode with the BM1368
+    /// lot-code letter `'V'` (W5-RANK-13 §2).
+    #[test]
+    fn exact_bhb68_rows_replace_the_bm1370_catch_all_answer() {
+        for sku in [
+            "BHB68601", "BHB68603", "BHB68606", "BHB68701", "BHB68703", "BHB68705", "BHB68707",
+            "BHB68709",
+        ] {
+            let entry = catalog_entry_for_sku(sku).expect("exact BHB68 row");
+            assert_eq!(entry.pattern, sku, "{sku} must match its OWN exact row");
+            assert_eq!(
+                entry.chip_family, "BM1368",
+                "{sku}: every roster BHB68xxx board is BM1368"
+            );
+        }
+    }
+
+    /// W8 rank-9 NEGATIVE pin: an unknown `BHB68…` SKU resolves to `None`.
+    ///
+    /// A catch-all in either direction is a guess — `-> BM1370` mis-labels the
+    /// likely-BM1368 unknown, `-> BM1368` would mis-label a future genuine
+    /// BM1370 `BHB68…` board. Identity resolution fails CLOSED; new evidence
+    /// adds a new EXACT row, never a prefix.
+    #[test]
+    fn unknown_bhb68_sku_resolves_to_none_never_a_guessed_family() {
+        for probe in [
+            "BHB68123",
+            "BHB68999",
+            "BHB68602",
+            "BHB68607",
+            "BHB68702",
+            "BHB68711",
+            "BHB68",
+            "BHB686",
+            "BHB68xxx",
+            "BHB686060",
+        ] {
+            assert_eq!(
+                chip_family_for_sku(probe),
+                None,
+                "{probe}: off-roster BHB68 must fail closed, not guess a family"
+            );
+            assert!(catalog_entry_for_sku(probe).is_none(), "{probe}");
+        }
+        // ...and no row in the table is a BHB68 prefix pattern anymore.
+        assert!(
+            !BHB_SKU_CATALOG
+                .iter()
+                .any(|e| e.pattern.starts_with("BHB68") && e.pattern.contains('x')),
+            "a BHB68 prefix row must never be reintroduced — exact keys only"
+        );
+    }
+
+    /// UB-26. Three SKUs that previously matched NO pattern and returned
+    /// `None`: `BHB42701` (BHB427, outside the `BHB426`/`BHB428` prefixes) and
+    /// the two non-`model_id` jig records.
+    #[test]
+    fn previously_unresolvable_exact_skus_now_resolve() {
+        assert_eq!(chip_family_for_sku("BHB42701"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("NBP1901"), Some("BM1398"));
+        assert_eq!(chip_family_for_sku("NBS1902"), Some("BM1398"));
+        // Still exact — no new prefix space was opened.
+        for probe in ["BHB427", "BHB42702", "NBP", "NBP19011", "NBS", "NB"] {
+            assert_eq!(
+                chip_family_for_sku(probe),
+                None,
+                "{probe} must not resolve — the new rows are exact keys"
+            );
+        }
+    }
+
+    /// LOAD-BEARING order invariant: this table is a linear `find`, so an
+    /// exact row placed AFTER a prefix that also matches it is dead code and
+    /// the wrong family wins silently. Assert every exact row still answers
+    /// for itself.
+    #[test]
+    fn exact_rows_precede_the_prefix_catch_all_they_correct() {
+        for entry in BHB_SKU_CATALOG {
+            // Only exact rows (patterns that are their own SKU) are checked;
+            // the pattern strings ending in `xx`/`xxx`/`xxxx` are prefixes.
+            if entry.pattern.contains('x') {
+                continue;
+            }
+            let resolved = catalog_entry_for_sku(entry.pattern)
+                .unwrap_or_else(|| panic!("{} resolves to nothing", entry.pattern));
+            assert_eq!(
+                resolved.pattern, entry.pattern,
+                "exact row {} is shadowed by earlier pattern {} — reorder the table",
+                entry.pattern, resolved.pattern
+            );
+        }
+    }
+
+    /// The new rows are IDENTITY LABELS. None of them widens the deployed-page
+    /// admission gate: `DEPLOYED_SKU_IDENTITY_POLICY` has no row for any of
+    /// them, so `observed_protocol_for_deployed_board_name` still refuses —
+    /// and in particular native BM1398 stays refused.
+    #[test]
+    fn new_exact_rows_do_not_widen_deployed_admission() {
+        use crate::hashboard_eeprom::observed_protocol_for_deployed_board_name;
+        for sku in [
+            "BHB42701", "BHB68601", "BHB68701", "BHB68703", "BHB68705", "BHB68707", "BHB68709",
+            "NBP1901", "NBS1902",
+        ] {
+            assert!(
+                catalog_entry_for_sku(sku).is_some(),
+                "{sku} must be catalogued"
+            );
+            assert_eq!(
+                observed_protocol_for_deployed_board_name(sku),
+                None,
+                "{sku}: a catalog identity label must never mint an observed identity"
+            );
+        }
+    }
+
+    /// No new row may claim an EEPROM format it has no held page for.
+    /// `format_version` is not a function of SKU (`BHB56801` is held as both
+    /// format 4 and format 5), so an unattested SKU says so.
+    #[test]
+    fn unattested_new_rows_do_not_claim_a_held_format() {
+        for sku in ["NBP1901", "NBS1902"] {
+            let e = catalog_entry_for_sku(sku).unwrap();
+            assert_eq!(e.eeprom_variant, "unknown_no_held_page", "{sku}");
+        }
+        for sku in ["BHB68601", "BHB68703", "BHB68705", "BHB68707", "BHB68709"] {
+            let e = catalog_entry_for_sku(sku).unwrap();
+            assert!(
+                e.note.contains("No held page for this SKU"),
+                "{sku}: an unattested format must say so in the note, got {:?}",
+                e.note
+            );
+            assert!(e.note.contains("dispatch on raw[0]"), "{sku}");
+        }
     }
 
     #[test]

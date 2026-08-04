@@ -53,6 +53,28 @@ pub fn mining_work_to_job(work: &MiningWork, job_id: u8, model: AsicModel) -> Mi
                 0, // starting_nonce
             )
         }
+        // MSBT0501 (Scrypt) — the payload byte order is DIFFERENT from every
+        // BM13xx part above, and one of the two remaining protocol residuals
+        // is exactly the final whole-buffer transform on it
+        // (MSBT0501_PROTOCOL.md §4.3, undecoded). So:
+        //   * NO 32-bit word reversal is applied. The vendor assembler copies
+        //     prevhash and merkle VERBATIM and byte-swaps only the 32-bit
+        //     scalars; word-reversing them here — the BM13xx habit — would
+        //     produce a well-formed packet with 0% share acceptance.
+        //   * The chip receives header bytes [0..75] (version IN, nonce OUT),
+        //     not BM1485's [4..79]. `lt0051::assemble_scrypt_payload` owns
+        //     that window; this function only hands over the raw fields.
+        // The LT0051 driver refuses `send_work` regardless, so this arm is a
+        // shape-preserving pass-through, not a live path.
+        AsicModel::Lt0051 => MiningJob::new_full(
+            job_id,
+            work.version,
+            work.prev_block_hash,
+            work.merkle_root,
+            work.ntime,
+            work.nbits,
+            0, // start-nonce: the vendor mining path always passes 0
+        ),
     }
 }
 
@@ -128,6 +150,10 @@ pub fn sv2_job_to_mining_work(
         job_id: format!("{}", job_id),
         extranonce2: String::new(),
         share_target,
+        // SV2 is Bitcoin-templated; the Scrypt path is V1-only by design
+        // (SCRYPT_STACK_DESIGN.md §4.6), so SV2 prebuilt work is always
+        // SHA-256d.
+        algorithm: dcentaxe_stratum::PowAlgorithm::Sha256d,
     }
 }
 

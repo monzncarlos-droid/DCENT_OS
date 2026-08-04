@@ -148,10 +148,12 @@ require_pattern "$auth_rs" 'if auth.version < 2 {' \
     'legacy auth version migration is an explicit load-time write trigger'
 require_pattern "$auth_rs" 'if let Some(legacy_token) = auth.api_token.take() {' \
     'legacy auth token migration is an explicit load-time write trigger'
-require_pattern "$auth_rs" 'if dirty {' \
-    'legacy auth migration only saves after a dirty schema/token upgrade'
+require_pattern "$auth_rs" 'if dirty && allow_persistent_mutation {' \
+    'legacy auth migration saves only after a dirty upgrade on a mutation-admitted API'
 require_pattern "$auth_rs" 'let _ = save_auth_at(path, &auth);' \
     'legacy auth migration save remains explicit'
+require_pattern "$auth_rs" '!OBSERVER_ONLY.load(Ordering::Acquire)' \
+    'observer-only auth loading explicitly withholds migration/quarantine persistence'
 
 if [ "$failures" -ne 0 ]; then
     printf '\nauth.json write-frequency audit failed: %s failure(s)\n' "$failures" >&2

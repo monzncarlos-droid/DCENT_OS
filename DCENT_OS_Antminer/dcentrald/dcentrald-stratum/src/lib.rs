@@ -45,6 +45,7 @@ pub mod v1;
 pub mod v2;
 pub mod version_mask;
 pub mod work;
+pub mod work_domain;
 
 pub use acceptance_tracker::{AcceptanceTracker, DEFAULT_WINDOW as ACCEPTANCE_DEFAULT_WINDOW};
 pub use pool_quality::{apply_stratum_status, PoolQualitySnapshot};
@@ -57,3 +58,4 @@ pub use work::{
     compute_midstate_from_prefix, double_sha256, sha256_compress, validate_full_header,
     validate_share, MiningWork, WorkBuilder,
 };
+pub use work_domain::{Extranonce2Exhausted, V1WorkDomain, WorkBuildError, WorkGeneration};

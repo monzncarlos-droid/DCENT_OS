@@ -22,11 +22,20 @@
 # D-Central Technologies - DCENTos v0.4.0
 #
 
-if [ -x /data/dcentrald ]; then
-    DAEMON="/data/dcentrald"
-else
-    DAEMON="/usr/local/bin/dcentrald"
-fi
+select_dcentrald_paths() {
+    if [ -x /data/dcentrald ]; then
+        DAEMON="/data/dcentrald"
+    else
+        DAEMON="/usr/local/bin/dcentrald"
+    fi
+    if [ -f /data/dcentrald.toml ]; then
+        CONFIG="/data/dcentrald.toml"
+    else
+        CONFIG="/etc/dcentrald.toml"
+    fi
+}
+
+select_dcentrald_paths
 PIDFILE="/var/run/dcentrald.pid"
 CHILD_PIDFILE="/var/run/dcentrald-child.pid"
 EXPECTFILE="/var/run/dcentrald.expected_exit.pid"
@@ -34,18 +43,114 @@ LOGFILE="/tmp/dcentrald.log"
 FAN_BASE=0x42800000
 # AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
 FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
+FANHOLD_READYFILE="/var/run/dcentrald-fanhold.ready"
 DEFAULT_COMPAT="/etc/default/dcentos-compat"
 PERSISTENT_COMPAT="/data/dcentos-compat"
 API_PORT=8080
 SCRIPT="$0"
 SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
-
-# Use persistent config if available, otherwise default
-if [ -f /data/dcentrald.toml ]; then
-    CONFIG="/data/dcentrald.toml"
-else
-    CONFIG="/etc/dcentrald.toml"
+PROCESS_IDENTITY_HELPER="/usr/libexec/dcentos/dcentrald-process-identity.sh"
+FAN_CUSTODY_HELPER="/usr/libexec/dcentos/dcentrald-fan-custody.sh"
+DEPLOY_RECOVERY_HELPER="/usr/libexec/dcentos/dcentrald-deploy-recovery.sh"
+DEPLOY_RECOVERY_BASE="/data/.dcent-deploy-recovery"
+DEPLOY_LOCK_HELPER="/usr/libexec/dcentos/dcentos-deploy-lock"
+DEPLOY_LOCK_PATH="/run/dcentos-deploy-admission.lock"
+DEPLOY_MAINTENANCE_MARKER="/run/dcentos-deploy-maintenance"
+CRASH_LATCH_FILE="/data/dcent/dcentrald-hardware-session.crash-latched"
+DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=0
+readonly DCENT_PROCESS_IDENTITY_TEST_AUTHORITY
+PROCESS_IDENTITY_AVAILABLE=0
+if [ -r "$PROCESS_IDENTITY_HELPER" ] && . "$PROCESS_IDENTITY_HELPER"; then
+    PROCESS_IDENTITY_AVAILABLE=1
 fi
+FAN_CUSTODY_AVAILABLE=0
+if [ "$PROCESS_IDENTITY_AVAILABLE" -eq 1 ] \
+    && [ -r "$FAN_CUSTODY_HELPER" ] && . "$FAN_CUSTODY_HELPER"; then
+    FAN_CUSTODY_AVAILABLE=1
+fi
+FAN_TRANSITION_LOCK_HELD=0
+
+dcent_release_fan_transition_lock() {
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_lock_release "${FANHOLD_READYFILE}.lock" || true
+        FAN_TRANSITION_LOCK_HELD=0
+    fi
+}
+
+dcent_acquire_fan_transition_lock() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    dcent_fan_lock_acquire "${FANHOLD_READYFILE}.lock" 10 || return 1
+    FAN_TRANSITION_LOCK_HELD=1
+    trap 'dcent_release_fan_transition_lock' 0
+    trap 'exit 1' 1 2 15
+}
+
+dcent_verify_resolved_deploy_config() {
+    return 0
+}
+
+dcent_verify_resolved_deploy_generation() {
+    dcent_verify_resolved_deploy_config
+}
+
+dcent_verify_resolved_deploy_selection() {
+    return 0
+}
+
+resolve_interrupted_persistent_deploy() {
+    if [ -r "$DEPLOY_RECOVERY_HELPER" ]; then
+        . "$DEPLOY_RECOVERY_HELPER" || return 1
+        dcent_recover_pending_deploy "$DEPLOY_RECOVERY_BASE" \
+            /data/dcentrald /data/dcentrald.toml /etc/dcentrald.toml \
+            /usr/local/bin/dcentrald
+        return $?
+    fi
+
+    # Older/incomplete rootfs overlays must not silently start through a
+    # transaction that they cannot interpret.
+    [ -e "$DEPLOY_RECOVERY_BASE" ] || [ -L "$DEPLOY_RECOVERY_BASE" ] || return 0
+    [ -d "$DEPLOY_RECOVERY_BASE" ] && [ ! -L "$DEPLOY_RECOVERY_BASE" ] || {
+        echo "  [FAIL] Persistent deploy recovery base is invalid"
+        return 1
+    }
+    [ "$(stat -c '%u:%a' "$DEPLOY_RECOVERY_BASE" 2>/dev/null)" = "0:700" ] || {
+        echo "  [FAIL] Persistent deploy recovery base metadata is invalid"
+        return 1
+    }
+    if [ -e "$DEPLOY_RECOVERY_BASE/.deploy-lease" ] \
+        || [ -L "$DEPLOY_RECOVERY_BASE/.deploy-lease" ]; then
+        echo "  [FAIL] Persistent deploy recovery helper is missing with an active lease"
+        return 1
+    fi
+    set -- "$DEPLOY_RECOVERY_BASE"/*/persistent-transaction.state
+    { [ ! -e "$1" ] && [ ! -L "$1" ]; } || {
+        echo "  [FAIL] Persistent deploy recovery helper is missing"
+        return 1
+    }
+}
+
+dcent_validate_deploy_lock_handoff() {
+    ready_fd=${DCENTOS_DEPLOY_LOCK_READY_FD:-}
+    lock_fd=${DCENTOS_DEPLOY_LOCK_FD:-}
+    case "$ready_fd:$lock_fd" in
+        *[!0-9:]*|:*|*:|*:*:*) return 1 ;;
+    esac
+    [ "$ready_fd" -ge 3 ] && [ "$ready_fd" -le 1024 ] \
+        && [ "$lock_fd" -ge 3 ] && [ "$lock_fd" -le 1024 ] \
+        && [ "$ready_fd" -ne "$lock_fd" ] || return 1
+    [ "$(readlink "/proc/$PPID/exe" 2>/dev/null)" = "$DEPLOY_LOCK_HELPER" ] \
+        || return 1
+    stat -Lc '%F' "/proc/$$/fd/$ready_fd" >/dev/null 2>&1 || return 1
+    named_lock=$(stat -c '%d:%i:%u:%g:%a:%h' "$DEPLOY_LOCK_PATH" 2>/dev/null) \
+        || return 1
+    inherited_lock=$(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/$$/fd/$lock_fd" 2>/dev/null) \
+        || return 1
+    [ "$named_lock" = "$inherited_lock" ] || return 1
+    case "$inherited_lock" in
+        *:0:0:600:1) ;;
+        *) return 1 ;;
+    esac
+}
 
 PLATFORM=""
 [ -r /etc/dcentos/platform ] && PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null)
@@ -60,6 +165,10 @@ case "$BOARD_TARGET" in
 esac
 
 migrate_legacy_api_port() {
+    # A transaction-bound config is immutable admission evidence. Migration is
+    # intentionally deferred to a future explicit config-management operation;
+    # rewriting it here would invalidate the generation between proof and exec.
+    [ "${DCENT_DEPLOY_CONFIG_BINDING_ACTIVE:-0}" -ne 1 ] || return 0
     [ -f "$CONFIG" ] || return 0
 
     # Rewrite legacy dcentrald API http_port 80 to 8080 so S80dashboard owns :80.
@@ -145,18 +254,34 @@ am2_power_cut_proven() {
 # S9/am1 fan registers hold via devmem so that branch is unchanged. PWM is only
 # ever driven DOWN (<= 30).
 am2_start_fan_custodian() {
-    # $1 = PWM (0..30). Kill any existing custodian, then background a new one.
     _pwm="$1"
-    if [ -f "$FANHOLD_PIDFILE" ]; then
-        start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-        rm -f "$FANHOLD_PIDFILE"
+    FAN_CUSTODY_RESULT=1
+    if [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ]; then
+        if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+            dcent_fan_custodian_start_locked "$DAEMON" "$_pwm" "$FANHOLD_PIDFILE" \
+                "$FANHOLD_READYFILE" start-stop-daemon "$LOGFILE" 10
+        else
+            dcent_fan_custodian_start "$DAEMON" "$_pwm" "$FANHOLD_PIDFILE" \
+                "$FANHOLD_READYFILE" start-stop-daemon "$LOGFILE" 10
+        fi
+        FAN_CUSTODY_RESULT=$?
     fi
-    if start-stop-daemon -S -b -m -p "$FANHOLD_PIDFILE" -x "$DAEMON" -- --hold-fan "$_pwm" >> $LOGFILE 2>&1; then
-        echo "$(date): SAFETY: am2 persistent fan custodian started at PWM $_pwm ($DAEMON --hold-fan $_pwm, pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> $LOGFILE
+    if [ "$FAN_CUSTODY_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: verified am2 fan custody at PWM $_pwm (pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> "$LOGFILE"
         return 0
     fi
-    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed to start" >> $LOGFILE
+    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed readiness/custody validation" >> "$LOGFILE"
     return 1
+}
+
+am2_stop_fan_custodian() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_custodian_stop_locked "$DAEMON" "$FANHOLD_PIDFILE" \
+            "$FANHOLD_READYFILE" 5 2
+    else
+        dcent_fan_custodian_stop "$DAEMON" "$FANHOLD_PIDFILE" "$FANHOLD_READYFILE" 5 2
+    fi
 }
 
 fan_safety_override() {
@@ -168,21 +293,76 @@ fan_safety_override() {
             fi
             # Persistent custodian, NOT the exit-immediately --set-fan one-shot.
             am2_start_fan_custodian "$FAN_PWM"
+            return $?
         else
             echo "$(date): WARN: am2 dcentrald binary absent at $DAEMON; fan cap not applied" >> $LOGFILE
+            return 1
         fi
     elif command -v devmem > /dev/null 2>&1; then
-        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null
-        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null
+        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null || return 1
+        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null || return 1
         echo "$(date): SAFETY: fans commanded to PWM 30 (dcentrald exited)" >> $LOGFILE
+        return 0
     fi
+    return 1
 }
 
 case "$1" in
+    deploy-recovery-capabilities)
+        [ -r "$DEPLOY_RECOVERY_HELPER" ] \
+            && [ ! -L "$DEPLOY_RECOVERY_HELPER" ] || exit 1
+        . "$DEPLOY_RECOVERY_HELPER" || exit 1
+        command -v dcent_deploy_print_capabilities >/dev/null 2>&1 || exit 1
+        dcent_deploy_print_capabilities
+        ;;
+
     start)
+        if [ ! -x "$DEPLOY_LOCK_HELPER" ]; then
+            echo "  [FAIL] dcentrald deploy/admission lock helper is missing"
+            exit 1
+        fi
+        exec "$DEPLOY_LOCK_HELPER" --handoff "$0" start-locked
+        ;;
+
+    start-locked)
+        if ! dcent_validate_deploy_lock_handoff; then
+            echo "  [FAIL] dcentrald deploy-lock handoff provenance is invalid"
+            exit 1
+        fi
+        [ ! -e "$DEPLOY_MAINTENANCE_MARKER" ] \
+            && [ ! -L "$DEPLOY_MAINTENANCE_MARKER" ] || {
+            echo "  [FAIL] dcentrald admission blocked by active deploy maintenance"
+            exit 1
+        }
+        if ! resolve_interrupted_persistent_deploy; then
+            echo "  [FAIL] dcentrald admission blocked by unresolved persistent deploy"
+            exit 1
+        fi
+        # Recovery may have restored or removed /data paths, so selection must
+        # occur after the generation resolver completes.
+        select_dcentrald_paths
+        if ! dcent_verify_resolved_deploy_selection "$DAEMON" "$CONFIG" \
+            || ! dcent_verify_resolved_deploy_generation; then
+            echo "  [FAIL] Resolved persistent generation changed before admission"
+            exit 1
+        fi
         if [ ! -x "$DAEMON" ]; then
             echo "  [SKIP] dcentrald: binary not found at $DAEMON"
             exit 0
+        fi
+        dcent_acquire_fan_transition_lock || {
+            echo "  [FAIL] Cannot serialize dcentrald owner admission"
+            exit 1
+        }
+
+        if [ "$IS_AM2" = "1" ] \
+            && { [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+                || [ -e "${FANHOLD_READYFILE}.pending" ]; }; then
+            am2_stop_fan_custodian || {
+                echo "  [FAIL] Prior fan custodian cannot be verified and stopped"
+                exit 1
+            }
+            echo "  [OK] exact prior am2 fan custodian stopped before owner admission"
         fi
 
         RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
@@ -190,8 +370,9 @@ case "$1" in
             echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
             exit 1
         fi
-        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
-            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+        if [ ! -r "$SESSION_LATCH_HELPER" ] \
+            || [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Persistent session or exact-process identity helper is missing"
             fan_safety_override
             exit 1
         fi
@@ -211,14 +392,6 @@ case "$1" in
         fi
         if [ -f /data/dcent/auth.json ]; then
             chmod 0600 /data/dcent/auth.json 2>/dev/null
-        fi
-
-        # Reap any persistent AM2 fan custodian left resident by a prior
-        # stop/safety so the main daemon can own the uio16 fan mmap (AM2 only).
-        if [ "$IS_AM2" = "1" ] && [ -f "$FANHOLD_PIDFILE" ]; then
-            start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-            rm -f "$FANHOLD_PIDFILE"
-            echo "  [OK] reaped prior am2 fan custodian before daemon launch"
         fi
 
         # Legacy compatibility mode only. Native DCENT_OS cold boot is the
@@ -260,16 +433,90 @@ case "$1" in
         # A live owner is refused above. Never kill-and-replace an orphan from
         # the start path: its hardware disposition is unknown.
 
-        if ! start-stop-daemon -S -b -m -p "$PIDFILE" \
-            -x /bin/sh -- "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
+        # Revalidate at the actual supervisor exec boundary. Fan/session
+        # serialization, optional PIC bootstrap, and compatibility work above
+        # can take minutes and must not widen config admission into a stale
+        # point-in-time observation.
+        select_dcentrald_paths
+        if [ ! -x "$DAEMON" ] \
+            || ! dcent_verify_resolved_deploy_selection "$DAEMON" "$CONFIG" \
+            || ! dcent_verify_resolved_deploy_generation; then
+            /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" deploy-generation-binding-changed \
+                >> "$LOGFILE" 2>&1 || true
+            fan_safety_override
+            echo "  [FAIL] Resolved persistent generation changed at exec boundary"
+            exit 1
+        fi
+
+        rm -f "$PIDFILE"
+        DCENTOS_SESSION_WRAPPER_PIDFILE="$PIDFILE" \
+            /bin/sh "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
             "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" \
-            "$DAEMON" --config "$CONFIG"; then
+            "$DAEMON" --config "$CONFIG" >>"$LOGFILE" 2>&1 &
+        SUPERVISOR_PID=$!
+        case "$SUPERVISOR_PID" in
+            ''|*[!0-9]*)
+                /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
+                    >> "$LOGFILE" 2>&1 || true
+                fan_safety_override
+                echo "  [FAIL] dcentrald supervisor did not start"
+                exit 1
+                ;;
+        esac
+        if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
             /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
                 >> "$LOGFILE" 2>&1 || true
             fan_safety_override
             echo "  [FAIL] dcentrald supervisor did not start"
             exit 1
         fi
+        ADMITTED_CHILD=
+        ADMISSION_WAIT=0
+        while [ -z "$ADMITTED_CHILD" ]; do
+            if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+                wait "$SUPERVISOR_PID" 2>/dev/null || true
+                /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-exited-before-admission \
+                    >> "$LOGFILE" 2>&1 || true
+                fan_safety_override
+                echo "  [FAIL] dcentrald supervisor exited before child admission"
+                exit 1
+            fi
+            CHILD_RECORD=$(cat "$CHILD_PIDFILE" 2>/dev/null || true)
+            CHILD_PID=$(printf '%s\n' "$CHILD_RECORD" | awk 'NF == 4 {print $1}')
+            CHILD_START=$(printf '%s\n' "$CHILD_RECORD" | awk 'NF == 4 {print $2}')
+            CHILD_TOKEN=$(printf '%s\n' "$CHILD_RECORD" | awk 'NF == 4 {print $3}')
+            case "$CHILD_PID:$CHILD_START" in
+                *[!0-9:]*|:*|*:)
+                    sleep 1
+                    continue
+                    ;;
+            esac
+            if [ "$CHILD_TOKEN" = "$SESSION_TOKEN" ] \
+                && [ "$(sed 's/^[^)]*) //' "/proc/$CHILD_PID/stat" 2>/dev/null \
+                    | awk '{print $20}')" = "$CHILD_START" ] \
+                && [ "$(readlink "/proc/$CHILD_PID/exe" 2>/dev/null)" = "$DAEMON" ]; then
+                ADMITTED_CHILD=$CHILD_PID
+                break
+            fi
+            ADMISSION_WAIT=$((ADMISSION_WAIT + 1))
+            if [ "$ADMISSION_WAIT" -eq 30 ]; then
+                echo "  [WAIT] dcentrald child admission remains unproven; retaining the kernel deploy lock"
+            fi
+            sleep 1
+        done
+        while ! "$DEPLOY_LOCK_HELPER" --ready; do
+            echo "  [WAIT] child admission is proven, but kernel deploy-lock handoff failed"
+            sleep 1
+        done
+        case "${DCENTOS_DEPLOY_LOCK_READY_FD:-}" in
+            ''|*[!0-9]*) ;;
+            *) eval "exec ${DCENTOS_DEPLOY_LOCK_READY_FD}>&-" ;;
+        esac
+        case "${DCENTOS_DEPLOY_LOCK_FD:-}" in
+            ''|*[!0-9]*) ;;
+            *) eval "exec ${DCENTOS_DEPLOY_LOCK_FD}>&-" ;;
+        esac
+        unset DCENTOS_DEPLOY_LOCK_READY_FD DCENTOS_DEPLOY_LOCK_FD
         echo "  [OK] dcentrald started (REST/WebSocket :$API_PORT, CGMiner :4028)"
         echo "  Log: $LOGFILE"
         ;;
@@ -282,34 +529,14 @@ case "$1" in
         #   + 5s fan cooldown = ~12s total
         # NEVER SIGKILL before voltage is off - kills heartbeat thread, PIC watchdog
         # fires, corrupts I2C bus, requires PSU power cycle.
-        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
-        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
-        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
-        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
-        # Wait up to 30 seconds for graceful shutdown.
-        # S9 shutdown can legitimately take ~18s when voltage-disable replies are slow.
-        for i in $(seq 1 30); do
-            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-        TIMED_OUT=0
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-            echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
-            rm -f "$EXPECTFILE"
-            TIMED_OUT=1
-            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
+        if [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Exact-process identity helper is unavailable; refusing stop mutations"
+            exit 1
         fi
-        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
-        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
-            kill -TERM "$WRAPPER_PID" 2>/dev/null
-            sleep 1
-            kill -9 "$WRAPPER_PID" 2>/dev/null
-        fi
-        rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        "$SCRIPT" safety
-        echo "  [OK] dcentrald stopped; any active hardware session remains unresolved"
+        dcent_stop_managed_session "$CHILD_PIDFILE" "$EXPECTFILE" "$DAEMON" \
+            "$PIDFILE" "$CRASH_LATCH_FILE" "$SCRIPT" "$LOGFILE" \
+            30 5 30 || exit $?
+        echo "  [OK] dcentrald stopped after exact owner-death and terminal-custody evidence"
         ;;
 
     restart)
@@ -319,7 +546,26 @@ case "$1" in
         ;;
 
     safety)
-        fan_safety_override
+        dcent_acquire_fan_transition_lock || exit 1
+        if [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+            || [ -e "${FANHOLD_READYFILE}.pending" ]; then
+            am2_stop_fan_custodian || exit 1
+        fi
+        if dcent_dcentrald_may_execute; then
+            echo "$(date): SAFETY-FAIL: refusing a competing safety writer while dcentrald may execute" >> "$LOGFILE"
+            exit 1
+        fi
+        # Power cut is load-bearing. A fan-only response must never be
+        # promoted by the session latch as a successful terminal receipt.
+        if [ ! -x "$DAEMON" ]; then
+            echo "$(date): SAFETY-FAIL: $DAEMON absent; power cut unavailable" >> "$LOGFILE"
+            exit 1
+        fi
+        "$DAEMON" --safe-off >> "$LOGFILE" 2>&1 || {
+            fan_safety_override || true
+            exit 1
+        }
+        fan_safety_override || exit 1
         ;;
 
     status)

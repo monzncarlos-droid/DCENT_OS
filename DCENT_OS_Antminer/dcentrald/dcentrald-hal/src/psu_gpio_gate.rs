@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -66,11 +67,45 @@ const DT_GPIO_LABEL_SOURCES: &[(&str, u32)] = &[
 ///
 /// Records the line's prior sysfs direction/value and restores it on `Drop`.
 pub struct PsuGpioGate {
+    io: Arc<dyn GpioIo>,
     gpio: u32,
+    /// Polarity is part of the admitted hardware session. Re-reading mutable
+    /// process environment during teardown could invert the electrical
+    /// meaning of a matching GPIO readback and mint false safe-off evidence.
+    active_low: bool,
+    off_level: bool,
     restore_direction: String,
     restore_value: Option<bool>,
     exported_by_us: bool,
     asserted: bool,
+    /// Once terminal safe-off is requested, the inherited state must never be
+    /// restored—even if polarity resolution, write, or readback fails.
+    terminal_restore_retired: bool,
+    /// OFF level to retry from Drop after a failed terminal transition. `None`
+    /// after successful verified closeout (no late hardware write remains).
+    terminal_off_retry: Option<bool>,
+}
+
+/// Proof that terminal teardown drove `PWR_CONTROL` to its electrically OFF
+/// level and read the same level back before retiring the scoped gate.
+///
+/// This differs deliberately from [`PsuGpioGate::deassert`], which restores
+/// the line's pre-assertion state and therefore is not necessarily a safe-off
+/// operation when firmware inherited an already-energized rail.
+#[derive(Debug)]
+pub struct PsuGpioSafeOffReceipt {
+    gpio: u32,
+    off_level: bool,
+}
+
+impl PsuGpioSafeOffReceipt {
+    pub fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    pub fn off_level(&self) -> bool {
+        self.off_level
+    }
 }
 
 /// Outcome of attempting to bring a GPIO line under sysfs control.
@@ -89,6 +124,50 @@ enum ExportOutcome {
     KernelClaimed,
 }
 
+/// Narrow, injectable boundary for the legacy sysfs GPIO ABI. Keeping this
+/// interface at the electrical operations (rather than arbitrary filesystem
+/// calls) makes lifecycle ordering and every fail-closed stage deterministic
+/// under unit tests while production still uses the same byte-for-byte sysfs
+/// writes.
+trait GpioIo: Send + Sync {
+    fn ensure_exported(&self, gpio: u32) -> Result<ExportOutcome>;
+    fn read_direction(&self, gpio: u32) -> Result<String>;
+    fn read_value(&self, gpio: u32) -> Result<bool>;
+    fn write_direction(&self, gpio: u32, direction: &str) -> Result<()>;
+    fn write_value(&self, gpio: u32, high: bool) -> Result<()>;
+    fn unexport(&self, gpio: u32) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct SysfsGpioIo;
+
+impl GpioIo for SysfsGpioIo {
+    fn ensure_exported(&self, gpio: u32) -> Result<ExportOutcome> {
+        ensure_exported(gpio)
+    }
+
+    fn read_direction(&self, gpio: u32) -> Result<String> {
+        read_trimmed(&direction_path(gpio))
+    }
+
+    fn read_value(&self, gpio: u32) -> Result<bool> {
+        read_value(gpio)
+    }
+
+    fn write_direction(&self, gpio: u32, direction: &str) -> Result<()> {
+        write_direction(gpio, direction)
+    }
+
+    fn write_value(&self, gpio: u32, high: bool) -> Result<()> {
+        write_value(gpio, high)
+    }
+
+    fn unexport(&self, gpio: u32) -> Result<()> {
+        fs::write("/sys/class/gpio/unexport", format!("{}", gpio))
+            .map_err(|e| HalError::Gpio(format!("unexport GPIO {}: {}", gpio, e)))
+    }
+}
+
 impl PsuGpioGate {
     /// Assert the am2 PSU hardware gate before any PSU I2C access.
     ///
@@ -98,8 +177,17 @@ impl PsuGpioGate {
     /// - `gpio:901`
     /// - `901`
     pub fn assert(spec: Option<&str>) -> Result<Self> {
+        Self::assert_with_io(spec, Arc::new(SysfsGpioIo))
+    }
+
+    fn assert_with_io(spec: Option<&str>, io: Arc<dyn GpioIo>) -> Result<Self> {
         let gpio = resolve_gpio(spec)?;
-        let outcome = ensure_exported(gpio)?;
+        // Resolve polarity before exporting or mutating the line, then retain
+        // it immutably for the full RAII session and terminal closeout.
+        let active_low = pwr_control_active_low(gpio)?;
+        let asserted_value = !active_low;
+        let off_level = active_low;
+        let outcome = io.ensure_exported(gpio)?;
 
         if matches!(outcome, ExportOutcome::KernelClaimed) {
             return Err(HalError::Gpio(format!(
@@ -109,10 +197,38 @@ impl PsuGpioGate {
         }
 
         let exported_by_us = matches!(outcome, ExportOutcome::Created);
-        let restore_direction = read_trimmed(&direction_path(gpio))?;
-        let restore_value = read_value(gpio).ok();
+        let restore_direction = io.read_direction(gpio)?;
+        let restore_value = io.read_value(gpio).ok();
 
-        write_direction(gpio, "out")?;
+        // Establish RAII ownership before the first direction/value mutation.
+        // From this point onward every `?` path either restores the inherited
+        // pre-assert state (before an ON write) or is explicitly retired into
+        // terminal-OFF retry ownership below.
+        let mut gate = Self {
+            io,
+            gpio,
+            active_low,
+            off_level,
+            restore_direction,
+            restore_value,
+            exported_by_us,
+            asserted: true,
+            terminal_restore_retired: false,
+            terminal_off_retry: None,
+        };
+
+        // The sysfs GPIO ABI accepts `high`/`low` on the direction attribute,
+        // setting output direction and the initial latch as one operation.
+        // Establish electrical OFF before attempting ON so changing an input
+        // to an output cannot expose an inherited ON latch even transiently.
+        let off_direction = if off_level { "high" } else { "low" };
+        if let Err(error) = gate.io.write_direction(gpio, off_direction) {
+            let rollback = gate.force_safe_off_verified();
+            return Err(HalError::Gpio(format!(
+                "PWR_CONTROL gpio{} failed to establish terminal-OFF output before assert: {}; terminal OFF rollback={:?}",
+                gpio, error, rollback
+            )));
+        }
         // 2026-06-07 (.25 active-LOW PWR_CONTROL): the RE-018 true-cold strace
         // proves gpio907 on `a lab unit` is ACTIVE-LOW — "0" = rail ON, "1" = rail OFF
         // (bosminer writes "1" to hold-off at cold, then "0" to energize ~55 s
@@ -123,19 +239,14 @@ impl PsuGpioGate {
         // DCENT_AM2_PWR_CONTROL_ACTIVE_LOW: default-OFF keeps the active-HIGH
         // ("1") behaviour for every other unit AND the bosminer-handoff path
         // (which uses TRUST_RAIL_FALLBACK and never asserts here) byte-identical.
-        let active_low = env_flag("DCENT_AM2_PWR_CONTROL_ACTIVE_LOW");
-        let active_high = env_flag("DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH");
-        if gpio == crate::board_control::AM2_PSU_ENABLE_GPIO && active_low == active_high {
+        if let Err(error) = gate.io.write_value(gpio, asserted_value) {
+            let rollback = gate.force_safe_off_verified();
             return Err(HalError::Gpio(format!(
-                "PWR_CONTROL gpio{} polarity unknown or conflicting; set exactly one of \
-                 DCENT_AM2_PWR_CONTROL_ACTIVE_LOW=1 or DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH=1",
-                gpio
+                "PWR_CONTROL gpio{} ON write failed (active_low={}): {}; terminal OFF rollback={:?}",
+                gpio, active_low, error, rollback
             )));
         }
-        // ON = high("1") for active-HIGH, low("0") for active-LOW.
-        let asserted_value = !active_low;
-        write_value(gpio, asserted_value)?;
-        let observed_value = read_value(gpio).ok();
+        let observed_value = gate.io.read_value(gpio).ok();
         // P1 (2026-06-13): verify the readback on the RESOLVED gpio, identical to
         // the polarity gate above (`gpio == AM2_PSU_ENABLE_GPIO`), NOT on the
         // literal spec string. `None`, `"PWR_CONTROL"`, `"label:PWR_CONTROL"`,
@@ -148,16 +259,18 @@ impl PsuGpioGate {
             match observed_value {
                 Some(value) if value == asserted_value => {}
                 Some(value) => {
+                    let rollback = gate.force_safe_off_verified();
                     return Err(HalError::Gpio(format!(
                         "PWR_CONTROL gpio{} readback mismatch after assert: wrote {} \
-                         (active_low={}), read {}",
-                        gpio, asserted_value as u8, active_low, value as u8
+                         (active_low={}), read {}; terminal OFF rollback={:?}",
+                        gpio, asserted_value as u8, active_low, value as u8, rollback
                     )));
                 }
                 None => {
+                    let rollback = gate.force_safe_off_verified();
                     return Err(HalError::Gpio(format!(
-                        "PWR_CONTROL gpio{} readback unavailable after assert",
-                        gpio
+                        "PWR_CONTROL gpio{} readback unavailable after assert; terminal OFF rollback={:?}",
+                        gpio, rollback
                     )));
                 }
             }
@@ -171,13 +284,7 @@ impl PsuGpioGate {
             "PWR_CONTROL asserted before PSU init (sysfs readback recorded)"
         );
 
-        Ok(Self {
-            gpio,
-            restore_direction,
-            restore_value,
-            exported_by_us,
-            asserted: true,
-        })
+        Ok(gate)
     }
 
     pub fn gpio(&self) -> u32 {
@@ -193,27 +300,43 @@ impl PsuGpioGate {
     /// `Drop`), so don't rely on them in tests beyond "must not panic".
     #[cfg(test)]
     pub(crate) fn for_test(gpio: u32) -> Self {
+        Self::for_test_with_active_low(gpio, false)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_active_low(gpio: u32, active_low: bool) -> Self {
         Self {
+            io: Arc::new(SysfsGpioIo),
             gpio,
+            active_low,
+            off_level: active_low,
             restore_direction: "in".to_string(),
             restore_value: None,
             exported_by_us: false,
             asserted: true,
+            terminal_restore_retired: false,
+            terminal_off_retry: None,
         }
     }
 
     /// Restore the line to its pre-asserted state.
     pub fn deassert(&mut self) -> Result<()> {
+        if self.terminal_restore_retired {
+            return Err(HalError::Gpio(format!(
+                "PWR_CONTROL gpio{} scoped restore was terminally retired",
+                self.gpio
+            )));
+        }
         if !self.asserted {
             return Ok(());
         }
 
         match self.restore_direction.as_str() {
-            "in" => write_direction(self.gpio, "in")?,
+            "in" => self.io.write_direction(self.gpio, "in")?,
             "out" => {
-                write_direction(self.gpio, "out")?;
+                self.io.write_direction(self.gpio, "out")?;
                 if let Some(prev) = self.restore_value {
-                    write_value(self.gpio, prev)?;
+                    self.io.write_value(self.gpio, prev)?;
                 }
             }
             other => {
@@ -223,30 +346,125 @@ impl PsuGpioGate {
                     "Unexpected GPIO direction while restoring PWR_CONTROL; falling back to stored value"
                 );
                 if let Some(prev) = self.restore_value {
-                    write_direction(self.gpio, "out")?;
-                    write_value(self.gpio, prev)?;
+                    self.io.write_direction(self.gpio, "out")?;
+                    self.io.write_value(self.gpio, prev)?;
                 } else {
-                    write_direction(self.gpio, "in")?;
+                    self.io.write_direction(self.gpio, "in")?;
                 }
             }
         }
 
         if self.exported_by_us {
-            let _ = fs::write("/sys/class/gpio/unexport", format!("{}", self.gpio));
+            let _ = self.io.unexport(self.gpio);
         }
 
         self.asserted = false;
         tracing::info!(gpio = self.gpio, "PWR_CONTROL restored");
         Ok(())
     }
+
+    /// Drive the rail gate to its terminal OFF level, verify readback, and
+    /// retire this guard's later pre-assert-state restoration.
+    ///
+    /// On success, `Drop` becomes a no-op for the electrical state. Keeping
+    /// the sysfs line exported and driven as an output is intentional: an
+    /// unexport or direction restore would weaken the just-observed OFF state.
+    pub fn force_safe_off_verified(&mut self) -> Result<PsuGpioSafeOffReceipt> {
+        // Retire inherited-state restoration before the first fallible step.
+        // A failed terminal attempt must never later restore an inherited ON
+        // state and re-energize the rail during scope teardown.
+        self.terminal_restore_retired = true;
+        self.asserted = false;
+        self.exported_by_us = false;
+
+        let active_low = self.active_low;
+        let off_level = self.off_level;
+        self.terminal_off_retry = Some(off_level);
+
+        self.io.write_direction(self.gpio, "out")?;
+        self.io.write_value(self.gpio, off_level)?;
+        let observed = self.io.read_value(self.gpio)?;
+        if observed != off_level {
+            return Err(HalError::Gpio(format!(
+                "PWR_CONTROL gpio{} readback mismatch after terminal safe-off: wrote {} \
+                 (active_low={}), read {}",
+                self.gpio, off_level as u8, active_low, observed as u8
+            )));
+        }
+
+        // Terminal safe-off supersedes the ordinary scoped-restore contract.
+        // Marking the guard inactive prevents a later Drop from restoring an
+        // inherited ON state after the software watchdog has been disarmed.
+        self.restore_direction = "out".to_string();
+        self.restore_value = Some(off_level);
+        self.terminal_off_retry = None;
+
+        tracing::info!(
+            gpio = self.gpio,
+            active_low,
+            off_level,
+            observed,
+            "PWR_CONTROL terminal safe-off completed (readback verified; scoped restore retired)"
+        );
+        Ok(PsuGpioSafeOffReceipt {
+            gpio: self.gpio,
+            off_level,
+        })
+    }
 }
 
 impl Drop for PsuGpioGate {
     fn drop(&mut self) {
+        if self.terminal_restore_retired {
+            if let Some(off_level) = self.terminal_off_retry {
+                let result = self
+                    .io
+                    .write_direction(self.gpio, "out")
+                    .and_then(|()| self.io.write_value(self.gpio, off_level))
+                    .and_then(|()| {
+                        let observed = self.io.read_value(self.gpio)?;
+                        if observed == off_level {
+                            Ok(())
+                        } else {
+                            Err(HalError::Gpio(format!(
+                                "PWR_CONTROL gpio{} terminal OFF retry readback mismatch: expected {}, read {}",
+                                self.gpio, off_level as u8, observed as u8
+                            )))
+                        }
+                    });
+                match result {
+                    Ok(()) => tracing::warn!(
+                        gpio = self.gpio,
+                        off_level,
+                        "PWR_CONTROL terminal safe-off retry succeeded during Drop"
+                    ),
+                    Err(error) => tracing::error!(
+                        gpio = self.gpio,
+                        off_level,
+                        error = %error,
+                        "PWR_CONTROL terminal safe-off retry failed during Drop; inherited state remains retired"
+                    ),
+                }
+            }
+            return;
+        }
         if let Err(e) = self.deassert() {
             tracing::warn!(gpio = self.gpio, error = %e, "Failed to restore PWR_CONTROL on drop");
         }
     }
+}
+
+fn pwr_control_active_low(gpio: u32) -> Result<bool> {
+    let active_low = env_flag("DCENT_AM2_PWR_CONTROL_ACTIVE_LOW");
+    let active_high = env_flag("DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH");
+    if gpio == crate::board_control::AM2_PSU_ENABLE_GPIO && active_low == active_high {
+        return Err(HalError::Gpio(format!(
+            "PWR_CONTROL gpio{} polarity unknown or conflicting; set exactly one of \
+             DCENT_AM2_PWR_CONTROL_ACTIVE_LOW=1 or DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH=1",
+            gpio
+        )));
+    }
+    Ok(active_low)
 }
 
 fn resolve_gpio(spec: Option<&str>) -> Result<u32> {
@@ -404,6 +622,163 @@ fn write_value(gpio: u32, high: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static POLARITY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PolarityEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous_low: Option<OsString>,
+        previous_high: Option<OsString>,
+    }
+
+    impl PolarityEnvGuard {
+        fn active_high() -> Self {
+            let lock = POLARITY_ENV_LOCK.lock().unwrap();
+            let low_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_LOW";
+            let high_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH";
+            let previous_low = std::env::var_os(low_key);
+            let previous_high = std::env::var_os(high_key);
+            std::env::remove_var(low_key);
+            std::env::set_var(high_key, "1");
+            Self {
+                _lock: lock,
+                previous_low,
+                previous_high,
+            }
+        }
+    }
+
+    impl Drop for PolarityEnvGuard {
+        fn drop(&mut self) {
+            let low_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_LOW";
+            let high_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH";
+            match self.previous_low.take() {
+                Some(value) => std::env::set_var(low_key, value),
+                None => std::env::remove_var(low_key),
+            }
+            match self.previous_high.take() {
+                Some(value) => std::env::set_var(high_key, value),
+                None => std::env::remove_var(high_key),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeOp {
+        EnsureExported,
+        ReadDirection,
+        ReadValue,
+        WriteDirection(String),
+        WriteValue(bool),
+        Unexport,
+    }
+
+    #[derive(Debug)]
+    struct FakeGpioState {
+        operations: Vec<FakeOp>,
+        direction: String,
+        value: bool,
+        fail_calls: BTreeSet<usize>,
+        read_overrides: VecDeque<bool>,
+    }
+
+    #[derive(Debug)]
+    struct FakeGpioIo {
+        state: Mutex<FakeGpioState>,
+    }
+
+    impl FakeGpioIo {
+        fn inherited(direction: &str, value: bool) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeGpioState {
+                    operations: Vec::new(),
+                    direction: direction.to_string(),
+                    value,
+                    fail_calls: BTreeSet::new(),
+                    read_overrides: VecDeque::new(),
+                }),
+            })
+        }
+
+        fn fail_call(&self, call_index: usize) {
+            self.state.lock().unwrap().fail_calls.insert(call_index);
+        }
+
+        fn override_next_read(&self, value: bool) {
+            self.state.lock().unwrap().read_overrides.push_back(value);
+        }
+
+        fn snapshot(&self) -> (Vec<FakeOp>, String, bool) {
+            let state = self.state.lock().unwrap();
+            (
+                state.operations.clone(),
+                state.direction.clone(),
+                state.value,
+            )
+        }
+
+        fn record(state: &mut FakeGpioState, operation: FakeOp) -> Result<()> {
+            let call_index = state.operations.len();
+            state.operations.push(operation);
+            if state.fail_calls.remove(&call_index) {
+                return Err(HalError::Gpio(format!(
+                    "injected GPIO failure at call {call_index}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl GpioIo for FakeGpioIo {
+        fn ensure_exported(&self, _gpio: u32) -> Result<ExportOutcome> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::EnsureExported)?;
+            Ok(ExportOutcome::Existed)
+        }
+
+        fn read_direction(&self, _gpio: u32) -> Result<String> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::ReadDirection)?;
+            Ok(state.direction.clone())
+        }
+
+        fn read_value(&self, _gpio: u32) -> Result<bool> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::ReadValue)?;
+            Ok(state.read_overrides.pop_front().unwrap_or(state.value))
+        }
+
+        fn write_direction(&self, _gpio: u32, direction: &str) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::WriteDirection(direction.to_string()))?;
+            state.direction = if matches!(direction, "high" | "low") {
+                "out".to_string()
+            } else {
+                direction.to_string()
+            };
+            if direction == "high" {
+                state.value = true;
+            } else if direction == "low" {
+                state.value = false;
+            }
+            Ok(())
+        }
+
+        fn write_value(&self, _gpio: u32, high: bool) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::WriteValue(high))?;
+            state.value = high;
+            Ok(())
+        }
+
+        fn unexport(&self, _gpio: u32) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            Self::record(&mut state, FakeOp::Unexport)
+        }
+    }
 
     #[test]
     fn parse_numeric_gpio_specs() {
@@ -435,5 +810,148 @@ mod tests {
         assert_eq!(gpio_from_dt_blob(blob, 897, "PWR_CONTROL"), Some(901));
         assert_eq!(gpio_from_dt_blob(blob, 897, "HB1_RESET"), Some(898));
         assert_eq!(gpio_from_dt_blob(blob, 897, "missing"), None);
+    }
+
+    #[test]
+    fn terminal_safe_off_receipt_reports_verified_line_and_level() {
+        let receipt = PsuGpioSafeOffReceipt {
+            gpio: 907,
+            off_level: true,
+        };
+        assert_eq!(receipt.gpio(), 907);
+        assert!(receipt.off_level());
+    }
+
+    #[test]
+    fn injected_gpio_lifecycle_establishes_off_before_on_and_never_restores_inherited_on() {
+        let _env = PolarityEnvGuard::active_high();
+        let fake = FakeGpioIo::inherited("out", true);
+        let mut gate = PsuGpioGate::assert_with_io(Some("gpio:907"), fake.clone()).unwrap();
+        assert!(gate.is_asserted());
+
+        let receipt = gate.force_safe_off_verified().unwrap();
+        assert_eq!(receipt.gpio(), 907);
+        assert!(!receipt.off_level());
+        drop(gate);
+
+        let (operations, direction, value) = fake.snapshot();
+        assert_eq!(direction, "out");
+        assert!(!value);
+        assert_eq!(
+            operations,
+            vec![
+                FakeOp::EnsureExported,
+                FakeOp::ReadDirection,
+                FakeOp::ReadValue,
+                FakeOp::WriteDirection("low".to_string()),
+                FakeOp::WriteValue(true),
+                FakeOp::ReadValue,
+                FakeOp::WriteDirection("out".to_string()),
+                FakeOp::WriteValue(false),
+                FakeOp::ReadValue,
+            ]
+        );
+    }
+
+    #[test]
+    fn injected_assertion_failures_are_bounded_and_post_mutation_failures_end_off() {
+        let _env = PolarityEnvGuard::active_high();
+
+        for failure_call in [0usize, 1, 3, 4, 5] {
+            let fake = FakeGpioIo::inherited("out", true);
+            fake.fail_call(failure_call);
+            let result = PsuGpioGate::assert_with_io(Some("gpio:907"), fake.clone());
+            assert!(
+                result.is_err(),
+                "failure call {failure_call} must reject assert"
+            );
+            let (_, _, value) = fake.snapshot();
+            if failure_call >= 3 {
+                assert!(
+                    !value,
+                    "post-mutation failure call {failure_call} must finish electrically OFF"
+                );
+            }
+        }
+
+        // The inherited value is useful restore metadata but is not required
+        // for safe assertion. Losing that read must remain explicit in the
+        // trace and terminal closeout must still prove OFF.
+        let fake = FakeGpioIo::inherited("out", true);
+        fake.fail_call(2);
+        let mut gate = PsuGpioGate::assert_with_io(Some("gpio:907"), fake.clone()).unwrap();
+        assert_eq!(gate.restore_value, None);
+        gate.force_safe_off_verified().unwrap();
+        drop(gate);
+        assert!(!fake.snapshot().2);
+    }
+
+    #[test]
+    fn injected_terminal_failures_are_retried_by_drop_without_inherited_restore() {
+        let _env = PolarityEnvGuard::active_high();
+
+        for terminal_failure_offset in 0usize..=2 {
+            let fake = FakeGpioIo::inherited("out", true);
+            let mut gate = PsuGpioGate::assert_with_io(Some("gpio:907"), fake.clone()).unwrap();
+            let first_terminal_call = fake.snapshot().0.len();
+            fake.fail_call(first_terminal_call + terminal_failure_offset);
+            assert!(gate.force_safe_off_verified().is_err());
+            assert!(gate.terminal_restore_retired);
+            assert_eq!(gate.terminal_off_retry, Some(false));
+            drop(gate);
+            let (_, direction, value) = fake.snapshot();
+            assert_eq!(direction, "out");
+            assert!(!value, "Drop retry must leave the active-high rail OFF");
+        }
+
+        let fake = FakeGpioIo::inherited("out", true);
+        let mut gate = PsuGpioGate::assert_with_io(Some("gpio:907"), fake.clone()).unwrap();
+        fake.override_next_read(true);
+        assert!(gate.force_safe_off_verified().is_err());
+        drop(gate);
+        assert!(
+            !fake.snapshot().2,
+            "readback mismatch retry must finish OFF"
+        );
+    }
+
+    #[test]
+    fn failed_terminal_transition_irrevocably_retires_scoped_restore() {
+        let mut gate = PsuGpioGate::for_test(u32::MAX - 1);
+        assert!(gate.force_safe_off_verified().is_err());
+        assert!(gate.terminal_restore_retired);
+        assert!(!gate.asserted);
+        assert!(gate.terminal_off_retry.is_some());
+        assert!(gate.deassert().is_err());
+    }
+
+    #[test]
+    fn terminal_safe_off_uses_session_polarity_after_environment_changes() {
+        let _lock = POLARITY_ENV_LOCK.lock().unwrap();
+        let low_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_LOW";
+        let high_key = "DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH";
+        let previous_low = std::env::var_os(low_key);
+        let previous_high = std::env::var_os(high_key);
+
+        // This owner represents a session admitted as active-low. Mutating the
+        // process environment afterward must neither change its OFF level nor
+        // make terminal closeout re-run polarity admission.
+        let mut gate = PsuGpioGate::for_test_with_active_low(u32::MAX - 2, true);
+        std::env::remove_var(low_key);
+        std::env::set_var(high_key, "1");
+
+        assert!(gate.force_safe_off_verified().is_err());
+        assert_eq!(gate.terminal_off_retry, Some(true));
+        assert!(gate.active_low);
+        assert!(gate.off_level);
+
+        match previous_low {
+            Some(value) => std::env::set_var(low_key, value),
+            None => std::env::remove_var(low_key),
+        }
+        match previous_high {
+            Some(value) => std::env::set_var(high_key, value),
+            None => std::env::remove_var(high_key),
+        }
     }
 }

@@ -449,6 +449,25 @@ pub fn is_lan_restricted_verb(name: &str) -> bool {
     is_mutating_verb(name) || name == "kill"
 }
 
+/// Closed observer-only refusal set. In addition to mining/hardware mutation,
+/// session creation, revocation, and eviction alter process state and are not
+/// observation. The restriction applies equally to loopback and LAN callers.
+pub fn observer_restricted_verb(name: &str) -> bool {
+    is_mutating_verb(name) || matches!(name, "logon" | "logoff" | "session" | "kill")
+}
+
+fn observer_access_denied(blocked: &str) -> serde_json::Value {
+    serde_json::json!({
+        "STATUS": [CgMinerStatus::error_for(
+            CgminerStatusCode::AccessDenied,
+            format!(
+                "access denied: observer-only API forbids control/session command '{blocked}'"
+            ),
+        )],
+        "id": 1
+    })
+}
+
 /// API-1: may a peer issue a MUTATING verb?
 ///
 /// `true` when the peer is loopback (local control is always allowed) OR when
@@ -470,6 +489,13 @@ pub async fn handle_command_from_peer(
     cmd: &CgMinerCommand,
     peer: SocketAddr,
 ) -> serde_json::Value {
+    if state.config.observer_only {
+        let verbs = crate::cgminer_luxos::expand_batch(&cmd.command)
+            .unwrap_or_else(|| vec![cmd.command.clone()]);
+        if let Some(blocked) = verbs.iter().find(|verb| observer_restricted_verb(verb)) {
+            return observer_access_denied(blocked);
+        }
+    }
     // Gate mutating/control verbs from a non-loopback peer (unless
     // cgminer_lan_writes). A `+`-batch MUST be checked over EVERY sub-command,
     // not the literal batch string: `summary+restart` would otherwise slip past
@@ -515,6 +541,13 @@ pub async fn handle_command_from_peer(
 /// TCP listener calls [`handle_command_from_peer`], which refuses mutating
 /// verbs from non-loopback peers unless `cgminer_lan_writes` is set.
 pub async fn handle_command_arc(state: &Arc<AppState>, cmd: &CgMinerCommand) -> serde_json::Value {
+    if state.config.observer_only {
+        let verbs = crate::cgminer_luxos::expand_batch(&cmd.command)
+            .unwrap_or_else(|| vec![cmd.command.clone()]);
+        if let Some(blocked) = verbs.iter().find(|verb| observer_restricted_verb(verb)) {
+            return observer_access_denied(blocked);
+        }
+    }
     // 1. `+` batching — only parameterless commands may be batched.
     if let Some(parts) = crate::cgminer_luxos::expand_batch(&cmd.command) {
         if cmd.parameter.is_some() {
@@ -2974,5 +3007,53 @@ mod tests {
         ] {
             assert!(!is_lan_restricted_verb(v), "{v} must NOT be LAN-restricted");
         }
+    }
+
+    #[test]
+    fn observer_restriction_includes_mutation_and_all_session_lifecycle() {
+        for verb in [
+            "restart",
+            "voltageset",
+            "fanset",
+            "logon",
+            "logoff",
+            "session",
+            "kill",
+        ] {
+            assert!(
+                observer_restricted_verb(verb),
+                "{verb} must be refused in observer-only mode"
+            );
+        }
+        for verb in ["summary", "stats", "pools", "metrics", "systemaudit"] {
+            assert!(
+                !observer_restricted_verb(verb),
+                "{verb} must remain observable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_only_refuses_loopback_control_sessions_and_batched_smuggling() {
+        let mut state = golden_app_state();
+        Arc::get_mut(&mut state)
+            .expect("test owns the only AppState reference")
+            .config
+            .observer_only = true;
+
+        let read = handle_command_arc(&state, &command("summary")).await;
+        assert_eq!(read["STATUS"][0]["STATUS"], serde_json::json!("S"));
+
+        for verb in ["restart", "logon", "logoff", "session", "kill"] {
+            let denied = handle_command_arc(&state, &command(verb)).await;
+            assert_eq!(denied["STATUS"][0]["Code"], serde_json::json!(45), "{verb}");
+        }
+
+        let denied = handle_command_arc(&state, &command("summary+logon")).await;
+        assert_eq!(denied["STATUS"][0]["Code"], serde_json::json!(45));
+
+        let loopback: SocketAddr = "127.0.0.1:55000".parse().unwrap();
+        let denied = handle_command_from_peer(&state, &command("restart"), loopback).await;
+        assert_eq!(denied["STATUS"][0]["Code"], serde_json::json!(45));
     }
 }

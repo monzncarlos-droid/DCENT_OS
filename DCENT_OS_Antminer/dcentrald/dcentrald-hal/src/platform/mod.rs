@@ -16,14 +16,8 @@ pub mod amlogic;
 pub mod beaglebone;
 pub mod beaglebone_cold_boot;
 pub mod config;
-// CV1835 cold-boot/pinmux RE port: constants + helpers are pinned from the
-// dev-kit ground truth but not yet wired into a live path (env-gated bring-up),
-// so they are intentionally not-yet-constructed scaffolding.
-#[allow(dead_code)]
-pub mod cvitek;
-#[allow(dead_code)]
+pub(crate) mod cvitek;
 pub(crate) mod cvitek_cold_boot;
-#[allow(dead_code)]
 pub(crate) mod cvitek_pinmux;
 #[cfg(feature = "sim-hal")]
 pub mod sim;
@@ -33,7 +27,8 @@ pub mod zynq;
 
 use crate::i2c::I2cBus;
 use crate::{HalError, Result};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 pub use am2_controller::{
@@ -165,22 +160,45 @@ pub trait FanAccess: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
 enum HardwareMutationGatePhase {
-    Pending,
-    Open,
-    Closed,
+    Pending = 0,
+    Open = 1,
+    Closed = 2,
 }
 
 #[derive(Debug)]
 struct HardwareMutationGateState {
-    phase: HardwareMutationGatePhase,
     in_flight: usize,
 }
 
 #[derive(Debug)]
 struct HardwareMutationGateInner {
+    /// Atomically couples admission phase and generation so terminal closure
+    /// never depends on either mutex. The low two bits encode the phase.
+    admission: AtomicU64,
     state: Mutex<HardwareMutationGateState>,
-    drained: Condvar,
+    /// Serializes the final hardware commit of every admitted request against
+    /// terminal safe-off. Preparatory work must stay outside this fence.
+    commit_fence: Mutex<()>,
+}
+
+const HARDWARE_MUTATION_PHASE_BITS: u32 = 2;
+const HARDWARE_MUTATION_PHASE_MASK: u64 = (1 << HARDWARE_MUTATION_PHASE_BITS) - 1;
+const HARDWARE_MUTATION_MAX_GENERATION: u64 = u64::MAX >> HARDWARE_MUTATION_PHASE_BITS;
+
+fn encode_mutation_admission(phase: HardwareMutationGatePhase, generation: u64) -> u64 {
+    (generation << HARDWARE_MUTATION_PHASE_BITS) | phase as u64
+}
+
+fn decode_mutation_admission(value: u64) -> (HardwareMutationGatePhase, u64) {
+    let phase = match value & HARDWARE_MUTATION_PHASE_MASK {
+        0 => HardwareMutationGatePhase::Pending,
+        1 => HardwareMutationGatePhase::Open,
+        2 => HardwareMutationGatePhase::Closed,
+        _ => unreachable!("two-bit hardware mutation phase was invalid"),
+    };
+    (phase, value >> HARDWARE_MUTATION_PHASE_BITS)
 }
 
 /// Shared admission barrier for hardware mutations that can race teardown.
@@ -214,21 +232,16 @@ impl HardwareMutationGate {
     fn new(phase: HardwareMutationGatePhase) -> Self {
         Self {
             inner: Arc::new(HardwareMutationGateInner {
-                state: Mutex::new(HardwareMutationGateState {
-                    phase,
-                    in_flight: 0,
-                }),
-                drained: Condvar::new(),
+                admission: AtomicU64::new(encode_mutation_admission(phase, 1)),
+                state: Mutex::new(HardwareMutationGateState { in_flight: 0 }),
+                commit_fence: Mutex::new(()),
             }),
         }
     }
 
     pub fn try_acquire(&self) -> Result<HardwareMutationLease> {
-        let mut state =
-            self.inner.state.lock().map_err(|_| {
-                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
-            })?;
-        match state.phase {
+        let observed = self.inner.admission.load(Ordering::Acquire);
+        match decode_mutation_admission(observed).0 {
             HardwareMutationGatePhase::Open => {}
             HardwareMutationGatePhase::Pending => {
                 return Err(HalError::Platform(
@@ -241,48 +254,160 @@ impl HardwareMutationGate {
                 ));
             }
         }
+        let mut state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => {
+                return Err(HalError::Platform(
+                    "hardware mutation admission state is busy; retry the request".to_string(),
+                ))
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(HalError::Platform(
+                    "hardware mutation gate mutex poisoned".to_string(),
+                ))
+            }
+        };
+        let admitted = self.inner.admission.load(Ordering::Acquire);
+        let (phase, generation) = decode_mutation_admission(admitted);
+        if phase != HardwareMutationGatePhase::Open || admitted != observed {
+            return Err(HalError::Platform(
+                "hardware mutation admission closed while acquiring a lease".to_string(),
+            ));
+        }
         state.in_flight = state.in_flight.saturating_add(1);
         drop(state);
         Ok(HardwareMutationLease {
             inner: Arc::clone(&self.inner),
+            generation,
         })
     }
 
     pub fn close_and_drain(&self, timeout: Duration) -> Result<HardwareMutationBarrierReceipt> {
         let started_at = Instant::now();
-        let mut state =
-            self.inner.state.lock().map_err(|_| {
-                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
-            })?;
-        state.phase = HardwareMutationGatePhase::Closed;
+        let deadline = started_at + timeout;
+        self.close_and_drain_before(deadline, Some(timeout))
+    }
 
-        while state.in_flight != 0 {
-            let remaining = timeout.saturating_sub(started_at.elapsed());
-            if remaining.is_zero() {
+    /// Irreversibly close admission and drain leases against an already-issued
+    /// absolute deadline. Unlike the zero-duration compatibility path above,
+    /// an observation at or after this deadline is never positive evidence.
+    pub fn close_and_drain_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<HardwareMutationBarrierReceipt> {
+        self.close_and_drain_before(deadline, None)
+    }
+
+    fn close_and_drain_before(
+        &self,
+        deadline: Instant,
+        relative_timeout: Option<Duration>,
+    ) -> Result<HardwareMutationBarrierReceipt> {
+        let closed_generation = close_mutation_generation(&self.inner);
+        let mut first_probe = true;
+        let mut last_in_flight = None;
+
+        loop {
+            match self.inner.state.try_lock() {
+                Ok(state) => {
+                    let observed_at = Instant::now();
+                    last_in_flight = Some(state.in_flight);
+                    if state.in_flight == 0 {
+                        let timely = relative_timeout.map_or(observed_at < deadline, |timeout| {
+                            drain_observation_is_timely(timeout, first_probe, observed_at, deadline)
+                        });
+                        if timely {
+                            return Ok(HardwareMutationBarrierReceipt {
+                                closed_generation,
+                                closed_and_drained_at: observed_at,
+                            });
+                        }
+                        let deadline_description = relative_timeout.map_or_else(
+                            || "absolute drain deadline".to_string(),
+                            |timeout| format!("{} ms drain deadline", timeout.as_millis()),
+                        );
+                        return Err(HalError::Platform(format!(
+                            "hardware mutation leases became quiescent only at or after the {deadline_description}"
+                        )));
+                    }
+                }
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(HalError::Platform(
+                        "hardware mutation gate mutex poisoned".to_string(),
+                    ))
+                }
+            }
+
+            first_probe = false;
+            let now = Instant::now();
+            if now >= deadline {
+                let detail = last_in_flight.map_or_else(
+                    || "hardware mutation admission state remained busy".to_string(),
+                    |count| format!("{count} in-flight hardware mutation(s) remained"),
+                );
+                let timeout_description = relative_timeout.map_or_else(
+                    || "the absolute deadline elapsed".to_string(),
+                    |timeout| format!("timed out after {} ms", timeout.as_millis()),
+                );
                 return Err(HalError::Platform(format!(
-                    "timed out draining {} in-flight hardware mutation(s)",
-                    state.in_flight
+                    "{timeout_description} draining hardware mutations: {detail}"
                 )));
             }
-            let (next_state, wait) =
-                self.inner
-                    .drained
-                    .wait_timeout(state, remaining)
-                    .map_err(|_| {
-                        HalError::Platform("hardware mutation gate mutex poisoned".to_string())
-                    })?;
-            state = next_state;
-            if wait.timed_out() && state.in_flight != 0 {
-                return Err(HalError::Platform(format!(
-                    "timed out draining {} in-flight hardware mutation(s)",
-                    state.in_flight
-                )));
-            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(1)),
+            );
         }
+    }
 
-        Ok(HardwareMutationBarrierReceipt {
-            closed_and_drained_at: Instant::now(),
-        })
+    /// Irreversibly close mutation admission and return move-only authority to
+    /// observe the final software commit section without parking a thread.
+    ///
+    /// Lease drain and commit-fence quiescence are intentionally independent:
+    /// a stale lease may remain in preparatory work after close, yet can no
+    /// longer enter [`HardwareMutationLease::commit`]. Callers which require
+    /// both facts must retain the separate drain receipt as well.
+    pub fn revoke_commit_fence(&self) -> RevokedHardwareMutationCommitFence {
+        let closed_generation = close_mutation_generation(&self.inner);
+        RevokedHardwareMutationCommitFence {
+            inner: Arc::clone(&self.inner),
+            closed_generation,
+        }
+    }
+}
+
+fn drain_observation_is_timely(
+    timeout: Duration,
+    first_probe: bool,
+    observed_at: Instant,
+    deadline: Instant,
+) -> bool {
+    observed_at < deadline || (timeout.is_zero() && first_probe)
+}
+
+fn close_mutation_generation(inner: &HardwareMutationGateInner) -> u64 {
+    let mut observed = inner.admission.load(Ordering::Acquire);
+    loop {
+        let (phase, generation) = decode_mutation_admission(observed);
+        if phase == HardwareMutationGatePhase::Closed {
+            return generation;
+        }
+        let closed_generation = generation
+            .saturating_add(1)
+            .min(HARDWARE_MUTATION_MAX_GENERATION);
+        let closed =
+            encode_mutation_admission(HardwareMutationGatePhase::Closed, closed_generation);
+        match inner.admission.compare_exchange_weak(
+            observed,
+            closed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return closed_generation,
+            Err(current) => observed = current,
+        }
     }
 }
 
@@ -306,17 +431,30 @@ impl HardwareMutationGateOwner {
     }
 
     pub fn open(&self) -> Result<HardwareMutationAdmissionReceipt> {
-        let mut state =
-            self.gate.inner.state.lock().map_err(|_| {
-                HalError::Platform("hardware mutation gate mutex poisoned".to_string())
-            })?;
-        match state.phase {
-            HardwareMutationGatePhase::Pending => {
-                state.phase = HardwareMutationGatePhase::Open;
-                Ok(HardwareMutationAdmissionReceipt {
+        let observed = self.gate.inner.admission.load(Ordering::Acquire);
+        let (phase, generation) = decode_mutation_admission(observed);
+        match phase {
+            HardwareMutationGatePhase::Pending => self
+                .gate
+                .inner
+                .admission
+                .compare_exchange(
+                    observed,
+                    encode_mutation_admission(HardwareMutationGatePhase::Open, generation),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| HardwareMutationAdmissionReceipt {
                     opened_at: Instant::now(),
                 })
-            }
+                .map_err(|current| {
+                    let detail = match decode_mutation_admission(current).0 {
+                        HardwareMutationGatePhase::Pending => "changed concurrently",
+                        HardwareMutationGatePhase::Open => "was already opened",
+                        HardwareMutationGatePhase::Closed => "is terminally closed",
+                    };
+                    HalError::Platform(format!("hardware mutation admission {detail}"))
+                }),
             HardwareMutationGatePhase::Open => Err(HalError::Platform(
                 "hardware mutation admission was already opened".to_string(),
             )),
@@ -328,6 +466,17 @@ impl HardwareMutationGateOwner {
 
     pub fn close_and_drain(&self, timeout: Duration) -> Result<HardwareMutationBarrierReceipt> {
         self.gate.close_and_drain(timeout)
+    }
+
+    pub fn close_and_drain_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<HardwareMutationBarrierReceipt> {
+        self.gate.close_and_drain_until(deadline)
+    }
+
+    pub fn revoke_commit_fence(&self) -> RevokedHardwareMutationCommitFence {
+        self.gate.revoke_commit_fence()
     }
 }
 
@@ -356,6 +505,48 @@ impl HardwareMutationAdmissionReceipt {
 #[derive(Debug)]
 pub struct HardwareMutationLease {
     inner: Arc<HardwareMutationGateInner>,
+    generation: u64,
+}
+
+impl HardwareMutationLease {
+    /// Execute one final physical mutation only while this lease's exact open
+    /// generation remains current.
+    ///
+    /// The closure is serialized against
+    /// [`HardwareMutationGate::revoke_commit_fence`]. Long-running
+    /// parsing, validation, queueing, or broker preparation belongs before this
+    /// call; keep only the final bounded write/readback transaction inside it.
+    pub fn commit<T>(&self, mutation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.ensure_current()?;
+        let fence = loop {
+            self.ensure_current()?;
+            match self.inner.commit_fence.try_lock() {
+                Ok(fence) => break fence,
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(HalError::Platform(
+                        "hardware mutation commit fence poisoned".to_string(),
+                    ))
+                }
+            }
+        };
+        self.ensure_current()?;
+        let result = mutation();
+        drop(fence);
+        result
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        let (phase, generation) =
+            decode_mutation_admission(self.inner.admission.load(Ordering::Acquire));
+        if phase != HardwareMutationGatePhase::Open || generation != self.generation {
+            return Err(HalError::Platform(format!(
+                "hardware mutation lease generation {} is stale; active generation {} is {:?}",
+                self.generation, generation, phase
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for HardwareMutationLease {
@@ -366,9 +557,6 @@ impl Drop for HardwareMutationLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight = state.in_flight.saturating_sub(1);
-        if state.in_flight == 0 {
-            self.inner.drained.notify_all();
-        }
     }
 }
 
@@ -376,13 +564,88 @@ impl Drop for HardwareMutationLease {
 /// control-plane mutation has completed.
 #[derive(Debug)]
 pub struct HardwareMutationBarrierReceipt {
+    closed_generation: u64,
     closed_and_drained_at: Instant,
 }
 
 impl HardwareMutationBarrierReceipt {
+    pub fn closed_generation(&self) -> u64 {
+        self.closed_generation
+    }
+
     pub fn closed_and_drained_at(&self) -> Instant {
         self.closed_and_drained_at
     }
+}
+
+/// Opaque proof that terminal admission is closed and no earlier final commit
+/// can still execute after the caller begins safe-off.
+#[derive(Debug)]
+pub struct HardwareMutationCommitFenceReceipt {
+    closed_generation: u64,
+    fenced_at: Instant,
+    fence_poisoned: bool,
+}
+
+impl HardwareMutationCommitFenceReceipt {
+    pub fn closed_generation(&self) -> u64 {
+        self.closed_generation
+    }
+
+    pub fn fenced_at(&self) -> Instant {
+        self.fenced_at
+    }
+
+    /// A poisoned fence is quiescent, but the previous mutation may have
+    /// unwound after a partial physical side effect. Terminal safe-off remains
+    /// mandatory and diagnostics must not present this as a clean commit.
+    pub fn fence_poisoned(&self) -> bool {
+        self.fence_poisoned
+    }
+}
+
+/// Move-only authority for one closed hardware-mutation generation.
+#[derive(Debug)]
+pub struct RevokedHardwareMutationCommitFence {
+    inner: Arc<HardwareMutationGateInner>,
+    closed_generation: u64,
+}
+
+impl RevokedHardwareMutationCommitFence {
+    pub fn closed_generation(&self) -> u64 {
+        self.closed_generation
+    }
+
+    /// Probe commit-section quiescence without blocking an OS thread.
+    pub fn try_wait(self) -> HardwareMutationCommitFenceTryWait {
+        let fence_poisoned = match self.inner.commit_fence.try_lock() {
+            Ok(fence) => {
+                drop(fence);
+                Some(false)
+            }
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(error)) => {
+                drop(error.into_inner());
+                Some(true)
+            }
+        };
+        match fence_poisoned {
+            Some(fence_poisoned) => {
+                HardwareMutationCommitFenceTryWait::Fenced(HardwareMutationCommitFenceReceipt {
+                    closed_generation: self.closed_generation,
+                    fenced_at: Instant::now(),
+                    fence_poisoned,
+                })
+            }
+            None => HardwareMutationCommitFenceTryWait::Pending(self),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HardwareMutationCommitFenceTryWait {
+    Pending(RevokedHardwareMutationCommitFence),
+    Fenced(HardwareMutationCommitFenceReceipt),
 }
 
 #[cfg(test)]
@@ -435,9 +698,168 @@ mod hardware_mutation_gate_tests {
     #[test]
     fn drain_timeout_keeps_admission_closed() {
         let gate = HardwareMutationGate::new_open();
-        let _lease = gate.try_acquire().unwrap();
+        let lease = gate.try_acquire().unwrap();
         assert!(gate.close_and_drain(Duration::from_millis(1)).is_err());
         assert!(gate.try_acquire().is_err());
+        let wrote_after_close = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote_after_close_for_commit = Arc::clone(&wrote_after_close);
+        assert!(lease
+            .commit(|| {
+                wrote_after_close_for_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+        assert!(!wrote_after_close.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn terminal_fence_orders_an_entered_commit_before_safe_off_and_rejects_later_commit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let gate = HardwareMutationGate::new_open();
+        let lease = gate.try_acquire().unwrap();
+        let hardware_enabled = Arc::new(AtomicBool::new(false));
+        let hardware_enabled_for_commit = Arc::clone(&hardware_enabled);
+        let (commit_entered_tx, commit_entered_rx) = mpsc::channel();
+        let (release_commit_tx, release_commit_rx) = mpsc::channel();
+        let (try_late_commit_tx, try_late_commit_rx) = mpsc::channel();
+        let (late_result_tx, late_result_rx) = mpsc::channel();
+        let commit_thread = thread::spawn(move || {
+            lease
+                .commit(|| {
+                    commit_entered_tx.send(()).unwrap();
+                    release_commit_rx.recv().unwrap();
+                    hardware_enabled_for_commit.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            try_late_commit_rx.recv().unwrap();
+            let late = lease.commit(|| {
+                hardware_enabled_for_commit.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            late_result_tx.send(late.is_err()).unwrap();
+        });
+        commit_entered_rx.recv().unwrap();
+
+        let revoked = gate.revoke_commit_fence();
+        while gate.try_acquire().is_ok() {
+            thread::yield_now();
+        }
+        let mut pending = match revoked.try_wait() {
+            HardwareMutationCommitFenceTryWait::Pending(pending) => pending,
+            HardwareMutationCommitFenceTryWait::Fenced(_) => {
+                panic!("entered final commit unexpectedly appeared quiescent")
+            }
+        };
+
+        release_commit_tx.send(()).unwrap();
+        let poll_deadline = Instant::now() + Duration::from_secs(1);
+        let fence_receipt = loop {
+            match pending.try_wait() {
+                HardwareMutationCommitFenceTryWait::Fenced(receipt) => break receipt,
+                HardwareMutationCommitFenceTryWait::Pending(next) => {
+                    assert!(
+                        Instant::now() < poll_deadline,
+                        "released commit did not become quiescent within one second"
+                    );
+                    pending = next;
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert!(fence_receipt.closed_generation() >= 2);
+        assert!(fence_receipt.fenced_at() <= Instant::now());
+        assert!(!fence_receipt.fence_poisoned());
+
+        // Terminal safe-off happens only after the fence receipt.
+        hardware_enabled.store(false, Ordering::SeqCst);
+        try_late_commit_tx.send(()).unwrap();
+        assert!(late_result_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        commit_thread.join().unwrap();
+        assert!(!hardware_enabled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn revocation_rejects_a_waiting_stale_commit_before_the_entered_commit_returns() {
+        let gate = HardwareMutationGate::new_open();
+        let entered_lease = gate.try_acquire().unwrap();
+        let waiting_lease = gate.try_acquire().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let entered_thread = thread::spawn(move || {
+            entered_lease
+                .commit(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let waiting_thread = thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            waiting_lease.commit(|| Ok(())).is_err()
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let revoked = gate.revoke_commit_fence();
+
+        assert!(
+            waiting_thread
+                .join()
+                .expect("waiting commit thread did not panic"),
+            "stale commit was not rejected after terminal revocation"
+        );
+        assert!(matches!(
+            revoked.try_wait(),
+            HardwareMutationCommitFenceTryWait::Pending(_)
+        ));
+        release_tx.send(()).unwrap();
+        entered_thread.join().unwrap();
+    }
+
+    #[test]
+    fn panicked_commit_mints_dirty_quiescence_evidence_and_rejects_late_mutation() {
+        let gate = HardwareMutationGate::new_open();
+        let panicking_lease = gate.try_acquire().unwrap();
+        let late_lease = gate.try_acquire().unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = panicking_lease.commit(|| -> Result<()> {
+                panic!("fixture commit panicked after a possible physical side effect")
+            });
+        }));
+        assert!(panic.is_err());
+
+        let receipt = match gate.revoke_commit_fence().try_wait() {
+            HardwareMutationCommitFenceTryWait::Fenced(receipt) => receipt,
+            HardwareMutationCommitFenceTryWait::Pending(_) => {
+                panic!("unwound commit retained the commit fence")
+            }
+        };
+        assert!(receipt.fence_poisoned());
+        assert!(late_lease.commit(|| Ok(())).is_err());
+        drop(late_lease);
+        drop(panicking_lease);
+        assert!(gate.close_and_drain(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn preparatory_lease_timeout_can_still_prove_commit_fence_quiescence() {
+        let gate = HardwareMutationGate::new_open();
+        let lease = gate.try_acquire().unwrap();
+
+        assert!(gate.close_and_drain(Duration::from_millis(1)).is_err());
+        let receipt = match gate.revoke_commit_fence().try_wait() {
+            HardwareMutationCommitFenceTryWait::Fenced(receipt) => receipt,
+            HardwareMutationCommitFenceTryWait::Pending(_) => {
+                panic!("a lease outside its commit section held the commit fence")
+            }
+        };
+        assert!(!receipt.fence_poisoned());
+        assert!(lease.commit(|| Ok(())).is_err());
     }
 
     #[test]
@@ -446,8 +868,48 @@ mod hardware_mutation_gate_tests {
 
         assert!(gate.try_acquire().is_err());
         let receipt = gate.close_and_drain(Duration::ZERO).unwrap();
+        assert_eq!(receipt.closed_generation(), 1);
         assert!(receipt.closed_and_drained_at() <= Instant::now());
         assert!(gate.try_acquire().is_err());
+    }
+
+    #[test]
+    fn only_zero_timeout_allows_an_initial_quiescent_observation_at_its_deadline() {
+        let deadline = Instant::now();
+        assert!(drain_observation_is_timely(
+            Duration::ZERO,
+            true,
+            deadline,
+            deadline
+        ));
+        assert!(!drain_observation_is_timely(
+            Duration::from_millis(1),
+            true,
+            deadline,
+            deadline
+        ));
+        assert!(!drain_observation_is_timely(
+            Duration::ZERO,
+            false,
+            deadline,
+            deadline
+        ));
+    }
+
+    #[test]
+    fn absolute_mutation_drain_never_rebases_an_expired_deadline() {
+        let owner = HardwareMutationGateOwner::new_pending();
+        let gate = owner.gate();
+        owner.open().unwrap();
+        let expired = Instant::now();
+
+        let error = owner.close_and_drain_until(expired).unwrap_err();
+
+        assert!(error.to_string().contains("absolute drain deadline"));
+        assert!(
+            gate.try_acquire().is_err(),
+            "expired drain must still close admission"
+        );
     }
 
     #[test]

@@ -108,6 +108,21 @@ pub enum FanVariant {
     Am2Uio16,
 }
 
+/// Policy for the optional AM2 `board-control +0x04` C49 -> C52 write.
+///
+/// Register layout and board-mode mutation are deliberately independent.
+/// Multiple AM2 generations expose the same four-tach/two-PWM fan block, but
+/// only a bounded set of S19-family captures proves that rewriting the sibling
+/// board-control register is safe and necessary. Callers for other hardware
+/// must preserve the existing board mode until equivalent evidence exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Am2FanModePolicy {
+    /// Leave the board-control mode register byte-for-byte unchanged.
+    Preserve,
+    /// Apply the live-proven C49 -> C52 mode switch with readback.
+    EnableC52,
+}
+
 impl FanVariant {
     /// Physical fan positions managed by this fan-control variant.
     pub const fn physical_fan_count(self) -> u8 {
@@ -323,8 +338,8 @@ fn clamp_pwm_with_profile_cap(pwm: u8, profile_cap_pwm: u8) -> u8 {
 }
 
 #[inline]
-fn open_with_variant_should_enable_am2_c52(variant: FanVariant) -> bool {
-    matches!(variant, FanVariant::Am2Uio16)
+fn should_enable_am2_c52(variant: FanVariant, policy: Am2FanModePolicy) -> bool {
+    matches!(variant, FanVariant::Am2Uio16) && matches!(policy, Am2FanModePolicy::EnableC52)
 }
 
 impl FanController {
@@ -360,22 +375,57 @@ impl FanController {
     }
 
     /// Open the fan controller UIO device by number with an explicit variant.
+    ///
+    /// Variant selects only the register layout. Product identity is not
+    /// available here, so this compatibility entry point preserves the
+    /// independent AM2 board-control mode. Exact S19 callers must opt into C52
+    /// through [`Self::open_with_variant_and_mode_policy`].
     pub fn open_with_variant(uio_number: u8, variant: FanVariant) -> Result<Self> {
+        Self::open_with_variant_and_mode_policy(uio_number, variant, Am2FanModePolicy::Preserve)
+    }
+
+    /// Open with independently selected register layout and board-mode policy.
+    ///
+    /// This is the preferred platform entry point. It prevents a topology
+    /// decision (four tach inputs) from silently authorizing a write to a
+    /// separate board-control IP whose semantics vary across AM2 generations.
+    pub fn open_with_variant_and_mode_policy(
+        uio_number: u8,
+        variant: FanVariant,
+        mode_policy: Am2FanModePolicy,
+    ) -> Result<Self> {
         let regs = UioDevice::open(uio_number)?;
         let mut fan = Self::new_with_variant(regs, variant);
-        if open_with_variant_should_enable_am2_c52(variant) {
-            fan.enable_am2_c52_fan_mode_from_board_control("FanController::open_with_variant");
+        if should_enable_am2_c52(variant, mode_policy) {
+            fan.enable_am2_c52_fan_mode_from_board_control(
+                "FanController::open_with_variant_and_mode_policy",
+            );
         }
-        fan.attach_front_fan_surface_from_env("FanController::open_with_variant");
+        fan.attach_front_fan_surface_from_env("FanController::open_with_variant_and_mode_policy");
         Ok(fan)
     }
 
     /// Discover and open the fan controller by UIO name.
+    ///
+    /// Product identity is not available at this layer, so discovery preserves
+    /// board-control mode. A caller with typed S19 evidence may opt into C52
+    /// explicitly through [`Self::open_discovered_with_mode_policy`].
     pub fn open_discovered() -> Result<(FanUioDiscovery, Self)> {
+        Self::open_discovered_with_mode_policy(Am2FanModePolicy::Preserve)
+    }
+
+    /// Discover and open with an explicit board-mode mutation policy.
+    pub fn open_discovered_with_mode_policy(
+        mode_policy: Am2FanModePolicy,
+    ) -> Result<(FanUioDiscovery, Self)> {
         let discovery = discover_fan_uio().ok_or_else(|| {
             HalError::Fan("no 'fan-control' UIO found under /sys/class/uio".to_string())
         })?;
-        let fan = Self::open_with_variant(discovery.uio_number, discovery.variant)?;
+        let fan = Self::open_with_variant_and_mode_policy(
+            discovery.uio_number,
+            discovery.variant,
+            mode_policy,
+        )?;
         Ok((discovery, fan))
     }
 
@@ -846,15 +896,19 @@ mod tests {
     }
 
     #[test]
-    fn am2_c52_fan_mode_status_records_mode() {
-        assert!(
-            open_with_variant_should_enable_am2_c52(FanVariant::Am2Uio16),
-            "AM2 open_with_variant must attempt the C49->C52 fan-mode switch"
-        );
-        assert!(
-            !open_with_variant_should_enable_am2_c52(FanVariant::Am1S9),
-            "S9 must not attempt the AM2 board-control C52 switch"
-        );
+    fn explicit_board_mode_policy_is_independent_from_fan_register_layout() {
+        assert!(should_enable_am2_c52(
+            FanVariant::Am2Uio16,
+            Am2FanModePolicy::EnableC52
+        ));
+        assert!(!should_enable_am2_c52(
+            FanVariant::Am2Uio16,
+            Am2FanModePolicy::Preserve
+        ));
+        assert!(!should_enable_am2_c52(
+            FanVariant::Am1S9,
+            Am2FanModePolicy::EnableC52
+        ));
     }
 
     #[test]
@@ -909,16 +963,21 @@ mod tests {
     }
 
     #[test]
-    fn open_with_variant_calls_am2_c52_switch() {
+    fn open_with_variant_preserves_board_mode_without_product_identity() {
         let source = include_str!("fan.rs");
         let body = source
             .split("pub fn open_with_variant")
             .nth(1)
-            .and_then(|rest| rest.split("pub fn open_discovered").next())
+            .and_then(|rest| {
+                rest.split("pub fn open_with_variant_and_mode_policy")
+                    .next()
+            })
             .expect("open_with_variant body must be visible to the source pin");
         assert!(
-            body.contains("enable_am2_c52_fan_mode_from_board_control"),
-            "removing the C52 switch from open_with_variant must fail a host test"
+            body.contains("Am2FanModePolicy::Preserve")
+                && !body.contains("Am2FanModePolicy::EnableC52")
+                && body.contains("open_with_variant_and_mode_policy"),
+            "layout-only open_with_variant must not infer AM2 board-mode mutation authority"
         );
     }
 

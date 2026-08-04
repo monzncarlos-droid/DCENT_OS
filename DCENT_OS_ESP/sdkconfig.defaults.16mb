@@ -1,0 +1,25 @@
+# Shared ESP32-S3 **16 MB (N16R8)** sdkconfig overlay — DIO, 80 MHz, plus the
+# 16 MB partition table. Used by every 16 MB board target, not one vendor's:
+#   * Hammer BC0x / DC0x — verified from the Hammer vendor corpus
+#     (HAMMER_HARDWARE_MATRIX.md §6 "ESP32-S3, 16 MB flash, DIO, 80 MHz [V]").
+#   * Lucky Miner LV06 / LV07 / LV08 — ESP32-S3 N16R8 (Lucky enablement wave
+#     2026-07-27). EXPERIMENTAL: no Lucky hardware exists on any bench, so this
+#     overlay is host/desk-derived and has never been flashed to a Lucky unit.
+#
+# Renamed from `sdkconfig.defaults.hammer-16mb` when the second 16 MB family
+# arrived; that filename is kept as a working deprecated alias so any command
+# line or doc still naming it keeps producing this exact layout.
+#
+# Usage (16 MB targets ONLY — never make this the default; 8 MB boards keep
+# partitions.csv):
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.16mb" \
+#     CARGO_TARGET_DIR=C:/bt cargo build --release -p dcentaxe \
+#     --no-default-features --features hammer-bc04
+#
+# Remember the  rule: changing sdkconfig requires deleting the build
+# cache (rm -rf C:/bt) for CMake's autoconf.h to regenerate.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16mb.csv"

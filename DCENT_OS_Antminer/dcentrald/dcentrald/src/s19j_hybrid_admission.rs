@@ -7,6 +7,7 @@
 //! and returns an opaque, non-duplicable capability.
 
 use crate::daemon_lifecycle::PlatformIdentitySnapshot;
+use crate::runtime::hardware_info::OBSERVED_CONTROL_BOARD_ZYNQ_AM2;
 use crate::RuntimeDispatchKind;
 use dcentrald_common::{
     AsicProtocolIdentity, BoardFamily, ChainTransportKind, SlotPolicy, VoltageControllerClass,
@@ -14,7 +15,6 @@ use dcentrald_common::{
 };
 
 const BOARD_TARGET: &str = "am2-s19j";
-const OBSERVED_AM2_CONTROL_BOARD: &str = "Zynq am2-s17";
 
 /// Capability to construct and enter the AM2/Zynq BM1362 hybrid engine.
 ///
@@ -83,11 +83,10 @@ pub(crate) fn admit_s19j_hybrid_route(
         ));
     }
 
-    // The current passive detector reports the AM2 UIO topology as
-    // `Zynq am2-s17`; the product suffix is historical and not ASIC evidence.
-    // Bind only the measured carrier class and leave hashboard/ASIC proof to
-    // their independent evidence boundaries.
-    if identity.observed_control_board != OBSERVED_AM2_CONTROL_BOARD {
+    // Bind the detector's canonical AM2 fabric observation only. Product
+    // suffixes are not carrier evidence; hashboard/ASIC proof remains at its
+    // independent admission boundary.
+    if identity.observed_control_board != OBSERVED_CONTROL_BOARD_ZYNQ_AM2 {
         return Err(format!(
             "declared AM2 hybrid composition contradicts observed control board {:?}",
             identity.observed_control_board
@@ -114,6 +113,7 @@ mod tests {
     fn identity(board_target: &str, observed_control_board: &str) -> PlatformIdentitySnapshot {
         PlatformIdentitySnapshot {
             declared_board_target: Some(board_target.to_string()),
+            observed_board_target: None,
             board_desc: dcentrald_common::BoardDesc::lookup(board_target),
             declared_platform_marker: Some("zynq-bm3-am2".to_string()),
             declared_subtype: None,
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn exact_am2_zynq_bm1362_hybrid_composition_is_admitted() {
         let _admission = admit_s19j_hybrid_route(
-            &identity(BOARD_TARGET, "Zynq am2-s17"),
+            &identity(BOARD_TARGET, OBSERVED_CONTROL_BOARD_ZYNQ_AM2),
             RuntimeDispatchKind::S19jHybrid,
             Some(AsicProtocolIdentity::Bm1362),
         )
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn wrong_route_or_asic_identity_fails_closed() {
-        let am2 = identity(BOARD_TARGET, "Zynq am2-s17");
+        let am2 = identity(BOARD_TARGET, OBSERVED_CONTROL_BOARD_ZYNQ_AM2);
         assert!(admit_s19j_hybrid_route(
             &am2,
             RuntimeDispatchKind::Serial,

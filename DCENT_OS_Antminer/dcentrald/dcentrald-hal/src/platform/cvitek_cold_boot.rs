@@ -53,19 +53,26 @@
 //! | 5     | 8.5 s   | MiscCtrl 0x00C100B0 triple-write × 5 ms spacing.      | R4-CONFIRMED §2.6 |
 //! | 6     | 9.0 s   | First WORK_TX dispatch readiness (FPGA register-poke).| INFERRED §3 / R4-1 |
 //!
-//! ## INFERRED FPGA registers (Phase 6 only — R4-1 carry-forward)
+//! ## Phase-6 FPGA registers — CONTRADICTED BY HELD FIRMWARE (2026-07-24)
 //!
-//! Phase 6's FPGA writes target offsets at 0x43C00000 base that R4
-//! explicitly marks **PARTIAL — inferred from S17/T9 patterns** (see
-//! `bmminer_init_trace_cv1835.md` §7 confidence row). Lines doing those
-//! writes are flagged `// XXX: INFERRED — RE3 §6 / R4-1 carry-forward`
-//! and gated behind `DCENT_CV1835_ACCEPT_INFERRED_FPGA=1`. Round-4 RE
-//! blocker R4-1 (CV1835 FPGA register probe on bench unit) is what
-//! closes the gate. The env-gate's runtime scope is unchanged — Phase 6
-//! is required for first WORK_TX dispatch, so the gate still controls
-//! whether the cold-boot routine can run end-to-end at all. Only its
-//! marker semantics tightened: Phase 1-5 are no longer "inferred", just
-//! "hardware-gated" (no live CV1835 unit yet).
+//! **The Phase-6 "FPGA register" path is not merely inferred — it is CONTRADICTED.**
+//! CV1835 has **no FPGA** and no memory-mapped work FIFO. Confirmed two ways this
+//! session: (1) a full-tree search of the held VNish CV1835 rootfs
+//! finds **zero** references to
+//! `0x43C00000`, `axi_fpga`, or `fpga_mem`; (2)  Q6 already proved CV1835 uses
+//! `cv183x_base.ko` SoC-peripheral mmap, not an FPGA bitstream. The real hashboard
+//! dispatch path is the **`/dev/uart_trans` char device** (`uart_trans.ko`), driven
+//! via the existing `dcentrald_asic::bm1362::wire_uart_trans` codec.
+//!
+//! Therefore the R4-1 "bench CV1835 FPGA register probe" blocker is moot — there is
+//! nothing to probe. The `INFERRED_FPGA_*` constants, `fpga_chain_offset`, and the
+//! `run_fpga_dispatch_prep` path below are retained only as documented-dead scaffolding
+//! (env-gated default-OFF, and the gate now records the contradiction). **Do NOT
+//! bench-probe for a CV1835 FPGA; do NOT re-enable this path.** The correct Phase-6
+//! replacement is the `/dev/uart_trans` dispatch — a platform-dispatch refactor that
+//! must be validated on a Linux/bench target (its ioctl cannot be host-tested), tracked
+//! as the "CVITEK Phase-6 rewrite" task. Until then Phase 1-5 are hardware-gated (no
+//! live CV1835 unit) and Phase 6 is contradicted-dead.
 //!
 //! ## W13.D1 boot-phase emission (future wiring)
 //!
@@ -131,6 +138,14 @@
 //!   hardware lands.
 //!   See `~/.
 
+// clippy/dead_code: CV1835 (CViTek) is an EVIDENCE-RETAINED platform port. The
+// module is a complete RE'd bring-up path with no live fleet unit, so most of it
+// has no production caller yet and every item reads as dead code. It is retained
+// deliberately — the repo models exactly this state as
+// `RuntimeStatus::EvidenceRetainedNotImplemented`. Deleting it to satisfy the
+// lint would destroy real reverse-engineering work; wiring it to satisfy the lint
+// would promote an unproven platform. Allowed here until a bench unit lands.
+#![allow(dead_code)]
 use std::time::{Duration, Instant};
 
 use crate::psu_apw12_smbus::{run_with_power_rollback, Apw12SmbusBackend};
@@ -259,10 +274,23 @@ pub const CV1835_STOCK_MODULE_LOAD_ORDER: [&str; 3] = [
 /// Stock CV1835 PWR_EN GPIO (sysfs, exported `out`). Corroborated by VNish `bootos.sh` too.
 pub const CV1835_STOCK_GPIO_PWR_EN: u32 = 412;
 
-/// Stock CV1835 ASIC reset/control GPIOs (sysfs, exported `out`, set `1`). The stock firmware drives
-/// SIX lines — the original four (427/429/431/433) PLUS gpio434/gpio435, which the inferred markers
-/// (`ASIC_RESET_GPIOS_R4`, 4 entries) omitted.
-pub const CV1835_STOCK_GPIO_ASIC_RST: [u32; 6] = [427, 429, 431, 433, 434, 435];
+/// Stock CV1835 ASIC reset/control GPIOs (sysfs, exported `out`, set `1`): the four
+/// lines `427/429/431/433`, R4-confirmed and matching [`ASIC_RESET_GPIOS_R4`].
+///
+/// **Correction (2026-07-24, held-firmware-verified):** an earlier pass appended
+/// `gpio434/gpio435` here, calling them a fifth/sixth reset. They are NOT resets —
+/// they are the board's status LEDs. The held VNish CV1835 rootfs
+/// is a script
+/// headed *"Blink red and green leds sequentially"* that exports gpio434 as the **red
+/// LED** and gpio435 as the **green LED** and alternates them. Driving an LED line as
+/// an ASIC reset on a live board would be a functional bug, so they are split out into
+/// [`CV1835_STOCK_GPIO_LED`] and removed from the reset set.
+pub const CV1835_STOCK_GPIO_ASIC_RST: [u32; 4] = [427, 429, 431, 433];
+
+/// Stock CV1835 status LEDs (sysfs), NOT ASIC resets: `434` = red, `435` = green.
+/// Held-firmware source: `vnish-s19kpro-cv-1.2.7/usr/bin/blink`. Kept as a named
+/// constant so nothing re-adds them to [`CV1835_STOCK_GPIO_ASIC_RST`].
+pub const CV1835_STOCK_GPIO_LED: [u32; 2] = [434, 435];
 
 /// Stock CV1835 SoC PINMUX / clock-reset replay — byte-exact `(devmem_addr, value)` 32-bit writes
 /// in firmware order, plus the `0x03005D00 = 0x4D474E35` ("5NGM") clock-gate unlock. These replace
@@ -818,10 +846,14 @@ mod tests {
             ["cv183x_pwm.ko", "cv183x_base.ko", "uart_trans.ko"]
         );
         assert_eq!(CV1835_STOCK_GPIO_PWR_EN, 412);
-        assert_eq!(CV1835_STOCK_GPIO_ASIC_RST, [427, 429, 431, 433, 434, 435]);
-        // The stock map is a SUPERSET of the previously-inferred 4-entry ASIC_RESET_GPIOS_R4.
-        for g in ASIC_RESET_GPIOS_R4 {
-            assert!(CV1835_STOCK_GPIO_ASIC_RST.contains(&g));
+        // Held-firmware correction (blink script proves 434/435 are red/green LEDs):
+        // the reset set is exactly the R4-confirmed four, and the LEDs are separate.
+        assert_eq!(CV1835_STOCK_GPIO_ASIC_RST, [427, 429, 431, 433]);
+        assert_eq!(CV1835_STOCK_GPIO_ASIC_RST, ASIC_RESET_GPIOS_R4);
+        assert_eq!(CV1835_STOCK_GPIO_LED, [434, 435]);
+        // The LEDs must NEVER appear in the reset set.
+        for led in CV1835_STOCK_GPIO_LED {
+            assert!(!CV1835_STOCK_GPIO_ASIC_RST.contains(&led));
         }
         // Pinmux replay: 24 byte-exact writes ending in the 0x03005D00 = 0x4D474E35 unlock.
         assert_eq!(CV1835_STOCK_PINMUX_REPLAY.len(), 24);
@@ -1200,12 +1232,15 @@ mod tests {
         let content_only = &src[..test_mod_start];
         let count = content_only.matches("XXX: INFERRED").count();
         assert_eq!(
-            count, 12,
-            "expected 12 XXX: INFERRED content markers post-W13.B4 \
-             (1 file-level doc + 4 const doc-blocks + 1 helper doc + \
-             6 Phase 6 inline/tracing/error), got {}. \
-             If you intentionally added or removed a Phase 6 INFERRED \
-             marker, update this number AND document the change in .",
+            count, 11,
+            "expected 11 XXX: INFERRED content markers post-2026-07-24 \
+             (4 const doc-blocks + 1 helper doc + 6 Phase 6 inline/tracing/error). \
+             Was 12 pre-2026-07-24; the file-level doc's single \"flagged as \
+             XXX: INFERRED\" mention was intentionally removed when Phase 6 was \
+             re-documented as CONTRADICTED-BY-HELD-FIRMWARE (held VNish CV1835 rootfs \
+             has zero FPGA references; CV1835 has no FPGA). The inline markers stay \
+             because the path is still not-live-verified. Got {}. If you changed a \
+             Phase 6 INFERRED marker, update this number AND document why.",
             count
         );
     }

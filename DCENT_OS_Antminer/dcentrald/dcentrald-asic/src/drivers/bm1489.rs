@@ -566,10 +566,12 @@ impl ChipDriver for Bm1489Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // Standard (difficulty - 1) — same as BM1397+. BM1485 (predecessor)
-        // uses bit-reversed encoding per BM1387 pattern; BM1489 unconfirmed.
-        // [GAP — wave-8: verify against live ticket_mask write trace.]
-        difficulty.saturating_sub(1)
+        // G25 pure SSOT: plain (wave-8 unconfirmed; predecessor BM1485 was
+        // bit-reversed). Live write-trace may promote to BitReversed later.
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

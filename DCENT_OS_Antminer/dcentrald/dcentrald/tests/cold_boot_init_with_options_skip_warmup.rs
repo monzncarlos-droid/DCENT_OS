@@ -58,14 +58,22 @@ fn cold_boot_init_with_options_skip_warmup_branch_is_present_and_correct() {
          skip_warmup_loop=false (legacy callers byte-identical)"
     );
 
-    // The thin `cold_boot_init` trampoline must still call
-    // `cold_boot_init_with_options(voltage_mv, false)` so existing call
-    // sites preserve byte-identical behaviour.
-    assert!(
-        DSPIC_MOD_RS.contains("self.cold_boot_init_with_options(voltage_mv, false)"),
-        "cold_boot_init must trampoline to cold_boot_init_with_options(_, false) \
-         to preserve byte-identical legacy semantics on non-Wave-22 callers"
-    );
+    // The thin `cold_boot_init` trampoline now shares the internal policy with
+    // the cancellation-aware wrapper. Pin its semantic arguments instead of
+    // the obsolete wrapper-to-wrapper syntax: legacy warmup remains enabled,
+    // compatibility waits remain unbounded, and cancellation remains false.
+    let cold_boot_start = DSPIC_MOD_RS
+        .find("pub fn cold_boot_init(&mut self, voltage_mv: u16)")
+        .expect("cold_boot_init wrapper");
+    let cancellable_start = DSPIC_MOD_RS[cold_boot_start..]
+        .find("pub fn cold_boot_init_cancellable(")
+        .map(|offset| cold_boot_start + offset)
+        .expect("cancellable cold-boot wrapper boundary");
+    let cold_boot_wrapper = &DSPIC_MOD_RS[cold_boot_start..cancellable_start];
+    assert!(cold_boot_wrapper.contains("self.cold_boot_init_with_options_policy("));
+    assert!(cold_boot_wrapper.contains("voltage_mv, false"));
+    assert!(cold_boot_wrapper.contains("std::time::Duration::MAX"));
+    assert!(cold_boot_wrapper.contains("false\n        })"));
 }
 
 #[test]

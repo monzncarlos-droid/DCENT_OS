@@ -91,10 +91,33 @@ case "$target" in
     bitaxe-gamma-duo)                      stem="DCENTOS_ESP3_BitaxeGammaDuo" ;;
     bitaxe-hex-supra)                      stem="DCENTOS_ESP3_BitaxeHexSupra" ;;
     bitaxe-gamma-turbo|bitaxe-gt)          stem="DCENTOS_ESP3_BitaxeGammaTurbo" ;;
+    # Backfill (2026-07-27): these 6 ESP targets exist in the build matrix but
+    # were missing here, so naming any of them exited 2. Harmless until now
+    # only because this script is called from the 6-board public release
+    # matrix. GEN follows the ASIC: BM1397 = ESP2, BM1366/68/70 = ESP3.
+    bitaxe-touch)                          stem="DCENTOS_ESP3_BitaxeTouch" ;;
+    bitaxe-gt-touch)                       stem="DCENTOS_ESP3_BitaxeTurboTouch" ;;
+    nerdnos)                               stem="DCENTOS_ESP2_NerdNOS" ;;
+    nerdaxe)                               stem="DCENTOS_ESP3_NerdAxe" ;;
+    nerdqaxe-plus)                         stem="DCENTOS_ESP3_NerdQaxePlus" ;;
+    nerdqaxe-pp)                           stem="DCENTOS_ESP3_NerdQaxePP" ;;
     dcent-axe-900-920)                     stem="DCENTOS_ESP2_DCENTAxe" ;;
     dcent-axe-bm1397)                      stem="DCENTOS_ESP2_DCENTAxeBm1397" ;;
     dcent-axe-quad-bm1397)                 stem="DCENTOS_ESP2_DCENTAxeQuadBm1397" ;;
     dcent-axe-hex-bm1397)                  stem="DCENTOS_ESP2_DCENTAxeHexBm1397" ;;
+    hammer-bc01)                           stem="DCENTOS_ESP3_HammerBC01" ;;
+    hammer-bc01-pro)                       stem="DCENTOS_ESP3_HammerBC01Pro" ;;
+    hammer-bc02)                           stem="DCENTOS_ESP3_HammerBC02" ;;
+    hammer-bc04)                           stem="DCENTOS_ESP3_HammerBC04" ;;
+    hammer-dc02)                           stem="DCENTOS_ESP3_HammerDC02" ;;
+    hammer-dc04)                           stem="DCENTOS_ESP3_HammerDC04" ;;
+    hammer-dc06)                           stem="DCENTOS_ESP3_HammerDC06" ;;
+    # Lucky Miner LVxx — BM1366 (ESP3-class, same stem generation as the
+    # Ultra / Hex Ultra). EXPERIMENTAL: no Lucky hardware exists on any bench;
+    # a named image proves nothing about the board it is named for.
+    lucky-lv06)                            stem="DCENTOS_ESP3_LuckyLV06" ;;
+    lucky-lv07)                            stem="DCENTOS_ESP3_LuckyLV07" ;;
+    lucky-lv08)                            stem="DCENTOS_ESP3_LuckyLV08" ;;
     wm-h616-m60s|whatsminer-m60s)          stem="DCENTOS_H616_M60S" ;;
     avalon-k230-q|avalon-q-k230)           stem="DCENTOS_K230_AvalonQ" ;;
     avalon-k230-nano3|avalon-nano3)        stem="DCENTOS_K230_Nano3" ;;

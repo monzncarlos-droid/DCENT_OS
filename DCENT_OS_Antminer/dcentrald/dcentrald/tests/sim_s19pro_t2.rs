@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use dcentrald_asic::chain::Chain as HashChain;
-use dcentrald_asic::drivers::ChipRegistry;
+use dcentrald_asic::chain::{Chain as HashChain, EnumerationCommandDialect};
+use dcentrald_asic::drivers::{ChipDriverMaturity, ChipRegistry};
 use dcentrald_hal::chain_backend::Bm1397PlusChainBackend;
 use dcentrald_hal::fpga_chain::FpgaChain;
 use dcentrald_hal::platform::sim::{SimModel, SimNoncePolicy, SimPlatform};
@@ -60,9 +60,57 @@ fn header_for(work: &dcentrald_stratum::MiningWork, nonce: u32) -> [u8; 80] {
     header
 }
 
+/// The driver maturity each simulated chip is registered at.
+///
+/// Pinned rather than read. This helper previously asked the registry for the
+/// maturity and then built whichever registry that answer demanded, which made
+/// the T2 proof pass identically whether a chip was Production or Experimental.
+/// That is the wrong way round: maturity is what decides whether a driver may
+/// touch energized hardware without an exact per-chip opt-in, so it is a fact
+/// the proof should ASSERT, not a parameter the proof should absorb.
+fn pinned_maturity(chip_id: u16) -> ChipDriverMaturity {
+    match chip_id {
+        // BM1387 / BM1362 / BM1366 / BM1368 — Production.
+        0x1387 | 0x1362 | 0x1366 | 0x1368 => ChipDriverMaturity::Production,
+        // BM1397 / BM1398 / BM1370 — Experimental, admitted only behind an
+        // exact per-chip opt-in.
+        0x1397 | 0x1398 | 0x1370 => ChipDriverMaturity::Experimental,
+        other => panic!(
+            "simulated chip {other:#06x} has no pinned driver maturity. Add it to \
+             pinned_maturity deliberately; letting the registry decide is exactly \
+             the drift this pin exists to catch."
+        ),
+    }
+}
+
+fn registry_admitting_catalogued_driver(chip_id: u16) -> ChipRegistry {
+    let production = ChipRegistry::production();
+    let recognition = production
+        .recognize(chip_id)
+        .expect("simulated chip identity must be catalogued");
+    let pinned = pinned_maturity(chip_id);
+    assert_eq!(
+        recognition.maturity(),
+        pinned,
+        "chip {chip_id:#06x} is registered as {:?} but this headless proof pins \
+         {pinned:?}. If the promotion is intended, update pinned_maturity in the \
+         same commit and justify it — Production means no per-chip opt-in stands \
+         between this driver and an energized hashboard.",
+        recognition.maturity()
+    );
+    match pinned {
+        ChipDriverMaturity::Production => production,
+        ChipDriverMaturity::Experimental => ChipRegistry::with_experimental_driver(chip_id),
+        ChipDriverMaturity::Scaffold => {
+            panic!("headless hardware proof must not authorize a Scaffold driver")
+        }
+    }
+}
+
 /// T2 means one model has crossed all four device-free boundaries in one
-/// proof: selected geometry, enumeration, the production ASIC init path, and
-/// a target-valid nonce serialized to a loopback pool and accepted.
+/// proof: selected geometry, enumeration, an ASIC init path explicitly admitted
+/// at its catalogued maturity, and a target-valid nonce serialized to a
+/// loopback pool and accepted.
 async fn assert_headless_t2(
     model: SimModel,
     chip_id: u16,
@@ -87,12 +135,14 @@ async fn assert_headless_t2(
         .iter()
         .all(|response| response.starts_with(&chip_id.to_be_bytes())));
 
-    let registry = ChipRegistry::production();
-    let driver = registry.detect(chip_id).expect("production ASIC driver");
+    let registry = registry_admitting_catalogued_driver(chip_id);
+    let driver = registry
+        .detect(chip_id)
+        .expect("ASIC driver admitted at its catalogued maturity");
     let mut chain = FpgaChain::open_sim_for_model(0, model).expect("simulated FPGA chain");
     driver
         .init_chain(&mut chain, chip_count, frequency_mhz)
-        .expect("production ASIC initialization");
+        .expect("maturity-admitted ASIC initialization");
 
     assert_share_accept(chain, worker).await;
 }
@@ -118,7 +168,9 @@ async fn assert_share_accept(chain: FpgaChain, worker: &str) {
     // proof. This avoids falsely claiming a CPU brute-force result at pdiff-1;
     // the exact 80-byte header still passes the production local validator.
     job.share_target = [0xff; 32];
-    let work = WorkBuilder::new().next_work(&job);
+    let work = WorkBuilder::new()
+        .next_work(&job)
+        .expect("finite V1 work allocation");
     let expected_nonce = 0x1357_2468;
     let header = header_for(&work, expected_nonce);
     assert!(validate_full_header(&header, &work.share_target));
@@ -139,6 +191,7 @@ async fn assert_share_accept(chain: FpgaChain, worker: &str) {
 
     share_tx
         .send(ValidShare {
+            work_generation: work.work_generation,
             worker_name: worker.to_string(),
             job_id: work.job_id,
             extranonce2: work.extranonce2,
@@ -182,7 +235,7 @@ async fn s9_reaches_headless_t2_through_legacy_fpga_fifo() {
     let mut hash_chain = HashChain::new(FpgaChain::open_sim(6).expect("simulated S9 FPGA"), 6);
 
     let enumeration = hash_chain
-        .enumerate_chips()
+        .enumerate_chips(EnumerationCommandDialect::Bm1387)
         .expect("legacy FPGA FIFO enumeration");
     assert_eq!(
         (enumeration.chip_count(), enumeration.chip_id()),

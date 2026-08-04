@@ -5,13 +5,15 @@
 //!
 //! 1. **CPU computes midstate** (SHA-256 first block hash of the 80-byte header)
 //! 2. **CPU writes midstate + job metadata** to FPGA registers (0x130-0x15C)
-//! 3. **CPU writes full job data** to DMA buffer in DDR (0x1F000000 or 0x1F200000)
+//! 3. **CPU writes full job data** to DMA buffer at admitted base + 0x200000/0x210000
 //! 4. **CPU signals FPGA** via JOB_DATA_READY register
 //! 5. **FPGA distributes work** to all 3 chains simultaneously via DMA
 //! 6. **FPGA collects nonces** into shared RETURN_NONCE FIFO
 //!
-//! Double-buffering: Two DDR regions alternate (0x1F000000 and 0x1F200000).
-//! While FPGA reads from one buffer, CPU writes the next job to the other.
+//! Double-buffering: two 64 KiB DDR regions alternate at offsets 0x200000 and
+//! 0x210000. The separate 2 MiB region at offset zero is reserved for the
+//! FPGA-written nonce2/job-id mapping store. Physical base is admitted from the
+//! kernel module parameter as 0x0F000000, 0x1F000000, or 0x3F000000.
 //!
 //! AsicBoost: 4 block version slots at registers 0x130-0x13C allow
 //! version-rolling AsicBoost with up to 4 midstates per job.
@@ -29,15 +31,126 @@ use crate::{HalError, Result};
 // DMA buffer layout
 // ---------------------------------------------------------------------------
 
-/// First DMA buffer physical address (work TX region).
-pub const DMA_BUFFER_0: u64 = 0x1F00_0000;
+/// Stock-supported physical bases selected by the kernel module from RAM size.
+pub const STOCK_DMA_BASE_256M: u32 = 0x0F00_0000;
+pub const STOCK_DMA_BASE_512M: u32 = 0x1F00_0000;
+pub const STOCK_DMA_BASE_1G: u32 = 0x3F00_0000;
+pub const STOCK_DMA_BASES: [u32; 3] = [STOCK_DMA_BASE_256M, STOCK_DMA_BASE_512M, STOCK_DMA_BASE_1G];
 
-/// Second DMA buffer physical address (nonce2/jobid store, also used as
-/// alternate work buffer for double-buffering).
-pub const DMA_BUFFER_1: u64 = 0x1F20_0000;
+/// FPGA-written nonce2/job-id mapping store (2 MiB) starts at DMA offset zero.
+pub const NONCE2_JOBID_STORE_OFFSET: u32 = 0;
+pub const NONCE2_JOBID_STORE_SIZE: usize = 0x0020_0000;
 
-/// Size of each DMA buffer (2 MB).
-pub const DMA_BUFFER_SIZE: usize = 0x0020_0000;
+/// CPU-written double-buffered job regions from the stock cgminer layout.
+///
+/// These must never alias the mapping store. The previous implementation
+/// incorrectly alternated back to 0x1F000000 and overwrote FPGA correlation
+/// records on every second dispatch.
+pub const JOB_BUFFER_0_OFFSET: u32 = 0x0020_0000;
+pub const JOB_BUFFER_1_OFFSET: u32 = 0x0021_0000;
+pub const JOB_BUFFER_SIZE: usize = 0x0001_0000;
+
+/// Admitted physical layout for one loaded `fpga_mem_driver` instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StockDmaLayout {
+    physical_base: u32,
+}
+
+impl StockDmaLayout {
+    /// Accept only the three RAM-dependent bases present in stock Bitmain
+    /// startup scripts and cgminer constants. Unknown/aligned guesses fail.
+    pub fn admit(physical_base: u64) -> Result<Self> {
+        let physical_base = u32::try_from(physical_base).map_err(|_| {
+            HalError::Other(format!(
+                "stock FPGA DMA base 0x{physical_base:X} exceeds the 32-bit register ABI"
+            ))
+        })?;
+        if !STOCK_DMA_BASES.contains(&physical_base) {
+            return Err(HalError::Other(format!(
+                "unverified stock FPGA DMA base 0x{physical_base:08X}; expected one of 0x0F000000, 0x1F000000, or 0x3F000000"
+            )));
+        }
+        Ok(Self { physical_base })
+    }
+
+    pub const fn physical_base(self) -> u32 {
+        self.physical_base
+    }
+
+    pub const fn nonce2_jobid_store(self) -> u32 {
+        self.physical_base + NONCE2_JOBID_STORE_OFFSET
+    }
+
+    pub const fn job_buffer_0(self) -> u32 {
+        self.physical_base + JOB_BUFFER_0_OFFSET
+    }
+
+    pub const fn job_buffer_1(self) -> u32 {
+        self.physical_base + JOB_BUFFER_1_OFFSET
+    }
+}
+
+const FPGA_MEM_OFFSET_PARAMETER_PATHS: [&str; 2] = [
+    "/sys/module/fpga_mem_driver/parameters/fpga_mem_offset_addr",
+    "/sys/module/fpga_mem/parameters/fpga_mem_offset_addr",
+];
+
+fn parse_stock_dma_base(raw: &str) -> Result<u64> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(HalError::Other(
+            "empty fpga_mem_offset_addr module parameter".to_string(),
+        ));
+    }
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|error| {
+            HalError::Other(format!(
+                "invalid hexadecimal fpga_mem_offset_addr {value:?}: {error}"
+            ))
+        })
+    } else {
+        value.parse::<u64>().map_err(|error| {
+            HalError::Other(format!(
+                "invalid decimal fpga_mem_offset_addr {value:?}: {error}"
+            ))
+        })
+    }
+}
+
+fn discover_stock_dma_layout() -> Result<StockDmaLayout> {
+    let mut observed: Option<(String, u64)> = None;
+    for path in FPGA_MEM_OFFSET_PARAMETER_PATHS {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let base = parse_stock_dma_base(&raw)?;
+        if let Some((previous_path, previous_base)) = &observed {
+            if *previous_base != base {
+                return Err(HalError::Other(format!(
+                    "conflicting stock FPGA DMA bases: {previous_path}=0x{previous_base:X}, {path}=0x{base:X}"
+                )));
+            }
+        } else {
+            observed = Some((path.to_string(), base));
+        }
+    }
+    let Some((source, base)) = observed else {
+        return Err(HalError::Other(format!(
+            "cannot verify stock FPGA DMA base: none of {} exists",
+            FPGA_MEM_OFFSET_PARAMETER_PATHS.join(", ")
+        )));
+    };
+    let layout = StockDmaLayout::admit(base)?;
+    tracing::info!(
+        source,
+        physical_base = format_args!("0x{:08X}", layout.physical_base()),
+        "Admitted stock FPGA DMA layout from kernel module parameter"
+    );
+    Ok(layout)
+}
 
 /// Work item size in DMA buffer (64 bytes = 0x40).
 /// Each work item contains: work_id, version, counter, reserved,
@@ -46,7 +159,7 @@ pub const DMA_BUFFER_SIZE: usize = 0x0020_0000;
 pub const WORK_ITEM_SIZE: usize = 64;
 
 /// Maximum work items per DMA buffer.
-pub const MAX_WORK_ITEMS: usize = DMA_BUFFER_SIZE / WORK_ITEM_SIZE;
+pub const MAX_WORK_ITEMS: usize = NONCE2_JOBID_STORE_SIZE / WORK_ITEM_SIZE;
 
 // ---------------------------------------------------------------------------
 // Nonce return format
@@ -71,8 +184,8 @@ pub const NONCE_WORDS: usize = 2;
 
 /// DMA buffer access via /dev/fpga_mem.
 ///
-/// Provides mmap'd access to the 16 MB DDR region at 0x1F000000 used for
-/// work data transfer between CPU and FPGA.
+/// Provides mmap'd access to the 16 MB DDR region selected by the kernel
+/// module for work data transfer between CPU and FPGA.
 pub struct StockFpgaDma {
     /// mmap'd pointer to DMA region base.
     dma_base: *mut u8,
@@ -80,6 +193,8 @@ pub struct StockFpgaDma {
     _dma_file: std::fs::File,
     /// Total mmap size.
     dma_size: usize,
+    /// Physical address programmed into FPGA registers for this mapping.
+    layout: StockDmaLayout,
 }
 
 // SAFETY: StockFpgaDma holds an mmap'd pointer that is process-global.
@@ -90,9 +205,11 @@ impl StockFpgaDma {
     /// Open the DMA buffer interface.
     ///
     /// Opens /dev/fpga_mem and mmaps the 16 MB DMA region.
-    /// The physical base address (0x1F000000 for 512MB boards) is set by the
-    /// fpga_mem_driver kernel module parameter.
+    /// The physical base is read back from the `fpga_mem_driver` kernel module
+    /// parameter and admitted against the stock RAM-dependent address set
+    /// before the device is opened.
     pub fn open() -> Result<Self> {
+        let layout = discover_stock_dma_layout()?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -120,6 +237,7 @@ impl StockFpgaDma {
 
         tracing::info!(
             size = format_args!("{} MB", dma_size / (1024 * 1024)),
+            physical_base = format_args!("0x{:08X}", layout.physical_base()),
             "Stock FPGA DMA buffer opened ({} MB at /dev/fpga_mem)",
             dma_size / (1024 * 1024),
         );
@@ -128,14 +246,19 @@ impl StockFpgaDma {
             dma_base: ptr.as_ptr() as *mut u8,
             _dma_file: file,
             dma_size,
+            layout,
         })
+    }
+
+    pub const fn layout(&self) -> StockDmaLayout {
+        self.layout
     }
 
     /// Get a mutable pointer to an offset within the DMA region.
     ///
-    /// The offset is relative to the DMA base (0x1F000000 physical).
-    /// For buffer 0: offset = 0x000000
-    /// For buffer 1: offset = 0x200000
+    /// The offset is relative to the admitted physical DMA base.
+    /// The nonce2/job-id store begins at offset 0; job buffers begin at
+    /// offsets 0x200000 and 0x210000.
     ///
     /// # Safety
     /// Caller must ensure offset + access size does not exceed DMA region.
@@ -233,12 +356,14 @@ impl<'a> StockFpgaWorkEngine<'a> {
         self.fpga.write_reg(REG_HASH_COUNTING_NUMBER, asic_count);
 
         // Set nonce2/jobid store address
-        self.fpga
-            .write_reg(REG_NONCE2_AND_JOBID_STORE_ADDRESS, DMA_BUFFER_0 as u32);
+        self.fpga.write_reg(
+            REG_NONCE2_AND_JOBID_STORE_ADDRESS,
+            self.dma.layout().nonce2_jobid_store(),
+        );
 
-        // Set initial job start address (buffer 1 = 0x1F200000)
+        // Set initial job start address.
         self.fpga
-            .write_reg(REG_JOB_START_ADDRESS, DMA_BUFFER_1 as u32);
+            .write_reg(REG_JOB_START_ADDRESS, self.dma.layout().job_buffer_0());
 
         // Enable nonce FIFO interrupt
         self.fpga
@@ -266,21 +391,35 @@ impl<'a> StockFpgaWorkEngine<'a> {
     /// We only read the current state and set our job_id counter to continue
     /// from where that runtime left off. DO NOT overwrite DHASH_ACC_CONTROL or
     /// NONCE2_AND_JOBID_STORE_ADDRESS.
-    pub fn init_passthrough(&mut self) {
+    pub fn init_passthrough(&mut self) -> Result<()> {
         let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
         let job_id = self.fpga.read_reg(REG_JOB_ID);
         let job_start = self.fpga.read_reg(REG_JOB_START_ADDRESS);
         let nonce2_store = self.fpga.read_reg(REG_NONCE2_AND_JOBID_STORE_ADDRESS);
         let buffer_space = self.fpga.read_reg(REG_BUFFER_SPACE);
 
+        let layout = self.dma.layout();
+        if nonce2_store != layout.nonce2_jobid_store() {
+            return Err(HalError::Other(format!(
+                "inherited stock FPGA nonce2 store 0x{nonce2_store:08X} does not match admitted kernel DMA base 0x{:08X}",
+                layout.nonce2_jobid_store()
+            )));
+        }
+
         // Continue from the inherited job_id
         self.job_id = job_id;
 
         // Determine active buffer from JOB_START_ADDRESS
-        if job_start == DMA_BUFFER_1 as u32 {
+        if job_start == layout.job_buffer_1() {
             self.active_buffer = 1;
-        } else {
+        } else if job_start == layout.job_buffer_0() {
             self.active_buffer = 0;
+        } else {
+            return Err(HalError::Other(format!(
+                "inherited stock FPGA job buffer 0x{job_start:08X} is outside admitted DMA layout (expected 0x{:08X} or 0x{:08X})",
+                layout.job_buffer_0(),
+                layout.job_buffer_1()
+            )));
         }
 
         tracing::info!(
@@ -291,23 +430,24 @@ impl<'a> StockFpgaWorkEngine<'a> {
             buffer_space = format_args!("0x{:02X}", buffer_space),
             "Stock FPGA work engine passthrough: preserving inherited DHASH state"
         );
+        Ok(())
     }
 
     /// Get the physical address of the currently inactive (writable) DMA buffer.
     fn writable_buffer_phys(&self) -> u64 {
         if self.active_buffer == 0 {
-            DMA_BUFFER_1
+            u64::from(self.dma.layout().job_buffer_1())
         } else {
-            DMA_BUFFER_0
+            u64::from(self.dma.layout().job_buffer_0())
         }
     }
 
     /// Get the DMA offset of the currently inactive (writable) buffer.
     fn writable_buffer_offset(&self) -> usize {
         if self.active_buffer == 0 {
-            (DMA_BUFFER_1 - DMA_BUFFER_0) as usize
+            JOB_BUFFER_1_OFFSET as usize
         } else {
-            0
+            JOB_BUFFER_0_OFFSET as usize
         }
     }
 
@@ -343,22 +483,17 @@ impl<'a> StockFpgaWorkEngine<'a> {
     /// Set up AsicBoost 4-way version rolling.
     ///
     /// Writes 4 different block versions to consecutive registers (0x130-0x13C).
-    /// Each version differs only in the overt ASICBoost bits, allowing the FPGA
-    /// to test 4 version variants per nonce range simultaneously.
+    /// Pure packing SSOT: `dcentrald_common::stock_asicboost_version_words` (G17).
     ///
     /// # Arguments
     /// * `base_version` - Base block version from stratum
     /// * `version_mask` - Allowed version-rolling bits (e.g., 0x1FFFE000)
     pub fn set_asicboost_versions(&self, base_version: u32, version_mask: u32) {
-        // Generate 4 versions by setting different bits in the mask.
-        // bmminer uses BLOCK_HEADER_VERSION registers at 0x130, 0x134, 0x138, 0x13C.
-        // Note: On stock FPGA, these 4 registers are at fixed positions.
-        // The stock FPGA natively supports 4-way version rolling.
-        for i in 0u32..4 {
-            let version_bits = (i << 13) & version_mask;
-            let version = (base_version & !version_mask) | version_bits;
-            self.fpga
-                .write_reg(REG_BLOCK_HEADER_VERSION + (i * 4), version);
+        let words = dcentrald_common::stock_asicboost_version_words(base_version, version_mask);
+        for (i, &version) in words.iter().enumerate() {
+            let reg = dcentrald_common::stock_asicboost_version_reg(i as u8);
+            debug_assert_eq!(reg, REG_BLOCK_HEADER_VERSION + (i as u32 * 4));
+            self.fpga.write_reg(reg, version);
         }
 
         tracing::debug!(
@@ -434,6 +569,15 @@ impl<'a> StockFpgaWorkEngine<'a> {
         ntime: u32,
         nbits: u32,
     ) -> u32 {
+        // G18: clear sticky multi-midstate from a prior AsicBoost job so
+        // 0x134/0x138 resume ntime/nbits (single-version) semantics.
+        let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
+        let dhash_single =
+            dcentrald_common::stock_dhash_with_multi_midstate(dhash, /* enable */ false);
+        if dhash_single != dhash {
+            self.fpga.write_reg(REG_DHASH_ACC_CONTROL, dhash_single);
+        }
+
         // Write job data to inactive DMA buffer
         let buf_offset = self.writable_buffer_offset();
         self.dma.write_bytes(buf_offset, job_data);
@@ -474,6 +618,15 @@ impl<'a> StockFpgaWorkEngine<'a> {
     /// Dispatch work with AsicBoost (4 version variants).
     ///
     /// Same as dispatch_work() but also sets up 4-way version rolling.
+    ///
+    /// # Register alias (load-bearing)
+    ///
+    /// Stock map dual-uses `0x134`/`0x138` as TIME_STAMP/TARGET_BITS **and**
+    /// AsicBoost version slots 1/2 (`get_block_header_version{1,2}_ab`). In
+    /// multi-midstate mode those slots must hold packed versions at
+    /// JOB_DATA_READY — ntime/nbits are also carried in the VIL DMA job
+    /// template. Write order: ntime/nbits first, then **last** the 4 version
+    /// words so they are not clobbered (G17 critic).
     pub fn dispatch_work_asicboost(
         &mut self,
         job_data: &[u8],
@@ -483,14 +636,13 @@ impl<'a> StockFpgaWorkEngine<'a> {
         ntime: u32,
         nbits: u32,
     ) -> u32 {
-        // Set 4-way AsicBoost versions
-        self.set_asicboost_versions(base_version, version_mask);
-
-        // Enable multi-midstate in DHASH control
+        // Enable multi-midstate in DHASH control before version-slot programming
+        // (pure apply: stock_dhash_with_multi_midstate — G17/G18).
         let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
-        if dhash & DHASH_MULTI_MIDSTATE == 0 {
-            self.fpga
-                .write_reg(REG_DHASH_ACC_CONTROL, dhash | DHASH_MULTI_MIDSTATE);
+        let dhash_ab =
+            dcentrald_common::stock_dhash_with_multi_midstate(dhash, /* enable */ true);
+        if dhash_ab != dhash {
+            self.fpga.write_reg(REG_DHASH_ACC_CONTROL, dhash_ab);
         }
 
         // Write job data to inactive DMA buffer
@@ -500,7 +652,8 @@ impl<'a> StockFpgaWorkEngine<'a> {
         // Write previous block hash (FPGA computes midstate internally)
         self.write_prev_hash(prev_hash);
 
-        // Write header fields (ntime, nbits -- version handled by set_asicboost_versions)
+        // ntime/nbits first (same addrs as AB slots 1/2 — will be overwritten
+        // by set_asicboost_versions for multi-midstate latch image).
         self.fpga.write_reg(REG_TIME_STAMP, ntime);
         self.fpga.write_reg(REG_TARGET_BITS, nbits);
 
@@ -510,9 +663,13 @@ impl<'a> StockFpgaWorkEngine<'a> {
         self.fpga
             .write_reg(REG_JOB_START_ADDRESS, self.writable_buffer_phys() as u32);
 
-        // Increment and set job ID
+        // Increment and set job ID (G15 correlation spine)
         self.job_id = self.job_id.wrapping_add(1);
         self.fpga.write_reg(REG_JOB_ID, self.job_id);
+
+        // LAST: 4 packed version words at 0x130..0x13C so the post-ready
+        // image is v0..v3, not v0/ntime/nbits/v3.
+        self.set_asicboost_versions(base_version, version_mask);
 
         // Signal FPGA
         self.fpga.write_reg(REG_JOB_DATA_READY, 1);
@@ -694,5 +851,51 @@ impl WorkBackend {
     /// Returns `true` if this backend is the Zynq UIO/DMA path.
     pub fn is_uio_dma(&self) -> bool {
         matches!(self, WorkBackend::UioDma(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_stock_dma_layout_keeps_job_buffers_outside_mapping_store() {
+        for base in STOCK_DMA_BASES {
+            let layout = StockDmaLayout::admit(u64::from(base)).expect("evidence-backed base");
+            let store_end = layout.nonce2_jobid_store() + NONCE2_JOBID_STORE_SIZE as u32;
+            assert_eq!(store_end, layout.job_buffer_0());
+            assert_eq!(
+                layout.job_buffer_1() - layout.job_buffer_0(),
+                JOB_BUFFER_SIZE as u32
+            );
+            assert!(layout.job_buffer_0() >= store_end);
+            assert!(layout.job_buffer_1() >= store_end);
+        }
+        assert_eq!(MAX_WORK_ITEMS, 32_768);
+    }
+
+    #[test]
+    fn writable_job_buffer_offsets_match_stock_cgminer_layout() {
+        assert_eq!(JOB_BUFFER_0_OFFSET, 0x0020_0000);
+        assert_eq!(JOB_BUFFER_1_OFFSET, 0x0021_0000);
+    }
+
+    #[test]
+    fn stock_dma_layout_refuses_unknown_or_out_of_range_bases() {
+        for base in [0, 0x1000, 0x2F00_0000, 0x4F00_0000, u64::MAX] {
+            assert!(
+                StockDmaLayout::admit(base).is_err(),
+                "unverified base 0x{base:X} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_dma_module_parameter_parser_accepts_kernel_hex_and_decimal_forms() {
+        assert_eq!(parse_stock_dma_base("0x0F000000\n").unwrap(), 0x0F00_0000);
+        assert_eq!(parse_stock_dma_base("520093696").unwrap(), 0x1F00_0000);
+        assert_eq!(parse_stock_dma_base("1056964608\n").unwrap(), 0x3F00_0000);
+        assert!(parse_stock_dma_base("").is_err());
+        assert!(parse_stock_dma_base("0xnothex").is_err());
     }
 }

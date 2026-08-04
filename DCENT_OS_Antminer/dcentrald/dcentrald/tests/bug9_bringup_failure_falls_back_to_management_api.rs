@@ -1,5 +1,5 @@
-//! BUG-9 (2026-06-05) — standard-daemon mining bring-up must be CRASH-SAFE:
-//! a hung or failed `init()` must NOT take the :8080/:4028 API down.
+//! BUG-9 (2026-06-05) — standard-daemon mining bring-up must be bounded and
+//! fail closed without overstating management-plane availability.
 //!
 //! ## Live symptom that motivated this
 //!
@@ -29,17 +29,16 @@
 //!     `DCENT_INIT_TIMEOUT_SECS`). An infinite wedge becomes a clean error in
 //!     bounded time.
 //!
-//! (B) FALL BACK TO MANAGEMENT-ONLY *WITH THE API UP*: on timeout OR error, the
-//!     defensive hardware-safe-off teardown `self.shutdown()` runs, then
-//!     `run_lifecycle` hands off to `self.run_api_only()` — which builds a clean
-//!     management `AppState`, SPAWNS the API, and parks until SIGTERM. The
-//!     dashboard stays reachable and the bring-up error is reported; the daemon
-//!     never hangs and never crashes on a failed bring-up.
+//! (B) ATTEMPT TERMINAL SAFE-OFF: management-only is conditional on a positive
+//!     terminal closeout. Current production init marks partial hardware state
+//!     unknown, so an init failure normally remains ResetPending and exits for
+//!     the external safety path. The coordinator's simulated management-only
+//!     branch is retained for a future evidence-backed partial-bringup ledger.
 //!
 //! The hardware-independent coordinator in `daemon_lifecycle.rs` now owns and
 //! runtime-tests the deadline and recovery ordering. This integration test only
-//! pins the concrete daemon's delegation into that coordinator and the API-only
-//! adapter; it deliberately does not duplicate implementation spelling.
+//! pins the concrete daemon's delegation, the closed-gate API adapter, and the
+//! honest production ResetPending boundary.
 
 const DAEMON_RS: &str = include_str!("../src/daemon.rs");
 const DAEMON_LIFECYCLE_RS: &str = include_str!("../src/daemon_lifecycle.rs");
@@ -104,11 +103,9 @@ fn bug9_init_timeout_env_override_is_floored() {
     );
 }
 
-/// The fall-back uses the EXISTING `run_api_only()` (which already spawns the
-/// API via `start_api_servers` and parks on the shutdown token) — so the API
-/// the operator reaches in the failure path is the same well-tested management
-/// plane the `!mining_start_enabled()` boot already uses. Pin that
-/// `run_api_only` both exists and spawns the API.
+/// The fall-back uses the existing `run_api_only()` wrapper, which delegates to
+/// a closed hardware-mutation-gate helper that owns `start_api_servers`. Pin the
+/// management-plane liveness and fail-closed mutation posture together.
 #[test]
 fn bug9_run_api_only_spawns_the_api_server() {
     let api_only = DAEMON_RS
@@ -123,8 +120,35 @@ fn bug9_run_api_only_spawns_the_api_server() {
         .unwrap_or(rest.len());
     let body = &rest[..end];
     assert!(
-        body.contains("start_api_servers"),
-        "BUG-9 (B): run_api_only() must spawn the API via start_api_servers — \
-         it is the management plane the bring-up-failure fall-back relies on"
+        body.contains("run_api_only_with_hardware_mutation_gate")
+            && body.contains("HardwareMutationGate::new_closed()"),
+        "BUG-9 (B): run_api_only() must delegate to the closed-gate management API helper"
     );
+
+    let helper = DAEMON_RS
+        .find("async fn run_api_only_with_hardware_mutation_gate(")
+        .expect("closed-gate API helper missing");
+    let helper_rest = &DAEMON_RS[helper..];
+    let helper_end = helper_rest[10..]
+        .find("\n    async fn ")
+        .or_else(|| helper_rest[10..].find("\n    fn "))
+        .map(|i| i + 10)
+        .unwrap_or(helper_rest.len());
+    assert!(
+        helper_rest[..helper_end].contains("start_api_servers"),
+        "BUG-9 (B): the closed-gate helper must spawn the management API"
+    );
+}
+
+/// Do not regress the current honest boundary into an unsupported claim that
+/// arbitrary partial initialization can safely park in management-only mode.
+#[test]
+fn bug9_production_partial_init_remains_reset_pending_without_a_safety_ledger() {
+    assert!(DAEMON_RS.contains("self.preflight_hardware_state_unknown = true;"));
+    assert!(DAEMON_RS
+        .contains("let mut software_disable_failed = self.preflight_hardware_state_unknown"));
+    assert!(
+        DAEMON_RS.contains("shutdown safety evidence is incomplete; terminal closeout is unproven")
+    );
+    assert!(DAEMON_LIFECYCLE_RS.contains("management-only is forbidden"));
 }

@@ -49,17 +49,23 @@ mod tests {
     }
 
     #[test]
-    fn close_magic_is_the_only_magic_close_path() {
-        let close_body = source_after("pub fn close_magic(mut self)");
+    fn try_close_magic_is_the_only_magic_close_path() {
+        let production = source_after("/// Hardware watchdog wrapper.");
+        let close_body = source_after("pub fn try_close_magic(&mut self)");
         let drop_body = source_after("impl Drop for Watchdog");
 
         assert!(
+            !production.contains("pub fn close_magic("),
+            "a consuming magic-close API would implicitly close the armed fd on write failure"
+        );
+
+        assert!(
             close_body.contains("nix::unistd::write(&self.file, &[WATCHDOG_MAGIC_CLOSE])"),
-            "close_magic must write WATCHDOG_MAGIC_CLOSE before dropping the fd"
+            "try_close_magic must write WATCHDOG_MAGIC_CLOSE before issuing success"
         );
         assert!(
             close_body.contains("if written != 1"),
-            "close_magic must require one complete magic-close byte before issuing a receipt"
+            "try_close_magic must require one complete magic-close byte before issuing a receipt"
         );
         assert!(
             !drop_body.contains("WATCHDOG_MAGIC_CLOSE")
@@ -159,11 +165,11 @@ impl Watchdog {
         Ok(secs as u32)
     }
 
-    /// Close the watchdog with the magic close character.
+    /// Attempt the watchdog magic-close write without surrendering ownership.
     ///
-    /// Writing "V" before closing tells the watchdog driver to disable
-    /// the timer (only works when CONFIG_WATCHDOG_NOWAYOUT is not set).
-    pub fn close_magic(mut self) -> Result<()> {
+    /// On error the caller must retain this device: dropping an armed watchdog
+    /// descriptor is not a portable fail-closed guarantee across Linux drivers.
+    pub fn try_close_magic(&mut self) -> Result<()> {
         let written = nix::unistd::write(&self.file, &[WATCHDOG_MAGIC_CLOSE])
             .map_err(|e| HalError::Watchdog(format!("magic close failed: {}", e)))?;
         if written != 1 {
@@ -175,7 +181,6 @@ impl Watchdog {
         tracing::info!(
             "Watchdog magic-close byte write completed; kernel timer state remains unmeasured"
         );
-        // File is closed when `self.file` is dropped
         Ok(())
     }
 }

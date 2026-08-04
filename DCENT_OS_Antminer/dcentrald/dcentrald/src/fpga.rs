@@ -76,9 +76,17 @@ pub const FAN_UIO: u8 = 0;
 /// UIO device number for the glitch monitor.
 pub const GLITCH_MONITOR_UIO: u8 = 13;
 
-/// FPGA fabric clock frequency in Hz.
-/// 100 MHz FCLK doubled by PL PLL = 200 MHz.
+/// **S9 (am1) bitstream** FPGA fabric clock frequency in Hz.
+/// 100 MHz FCLK doubled by PL PLL = 200 MHz — an S9-only derivation. The
+/// S19j Pro (am2) FCLK0 is 100 MHz (live probe,
+/// :587,596`);
+/// do NOT apply this constant's Hz math to a non-S9 carrier. Per-carrier
+/// declared values: `dcentrald_hal::fpga_chain::CARRIER_FIFO_FABRIC` (W8 CLK-1).
 pub const FPGA_CLK_HZ: u32 = 200_000_000;
+
+// W8 CLK-1: this constant duplicates the HAL's S9-scoped value. Pin them
+// together at compile time so the two copies can never drift apart silently.
+const _: () = assert!(FPGA_CLK_HZ == dcentrald_hal::fpga_chain::FPGA_CLK_HZ);
 
 /// PIC I2C addresses for S9 chains 6, 7, 8 (verified from live probe).
 pub const S9_PIC_ADDRS: [u8; S9_CHAIN_COUNT] = [0x55, 0x56, 0x57];

@@ -55,16 +55,18 @@ while IFS= read -r line; do
     case "$chip" in BM[0-9]*) : ;; *) bad "row $rows ($sku): chip '$chip' not BM<digits>" ;; esac
     case "$cid" in 0 | 0x[0-9a-fA-F]*) : ;; *) bad "row $rows ($sku): chip_id '$cid' not 0 or 0x<hex>" ;; esac
     case "$en" in '' | *[!0-9]*) bad "row $rows ($sku): enum_expect '$en' not a non-negative integer" ;; esac
-    case "$soc" in zynq | amlogic) : ;; *) bad "row $rows ($sku): soc '$soc' not zynq|amlogic" ;; esac
-    case "$bc" in nand-ab | single-image) : ;; *) bad "row $rows ($sku): boot_chain '$bc' not nand-ab|single-image" ;; esac
+    case "$soc" in zynq | amlogic | am335x) : ;; *) bad "row $rows ($sku): soc '$soc' not zynq|amlogic|am335x" ;; esac
+    case "$bc" in nand-ab | single-image | external-media) : ;; *) bad "row $rows ($sku): boot_chain '$bc' not nand-ab|single-image|external-media" ;; esac
     case "$rs" in PRODUCTION | EXPERIMENTAL | NOT-IMPLEMENTED) : ;; *) bad "row $rows ($sku): release_state '$rs' invalid" ;; esac
 
-    # Cross-field consistency the harness relies on (armv7=Zynq A/B, aarch64=Amlogic single-image).
-    case "$arch/$soc" in armv7/zynq | aarch64/amlogic) : ;; *) bad "row $rows ($sku): arch/soc mismatch '$arch/$soc'" ;; esac
-    case "$soc/$bc" in zynq/nand-ab | amlogic/single-image) : ;; *) bad "row $rows ($sku): soc/boot_chain mismatch '$soc/$bc'" ;; esac
+    # Cross-field consistency the harness relies on. AM335x is ARMv7 but is a
+    # distinct external-media-only route, never a Zynq A/B alias.
+    case "$arch/$soc" in armv7/zynq | armv7/am335x | aarch64/amlogic) : ;; *) bad "row $rows ($sku): arch/soc mismatch '$arch/$soc'" ;; esac
+    case "$soc/$bc" in zynq/nand-ab | amlogic/single-image | am335x/external-media) : ;; *) bad "row $rows ($sku): soc/boot_chain mismatch '$soc/$bc'" ;; esac
+    case "$soc/$bt" in am335x/am3-bb-*) : ;; am335x/*) bad "row $rows ($sku): AM335x board_target '$bt' must start am3-bb-" ;; esac
 done < "$tmp"
 
-[ "$rows" -eq 20 ] || bad "expected exactly 20 target SKU rows, found $rows"
+[ "$rows" -eq 21 ] || bad "expected exactly 21 target SKU rows, found $rows"
 
 if [ "$fails" -eq 0 ]; then
     echo "PASS: skus.conf structurally valid — $rows SKU rows; columns, vocabulary, and arch/soc/boot_chain consistency all OK"

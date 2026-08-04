@@ -11,7 +11,7 @@
 //! Communication with the rest of dcentrald is via typed mpsc channels.
 
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -24,7 +24,8 @@ use super::messages::*;
 use crate::pool_failover::{FailoverAction, PoolFailoverFsm};
 use crate::types::*;
 use crate::version_mask::{format_version_mask, parse_and_clamp_version_mask, parse_version_mask};
-use crate::work::{difficulty_to_target, WorkBuilder};
+use crate::work::difficulty_to_target;
+use crate::work_domain::{V1WorkControl, V1WorkDomain, WorkGeneration};
 use dcentrald_api_types::luxos_pool_failover::{LuxosFailoverTrigger, LuxosPoolFailoverConfig};
 
 /// Pool-failover robustness — increment 1: stable-primary-return
@@ -339,6 +340,8 @@ mod ntime_window_tests {
 
         let base_ntime = 1_700_000_000u32;
         let job = JobTemplate {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: "sw11".to_string(),
             prev_block_hash: [0u8; 32],
             coinbase1: vec![0x01],
@@ -374,7 +377,25 @@ mod ntime_window_tests {
 #[cfg(test)]
 mod nonce_dedup_tests {
     // SW-04: bounded per-job nonce dedup.
-    use super::{NonceDedup, NONCE_DEDUP_JOBS, NONCE_DEDUP_MAX_KEYS_PER_JOB};
+    use super::{
+        NonceDedup, NonceDedupCapacityExceeded, NONCE_DEDUP_JOBS, NONCE_DEDUP_MAX_KEYS_PER_JOB,
+    };
+    use crate::types::ValidShare;
+    use crate::work_domain::WorkGeneration;
+
+    fn full_share(generation: WorkGeneration, extranonce2: &str, ntime: &str) -> ValidShare {
+        ValidShare {
+            work_generation: generation,
+            worker_name: "worker".to_string(),
+            job_id: "wire-job".to_string(),
+            extranonce2: extranonce2.to_string(),
+            ntime: ntime.to_string(),
+            nonce: "deadbeef".to_string(),
+            version_bits: Some("00002000".to_string()),
+            version: 0x2000_2000,
+            achieved_difficulty: None,
+        }
+    }
 
     #[test]
     fn first_submission_is_not_duplicate() {
@@ -387,15 +408,22 @@ mod nonce_dedup_tests {
         // S4-3: a pathological pool reusing one job_id for a long low-difficulty
         // window must not grow the per-job nonce set without bound.
         let mut d = NonceDedup::default();
-        for i in 0..(NONCE_DEDUP_MAX_KEYS_PER_JOB + 500) {
-            let nonce = format!("{i:08x}");
-            // Every nonce is unique, so none is a duplicate.
-            assert!(!d.is_duplicate_then_record("job-a", &nonce, None));
+        let generation = WorkGeneration { session: 1, job: 1 };
+        for i in 0..NONCE_DEDUP_MAX_KEYS_PER_JOB {
+            let mut share = full_share(generation, "00000000", "66112233");
+            share.nonce = format!("{i:08x}");
+            assert_eq!(d.try_is_duplicate_share_then_record(&share), Ok(false));
         }
-        // Memory is bounded to the cap, NOT the ~cap+500 unique nonces submitted.
         assert_eq!(d.tracked_key_count(), NONCE_DEDUP_MAX_KEYS_PER_JOB);
-        // A nonce recorded within the cap is still caught as a duplicate.
-        assert!(d.is_duplicate_then_record("job-a", &format!("{:08x}", 0), None));
+        let mut overflow = full_share(generation, "00000000", "66112233");
+        overflow.nonce = format!("{:08x}", NONCE_DEDUP_MAX_KEYS_PER_JOB);
+        assert!(matches!(
+            d.try_is_duplicate_share_then_record(&overflow),
+            Err(NonceDedupCapacityExceeded { .. })
+        ));
+        let mut first = full_share(generation, "00000000", "66112233");
+        first.nonce = "00000000".to_string();
+        assert_eq!(d.try_is_duplicate_share_then_record(&first), Ok(true));
     }
 
     #[test]
@@ -423,18 +451,40 @@ mod nonce_dedup_tests {
     }
 
     #[test]
-    fn oldest_job_evicted_beyond_capacity() {
+    fn live_generation_capacity_fails_closed_without_eviction() {
         let mut d = NonceDedup::default();
         // Fill capacity with distinct jobs.
-        for i in 0..NONCE_DEDUP_JOBS {
-            assert!(!d.is_duplicate_then_record(&format!("job-{i}"), "aa", None));
+        for job in 1..=NONCE_DEDUP_JOBS as u64 {
+            let share = full_share(WorkGeneration { session: 1, job }, "00", "66112233");
+            assert_eq!(d.try_is_duplicate_share_then_record(&share), Ok(false));
         }
         // A new job evicts job-0.
-        assert!(!d.is_duplicate_then_record("job-new", "aa", None));
+        let overflow = full_share(
+            WorkGeneration {
+                session: 1,
+                job: NONCE_DEDUP_JOBS as u64 + 1,
+            },
+            "00",
+            "66112233",
+        );
+        assert!(matches!(
+            d.try_is_duplicate_share_then_record(&overflow),
+            Err(NonceDedupCapacityExceeded { .. })
+        ));
         // job-0's nonce is forgotten → re-submitting it now reads as NEW, not dup.
-        assert!(!d.is_duplicate_then_record("job-0", "aa", None));
+        let oldest = full_share(WorkGeneration { session: 1, job: 1 }, "00", "66112233");
+        assert_eq!(
+            d.try_is_duplicate_share_then_record(&oldest),
+            Ok(true),
+            "capacity must never evict an identity that remains submit-valid"
+        );
         // The most-recent job is still tracked.
-        assert!(d.is_duplicate_then_record("job-new", "aa", None));
+        d.retain_valid_from(1, 2);
+        assert_eq!(
+            d.try_is_duplicate_share_then_record(&overflow),
+            Ok(false),
+            "advancing the clean-job floor may reclaim invalid generations"
+        );
     }
 
     #[test]
@@ -463,6 +513,81 @@ mod nonce_dedup_tests {
         // is a genuinely-different share for a genuinely-different job and MUST
         // be submittable, not silently deduped.
         assert!(!d.is_duplicate_then_record("1", "00c0ffee", Some("00002000")));
+    }
+
+    #[test]
+    fn complete_submit_identity_distinguishes_extranonce2_and_ntime() {
+        let mut d = NonceDedup::default();
+        let generation = WorkGeneration { session: 7, job: 9 };
+        let first = full_share(generation, "00000000", "66112233");
+        let different_en2 = full_share(generation, "01000000", "66112233");
+        let different_ntime = full_share(generation, "00000000", "66112234");
+
+        assert!(!d.try_is_duplicate_share_then_record(&first).unwrap());
+        assert!(
+            !d.try_is_duplicate_share_then_record(&different_en2)
+                .unwrap(),
+            "same nonce/version on a different extranonce2 is distinct work"
+        );
+        assert!(
+            !d.try_is_duplicate_share_then_record(&different_ntime)
+                .unwrap(),
+            "same nonce/version on a different ntime is distinct work"
+        );
+        assert!(
+            d.try_is_duplicate_share_then_record(&first).unwrap(),
+            "only an exact generation-bound wire tuple is a duplicate"
+        );
+    }
+
+    #[test]
+    fn complete_submit_identity_distinguishes_work_generation() {
+        let mut d = NonceDedup::default();
+        let first = full_share(
+            WorkGeneration { session: 7, job: 9 },
+            "00000000",
+            "66112233",
+        );
+        let replayed_wire_tuple = full_share(
+            WorkGeneration { session: 8, job: 1 },
+            "00000000",
+            "66112233",
+        );
+
+        assert!(!d.try_is_duplicate_share_then_record(&first).unwrap());
+        assert!(
+            !d.try_is_duplicate_share_then_record(&replayed_wire_tuple)
+                .unwrap(),
+            "a recycled wire tuple in a fresh subscription is distinct"
+        );
+        assert!(d
+            .try_is_duplicate_share_then_record(&replayed_wire_tuple)
+            .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod v1_namespace_registry_tests {
+    use super::{v1_namespace_registry_requires_reset, MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION};
+
+    #[test]
+    fn known_namespace_is_never_evicted_at_capacity() {
+        assert!(!v1_namespace_registry_requires_reset(
+            MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION,
+            true
+        ));
+    }
+
+    #[test]
+    fn unseen_namespace_at_capacity_forces_session_reset() {
+        assert!(!v1_namespace_registry_requires_reset(
+            MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION - 1,
+            false
+        ));
+        assert!(v1_namespace_registry_requires_reset(
+            MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION,
+            false
+        ));
     }
 }
 
@@ -758,6 +883,14 @@ enum SessionEndReason {
     UserSplitSwitch,
     /// Auto mode wants to leave V1 fallback and retry SV2.
     AutoRetrySv2,
+    /// The active finite V1 extranonce2 domain was consumed.
+    Extranonce2Exhausted {
+        generation: WorkGeneration,
+        extranonce2_size: usize,
+    },
+    /// A bounded work-identity guard requires a flush and immediate clean
+    /// resubscribe, without ordinary failure accounting or hash-on-disconnect.
+    WorkIdentityReset { reason: &'static str },
     /// Pool requested reconnect to a specific endpoint.
     Reconnect {
         host: String,
@@ -771,15 +904,13 @@ struct PendingSubmit {
     share: ValidShare,
 }
 
-/// SW-04: how many recent job IDs the per-job nonce-dedup tracker retains.
-/// A nonce is only a meaningful duplicate within the same job, and a job is
-/// stale within a few `mining.notify` cadences, so tracking the last 3 jobs is
-/// ample to catch a re-submitted nonce (e.g. the same solution arriving twice
-/// from the validate/dispatch pipeline) without unbounded growth on a
-/// long-running session. Bounded, O(1) eviction.
-const NONCE_DEDUP_JOBS: usize = 3;
+/// SW-04: how many recent work generations the submit-dedup tracker retains.
+/// Generations become stale within a few `mining.notify` cadences, so tracking
+/// the last three catches repeated complete submissions without unbounded
+/// growth on a long-running session. Bounded, O(1) eviction.
+const NONCE_DEDUP_JOBS: usize = 256;
 
-/// S4-3: upper bound on submitted-nonce keys tracked PER retained job. A normal
+/// S4-3: upper bound on submitted-share keys per retained work generation. A normal
 /// pool rotates `job_id` every `mining.notify` (whole job sets are evicted via
 /// `NONCE_DEDUP_JOBS`), so a job holds at most a few seconds of nonces. This cap
 /// only bites on a pathological pool that reuses one `job_id` for a very long
@@ -788,64 +919,150 @@ const NONCE_DEDUP_JOBS: usize = 3;
 /// `NONCE_DEDUP_JOBS × NONCE_DEDUP_MAX_KEYS_PER_JOB` keys instead of unbounded.
 const NONCE_DEDUP_MAX_KEYS_PER_JOB: usize = 100_000;
 
-/// SW-04: bounded per-job submitted-nonce tracker. Prevents re-submitting an
+/// A hostile pool must not grow the subscription namespace registry forever.
+/// Crossing this generous bound forces a clean session reset instead of
+/// evicting a cursor and making a later namespace replay ambiguous.
+const MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION: usize = 256;
+
+fn v1_namespace_registry_requires_reset(current_len: usize, already_known: bool) -> bool {
+    !already_known && current_len >= MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION
+}
+
+/*
 /// identical (job_id, nonce[, version_bits]) tuple to the pool — a duplicate
 /// share is a guaranteed pool reject that burns a reject slot (and, with
 /// reject-rate failover enabled, can nudge a false failover).
 ///
-/// Memory is bounded to the last `NONCE_DEDUP_JOBS` job IDs; when a new job
-/// appears the oldest job's nonce set is evicted whole. Within a job, the
+/// Memory is bounded to the last `NONCE_DEDUP_JOBS` work generations; when a
+/// new generation appears, the oldest generation set is evicted whole.
 /// dedup key is `nonce` plus the version-rolling bits (two shares may legitimately
 /// share a nonce at different rolled versions under ASICBoost — those are NOT
 /// duplicates and must both be submitted).
+*/
+/// Exact generation-bound `mining.submit` identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SubmittedShareKey {
+    job_id: String,
+    extranonce2: String,
+    ntime: String,
+    nonce: String,
+    version_bits: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct NonceDedup {
+    /*
     /// FIFO of (job_id, submitted-nonce-keys) — front = oldest, back = newest.
-    jobs: VecDeque<(String, HashSet<String>)>,
+     */
+    /// FIFO of work generations and complete submitted-share keys.
+    jobs: VecDeque<(WorkGeneration, HashSet<SubmittedShareKey>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonceDedupCapacityExceeded {
+    generation: WorkGeneration,
+    retained_generations: usize,
+    retained_keys_in_generation: usize,
 }
 
 impl NonceDedup {
-    /// Dedup key within a job: nonce + version-rolling delta. Under ASICBoost a
+    /*
     /// single nonce can be valid at multiple rolled versions, so the version
     /// bits are part of the identity — otherwise we'd wrongly drop a distinct
-    /// valid share.
-    fn key(nonce: &str, version_bits: Option<&str>) -> String {
-        match version_bits {
-            Some(v) => format!("{nonce}|{v}"),
-            None => nonce.to_string(),
+     */
+    /// Complete `mining.submit` identity within one internal work generation.
+    fn key(share: &ValidShare) -> SubmittedShareKey {
+        SubmittedShareKey {
+            job_id: share.job_id.clone(),
+            extranonce2: share.extranonce2.clone(),
+            ntime: share.ntime.clone(),
+            nonce: share.nonce.clone(),
+            version_bits: share.version_bits.clone(),
         }
     }
 
-    /// Record (job_id, nonce, version_bits). Returns `true` if this exact tuple
+    /// Returns true only if this complete generation-bound tuple
     /// was already submitted within the retained window (i.e. it's a duplicate
     /// and should be dropped pre-submit); `false` if it's new (now recorded).
+    fn try_is_duplicate_share_then_record(
+        &mut self,
+        share: &ValidShare,
+    ) -> Result<bool, NonceDedupCapacityExceeded> {
+        let key = Self::key(share);
+        let retained_generations = self.jobs.len();
+
+        if let Some((_, set)) = self
+            .jobs
+            .iter_mut()
+            .find(|(generation, _)| *generation == share.work_generation)
+        {
+            // Known job. Under the per-job cap (S4-3), behave exactly as before:
+            // `insert` returns false if the key was already present → duplicate.
+            // At the cap, stop inserting new keys so the set can't grow without
+            // bound, but still report a key already recorded as a duplicate.
+            if set.contains(&key) {
+                return Ok(true);
+            }
+            if set.len() >= NONCE_DEDUP_MAX_KEYS_PER_JOB {
+                return Err(NonceDedupCapacityExceeded {
+                    generation: share.work_generation,
+                    retained_generations,
+                    retained_keys_in_generation: set.len(),
+                });
+            }
+            set.insert(key);
+            return Ok(false);
+        }
+
+        // New job: evict the oldest if at capacity, then start its nonce set.
+        if self.jobs.len() >= NONCE_DEDUP_JOBS {
+            return Err(NonceDedupCapacityExceeded {
+                generation: share.work_generation,
+                retained_generations: self.jobs.len(),
+                retained_keys_in_generation: 0,
+            });
+        }
+        let mut set = HashSet::new();
+        set.insert(key);
+        self.jobs.push_back((share.work_generation, set));
+        Ok(false)
+    }
+
+    /// Discard only identities that the clean-job generation floor has made
+    /// impossible to submit. Non-clean generations remain retained.
+    fn retain_valid_from(&mut self, session: u64, minimum_job: u64) {
+        self.jobs.retain(|(generation, _)| {
+            generation.session == session && generation.job >= minimum_job
+        });
+    }
+
+    /// Compatibility adapter for the pre-G50 unit corpus. Production always
+    /// calls `is_duplicate_share_then_record` with the real complete share.
+    #[cfg(test)]
     fn is_duplicate_then_record(
         &mut self,
         job_id: &str,
         nonce: &str,
         version_bits: Option<&str>,
     ) -> bool {
-        let key = Self::key(nonce, version_bits);
-
-        if let Some((_, set)) = self.jobs.iter_mut().find(|(jid, _)| jid == job_id) {
-            // Known job. Under the per-job cap (S4-3), behave exactly as before:
-            // `insert` returns false if the key was already present → duplicate.
-            // At the cap, stop inserting new keys so the set can't grow without
-            // bound, but still report a key already recorded as a duplicate.
-            if set.len() < NONCE_DEDUP_MAX_KEYS_PER_JOB {
-                return !set.insert(key);
-            }
-            return set.contains(&key);
-        }
-
-        // New job: evict the oldest if at capacity, then start its nonce set.
-        if self.jobs.len() >= NONCE_DEDUP_JOBS {
-            self.jobs.pop_front();
-        }
-        let mut set = HashSet::new();
-        set.insert(key);
-        self.jobs.push_back((job_id.to_string(), set));
-        false
+        let stable_job = job_id.bytes().fold(1u64, |acc, byte| {
+            acc.wrapping_mul(257).wrapping_add(u64::from(byte))
+        });
+        self.try_is_duplicate_share_then_record(&ValidShare {
+            work_generation: WorkGeneration {
+                session: 1,
+                job: stable_job,
+            },
+            worker_name: "test.worker".to_string(),
+            job_id: job_id.to_string(),
+            extranonce2: "00000000".to_string(),
+            ntime: "66112233".to_string(),
+            nonce: nonce.to_string(),
+            version_bits: version_bits.map(str::to_string),
+            version: 0x2000_0000,
+            achieved_difficulty: None,
+        })
+        .expect("compatibility unit corpus stays below dedup capacity")
     }
 
     /// Test-only: total submitted-nonce keys tracked across all retained jobs
@@ -945,6 +1162,8 @@ const SESSION_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 impl JobTemplate {
     fn flush_only(pool_difficulty: f64) -> Self {
         Self {
+            work_generation: WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: String::new(),
             prev_block_hash: [0u8; 32],
             coinbase1: Vec::new(),
@@ -1005,7 +1224,6 @@ pub struct StratumV1Client {
     status_tx: mpsc::Sender<StratumStatus>,
 
     // Internal state
-    work_builder: WorkBuilder,
     request_id_counter: u64,
     current_difficulty: f64,
     extranonce1: Vec<u8>,
@@ -1014,6 +1232,27 @@ pub struct StratumV1Client {
     current_pool_index: usize,
     last_job: Option<JobTemplate>,
     mining_state_announced: bool,
+    /// Monotonic subscription identity. Incremented only after a valid
+    /// `mining.subscribe` result is accepted.
+    session_generation: u64,
+    /// Monotonic job counter within the current subscription.
+    job_generation: u64,
+    /// Oldest job generation still eligible for submission in this session.
+    /// Raised by clean jobs and session-parameter rotations.
+    minimum_valid_job_generation: u64,
+    /// Shared reverse path installed into every V1 work domain.
+    work_control_tx: mpsc::UnboundedSender<V1WorkControl>,
+    work_control_rx: mpsc::UnboundedReceiver<V1WorkControl>,
+    /// One linear extranonce2 cursor for the active subscription-parameter
+    /// namespace. Every notify rotates its validity generation on this same
+    /// domain, so even a non-adjacent A -> B -> A replay cannot reuse A's
+    /// earlier extranonce2 values. A genuine set_extranonce change replaces
+    /// the domain because extranonce1/width define a new hash namespace.
+    subscription_work_domain: Option<Arc<V1WorkDomain>>,
+    /// Every extranonce1/width namespace observed in this subscription retains
+    /// its finite cursor. Returning A -> B -> A therefore resumes A instead of
+    /// recreating A:00. The map is cleared only by a successful subscribe.
+    work_domains_by_namespace: HashMap<(Vec<u8>, usize), Arc<V1WorkDomain>>,
 
     /// G36 observe-only shadow (default-OFF behind `[pool].smart_failover_enabled`).
     /// `Some` only after the first failover event when the operator opted in; the
@@ -1166,13 +1405,13 @@ impl StratumV1Client {
             (false, Duration::ZERO, Duration::ZERO)
         };
 
+        let (work_control_tx, work_control_rx) = mpsc::unbounded_channel();
         Self {
             config,
             stats: Arc::new(Mutex::new(StratumStats::default())),
             job_tx,
             share_rx,
             status_tx,
-            work_builder: WorkBuilder::new(),
             request_id_counter: 10, // Start after handshake IDs
             current_difficulty: 1.0,
             extranonce1: Vec::new(),
@@ -1187,6 +1426,13 @@ impl StratumV1Client {
             current_pool_index: 0,
             last_job: None,
             mining_state_announced: false,
+            session_generation: 0,
+            job_generation: 0,
+            minimum_valid_job_generation: 0,
+            work_control_tx,
+            work_control_rx,
+            subscription_work_domain: None,
+            work_domains_by_namespace: HashMap::new(),
             failover_fsm: None,
             pending_submits: Vec::with_capacity(64),
             pending_reconnect: None,
@@ -2056,6 +2302,54 @@ impl StratumV1Client {
                             self.send_hashrate_split_status(false).await;
                             continue; // No backoff on planned user split switch
                         }
+                        Ok(SessionEndReason::Extranonce2Exhausted {
+                            generation,
+                            extranonce2_size,
+                        }) => {
+                            self.flush_dispatcher_for_pool_switch(is_donation).await;
+                            self.send_status(StratumStatus::StateChanged(
+                                StratumState::Disconnected,
+                            ))
+                            .await;
+                            {
+                                let mut stats = self.stats.lock().await;
+                                stats.connected = false;
+                            }
+                            info!(
+                                session_generation = generation.session,
+                                job_generation = generation.job,
+                                extranonce2_size,
+                                "Finite V1 work domain consumed; stale ledgers flushed and socket closed before resubscribe"
+                            );
+                            self.wait_with_share_drain(
+                                Duration::from_millis(100),
+                                "extranonce2 exhaustion resubscribe",
+                            )
+                            .await;
+                            continue;
+                        }
+                        Ok(SessionEndReason::WorkIdentityReset { reason }) => {
+                            self.flush_dispatcher_for_pool_switch(is_donation).await;
+                            self.send_status(StratumStatus::StateChanged(
+                                StratumState::Disconnected,
+                            ))
+                            .await;
+                            {
+                                let mut stats = self.stats.lock().await;
+                                stats.connected = false;
+                            }
+                            info!(
+                                reason,
+                                "V1 work-identity guard requested reset; stale ledgers flushed \
+                                 and socket closed before immediate resubscribe"
+                            );
+                            self.wait_with_share_drain(
+                                Duration::from_millis(100),
+                                "work identity reset resubscribe",
+                            )
+                            .await;
+                            continue;
+                        }
                         Ok(SessionEndReason::Clean) => {
                             user_failure_reason = "session_clean_end".to_string();
                             info!(
@@ -2535,7 +2829,6 @@ impl StratumV1Client {
                                             "Pool version-rolling mask exceeded configured operator mask; clamping to requested bits"
                                         );
                                     }
-                                    self.work_builder.set_version_mask(self.version_mask);
                                     let rollable_bits = self.version_mask.count_ones();
                                     info!(
                                         mask = %format_version_mask(self.version_mask),
@@ -2768,6 +3061,20 @@ impl StratumV1Client {
             if let Some(pending) = self.pending_share.take() {
                 let share = pending.share;
 
+                if share.work_generation.session != self.session_generation
+                    || share.work_generation.job < self.minimum_valid_job_generation
+                {
+                    warn!(
+                        share_session_generation = share.work_generation.session,
+                        share_job_generation = share.work_generation.job,
+                        current_session_generation = self.session_generation,
+                        minimum_valid_job_generation = self.minimum_valid_job_generation,
+                        job_id = %share.job_id,
+                        "Dropping late share from a superseded V1 work generation before pool submission"
+                    );
+                    continue;
+                }
+
                 // SW-03: ntime validity-window check BEFORE submit. A share whose
                 // ntime has drifted beyond ±2h from the pool's current job ntime
                 // is consensus-invalid and a guaranteed pool reject — submitting
@@ -2805,20 +3112,35 @@ impl StratumV1Client {
                 // SW-04: per-job nonce dedup. A duplicate (job_id, nonce,
                 // version_bits) is a guaranteed pool reject; drop it before it
                 // reaches the wire. Bounded to the last few jobs (see NonceDedup).
-                if self.nonce_dedup.is_duplicate_then_record(
-                    &share.job_id,
-                    &share.nonce,
-                    share.version_bits.as_deref(),
-                ) {
-                    debug!(
-                        target: "stratum_v1",
-                        job_id = %share.job_id,
-                        nonce = %share.nonce,
-                        version_bits = ?share.version_bits,
-                        "Dropping duplicate share pre-submit (same job/nonce/version \
-                         already submitted) — would be a guaranteed pool reject."
-                    );
-                    continue;
+                match self.nonce_dedup.try_is_duplicate_share_then_record(&share) {
+                    Ok(true) => {
+                        debug!(
+                            target: "stratum_v1",
+                            job_id = %share.job_id,
+                            work_generation = ?share.work_generation,
+                            extranonce2 = %share.extranonce2,
+                            ntime = %share.ntime,
+                            nonce = %share.nonce,
+                            version_bits = ?share.version_bits,
+                            "Dropping duplicate share pre-submit (same job/nonce/version \
+                             already submitted) — would be a guaranteed pool reject."
+                        );
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(
+                            generation = ?error.generation,
+                            retained_generations = error.retained_generations,
+                            retained_keys_in_generation = error.retained_keys_in_generation,
+                            "V1 submit-dedup capacity exhausted while generations remain valid; \
+                             flushing work and resetting the session rather than forgetting a \
+                             live share identity"
+                        );
+                        return Ok(SessionEndReason::WorkIdentityReset {
+                            reason: "submit dedup capacity",
+                        });
+                    }
                 }
 
                 // Primary donation submits use the configured donation worker.
@@ -2891,6 +3213,34 @@ impl StratumV1Client {
             }
 
             tokio::select! {
+                control = self.work_control_rx.recv() => {
+                    let Some(V1WorkControl::Extranonce2Exhausted(exhausted)) = control else {
+                        continue;
+                    };
+                    let generation = exhausted.generation();
+                    let active_generation = self.last_job.as_ref().map(|job| job.work_generation);
+                    if generation.session == self.session_generation
+                        && active_generation == Some(generation)
+                    {
+                        warn!(
+                            session_generation = generation.session,
+                            job_generation = generation.job,
+                            extranonce2_size = exhausted.extranonce2_size,
+                            "Active Stratum V1 extranonce2 domain exhausted; ending the socket session for a clean resubscribe"
+                        );
+                        return Ok(SessionEndReason::Extranonce2Exhausted {
+                            generation,
+                            extranonce2_size: exhausted.extranonce2_size,
+                        });
+                    }
+                    debug!(
+                        exhausted_session_generation = generation.session,
+                        exhausted_job_generation = generation.job,
+                        current_session_generation = self.session_generation,
+                        ?active_generation,
+                        "Ignoring stale extranonce2 exhaustion from a superseded V1 work generation"
+                    );
+                }
                 // Read from pool
                 line = conn.read_line() => {
                     let line = line.map_err(SessionError::Connection)?
@@ -2950,9 +3300,9 @@ impl StratumV1Client {
                                     _ => "pool re-confirmed the current difficulty (no change).",
                                 },
                             );
-                            // POOL-2: difficulty-only change — recompute the share
-                            // target but do NOT restart in-flight work.
-                            self.refresh_current_job("set_difficulty", false).await;
+                            // Verified V1 sequencing: the new target applies to
+                            // subsequent mining.notify jobs. Already-dispatched
+                            // work retains its notify-time target.
                         }
                         PoolMessage::SetExtranonce { extranonce1, extranonce2_size } => {
                             // Mid-session extranonce rotation. Some pools do this periodically
@@ -2978,6 +3328,34 @@ impl StratumV1Client {
                                 }
                             };
                             let old_en1 = hex::encode(&self.extranonce1);
+                            if new_extranonce1 == self.extranonce1
+                                && extranonce2_size == self.extranonce2_size
+                            {
+                                debug!(
+                                    extranonce1 = %extranonce1,
+                                    extranonce2_size,
+                                    "Ignoring idempotent mining.set_extranonce replay"
+                                );
+                                continue;
+                            }
+                            let requested_namespace =
+                                (new_extranonce1.clone(), extranonce2_size);
+                            if v1_namespace_registry_requires_reset(
+                                self.work_domains_by_namespace.len(),
+                                self.work_domains_by_namespace
+                                    .contains_key(&requested_namespace),
+                            ) {
+                                warn!(
+                                    namespaces = self.work_domains_by_namespace.len(),
+                                    limit = MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION,
+                                    "Pool exceeded the bounded V1 extranonce namespace registry; \
+                                     resetting the session rather than evicting a cursor that \
+                                     could later be replayed"
+                                );
+                                return Ok(SessionEndReason::WorkIdentityReset {
+                                    reason: "extranonce namespace registry capacity",
+                                });
+                            }
                             self.extranonce1 = new_extranonce1;
                             self.extranonce2_size = extranonce2_size;
                             info!(
@@ -2987,7 +3365,7 @@ impl StratumV1Client {
                                 "Extranonce rotated mid-session — pool changed our session ID from 0x{} to 0x{}. This is normal, prevents work duplication between miners.",
                                 old_en1, extranonce1,
                             );
-                            self.refresh_current_job("set_extranonce", true).await;
+                            self.refresh_current_job("set_extranonce", false).await;
                         }
                         PoolMessage::SetVersionMask(mask_str) => {
                             if !self.config.version_rolling {
@@ -3013,8 +3391,14 @@ impl StratumV1Client {
                                     continue;
                                 }
                             };
+                            if new_mask == old_mask {
+                                debug!(
+                                    mask = %format_version_mask(new_mask),
+                                    "Ignoring idempotent mining.set_version_mask replay"
+                                );
+                                continue;
+                            }
                             self.version_mask = new_mask;
-                            self.work_builder.set_version_mask(self.version_mask);
                             info!(
                                 old_mask = %format_version_mask(old_mask),
                                 new_mask = %format_version_mask(self.version_mask),
@@ -3294,8 +3678,38 @@ impl StratumV1Client {
             })?;
         self.extranonce1 = extranonce1;
         self.extranonce2_size = extranonce2_size;
+        self.session_generation = self.session_generation.checked_add(1).ok_or_else(|| {
+            SessionError::ParseError("internal V1 session generation exhausted".into())
+        })?;
+        self.job_generation = 0;
+        self.minimum_valid_job_generation = 0;
+        self.subscription_work_domain = None;
+        self.work_domains_by_namespace.clear();
+        self.nonce_dedup.reset();
 
         Ok(())
+    }
+
+    fn mint_work_generation(&mut self) -> Result<WorkGeneration, SessionError> {
+        self.job_generation = self.job_generation.checked_add(1).ok_or_else(|| {
+            SessionError::ParseError("internal V1 job generation exhausted".into())
+        })?;
+        Ok(WorkGeneration {
+            session: self.session_generation,
+            job: self.job_generation,
+        })
+    }
+
+    fn new_work_domain(
+        &self,
+        generation: WorkGeneration,
+    ) -> Result<Arc<V1WorkDomain>, SessionError> {
+        V1WorkDomain::new(
+            generation,
+            self.extranonce2_size,
+            self.work_control_tx.clone(),
+        )
+        .map_err(|error| SessionError::ParseError(error.to_string()))
     }
 
     /// Handle a mining.notify message — convert to JobTemplate and send downstream.
@@ -3396,10 +3810,6 @@ impl StratumV1Client {
                 );
             }
 
-            if clean_jobs {
-                self.work_builder.reset_extranonce2();
-            }
-
             // W5.4: dispatching work before mining.subscribe parsed
             // extranonce2_size is a protocol bug — every share submission
             // would land at offset 0 with an unsized counter. The constructor
@@ -3431,7 +3841,35 @@ impl StratumV1Client {
                 return Ok(());
             }
 
+            // Extranonce2 belongs to the subscription-parameter namespace, not
+            // to an individual notify. Reusing it only for the immediately
+            // previous hash template is insufficient: A -> B -> A would give
+            // the replayed A a fresh zero cursor and recreate an exact header.
+            // Keep one linear domain until subscribe or set_extranonce changes
+            // the namespace, rotating only its internal validity generation.
+            let work_generation = self.mint_work_generation()?;
+            let v1_work_domain = if let Some(domain) = self.subscription_work_domain.clone() {
+                domain
+                    .rotate_generation_preserving_cursor(work_generation)
+                    .map_err(|error| SessionError::ParseError(error.to_string()))?;
+                Some(domain)
+            } else {
+                let domain = self.new_work_domain(work_generation)?;
+                self.subscription_work_domain = Some(Arc::clone(&domain));
+                self.work_domains_by_namespace.insert(
+                    (self.extranonce1.clone(), self.extranonce2_size),
+                    Arc::clone(&domain),
+                );
+                Some(domain)
+            };
+            if clean_jobs || self.minimum_valid_job_generation == 0 {
+                self.minimum_valid_job_generation = work_generation.job;
+                self.nonce_dedup
+                    .retain_valid_from(self.session_generation, self.minimum_valid_job_generation);
+            }
             let job = JobTemplate {
+                work_generation,
+                v1_work_domain,
                 job_id: job_id.clone(),
                 prev_block_hash,
                 coinbase1: coinbase1_bytes,
@@ -3497,14 +3935,15 @@ impl StratumV1Client {
 
     /// Re-dispatch the current job after a mid-session parameter change.
     ///
-    /// `restart_work` selects whether the refresh invalidates queued ASIC work:
-    /// - `true` for `mining.set_extranonce` / version-mask changes, which change
-    ///   the coinbase / valid version-roll space, so in-flight work is stale and
-    ///   must be flushed (clean restart).
-    /// - `false` for a difficulty-only `mining.set_difficulty`, which changes ONLY
-    ///   the share acceptance threshold, not the block work — forcing a restart
-    ///   there would needlessly throw away good in-flight work (POOL-2).
-    async fn refresh_current_job(&mut self, reason: &str, restart_work: bool) {
+    /// Every refresh invalidates queued ASIC work and rotates the internal
+    /// share-validity generation. `preserve_cursor` distinguishes changes that
+    /// leave the hash namespace intact (version-mask updates) from changes that
+    /// alter it (a genuinely new extranonce1/width):
+    ///
+    /// - `true`: atomically revoke old clones but retain the next EN2 value.
+    /// - `false`: select the retained `(extranonce1, width)` domain, creating it
+    ///   only on first sight. A later A -> B -> A resumes A's cursor.
+    async fn refresh_current_job(&mut self, reason: &str, preserve_cursor: bool) {
         let Some(mut job) = self.last_job.clone() else {
             return;
         };
@@ -3536,24 +3975,65 @@ impl StratumV1Client {
         job.extranonce1 = self.extranonce1.clone();
         job.extranonce2_size = self.extranonce2_size;
         job.version_mask = self.version_mask;
-        // POOL-2: the job's share_target / pool_difficulty were computed at
-        // notify time from the THEN-current difficulty. A mid-session
-        // mining.set_difficulty updates self.current_difficulty but, without this
-        // recompute, the re-dispatched job would carry the STALE target — after a
-        // difficulty INCREASE that target is too easy, so the pool low-diff-rejects
-        // (code 23) every resulting share. Recompute from the live difficulty so
-        // the dispatcher validates against the value the pool now expects.
-        job.share_target = difficulty_to_target(self.current_difficulty);
-        job.pool_difficulty = self.current_difficulty;
-        // Extranonce / version-mask changes invalidate queued ASIC work (coinbase
-        // / valid version-roll space changed) → restart like a clean job. A
-        // difficulty-only refresh must NOT force a restart: the in-flight work is
-        // still valid, only the accept threshold moved, and forcing clean_jobs
-        // here would cause a wasteful double work-restart.
-        job.clean_jobs = restart_work;
-        if restart_work {
-            self.work_builder.reset_extranonce2();
-        }
+        // Difficulty applies only to subsequent mining.notify jobs. A parameter
+        // refresh of the current wire job keeps its notify-time target.
+        job.clean_jobs = true;
+        let work_generation = match self.mint_work_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                error!(%error, reason, "Cannot mint a fresh V1 work generation");
+                return;
+            }
+        };
+        let work_domain = if preserve_cursor {
+            let Some(domain) = job.v1_work_domain.clone() else {
+                error!(
+                    reason,
+                    "Cannot preserve cursor for a V1 job with no work domain"
+                );
+                return;
+            };
+            if let Err(error) = domain.rotate_generation_preserving_cursor(work_generation) {
+                error!(%error, reason, "Cannot rotate the V1 work generation");
+                return;
+            }
+            domain
+        } else {
+            // First revoke the previously active namespace so queued builders
+            // cannot continue allocating after set_extranonce switches away.
+            if let Some(active) = self.subscription_work_domain.clone() {
+                if let Err(error) = active.rotate_generation_preserving_cursor(work_generation) {
+                    error!(%error, reason, "Cannot revoke the prior V1 work namespace");
+                    return;
+                }
+            }
+
+            let namespace = (self.extranonce1.clone(), self.extranonce2_size);
+            if let Some(domain) = self.work_domains_by_namespace.get(&namespace).cloned() {
+                if let Err(error) = domain.rotate_generation_preserving_cursor(work_generation) {
+                    error!(%error, reason, "Cannot resume the retained V1 work namespace");
+                    return;
+                }
+                domain
+            } else {
+                let domain = match self.new_work_domain(work_generation) {
+                    Ok(domain) => domain,
+                    Err(error) => {
+                        error!(%error, reason, "Cannot create a fresh V1 work namespace");
+                        return;
+                    }
+                };
+                self.work_domains_by_namespace
+                    .insert(namespace, Arc::clone(&domain));
+                domain
+            }
+        };
+        job.work_generation = work_generation;
+        self.subscription_work_domain = Some(Arc::clone(&work_domain));
+        job.v1_work_domain = Some(work_domain);
+        self.minimum_valid_job_generation = work_generation.job;
+        self.nonce_dedup
+            .retain_valid_from(self.session_generation, self.minimum_valid_job_generation);
         self.last_job = Some(job.clone());
 
         if self.job_tx.send(job).await.is_err() {
@@ -3574,7 +4054,6 @@ impl StratumV1Client {
         self.pending_share = None;
         self.last_job = None;
         self.last_stale_jobs_flushed_on_switch = false;
-        self.work_builder.reset_extranonce2();
         // D-01: drop per-job nonce-dedup history at the pool boundary. Job IDs
         // are pool-scoped and short job IDs are recycled across pools, so a
         // recycled `job_id` from the old pool could otherwise wrongly mark a
@@ -4175,6 +4654,7 @@ mod tests {
 
     fn test_share(job_id: &str, nonce: &str, version_bits: Option<&str>) -> ValidShare {
         ValidShare {
+            work_generation: WorkGeneration { session: 1, job: 1 },
             worker_name: "worker.original".to_string(),
             job_id: job_id.to_string(),
             extranonce2: "abcd1234".to_string(),
@@ -4581,15 +5061,10 @@ mod tests {
         );
     }
 
-    /// POOL-2 (P2): a mid-session difficulty INCREASE with no following
-    /// `mining.notify` must re-dispatch the current job with the NEW (harder)
-    /// share target. Pre-fix `refresh_current_job` cloned `last_job` but left the
-    /// notify-time `share_target`/`pool_difficulty` in place, so after a
-    /// difficulty increase the re-dispatched job carried a too-easy target and the
-    /// pool low-diff-rejected (code 23) the resulting shares. It must also NOT
-    /// force a work restart (`clean_jobs`) for a difficulty-only refresh.
+    /// Verified V1 sequencing contract: set_difficulty affects subsequent jobs,
+    /// while a job already in flight retains its notify-time target.
     #[tokio::test]
-    async fn refresh_after_difficulty_increase_redispatches_with_new_target() {
+    async fn difficulty_change_waits_for_next_notify_and_preserves_live_job_target() {
         use crate::work::difficulty_to_target;
 
         let (job_tx, mut job_rx) = mpsc::channel(4);
@@ -4610,29 +5085,237 @@ mod tests {
         assert_eq!(seeded.pool_difficulty, 1.0);
         assert_eq!(seeded.share_target, difficulty_to_target(1.0));
 
-        // Pool raises difficulty mid-session with NO following notify — exactly
-        // the SetDifficulty handler's path: bump current_difficulty, then refresh
-        // the current job as a difficulty-only change (restart_work=false).
+        // The SetDifficulty branch updates this state and must enqueue no
+        // replacement for job A.
         client.current_difficulty = 8192.0;
-        client.refresh_current_job("set_difficulty", false).await;
-
-        let refreshed = job_rx
-            .try_recv()
-            .expect("difficulty change must re-dispatch the current job");
-        assert_eq!(
-            refreshed.share_target,
-            difficulty_to_target(8192.0),
-            "re-dispatched job must carry the NEW (harder) share target, not the stale one"
-        );
-        assert_eq!(refreshed.pool_difficulty, 8192.0);
         assert!(
-            !refreshed.clean_jobs,
-            "a difficulty-only refresh must NOT force a work restart"
+            job_rx.try_recv().is_err(),
+            "set_difficulty must not redispatch or mutate the live wire job"
+        );
+        let live = client.last_job.as_ref().expect("job A remains live");
+        assert_eq!(live.pool_difficulty, 1.0);
+        assert_eq!(live.share_target, difficulty_to_target(1.0));
+
+        let next = parse_pool_message(notify_line("pool2-job-next", false).trim())
+            .expect("next notify must parse");
+        client
+            .handle_notify(next)
+            .await
+            .expect("next notify must succeed");
+        let subsequent = job_rx.try_recv().expect("job B must dispatch");
+        assert_eq!(
+            subsequent.share_target,
+            difficulty_to_target(8192.0),
+            "the subsequent notify must snapshot the new difficulty"
+        );
+        assert_eq!(subsequent.pool_difficulty, 8192.0);
+        assert_ne!(
+            seeded.share_target, subsequent.share_target,
+            "job A and job B must retain their distinct notify-time targets"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_mask_refresh_rotates_epoch_without_restarting_extranonce2() {
+        use crate::work::WorkBuilder;
+        use crate::work_domain::WorkBuildError;
+
+        let (job_tx, mut job_rx) = mpsc::channel(4);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(4);
+        let mut client = StratumV1Client::new(test_config(), job_tx, share_rx, status_tx);
+        client.extranonce2_size = 1;
+
+        let notify = parse_pool_message(notify_line("mask-refresh", true).trim())
+            .expect("notify must parse");
+        client
+            .handle_notify(notify)
+            .await
+            .expect("seed notify must succeed");
+        let original = job_rx.try_recv().expect("seed job must dispatch");
+        let mut old_chain = WorkBuilder::new();
+        assert_eq!(
+            old_chain
+                .next_work(&original)
+                .expect("first allocation")
+                .extranonce2,
+            "00"
+        );
+
+        client.version_mask = 0x00ff_e000;
+        client.current_difficulty = 8192.0;
+        client.refresh_current_job("set_version_mask", true).await;
+        let refreshed = job_rx.try_recv().expect("mask refresh must dispatch");
+
+        assert_ne!(refreshed.work_generation, original.work_generation);
+        assert!(Arc::ptr_eq(
+            refreshed
+                .v1_work_domain
+                .as_ref()
+                .expect("refreshed V1 domain"),
+            original
+                .v1_work_domain
+                .as_ref()
+                .expect("original V1 domain")
+        ));
+        assert_eq!(
+            refreshed.pool_difficulty, original.pool_difficulty,
+            "parameter refresh must keep the live job's notify-time difficulty"
+        );
+        assert!(matches!(
+            old_chain.next_work(&original),
+            Err(WorkBuildError::SupersededV1WorkGeneration { .. })
+        ));
+        assert_eq!(
+            WorkBuilder::new()
+                .next_work(&refreshed)
+                .expect("rotated generation must allocate")
+                .extranonce2,
+            "01",
+            "version-mask rotation must continue the shared cursor, never repeat 00"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_notify_rotates_epoch_but_preserves_extranonce2_cursor() {
+        use crate::work::WorkBuilder;
+        use crate::work_domain::WorkBuildError;
+
+        let (job_tx, mut job_rx) = mpsc::channel(4);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(4);
+        let mut client = StratumV1Client::new(test_config(), job_tx, share_rx, status_tx);
+        client.extranonce2_size = 1;
+
+        let first_notify =
+            parse_pool_message(notify_line("wire-job-a", true).trim()).expect("first notify");
+        client
+            .handle_notify(first_notify)
+            .await
+            .expect("first notify must succeed");
+        let first = job_rx.try_recv().expect("first job");
+        let mut old_chain = WorkBuilder::new();
+        assert_eq!(old_chain.next_work(&first).unwrap().extranonce2, "00");
+
+        // Only the server's opaque job_id differs; all hash inputs are exact.
+        let replay =
+            parse_pool_message(notify_line("wire-job-b", true).trim()).expect("replayed notify");
+        client
+            .handle_notify(replay)
+            .await
+            .expect("replayed notify must succeed");
+        let second = job_rx.try_recv().expect("replayed job");
+
+        assert_ne!(second.work_generation, first.work_generation);
+        assert!(matches!(
+            old_chain.next_work(&first),
+            Err(WorkBuildError::SupersededV1WorkGeneration { .. })
+        ));
+        assert_eq!(
+            WorkBuilder::new().next_work(&second).unwrap().extranonce2,
+            "01",
+            "an identical hash namespace must never restart at zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_adjacent_notify_replay_never_reuses_an_exact_header() {
+        use crate::work::WorkBuilder;
+
+        let (job_tx, mut job_rx) = mpsc::channel(4);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(4);
+        let mut client = StratumV1Client::new(test_config(), job_tx, share_rx, status_tx);
+        client.extranonce2_size = 1;
+
+        let a = parse_pool_message(notify_line_with_ntime("wire-a", "66112233", true).trim())
+            .expect("notify A");
+        client
+            .handle_notify(a)
+            .await
+            .expect("notify A must succeed");
+        let job_a = job_rx.try_recv().expect("job A");
+        let work_a = WorkBuilder::new().next_work(&job_a).expect("work A");
+        assert_eq!(work_a.extranonce2, "00");
+
+        let b = parse_pool_message(notify_line_with_ntime("wire-b", "66112234", false).trim())
+            .expect("notify B");
+        client
+            .handle_notify(b)
+            .await
+            .expect("notify B must succeed");
+        let job_b = job_rx.try_recv().expect("job B");
+        let work_b = WorkBuilder::new().next_work(&job_b).expect("work B");
+        assert_eq!(work_b.extranonce2, "01");
+
+        let replay =
+            parse_pool_message(notify_line_with_ntime("wire-a-replay", "66112233", false).trim())
+                .expect("replayed notify A");
+        client
+            .handle_notify(replay)
+            .await
+            .expect("replayed notify A must succeed");
+        let replayed_job_a = job_rx.try_recv().expect("replayed job A");
+        let replayed_work_a = WorkBuilder::new()
+            .next_work(&replayed_job_a)
+            .expect("replayed work A");
+
+        assert_eq!(replayed_work_a.extranonce2, "02");
+        assert_ne!(
+            work_a.merkle_root, replayed_work_a.merkle_root,
+            "A -> B -> A must change A's coinbase and merkle root"
         );
         assert_ne!(
-            seeded.share_target, refreshed.share_target,
-            "the harder target must actually differ from the seeded easy target"
+            work_a.midstates, replayed_work_a.midstates,
+            "A -> B -> A must never recreate A's exact header prefix"
         );
+    }
+
+    #[tokio::test]
+    async fn set_extranonce_a_b_a_resumes_namespace_cursor_without_header_replay() {
+        use crate::work::WorkBuilder;
+        use crate::work_domain::WorkBuildError;
+
+        let (job_tx, mut job_rx) = mpsc::channel(4);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(4);
+        let mut client = StratumV1Client::new(test_config(), job_tx, share_rx, status_tx);
+        client.extranonce1 = vec![0xaa];
+        client.extranonce2_size = 1;
+
+        let notify = parse_pool_message(notify_line("set-en-replay", true).trim()).expect("notify");
+        client
+            .handle_notify(notify)
+            .await
+            .expect("notify must succeed");
+        let job_a = job_rx.try_recv().expect("namespace A job");
+        let mut stale_a_builder = WorkBuilder::new();
+        let work_a = stale_a_builder.next_work(&job_a).expect("A:00");
+        assert_eq!(work_a.extranonce2, "00");
+
+        client.extranonce1 = vec![0xbb];
+        client.refresh_current_job("set_extranonce B", false).await;
+        let job_b = job_rx.try_recv().expect("namespace B job");
+        assert!(matches!(
+            stale_a_builder.next_work(&job_a),
+            Err(WorkBuildError::SupersededV1WorkGeneration { .. })
+        ));
+        let work_b = WorkBuilder::new().next_work(&job_b).expect("B:00");
+        assert_eq!(work_b.extranonce2, "00");
+
+        client.extranonce1 = vec![0xaa];
+        client.refresh_current_job("set_extranonce A", false).await;
+        let replayed_job_a = job_rx.try_recv().expect("resumed namespace A job");
+        let replayed_work_a = WorkBuilder::new()
+            .next_work(&replayed_job_a)
+            .expect("A must resume");
+
+        assert_eq!(
+            replayed_work_a.extranonce2, "01",
+            "returning to a seen extranonce namespace must resume its cursor"
+        );
+        assert_ne!(work_a.merkle_root, replayed_work_a.merkle_root);
+        assert_ne!(work_a.midstates, replayed_work_a.midstates);
     }
 
     async fn closed_pool_url() -> String {
@@ -4656,6 +5339,10 @@ mod tests {
     }
 
     fn notify_line(job_id: &str, clean_jobs: bool) -> String {
+        notify_line_with_ntime(job_id, "66112233", clean_jobs)
+    }
+
+    fn notify_line_with_ntime(job_id: &str, ntime: &str, clean_jobs: bool) -> String {
         format!(
             "{}\n",
             serde_json::json!({
@@ -4669,7 +5356,7 @@ mod tests {
                     [],
                     "20000000",
                     "1d00ffff",
-                    "66112233",
+                    ntime,
                     clean_jobs
                 ],
             })
@@ -4751,6 +5438,337 @@ mod tests {
             requests_rx,
             task,
         }
+    }
+
+    /// Accepts repeated sessions and deliberately grants the smallest legal
+    /// extranonce2 domain. This makes a real 256-work exhaustion/reconnect
+    /// cycle cheap enough to pin in the normal test suite.
+    async fn spawn_exhaustion_reconnect_pool() -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind exhaustion reconnect mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(128);
+
+        let task = tokio::spawn(async move {
+            let mut connection_number = 0u64;
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                connection_number += 1;
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = requests_tx.send(line.clone()).await;
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                    match id {
+                        ID_CONFIGURE => {
+                            let _ = writer
+                                .write_all(
+                                    response_line(
+                                        ID_CONFIGURE,
+                                        serde_json::json!({
+                                            "version-rolling": true,
+                                            "version-rolling.mask": "1fffe000",
+                                        }),
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                        }
+                        ID_SUBSCRIBE => {
+                            let extranonce1 = format!("{connection_number:08x}");
+                            let _ = writer
+                                .write_all(
+                                    response_line(ID_SUBSCRIBE, json!([[], extranonce1, 1]))
+                                        .as_bytes(),
+                                )
+                                .await;
+                        }
+                        ID_AUTHORIZE => {
+                            let _ = writer
+                                .write_all(
+                                    response_line(ID_AUTHORIZE, Value::Bool(true)).as_bytes(),
+                                )
+                                .await;
+                            let job_id = format!("exhaustion-job-{connection_number}");
+                            let _ = writer
+                                .write_all(notify_line(&job_id, true).as_bytes())
+                                .await;
+                        }
+                        request_id if request_id > ID_SUGGEST_DIFF => {
+                            let _ = writer
+                                .write_all(response_line(request_id, Value::Bool(true)).as_bytes())
+                                .await;
+                        }
+                        _ => {}
+                    }
+                    let _ = writer.flush().await;
+                }
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{port}"),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// G50 quality-bar proof: two independent builders consume one exact
+    /// width-one domain, exhaustion ends the live socket session, a flush-only
+    /// barrier reaches the dispatcher before replacement work, and the next
+    /// subscription starts a distinct generation at extranonce2 zero.
+    #[tokio::test]
+    async fn extranonce2_exhaustion_flushes_then_resubscribes_without_reuse() {
+        use crate::work::WorkBuilder;
+        use crate::work_domain::WorkBuildError;
+        use std::collections::HashSet;
+
+        let pool = spawn_exhaustion_reconnect_pool().await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = pool.url.clone();
+
+        let (job_tx, mut job_rx) = mpsc::channel(16);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(64);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+        let client_task = tokio::spawn(run_client_for_mock_wave(
+            client,
+            Duration::from_millis(1_200),
+        ));
+
+        let first_job = tokio::time::timeout(Duration::from_secs(3), job_rx.recv())
+            .await
+            .expect("first subscription must dispatch promptly")
+            .expect("job channel must remain open");
+        assert!(!first_job.is_flush_only());
+        assert_eq!(first_job.extranonce2_size, 1);
+
+        // Model AM2-style parallel consumers explicitly. Resetting either local
+        // builder must not rewind the generation-owned shared domain.
+        let mut chain_a = WorkBuilder::new();
+        let mut chain_b = WorkBuilder::new();
+        let mut seen = HashSet::new();
+        for expected in 0u16..=u8::MAX as u16 {
+            let work = if expected % 2 == 0 {
+                chain_a.next_work(&first_job)
+            } else {
+                chain_b.next_work(&first_job)
+            }
+            .expect("every in-domain work allocation must succeed");
+            assert_eq!(work.work_generation, first_job.work_generation);
+            assert_eq!(work.extranonce2, format!("{expected:02x}"));
+            assert!(seen.insert(work.extranonce2));
+            if expected == 127 {
+                chain_a.reset_extranonce2();
+                chain_b.reset_extranonce2();
+            }
+        }
+        assert_eq!(seen.len(), 256);
+        assert!(matches!(
+            chain_a.next_work(&first_job),
+            Err(WorkBuildError::Extranonce2Exhausted(_))
+        ));
+
+        let (saw_flush, second_job) = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut saw_flush = false;
+            loop {
+                let job = job_rx
+                    .recv()
+                    .await
+                    .expect("job channel must survive exhaustion resubscribe");
+                if job.is_flush_only() {
+                    saw_flush = true;
+                    continue;
+                }
+                assert!(
+                    saw_flush,
+                    "replacement work must never cross the dispatcher before the flush barrier"
+                );
+                break (saw_flush, job);
+            }
+        })
+        .await
+        .expect("exhaustion must trigger a bounded resubscribe");
+
+        assert!(saw_flush);
+        assert_ne!(
+            second_job.work_generation.session, first_job.work_generation.session,
+            "replacement work must belong to a new subscription generation"
+        );
+        assert_eq!(
+            WorkBuilder::new()
+                .next_work(&second_job)
+                .expect("new subscription domain must be usable")
+                .extranonce2,
+            "00",
+            "a new subscription may restart at zero because extranonce1 and session generation changed"
+        );
+
+        let returned = client_task
+            .await
+            .expect("mock-wave client task must not panic");
+        drop(returned);
+        let requests = finish_mock_pool(pool).await;
+        let subscriptions = requests
+            .iter()
+            .filter(|request| request.contains("\"method\":\"mining.subscribe\""))
+            .count();
+        assert!(
+            subscriptions >= 2,
+            "exhaustion must cause a second real mining.subscribe; saw {subscriptions}"
+        );
+    }
+
+    /// A repeated-session pool that floods unique set_extranonce namespaces on
+    /// only the first connection. The client must flush and cleanly resubscribe
+    /// when its bounded cursor registry reaches capacity.
+    async fn spawn_namespace_capacity_reconnect_pool() -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind namespace-capacity mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(128);
+
+        let task = tokio::spawn(async move {
+            let mut connection_number = 0u64;
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                connection_number += 1;
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = requests_tx.send(line.clone()).await;
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                    match id {
+                        ID_CONFIGURE => {
+                            let _ = writer
+                                .write_all(
+                                    response_line(
+                                        ID_CONFIGURE,
+                                        serde_json::json!({
+                                            "version-rolling": true,
+                                            "version-rolling.mask": "1fffe000",
+                                        }),
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                        }
+                        ID_SUBSCRIBE => {
+                            let initial = format!("f{connection_number:07x}");
+                            let _ = writer
+                                .write_all(
+                                    response_line(ID_SUBSCRIBE, json!([[], initial, 1])).as_bytes(),
+                                )
+                                .await;
+                        }
+                        ID_AUTHORIZE => {
+                            let _ = writer
+                                .write_all(
+                                    response_line(ID_AUTHORIZE, Value::Bool(true)).as_bytes(),
+                                )
+                                .await;
+                            let job_id = format!("namespace-job-{connection_number}");
+                            let _ = writer
+                                .write_all(notify_line(&job_id, true).as_bytes())
+                                .await;
+                            if connection_number == 1 {
+                                for namespace in 1..=MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION {
+                                    let notification = serde_json::json!({
+                                        "id": null,
+                                        "method": "mining.set_extranonce",
+                                        "params": [format!("{namespace:08x}"), 1],
+                                    })
+                                    .to_string()
+                                        + "\n";
+                                    let _ = writer.write_all(notification.as_bytes()).await;
+                                }
+                            }
+                        }
+                        request_id if request_id > ID_SUGGEST_DIFF => {
+                            let _ = writer
+                                .write_all(response_line(request_id, Value::Bool(true)).as_bytes())
+                                .await;
+                        }
+                        _ => {}
+                    }
+                    let _ = writer.flush().await;
+                }
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{port}"),
+            requests_rx,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_capacity_flushes_then_resubscribes_without_cursor_eviction() {
+        let pool = spawn_namespace_capacity_reconnect_pool().await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = pool.url.clone();
+
+        let (job_tx, mut job_rx) = mpsc::channel(600);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(128);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+        let client_task = tokio::spawn(run_client_for_mock_wave(
+            client,
+            Duration::from_millis(2_000),
+        ));
+
+        let (pre_flush_jobs, replacement) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut pre_flush_jobs = 0usize;
+            let mut saw_flush = false;
+            loop {
+                let job = job_rx.recv().await.expect("job channel remains open");
+                if job.is_flush_only() {
+                    saw_flush = true;
+                    continue;
+                }
+                if saw_flush {
+                    break (pre_flush_jobs, job);
+                }
+                pre_flush_jobs += 1;
+            }
+        })
+        .await
+        .expect("namespace capacity reset must resubscribe promptly");
+
+        assert_eq!(
+            pre_flush_jobs, MAX_V1_WORK_NAMESPACES_PER_SUBSCRIPTION,
+            "initial namespace plus retained refreshes must remain live until the exact bound"
+        );
+        assert_eq!(replacement.work_generation.session, 2);
+
+        let returned = client_task.await.expect("mock client must not panic");
+        drop(returned);
+        let requests = finish_mock_pool(pool).await;
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.contains("\"method\":\"mining.subscribe\""))
+                .count()
+                >= 2,
+            "namespace capacity must cause a second real mining.subscribe"
+        );
     }
 
     async fn spawn_set_version_mask_pool(job_id: &'static str, mask: &'static str) -> MockPool {

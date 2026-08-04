@@ -53,6 +53,9 @@ pub mod board;
 // Pure CML fault-escalation window logic (no ESP-IDF dep) — host-testable and
 // consumed by the espidf-only `power` module.
 pub mod cml_escalation;
+// Pure Hammer DC TMP75 address-strap classifier. The bus-touching ACK probe is
+// isolated below and compiled only for ESP-IDF.
+pub mod hammer_strap;
 // Pure TPS546 write-protect policy (XPSAFE-2, cross-pollinated from DCENT_OS's
 // HAL EEPROM write-denylist). No ESP-IDF dep — host-testable; consumed by the
 // espidf-only `i2c` module's write path. Default-OFF (disarmed) so field-proven
@@ -64,6 +67,9 @@ pub mod tps546_guard;
 // max-cooling fan-duty bytes. No ESP-IDF dep — host-testable and the single
 // source of truth shared by the espidf-only panic hook and `gpio::enable_buck`.
 pub mod safety;
+// Hammer's ST7789 i80 panel GPIO map is pure metadata plus host-run collision
+// tests. The panel driver stays absent until GPIO15 is characterized on bench.
+pub mod st7789_pins;
 // DCENT_axe on-board SX1262 LoRa radio pin map (LOCKED 9/9 vs BM1397 netlist)
 // + the esp-idf SPI3/HSPI bus builder. The pure pin map (const table + table
 // test) is host-testable; the `open_lora_bus` builder inside is esp-idf-gated
@@ -93,6 +99,8 @@ pub mod fan_pid;
 #[cfg(target_os = "espidf")]
 pub mod gpio;
 #[cfg(target_os = "espidf")]
+pub mod hammer_strap_probe;
+#[cfg(target_os = "espidf")]
 pub mod i2c;
 #[cfg(target_os = "espidf")]
 pub mod power;
@@ -101,12 +109,65 @@ pub mod power;
 // host-testable. `power.rs` re-exports the PMBus fns and calls `ds4432u_dac_code`
 // so the regulator code path stays byte-identical.
 pub mod power_convert;
+// Pure TPS53647/TPS53667 multi-phase VRM math (VID ladder, part identity, phase
+// and over-current encoding) — the Nerd family's multi-ASIC boards carry one of
+// these instead of the TPS546 every BitAxe-class board uses. Same host-pure
+// split as `power_convert`: no ESP-IDF dep, so the part-identity gate and the
+// fail-closed voltage window are exercised by the host test gate with no
+// hardware. The SMBus shim lives in `tps5364x` (espidf-only).
 #[cfg(target_os = "espidf")]
 pub mod temp;
+#[cfg(all(target_os = "espidf", feature = "power-tps5364x"))]
+pub mod tps5364x;
+pub mod tps5364x_convert;
 // Pure EMC2101 external-diode temperature decode (no ESP-IDF dep) — split out of
 // the espidf-only `temp` module so the sensor-availability decision (HALT-3) is
 // host-testable; consumed by `temp::Emc2101::read_external_temp`.
 pub mod temp_decode;
+// Pure TMP451 / ADT7461-family remote-diode decode + analog-mux channel encoding
+// (no ESP-IDF dep) — the per-ASIC thermal source on the muxed Nerd boards, whose
+// register map is confirmed by BOTH the upstream Nerd firmware and Bitmain's own
+// S21xp factory jig. Host-testable so the fail-closed availability rule and the
+// per-board calibration bounds run in the host gate. Transport shim: `tmp451`.
+#[cfg(all(target_os = "espidf", feature = "temp-tmp451"))]
+pub mod tmp451;
+pub mod tmp451_convert;
+// Pure TMP1075 addressing/topology/decode (no ESP-IDF dep) — the decode half of
+// `temp::Tmp1075`, plus the `0x48 + n` multi-device addressing the Nerd boards
+// need and the rule that device 1 is the VOLTAGE-REGULATOR sensor, not an ASIC
+// sensor. Host-testable so that rule (and the two decode defects the upstream C
+// carries) are pinned by the host gate.
+pub mod tmp1075_convert;
+// Pure FXL6408 I2C port-expander register/bit core (no ESP-IDF dep) — the
+// Q-series is the first family whose ASIC reset, VREG enable and LDO enable are
+// I2C transactions rather than GPIO writes, so each one can FAIL. The shadow
+// registers this part requires are split into compute (`with_pin`) and record
+// (`commit`) so a write the bus rejected can never leak into the next mask.
+pub mod fxl6408_convert;
+// ESP-IDF transport for the above. Split out because the pure core shipped a
+// full register model with NO driver and no caller behind it, which is what
+// kept the Q1370/Q1373 classified as having no rail actuator at all: their
+// enable is real, it is just an I2C write nothing could issue.
+#[cfg(all(target_os = "espidf", feature = "io-expander-fxl6408"))]
+pub mod fxl6408;
+// Pure PCA9544A I2C bus-multiplexer channel core (no ESP-IDF dep) — the
+// BitForge Nano is the first board whose two thermal sensors share one
+// hard-wired address and are reachable only by selecting a mux channel first.
+// That makes the channel select part of the THERMAL path: a select that fails
+// silently returns the other ASIC's die temperature under this ASIC's name.
+// Select and confirm are therefore bound together here, and "no channel
+// connected" is a state rather than upstream's underflowed integer.
+#[cfg(all(target_os = "espidf", feature = "i2c-mux-pca9544"))]
+pub mod pca9544;
+pub mod pca9544_convert;
+// Pure NTC-thermistor-on-ADC conversion (no ESP-IDF dep) — the first
+// temperature sensor in the registry that is NOT an I2C part. The BitForge Nano
+// carries a 10 k NTC per ASIC in a divider on two ESP32 ADC inputs, reads them
+// exactly once at init, and throws the value away; this makes them a real
+// runtime source. Host-pure so the divider algebra and the fail-closed input
+// validation (upstream returns -273.15 as an in-band error value, and divides
+// by zero on an open circuit) run in the host gate. Transport shim: `ntc`.
+pub mod ntc_convert;
 #[cfg(target_os = "espidf")]
 pub mod uart;
 

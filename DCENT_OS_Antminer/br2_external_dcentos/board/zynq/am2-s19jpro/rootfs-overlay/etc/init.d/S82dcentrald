@@ -41,11 +41,42 @@ LOGFILE="/tmp/dcentrald.log"
 FAN_BASE=0x42800000
 # AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
 FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
+FANHOLD_READYFILE="/var/run/dcentrald-fanhold.ready"
 DEFAULT_COMPAT="/etc/default/dcentos-compat"
 PERSISTENT_COMPAT="/data/dcentos-compat"
 API_PORT=8080
 SCRIPT="$0"
 SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
+PROCESS_IDENTITY_HELPER="/usr/libexec/dcentos/dcentrald-process-identity.sh"
+FAN_CUSTODY_HELPER="/usr/libexec/dcentos/dcentrald-fan-custody.sh"
+CRASH_LATCH_FILE="/data/dcent/dcentrald-hardware-session.crash-latched"
+DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=0
+readonly DCENT_PROCESS_IDENTITY_TEST_AUTHORITY
+PROCESS_IDENTITY_AVAILABLE=0
+if [ -r "$PROCESS_IDENTITY_HELPER" ] && . "$PROCESS_IDENTITY_HELPER"; then
+    PROCESS_IDENTITY_AVAILABLE=1
+fi
+FAN_CUSTODY_AVAILABLE=0
+if [ "$PROCESS_IDENTITY_AVAILABLE" -eq 1 ] \
+    && [ -r "$FAN_CUSTODY_HELPER" ] && . "$FAN_CUSTODY_HELPER"; then
+    FAN_CUSTODY_AVAILABLE=1
+fi
+FAN_TRANSITION_LOCK_HELD=0
+
+dcent_release_fan_transition_lock() {
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_lock_release "${FANHOLD_READYFILE}.lock" || true
+        FAN_TRANSITION_LOCK_HELD=0
+    fi
+}
+
+dcent_acquire_fan_transition_lock() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    dcent_fan_lock_acquire "${FANHOLD_READYFILE}.lock" 10 || return 1
+    FAN_TRANSITION_LOCK_HELD=1
+    trap 'dcent_release_fan_transition_lock' 0
+    trap 'exit 1' 1 2 15
+}
 
 # Use persistent config if available, otherwise default.
 #
@@ -190,6 +221,31 @@ if [ -r /data/dcentrald-env ]; then
     . /data/dcentrald-env
 fi
 
+# DO NOT normalize DCENT_AM2_PWR_CONTROL_ACTIVE_{LOW,HIGH} here.
+#
+# A previous revision force-set ACTIVE_HIGH for am2-s19j|am2-s19jpro|
+# am2-s19jpro-zynq (after unsetting ACTIVE_LOW), claiming gpio907 is active
+# HIGH. That is INVERTED, and it is a safe-off correctness bug, not a
+# preference:
+#
+#   * strace-verified sequence — gpio907 reads `1` during the reset hold and
+#     `0` coincident with "PSU: Enable", i.e. 0 = rail ON
+#     ( line 52).
+#   * `W1_2_JIG_VS_DCENT_OP_DIFF.md` states "gpio907 rail polarity active-LOW".
+#   * `/etc/default/dcentrald-am2-xil-env` documents the same, citing
+#     `psu_gpio_gate.rs:111-120`: "0" = rail ON, "1" = rail OFF.
+#
+# `am2_power_cut_proven()` below INVERTS its gpio907 comparison based on this
+# flag, so asserting ACTIVE_HIGH on an active-LOW board makes the script report
+# "power cut proven" at exactly the value that means the rail is ENERGIZED —
+# a false safe-off proof on the operator's home `a lab unit` unit.
+#
+# Polarity is per-unit evidence, not a board-target constant: the env file
+# deliberately scopes ACTIVE_LOW to the proven xil branch and leaves every
+# other AM2 Xilinx unit UNSET so `am2_pwr_control_polarity_known()` returns
+# false and the caller conservatively skips with a WARN. Force-setting a
+# polarity for all three board targets destroys that fail-closed default.
+
 bosminer_pic_bootstrap_enabled() {
     BOSMINER_PIC_BOOTSTRAP=0
     [ -f "$DEFAULT_COMPAT" ] && . "$DEFAULT_COMPAT"
@@ -302,18 +358,34 @@ am2_power_cut_proven() {
 # via devmem, so the non-AM2 branch is unchanged. PWM is only ever driven DOWN
 # (<= 30, clamped again inside dcentrald).
 am2_start_fan_custodian() {
-    # $1 = PWM (0..30). Kill any existing custodian, then background a new one.
     _pwm="$1"
-    if [ -f "$FANHOLD_PIDFILE" ]; then
-        start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-        rm -f "$FANHOLD_PIDFILE"
+    FAN_CUSTODY_RESULT=1
+    if [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ]; then
+        if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+            dcent_fan_custodian_start_locked "$DAEMON" "$_pwm" "$FANHOLD_PIDFILE" \
+                "$FANHOLD_READYFILE" start-stop-daemon "$LOGFILE" 10
+        else
+            dcent_fan_custodian_start "$DAEMON" "$_pwm" "$FANHOLD_PIDFILE" \
+                "$FANHOLD_READYFILE" start-stop-daemon "$LOGFILE" 10
+        fi
+        FAN_CUSTODY_RESULT=$?
     fi
-    if start-stop-daemon -S -b -m -p "$FANHOLD_PIDFILE" -x "$DAEMON" -- --hold-fan "$_pwm" >> $LOGFILE 2>&1; then
-        echo "$(date): SAFETY: am2 persistent fan custodian started at PWM $_pwm ($DAEMON --hold-fan $_pwm, pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> $LOGFILE
+    if [ "$FAN_CUSTODY_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: verified am2 fan custody at PWM $_pwm (pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> "$LOGFILE"
         return 0
     fi
-    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed to start" >> $LOGFILE
+    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed readiness/custody validation" >> "$LOGFILE"
     return 1
+}
+
+am2_stop_fan_custodian() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_custodian_stop_locked "$DAEMON" "$FANHOLD_PIDFILE" \
+            "$FANHOLD_READYFILE" 5 2
+    else
+        dcent_fan_custodian_stop "$DAEMON" "$FANHOLD_PIDFILE" "$FANHOLD_READYFILE" 5 2
+    fi
 }
 
 fan_safety_override() {
@@ -327,14 +399,18 @@ fan_safety_override() {
             # (which left the AM2 board to revert fans to full speed). See
             # am2_start_fan_custodian + .
             am2_start_fan_custodian "$FAN_PWM"
+            return $?
         else
             echo "$(date): WARN: am2 dcentrald binary absent at $DAEMON — could NOT cap fans (devmem is a no-op on am2; PIC watchdog will cut voltage)" >> $LOGFILE
+            return 1
         fi
     elif command -v devmem > /dev/null 2>&1; then
-        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null
-        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null
+        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null || return 1
+        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null || return 1
         echo "$(date): SAFETY: fans commanded to PWM 30 (dcentrald exited)" >> $LOGFILE
+        return 0
     fi
+    return 1
 }
 
 case "$1" in
@@ -343,14 +419,29 @@ case "$1" in
             echo "  [SKIP] dcentrald: binary not found at $DAEMON"
             exit 0
         fi
+        dcent_acquire_fan_transition_lock || {
+            echo "  [FAIL] Cannot serialize dcentrald owner admission"
+            exit 1
+        }
+
+        if [ "$IS_AM2" = "1" ] \
+            && { [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+                || [ -e "${FANHOLD_READYFILE}.pending" ]; }; then
+            am2_stop_fan_custodian || {
+                echo "  [FAIL] Prior fan custodian cannot be verified and stopped"
+                exit 1
+            }
+            echo "  [OK] exact prior am2 fan custodian stopped before owner admission"
+        fi
 
         RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
         if [ -n "$RUNNING_PIDS" ]; then
             echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
             exit 1
         fi
-        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
-            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+        if [ ! -r "$SESSION_LATCH_HELPER" ] \
+            || [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Persistent session or exact-process identity helper is missing"
             fan_safety_override
             exit 1
         fi
@@ -359,18 +450,6 @@ case "$1" in
             fan_safety_override
             exit 1
         }
-
-        # Reap any persistent AM2 fan custodian left resident by a prior
-        # stop/safety/clean-stop (am2_start_fan_custodian / --hold-fan). It
-        # owns the uio16 fan mmap; the main daemon must own it for mining-fan
-        # control, so kill the custodian before launch. The daemon's own
-        # in-process park/PID then holds the fans. (AM2 only; FANHOLD_PIDFILE
-        # is never written on S9/am1.)
-        if [ "$IS_AM2" = "1" ] && [ -f "$FANHOLD_PIDFILE" ]; then
-            start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-            rm -f "$FANHOLD_PIDFILE"
-            echo "  [OK] reaped prior am2 fan custodian before daemon launch"
-        fi
 
         # W1.5 (2026-05-07): re-assert tight perms on /data/dcent/ + auth.json
         # before launching the daemon. dcentrald will also auto-correct via
@@ -459,34 +538,14 @@ case "$1" in
         #   + 5s fan cooldown = ~12s total
         # NEVER SIGKILL before voltage is off - kills heartbeat thread, PIC watchdog
         # fires, corrupts I2C bus, requires PSU power cycle.
-        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
-        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
-        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
-        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
-        # Wait up to 30 seconds for graceful shutdown.
-        # S9 shutdown can legitimately take ~18s when voltage-disable replies are slow.
-        for i in $(seq 1 30); do
-            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-        TIMED_OUT=0
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-            echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
-            rm -f "$EXPECTFILE"
-            TIMED_OUT=1
-            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
+        if [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Exact-process identity helper is unavailable; refusing stop mutations"
+            exit 1
         fi
-        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
-        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
-            kill -TERM "$WRAPPER_PID" 2>/dev/null
-            sleep 1
-            kill -9 "$WRAPPER_PID" 2>/dev/null
-        fi
-        rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        "$SCRIPT" safety
-        echo "  [OK] dcentrald stopped; any active hardware session remains unresolved"
+        dcent_stop_managed_session "$CHILD_PIDFILE" "$EXPECTFILE" "$DAEMON" \
+            "$PIDFILE" "$CRASH_LATCH_FILE" "$SCRIPT" "$LOGFILE" \
+            30 5 30 || exit $?
+        echo "  [OK] dcentrald stopped after exact owner-death and terminal-custody evidence"
         ;;
 
     restart)
@@ -496,6 +555,15 @@ case "$1" in
         ;;
 
     safety)
+        dcent_acquire_fan_transition_lock || exit 1
+        if [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+            || [ -e "${FANHOLD_READYFILE}.pending" ]; then
+            am2_stop_fan_custodian || exit 1
+        fi
+        if dcent_dcentrald_may_execute; then
+            echo "$(date): SAFETY-FAIL: refusing a competing safety writer while dcentrald may execute" >> "$LOGFILE"
+            exit 1
+        fi
         # G22 (no-brick safety, gap-swarm 2026-05-28): the emergency safety response
         # must CUT HASH POWER, not just cap fans. Delegate the cut to the daemon's
         # audited per-platform one-shot `--safe-off` (am2 -> explicit PWR_CONTROL
@@ -504,21 +572,24 @@ case "$1" in
         # fan-only override if the binary is absent, polarity is unknown, or the cut
         # fails, so an emergency NEVER ends up doing nothing.
         if [ "$IS_AM2" = "1" ] && ! am2_pwr_control_polarity_known; then
-            echo "$(date): WARN: AM2 PWR_CONTROL polarity unknown; skipping --safe-off to avoid energizing gpio907 with the wrong polarity" >> $LOGFILE
-            fan_safety_override
-            exit 0
+            echo "$(date): SAFETY-FAIL: AM2 PWR_CONTROL polarity unknown; fan-only fallback is not a power-cut receipt" >> "$LOGFILE"
+            fan_safety_override || true
+            exit 1
         fi
-        if [ -x "$DAEMON" ]; then
-            if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
-                echo "$(date): SAFETY: --safe-off returned command/readback evidence; physical rail state was not measured" >> $LOGFILE
-            else
-                echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
-                fan_safety_override
-            fi
-        else
-            echo "$(date): WARN: $DAEMON absent at $DAEMON — PSU cut unavailable, fan-only safety override (PIC watchdog will cut voltage)" >> $LOGFILE
-            fan_safety_override
+        if [ ! -x "$DAEMON" ]; then
+            echo "$(date): SAFETY-FAIL: $DAEMON absent; PSU cut unavailable" >> "$LOGFILE"
+            exit 1
         fi
+        if ! "$DAEMON" --safe-off >> "$LOGFILE" 2>&1; then
+            echo "$(date): SAFETY-FAIL: $DAEMON --safe-off failed; fan-only fallback is not a power-cut receipt" >> "$LOGFILE"
+            fan_safety_override || true
+            exit 1
+        fi
+        if ! fan_safety_override; then
+            echo "$(date): SAFETY-FAIL: power cut returned evidence but persistent fan custody failed" >> "$LOGFILE"
+            exit 1
+        fi
+        echo "$(date): SAFETY: power-cut command/readback and persistent fan custody returned evidence; physical rail state remains separately classified" >> "$LOGFILE"
         ;;
 
     safety-hold)

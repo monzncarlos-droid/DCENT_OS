@@ -5,9 +5,11 @@
 //! (88-byte BM1362 serial work dispatch over the OMAP UART, no kernel module),
 //! the BM1362 chip-side init, and a Stratum mining loop.
 //!
-//! Live target: 203.0.113.79 (LuxOS). The cold-boot sequence is BEST-GUESS
-//! — Phase D
-//! iterates it on the live unit.
+//! Historical bench target: `a lab unit` (LuxOS). An earlier binary produced accepted
+//! shares there. The current retained-GPIO59/watchdog lifecycle is EXPERIMENTAL
+//! and host-validated only; an authorized current-binary bench rerun is still
+//! required. Remaining inferred cold-boot surfaces are catalogued in
+//! .
 //!
 //! ## Mining-loop wiring decision: OPTION B2 (self-contained loop, reuse the crates)
 //!
@@ -21,7 +23,7 @@
 //! of `SerialMiner::run()` branches. Too invasive for the win.
 //!
 //! Instead this module does the `a lab unit`-specific cold-boot + BM1362 chip-side init
-//! itself (it already does both, and that path is LIVE-VALIDATED on `a lab unit`), then
+//! itself (the earlier sequence has historical `a lab unit` evidence), then
 //! runs a **small self-contained mining loop on the existing blocking thread**
 //! that REUSES the shared crates rather than re-implementing them:
 //!  - `dcentrald_stratum::StratumRouter` (Stratum V1/V2 connect, job feed,
@@ -85,9 +87,10 @@
 //! remaining BB blocker is the APW set-voltage/watchdog write opcodes that are
 //! still deliberately best-effort stubs.
 //!
-//! The `a lab unit` cold-boot run (which the milestone log proves works) is unchanged:
-//! `cold_boot_sequence_s19j_io_v2` / `run_cold_boot` are consumed exactly as
-//! before. Set `DCENT_AM3_BB_STUB_LOOP=1` to fall back to the old logging-only
+//! The cold-boot command sequence retains its historical evidence, but its
+//! authority boundary is stronger: `cold_boot_sequence_s19j_io_v2` now consumes
+//! the caller's sole pre-opened ON owner and never exports/configures GPIO59.
+//! Set `DCENT_AM3_BB_STUB_LOOP=1` to fall back to the old logging-only
 //! stub ([`run_mining_loop_stub`]) for a cold-boot/enum-only diagnostic run.
 //!
 //! ## Cross-references
@@ -100,16 +103,20 @@
 //! - `DCENT_OS_Antminer/dcentrald/dcentrald/src/serial_mining.rs` — the shared Stratum/work-build machinery + the proven BM1362 serial work/nonce path this loop mirrors
 //! -  — the v1 cold-boot sequence + the LuxOS wire capture
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -137,7 +144,8 @@ use dcentrald_hal::platform::beaglebone::{
     authorize_am3_bb_identity, read_active_board_target_name, BeagleBonePlatform,
 };
 use dcentrald_hal::platform::{
-    FanAccess, FanCommandReceipt, HardwareMutationGate, HardwareMutationGateOwner, Platform,
+    FanAccess, FanCommandReceipt, HardwareMutationBarrierReceipt,
+    HardwareMutationCommitFenceTryWait, HardwareMutationGate, HardwareMutationGateOwner, Platform,
 };
 use dcentrald_hal::psu_apw_uart_tunnel::{ApwUartTunnel, ApwUartTunnelBus};
 use dcentrald_hal::serial::DevmemUart;
@@ -146,10 +154,15 @@ use dcentrald_hal::serial_chain::SerialChainBackend;
 use crate::config::DcentraldConfig;
 use crate::model;
 use crate::runtime::safety_watchdog::{
-    SafetyLiveness, SafetyWatchdogOwner, WatchdogCloseoutReceipt, WatchdogDisarmPermit,
-    DEFAULT_WATCHDOG_STOP_TIMEOUT, DEFAULT_WATCHDOG_TEARDOWN_GRACE,
+    Am3BbNeverEnergized, Am3BbThreadSlot, Am3BbWatchdogRouteScope, Am3BbWatchdogShutdownManifest,
+    SafetyLiveness, SafetyWatchdogOwner, WatchdogAdmission, WatchdogCloseoutReceipt,
+    WatchdogDisarmPermit, DEFAULT_WATCHDOG_STOP_TIMEOUT,
 };
-use crate::runtime::thread_guard::{RuntimeThreadGuard, ThreadStopSummary};
+use crate::runtime::teardown_budget::{TeardownBudgetView, TeardownDisarmAuthority, TeardownStage};
+use crate::runtime::thread_guard::{
+    FixedThreadRosterGuard, ThreadRosterOwner, ThreadRosterQuiescenceReceipt, ThreadRosterStop,
+};
+use crate::runtime::watchdog_feed_gate::WatchdogFeedStopSignal;
 
 /// Number of distinct nonce→work correlation slots (`work_by_id` length).
 ///
@@ -193,6 +206,13 @@ const BM13XX_CMD_PREAMBLE: [u8; 2] = [0x55, 0xAA];
 const BM13XX_GET_ADDRESS_RESPONSE_FRAME_BYTES: usize = 9;
 const BM13XX_RESPONSE_PREAMBLE: [u8; 2] = [0xAA, 0x55];
 const BM1362_UNASSIGNED_GET_ADDRESS_PAYLOAD: [u8; 6] = [0x13, 0x62, 0x03, 0x00, 0x00, 0x00];
+
+/// Bound completed foreign-ON-writer serialization iterations. Every completed
+/// iteration reasserts physical LOW; exhaustion leaves ON authority terminally
+/// revoked and lets the armed watchdog remain the independent containment
+/// boundary. This is not a wall-clock bound on a sleeping sysfs callback.
+const AM3_BB_CUTOFF_SERIALIZATION_YIELD_LIMIT: usize = 4_096;
+const AM3_BB_RAW_SYSCALL_EINTR_RETRY_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GetAddressIntegrity {
@@ -504,6 +524,7 @@ const ENV_AM3_BB_USE_DEVMEM_UART: &str = "DCENT_AM3_BB_USE_DEVMEM_UART";
 const ENV_AM3_BB_ALLOW_NO_RX_MINING: &str = "DCENT_AM3_BB_ALLOW_NO_RX_MINING";
 const ENV_AM3_BB_ASSUME_JOB_RESPONSE_FLAGS: &str = "DCENT_AM3_BB_ASSUME_JOB_RESPONSE_FLAGS";
 const ENV_AM3_BB_WORK_CODEC: &str = "DCENT_AM3_BB_WORK_CODEC";
+const ENV_AM2_ACCEPT_DEGRADED_HARDWARE: &str = "DCENT_AM2_ACCEPT_DEGRADED_HARDWARE";
 
 // AM3 BB hashboard-side dsPIC path. LuxOS ftrace on `a lab unit` (2026-05-13)
 // shows firmware 0x89 controllers on I2C bus 0 using one full-frame write
@@ -534,6 +555,13 @@ const AM3_BB_THERMAL_MIN_SAMPLES_PER_CHAIN: usize = 1;
 const AM3_BB_LM75_REPLY_LEN: usize = 7;
 const AM3_BB_LM75_MIN_VALID_C: f32 = -20.0;
 const AM3_BB_LM75_MAX_VALID_C: f32 = 125.0;
+/// `reply[5]` of a dsPIC LM75 bridge reply. Live `a lab unit` capture: `0x00` on every
+/// good read, `0x01` on every bad one. See `am3_bb_decode_lm75_bridge_reply`.
+const AM3_BB_LM75_STATUS_OK: u8 = 0x00;
+/// The LM75 data register is 11-bit and left-justified, so a genuine reading
+/// always has a zero low nibble. Non-zero means a framing/bus error, not a cold
+/// sensor (ePIC `pic_driver.ko` returns `-EPROTO` on exactly this condition).
+const AM3_BB_LM75_RAW_LOW_NIBBLE_MASK: i16 = 0x000F;
 // Live `a lab unit` validation on 2026-05-13 showed the dsPIC LM75 bridge can return
 // one malformed runtime poll while the pool/heartbeat path is active. Keep
 // pre-start proof strict, but tolerate only a short fresh-sample window at
@@ -551,6 +579,10 @@ const AM3_BB_FAN_PID_MAX_STEP_PWM: u8 = 3;
 const AM3_BB_GPIO_SYSFS_ROOT: &str = "/sys/class/gpio";
 const AM3_BB_WATCHDOG_BRINGUP_GRACE: Duration = Duration::from_secs(180);
 const AM3_BB_API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Stratum cancellation is only one actor-close stage. It must not consume the
+/// complete watchdog-issued cleanup window and starve API fencing, controller
+/// safe-off, heartbeat join, or reset assertion.
+const AM3_BB_STRATUM_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn am3_bb_thermal_poll_interval(pid_interval_s: f32) -> Duration {
     let millis =
@@ -899,32 +931,256 @@ pub fn chain_uart_specs(platform: &BeagleBonePlatform) -> Vec<ChainUartSpec> {
 /// for graceful shutdown.
 ///
 /// Steps 1-7 in [`run_am3_bb_blocking`] are the cold-boot + chip-init
-/// plumbing (LIVE-VALIDATED on `a lab unit`); step 8 is the Stratum mining loop
+/// plumbing (historically exercised on `a lab unit`, current binary bench-pending);
+/// step 8 is the Stratum mining loop
 /// (Option B2 — reuses `dcentrald_stratum` + the `Am335xUartTransport`).
 /// `DCENT_AM3_BB_STUB_LOOP=1` keeps the old logging-only stub instead.
 /// Pre-energize ownership bundle shared by the AM3-BB engine and its API.
-/// Construction is possible only after the SoC watchdog reports an initial
-/// kick. The mutation gate is then the single API admission domain retained
-/// through teardown.
+/// The immutable, read-only platform snapshot is captured first. Hardware
+/// ownership is possible only after the SoC watchdog reports an initial kick.
+/// The mutation gate is then the single API admission domain retained through
+/// teardown.
+struct Am3BbRouteReceipt {
+    /// Fully normalized topology. The HAL constructor admits only the one
+    /// exact S19J_IO_BOARD_V2_0 tuple and records its identity provenance.
+    platform: BeagleBonePlatform,
+}
+
+impl Am3BbRouteReceipt {
+    fn capture(identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot) -> Result<Self> {
+        if identity.board_target() != "am3-bb-s19jpro" {
+            anyhow::bail!(
+                "am3-bb: runtime admission snapshot names board target {:?}",
+                identity.board_target()
+            );
+        }
+        let platform = BeagleBonePlatform::new()
+            .context("am3-bb: failed to capture admitted BeagleBone topology")?;
+        if platform.board_target_name() != identity.board_target() {
+            anyhow::bail!(
+                "am3-bb: captured platform target {} contradicts startup snapshot {}",
+                platform.board_target_name(),
+                identity.board_target()
+            );
+        }
+        info!(
+            startup_identity_source = identity.board_target_source(),
+            topology_identity_source = platform.identity_evidence().receipt_label(),
+            "AM3_BB_TOPOLOGY_CAPTURE_RECEIPT schema=v2 run_pid={} board_target=am3-bb-s19jpro soc=am335x carrier=S19J_IO_BOARD_V2_0 asic=BM1362 asic_evidence=declared_runtime_composition topology_profile=s19j_io_board_v2_0_exact_v1 gpio_profile=enable59-rst49_60_27_22-plug51_48_47_46-fantach7_20_110_112-led23_45 uart_profile=ttyS1_48022000-ttyS2_48024000-ttyS4_481a8000-3000000 i2c_profile=eeprom0_50_51_52-deny-psu1_10 cold_boot_profile=15000_13800-reset10_1100_retry1x2_200_100-fan10_30 identity_evidence={}",
+            std::process::id(),
+            platform.identity_evidence().receipt_label(),
+        );
+        Ok(Self { platform })
+    }
+
+    fn api_identity(&self) -> crate::runtime::api::AdmittedApiHardwareIdentity {
+        let evidence_source = self.platform.identity_evidence().receipt_label();
+        crate::runtime::api::AdmittedApiHardwareIdentity {
+            control_board_label: "BeagleBone am3-bb-s19jpro".to_string(),
+            chip_type_label: "BM1362".to_string(),
+            identification: dcentrald_api::HardwareIdentification::from_evidence(
+                vec![
+                    dcentrald_api::HardwareIdentityEvidence::observed_control_board(format!(
+                        "AM335x/S19J_IO_BOARD_V2_0/{evidence_source}"
+                    )),
+                    dcentrald_api::HardwareIdentityEvidence::declared_asic_board_target(
+                        "am3-bb-s19jpro",
+                        "BM1362",
+                    ),
+                ],
+                Some(
+                    "Exact AM335x carrier topology admitted; BM1362 is declared composition and chip population remains unproven"
+                        .to_string(),
+                ),
+            ),
+        }
+    }
+
+    fn publish_admission_receipt(&self) {
+        info!(
+            topology_identity_source = self.platform.identity_evidence().receipt_label(),
+            "AM3_BB_ROUTE_ADMISSION_RECEIPT schema=v2 run_pid={} board_target=am3-bb-s19jpro soc=am335x carrier=S19J_IO_BOARD_V2_0 asic=BM1362 asic_evidence=declared_runtime_composition topology_profile=s19j_io_board_v2_0_exact_v1 gpio_profile=enable59-rst49_60_27_22-plug51_48_47_46-fantach7_20_110_112-led23_45 uart_profile=ttyS1_48022000-ttyS2_48024000-ttyS4_481a8000-3000000 i2c_profile=eeprom0_50_51_52-deny-psu1_10 cold_boot_profile=15000_13800-reset10_1100_retry1x2_200_100-fan10_30 identity_evidence={}",
+            std::process::id(),
+            self.platform.identity_evidence().receipt_label(),
+        );
+    }
+}
+
 pub(crate) struct Am3BbSafetyAdmission {
+    /// Immutable board-target topology captured while consuming the exact
+    /// runtime-dispatch admission. The engine must never reread route files.
+    route_receipt: Am3BbRouteReceipt,
     watchdog: SafetyWatchdogOwner,
+    watchdog_route_scope: Am3BbWatchdogRouteScope,
     liveness: SafetyLiveness,
     hardware_mutation_owner: HardwareMutationGateOwner,
+    never_energized: Am3BbNeverEnergized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Am3BbFailureDisposition {
+    NoWatchdogOpened,
+    NeverEnergizedClosed,
+    TerminalSafeOffClosed,
+    ResetPending,
+}
+
+#[derive(Debug)]
+pub(crate) struct Am3BbLifecycleError {
+    disposition: Am3BbFailureDisposition,
+    source: anyhow::Error,
+    closeout: Option<Am3BbFailureCloseout>,
+}
+
+impl Am3BbLifecycleError {
+    fn no_watchdog_opened(source: anyhow::Error) -> Self {
+        Self {
+            disposition: Am3BbFailureDisposition::NoWatchdogOpened,
+            source,
+            closeout: None,
+        }
+    }
+
+    fn never_energized_closed(
+        source: anyhow::Error,
+        closeout: Am3BbNeverEnergizedCloseout,
+    ) -> Self {
+        Self {
+            disposition: Am3BbFailureDisposition::NeverEnergizedClosed,
+            source,
+            closeout: Some(Am3BbFailureCloseout::NeverEnergized(closeout)),
+        }
+    }
+
+    fn terminal_safe_off_closed(
+        source: anyhow::Error,
+        closeout: Am3BbTerminalSafeOffCloseout,
+    ) -> Self {
+        Self {
+            disposition: Am3BbFailureDisposition::TerminalSafeOffClosed,
+            source,
+            closeout: Some(Am3BbFailureCloseout::TerminalSafeOff(closeout)),
+        }
+    }
+
+    fn reset_pending(source: anyhow::Error) -> Self {
+        Self {
+            disposition: Am3BbFailureDisposition::ResetPending,
+            source,
+            closeout: None,
+        }
+    }
+
+    pub(crate) fn disposition(&self) -> Am3BbFailureDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Am3BbFailureDisposition,
+        anyhow::Error,
+        Option<Am3BbFailureCloseout>,
+    ) {
+        (self.disposition, self.source, self.closeout)
+    }
+}
+
+impl std::fmt::Display for Am3BbLifecycleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for Am3BbLifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl From<anyhow::Error> for Am3BbLifecycleError {
+    fn from(source: anyhow::Error) -> Self {
+        Self::reset_pending(source)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Am3BbNeverEnergizedCloseout {
+    _api: HardwareMutationBarrierReceipt,
+    _watchdog: WatchdogCloseoutReceipt,
+}
+
+/// Positive post-energization terminal authority. The opaque watchdog receipt
+/// can be minted only after the AM3 manifest has consumed the API barriers,
+/// exact heartbeat-roster join, controller-fabric transition, checked board
+/// safe-off receipt, and matching absolute teardown authority, followed by a
+/// successful magic-close write and watchdog-worker join.
+#[derive(Debug)]
+pub(crate) struct Am3BbTerminalSafeOffCloseout {
+    _watchdog: WatchdogCloseoutReceipt,
+}
+
+/// Closeout evidence is state-specific so `main` cannot accidentally accept a
+/// never-energized receipt for a post-energization failure (or vice versa).
+#[derive(Debug)]
+pub(crate) enum Am3BbFailureCloseout {
+    NeverEnergized(Am3BbNeverEnergizedCloseout),
+    TerminalSafeOff(Am3BbTerminalSafeOffCloseout),
 }
 
 impl Am3BbSafetyAdmission {
-    pub(crate) async fn start(config: &DcentraldConfig) -> Result<Self> {
+    pub(crate) async fn start(
+        config: &DcentraldConfig,
+        identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+        runtime_dispatch_admission: crate::RuntimeDispatchAdmission,
+    ) -> std::result::Result<Self, Am3BbLifecycleError> {
+        let _asic_protocol_admission = runtime_dispatch_admission
+            .require_asic_protocol(
+                crate::RuntimeDispatchKind::Am3BeagleBone,
+                "am3-bb-s19jpro",
+                dcentrald_common::AsicProtocolIdentity::Bm1362,
+            )
+            .map_err(anyhow::Error::msg)
+            .map_err(Am3BbLifecycleError::no_watchdog_opened)?;
+        // Capture and normalize every mutating GPIO/UART/I2C/cold-boot field
+        // once. The move-only receipt, not a target-name comparison, is the
+        // route authority subsequently consumed by hardware and API state.
+        let route_receipt = Am3BbRouteReceipt::capture(identity)
+            .map_err(Am3BbLifecycleError::no_watchdog_opened)?;
+
         let liveness = SafetyLiveness::default();
         let expected_liveness =
             am3_bb_expected_safety_liveness_interval(config.thermal.pid_interval_s);
-        let (watchdog, admission) = SafetyWatchdogOwner::start_before_energizing(
+        let (mut watchdog, admission) = SafetyWatchdogOwner::start_before_energizing(
             &config.watchdog,
             AM3_BB_WATCHDOG_BRINGUP_GRACE,
             expected_liveness,
             liveness.clone(),
         )
-        .await?;
-        let receipt = admission.require_armed("am3-bb")?;
+        .await
+        .map_err(anyhow::Error::new)
+        .map_err(Am3BbLifecycleError::no_watchdog_opened)?;
+        let receipt = match admission {
+            WatchdogAdmission::Armed(receipt) => receipt,
+            WatchdogAdmission::DisabledByConfiguration => {
+                return Err(Am3BbLifecycleError::no_watchdog_opened(anyhow::anyhow!(
+                    "am3-bb requires an armed SoC watchdog; watchdog is disabled by configuration"
+                )))
+            }
+            WatchdogAdmission::UnavailableBeforeOpen { reason } => {
+                return Err(Am3BbLifecycleError::no_watchdog_opened(anyhow::anyhow!(
+                    "am3-bb watchdog was unavailable before opening a descriptor: {reason}"
+                )))
+            }
+            WatchdogAdmission::OpenedOrOutcomeUnknown { reason } => {
+                return Err(Am3BbLifecycleError::reset_pending(anyhow::anyhow!(
+                    "am3-bb watchdog descriptor was opened or is outcome-unknown: {reason}"
+                )))
+            }
+        };
+        let watchdog_route_scope = watchdog.claim_am3_bb_route_scope()?;
+        let never_energized = watchdog.issue_am3_bb_never_energized()?;
+        route_receipt.publish_admission_receipt();
         info!(
             requested_timeout_s = receipt.requested_timeout_s,
             effective_timeout_s = receipt.effective_timeout_s,
@@ -935,14 +1191,40 @@ impl Am3BbSafetyAdmission {
         );
         let hardware_mutation_owner = HardwareMutationGateOwner::new_pending();
         Ok(Self {
+            route_receipt,
             watchdog,
+            watchdog_route_scope,
             liveness,
             hardware_mutation_owner,
+            never_energized,
         })
     }
 
     pub(crate) fn hardware_mutation_gate(&self) -> HardwareMutationGate {
         self.hardware_mutation_owner.gate()
+    }
+
+    pub(crate) fn api_identity(&self) -> crate::runtime::api::AdmittedApiHardwareIdentity {
+        self.route_receipt.api_identity()
+    }
+
+    pub(crate) async fn disarm_never_energized(self) -> Result<Am3BbNeverEnergizedCloseout> {
+        let Self {
+            mut watchdog,
+            hardware_mutation_owner,
+            never_energized,
+            ..
+        } = self;
+        let api = hardware_mutation_owner
+            .close_and_drain(Duration::ZERO)
+            .context("am3-bb: pre-energization API mutation gate did not close")?;
+        let watchdog = watchdog
+            .disarm_am3_bb_never_energized(never_energized, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+            .await?;
+        Ok(Am3BbNeverEnergizedCloseout {
+            _api: api,
+            _watchdog: watchdog,
+        })
     }
 }
 
@@ -950,13 +1232,22 @@ pub async fn run_am3_bb_mining(
     config: DcentraldConfig,
     shutdown: CancellationToken,
     safety_admission: Am3BbSafetyAdmission,
-) -> Result<()> {
+    state_tx: watch::Sender<dcentrald_api::MinerState>,
+) -> std::result::Result<(), Am3BbLifecycleError> {
     info!("Entering AM335x BB mining mode (--am3-bb-mining) — S19J_IO_BOARD_V2_0 / .79-class");
 
     if !config.mining_start_enabled() && std::env::var_os("DCENT_AM3_BB_STUB_LOOP").is_none() {
-        anyhow::bail!(
-            "am3-bb: mining is disabled or no pool is configured; refusing hardware cold-boot after safety admission"
-        );
+        return match safety_admission.disarm_never_energized().await {
+            Ok(closeout) => Err(Am3BbLifecycleError::never_energized_closed(
+                anyhow::anyhow!(
+                    "am3-bb: mining is disabled or no pool is configured; watchdog closed before hardware cold-boot"
+                ),
+                closeout,
+            )),
+            Err(error) => Err(Am3BbLifecycleError::reset_pending(error.context(
+                "am3-bb: configuration refusal could not close the never-energized watchdog run",
+            ))),
+        };
     }
 
     // The cold-boot + chip-init is blocking device I/O (mmap UART, i2c-gpio
@@ -967,54 +1258,130 @@ pub async fn run_am3_bb_mining(
     // runtime handle (mpsc channels bridge the two).
     let rt_handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
-        run_am3_bb_blocking(config, shutdown, rt_handle, safety_admission)
+        run_am3_bb_blocking(config, shutdown, rt_handle, safety_admission, state_tx)
     })
     .await
-    .context("am3-bb mining blocking task panicked")?;
+    .map_err(|error| {
+        Am3BbLifecycleError::reset_pending(
+            anyhow::Error::new(error).context("am3-bb mining blocking task panicked"),
+        )
+    })?;
     result
 }
 
 /// The blocking body of [`run_am3_bb_mining`].
+fn close_am3_bb_never_energized_after_error(
+    rt_handle: &tokio::runtime::Handle,
+    watchdog: SafetyWatchdogOwner,
+    hardware_mutation_owner: HardwareMutationGateOwner,
+    evidence: Am3BbNeverEnergized,
+    primary: anyhow::Error,
+) -> Am3BbLifecycleError {
+    let api = match hardware_mutation_owner.close_and_drain(Duration::ZERO) {
+        Ok(receipt) => receipt,
+        Err(closeout) => {
+            return Am3BbLifecycleError::reset_pending(anyhow::Error::new(closeout).context(
+                format!("AM3-BB pre-energization API closeout failed after: {primary:#}"),
+            ))
+        }
+    };
+    match rt_handle
+        .block_on(watchdog.disarm_am3_bb_never_energized(evidence, DEFAULT_WATCHDOG_STOP_TIMEOUT))
+    {
+        Ok(watchdog) => Am3BbLifecycleError::never_energized_closed(
+            primary.context(
+                "AM3-BB pre-energization failure closed the watchdog with positive evidence",
+            ),
+            Am3BbNeverEnergizedCloseout {
+                _api: api,
+                _watchdog: watchdog,
+            },
+        ),
+        Err(closeout) => Am3BbLifecycleError::reset_pending(closeout.context(format!(
+            "AM3-BB pre-energization watchdog closeout failed after: {primary:#}"
+        ))),
+    }
+}
+
 fn run_am3_bb_blocking(
     config: DcentraldConfig,
     shutdown: CancellationToken,
     rt_handle: tokio::runtime::Handle,
     safety_admission: Am3BbSafetyAdmission,
-) -> Result<()> {
+    state_tx: watch::Sender<dcentrald_api::MinerState>,
+) -> std::result::Result<(), Am3BbLifecycleError> {
     // Declare the watchdog first so every later hardware owner drops before
     // its fail-closed owner on early-return paths.
     let Am3BbSafetyAdmission {
+        route_receipt,
         mut watchdog,
+        mut watchdog_route_scope,
         liveness: watchdog_liveness,
         hardware_mutation_owner,
+        never_energized,
     } = safety_admission;
+    let mut never_energized = Some(never_energized);
+    let mut terminal_state = Am3BbTerminalStatePublisher::new(state_tx.clone());
+    macro_rules! pre_energize_try {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    let evidence = match never_energized.take() {
+                        Some(evidence) => evidence,
+                        None => {
+                            return Err(Am3BbLifecycleError::reset_pending(error.context(
+                                "AM3-BB pre-energization close authority was already consumed",
+                            )));
+                        }
+                    };
+                    let lifecycle_error = close_am3_bb_never_energized_after_error(
+                        &rt_handle,
+                        watchdog,
+                        hardware_mutation_owner,
+                        evidence,
+                        error.into(),
+                    );
+                    if lifecycle_error.disposition()
+                        == Am3BbFailureDisposition::NeverEnergizedClosed
+                    {
+                        terminal_state.record_safe_off(true);
+                    }
+                    return Err(lifecycle_error);
+                }
+            }
+        };
+    }
+    let platform = route_receipt.platform;
     // Validate every operator assertion and resolve catalog-backed geometry
-    // before BeagleBonePlatform::new can probe I2C controller identity.
-    let expected_chips_per_chain = resolve_am3_bb_chips_per_chain(
+    // before the admitted platform can open any hardware owner.
+    let expected_chips_per_chain = pre_energize_try!(resolve_am3_bb_chips_per_chain(
         config.mining.model.as_deref(),
         config.mining.serial_chip_type.as_deref(),
         config.mining.serial_chip_count,
-    )?;
+    ));
 
-    // ── 1. Build the platform (loads /etc/dcentos/board_targets/<name>.toml,
-    //       or the hardcoded .79 defaults; side-effect-free). ──
-    let platform = BeagleBonePlatform::new().context("BeagleBonePlatform::new() failed")?;
+    // Step 1 uses the exact platform topology captured during route admission.
+    // Do not reread board-target, device-tree, GPIO, UART, or I2C route files.
     let bt = platform.board_target();
     let chain_specs = chain_uart_specs(&platform);
     let stub_loop = std::env::var_os("DCENT_AM3_BB_STUB_LOOP").is_some();
     if !stub_loop {
         for forbidden_override in [
             ENV_AM3_BB_SKIP_DSPIC_INIT,
+            ENV_AM3_BB_SKIP_DSPIC_SET_VOLTAGE,
             ENV_AM3_BB_SKIP_DSPIC_HEARTBEAT,
             ENV_AM3_BB_DSPIC_EARLY_ENABLE,
             ENV_AM3_BB_DISABLE_HEARTBEAT_SUPERVISOR,
             ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR,
             ENV_AM3_BB_DISABLE_FAN_PID,
+            ENV_AM3_BB_ALLOW_NO_RX_MINING,
+            ENV_AM2_ACCEPT_DEGRADED_HARDWARE,
         ] {
             if env_flag_set(forbidden_override) {
-                anyhow::bail!(
+                pre_energize_try!(Err(anyhow::anyhow!(
                     "am3-bb: watched Mining admission forbids safety override {forbidden_override}"
-                );
+                )));
             }
         }
     }
@@ -1054,21 +1421,44 @@ fn run_am3_bb_blocking(
     // begins, every return path should leave the board in a reversible bench
     // state: capped fans, ASIC resets asserted, and board-enable off. dsPIC
     // voltage disable is attached after the controllers initialize.
-    let mut _run_safety_guard = Some(Am3BbRunSafetyGuard::new(
+    let mut _run_safety_guard = Some(pre_energize_try!(Am3BbRunSafetyGuard::new(
         &platform,
         None,
         Vec::new(),
         chain_specs.len(),
         config.thermal.fan_min_pwm,
         config.thermal.fan_max_pwm,
-    )?);
+    )));
     // Arm the crash-panic-hook teardown (panic="abort" bypasses the guard's Drop).
     // Done here, before board-enable is driven HIGH, so even a panic during
     // cold-boot cuts board power via main()'s panic hook. (wf_7c757213 safety audit.)
-    arm_am3_bb_teardown(&platform, chain_specs.len());
+    let panic_board_cutoff = pre_energize_try!(_run_safety_guard
+        .as_mut()
+        .context("am3-bb: run safety guard disappeared before panic-hook arm")
+        .and_then(Am3BbRunSafetyGuard::take_panic_board_cutoff));
+    let panic_watchdog_feed_stop = watchdog.feed_stop_signal();
+    pre_energize_try!(arm_am3_bb_teardown(
+        &platform,
+        chain_specs.len(),
+        panic_board_cutoff,
+        panic_watchdog_feed_stop,
+    ));
 
     if shutdown.is_cancelled() {
         info!("am3-bb: shutdown requested before cold-boot — exiting cleanly");
+        let evidence = never_energized
+            .take()
+            .context("am3-bb: missing never-energized close authority")?;
+        let api = hardware_mutation_owner
+            .close_and_drain(Duration::ZERO)
+            .context("am3-bb: pre-cold-boot cancellation API gate did not close")?;
+        let watchdog_closeout = rt_handle.block_on(
+            watchdog.disarm_am3_bb_never_energized(evidence, DEFAULT_WATCHDOG_STOP_TIMEOUT),
+        )?;
+        terminal_state.finish_never_energized(Am3BbNeverEnergizedCloseout {
+            _api: api,
+            _watchdog: watchdog_closeout,
+        });
         return Ok(());
     }
 
@@ -1080,11 +1470,13 @@ fn run_am3_bb_blocking(
     // otherwise the mmap of /dev/mem hits the Zynq PL-UART address, which is an
     // unmapped region on AM335x → SIGBUS. The table is a process-wide OnceLock;
     // calling this once before any `DevmemUart::open` is the contract.
-    dcentrald_hal::serial::select_uart_table_am335x()
-        .context("am3-bb: select AM335x OMAP UART MMIO table (must precede DevmemUart::open)")?;
+    pre_energize_try!(dcentrald_hal::serial::select_uart_table_am335x()
+        .context("am3-bb: select AM335x OMAP UART MMIO table (must precede DevmemUart::open)"));
     let enum_baud = 115_200u32;
     if chain_specs.is_empty() {
-        anyhow::bail!("am3-bb: board-target declares zero chain UARTs - nothing to mine on");
+        pre_energize_try!(Err(anyhow::anyhow!(
+            "am3-bb: board-target declares zero chain UARTs - nothing to mine on"
+        )));
     }
     let mut cold_boot_uarts: Vec<DevmemUart> = Vec::new();
     info!(
@@ -1097,18 +1489,20 @@ fn run_am3_bb_blocking(
             "am3-bb: lab override active - opening temporary DevmemUart handles for cold-boot shape check"
         );
         for spec in &chain_specs {
-            let uart = DevmemUart::open_no_unbind(&spec.device, enum_baud).with_context(|| {
+            let uart = pre_energize_try!(DevmemUart::open_no_unbind(&spec.device, enum_baud).with_context(|| {
             format!(
                 "am3-bb: DevmemUart::open({}, {}) failed — is stock luxminer/cgminer still running? \
                  stop it first",
                 spec.device, enum_baud
             )
-        })?;
+        }));
             info!(device = %spec.device, baud = enum_baud, "am3-bb: temporary cold-boot UART opened");
             cold_boot_uarts.push(uart);
         }
         if cold_boot_uarts.is_empty() {
-            anyhow::bail!("am3-bb: board-target declares zero chain UARTs — nothing to mine on");
+            pre_energize_try!(Err(anyhow::anyhow!(
+                "am3-bb: board-target declares zero chain UARTs — nothing to mine on"
+            )));
         }
 
         // ── 3. Build the APW121215f UART-tunnel PSU controller (bus 1 @ 0x10). ──
@@ -1116,9 +1510,9 @@ fn run_am3_bb_blocking(
 
     let psu_bus_num = platform.psu_i2c_bus();
     let psu_addr = platform.psu_i2c_addr();
-    let psu_i2c = platform
+    let psu_i2c = pre_energize_try!(platform
         .open_i2c(psu_bus_num)
-        .with_context(|| format!("am3-bb: open /dev/i2c-{} (PSU bus) failed", psu_bus_num))?;
+        .with_context(|| format!("am3-bb: open /dev/i2c-{} (PSU bus) failed", psu_bus_num)));
     let mut psu = ApwUartTunnel::new_at(DirectI2cApwBus { bus: psu_i2c }, psu_addr);
     info!(
         psu_bus = psu_bus_num,
@@ -1160,18 +1554,32 @@ fn run_am3_bb_blocking(
     //       which the cold-boot fn treats as non-fatal). The gpio enable +
     //       reset de-assert + settles are real. ──
     info!("am3-bb: starting cold-boot sequence (ColdBootOptsV2 from board-target)");
+    let board_enable = pre_energize_try!(_run_safety_guard
+        .as_mut()
+        .context("am3-bb: retained board-enable owner disappeared before cold boot"))
+    .board_enable_owner();
+    let energizing_boundary = match never_energized.take() {
+        Some(evidence) => evidence,
+        None => {
+            return Err(anyhow::anyhow!(
+                "am3-bb: never-energized authority disappeared at the cold-boot boundary; watchdog reset pending"
+            )
+            .into())
+        }
+    };
+    drop(energizing_boundary);
     platform
-        .run_cold_boot(&mut psu, &mut cold_boot_uarts)
+        .run_cold_boot(&mut psu, &mut cold_boot_uarts, board_enable)
         .context("am3-bb: cold-boot sequence failed")?;
     info!("am3-bb: cold-boot sequence returned OK");
     drop(cold_boot_uarts);
     info!("am3-bb: cold-boot complete with no temporary DevmemUart ownership");
 
     if shutdown.is_cancelled() {
-        info!(
-            "am3-bb: shutdown requested after cold-boot - safety guard will leave rails disabled"
-        );
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            "am3-bb: shutdown requested after cold-boot; safety guard will attempt cutoff during unwind; safe-off remains unproven and watchdog reset is pending"
+        )
+        .into());
     }
 
     // ── 4b. Hashboard-SKU energize-refusal gate ( B2, 2026-05-22). ──
@@ -1256,10 +1664,11 @@ fn run_am3_bb_blocking(
                         "am3-bb: [ENERGIZE-REFUSED] {}",
                         refusal.summary()
                     );
-                    anyhow::bail!(
+                    return Err(anyhow::anyhow!(
                         "am3-bb hashboard-SKU energize gate refused: {}",
                         refusal.summary()
-                    );
+                    )
+                    .into());
                 }
             }
         }
@@ -1326,17 +1735,19 @@ fn run_am3_bb_blocking(
             early_enable,
         );
         if active_dspic_addrs.is_empty() {
-            anyhow::bail!(
+            return Err(anyhow::anyhow!(
                 "am3-bb: no fw=0x89 hashboard dsPIC controllers initialized on bus {}",
                 AM3_BB_DSPIC_I2C_BUS
-            );
+            )
+            .into());
         }
         if !stub_loop && active_dspic_addrs != conservatively_owned_dspic_addrs {
-            anyhow::bail!(
-                "am3-bb: production mining requires exact dsPIC topology {:?}, observed {:?}; refusing partially owned hash power",
+            return Err(anyhow::anyhow!(
+                "am3-bb: non-stub mining requires exact dsPIC topology {:?}, observed {:?}; refusing partially owned hash power",
                 conservatively_owned_dspic_addrs,
                 active_dspic_addrs
-            );
+            )
+            .into());
         }
         info!(
             active_dspic_addrs = format_args!("{:02X?}", active_dspic_addrs),
@@ -1353,11 +1764,17 @@ fn run_am3_bb_blocking(
                 "am3-bb: lab override active — dsPIC runtime heartbeat thread disabled"
             );
         } else {
+            let actor_owner = watchdog_route_scope.take_actor_owner()?;
+            let heartbeat_board_cutoff = _run_safety_guard
+                .as_mut()
+                .context("am3-bb: run safety guard disappeared before heartbeat start")?
+                .take_heartbeat_board_cutoff()?;
             let mut heartbeat_guard = start_am3_bb_dspic_heartbeat(
+                actor_owner,
                 dspic_i2c.clone(),
                 active_dspic_addrs.clone(),
                 shutdown.clone(),
-                &platform,
+                heartbeat_board_cutoff,
             )?;
             let readiness = heartbeat_guard
                 .wait_for_verified_heartbeat_readiness(&shutdown)
@@ -1388,9 +1805,10 @@ fn run_am3_bb_blocking(
         );
     } else {
         let Some(dspic_i2c) = dspic_i2c_main.as_ref() else {
-            anyhow::bail!(
+            return Err(anyhow::anyhow!(
                 "am3-bb: dsPIC I2C service is unavailable; refusing to mine without thermal supervisor"
-            );
+            )
+            .into());
         };
         // Production requires one thermally covered dsPIC per declared
         // hash-chain. The enum-only stub may inspect a partial topology, but it
@@ -1411,8 +1829,10 @@ fn run_am3_bb_blocking(
     }
 
     if shutdown.is_cancelled() {
-        info!("am3-bb: shutdown requested after dsPIC init — exiting cleanly");
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            "am3-bb: shutdown requested after dsPIC init; safety guard will attempt cutoff during unwind; safe-off remains unproven and watchdog reset is pending"
+        )
+        .into());
     }
 
     // ── 6. BM1362 chip-side init per chain. ──
@@ -1480,7 +1900,9 @@ fn run_am3_bb_blocking(
         uarts.push(uart);
     }
     if uarts.is_empty() {
-        anyhow::bail!("am3-bb: board-target declares zero mining chain UARTs");
+        return Err(
+            anyhow::anyhow!("am3-bb: board-target declares zero mining chain UARTs").into(),
+        );
     }
 
     let mut total_chips: usize = 0;
@@ -1549,19 +1971,19 @@ fn run_am3_bb_blocking(
         .sum();
     info!(
         chains = uarts.len(),
-        total_chips,
+        assigned_chips_total = total_chips,
         rx_proven_chains,
         crc_verified_unassigned_observation_chains,
         crc_verified_unassigned_response_frames,
         initial_rx_bytes = ?initial_rx_bytes,
         fast_rx_bytes = ?fast_rx_bytes,
-        "am3-bb: BM1362 enumeration complete across all chains"
+        "am3-bb: configured BM1362 address assignment complete; this is not measured unique-chip enumeration"
     );
 
     // ── 6. Build the work-dispatch transport over the per-chain UARTs. ──
     let allow_no_rx_mining = env_flag_set(ENV_AM3_BB_ALLOW_NO_RX_MINING);
     if rx_proven_chains == 0 && !stub_loop && !allow_no_rx_mining {
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "am3-bb: refusing full mining because no BM1362 chain returned any UART bytes \
              during 115200 or fast-baud GetAddress probes (initial_rx_bytes={:?}, \
              fast_rx_bytes={:?}). Set {}=1 only for a bench override; remaining blocker is \
@@ -1569,7 +1991,8 @@ fn run_am3_bb_blocking(
             initial_rx_bytes,
             fast_rx_bytes,
             ENV_AM3_BB_ALLOW_NO_RX_MINING
-        );
+        )
+        .into());
     }
     if rx_proven_chains == 0 && allow_no_rx_mining {
         warn!(
@@ -1698,20 +2121,24 @@ fn run_am3_bb_blocking(
     // ── 8. Mining loop (Option B2 — reuse dcentrald_stratum + the transport).
     //       `DCENT_AM3_BB_STUB_LOOP=1` keeps the old logging-only stub for a
     //       cold-boot/enum-only diagnostic run. ──
-    let mining_result = if stub_loop {
+    let (mining_result, mut stratum_tasks, stratum_ownership_result) = if stub_loop {
         warn!("am3-bb: DCENT_AM3_BB_STUB_LOOP set — running the cold-boot/enum-only logging stub, NOT the mining loop");
         run_mining_loop_stub(&mut transport, total_chips, &shutdown);
-        Ok(())
+        (Ok(()), None, Ok(()))
     } else {
         // Borrow the run guard's clamp-enforced fan view for the continuous
         // PR-021 PID. The guard keeps ownership for the fail-closed teardown;
         // this is `None` if the BeagleBone PWM never opened (the PID then
         // simply doesn't run — the fail-closed supervisor still does).
-        let pid_fan = _run_safety_guard.as_ref().and_then(|g| g.capped_fan());
+        let run_guard = _run_safety_guard
+            .as_mut()
+            .context("am3-bb: run safety guard disappeared before mining loop")?;
+        let pid_fan = run_guard.capped_fan();
+        let mut runtime_cutoff = run_guard.runtime_cutoff();
         let heartbeat = dspic_heartbeat_guard
             .as_mut()
             .context("am3-bb: dsPIC heartbeat owner is missing before mining loop")?;
-        run_mining_loop(
+        match run_mining_loop(
             &config,
             &mut transport,
             total_chips,
@@ -1724,23 +2151,104 @@ fn run_am3_bb_blocking(
             &mut watchdog,
             watchdog_liveness,
             &hardware_mutation_owner,
-            platform.board_enable_gpio_v2_0(),
-            platform.board_target().board_enable_active_high(),
-        )
-        .context("am3-bb: mining loop exited with error")
+            &mut runtime_cutoff,
+            state_tx.clone(),
+        ) {
+            Ok(exit) => (exit.mining_result, Some(exit.stratum_tasks), Ok(())),
+            Err(error) => (
+                Err(error.into_source().context(
+                    "am3-bb: mining loop admission failed before any Stratum task was spawned",
+                )),
+                None,
+                Ok(()),
+            ),
+        }
     };
 
-    // Every exit, including a mining-loop error, enters the same bounded
-    // closeout. A missing prerequisite prevents Disarm submission and leaves
-    // the watchdog armed. Once Disarm is submitted, timeout means the
-    // magic-close outcome is unknown; a later join error may follow a completed
-    // magic-close and must not be collapsed into an "armed" claim.
-    rt_handle
-        .block_on(watchdog.begin_teardown(DEFAULT_WATCHDOG_TEARDOWN_GRACE))
-        .context("am3-bb: watchdog refused Teardown admission")?;
-    let api_barrier = hardware_mutation_owner
-        .close_and_drain(AM3_BB_API_MUTATION_DRAIN_TIMEOUT)
-        .context("am3-bb: API mutation admission did not drain")?;
+    // Every mining-loop exit after asynchronous ownership transfers enters this
+    // bounded closeout, as does mining-loop admission failure before Stratum
+    // ownership starts. Earlier post-energization bring-up failures retain the
+    // fail-closed guard and leave watchdog reset pending. A missing closeout
+    // prerequisite prevents Disarm submission and leaves the watchdog armed.
+    // Once Disarm is submitted, timeout means the magic-close outcome is
+    // unknown; a later join error may follow a completed magic-close and must
+    // not be collapsed into an "armed" claim.
+    let revoked_api_commit_fence = hardware_mutation_owner.revoke_commit_fence();
+    let teardown_request = watchdog
+        .request_teardown_budget()
+        .context("am3-bb: watchdog could not issue its one-shot teardown budget")?;
+    let (teardown_budget, pending_watchdog_teardown_admission) = teardown_request.into_parts();
+    let teardown_view = teardown_budget.view();
+    // Publish the independent heartbeat worker's stop before the first physical
+    // cutoff can block. Its bounded join remains later on the shared absolute
+    // teardown deadline so requesting cancellation cannot spend cleanup budget.
+    let heartbeat_feeder_owner = dspic_heartbeat_guard
+        .as_ref()
+        .context("am3-bb: dsPIC heartbeat owner is missing before teardown cutoff")?;
+    heartbeat_feeder_owner.request_stop();
+    // GPIO59 is the load-bearing physical cut. New API commits were revoked
+    // synchronously above and the watchdog deadline/command are published;
+    // perform the checked OFF write before waiting for the actor acknowledgement
+    // or spending cleanup time on leases, controllers, actors, or reset sysfs.
+    let board_cutoff_result = _run_safety_guard
+        .as_mut()
+        .context("am3-bb: run safety guard is missing before early board cutoff")?
+        .cut_board_enable_checked(teardown_view.clone());
+    if let Err(error) = &board_cutoff_result {
+        warn!(
+            %error,
+            "am3-bb: early checked board-enable cutoff failed; defense-in-depth teardown will continue and watchdog Disarm is forbidden"
+        );
+    }
+    if let Some(tasks) = stratum_tasks.as_ref() {
+        tasks.request_stop();
+    }
+    terminal_state.begin_stopping();
+    let watchdog_teardown_admission_result = rt_handle.block_on(
+        watchdog.observe_teardown_admission(pending_watchdog_teardown_admission, &teardown_view),
+    );
+    if let Err(error) = &watchdog_teardown_admission_result {
+        warn!(
+            %error,
+            "am3-bb: watchdog Teardown acknowledgement failed after local deadline publication and immediate board cutoff; defense-in-depth teardown will continue with Disarm forbidden"
+        );
+    }
+    let api_drain_deadline = am3_bb_capped_cleanup_deadline(
+        teardown_view.deadline(TeardownStage::CleanupComplete),
+        Instant::now(),
+        AM3_BB_API_MUTATION_DRAIN_TIMEOUT,
+    );
+    let api_barrier_result = hardware_mutation_owner
+        .close_and_drain_until(api_drain_deadline)
+        .context("am3-bb: API mutation admission did not drain before its absolute deadline");
+    if let Err(error) = &api_barrier_result {
+        warn!(
+            %error,
+            "am3-bb: API mutation drain lacked positive evidence; explicit controller and board safe-off will continue with watchdog disarm forbidden"
+        );
+    }
+    let api_commit_fence_result = match revoked_api_commit_fence.try_wait() {
+        HardwareMutationCommitFenceTryWait::Fenced(receipt) if receipt.fence_poisoned() => {
+            Err(anyhow::anyhow!(
+                "am3-bb: API commit fence is quiescent but poisoned by an unwound mutation"
+            ))
+        }
+        HardwareMutationCommitFenceTryWait::Fenced(receipt) => Ok(receipt),
+        HardwareMutationCommitFenceTryWait::Pending(_) => Err(anyhow::anyhow!(
+            "am3-bb: API commit fence remained busy after the bounded mutation drain"
+        )),
+    };
+    match &api_commit_fence_result {
+        Ok(receipt) => info!(
+            closed_generation = receipt.closed_generation(),
+            fence_poisoned = receipt.fence_poisoned(),
+            "am3-bb: fenced every entered API hardware commit before terminal controller safe-off"
+        ),
+        Err(error) => warn!(
+            %error,
+            "am3-bb: API final-commit fence lacked clean evidence; explicit controller and board safe-off will continue with watchdog disarm forbidden"
+        ),
+    }
     let dspic_i2c = dspic_i2c_main
         .as_ref()
         .context("am3-bb: dsPIC I2C ownership is missing at teardown")?;
@@ -1752,10 +2260,15 @@ fn run_am3_bb_blocking(
         "am3-bb: terminal I2C admission latched before actor shutdown"
     );
 
+    let heartbeat_stop_deadline = am3_bb_capped_cleanup_deadline(
+        teardown_view.deadline(TeardownStage::CleanupComplete),
+        Instant::now(),
+        Duration::from_millis(AM3_BB_DSPIC_HEARTBEAT_STOP_TIMEOUT_MS),
+    );
     let heartbeat_shutdown = dspic_heartbeat_guard
         .as_mut()
         .context("am3-bb: dsPIC heartbeat owner is missing at teardown")?
-        .stop_and_join(&rt_handle);
+        .stop_and_join_until(&rt_handle, heartbeat_stop_deadline);
     if !heartbeat_shutdown.graceful() {
         let evidence = heartbeat_shutdown;
         if evidence.worker_timed_out {
@@ -1777,10 +2290,10 @@ fn run_am3_bb_blocking(
             evidence.hard_board_cut_succeeded
         );
         return match mining_result {
-            Ok(()) => Err(heartbeat_error),
-            Err(mining_error) => {
-                Err(heartbeat_error.context(format!("mining loop also failed: {mining_error:#}")))
-            }
+            Ok(()) => Err(heartbeat_error.into()),
+            Err(mining_error) => Err(heartbeat_error
+                .context(format!("mining loop also failed: {mining_error:#}"))
+                .into()),
         };
     }
     let i2c_barrier = dspic_i2c.latch_terminal_safe_off();
@@ -1793,17 +2306,64 @@ fn run_am3_bb_blocking(
     let safe_off = _run_safety_guard
         .as_mut()
         .context("am3-bb: run safety guard is missing at teardown")?
-        .teardown_checked()?;
-    let barriers: [&dyn crate::runtime::safety_watchdog::MutationBarrierEvidence; 2] =
-        [&api_barrier, &i2c_barrier];
-    let permit =
-        WatchdogDisarmPermit::from_evidence_set(&barriers, &heartbeat_shutdown.summary, &safe_off)?;
-    let closeout =
+        .teardown_checked(board_cutoff_result.ok(), teardown_view.clone())?;
+    terminal_state.record_safe_off(mining_result.is_err());
+    // Stratum cancellation was published immediately after the load-bearing
+    // GPIO59 cut. Spend its bounded join budget only after controller actors
+    // are quiescent and checked hardware safe-off is proven, so a wedged pool
+    // task can never consume the physical-safety portion of the deadline.
+    let stratum_join_deadline = am3_bb_capped_cleanup_deadline(
+        teardown_view.deadline(TeardownStage::CleanupComplete),
+        Instant::now(),
+        AM3_BB_STRATUM_STOP_TIMEOUT,
+    );
+    let stratum_tasks_result = match (stratum_tasks.as_mut(), stratum_ownership_result) {
+        (Some(tasks), Ok(())) => tasks.stop_and_join(stratum_join_deadline),
+        (None, Err(error)) => Err(error),
+        (None, Ok(())) => Ok(()),
+        (Some(_), Err(error)) => Err(error.context(
+            "am3-bb: contradictory Stratum task ownership result forbids watchdog Disarm",
+        )),
+    };
+    if let Err(error) = &stratum_tasks_result {
+        warn!(
+            %error,
+            "am3-bb: Stratum cancellation/join lacked positive evidence after checked safe-off; watchdog Disarm is forbidden"
+        );
+    }
+    watchdog_teardown_admission_result.map_err(anyhow::Error::msg)?;
+    let api_barrier = api_barrier_result?;
+    let api_commit_fence = api_commit_fence_result?;
+    stratum_tasks_result?;
+    let teardown_disarm = teardown_budget.begin_disarm_at(Instant::now())?;
+    let manifest = Am3BbWatchdogShutdownManifest::new(
+        watchdog_route_scope,
+        api_barrier,
+        api_commit_fence,
+        i2c_barrier,
+        heartbeat_shutdown
+            .into_actor_receipt()
+            .context("am3-bb: exact dsPIC heartbeat roster lacked clean terminal authority")?,
+        safe_off,
+        teardown_disarm,
+    );
+    let permit = WatchdogDisarmPermit::from_am3_bb_manifest(manifest)?;
+    let watchdog_closeout =
         rt_handle.block_on(watchdog.disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT))?;
-    let WatchdogCloseoutReceipt::MagicCloseWriteCompletedAndWorkerExitObserved = closeout;
+    let terminal_closeout = Am3BbTerminalSafeOffCloseout {
+        _watchdog: watchdog_closeout,
+    };
 
-    mining_result?;
+    if let Err(mining_error) = mining_result {
+        return Err(Am3BbLifecycleError::terminal_safe_off_closed(
+            mining_error.context(
+                "am3-bb: post-energization failure completed checked safe-off and watchdog closeout",
+            ),
+            terminal_closeout,
+        ));
+    }
 
+    terminal_state.finish_stopped();
     info!("am3-bb: mining mode stopped with complete shutdown evidence");
     Ok(())
 }
@@ -1909,6 +2469,8 @@ fn bm1362_single(
     Ok(())
 }
 
+/// MiscCtrl per-chip triple-write cadence: pure `plan_misc_ctrl_triple_write_chip`.
+/// Value + label remain engine policy; reg must stay `MISC_CONTROL_REG` (0x18).
 fn bm1362_miscctrl_triple_write_single(
     uart: &mut Am3BbChainUart,
     chain_idx: usize,
@@ -1916,35 +2478,56 @@ fn bm1362_miscctrl_triple_write_single(
     value: u32,
     what: &str,
 ) -> Result<()> {
-    for _ in 0..3 {
-        bm1362_single(
-            uart,
-            chain_idx,
-            chip_addr,
-            cold_boot_step::MISC_CONTROL_REG,
-            value,
-            5,
-            what,
-        )?;
+    debug_assert_eq!(
+        cold_boot_step::MISC_CONTROL_REG,
+        dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+    );
+    for op in dcentrald_common::plan_misc_ctrl_triple_write_chip(chip_addr, value) {
+        match op {
+            dcentrald_common::TransportOp::SendWriteRegBm1397Plus {
+                chip_addr: addr,
+                reg,
+                value: v,
+            } => {
+                // Sleep is owned by pure DelayMs ops below (ms=0 here).
+                bm1362_single(uart, chain_idx, addr, reg, v, 0, what)?;
+            }
+            dcentrald_common::TransportOp::DelayMs { ms } => {
+                if ms > 0 {
+                    std::thread::sleep(Duration::from_millis(u64::from(ms)));
+                }
+            }
+            _ => {
+                // Pure plan only emits per-chip write + delay.
+            }
+        }
     }
     Ok(())
 }
 
+/// MiscCtrl broadcast triple-write cadence: pure `plan_misc_ctrl_triple_write_broadcast`.
 fn bm1362_miscctrl_triple_write_bcast(
     uart: &mut Am3BbChainUart,
     chain_idx: usize,
     value: u32,
     what: &str,
 ) -> Result<()> {
-    for _ in 0..3 {
-        bm1362_bcast(
-            uart,
-            chain_idx,
-            cold_boot_step::MISC_CONTROL_REG,
-            value,
-            5,
-            what,
-        )?;
+    debug_assert_eq!(
+        cold_boot_step::MISC_CONTROL_REG,
+        dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+    );
+    for op in dcentrald_common::plan_misc_ctrl_triple_write_broadcast(value) {
+        match op {
+            dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value: v } => {
+                bm1362_bcast(uart, chain_idx, reg, v, 0, what)?;
+            }
+            dcentrald_common::TransportOp::DelayMs { ms } => {
+                if ms > 0 {
+                    std::thread::sleep(Duration::from_millis(u64::from(ms)));
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -2275,15 +2858,84 @@ fn am3_bb_dspic_temp_bridge_frame(sensor_addr: u8) -> [u8; 8] {
     [0x55, 0xAA, 0x06, 0x3C, sensor_addr, 0x02, 0x00, checksum]
 }
 
+/// Decode one dsPIC-bridged LM75 reply into degrees Celsius, or reject it.
+///
+/// Wire layout, measured on live `a lab unit` (500 captured frames across
+/// *.log`):
+///
+/// ```text
+///   [0] 0x07      frame length          (499/500)
+///   [1] 0x3C      opcode echo           (499/500)
+///   [2] 0x01      payload descriptor    (499/499 well-formed; NOT a status byte)
+///   [3] temp hi   LM75 raw, big-endian, signed
+///   [4] temp lo   low nibble is always 0 (498/498 well-formed)
+///   [5] status    0x00 = good (296), 0x01 = bad (203), 0xFF = garbage (1)
+///   [6] checksum  additive sum of reply[0..=4] ONLY — reply[5] is excluded
+/// ```
+///
+/// Two independent structural rejects are enforced here, both imported from
+/// ePIC's GPL `pic_driver.ko` (`03-BEAGLEBONE_PLATFORM.md` §U-10,
+/// `11-GHIDRA_BMS_MINER_DEEP_RE.md`) — DESK evidence — and then re-indexed
+/// against our own live `a lab unit` measurement, which wins where the two conflict:
+///
+///  1. **Status byte non-zero ⇒ reject.** ePIC places its status byte at
+///     `reply[2]`. On OUR frame `reply[2]` is the constant `0x01` in all 499
+///     well-formed captures, so importing ePIC's byte index verbatim would
+///     reject 100% of good reads and blind the thermal supervisor. The
+///     equivalent byte on our bridge is `reply[5]`. Until now `reply[5] != 0`
+///     was rejected only *by accident*: the checksum fold below spanned
+///     `reply[..6]` while the device computes it over `reply[..5]`, so a status
+///     of `0x01` showed up as an off-by-one checksum. That coincidence is the
+///     recorded root cause of the `a lab unit` "noisy bridge replies" (README:26,180)
+///     and it is fragile — any frame whose payload error happened to cancel the
+///     status byte would have been laundered into a temperature. The predicate
+///     is now explicit and named.
+///  2. **`raw & 0x0F != 0` ⇒ reject.** The LM75 data register is 11-bit,
+///     left-justified, so the low nibble of a genuine reading is always zero.
+///     This is NOT redundant with the checksum: an 8-bit additive sum has no
+///     positional weighting and cannot detect a compensating two-byte
+///     corruption, whereas this invariant is a property of the sensor's own
+///     data format. Live `a lab unit` frame `[07,3C,01,06,01,00,1D]` (from the
+///     fail-closed negative control) would otherwise have looked like a
+///     plausible, *cool* 6.0 °C.
+///
+/// Conversion: ePIC uses `(raw >> 4) * 62.5 m°C`. Ours is `raw / 256.0 °C`.
+/// These are **exactly** equal — including for negative readings, since `>>` on
+/// `i16` is arithmetic — whenever the low nibble is zero, which reject (2) now
+/// guarantees. No divergence; the existing form is kept.
+///
+/// `reply[2]` is deliberately NOT pinned to `0x01`. It sits inside the checksum
+/// span, so corruption there is already caught, and hard-pinning a byte whose
+/// semantics we have not decoded would risk a total thermal blackout (and thus
+/// a refusal to mine) on an undecoded board variant.
+///
+/// A rejected reply yields `None`, never a temperature and never a default:
+/// the sample is simply not counted toward chain coverage, so the snapshot
+/// reports `fresh = false` and the fail-closed supervisor owns the decision.
 fn am3_bb_decode_lm75_bridge_reply(reply: &[u8]) -> Option<f32> {
     if reply.len() < AM3_BB_LM75_REPLY_LEN || reply[0] != 0x07 || reply[1] != 0x3C {
         return None;
     }
+    // Structural reject 1: bridge status byte. Checked BEFORE the checksum so
+    // the rejection reason is the real one rather than the historical
+    // off-by-one artefact.
+    if reply[5] != AM3_BB_LM75_STATUS_OK {
+        return None;
+    }
+    // Checksum span is kept at `reply[..6]`. With the status gate above,
+    // `reply[5]` is provably 0, so this is numerically identical to the
+    // device's true `reply[..5]` span — but it stays strictly fail-safe if a
+    // future edit ever removes the status check.
     let checksum = reply[..6].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
     if checksum != reply[6] {
         return None;
     }
-    let temp_c = i16::from_be_bytes([reply[3], reply[4]]) as f32 / 256.0;
+    let raw = i16::from_be_bytes([reply[3], reply[4]]);
+    // Structural reject 2: LM75 low nibble must be zero.
+    if raw & AM3_BB_LM75_RAW_LOW_NIBBLE_MASK != 0 {
+        return None;
+    }
+    let temp_c = raw as f32 / 256.0;
     if (AM3_BB_LM75_MIN_VALID_C..=AM3_BB_LM75_MAX_VALID_C).contains(&temp_c) {
         Some(temp_c)
     } else {
@@ -3106,21 +3758,72 @@ fn am3_bb_gpio_dir_at(sysfs_root: &Path, gpio: u32) -> std::path::PathBuf {
 }
 
 fn am3_bb_export_gpio_if_needed_at(sysfs_root: &Path, gpio: u32) -> Result<()> {
+    am3_bb_export_gpio_if_needed_at_with(sysfs_root, gpio, |path, value| {
+        std::fs::write(path, value)
+    })
+}
+
+fn am3_bb_export_gpio_if_needed_at_with<F>(
+    sysfs_root: &Path,
+    gpio: u32,
+    export_gpio: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &str) -> std::io::Result<()>,
+{
     let gpio_dir = am3_bb_gpio_dir_at(sysfs_root, gpio);
     if gpio_dir.exists() {
         return Ok(());
     }
-    std::fs::write(sysfs_root.join("export"), gpio.to_string())
-        .with_context(|| format!("am3-bb: export gpio{} failed", gpio))?;
-    thread::sleep(Duration::from_millis(10));
-    if !gpio_dir.exists() {
-        anyhow::bail!(
-            "am3-bb: gpio{} export command completed but {} did not appear",
-            gpio,
-            gpio_dir.display()
-        );
+    // Another process can win the export between the existence check and our
+    // write. Linux reports EBUSY in that case, but the operation is usable once
+    // the winner's gpioN node materializes. Preserve any write error and accept
+    // it only when the bounded observation below proves that materialization.
+    let gpio_text = gpio.to_string();
+    let export_error = export_gpio(&sysfs_root.join("export"), &gpio_text).err();
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !gpio_dir.exists() {
+        if Instant::now() >= deadline {
+            if let Some(error) = export_error {
+                return Err(error).with_context(|| {
+                    format!(
+                        "am3-bb: export gpio{} failed and {} did not materialize within 250ms",
+                        gpio,
+                        gpio_dir.display()
+                    )
+                });
+            }
+            anyhow::bail!(
+                "am3-bb: gpio{} export command completed but {} did not appear within 250ms",
+                gpio,
+                gpio_dir.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
     }
     Ok(())
+}
+
+fn am3_bb_wait_gpio_attributes_at(sysfs_root: &Path, gpio: u32) -> Result<()> {
+    let gpio_dir = am3_bb_gpio_dir_at(sysfs_root, gpio);
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let missing: Vec<&str> = ["direction", "active_low", "value"]
+            .into_iter()
+            .filter(|attr| !gpio_dir.join(attr).exists())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "am3-bb: gpio{} sysfs attributes {:?} did not appear within 250ms after export",
+                gpio,
+                missing
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn am3_bb_export_gpio_if_needed(gpio: u32) -> Result<()> {
@@ -3180,6 +3883,746 @@ fn am3_bb_prepare_output_gpio(gpio: u32, active_low: bool) -> Result<()> {
     am3_bb_prepare_output_gpio_at(Path::new(AM3_BB_GPIO_SYSFS_ROOT), gpio, active_low)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Am3BbCutoffTiming {
+    write_started_at: Instant,
+    completed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum Am3BbRetainedReadbackMode {
+    KernelSysfs,
+    #[cfg(test)]
+    OrdinaryFileFixture,
+}
+
+impl Am3BbRetainedReadbackMode {
+    fn expected_direction(self) -> &'static str {
+        match self {
+            Self::KernelSysfs => "out",
+            #[cfg(test)]
+            Self::OrdinaryFileFixture => "low",
+        }
+    }
+
+    #[cfg(test)]
+    fn needs_value_emulation(self) -> bool {
+        matches!(self, Self::OrdinaryFileFixture)
+    }
+}
+
+fn am3_bb_current_thread_token() -> usize {
+    // SAFETY: pthread_self has no preconditions and returns an opaque identity
+    // for the calling thread. DCENT_OS targets Unix/Linux; zero is reserved as
+    // the no-writer sentinel, so map an implausible zero token to one.
+    let token = unsafe { libc::pthread_self() as usize };
+    if token == 0 {
+        1
+    } else {
+        token
+    }
+}
+
+struct Am3BbOnWriterPublication {
+    writer_thread: Arc<AtomicUsize>,
+}
+
+impl Drop for Am3BbOnWriterPublication {
+    fn drop(&mut self) {
+        self.writer_thread.store(0, Ordering::SeqCst);
+    }
+}
+
+/// One pre-opened, physically raw GPIO59 cutoff capability.
+///
+/// The direction writer plus direction/active-low/value readers are opened
+/// before cold boot and retained for the lifetime of the consumer. Cutoff is
+/// encoded only as `direction=low`, whose kernel ABI sets output and the raw
+/// physical latch LOW regardless of later `active_low` drift. This type has no
+/// arbitrary-level or HIGH method. Lanes use independent file descriptions so
+/// panic/heartbeat work cannot race a runtime lane's offsets.
+struct Am3BbPreparedBoardCutoff {
+    gpio: u32,
+    off_level: &'static str,
+    direction_reader: File,
+    direction_writer: File,
+    active_low_reader: File,
+    value_reader: File,
+    #[cfg(test)]
+    fixture_value_writer: Option<File>,
+    /// Test-only rendezvous fired exactly once, immediately after the panic
+    /// lane's first physical LOW and before it enters the serialization loop.
+    ///
+    /// This exists so the adversarial interleaving this lane defends against —
+    /// a published ON writer landing HIGH *after* the first LOW — can be
+    /// reproduced by construction instead of by racing the host scheduler. The
+    /// previous approach spawned a thread, spun a fixed yield budget hoping to
+    /// catch the window, and (when that proved flaky) injected a
+    /// `#[cfg(test)] sleep(2ms)` right here to widen it. A sleep is not a
+    /// synchronization primitive: under load the window still closed early, and
+    /// the sleep put test-only timing inside a panic-path hook.
+    ///
+    /// Calling through an `Arc<dyn Fn>` performs no allocation, so the
+    /// no-allocation property of the lane holds in test builds too.
+    #[cfg(test)]
+    after_first_low_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    readback_mode: Am3BbRetainedReadbackMode,
+    terminal: Arc<AtomicBool>,
+    on_writer_thread: Arc<AtomicUsize>,
+}
+
+impl Am3BbPreparedBoardCutoff {
+    fn open_at(
+        sysfs_root: &Path,
+        gpio: u32,
+        off_level: &'static str,
+        lane: &'static str,
+        readback_mode: Am3BbRetainedReadbackMode,
+        terminal: Arc<AtomicBool>,
+        on_writer_thread: Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            off_level == "0",
+            "am3-bb: GPIO{} {} raw cutoff requires physical LOW, got {:?}",
+            gpio,
+            lane,
+            off_level
+        );
+        let gpio_dir = am3_bb_gpio_dir_at(sysfs_root, gpio);
+        let direction_path = gpio_dir.join("direction");
+        let value_path = am3_bb_gpio_dir_at(sysfs_root, gpio).join("value");
+        let active_low_path = gpio_dir.join("active_low");
+        let direction_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&direction_path)
+            .with_context(|| {
+                format!(
+                    "am3-bb: pre-open GPIO{} direction reader for {} lane at {} failed",
+                    gpio,
+                    lane,
+                    direction_path.display()
+                )
+            })?;
+        let direction_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&direction_path)
+            .with_context(|| {
+                format!(
+                    "am3-bb: pre-open GPIO{} direction writer for {} lane at {} failed",
+                    gpio,
+                    lane,
+                    direction_path.display()
+                )
+            })?;
+        let active_low_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&active_low_path)
+            .with_context(|| {
+                format!(
+                    "am3-bb: pre-open GPIO{} active_low reader for {} lane at {} failed",
+                    gpio,
+                    lane,
+                    active_low_path.display()
+                )
+            })?;
+        let value_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&value_path)
+            .with_context(|| {
+                format!(
+                    "am3-bb: pre-open GPIO{} value reader for {} lane at {} failed",
+                    gpio,
+                    lane,
+                    value_path.display()
+                )
+            })?;
+        #[cfg(test)]
+        let fixture_value_writer = if readback_mode.needs_value_emulation() {
+            Some(
+                std::fs::OpenOptions::new()
+                .write(true)
+                .open(&value_path)
+                .with_context(|| {
+                    format!(
+                        "am3-bb: pre-open GPIO{} ordinary-fixture value writer for {} lane at {} failed",
+                        gpio,
+                        lane,
+                        value_path.display()
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            gpio,
+            off_level,
+            direction_reader,
+            direction_writer,
+            active_low_reader,
+            value_reader,
+            #[cfg(test)]
+            fixture_value_writer,
+            #[cfg(test)]
+            after_first_low_hook: None,
+            readback_mode,
+            terminal,
+            on_writer_thread,
+        })
+    }
+
+    fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    fn off_level(&self) -> &'static str {
+        self.off_level
+    }
+
+    fn read_attr_checked(&self, reader: &File, attr: &str, expected: &str) -> Result<()> {
+        let mut reader = reader;
+        reader.seek(SeekFrom::Start(0)).with_context(|| {
+            format!(
+                "am3-bb: seek retained GPIO{} {} reader failed",
+                self.gpio, attr
+            )
+        })?;
+        let mut observed = String::new();
+        reader.read_to_string(&mut observed).with_context(|| {
+            format!(
+                "am3-bb: retained GPIO{} {} readback failed",
+                self.gpio, attr
+            )
+        })?;
+        am3_bb_validate_gpio_attr_readback(self.gpio, attr, expected, &observed)
+    }
+
+    fn read_prepared_topology_checked(&self) -> Result<()> {
+        self.read_attr_checked(
+            &self.direction_reader,
+            "direction",
+            self.readback_mode.expected_direction(),
+        )?;
+        self.read_attr_checked(&self.active_low_reader, "active_low", "0")
+    }
+
+    fn read_off_checked(&self) -> Result<()> {
+        self.read_prepared_topology_checked()?;
+        self.read_attr_checked(&self.value_reader, "value", self.off_level)
+    }
+
+    fn read_on_checked(&self) -> Result<()> {
+        self.read_prepared_topology_checked()?;
+        self.read_attr_checked(&self.value_reader, "value", "1")
+    }
+
+    #[cfg(test)]
+    fn emulate_fixture_raw_low(&self) -> bool {
+        let Some(writer) = self.fixture_value_writer.as_ref() else {
+            return true;
+        };
+        let fd = writer.as_raw_fd();
+        // SAFETY: fd is an owned, pre-opened ordinary-file fixture descriptor;
+        // the pointer addresses one live byte for exactly the syscall duration.
+        if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } != 0 {
+            return false;
+        }
+        let byte = b'0';
+        // SAFETY: same descriptor/lifetime argument as above; count is one.
+        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) == 1 }
+    }
+
+    fn write_off_checked(&self) -> Result<Am3BbCutoffTiming> {
+        let mut writer = &self.direction_writer;
+        writer.seek(SeekFrom::Start(0)).with_context(|| {
+            format!(
+                "am3-bb: seek retained GPIO{} raw cutoff direction writer failed",
+                self.gpio
+            )
+        })?;
+        let write_started_at = Instant::now();
+        writer.write_all(b"low").with_context(|| {
+            format!(
+                "am3-bb: retained GPIO{} raw direction=low cutoff failed",
+                self.gpio
+            )
+        })?;
+        #[cfg(test)]
+        anyhow::ensure!(
+            self.emulate_fixture_raw_low(),
+            "am3-bb: ordinary-file fixture could not emulate direction=low"
+        );
+        self.read_off_checked()?;
+        Ok(Am3BbCutoffTiming {
+            write_started_at,
+            completed_at: Instant::now(),
+        })
+    }
+
+    fn cut_checked(&self) -> Result<Am3BbCutoffTiming> {
+        self.terminal.store(true, Ordering::SeqCst);
+        let current_thread = am3_bb_current_thread_token();
+        for _ in 0..AM3_BB_CUTOFF_SERIALIZATION_YIELD_LIMIT {
+            let writer_thread = self.on_writer_thread.load(Ordering::SeqCst);
+            if writer_thread == 0 || writer_thread == current_thread {
+                return self.write_off_checked();
+            }
+            anyhow::ensure!(
+                self.write_off_raw_noalloc(),
+                "am3-bb: retained GPIO{} raw cutoff failed while serializing with the sole ON writer",
+                self.gpio
+            );
+            // SAFETY: sched_yield has no pointer or lifetime preconditions and
+            // lets the published ON writer retire on single-core AM335x.
+            let _ = unsafe { libc::sched_yield() };
+        }
+        let writer_thread = self.on_writer_thread.load(Ordering::SeqCst);
+        if writer_thread == 0 || writer_thread == current_thread {
+            return self.write_off_checked();
+        }
+        let final_raw_low = self.write_off_raw_noalloc();
+        anyhow::bail!(
+            "am3-bb: GPIO{} sole ON writer token {} did not retire within {} cutoff yields; final raw LOW write succeeded={}",
+            self.gpio,
+            writer_thread,
+            AM3_BB_CUTOFF_SERIALIZATION_YIELD_LIMIT,
+            final_raw_low
+        )
+    }
+
+    /// Panic-hook load-bearing primitive: publish the terminal latch and issue
+    /// raw `direction=low` through the already-open descriptor. If another
+    /// thread owns the only HIGH write window, repeatedly force LOW and yield
+    /// for a fixed iteration budget, then perform one final LOW attempt. A
+    /// failed raw write returns once the syscall or bounded EINTR retry loop
+    /// reports failure. The iteration budget does not make a sysfs callback
+    /// wall-clock bounded: a kernel write may still sleep until the hardware
+    /// watchdog resets the system. A panic on the ON-writing thread itself
+    /// cannot resume that write after the aborting hook returns.
+    /// No userspace allocation, formatting, readback, lock, or path lookup
+    /// occurs on the production path; kernels may still allocate in sysfs.
+    fn cut_raw_noalloc(&self) -> bool {
+        self.terminal.store(true, Ordering::SeqCst);
+        let current_thread = am3_bb_current_thread_token();
+        // Snapshot the writer publication before the first LOW. If a foreign
+        // writer retires while that write is in flight, its HIGH may still be
+        // the later physical write; remembering the snapshot forces a final
+        // LOW after retirement even though the next token load observes zero.
+        let initial_writer_thread = self.on_writer_thread.load(Ordering::SeqCst);
+        let first_write_ok = self.write_off_raw_noalloc();
+        if !first_write_ok {
+            return false;
+        }
+        if initial_writer_thread == current_thread {
+            return true;
+        }
+        // The first LOW has landed and the loop has not started yet. This is the
+        // exact instant a test needs in order to model a published ON writer
+        // that lands HIGH after us; the hook lets it act here by construction
+        // rather than by out-racing the scheduler. No production build contains
+        // this field, and no test that leaves the hook unset observes any
+        // behaviour change.
+        #[cfg(test)]
+        if let Some(after_first_low) = self.after_first_low_hook.as_ref() {
+            after_first_low();
+        }
+        let mut waited_for_other_writer = initial_writer_thread != 0;
+        for _ in 0..AM3_BB_CUTOFF_SERIALIZATION_YIELD_LIMIT {
+            let writer_thread = self.on_writer_thread.load(Ordering::SeqCst);
+            if writer_thread == 0 {
+                return if waited_for_other_writer {
+                    self.write_off_raw_noalloc()
+                } else {
+                    first_write_ok
+                };
+            }
+            if writer_thread == current_thread {
+                return first_write_ok;
+            }
+            waited_for_other_writer = true;
+            if !self.write_off_raw_noalloc() {
+                return false;
+            }
+            // SAFETY: sched_yield has no pointer or lifetime preconditions. It
+            // lets the published ON writer reach its terminal check/retirement
+            // on single-core AM335x systems while this hook keeps re-cutting.
+            let _ = unsafe { libc::sched_yield() };
+        }
+        let writer_thread = self.on_writer_thread.load(Ordering::SeqCst);
+        if writer_thread == 0 {
+            return self.write_off_raw_noalloc();
+        }
+        if writer_thread == current_thread {
+            return first_write_ok;
+        }
+        let _ = self.write_off_raw_noalloc();
+        false
+    }
+
+    fn write_off_raw_noalloc(&self) -> bool {
+        let fd = self.direction_writer.as_raw_fd();
+        let mut seek_completed = false;
+        for _ in 0..AM3_BB_RAW_SYSCALL_EINTR_RETRY_LIMIT {
+            // SAFETY: fd is an owned, pre-opened direction descriptor and
+            // offset zero is the required sysfs command boundary.
+            let result = unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            if result == 0 {
+                seek_completed = true;
+                break;
+            }
+            // SAFETY: errno is read immediately after the failed libc syscall.
+            if result < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            return false;
+        }
+        if !seek_completed {
+            return false;
+        }
+        let command = b"low";
+        for _ in 0..AM3_BB_RAW_SYSCALL_EINTR_RETRY_LIMIT {
+            // SAFETY: command is a live three-byte array and fd is the retained
+            // direction writer; the pointer is used only for this syscall.
+            let result = unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) };
+            if result == command.len() as isize {
+                #[cfg(test)]
+                return self.emulate_fixture_raw_low();
+                #[cfg(not(test))]
+                return true;
+            }
+            // SAFETY: errno is read immediately after the failed libc syscall.
+            if result < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            return false;
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Am3BbBoardEnableState {
+    PreparedOff,
+    EnergizationOutcomeUnknown,
+    Energized,
+    TerminalOff,
+}
+
+/// Sole owner of the GPIO59 ON transition. Emergency-only lanes never hold
+/// this type and therefore cannot invoke the cold-boot energization trait.
+struct Am3BbBoardEnableOwner {
+    io: Am3BbPreparedBoardCutoff,
+    on_writer: File,
+    board_enable_active_high: bool,
+    state: Am3BbBoardEnableState,
+    #[cfg(test)]
+    fail_on_readback_after_on_write: bool,
+}
+
+impl Am3BbBoardEnableOwner {
+    fn gpio(&self) -> u32 {
+        self.io.gpio()
+    }
+
+    fn off_level(&self) -> &'static str {
+        self.io.off_level()
+    }
+
+    fn cut_checked(&mut self) -> Result<Am3BbCutoffTiming> {
+        self.state = Am3BbBoardEnableState::EnergizationOutcomeUnknown;
+        match self.io.cut_checked() {
+            Ok(timing) => {
+                self.state = Am3BbBoardEnableState::TerminalOff;
+                Ok(timing)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cutoff_io(&self) -> &Am3BbPreparedBoardCutoff {
+        &self.io
+    }
+
+    fn write_on_checked(&self) -> Result<()> {
+        self.io.read_prepared_topology_checked()?;
+        let mut writer = &self.on_writer;
+        writer
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("am3-bb: seek sole GPIO{} ON writer failed", self.io.gpio))?;
+        writer
+            .write_all(b"1")
+            .with_context(|| format!("am3-bb: sole GPIO{} ON write failed", self.io.gpio))?;
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.fail_on_readback_after_on_write,
+            "am3-bb: injected GPIO{} ON readback failure after the HIGH write landed",
+            self.io.gpio
+        );
+        self.io.read_on_checked()
+    }
+}
+
+impl dcentrald_hal::platform::beaglebone_cold_boot::PreparedBoardEnable for Am3BbBoardEnableOwner {
+    fn gpio(&self) -> u32 {
+        self.io.gpio
+    }
+
+    fn board_enable_active_high(&self) -> bool {
+        self.board_enable_active_high
+    }
+
+    fn assert_checked(&mut self) -> dcentrald_hal::Result<()> {
+        if self.state != Am3BbBoardEnableState::PreparedOff
+            || self.io.terminal.load(Ordering::SeqCst)
+        {
+            return Err(dcentrald_hal::HalError::Gpio(format!(
+                "am3-bb: GPIO{} board-enable assertion requires live PreparedOff authority, observed state={:?} terminal={}",
+                self.io.gpio,
+                self.state,
+                self.io.terminal.load(Ordering::SeqCst)
+            )));
+        }
+        self.state = Am3BbBoardEnableState::EnergizationOutcomeUnknown;
+        let writer_thread = Arc::clone(&self.io.on_writer_thread);
+        let thread_token = am3_bb_current_thread_token();
+        writer_thread
+            .compare_exchange(0, thread_token, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|observed| {
+                dcentrald_hal::HalError::Gpio(format!(
+                    "am3-bb: GPIO{} ON writer publication was already owned by thread token {}",
+                    self.io.gpio, observed
+                ))
+            })?;
+        let _writer_publication = Am3BbOnWriterPublication { writer_thread };
+        if self.io.terminal.load(Ordering::SeqCst) {
+            self.state = Am3BbBoardEnableState::TerminalOff;
+            return Err(dcentrald_hal::HalError::Gpio(format!(
+                "am3-bb: GPIO{} terminal cutoff arrived before the sole ON write",
+                self.io.gpio
+            )));
+        }
+        if let Err(error) = self.write_on_checked() {
+            let recut = self.io.cut_checked();
+            self.state = if recut.is_ok() {
+                Am3BbBoardEnableState::TerminalOff
+            } else {
+                Am3BbBoardEnableState::EnergizationOutcomeUnknown
+            };
+            return Err(dcentrald_hal::HalError::Gpio(format!(
+                "am3-bb: GPIO{} ON assertion failed after ON-writer publication: {error:#}; mandatory OFF re-cut={recut:?}",
+                self.io.gpio
+            )));
+        }
+        if self.io.terminal.load(Ordering::SeqCst) {
+            let recut = self.io.cut_checked();
+            self.state = if recut.is_ok() {
+                Am3BbBoardEnableState::TerminalOff
+            } else {
+                Am3BbBoardEnableState::EnergizationOutcomeUnknown
+            };
+            return Err(dcentrald_hal::HalError::Gpio(format!(
+                "am3-bb: GPIO{} terminal cutoff raced board-enable assertion; mandatory OFF re-cut={:?}",
+                self.io.gpio, recut
+            )));
+        }
+        self.state = Am3BbBoardEnableState::Energized;
+        Ok(())
+    }
+}
+
+/// Borrowed OFF-only view used by the synchronous mining loop. It cannot
+/// access the owner's `PreparedBoardEnable` implementation.
+struct Am3BbRuntimeCutoff<'a> {
+    owner: &'a mut Am3BbBoardEnableOwner,
+}
+
+impl Am3BbRuntimeCutoff<'_> {
+    fn cut_checked(&mut self) -> Result<Am3BbCutoffTiming> {
+        self.owner.cut_checked()
+    }
+
+    fn gpio(&self) -> u32 {
+        self.owner.gpio()
+    }
+
+    fn off_level(&self) -> &'static str {
+        self.owner.off_level()
+    }
+}
+
+struct Am3BbPreparedBoardCutoffSet {
+    runtime: Am3BbBoardEnableOwner,
+    heartbeat: Am3BbPreparedBoardCutoff,
+    panic: Am3BbPreparedBoardCutoff,
+}
+
+fn am3_bb_prepare_active_high_board_enable_off_at<F>(
+    sysfs_root: &Path,
+    gpio: u32,
+    read_direction: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<String>,
+{
+    am3_bb_export_gpio_if_needed_at(sysfs_root, gpio)?;
+    am3_bb_wait_gpio_attributes_at(sysfs_root, gpio)?;
+
+    // `direction=low` atomically selects output mode and a LOW latch. This
+    // is a raw physical-low operation on both supported sysfs GPIO kernels, so
+    // it is safe even if an inherited export has active_low=1. Normalize the
+    // logical polarity only after the physical LOW latch is established.
+    let direction_path = am3_bb_gpio_dir_at(sysfs_root, gpio).join("direction");
+    std::fs::write(&direction_path, "low").with_context(|| {
+        format!(
+            "am3-bb: establish glitch-free GPIO{} direction=low failed",
+            gpio
+        )
+    })?;
+    let direction = read_direction(&direction_path).with_context(|| {
+        format!(
+            "am3-bb: read GPIO{} direction after direction=low failed",
+            gpio
+        )
+    })?;
+    if direction.trim() != "out" {
+        anyhow::bail!(
+            "am3-bb: GPIO{} direction after direction=low was {:?}, expected out",
+            gpio,
+            direction.trim()
+        );
+    }
+    am3_bb_write_gpio_attr_checked_at(sysfs_root, gpio, "active_low", "0")?;
+    let value = std::fs::read_to_string(am3_bb_gpio_dir_at(sysfs_root, gpio).join("value"))
+        .with_context(|| format!("am3-bb: read GPIO{} after direction=low failed", gpio))?;
+    am3_bb_validate_gpio_attr_readback(gpio, "value", "0", &value)
+}
+
+fn am3_bb_prepare_board_cutoff_set_at_with_direction_readback<F>(
+    sysfs_root: &Path,
+    gpio: u32,
+    board_enable_active_high: bool,
+    read_direction: F,
+    readback_mode: Am3BbRetainedReadbackMode,
+) -> Result<Am3BbPreparedBoardCutoffSet>
+where
+    F: FnOnce(&Path) -> std::io::Result<String>,
+{
+    if !board_enable_active_high {
+        anyhow::bail!(
+            "am3-bb: retained GPIO{} cutoff supports only the admitted active-high board-enable topology",
+            gpio
+        );
+    }
+    let off_level = "0";
+    am3_bb_prepare_active_high_board_enable_off_at(sysfs_root, gpio, read_direction)?;
+
+    let terminal = Arc::new(AtomicBool::new(false));
+    let on_writer_thread = Arc::new(AtomicUsize::new(0));
+    let runtime = Am3BbPreparedBoardCutoff::open_at(
+        sysfs_root,
+        gpio,
+        off_level,
+        "runtime",
+        readback_mode,
+        Arc::clone(&terminal),
+        Arc::clone(&on_writer_thread),
+    )?;
+    let on_value_path = am3_bb_gpio_dir_at(sysfs_root, gpio).join("value");
+    let on_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&on_value_path)
+        .with_context(|| {
+            format!(
+                "am3-bb: pre-open sole GPIO{} ON writer at {} failed",
+                gpio,
+                on_value_path.display()
+            )
+        })?;
+    let heartbeat = Am3BbPreparedBoardCutoff::open_at(
+        sysfs_root,
+        gpio,
+        off_level,
+        "heartbeat",
+        readback_mode,
+        Arc::clone(&terminal),
+        Arc::clone(&on_writer_thread),
+    )?;
+    let panic = Am3BbPreparedBoardCutoff::open_at(
+        sysfs_root,
+        gpio,
+        off_level,
+        "panic",
+        readback_mode,
+        terminal,
+        on_writer_thread,
+    )?;
+    for (lane, name) in [(&runtime, "runtime"), (&heartbeat, "heartbeat")] {
+        lane.write_off_checked().with_context(|| {
+            format!(
+                "am3-bb: retained GPIO{} {} cutoff lane failed pre-energization OFF preflight",
+                gpio, name
+            )
+        })?;
+    }
+    if !panic.write_off_raw_noalloc() {
+        anyhow::bail!(
+            "am3-bb: retained GPIO{} panic cutoff lane failed raw lseek+write preflight",
+            gpio
+        );
+    }
+    panic.read_off_checked().with_context(|| {
+        format!(
+            "am3-bb: retained GPIO{} panic cutoff lane failed raw preflight readback",
+            gpio
+        )
+    })?;
+    Ok(Am3BbPreparedBoardCutoffSet {
+        runtime: Am3BbBoardEnableOwner {
+            io: runtime,
+            on_writer,
+            board_enable_active_high,
+            state: Am3BbBoardEnableState::PreparedOff,
+            #[cfg(test)]
+            fail_on_readback_after_on_write: false,
+        },
+        heartbeat,
+        panic,
+    })
+}
+
+fn am3_bb_prepare_board_cutoff_set_at(
+    sysfs_root: &Path,
+    gpio: u32,
+    board_enable_active_high: bool,
+) -> Result<Am3BbPreparedBoardCutoffSet> {
+    am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+        sysfs_root,
+        gpio,
+        board_enable_active_high,
+        |path| std::fs::read_to_string(path),
+        Am3BbRetainedReadbackMode::KernelSysfs,
+    )
+}
+
+fn am3_bb_prepare_board_cutoff_set(
+    gpio: u32,
+    board_enable_active_high: bool,
+) -> Result<Am3BbPreparedBoardCutoffSet> {
+    am3_bb_prepare_board_cutoff_set_at(
+        Path::new(AM3_BB_GPIO_SYSFS_ROOT),
+        gpio,
+        board_enable_active_high,
+    )
+}
+
+fn am3_bb_reprepare_active_high_board_enable_off(gpio: u32) -> Result<()> {
+    am3_bb_prepare_active_high_board_enable_off_at(
+        Path::new(AM3_BB_GPIO_SYSFS_ROOT),
+        gpio,
+        |path| std::fs::read_to_string(path),
+    )
+}
+
 fn am3_bb_quiet_safe_pwm(config_min_pwm: u8, config_max_pwm: u8) -> u8 {
     let cap = config_max_pwm.min(AM3_BB_FAN_HARD_CAP_PWM);
     if cap >= AM3_BB_FAN_SAFE_FLOOR_PWM {
@@ -3215,9 +4658,8 @@ fn am3_bb_clamp_pid_pwm(config_min_pwm: u8, config_max_pwm: u8, requested: u8) -
 /// Invariant #2 (cut hash power BEFORE raising fan noise) is encoded here as a
 /// total order: at or above the dangerous threshold the answer is always
 /// [`Am3BbThermalAction::CutHashThenFan`], which the caller services by failing
-/// closed (the existing `poll_and_check` `Err` → run-guard teardown disables
-/// dsPIC voltage / asserts resets / drives board-enable off, THEN the guard
-/// keeps the fan at its quiet cap). The PID is only consulted in the
+/// closed (`poll_and_check` failure → immediate retained GPIO59 raw-LOW cut,
+/// then dsPIC/reset defense-in-depth and quiet fan coast-down). The PID is only consulted in the
 /// [`Am3BbThermalAction::PidWithinCap`] arm, i.e. while temperature is still
 /// below dangerous — so the fan is only ever raised *within* the quiet cap and
 /// only while hash power is still safely on.
@@ -3332,9 +4774,9 @@ impl Am3BbFanPid {
 
         // Invariant #2: at/above dangerous, the response is cut-hash-first.
         // The PID does not try to cool its way out by ramping the fan; the
-        // caller's `poll_and_check` returns Err and the run guard tears down
-        // (voltage off → resets asserted → board-enable off), with the fan
-        // held at the quiet cap. So here we simply stop trimming.
+        // caller's `poll_and_check` returns Err, immediately cuts GPIO59, and
+        // then performs dsPIC/reset defense-in-depth with the fan held at the
+        // quiet cap. So here we simply stop trimming.
         if am3_bb_thermal_action(snapshot.max_temp_c, dangerous_temp_c)
             == Am3BbThermalAction::CutHashThenFan
         {
@@ -3377,7 +4819,8 @@ impl Am3BbFanPid {
 /// am3-bb's fw=0x89 dsPIC has its own ~1-minute hardware watchdog that eventually
 /// cuts voltage, but without this a panic would leave the hashboards ENERGIZED
 /// (board-enable HIGH) for up to that full minute on a home/office unit. This stores
-/// the minimal GPIO state so the `main()` crash hook can cut board power IMMEDIATELY.
+/// the minimal GPIO state so the `main()` crash hook can attempt board-power cutoff
+/// before reset defense-in-depth and rely on watchdog reset if sysfs blocks or fails.
 /// Mirrors the am2 `AM2_TEARDOWN_PARAMS` / am3-aml `NOPIC_TEARDOWN_ARMED` pattern.
 ///
 /// Fans are intentionally NOT re-driven here: the am3-bb run holds fans at
@@ -3388,46 +4831,49 @@ impl Am3BbFanPid {
 /// guess (and the ns-period varies). Cutting board-enable removes the heat source,
 /// which is the actual fire-risk mitigation.
 struct Am3BbPanicTeardown {
-    board_enable_gpio: u32,
-    board_enable_active_high: bool,
+    watchdog_feed_stop: WatchdogFeedStopSignal,
+    board_cutoff: Am3BbPreparedBoardCutoff,
     reset_gpios: Vec<u32>,
 }
 
 static AM3BB_TEARDOWN_ARMED: std::sync::OnceLock<Am3BbPanicTeardown> = std::sync::OnceLock::new();
 
-/// Arm the am3-bb crash-panic-hook teardown. Call once, at guard-arm time (before
-/// board-enable is driven HIGH). Idempotent (`OnceLock::set`).
-pub fn arm_am3_bb_teardown(platform: &BeagleBonePlatform, chain_count: usize) {
-    let _ = AM3BB_TEARDOWN_ARMED.set(Am3BbPanicTeardown {
-        board_enable_gpio: platform.board_enable_gpio_v2_0(),
-        board_enable_active_high: platform.board_target().board_enable_active_high(),
-        reset_gpios: platform
-            .chain_reset_gpios_v2_0()
-            .into_iter()
-            .take(chain_count)
-            .collect(),
-    });
+/// Arm the am3-bb crash-panic-hook teardown. Call exactly once, at guard-arm
+/// time (before board-enable is driven HIGH). Duplicate arming is refused.
+fn arm_am3_bb_teardown(
+    platform: &BeagleBonePlatform,
+    chain_count: usize,
+    board_cutoff: Am3BbPreparedBoardCutoff,
+    watchdog_feed_stop: WatchdogFeedStopSignal,
+) -> Result<()> {
+    AM3BB_TEARDOWN_ARMED
+        .set(Am3BbPanicTeardown {
+            watchdog_feed_stop,
+            board_cutoff,
+            reset_gpios: platform
+                .chain_reset_gpios_v2_0()
+                .into_iter()
+                .take(chain_count)
+                .collect(),
+        })
+        .map_err(|_| anyhow::anyhow!("am3-bb: panic teardown was already armed"))
 }
 
 /// Best-effort cut-hash teardown for the `main()` crash panic hook on the am3-bb
-/// path. No-op (allocation-free) unless an am3-bb run armed it. Asserts the
-/// active-low ASIC resets, then drives board-enable OFF (cuts hashboard power).
-/// Swallows all errors — must never re-panic from inside the panic hook. Fans are
-/// already <= `PWM_SAFETY_MAX` by construction (see [`Am3BbPanicTeardown`]).
+/// path. No-op unless an am3-bb run armed it. The watchdog's lock-free terminal
+/// feed latch is published first, then the load-bearing retained GPIO59 write;
+/// reset defense-in-depth follows and may use ordinary sysfs helpers. The
+/// retained userspace path allocates nothing, although Linux 5.4 kernfs may
+/// allocate inside a sysfs write. Errors are swallowed so the hook cannot
+/// re-panic. Fans are already <= `PWM_SAFETY_MAX` by construction.
 pub fn am3_bb_panic_hook_best_effort_teardown() {
     if let Some(params) = AM3BB_TEARDOWN_ARMED.get() {
+        params.watchdog_feed_stop.close_terminal_lock_free();
+        let _ = params.board_cutoff.cut_raw_noalloc();
         for &gpio in &params.reset_gpios {
             let _ = am3_bb_prepare_output_gpio(gpio, true)
                 .and_then(|_| am3_bb_write_gpio_attr_checked(gpio, "value", "1"));
         }
-        let off_level = if params.board_enable_active_high {
-            "0"
-        } else {
-            "1"
-        };
-        let _ = am3_bb_prepare_output_gpio(params.board_enable_gpio, false).and_then(|_| {
-            am3_bb_write_gpio_attr_checked(params.board_enable_gpio, "value", off_level)
-        });
     }
 }
 
@@ -3525,8 +4971,9 @@ struct Am3BbRunSafetyGuard {
     dspic_i2c: Option<I2cServiceHandle>,
     active_dspic_addrs: Vec<u8>,
     reset_gpios: Vec<u32>,
-    board_enable_gpio: u32,
-    board_enable_active_high: bool,
+    board_enable: Am3BbBoardEnableOwner,
+    heartbeat_board_cutoff: Option<Am3BbPreparedBoardCutoff>,
+    panic_board_cutoff: Option<Am3BbPreparedBoardCutoff>,
     /// Shared so the runtime PID can borrow a clamp-enforced view
     /// ([`Am3BbCappedFan`]) while the guard keeps ownership for teardown. The
     /// PID can only ever drive this fan inside the quiet cap; the guard always
@@ -3536,7 +4983,22 @@ struct Am3BbRunSafetyGuard {
     fan_min_pwm: u8,
     fan_max_pwm: u8,
     safe_pwm: u8,
+    board_cutoff_receipt_issued: bool,
     teardown_done: bool,
+}
+
+/// One-shot proof that the load-bearing board-enable GPIO was driven to its
+/// configured OFF level and read back before slower controller/reset cleanup.
+/// This receipt is deliberately separate from the aggregate safe-off receipt:
+/// defense-in-depth work may fail, but it must never delay or impersonate the
+/// physical cutoff command.
+#[derive(Debug)]
+struct Am3BbBoardCutoffReceipt {
+    board_enable_gpio: u32,
+    off_level: &'static str,
+    started_at: Instant,
+    completed_at: Instant,
+    teardown_budget: TeardownBudgetView,
 }
 
 /// Software safe-off evidence for AM3-BB. This proves checked sysfs command
@@ -3547,6 +5009,13 @@ pub(crate) struct Am3BbSafeOffReceipt {
     board_enable_gpio: u32,
     reset_count: usize,
     dspic_count: usize,
+    teardown_budget: TeardownBudgetView,
+}
+
+impl Am3BbSafeOffReceipt {
+    pub(crate) fn same_teardown_budget(&self, authority: &TeardownDisarmAuthority) -> bool {
+        self.teardown_budget.same_budget(authority)
+    }
 }
 
 impl Am3BbRunSafetyGuard {
@@ -3558,6 +5027,10 @@ impl Am3BbRunSafetyGuard {
         fan_min_pwm: u8,
         fan_max_pwm: u8,
     ) -> Result<Self> {
+        let board_cutoffs = am3_bb_prepare_board_cutoff_set(
+            platform.board_enable_gpio_v2_0(),
+            platform.board_target().board_enable_active_high(),
+        )?;
         let safe_pwm = am3_bb_quiet_safe_pwm(fan_min_pwm, fan_max_pwm);
         let fan: Arc<dyn FanAccess> = Arc::from(
             platform
@@ -3585,12 +5058,14 @@ impl Am3BbRunSafetyGuard {
                 .into_iter()
                 .take(chain_count)
                 .collect(),
-            board_enable_gpio: platform.board_enable_gpio_v2_0(),
-            board_enable_active_high: platform.board_target().board_enable_active_high(),
+            board_enable: board_cutoffs.runtime,
+            heartbeat_board_cutoff: Some(board_cutoffs.heartbeat),
+            panic_board_cutoff: Some(board_cutoffs.panic),
             fan: Some(fan),
             fan_min_pwm,
             fan_max_pwm,
             safe_pwm,
+            board_cutoff_receipt_issued: false,
             teardown_done: false,
         })
     }
@@ -3604,6 +5079,28 @@ impl Am3BbRunSafetyGuard {
             owned_dspic_addrs = format_args!("{:02X?}", self.active_dspic_addrs),
             "am3-bb: safety guard owns every dsPIC that may have been energized"
         );
+    }
+
+    fn board_enable_owner(&mut self) -> &mut Am3BbBoardEnableOwner {
+        &mut self.board_enable
+    }
+
+    fn runtime_cutoff(&mut self) -> Am3BbRuntimeCutoff<'_> {
+        Am3BbRuntimeCutoff {
+            owner: &mut self.board_enable,
+        }
+    }
+
+    fn take_heartbeat_board_cutoff(&mut self) -> Result<Am3BbPreparedBoardCutoff> {
+        self.heartbeat_board_cutoff
+            .take()
+            .context("am3-bb: pre-energization heartbeat GPIO59 cutoff handle was already consumed")
+    }
+
+    fn take_panic_board_cutoff(&mut self) -> Result<Am3BbPreparedBoardCutoff> {
+        self.panic_board_cutoff
+            .take()
+            .context("am3-bb: pre-energization panic GPIO59 cutoff handle was already consumed")
     }
 
     /// A clamp-enforced, `Arc`-shared view onto the guard's fan for the
@@ -3620,16 +5117,67 @@ impl Am3BbRunSafetyGuard {
         })
     }
 
-    fn teardown_checked(&mut self) -> Result<Am3BbSafeOffReceipt> {
-        if self.teardown_done {
-            anyhow::bail!("am3-bb: safe-off was already attempted; receipt cannot be replayed");
+    fn cut_board_enable_checked(
+        &mut self,
+        teardown_budget: TeardownBudgetView,
+    ) -> Result<Am3BbBoardCutoffReceipt> {
+        if self.board_cutoff_receipt_issued {
+            anyhow::bail!(
+                "am3-bb: board-enable cutoff receipt was already issued; refusing to remint it"
+            );
         }
-        self.teardown_done = true;
+        // The retained I/O primitive timestamps immediately after its seek and
+        // immediately before the raw physical-LOW direction write. Export and
+        // direction preparation completed before cold boot and cannot borrow
+        // CutoffStart authority.
+        let timing = self.board_enable.cut_checked().with_context(|| {
+            format!(
+                "am3-bb: checked retained board-enable GPIO{} cutoff to level {} failed",
+                self.board_enable.gpio(),
+                self.board_enable.off_level()
+            )
+        })?;
+        let cutoff_started_timely = teardown_budget
+            .remaining_at(TeardownStage::CutoffStart, timing.write_started_at)
+            .is_ok();
+        self.board_cutoff_receipt_issued = true;
+        info!(
+            gpio = self.board_enable.gpio(),
+            off_level = self.board_enable.off_level(),
+            cutoff_started_timely,
+            "am3-bb: load-bearing board-enable cutoff completed before controller/reset cleanup"
+        );
+        Ok(Am3BbBoardCutoffReceipt {
+            board_enable_gpio: self.board_enable.gpio(),
+            off_level: self.board_enable.off_level(),
+            started_at: timing.write_started_at,
+            completed_at: timing.completed_at,
+            teardown_budget,
+        })
+    }
 
-        // prod-readiness hunt #4 (log-honesty): track the two best-effort legs
-        // (dsPIC disable + reset-assert) so the final summary doesn't affirm
-        // "voltage off, resets asserted" when only the board-enable-off write
-        // (the load-bearing cut) succeeded. Log-only — no command/ordering change.
+    /// Abnormal-exit power cut for [`Drop`]. This deliberately returns only a
+    /// boolean diagnostic: without the watchdog-issued teardown budget it can
+    /// never be upgraded into clean-shutdown or Disarm authority.
+    fn cut_board_enable_fallback(&mut self) -> bool {
+        match self.board_enable.cut_checked() {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "am3-bb: retained runtime board-enable cutoff failed; using non-authorizing fallback"
+                );
+                am3_bb_force_board_enable_off(
+                    self.board_enable.cutoff_io(),
+                    "run-safety-guard-fallback",
+                )
+            }
+        }
+    }
+
+    /// Controller/reset/fan defense-in-depth shared by the evidence-bearing
+    /// closeout and the non-authorizing Drop fallback.
+    fn run_defense_in_depth(&mut self) -> (Am3BbDspicShutdownEvidence, bool, bool) {
         let dspic_shutdown = self
             .dspic_i2c
             .as_ref()
@@ -3680,27 +5228,6 @@ impl Am3BbRunSafetyGuard {
             }
         }
 
-        let off_level = if self.board_enable_active_high {
-            "0"
-        } else {
-            "1"
-        };
-        let board_enable_off_ok = match am3_bb_prepare_output_gpio(self.board_enable_gpio, false)
-            .and_then(|_| {
-                am3_bb_write_gpio_attr_checked(self.board_enable_gpio, "value", off_level)
-            }) {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(
-                    gpio = self.board_enable_gpio,
-                    off_level,
-                    %error,
-                    "am3-bb: safety guard failed checked board-enable cutoff"
-                );
-                false
-            }
-        };
-
         // Acoustic coast-down follows the power cut. Once GPIO59 is checked
         // OFF, a fan readback failure is degraded evidence rather than a reason
         // to reboot and potentially re-energize a software-off rail.
@@ -3714,20 +5241,85 @@ impl Am3BbRunSafetyGuard {
             }
         }
 
+        (dspic_shutdown, dspic_disable_ok, resets_asserted_ok)
+    }
+
+    fn teardown_checked(
+        &mut self,
+        mut board_cutoff: Option<Am3BbBoardCutoffReceipt>,
+        teardown_budget: TeardownBudgetView,
+    ) -> Result<Am3BbSafeOffReceipt> {
+        if self.teardown_done {
+            anyhow::bail!("am3-bb: safe-off was already attempted; receipt cannot be replayed");
+        }
+
+        // A failed early sysfs preparation/write is not a terminal attempt.
+        // Retry the load-bearing checked cutoff before controller/reset work;
+        // only a valid receipt can authorize Disarm. If the retry also fails,
+        // Drop remains armed to attempt the non-authorizing fallback again.
+        if board_cutoff.is_none() {
+            match self.cut_board_enable_checked(teardown_budget.clone()) {
+                Ok(receipt) => {
+                    warn!(
+                        gpio = receipt.board_enable_gpio,
+                        "am3-bb: checked board-enable cutoff succeeded on teardown retry"
+                    );
+                    board_cutoff = Some(receipt);
+                }
+                Err(error) => warn!(
+                    %error,
+                    "am3-bb: checked board-enable cutoff retry failed; defense-in-depth and Drop fallback remain required"
+                ),
+            }
+        }
+
+        let expected_off_level = self.board_enable.off_level();
+        let board_enable_off_ok = board_cutoff.is_some_and(|receipt| {
+            receipt.board_enable_gpio == self.board_enable.gpio()
+                && receipt.off_level == expected_off_level
+                && receipt.teardown_budget.same_view(&teardown_budget)
+                && teardown_budget
+                    .require_not_before_start(receipt.started_at)
+                    .is_ok()
+                && teardown_budget
+                    .require_completed_at(TeardownStage::CutoffStart, receipt.started_at)
+                    .is_ok()
+                && teardown_budget
+                    .require_completed_at(TeardownStage::CutoffComplete, receipt.completed_at)
+                    .is_ok()
+        });
+
+        // prod-readiness hunt #4 (log-honesty): track the two best-effort legs
+        // (dsPIC disable + reset-assert) so the final summary doesn't affirm
+        // "voltage off, resets asserted" when only the board-enable-off write
+        // (the load-bearing cut) succeeded. Log-only — no command/ordering change.
+        let (dspic_shutdown, dspic_disable_ok, resets_asserted_ok) = self.run_defense_in_depth();
+
+        if !board_enable_off_ok {
+            let fallback_ok = self.cut_board_enable_fallback();
+            warn!(
+                fallback_ok,
+                "am3-bb: checked cutoff evidence was unavailable; repeated physical board-enable OFF without minting Disarm authority"
+            );
+        }
+
         if dspic_disable_ok && resets_asserted_ok && board_enable_off_ok {
+            teardown_budget.require_completed_at(TeardownStage::CleanupComplete, Instant::now())?;
+            self.teardown_done = true;
             info!(
                 reset_gpios = ?self.reset_gpios,
-                board_enable_gpio = self.board_enable_gpio,
-                board_enable_off_level = off_level,
+                board_enable_gpio = self.board_enable.gpio(),
+                board_enable_off_level = expected_off_level,
                 safe_pwm = self.safe_pwm,
                 dspic_delivery_attempts = dspic_shutdown.delivery_attempts,
                 dspic_observation_failures = dspic_shutdown.observation_failures,
                 "am3-bb: every owned dsPIC SafeOff and checked reset/GPIO59 readback completed; physical rail-off was not independently measured"
             );
             Ok(Am3BbSafeOffReceipt {
-                board_enable_gpio: self.board_enable_gpio,
+                board_enable_gpio: self.board_enable.gpio(),
                 reset_count: self.reset_gpios.len(),
                 dspic_count: self.active_dspic_addrs.len(),
+                teardown_budget,
             })
         } else {
             // prod-readiness hunt #4: board-enable-off (the load-bearing power
@@ -3735,8 +5327,8 @@ impl Am3BbRunSafetyGuard {
             // instead of affirming "voltage off, resets asserted".
             warn!(
                 reset_gpios = ?self.reset_gpios,
-                board_enable_gpio = self.board_enable_gpio,
-                board_enable_off_level = off_level,
+                board_enable_gpio = self.board_enable.gpio(),
+                board_enable_off_level = expected_off_level,
                 safe_pwm = self.safe_pwm,
                 dspic_disable_ok,
                 dspic_delivery_attempts = dspic_shutdown.delivery_attempts,
@@ -3760,8 +5352,20 @@ impl Am3BbRunSafetyGuard {
 impl Drop for Am3BbRunSafetyGuard {
     fn drop(&mut self) {
         if !self.teardown_done {
-            if let Err(error) = self.teardown_checked() {
-                warn!(%error, "am3-bb: fail-closed Drop safe-off was incomplete");
+            self.teardown_done = true;
+            let board_enable_off_ok =
+                self.board_cutoff_receipt_issued || self.cut_board_enable_fallback();
+            let (dspic_shutdown, dspic_disable_ok, resets_asserted_ok) =
+                self.run_defense_in_depth();
+            if !(board_enable_off_ok && dspic_disable_ok && resets_asserted_ok) {
+                warn!(
+                    board_enable_off_ok,
+                    dspic_disable_ok,
+                    dspic_delivery_attempts = dspic_shutdown.delivery_attempts,
+                    dspic_delivery_failures = dspic_shutdown.delivery_failures,
+                    resets_asserted_ok,
+                    "am3-bb: fail-closed Drop safe-off was incomplete; no clean-shutdown evidence was minted"
+                );
             }
         }
     }
@@ -3798,9 +5402,8 @@ fn am3_bb_post_dspic_reset_chains(platform: &BeagleBonePlatform, chain_count: us
     Ok(())
 }
 
-#[derive(Debug)]
 struct Am3BbHeartbeatShutdownEvidence {
-    summary: ThreadStopSummary,
+    actor_stop: ThreadRosterStop<Am3BbThreadSlot>,
     worker_timed_out: bool,
     worker_panicked: bool,
     hard_board_cut_attempted: bool,
@@ -3811,33 +5414,81 @@ impl Am3BbHeartbeatShutdownEvidence {
     fn graceful(&self) -> bool {
         !self.worker_timed_out && !self.worker_panicked
     }
+
+    fn into_actor_receipt(self) -> Option<ThreadRosterQuiescenceReceipt<Am3BbThreadSlot>> {
+        self.actor_stop.into_receipt()
+    }
 }
 
-fn am3_bb_force_board_enable_off(
-    board_enable_gpio: u32,
-    board_enable_active_high: bool,
+fn am3_bb_force_runtime_board_enable_off(
+    board_cutoff: &mut Am3BbRuntimeCutoff<'_>,
     reason: &'static str,
 ) -> bool {
-    let off_level = if board_enable_active_high { "0" } else { "1" };
-    match am3_bb_prepare_output_gpio(board_enable_gpio, false)
-        .and_then(|_| am3_bb_write_gpio_attr_checked(board_enable_gpio, "value", off_level))
-    {
-        Ok(()) => {
+    match board_cutoff.cut_checked() {
+        Ok(_) => {
             warn!(
-                gpio = board_enable_gpio,
-                off_level, reason, "am3-bb: hard board-enable cutoff applied"
+                gpio = board_cutoff.gpio(),
+                off_level = board_cutoff.off_level(),
+                reason,
+                "am3-bb: hard board-enable cutoff applied through retained runtime owner"
             );
             true
         }
-        Err(e) => {
+        Err(retained_error) => {
             warn!(
-                gpio = board_enable_gpio,
-                off_level,
+                gpio = board_cutoff.gpio(),
                 reason,
-                error = %e,
-                "am3-bb: hard board-enable cutoff failed"
+                error = %retained_error,
+                "am3-bb: retained runtime cutoff failed; attempting non-authorizing glitch-free re-prepare"
             );
-            false
+            am3_bb_reprepare_active_high_board_enable_off(board_cutoff.gpio()).is_ok()
+        }
+    }
+}
+
+fn am3_bb_force_board_enable_off(
+    board_cutoff: &Am3BbPreparedBoardCutoff,
+    reason: &'static str,
+) -> bool {
+    match board_cutoff.cut_checked() {
+        Ok(_) => {
+            warn!(
+                gpio = board_cutoff.gpio(),
+                off_level = board_cutoff.off_level(),
+                reason,
+                "am3-bb: hard board-enable cutoff applied through retained handle"
+            );
+            true
+        }
+        Err(retained_error) => {
+            warn!(
+                gpio = board_cutoff.gpio(),
+                off_level = board_cutoff.off_level(),
+                reason,
+                error = %retained_error,
+                "am3-bb: retained hard-cutoff handle failed; attempting non-authorizing sysfs re-prepare fallback"
+            );
+            match am3_bb_reprepare_active_high_board_enable_off(board_cutoff.gpio()) {
+                Ok(()) => {
+                    warn!(
+                        gpio = board_cutoff.gpio(),
+                        off_level = board_cutoff.off_level(),
+                        reason,
+                        "am3-bb: hard board-enable cutoff required sysfs re-prepare fallback"
+                    );
+                    true
+                }
+                Err(fallback_error) => {
+                    warn!(
+                        gpio = board_cutoff.gpio(),
+                        off_level = board_cutoff.off_level(),
+                        reason,
+                        error = %fallback_error,
+                        "am3-bb: retained and re-prepare hard board-enable cutoff both failed"
+                    );
+                    false
+                }
+            }
         }
     }
 }
@@ -3962,11 +5613,26 @@ impl Am3BbHeartbeatAdmission {
 }
 
 struct Am3BbDspicHeartbeatGuard {
-    threads: RuntimeThreadGuard,
+    threads: FixedThreadRosterGuard<Am3BbThreadSlot>,
     admission: Am3BbHeartbeatAdmission,
-    board_enable_gpio: u32,
-    board_enable_active_high: bool,
+    board_cutoff: Am3BbPreparedBoardCutoff,
     explicitly_stopped: bool,
+}
+
+fn am3_bb_cut_on_heartbeat_error<T>(
+    result: Result<T>,
+    board_cutoff: &Am3BbPreparedBoardCutoff,
+    reason: &'static str,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let cutoff_succeeded = am3_bb_force_board_enable_off(board_cutoff, reason);
+            Err(error.context(format!(
+                "am3-bb: immediate retained GPIO59 cutoff after heartbeat failure succeeded={cutoff_succeeded}"
+            )))
+        }
+    }
 }
 
 impl Am3BbDspicHeartbeatGuard {
@@ -3974,37 +5640,47 @@ impl Am3BbDspicHeartbeatGuard {
         &mut self,
         shutdown: &CancellationToken,
     ) -> Result<Am3BbHeartbeatReadinessReceipt> {
-        self.admission.wait_for_verified_heartbeat_readiness(
+        let result = self.admission.wait_for_verified_heartbeat_readiness(
             shutdown,
             Duration::from_millis(AM3_BB_DSPIC_HEARTBEAT_READINESS_TIMEOUT_MS),
+        );
+        am3_bb_cut_on_heartbeat_error(
+            result,
+            &self.board_cutoff,
+            "dspic-heartbeat-readiness-failure",
         )
     }
 
     fn require_ready_and_healthy(&mut self, stage: &'static str) -> Result<()> {
-        self.admission.require_ready_and_healthy(stage)
+        let result = self.admission.require_ready_and_healthy(stage);
+        am3_bb_cut_on_heartbeat_error(
+            result,
+            &self.board_cutoff,
+            "dspic-heartbeat-terminal-failure",
+        )
     }
 
-    fn stop_and_join(
+    fn request_stop(&self) {
+        self.threads.request_stop();
+    }
+
+    fn stop_and_join_until(
         &mut self,
         rt_handle: &tokio::runtime::Handle,
+        deadline: Instant,
     ) -> Am3BbHeartbeatShutdownEvidence {
-        let summary = rt_handle.block_on(self.threads.stop_and_join(Duration::from_millis(
-            AM3_BB_DSPIC_HEARTBEAT_STOP_TIMEOUT_MS,
-        )));
-        let worker_timed_out = summary.any_timed_out();
-        let worker_panicked = summary.any_panicked();
-        let hard_board_cut_succeeded = worker_timed_out
-            && am3_bb_force_board_enable_off(
-                self.board_enable_gpio,
-                self.board_enable_active_high,
-                "dspic-heartbeat-stop-timeout",
-            );
+        let actor_stop = rt_handle.block_on(self.threads.stop_and_join_until(deadline));
+        let worker_timed_out = actor_stop.any_timed_out();
+        let worker_panicked = actor_stop.any_panicked();
+        let hard_board_cut_attempted = worker_timed_out || worker_panicked;
+        let hard_board_cut_succeeded = hard_board_cut_attempted
+            && am3_bb_force_board_enable_off(&self.board_cutoff, "dspic-heartbeat-stop-failure");
         self.explicitly_stopped = true;
         Am3BbHeartbeatShutdownEvidence {
-            summary,
+            actor_stop,
             worker_timed_out,
             worker_panicked,
-            hard_board_cut_attempted: worker_timed_out,
+            hard_board_cut_attempted,
             hard_board_cut_succeeded,
         }
     }
@@ -4018,8 +5694,7 @@ impl Drop for Am3BbDspicHeartbeatGuard {
         self.threads.request_stop();
         if !self.explicitly_stopped {
             let hard_board_cut_succeeded = am3_bb_force_board_enable_off(
-                self.board_enable_gpio,
-                self.board_enable_active_high,
+                &self.board_cutoff,
                 "dspic-heartbeat-owner-drop-without-quiescence",
             );
             warn!(
@@ -4121,10 +5796,11 @@ fn run_am3_bb_dspic_heartbeat_worker(
 }
 
 fn start_am3_bb_dspic_heartbeat(
+    actor_owner: ThreadRosterOwner<Am3BbThreadSlot>,
     i2c: I2cServiceHandle,
     active_addrs: Vec<u8>,
     shutdown: CancellationToken,
-    platform: &BeagleBonePlatform,
+    board_cutoff: Am3BbPreparedBoardCutoff,
 ) -> Result<Am3BbDspicHeartbeatGuard> {
     if active_addrs.is_empty() {
         anyhow::bail!("am3-bb: refusing to start dsPIC heartbeat owner with zero controllers");
@@ -4132,6 +5808,8 @@ fn start_am3_bb_dspic_heartbeat(
     let expected_chains = active_addrs.len();
     let worker_stop = CancellationToken::new();
     let stop_worker = worker_stop.clone();
+    let mut threads = actor_owner.activate(worker_stop);
+    let actor_slot = threads.reserve(Am3BbThreadSlot::DspicHeartbeat)?;
     let supervisor_disabled = env_flag_set(ENV_AM3_BB_DISABLE_HEARTBEAT_SUPERVISOR);
     if supervisor_disabled {
         warn!(
@@ -4163,13 +5841,11 @@ fn start_am3_bb_dspic_heartbeat(
         })
         .context("am3-bb: spawn dsPIC heartbeat thread failed")?;
 
-    let mut threads = RuntimeThreadGuard::new(worker_stop);
-    threads.push("am3-bb-dspic-heartbeat", handle);
+    actor_slot.attach(handle);
     Ok(Am3BbDspicHeartbeatGuard {
         threads,
         admission: Am3BbHeartbeatAdmission::new(events_rx, expected_chains),
-        board_enable_gpio: platform.board_enable_gpio_v2_0(),
-        board_enable_active_high: platform.board_target().board_enable_active_high(),
+        board_cutoff,
         explicitly_stopped: false,
     })
 }
@@ -4305,7 +5981,10 @@ fn bm1362_chip_init_one_chain(
     // different enum baud / settle time. Repeated unassigned responses are
     // liveness frames, not unique-chip or chip-count evidence.
     let n_assign = expected_chips_per_chain.clamp(1, BM1362_MAX_CHIPS_PER_CHAIN);
-    let addr_interval = (256u16 / n_assign as u16).max(1);
+    // Pure full-population stride SSOT (P1-3) — no open-coded 256/N.
+    // `n_assign` is clamped to 1..=255 (BM1362_MAX_CHIPS_PER_CHAIN) above, so
+    // the u8 narrowing is lossless by construction.
+    let addr_interval = u16::from(dcentrald_common::bm1397plus_addr_interval(n_assign as u8));
     let mut n_fast = 0usize;
     let mut fast_get_address_observation = None;
     info!(
@@ -4545,22 +6224,17 @@ fn bm1362_chip_init_one_chain(
             "FastUART(0x28)",
         )?;
 
-        // Step 6 (cont.) — MiscCtrl(0x18) = 0x00C100B0 triple-write at 115200,
-        // BEFORE the host baud switch (the proven trace does the
-        // post-fast-uart-reg MiscCtrl×3 then switches the host baud) — only
-        // when the board-target opts say so
+        // Step 6 (cont.) — MiscCtrl(0x18) triple-write at 115200 BEFORE host
+        // baud switch (proven trace order). Cadence: pure plan via
+        // `bm1362_miscctrl_triple_write_bcast` (P1-1); board-target opt-in only
         //.
         if run_miscctrl_triple_write {
-            for _ in 0..3 {
-                bm1362_bcast(
-                    uart,
-                    chain_idx,
-                    cold_boot_step::MISC_CONTROL_REG,
-                    init_values.misc_control_post_fast_baud,
-                    5,
-                    "MiscCtrl(0x18) post-fast-uart-reg",
-                )?;
-            }
+            bm1362_miscctrl_triple_write_bcast(
+                uart,
+                chain_idx,
+                init_values.misc_control_post_fast_baud,
+                "MiscCtrl(0x18) post-fast-uart-reg",
+            )?;
             info!(
                 chain = chain_idx,
                 misc_post_fast = format_args!("0x{:08X}", init_values.misc_control_post_fast_baud),
@@ -4781,6 +6455,7 @@ fn bm1362_chip_init_one_chain(
 /// is stale anyway, same as the transport's 16-slot in-flight ring.
 #[derive(Clone)]
 struct DispatchedWork {
+    work_generation: dcentrald_stratum::WorkGeneration,
     job_id: String,
     extranonce2: String,
     ntime: u32,
@@ -4917,15 +6592,18 @@ fn am3_bb_update_best_replay(best: &mut Option<Am3BbNonceReplay>, replay: Am3BbN
     }
 }
 
-fn am3_bb_replay_bm1362_nonce_decodes(
-    history: &VecDeque<DispatchedWork>,
+fn am3_bb_replay_bm1362_nonce_decodes<'a, I>(
+    history: I,
     nr: &Bm1362SerialNonce,
 ) -> (
     Option<Am3BbNonceReplay>,
     Option<Am3BbNonceReplay>,
     Option<Am3BbNonceReplay>,
     u32,
-) {
+)
+where
+    I: IntoIterator<Item = &'a DispatchedWork>,
+{
     let nonce_wire = [
         nr.raw_frame[2],
         nr.raw_frame[3],
@@ -4939,7 +6617,8 @@ fn am3_bb_replay_bm1362_nonce_decodes(
     let mut alternate_pool_hit = None;
     let mut version_rejects = 0u32;
 
-    for candidate in history.iter().rev() {
+    // Caller supplies newest-first (WorkHistoryRing::iter_newest_first) or any order.
+    for candidate in history {
         let version_variants = [
             (
                 "be_shift_replace",
@@ -5029,6 +6708,221 @@ fn stratum_config_from(config: &DcentraldConfig) -> dcentrald_stratum::types::St
     )
 }
 
+/// Sole owner of terminal AM3 API state. Drop is fail-closed: any return before
+/// a checked safe-off receipt publishes that physical safe-off is unproven.
+struct Am3BbTerminalStatePublisher {
+    state_tx: watch::Sender<dcentrald_api::MinerState>,
+    safe_off_proven: bool,
+    completed: bool,
+}
+
+impl Am3BbTerminalStatePublisher {
+    fn new(state_tx: watch::Sender<dcentrald_api::MinerState>) -> Self {
+        Self {
+            state_tx,
+            safe_off_proven: false,
+            completed: false,
+        }
+    }
+
+    fn publish(&self, pool_status: &str, chain_status: &str) {
+        self.state_tx.send_modify(|state| {
+            state.hashrate_ghs = 0.0;
+            state.hashrate_5s_ghs = 0.0;
+            state.pool.status = pool_status.to_string();
+            state.pool.latency_ms = 0;
+            for chain in &mut state.chains {
+                chain.hashrate_ghs = 0.0;
+                chain.status = chain_status.to_string();
+            }
+        });
+    }
+
+    fn begin_stopping(&self) {
+        self.publish("stopping", "stopping_population_unproven");
+    }
+
+    fn record_safe_off(&mut self, mining_faulted: bool) {
+        self.safe_off_proven = true;
+        if mining_faulted {
+            self.publish(
+                "faulted_safe_off_proven",
+                "faulted_population_unproven_safe_off_proven",
+            );
+        } else {
+            self.publish(
+                "stopping_safe_off_proven",
+                "stopping_population_unproven_safe_off_proven",
+            );
+        }
+    }
+
+    fn finish_stopped(&mut self) {
+        self.publish("stopped", "stopped_population_unproven");
+        self.completed = true;
+    }
+
+    fn finish_never_energized(&mut self, _closeout: Am3BbNeverEnergizedCloseout) {
+        self.safe_off_proven = true;
+        self.publish("stopped_never_energized", "stopped_never_energized");
+        self.completed = true;
+    }
+}
+
+impl Drop for Am3BbTerminalStatePublisher {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if self.safe_off_proven {
+            self.publish(
+                "faulted_safe_off_proven",
+                "faulted_population_unproven_safe_off_proven",
+            );
+        } else {
+            self.publish(
+                "faulted_safe_off_unproven",
+                "faulted_population_unproven_safe_off_unproven",
+            );
+        }
+    }
+}
+
+/// Owns every asynchronous AM3 Stratum publisher. The closed gate is checked
+/// inside every status mutation closure, so a task already scheduled when
+/// teardown begins cannot overwrite terminal state.
+fn am3_bb_capped_cleanup_deadline(
+    cleanup_deadline: Instant,
+    now: Instant,
+    stage_cap: Duration,
+) -> Instant {
+    now.checked_add(stage_cap)
+        .unwrap_or(cleanup_deadline)
+        .min(cleanup_deadline)
+}
+
+struct Am3BbStratumTaskGuard {
+    rt_handle: tokio::runtime::Handle,
+    shutdown: CancellationToken,
+    router: Option<tokio::task::JoinHandle<()>>,
+    status: Option<tokio::task::JoinHandle<()>>,
+    publisher_closed: Arc<AtomicBool>,
+}
+
+impl Am3BbStratumTaskGuard {
+    fn pending(
+        rt_handle: tokio::runtime::Handle,
+        shutdown: CancellationToken,
+        publisher_closed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            rt_handle,
+            shutdown,
+            router: None,
+            status: None,
+            publisher_closed,
+        }
+    }
+
+    fn spawn_router(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        assert!(self.router.is_none(), "AM3 Stratum router spawned twice");
+        self.router = Some(self.rt_handle.spawn(future));
+    }
+
+    fn spawn_status(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        assert!(
+            self.status.is_none(),
+            "AM3 Stratum status task spawned twice"
+        );
+        self.status = Some(self.rt_handle.spawn(future));
+    }
+
+    fn close_publisher(&self) {
+        self.publisher_closed.store(true, Ordering::Release);
+    }
+
+    fn request_stop(&self) {
+        self.close_publisher();
+        self.shutdown.cancel();
+    }
+
+    fn stop_and_join(&mut self, deadline: Instant) -> Result<()> {
+        self.request_stop();
+        anyhow::ensure!(
+            self.router.is_some() && self.status.is_some(),
+            "am3-bb: incomplete Stratum task roster cannot be consumed (router_present={}, status_present={})",
+            self.router.is_some(),
+            self.status.is_some()
+        );
+        let mut router = self
+            .router
+            .take()
+            .expect("complete Stratum roster was checked before router take");
+        let mut status = self
+            .status
+            .take()
+            .expect("complete Stratum roster was checked before status take");
+        let joined = self.rt_handle.block_on(async {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                tokio::join!(&mut router, &mut status)
+            })
+            .await
+        });
+        let (router_result, status_result) = match joined {
+            Ok(results) => results,
+            Err(_) => {
+                router.abort();
+                status.abort();
+                anyhow::bail!(
+                    "am3-bb: Stratum tasks missed the absolute cancellation deadline; abort requested without an unbounded follow-up join (router_finished={}, status_finished={})",
+                    router.is_finished(),
+                    status.is_finished()
+                );
+            }
+        };
+        router_result.context("am3-bb: Stratum router task panicked during terminal join")?;
+        status_result.context("am3-bb: Stratum status task panicked during terminal join")?;
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "am3-bb: Stratum tasks completed at or after the strict absolute cancellation deadline"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for Am3BbStratumTaskGuard {
+    fn drop(&mut self) {
+        self.close_publisher();
+        self.shutdown.cancel();
+        if let Some(router) = self.router.take() {
+            router.abort();
+        }
+        if let Some(status) = self.status.take() {
+            status.abort();
+        }
+    }
+}
+
+struct Am3BbMiningLoopExit {
+    mining_result: Result<()>,
+    stratum_tasks: Am3BbStratumTaskGuard,
+}
+
+/// A preparation error from `run_mining_loop` is issued only before control is
+/// transferred to the infallible-top-level `run_started_mining_loop` phase.
+/// The started phase owns every asynchronous spawn and captures operational
+/// failures in `Am3BbMiningLoopExit::mining_result`, so the caller can
+/// positively classify the Stratum roster as never spawned instead of
+/// inventing unknown ownership.
+#[derive(Debug)]
+struct Am3BbMiningLoopNotStarted(anyhow::Error);
+
+impl Am3BbMiningLoopNotStarted {
+    fn into_source(self) -> anyhow::Error {
+        self.0
+    }
+}
+
 /// The Option-B2 mining loop: Stratum (router on `rt_handle`) ↔ this blocking
 /// thread (work-build + paced dispatch + nonce-validate + dedup + submit).
 ///
@@ -5053,26 +6947,26 @@ fn run_mining_loop<U: ChainUart>(
     watchdog: &mut SafetyWatchdogOwner,
     watchdog_liveness: SafetyLiveness,
     hardware_mutation_owner: &HardwareMutationGateOwner,
-    board_enable_gpio: u32,
-    board_enable_active_high: bool,
-) -> Result<()> {
-    use dcentrald_stratum::share_pipeline::{validate_full_header, WorkBuilder};
-
+    board_cutoff: &mut Am3BbRuntimeCutoff<'_>,
+    state_tx: watch::Sender<dcentrald_api::MinerState>,
+) -> std::result::Result<Am3BbMiningLoopExit, Am3BbMiningLoopNotStarted> {
     if config.pool.url.trim().is_empty() || config.pool.worker.trim().is_empty() {
-        anyhow::bail!(
+        return Err(Am3BbMiningLoopNotStarted(anyhow::anyhow!(
             "am3-bb: mining loop requires a non-empty pool.url AND pool.worker — set a real BTC address. \
              (Use DCENT_AM3_BB_STUB_LOOP=1 for a cold-boot/enum-only run with no pool.)"
-        );
+        )));
     }
 
     if env_flag_set(ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR) {
-        anyhow::bail!(
+        return Err(Am3BbMiningLoopNotStarted(anyhow::anyhow!(
             "am3-bb: watched Mining admission forbids {}",
             ENV_AM3_BB_SKIP_THERMAL_SUPERVISOR
-        );
+        )));
     }
     let Some(i2c) = thermal_i2c else {
-        anyhow::bail!("am3-bb: runtime LM75 thermal supervisor requires dsPIC I2C access");
+        return Err(Am3BbMiningLoopNotStarted(anyhow::anyhow!(
+            "am3-bb: runtime LM75 thermal supervisor requires dsPIC I2C access"
+        )));
     };
     let mut thermal_supervisor = Am3BbThermalSupervisor::new(
         i2c,
@@ -5080,8 +6974,11 @@ fn run_mining_loop<U: ChainUart>(
         transport.chain_count(),
         config.thermal.hot_temp_c,
         config.thermal.dangerous_temp_c,
-    )?;
-    thermal_supervisor.poll_and_check("pre-stratum")?;
+    )
+    .map_err(Am3BbMiningLoopNotStarted)?;
+    thermal_supervisor
+        .poll_and_check("pre-stratum")
+        .map_err(Am3BbMiningLoopNotStarted)?;
     let thermal_poll_ms =
         am3_bb_thermal_poll_interval(config.thermal.pid_interval_s).as_millis() as u64;
 
@@ -5092,14 +6989,16 @@ fn run_mining_loop<U: ChainUart>(
     // when the fail-closed supervisor itself is disabled (lab override): with
     // no validated thermal proof there is nothing safe to drive a PID from.
     if env_flag_set(ENV_AM3_BB_DISABLE_FAN_PID) {
-        anyhow::bail!(
+        return Err(Am3BbMiningLoopNotStarted(anyhow::anyhow!(
             "am3-bb: watched Mining admission forbids {}",
             ENV_AM3_BB_DISABLE_FAN_PID
-        );
+        )));
     }
     let fan = pid_fan
-        .context("am3-bb: watched Mining admission requires checked BeagleBone fan ownership")?;
-    let mut fan_pid = Am3BbFanPid::new(fan, config.thermal.target_temp_c)?;
+        .context("am3-bb: watched Mining admission requires checked BeagleBone fan ownership")
+        .map_err(Am3BbMiningLoopNotStarted)?;
+    let mut fan_pid =
+        Am3BbFanPid::new(fan, config.thermal.target_temp_c).map_err(Am3BbMiningLoopNotStarted)?;
     info!(
         target_temp_c = config.thermal.target_temp_c,
         start_pwm = fan_pid.commanded_pwm(),
@@ -5113,9 +7012,15 @@ fn run_mining_loop<U: ChainUart>(
         shutdown,
         true,
         "watched Mining admission",
-    )?;
-    rt_handle.block_on(watchdog.enter_mining())?;
-    let api_admission = hardware_mutation_owner.open()?;
+    )
+    .map_err(Am3BbMiningLoopNotStarted)?;
+    rt_handle
+        .block_on(watchdog.enter_mining())
+        .map_err(Am3BbMiningLoopNotStarted)?;
+    let api_admission = hardware_mutation_owner
+        .open()
+        .map_err(anyhow::Error::new)
+        .map_err(Am3BbMiningLoopNotStarted)?;
     info!(
         opened_at = ?api_admission.opened_at(),
         "am3-bb: API hardware-mutation admission opened after Mining readiness"
@@ -5134,6 +7039,43 @@ fn run_mining_loop<U: ChainUart>(
         "am3-bb: quiet thermal guard active (fail-closed LM75 hard-stop + continuous capped fan PID)"
     );
 
+    Ok(run_started_mining_loop(
+        config,
+        transport,
+        total_chips,
+        shutdown,
+        heartbeat,
+        rt_handle,
+        thermal_supervisor,
+        thermal_poll_ms,
+        fan_pid,
+        watchdog_liveness,
+        board_cutoff,
+        state_tx,
+    ))
+}
+
+/// Started AM3 mining phase.
+///
+/// This function is deliberately infallible at its top level: once it owns a
+/// Stratum task, every operational outcome is returned inside
+/// `Am3BbMiningLoopExit`, together with the complete task-owner guard.
+fn run_started_mining_loop<U: ChainUart>(
+    config: &DcentraldConfig,
+    transport: &mut Am335xUartTransport<U>,
+    total_chips: usize,
+    shutdown: &CancellationToken,
+    heartbeat: &mut Am3BbDspicHeartbeatGuard,
+    rt_handle: &tokio::runtime::Handle,
+    mut thermal_supervisor: Am3BbThermalSupervisor,
+    thermal_poll_ms: u64,
+    mut fan_pid: Am3BbFanPid,
+    watchdog_liveness: SafetyLiveness,
+    board_cutoff: &mut Am3BbRuntimeCutoff<'_>,
+    state_tx: watch::Sender<dcentrald_api::MinerState>,
+) -> Am3BbMiningLoopExit {
+    use dcentrald_stratum::share_pipeline::{validate_full_header, WorkBuilder};
+
     // --- Stratum channels (same shape serial_mining.rs uses). ---
     let (job_tx, mut job_rx) = mpsc::channel::<dcentrald_stratum::types::JobTemplate>(32);
     let (share_tx, share_rx) = mpsc::channel::<dcentrald_stratum::types::ValidShare>(256);
@@ -5141,561 +7083,746 @@ fn run_mining_loop<U: ChainUart>(
 
     let stratum_config = stratum_config_from(config);
     let router = dcentrald_stratum::StratumRouter::new(stratum_config);
-    rt_handle.spawn(async move {
-        router.run(job_tx, share_rx, status_tx).await;
+    let stratum_tasks_shutdown = CancellationToken::new();
+    let publisher_closed = Arc::new(AtomicBool::new(false));
+    // Establish cancellation and Drop ownership before the first spawn. No raw
+    // JoinHandle may ever exist outside this guard across another operation.
+    let mut stratum_tasks = Am3BbStratumTaskGuard::pending(
+        rt_handle.clone(),
+        stratum_tasks_shutdown.clone(),
+        publisher_closed.clone(),
+    );
+    let router_shutdown = stratum_tasks_shutdown.clone();
+    stratum_tasks.spawn_router(async move {
+        tokio::select! {
+            biased;
+            _ = router_shutdown.cancelled() => {}
+            _ = router.run(job_tx, share_rx, status_tx) => {}
+        }
+    });
+    state_tx.send_modify(|state| {
+        state.pool.url = config.pool.url.clone();
+        state.pool.worker = config.pool.worker.clone();
+        state.pool.protocol = config
+            .pool
+            .protocol
+            .clone()
+            .unwrap_or_else(|| "sv1".to_string());
+        // The configured address plan is not measured enumeration. Publish
+        // three known UART lanes with zero observed chips until an exact
+        // current-run population receipt exists.
+        state.chains = (0..transport.chain_count())
+            .map(|chain| dcentrald_api::ChainState {
+                id: chain as u8,
+                chips: 0,
+                frequency_mhz: 0,
+                voltage_mv: 0,
+                temp_c: 0.0,
+                temp_source: None,
+                hashrate_ghs: 0.0,
+                errors: 0,
+                status: "population_unproven".to_string(),
+            })
+            .collect();
     });
     // Drain Stratum status events on the runtime so the channel doesn't back
-    // up; we only log them here (the dashboard/state-channel wiring is owned by
-    // the proxy-mode API main.rs already started — out of scope for this loop).
-    rt_handle.spawn(async move {
-        while let Some(st) = status_rx.recv().await {
-            match st {
-                dcentrald_stratum::types::StratumStatus::ShareAccepted { job_id, .. } => {
-                    info!(job_id = %job_id, "am3-bb: SHARE ACCEPTED")
+    // up and project pool-acknowledged state into the dashboard/API channel.
+    let status_state_tx = state_tx.clone();
+    let status_shutdown = stratum_tasks_shutdown.clone();
+    let status_publisher_closed = publisher_closed.clone();
+    stratum_tasks.spawn_status(async move {
+        const DIFF1_HASHES: f64 = 4_294_967_296.0;
+        let started = Instant::now();
+        let mut accepted_difficulty_sum = 0.0_f64;
+        let mut recent_accepted = VecDeque::<(Instant, f64)>::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = status_shutdown.cancelled() => break,
+                _ = tick.tick() => {
+                    let now = Instant::now();
+                    while recent_accepted.front().is_some_and(|(at, _)| {
+                        now.duration_since(*at) > Duration::from_secs(5)
+                    }) {
+                        recent_accepted.pop_front();
+                    }
+                    let recent_difficulty: f64 = recent_accepted
+                        .iter()
+                        .map(|(_, difficulty)| *difficulty)
+                        .sum();
+                    let uptime_s = started.elapsed().as_secs();
+                    let lifetime_ghs = accepted_difficulty_sum * DIFF1_HASHES
+                        / started.elapsed().as_secs_f64().max(1.0)
+                        / 1_000_000_000.0;
+                    let recent_ghs =
+                        recent_difficulty * DIFF1_HASHES / 5.0 / 1_000_000_000.0;
+                    status_state_tx.send_modify(|state| {
+                        if status_publisher_closed.load(Ordering::Acquire) {
+                            return;
+                        }
+                        state.uptime_s = uptime_s;
+                        state.hashrate_ghs = lifetime_ghs;
+                        state.hashrate_5s_ghs = recent_ghs;
+                    });
                 }
-                dcentrald_stratum::types::StratumStatus::ShareRejected {
-                    job_id,
-                    error_msg,
-                    ..
-                } => warn!(job_id = %job_id, error = %error_msg, "am3-bb: SHARE REJECTED"),
-                dcentrald_stratum::types::StratumStatus::DifficultyChanged(d) => {
-                    info!(difficulty = d, "am3-bb: pool difficulty")
+                status = status_rx.recv() => {
+                    let Some(st) = status else { break; };
+                    match st {
+                        dcentrald_stratum::types::StratumStatus::ShareAccepted {
+                            job_id,
+                            pool_target_difficulty,
+                            ..
+                        } => {
+                            let credited = if pool_target_difficulty.is_finite()
+                                && pool_target_difficulty > 0.0
+                            {
+                                pool_target_difficulty
+                            } else {
+                                0.0
+                            };
+                            accepted_difficulty_sum += credited;
+                            recent_accepted.push_back((Instant::now(), credited));
+                            status_state_tx.send_modify(|state| {
+                                if status_publisher_closed.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                state.accepted = state.accepted.saturating_add(1);
+                                state.pool.status = "mining".to_string();
+                                state.pool.last_share_at = dcentrald_api::unix_epoch_ms() / 1000;
+                                state.pool.difficulty = credited;
+                            });
+                            info!(job_id = %job_id, pool_target_difficulty, "am3-bb: SHARE ACCEPTED")
+                        }
+                        dcentrald_stratum::types::StratumStatus::ShareRejected {
+                            job_id,
+                            error_code,
+                            error_msg,
+                            ..
+                        } => {
+                            status_state_tx.send_modify(|state| {
+                                if status_publisher_closed.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                state.rejected = state.rejected.saturating_add(1);
+                                let bucket = dcentrald_api::classify_reject_reason(
+                                    error_code,
+                                    &error_msg,
+                                );
+                                state.pool.reject_reason_counts[bucket] = state.pool
+                                    .reject_reason_counts[bucket]
+                                    .saturating_add(1);
+                            });
+                            warn!(job_id = %job_id, error = %error_msg, "am3-bb: SHARE REJECTED")
+                        }
+                        dcentrald_stratum::types::StratumStatus::DifficultyChanged(difficulty) => {
+                            if difficulty.is_finite() && difficulty >= 0.0 {
+                                status_state_tx.send_modify(|state| {
+                                    if status_publisher_closed.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    state.pool.difficulty = difficulty;
+                                });
+                            }
+                            info!(difficulty, "am3-bb: pool difficulty")
+                        }
+                        dcentrald_stratum::types::StratumStatus::StateChanged(pool_state) => {
+                            let status = match pool_state {
+                                dcentrald_stratum::types::StratumState::Disconnected => "disconnected",
+                                dcentrald_stratum::types::StratumState::Connecting => "connecting",
+                                dcentrald_stratum::types::StratumState::Authorized => "authorized",
+                                dcentrald_stratum::types::StratumState::Mining => "mining",
+                                dcentrald_stratum::types::StratumState::Donating => "donating",
+                                dcentrald_stratum::types::StratumState::AuthFailed => "auth_failed",
+                            };
+                            status_state_tx.send_modify(|state| {
+                                if status_publisher_closed.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                state.pool.status = status.to_string();
+                            });
+                            info!(state = ?pool_state, "am3-bb: pool state")
+                        }
+                        dcentrald_stratum::types::StratumStatus::Latency(latency_ms) => {
+                            status_state_tx.send_modify(|state| {
+                                if status_publisher_closed.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                state.pool.latency_ms = latency_ms;
+                            });
+                        }
+                        _ => {}
+                    }
                 }
-                dcentrald_stratum::types::StratumStatus::StateChanged(s) => {
-                    info!(state = ?s, "am3-bb: pool state")
-                }
-                _ => {}
             }
         }
     });
 
-    let assume_job_response_flags = env_flag_set(ENV_AM3_BB_ASSUME_JOB_RESPONSE_FLAGS);
-    if assume_job_response_flags {
-        warn!(
+    let mining_result = (|| -> Result<()> {
+        let assume_job_response_flags = env_flag_set(ENV_AM3_BB_ASSUME_JOB_RESPONSE_FLAGS);
+        if assume_job_response_flags {
+            warn!(
             env = ENV_AM3_BB_ASSUME_JOB_RESPONSE_FLAGS,
             "am3-bb: lab override active - validating parsed BM1362 frames even when flags bit7 is clear"
         );
-    }
+        }
 
-    let work_codec = Am3BbWorkCodec::from_env();
+        let work_codec = Am3BbWorkCodec::from_env();
 
-    info!(
-        chains = transport.chain_count(),
-        total_chips,
-        dispatch_interval_us = transport.dispatch_interval_us(),
-        work_codec = work_codec.as_str(),
-        pool = %config.pool.url,
-        "=== am3-bb MINING ACTIVE (Option B2) — Stratum + paced BM1362 serial-work dispatch + nonce-validate/dedup/submit ==="
-    );
+        info!(
+            chains = transport.chain_count(),
+            total_chips,
+            dispatch_interval_us = transport.dispatch_interval_us(),
+            work_codec = work_codec.as_str(),
+            pool = %config.pool.url,
+            "=== am3-bb MINING ACTIVE (Option B2) — Stratum + paced BM1362 serial-work dispatch + nonce-validate/dedup/submit ==="
+        );
 
-    let worker_name = config.pool.worker.clone();
-    let mut work_builder = WorkBuilder::new();
-    let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
-    let mut asic_job_id: u8 = 0;
-    // Per-job_id-slot history of dispatched work, for nonce → header lookup.
-    let mut work_by_id: Vec<VecDeque<DispatchedWork>> =
-        (0..ASIC_JOB_ID_SPAN).map(|_| VecDeque::new()).collect();
-    let mut next_chain: usize = 0;
-    // Dedup BEFORE pool submission.
-    let mut seen_shares: HashSet<(u8, u32, u16)> = HashSet::new();
-    // Bound the dedup set so a long run doesn't grow unbounded; a clean-jobs
-    // event clears it (new block ⇒ old (job_id, nonce) pairs are irrelevant).
-    const SEEN_SHARES_SOFT_CAP: usize = 8192;
-
-    let chain_count = transport.chain_count().max(1);
-    let start = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let mut last_thermal_poll = Instant::now();
-    let mut last_dispatch_attempt = Instant::now();
-    // Per-chain ~one frame every dispatch_interval_us; loop-tick ~= the
-    // interval / chain_count so all chains stay fed without flooding.
-    let tick =
-        Duration::from_micros((transport.dispatch_interval_us() / chain_count as u64).max(500));
-    let mut total_work: u64 = 0;
-    let mut total_rx_frames: u64 = 0;
-    let mut total_nonces: u64 = 0;
-    let mut non_job_frames: u64 = 0;
-    let mut assumed_job_response_frames: u64 = 0;
-    let mut shares_submitted: u64 = 0;
-    let mut dup_nonces: u64 = 0;
-    let mut bad_nonces: u64 = 0;
-    let mut target_miss_nonces: u64 = 0;
-    let mut unknown_job_nonces: u64 = 0;
-    let mut alternate_decode_pool_hits: u64 = 0;
-    let mut version_metadata_rejects: u64 = 0;
-    let mut best_target_miss_difficulty: Option<f64> = None;
-
-    loop {
-        // Observe terminal heartbeat failure/panic before interpreting the
-        // worker's cancellation as an ordinary operator shutdown.
-        heartbeat.require_ready_and_healthy("runtime supervision")?;
-        if shutdown.is_cancelled() {
-            info!(
-                uptime_s = start.elapsed().as_secs(),
-                work_codec = work_codec.as_str(),
-                total_work,
-                total_rx_frames,
-                total_nonces,
-                non_job_frames,
-                assumed_job_response_frames,
-                shares_submitted,
-                dup_nonces,
-                bad_nonces,
-                target_miss_nonces,
-                unknown_job_nonces,
-                alternate_decode_pool_hits,
-                version_metadata_rejects,
-                best_target_miss_difficulty,
-                "am3-bb: shutdown requested — exiting mining loop"
+        let worker_name = config.pool.worker.clone();
+        let mut work_builder = WorkBuilder::new();
+        let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
+        // G13: pure SerialWorkBookkeeping façade (history + job cursor + SeenShareSet).
+        // Serial88 step 24 mask 0x7F; Asic86 step 1 full u8; depth AM3_BB_WORK_HISTORY_PER_ID.
+        // Dedup BEFORE pool submission (feedback_s9_never_regress_checklist).
+        // Do not force generation-keyed bookkeeping onto BIP320 job_id/nonce/vbits path.
+        let job_cursor = match work_codec {
+            Am3BbWorkCodec::Serial88 => {
+                dcentrald_common::AsicJobIdCursor::serial_mining(JOB_ID_INCREMENT)
+            }
+            Am3BbWorkCodec::Asic86 => dcentrald_common::AsicJobIdCursor::with_mask(0, 1, 0xFF),
+        };
+        let mut bookkeeping =
+            dcentrald_common::SerialWorkBookkeeping::<DispatchedWork>::with_depth_and_cursor(
+                WORK_HISTORY_PER_ECHOED_JOB_ID,
+                job_cursor,
             );
-            return Ok(());
-        }
-        {
-            if last_thermal_poll.elapsed() >= Duration::from_millis(thermal_poll_ms) {
-                last_thermal_poll = Instant::now();
-                // INVARIANT #2 + #4 ORDERING: `?` fires FIRST. If the
-                // supervisor decides dangerous temp or lost-thermal-proof, it
-                // returns Err here and the run-scope guard tears down (dsPIC
-                // voltage off → resets asserted → board-enable off → fan held
-                // at quiet cap) BEFORE the PID is ever consulted. So the PID
-                // can only ever see a snapshot the supervisor already deemed
-                // safe and fresh — it never "out-cools" a dangerous temp by
-                // ramping the fan; hash power is cut first, by construction.
-                let snapshot = match thermal_supervisor.poll_and_check("runtime") {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        am3_bb_force_board_enable_off(
-                            board_enable_gpio,
-                            board_enable_active_high,
-                            "thermal-supervisor-failure",
-                        );
-                        return Err(error);
-                    }
-                };
-                if snapshot.fresh {
-                    if let Err(error) =
-                        fan_pid.step(&snapshot, f32::from(config.thermal.dangerous_temp_c))
-                    {
-                        am3_bb_force_board_enable_off(
-                            board_enable_gpio,
-                            board_enable_active_high,
-                            "checked-fan-command-failure",
-                        );
-                        return Err(error);
-                    }
-                    // One tick proves fresh thermal sensing plus a checked fan
-                    // policy iteration; loop activity alone is not liveness.
-                    watchdog_liveness.mark_progress();
-                }
-            }
-        }
+        let mut next_chain: usize = 0;
 
-        // --- Pull any pool jobs (non-blocking; the router pushes). ---
+        let chain_count = transport.chain_count().max(1);
+        let start = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        let mut last_thermal_poll = Instant::now();
+        let mut last_dispatch_attempt = Instant::now();
+        // Per-chain ~one frame every dispatch_interval_us; loop-tick ~= the
+        // interval / chain_count so all chains stay fed without flooding.
+        let tick =
+            Duration::from_micros((transport.dispatch_interval_us() / chain_count as u64).max(500));
+        let mut total_work: u64 = 0;
+        let mut total_rx_frames: u64 = 0;
+        let mut total_nonces: u64 = 0;
+        let mut non_job_frames: u64 = 0;
+        let mut assumed_job_response_frames: u64 = 0;
+        let mut shares_submitted: u64 = 0;
+        let mut dup_nonces: u64 = 0;
+        let mut bad_nonces: u64 = 0;
+        let mut target_miss_nonces: u64 = 0;
+        let mut unknown_job_nonces: u64 = 0;
+        let mut alternate_decode_pool_hits: u64 = 0;
+        let mut version_metadata_rejects: u64 = 0;
+        let mut best_target_miss_difficulty: Option<f64> = None;
+
         loop {
-            match job_rx.try_recv() {
-                Ok(job) => {
-                    if job.clean_jobs {
-                        info!(job_id = %job.job_id, "am3-bb: NEW BLOCK — flush stale work + dedup set");
-                        work_builder.reset_extranonce2();
-                        transport.clean_work();
-                        seen_shares.clear();
-                        for slot in work_by_id.iter_mut() {
-                            slot.clear();
+            // Observe terminal heartbeat failure/panic before interpreting the
+            // worker's cancellation as an ordinary operator shutdown.
+            heartbeat.require_ready_and_healthy("runtime supervision")?;
+            if shutdown.is_cancelled() {
+                info!(
+                    uptime_s = start.elapsed().as_secs(),
+                    work_codec = work_codec.as_str(),
+                    total_work,
+                    total_rx_frames,
+                    total_nonces,
+                    non_job_frames,
+                    assumed_job_response_frames,
+                    shares_submitted,
+                    dup_nonces,
+                    bad_nonces,
+                    target_miss_nonces,
+                    unknown_job_nonces,
+                    alternate_decode_pool_hits,
+                    version_metadata_rejects,
+                    best_target_miss_difficulty,
+                    "am3-bb: shutdown requested — exiting mining loop"
+                );
+                return Ok(());
+            }
+            {
+                if last_thermal_poll.elapsed() >= Duration::from_millis(thermal_poll_ms) {
+                    last_thermal_poll = Instant::now();
+                    // INVARIANT #2 + #4 ORDERING: `?` fires FIRST. If the
+                    // supervisor decides dangerous temp or lost-thermal-proof, it
+                    // returns Err here and the retained runtime lane cuts GPIO59
+                    // before dsPIC/reset defense-in-depth and quiet fan coast-down,
+                    // all BEFORE the PID is ever consulted. So the PID
+                    // can only ever see a snapshot the supervisor already deemed
+                    // safe and fresh — it never "out-cools" a dangerous temp by
+                    // ramping the fan; hash power is cut first, by construction.
+                    let snapshot = match thermal_supervisor.poll_and_check("runtime") {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            am3_bb_force_runtime_board_enable_off(
+                                board_cutoff,
+                                "thermal-supervisor-failure",
+                            );
+                            return Err(error);
                         }
+                    };
+                    if snapshot.fresh {
+                        if let Err(error) =
+                            fan_pid.step(&snapshot, f32::from(config.thermal.dangerous_temp_c))
+                        {
+                            am3_bb_force_runtime_board_enable_off(
+                                board_cutoff,
+                                "checked-fan-command-failure",
+                            );
+                            return Err(error);
+                        }
+                        let observed_temp_c = snapshot.max_temp_c;
+                        let fan_pwm = fan_pid.commanded_pwm();
+                        let fan_rpm = fan_pid.fan.get_rpm();
+                        state_tx.send_modify(|state| {
+                            state.fans.pwm = fan_pwm;
+                            state.fans.rpm = fan_rpm;
+                            for chain in &mut state.chains {
+                                chain.temp_c = observed_temp_c;
+                                chain.temp_source =
+                                    Some("max_across_current_lm75_chain_coverage".to_string());
+                                chain.status =
+                                    "temperature_observed_population_unproven".to_string();
+                            }
+                        });
+                        // One tick proves fresh thermal sensing plus a checked fan
+                        // policy iteration; loop activity alone is not liveness.
+                        watchdog_liveness.mark_progress();
                     }
-                    work_builder.set_version_mask(job.version_mask);
-                    if job.is_flush_only() {
-                        info!(job_id = %job.job_id, "am3-bb: pool-switch flush — dispatch paused until next notify");
-                        current_job = None;
-                    } else {
-                        current_job = Some(job);
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    warn!("am3-bb: Stratum job channel closed — exiting mining loop");
-                    return Ok(());
                 }
             }
-        }
 
-        // --- Dispatch one round of work (round-robin across chains, paced). ---
-        if last_dispatch_attempt.elapsed() >= tick {
-            last_dispatch_attempt = Instant::now();
-            if let Some(ref job) = current_job {
-                let work = work_builder.next_work(job);
-
-                // R7-3: the PROVEN 88-byte BM1362 serial full-header work frame
-                // ([0x55 0xAA][0x21][0x56][82-byte payload][CRC16-CCITT-FALSE BE])
-                // — see `build_bm1362_serial_work_frame` + the module doc. The
-                // W14.B `AsicWorkFrame` 86-byte `asic_work_t` codec was a W4
-                // dev-kit fabrication and is NOT what the chip speaks.
-                let chain = next_chain % transport.chain_count().max(1);
-                next_chain = next_chain.wrapping_add(1);
-                let now = now_us();
-                let send_result = match work_codec {
-                    Am3BbWorkCodec::Serial88 => {
-                        let frame_bytes = build_bm1362_serial_work_frame(&work, asic_job_id);
-                        transport.try_send_raw(chain, &frame_bytes, asic_job_id, now)
-                    }
-                    Am3BbWorkCodec::Asic86 => {
-                        let frame = build_bm1362_asic86_work_frame(
-                            &work,
-                            asic_job_id,
-                            total_work.wrapping_add(1) as u32,
-                        );
-                        transport.try_send_work(chain, &frame, now)
-                    }
-                };
-                match send_result {
-                    Ok(true) => {
-                        let job_slot = work_codec.job_id_slot(asic_job_id);
-                        let history = &mut work_by_id[job_slot as usize];
-                        history.push_back(DispatchedWork {
-                            job_id: work.job_id.clone(),
-                            extranonce2: work.extranonce2.clone(),
-                            ntime: work.ntime,
-                            nbits: work.nbits,
-                            version: work.version,
-                            version_mask: work.version_mask,
-                            prev_block_hash: work.prev_block_hash,
-                            merkle_root: work.merkle_root,
-                            share_target: work.share_target,
-                        });
-                        if history.len() > WORK_HISTORY_PER_ECHOED_JOB_ID {
-                            history.pop_front();
+            // --- Pull any pool jobs (non-blocking; the router pushes). ---
+            loop {
+                match job_rx.try_recv() {
+                    Ok(job) => {
+                        if job.clean_jobs {
+                            info!(job_id = %job.job_id, "am3-bb: NEW BLOCK — flush stale work + dedup set");
+                            work_builder.reset_extranonce2();
+                            transport.clean_work();
+                            bookkeeping.on_clean_jobs();
                         }
-                        asic_job_id = match work_codec {
-                            Am3BbWorkCodec::Serial88 => next_bm1362_serial_job_id(asic_job_id),
-                            Am3BbWorkCodec::Asic86 => {
-                                asic_job_id.wrapping_add(work_codec.job_id_increment())
+                        work_builder.set_version_mask(job.version_mask);
+                        if job.is_flush_only() {
+                            info!(job_id = %job.job_id, "am3-bb: pool-switch flush — dispatch paused until next notify");
+                            current_job = None;
+                        } else {
+                            current_job = Some(job);
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        warn!("am3-bb: Stratum job channel closed — exiting mining loop");
+                        return Ok(());
+                    }
+                }
+            }
+
+            // --- Dispatch one round of work (round-robin across chains, paced). ---
+            if last_dispatch_attempt.elapsed() >= tick {
+                last_dispatch_attempt = Instant::now();
+                if let Some(ref job) = current_job {
+                    let work = match work_builder.next_work(job) {
+                        Ok(work) => work,
+                        Err(error) => {
+                            warn!(%error, "am3-bb: V1 work domain unavailable; pausing dispatch until a fresh generation arrives");
+                            current_job = None;
+                            continue;
+                        }
+                    };
+
+                    // R7-3: the PROVEN 88-byte BM1362 serial full-header work frame
+                    // ([0x55 0xAA][0x21][0x56][82-byte payload][CRC16-CCITT-FALSE BE])
+                    // — see `build_bm1362_serial_work_frame` + the module doc. The
+                    // W14.B `AsicWorkFrame` 86-byte `asic_work_t` codec was a W4
+                    // dev-kit fabrication and is NOT what the chip speaks.
+                    let chain = next_chain % transport.chain_count().max(1);
+                    next_chain = next_chain.wrapping_add(1);
+                    let now = now_us();
+                    let asic_job_id = bookkeeping.job_ids.current();
+                    let send_result = match work_codec {
+                        Am3BbWorkCodec::Serial88 => {
+                            let frame_bytes = build_bm1362_serial_work_frame(&work, asic_job_id);
+                            transport.try_send_raw(chain, &frame_bytes, asic_job_id, now)
+                        }
+                        Am3BbWorkCodec::Asic86 => {
+                            let frame = build_bm1362_asic86_work_frame(
+                                &work,
+                                asic_job_id,
+                                total_work.wrapping_add(1) as u32,
+                            );
+                            transport.try_send_work(chain, &frame, now)
+                        }
+                    };
+                    match send_result {
+                        Ok(true) => {
+                            let job_slot = work_codec.job_id_slot(asic_job_id);
+                            bookkeeping.history.push(
+                                job_slot,
+                                DispatchedWork {
+                                    work_generation: work.work_generation,
+                                    job_id: work.job_id.clone(),
+                                    extranonce2: work.extranonce2.clone(),
+                                    ntime: work.ntime,
+                                    nbits: work.nbits,
+                                    version: work.version,
+                                    version_mask: work.version_mask,
+                                    prev_block_hash: work.prev_block_hash,
+                                    merkle_root: work.merkle_root,
+                                    share_target: work.share_target,
+                                },
+                            );
+                            let _ = bookkeeping.job_ids.take_and_advance();
+                            total_work += 1;
+                            if total_work == 1 {
+                                info!(
+                                    chain,
+                                    work_codec = work_codec.as_str(),
+                                    "am3-bb: first BM1362 work frame dispatched"
+                                );
                             }
-                        };
-                        total_work += 1;
-                        if total_work == 1 {
-                            info!(
-                                chain,
-                                work_codec = work_codec.as_str(),
-                                "am3-bb: first BM1362 work frame dispatched"
+                        }
+                        Ok(false) => { /* paced off — retry next tick */ }
+                        Err(UartTransportError::ChainOutOfRange) => {
+                            warn!(chain, "am3-bb: dispatch chain out of range — skipping");
+                        }
+                        Err(UartTransportError::WriteFailed) => {
+                            warn!(chain, "am3-bb: chain UART write failed during dispatch");
+                        }
+                        Err(UartTransportError::FrameTooLong) => {
+                            // Unreachable for try_send_raw (no length cap) — handled
+                            // for exhaustiveness.
+                            warn!(
+                                "am3-bb: dispatch reported FrameTooLong — unexpected for raw send"
                             );
                         }
                     }
-                    Ok(false) => { /* paced off — retry next tick */ }
-                    Err(UartTransportError::ChainOutOfRange) => {
-                        warn!(chain, "am3-bb: dispatch chain out of range — skipping");
-                    }
-                    Err(UartTransportError::WriteFailed) => {
-                        warn!(chain, "am3-bb: chain UART write failed during dispatch");
-                    }
-                    Err(UartTransportError::FrameTooLong) => {
-                        // Unreachable for try_send_raw (no length cap) — handled
-                        // for exhaustiveness.
-                        warn!("am3-bb: dispatch reported FrameTooLong — unexpected for raw send");
-                    }
                 }
             }
-        }
 
-        // --- Poll nonces, validate, dedup, submit. ---
-        if work_codec == Am3BbWorkCodec::Serial88 {
-            //
-            // R7-3: BM1362 serial-wire nonce frames are 11 bytes ([0xAA 0x55]
-            // [n3 n2 n1 n0][midstate_idx][result][vbits_hi vbits_lo][flags]) —
-            // `recv_bm1362_serial_nonces` parses them. (`recv_nonces` parses the
-            // different/wrong W14.B 10-byte codec.) `flags` bit7 = job response;
-            // `result` high nibble (>>1) echoes `sent_job_id & 0x78`; `vbits` BE.
-            for (chain_idx, nr) in transport.recv_bm1362_serial_nonces() {
-                total_rx_frames += 1;
-                let is_job_response = nr.flags & 0x80 != 0;
-                if !is_job_response {
-                    // Not a job-response frame (status / config echo) — ignore.
-                    non_job_frames += 1;
-                    if non_job_frames <= 8 {
-                        info!(
+            // --- Poll nonces, validate, dedup, submit. ---
+            if work_codec == Am3BbWorkCodec::Serial88 {
+                //
+                // R7-3: BM1362 serial-wire nonce frames are 11 bytes ([0xAA 0x55]
+                // [n3 n2 n1 n0][midstate_idx][result][vbits_hi vbits_lo][flags]) —
+                // `recv_bm1362_serial_nonces` parses them. (`recv_nonces` parses the
+                // different/wrong W14.B 10-byte codec.) `flags` bit7 = job response;
+                // `result` high nibble (>>1) echoes `sent_job_id & 0x78`; `vbits` BE.
+                for (chain_idx, nr) in transport.recv_bm1362_serial_nonces() {
+                    total_rx_frames += 1;
+                    let is_job_response = nr.flags & 0x80 != 0;
+                    if !is_job_response {
+                        // Not a job-response frame (status / config echo) — ignore.
+                        non_job_frames += 1;
+                        if non_job_frames <= 8 {
+                            info!(
+                                chain = chain_idx,
+                                job_id = nr.job_id,
+                                result = format_args!("0x{:02X}", nr.result_byte),
+                                small_core = nr.small_core,
+                                midstate_idx = nr.midstate_idx,
+                                flags = format_args!("0x{:02X}", nr.flags),
+                                vbits = format_args!("0x{:04X}", nr.version_bits_raw),
+                                nonce = format_args!("0x{:08X}", nr.nonce),
+                                "am3-bb: non-job BM1362 serial frame ignored"
+                            );
+                        }
+                        if !assume_job_response_flags {
+                            continue;
+                        }
+                        assumed_job_response_frames += 1;
+                    }
+                    total_nonces += 1;
+
+                    if bookkeeping.history.is_empty_slot(nr.job_id) {
+                        bad_nonces += 1;
+                        unknown_job_nonces += 1;
+                        debug!(
                             chain = chain_idx,
                             job_id = nr.job_id,
                             result = format_args!("0x{:02X}", nr.result_byte),
                             small_core = nr.small_core,
-                            midstate_idx = nr.midstate_idx,
                             flags = format_args!("0x{:02X}", nr.flags),
-                            vbits = format_args!("0x{:04X}", nr.version_bits_raw),
                             nonce = format_args!("0x{:08X}", nr.nonce),
-                            "am3-bb: non-job BM1362 serial frame ignored"
+                            "am3-bb: nonce for unknown job_id slot — dropped (stale / reused slot)"
                         );
-                    }
-                    if !assume_job_response_flags {
+                        continue;
+                    };
+
+                    let matched =
+                        bookkeeping
+                            .history
+                            .iter_newest_first(nr.job_id)
+                            .find_map(|candidate| {
+                                let rv = rolled_version_checked(
+                                    candidate.version,
+                                    candidate.version_mask,
+                                    nr.version_bits_raw,
+                                )?;
+                                let header = candidate.full_header(rv, nr.nonce);
+                                if validate_full_header(&header, &candidate.share_target) {
+                                    Some((candidate.clone(), rv, header))
+                                } else {
+                                    None
+                                }
+                            });
+                    let Some((dw, rv, header)) = matched else {
+                        bad_nonces += 1;
+                        target_miss_nonces += 1;
+                        let (best_current, best_any, alternate_pool_hit, version_rejects) =
+                            am3_bb_replay_bm1362_nonce_decodes(
+                                bookkeeping.history.iter_newest_first(nr.job_id),
+                                &nr,
+                            );
+                        version_metadata_rejects =
+                            version_metadata_rejects.saturating_add(u64::from(version_rejects));
+                        if let Some(best) =
+                            best_current.as_ref().and_then(|b| b.achieved_difficulty)
+                        {
+                            best_target_miss_difficulty = Some(
+                                best_target_miss_difficulty
+                                    .map(|prev| prev.max(best))
+                                    .unwrap_or(best),
+                            );
+                        }
+                        if let Some(alt) = alternate_pool_hit {
+                            alternate_decode_pool_hits =
+                                alternate_decode_pool_hits.saturating_add(1);
+                            warn!(
+                                chain = chain_idx,
+                                job_id = nr.job_id,
+                                raw = %hex_preview(&nr.raw_frame, nr.raw_frame.len()),
+                                alt_pool_job = %alt.job_id,
+                                nonce_decode = alt.nonce_label,
+                                version_decode = alt.version_label,
+                                nonce = format_args!("0x{:08X}", alt.nonce_submit),
+                                rolled_version = format_args!("0x{:08X}", alt.rolled_version),
+                                achieved_difficulty = alt.achieved_difficulty,
+                                "am3-bb: alternate BM1362 nonce decode would meet pool target"
+                            );
+                        }
+                        if total_nonces <= 8 {
+                            let nonce_be = u32::from_be_bytes([
+                                nr.raw_frame[2],
+                                nr.raw_frame[3],
+                                nr.raw_frame[4],
+                                nr.raw_frame[5],
+                            ]);
+                            let vbits_le = u16::from_le_bytes([nr.raw_frame[8], nr.raw_frame[9]]);
+                            info!(
+                                chain = chain_idx,
+                                job_id = nr.job_id,
+                                job_id_bm1366 = nr.result_byte & 0xF8,
+                                job_id_no_shift = nr.result_byte & 0xF0,
+                                result = format_args!("0x{:02X}", nr.result_byte),
+                                small_core = nr.small_core,
+                                flags = format_args!("0x{:02X}", nr.flags),
+                                vbits = format_args!("0x{:04X}", nr.version_bits_raw),
+                                vbits_le = format_args!("0x{:04X}", vbits_le),
+                                nonce = format_args!("0x{:08X}", nr.nonce),
+                                nonce_be = format_args!("0x{:08X}", nonce_be),
+                                raw = %hex_preview(&nr.raw_frame, nr.raw_frame.len()),
+                                history_len = bookkeeping.history.slot_len(nr.job_id),
+                                best_current_pool_diff = best_current
+                                    .as_ref()
+                                    .and_then(|b| b.achieved_difficulty),
+                                best_any_decode = ?best_any.as_ref().map(|b| {
+                                    format!(
+                                        "{}+{} nonce=0x{:08X} ver=0x{:08X} diff={:?}",
+                                        b.nonce_label,
+                                        b.version_label,
+                                        b.nonce_submit,
+                                        b.rolled_version,
+                                        b.achieved_difficulty
+                                    )
+                                }),
+                                version_rejects,
+                                assumed_job_response = !is_job_response && assume_job_response_flags,
+                                "am3-bb: nonce did not validate against recent work history"
+                            );
+                        }
+                        continue;
+                    };
+
+                    // P1-1 pure SeenShareSet (clear-before-insert over-cap SSOT).
+                    if !bookkeeping
+                        .seen
+                        .insert(nr.job_id, nr.nonce, nr.version_bits_raw)
+                    {
+                        dup_nonces += 1;
                         continue;
                     }
-                    assumed_job_response_frames += 1;
-                }
-                total_nonces += 1;
-
-                let history = &work_by_id[nr.job_id as usize];
-                if history.is_empty() {
-                    bad_nonces += 1;
-                    unknown_job_nonces += 1;
-                    debug!(
+                    let vdelta = rv ^ dw.version;
+                    let achieved_difficulty = am3_bb_achieved_difficulty_from_header(&header);
+                    let share = dcentrald_stratum::types::ValidShare {
+                        work_generation: dw.work_generation,
+                        worker_name: worker_name.clone(),
+                        job_id: dw.job_id.clone(),
+                        extranonce2: dw.extranonce2.clone(),
+                        ntime: format!("{:08x}", dw.ntime),
+                        nonce: format!("{:08x}", nr.nonce),
+                        version_bits: if vdelta != 0 {
+                            Some(format!("{:08x}", vdelta))
+                        } else {
+                            None
+                        },
+                        version: rv,
+                        achieved_difficulty,
+                    };
+                    if share_tx.blocking_send(share).is_err() {
+                        warn!("am3-bb: Stratum share channel closed — exiting mining loop");
+                        return Ok(());
+                    }
+                    shares_submitted += 1;
+                    info!(
                         chain = chain_idx,
-                        job_id = nr.job_id,
-                        result = format_args!("0x{:02X}", nr.result_byte),
+                        job_id = %dw.job_id,
                         small_core = nr.small_core,
-                        flags = format_args!("0x{:02X}", nr.flags),
                         nonce = format_args!("0x{:08X}", nr.nonce),
-                        "am3-bb: nonce for unknown job_id slot — dropped (stale / reused slot)"
+                        version = format_args!("0x{:08X}", rv),
+                        achieved_difficulty,
+                        "am3-bb: VALID SHARE submitted to pool"
                     );
-                    continue;
-                };
-
-                let matched = history.iter().rev().find_map(|candidate| {
-                    let rv = rolled_version_checked(
-                        candidate.version,
-                        candidate.version_mask,
-                        nr.version_bits_raw,
-                    )?;
-                    let header = candidate.full_header(rv, nr.nonce);
-                    if validate_full_header(&header, &candidate.share_target) {
-                        Some((candidate.clone(), rv, header))
-                    } else {
-                        None
-                    }
-                });
-                let Some((dw, rv, header)) = matched else {
-                    bad_nonces += 1;
-                    target_miss_nonces += 1;
-                    let (best_current, best_any, alternate_pool_hit, version_rejects) =
-                        am3_bb_replay_bm1362_nonce_decodes(history, &nr);
-                    version_metadata_rejects =
-                        version_metadata_rejects.saturating_add(u64::from(version_rejects));
-                    if let Some(best) = best_current.as_ref().and_then(|b| b.achieved_difficulty) {
-                        best_target_miss_difficulty = Some(
-                            best_target_miss_difficulty
-                                .map(|prev| prev.max(best))
-                                .unwrap_or(best),
-                        );
-                    }
-                    if let Some(alt) = alternate_pool_hit {
-                        alternate_decode_pool_hits = alternate_decode_pool_hits.saturating_add(1);
-                        warn!(
-                            chain = chain_idx,
-                            job_id = nr.job_id,
-                            raw = %hex_preview(&nr.raw_frame, nr.raw_frame.len()),
-                            alt_pool_job = %alt.job_id,
-                            nonce_decode = alt.nonce_label,
-                            version_decode = alt.version_label,
-                            nonce = format_args!("0x{:08X}", alt.nonce_submit),
-                            rolled_version = format_args!("0x{:08X}", alt.rolled_version),
-                            achieved_difficulty = alt.achieved_difficulty,
-                            "am3-bb: alternate BM1362 nonce decode would meet pool target"
-                        );
-                    }
-                    if total_nonces <= 8 {
-                        let nonce_be = u32::from_be_bytes([
-                            nr.raw_frame[2],
-                            nr.raw_frame[3],
-                            nr.raw_frame[4],
-                            nr.raw_frame[5],
-                        ]);
-                        let vbits_le = u16::from_le_bytes([nr.raw_frame[8], nr.raw_frame[9]]);
-                        info!(
-                            chain = chain_idx,
-                            job_id = nr.job_id,
-                            job_id_bm1366 = nr.result_byte & 0xF8,
-                            job_id_no_shift = nr.result_byte & 0xF0,
-                            result = format_args!("0x{:02X}", nr.result_byte),
-                            small_core = nr.small_core,
-                            flags = format_args!("0x{:02X}", nr.flags),
-                            vbits = format_args!("0x{:04X}", nr.version_bits_raw),
-                            vbits_le = format_args!("0x{:04X}", vbits_le),
-                            nonce = format_args!("0x{:08X}", nr.nonce),
-                            nonce_be = format_args!("0x{:08X}", nonce_be),
-                            raw = %hex_preview(&nr.raw_frame, nr.raw_frame.len()),
-                            history_len = history.len(),
-                            best_current_pool_diff = best_current
-                                .as_ref()
-                                .and_then(|b| b.achieved_difficulty),
-                            best_any_decode = ?best_any.as_ref().map(|b| {
-                                format!(
-                                    "{}+{} nonce=0x{:08X} ver=0x{:08X} diff={:?}",
-                                    b.nonce_label,
-                                    b.version_label,
-                                    b.nonce_submit,
-                                    b.rolled_version,
-                                    b.achieved_difficulty
-                                )
-                            }),
-                            version_rejects,
-                            assumed_job_response = !is_job_response && assume_job_response_flags,
-                            "am3-bb: nonce did not validate against recent work history"
-                        );
-                    }
-                    continue;
-                };
-
-                let dedup_key = (nr.job_id, nr.nonce, nr.version_bits_raw);
-                if !seen_shares.insert(dedup_key) {
-                    dup_nonces += 1;
-                    continue;
                 }
-                if seen_shares.len() > SEEN_SHARES_SOFT_CAP {
-                    seen_shares.clear();
-                    seen_shares.insert(dedup_key);
-                }
-                let vdelta = rv ^ dw.version;
-                let achieved_difficulty = am3_bb_achieved_difficulty_from_header(&header);
-                let share = dcentrald_stratum::types::ValidShare {
-                    worker_name: worker_name.clone(),
-                    job_id: dw.job_id.clone(),
-                    extranonce2: dw.extranonce2.clone(),
-                    ntime: format!("{:08x}", dw.ntime),
-                    nonce: format!("{:08x}", nr.nonce),
-                    version_bits: if vdelta != 0 {
-                        Some(format!("{:08x}", vdelta))
-                    } else {
-                        None
-                    },
-                    version: rv,
-                    achieved_difficulty,
-                };
-                if share_tx.blocking_send(share).is_err() {
-                    warn!("am3-bb: Stratum share channel closed — exiting mining loop");
-                    return Ok(());
-                }
-                shares_submitted += 1;
-                info!(
-                    chain = chain_idx,
-                    job_id = %dw.job_id,
-                    small_core = nr.small_core,
-                    nonce = format_args!("0x{:08X}", nr.nonce),
-                    version = format_args!("0x{:08X}", rv),
-                    achieved_difficulty,
-                    "am3-bb: VALID SHARE submitted to pool"
-                );
-            }
-        } else {
-            for (chain_idx, nr) in transport.recv_nonces() {
-                total_rx_frames += 1;
-                total_nonces += 1;
+            } else {
+                for (chain_idx, nr) in transport.recv_nonces() {
+                    total_rx_frames += 1;
+                    total_nonces += 1;
 
-                let history = &work_by_id[nr.job_id as usize];
-                if history.is_empty() {
-                    bad_nonces += 1;
-                    unknown_job_nonces += 1;
-                    debug!(
-                        chain = chain_idx,
-                        response_chain = nr.chain_id,
-                        job_id = nr.job_id,
-                        nonce = format_args!("0x{:08X}", nr.nonce),
-                        "am3-bb: asic86 nonce for unknown job_id slot - dropped"
-                    );
-                    continue;
-                }
-
-                let matched = history.iter().rev().find_map(|candidate| {
-                    let header = candidate.full_header(candidate.version, nr.nonce);
-                    if validate_full_header(&header, &candidate.share_target) {
-                        Some((candidate.clone(), header))
-                    } else {
-                        None
-                    }
-                });
-                let Some((dw, header)) = matched else {
-                    bad_nonces += 1;
-                    target_miss_nonces += 1;
-                    if total_nonces <= 8 {
-                        info!(
+                    if bookkeeping.history.is_empty_slot(nr.job_id) {
+                        bad_nonces += 1;
+                        unknown_job_nonces += 1;
+                        debug!(
                             chain = chain_idx,
                             response_chain = nr.chain_id,
                             job_id = nr.job_id,
                             nonce = format_args!("0x{:08X}", nr.nonce),
-                            history_len = history.len(),
-                            "am3-bb: asic86 nonce did not validate against recent work history"
+                            "am3-bb: asic86 nonce for unknown job_id slot - dropped"
                         );
+                        continue;
                     }
-                    continue;
-                };
 
-                let dedup_key = (nr.job_id, nr.nonce, 0);
-                if !seen_shares.insert(dedup_key) {
-                    dup_nonces += 1;
-                    continue;
-                }
-                if seen_shares.len() > SEEN_SHARES_SOFT_CAP {
-                    seen_shares.clear();
-                    seen_shares.insert(dedup_key);
-                }
+                    let matched =
+                        bookkeeping
+                            .history
+                            .iter_newest_first(nr.job_id)
+                            .find_map(|candidate| {
+                                let header = candidate.full_header(candidate.version, nr.nonce);
+                                if validate_full_header(&header, &candidate.share_target) {
+                                    Some((candidate.clone(), header))
+                                } else {
+                                    None
+                                }
+                            });
+                    let Some((dw, header)) = matched else {
+                        bad_nonces += 1;
+                        target_miss_nonces += 1;
+                        if total_nonces <= 8 {
+                            info!(
+                                chain = chain_idx,
+                                response_chain = nr.chain_id,
+                                job_id = nr.job_id,
+                                nonce = format_args!("0x{:08X}", nr.nonce),
+                                history_len = bookkeeping.history.slot_len(nr.job_id),
+                                "am3-bb: asic86 nonce did not validate against recent work history"
+                            );
+                        }
+                        continue;
+                    };
 
-                let achieved_difficulty = am3_bb_achieved_difficulty_from_header(&header);
-                let share = dcentrald_stratum::types::ValidShare {
-                    worker_name: worker_name.clone(),
-                    job_id: dw.job_id.clone(),
-                    extranonce2: dw.extranonce2.clone(),
-                    ntime: format!("{:08x}", dw.ntime),
-                    nonce: format!("{:08x}", nr.nonce),
-                    version_bits: None,
-                    version: dw.version,
-                    achieved_difficulty,
-                };
-                if share_tx.blocking_send(share).is_err() {
-                    warn!("am3-bb: Stratum share channel closed - exiting mining loop");
-                    return Ok(());
+                    // asic86 path: no version rolling in key (vbits collapsed to 0).
+                    if !bookkeeping.seen.insert(nr.job_id, nr.nonce, 0) {
+                        dup_nonces += 1;
+                        continue;
+                    }
+
+                    let achieved_difficulty = am3_bb_achieved_difficulty_from_header(&header);
+                    let share = dcentrald_stratum::types::ValidShare {
+                        work_generation: dw.work_generation,
+                        worker_name: worker_name.clone(),
+                        job_id: dw.job_id.clone(),
+                        extranonce2: dw.extranonce2.clone(),
+                        ntime: format!("{:08x}", dw.ntime),
+                        nonce: format!("{:08x}", nr.nonce),
+                        version_bits: None,
+                        version: dw.version,
+                        achieved_difficulty,
+                    };
+                    if share_tx.blocking_send(share).is_err() {
+                        warn!("am3-bb: Stratum share channel closed - exiting mining loop");
+                        return Ok(());
+                    }
+                    shares_submitted += 1;
+                    info!(
+                        chain = chain_idx,
+                        response_chain = nr.chain_id,
+                        job_id = %dw.job_id,
+                        nonce = format_args!("0x{:08X}", nr.nonce),
+                        version = format_args!("0x{:08X}", dw.version),
+                        achieved_difficulty,
+                        "am3-bb: VALID asic86 SHARE submitted to pool"
+                    );
                 }
-                shares_submitted += 1;
-                info!(
-                    chain = chain_idx,
-                    response_chain = nr.chain_id,
-                    job_id = %dw.job_id,
-                    nonce = format_args!("0x{:08X}", nr.nonce),
-                    version = format_args!("0x{:08X}", dw.version),
-                    achieved_difficulty,
-                    "am3-bb: VALID asic86 SHARE submitted to pool"
-                );
             }
-        }
 
-        if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-            let rx_counters = transport.bm1362_serial_rx_counters();
-            let rx_raw_bytes: Vec<u64> = rx_counters.iter().map(|c| c.raw_bytes).collect();
-            let rx_parsed_frames: Vec<u64> = rx_counters.iter().map(|c| c.parsed_frames).collect();
-            let rx_job_response_frames: Vec<u64> =
-                rx_counters.iter().map(|c| c.job_response_frames).collect();
-            let rx_non_job_frames: Vec<u64> = rx_counters
-                .iter()
-                .map(|c| c.non_job_response_frames)
-                .collect();
-            let rx_resync_bytes: Vec<u64> = rx_counters.iter().map(|c| c.resync_bytes).collect();
-            let rx_buffered_bytes: Vec<usize> =
-                rx_counters.iter().map(|c| c.buffered_bytes).collect();
-            info!(
-                uptime_s = start.elapsed().as_secs(),
-                work_codec = work_codec.as_str(),
-                total_work,
-                total_rx_frames,
-                total_nonces,
-                non_job_frames,
-                assumed_job_response_frames,
-                shares_submitted,
-                dup_nonces,
-                bad_nonces,
-                target_miss_nonces,
-                unknown_job_nonces,
-                alternate_decode_pool_hits,
-                version_metadata_rejects,
-                best_target_miss_difficulty,
-                chains = transport.chain_count(),
-                rx_raw_bytes = ?rx_raw_bytes,
-                rx_parsed_frames = ?rx_parsed_frames,
-                rx_job_response_frames = ?rx_job_response_frames,
-                rx_non_job_frames = ?rx_non_job_frames,
-                rx_resync_bytes = ?rx_resync_bytes,
-                rx_buffered_bytes = ?rx_buffered_bytes,
-                fan_pid_pwm = fan_pid.commanded_pwm(),
-                fan_pid_rpm = fan_pid.fan.get_rpm(),
-                "am3-bb: mining loop alive"
-            );
-            last_heartbeat = Instant::now();
-        }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                let rx_counters = transport.bm1362_serial_rx_counters();
+                let rx_raw_bytes: Vec<u64> = rx_counters.iter().map(|c| c.raw_bytes).collect();
+                let rx_parsed_frames: Vec<u64> =
+                    rx_counters.iter().map(|c| c.parsed_frames).collect();
+                let rx_job_response_frames: Vec<u64> =
+                    rx_counters.iter().map(|c| c.job_response_frames).collect();
+                let rx_non_job_frames: Vec<u64> = rx_counters
+                    .iter()
+                    .map(|c| c.non_job_response_frames)
+                    .collect();
+                let rx_resync_bytes: Vec<u64> =
+                    rx_counters.iter().map(|c| c.resync_bytes).collect();
+                let rx_buffered_bytes: Vec<usize> =
+                    rx_counters.iter().map(|c| c.buffered_bytes).collect();
+                info!(
+                    uptime_s = start.elapsed().as_secs(),
+                    work_codec = work_codec.as_str(),
+                    total_work,
+                    total_rx_frames,
+                    total_nonces,
+                    non_job_frames,
+                    assumed_job_response_frames,
+                    shares_submitted,
+                    dup_nonces,
+                    bad_nonces,
+                    target_miss_nonces,
+                    unknown_job_nonces,
+                    alternate_decode_pool_hits,
+                    version_metadata_rejects,
+                    best_target_miss_difficulty,
+                    chains = transport.chain_count(),
+                    rx_raw_bytes = ?rx_raw_bytes,
+                    rx_parsed_frames = ?rx_parsed_frames,
+                    rx_job_response_frames = ?rx_job_response_frames,
+                    rx_non_job_frames = ?rx_non_job_frames,
+                    rx_resync_bytes = ?rx_resync_bytes,
+                    rx_buffered_bytes = ?rx_buffered_bytes,
+                    fan_pid_pwm = fan_pid.commanded_pwm(),
+                    fan_pid_rpm = fan_pid.fan.get_rpm(),
+                    "am3-bb: mining loop alive"
+                );
+                last_heartbeat = Instant::now();
+            }
 
-        std::thread::sleep(tick);
+            std::thread::sleep(tick);
+        }
+    })();
+
+    Am3BbMiningLoopExit {
+        mining_result,
+        stratum_tasks,
     }
 }
 
@@ -5792,11 +7919,11 @@ fn run_mining_loop_stub<U: ChainUart>(
 mod tests {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
     use dcentrald_hal::platform::beaglebone::BeagleBonePlatform;
-    use dcentrald_hal::platform::beaglebone_cold_boot::ColdBootOptsV2;
+    use dcentrald_hal::platform::beaglebone_cold_boot::{ColdBootOptsV2, PreparedBoardEnable};
     use dcentrald_hal::platform::config::PlatformConfig;
 
     fn test_platform() -> BeagleBonePlatform {
@@ -5902,6 +8029,389 @@ mod tests {
             .to_string();
 
         assert!(error.contains("did not appear"), "{error}");
+    }
+
+    #[test]
+    fn concurrent_gpio_export_error_is_accepted_only_after_node_materializes() {
+        let root = TempGpioRoot::new();
+
+        am3_bb_export_gpio_if_needed_at_with(root.path(), 22, |_path, _value| {
+            root.add_gpio(22);
+            Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+        })
+        .unwrap();
+
+        assert!(root.path().join("gpio22").is_dir());
+    }
+
+    #[test]
+    fn delayed_gpio_attributes_are_boundedly_observed_after_export() {
+        let root = TempGpioRoot::new();
+        let gpio = root.path().join("gpio22");
+        std::fs::create_dir(&gpio).unwrap();
+        let delayed_gpio = gpio.clone();
+        let materializer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            for (name, value) in [("direction", "in"), ("active_low", "0"), ("value", "0")] {
+                std::fs::write(delayed_gpio.join(name), value).unwrap();
+            }
+        });
+
+        am3_bb_wait_gpio_attributes_at(root.path(), 22).unwrap();
+        materializer.join().unwrap();
+    }
+
+    #[test]
+    fn retained_gpio59_cutoff_set_prepares_glitch_free_off_and_owns_the_only_on_transition() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        std::fs::write(gpio.join("active_low"), "1").unwrap();
+        std::fs::write(gpio.join("value"), "1").unwrap();
+
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |direction_path| {
+                // Model the kernel's atomic `direction=low` behavior: the
+                // ordinary-file fixture does not update `value` itself.
+                std::fs::write(direction_path.parent().unwrap().join("value"), "0")?;
+                Ok("out\n".to_owned())
+            },
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("active_low")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("direction")).unwrap(),
+            "low"
+        );
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+
+        PreparedBoardEnable::assert_checked(&mut set.runtime).unwrap();
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "1");
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+
+        set.heartbeat.cut_checked().unwrap();
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+    }
+
+    #[test]
+    fn every_retained_gpio59_lane_can_cut_with_an_independent_file_offset() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+
+        PreparedBoardEnable::assert_checked(&mut set.runtime).unwrap();
+        set.heartbeat.cut_checked().unwrap();
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+
+        std::fs::write(gpio.join("value"), "1").unwrap();
+        assert!(set.panic.cut_raw_noalloc());
+        set.panic.read_off_checked().unwrap();
+
+        std::fs::write(gpio.join("value"), "1").unwrap();
+        set.runtime.cut_checked().unwrap();
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+    }
+
+    #[test]
+    fn emergency_gpio59_cut_before_energization_permanently_revokes_on_authority() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+
+        set.heartbeat.cut_checked().unwrap();
+        let error = PreparedBoardEnable::assert_checked(&mut set.runtime)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("terminal=true"), "{error}");
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+    }
+
+    #[test]
+    fn retained_gpio59_cutoff_uses_open_inode_after_ordinary_unlink_fixture() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+
+        PreparedBoardEnable::assert_checked(&mut set.runtime).unwrap();
+        std::fs::remove_file(gpio.join("value")).unwrap();
+
+        set.runtime.cut_checked().unwrap();
+        set.runtime.io.read_off_checked().unwrap();
+        // This proves the implementation performs no path reopen. It does not
+        // model sysfs/kernfs unexport, which can invalidate retained FDs with
+        // ENODEV/EIO and remains contained by checked fallback + watchdog.
+        assert!(!gpio.join("value").exists());
+    }
+
+    #[test]
+    fn panic_gpio59_cut_serializes_with_published_on_writer_and_finishes_low() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        let writer_thread = Arc::clone(&set.panic.on_writer_thread);
+        let terminal = Arc::clone(&set.panic.terminal);
+
+        // `usize::MAX` is the established fixture token for "some other thread
+        // published an ON write and has not retired yet" — the same sentinel
+        // the budget-exhaustion sibling below uses. It must not be this
+        // thread's own token: the lane deliberately short-circuits when the
+        // in-flight writer IS the caller, which is a different case.
+        writer_thread.store(usize::MAX, Ordering::SeqCst);
+
+        // Drive the adversarial interleaving by construction. The hook runs
+        // inside the lane at the one instant that matters: after the first
+        // physical LOW, before the serialization loop.
+        //
+        // Previously this test spawned the lane on another thread and spun a
+        // 10_000-iteration yield budget hoping to catch that window. Under load
+        // the spawned thread could fail to be scheduled at all within the
+        // budget, so the fixture wrote its HIGH too early and the assertions
+        // failed on a machine that was merely busy — and the workaround was a
+        // `sleep(2ms)` compiled into the panic lane itself. Both are gone.
+        let observed_first_low = Arc::new(AtomicBool::new(false));
+        let mut panic_lane = set.panic;
+        let hook_value_path = gpio.join("value");
+        let hook_writer_thread = Arc::clone(&writer_thread);
+        let hook_observed_first_low = Arc::clone(&observed_first_low);
+        panic_lane.after_first_low_hook = Some(Arc::new(move || {
+            // The lane must already have driven the pin LOW before it waits on
+            // anyone. Asserting it here — rather than polling for it — is what
+            // makes the ordering a proof instead of an observation.
+            let level = std::fs::read_to_string(&hook_value_path).unwrap();
+            assert!(
+                level.starts_with('0'),
+                "panic lane entered serialization without a first LOW (value={level:?})"
+            );
+            hook_observed_first_low.store(true, Ordering::SeqCst);
+
+            // The published ON writer lands HIGH after our first LOW, then
+            // retires. The lane must notice and re-cut.
+            std::fs::write(&hook_value_path, "1").unwrap();
+            hook_writer_thread.store(0, Ordering::SeqCst);
+        }));
+
+        let cutoff_succeeded = panic_lane.cut_raw_noalloc();
+
+        assert!(
+            observed_first_low.load(Ordering::SeqCst),
+            "the rendezvous never fired, so nothing was actually serialized"
+        );
+        assert!(terminal.load(Ordering::SeqCst));
+        assert!(cutoff_succeeded);
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+    }
+
+    #[test]
+    fn polarity_drift_is_cut_physically_low_but_refuses_a_checked_receipt() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        PreparedBoardEnable::assert_checked(&mut set.runtime).unwrap();
+        std::fs::write(gpio.join("active_low"), "1").unwrap();
+
+        let error = set.heartbeat.cut_checked().unwrap_err().to_string();
+
+        assert!(error.contains("active_low readback mismatch"), "{error}");
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+    }
+
+    #[test]
+    fn raw_cutoff_descriptor_failure_still_revokes_on_authority() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        set.panic.direction_writer = std::fs::OpenOptions::new()
+            .read(true)
+            .open(gpio.join("direction"))
+            .unwrap();
+
+        assert!(!set.panic.cut_raw_noalloc());
+        assert!(set.panic.terminal.load(Ordering::SeqCst));
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+    }
+
+    #[test]
+    fn landed_on_write_with_failed_readback_is_immediately_recut() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        set.runtime.fail_on_readback_after_on_write = true;
+
+        let error = PreparedBoardEnable::assert_checked(&mut set.runtime)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("after the HIGH write landed"), "{error}");
+        assert!(error.contains("mandatory OFF re-cut=Ok"), "{error}");
+        assert_eq!(set.runtime.state, Am3BbBoardEnableState::TerminalOff);
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+        assert!(set.runtime.io.terminal.load(Ordering::SeqCst));
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+    }
+
+    #[test]
+    fn panic_cutoff_iteration_budget_exhausts_when_a_foreign_on_writer_never_retires() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        set.panic
+            .on_writer_thread
+            .store(usize::MAX, Ordering::SeqCst);
+        let writer_thread = Arc::clone(&set.panic.on_writer_thread);
+        let terminal = Arc::clone(&set.panic.terminal);
+        let (completed_tx, completed_rx) = std_mpsc::channel();
+        let worker = thread::spawn(move || {
+            completed_tx.send(set.panic.cut_raw_noalloc()).unwrap();
+        });
+        // This timeout is a DEADLOCK GUARD, not a performance assertion. The
+        // property under test is "the budget is finite", and exhausting it
+        // costs AM3_BB_CUTOFF_SERIALIZATION_YIELD_LIMIT (4096) real sysfs
+        // writes plus a sched_yield each. On a loaded host that legitimately
+        // exceeds a second, so the previous one-second bound failed the gate
+        // for being busy rather than for being wrong. Keep it generous: if the
+        // unbounded-loop regression ever returns, the release-then-join below
+        // still unblocks the worker, so a slow machine waits and a broken lane
+        // is still caught.
+        let completion = completed_rx.recv_timeout(Duration::from_secs(120));
+        // If the old infinite loop regresses, release the fixture before the
+        // assertion so the test fails instead of hanging the entire suite.
+        writer_thread.store(0, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        assert_eq!(
+            completion.expect(
+                "panic lane never returned within the deadlock guard: the bounded \
+                 serialization budget has regressed to an unbounded wait"
+            ),
+            false
+        );
+        assert!(terminal.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+    }
+
+    #[test]
+    fn heartbeat_terminal_error_cuts_gpio59_before_returning_failure() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        let mut set = am3_bb_prepare_board_cutoff_set_at_with_direction_readback(
+            root.path(),
+            59,
+            true,
+            |_path| Ok("out".to_owned()),
+            Am3BbRetainedReadbackMode::OrdinaryFileFixture,
+        )
+        .unwrap();
+        PreparedBoardEnable::assert_checked(&mut set.runtime).unwrap();
+
+        let error = am3_bb_cut_on_heartbeat_error::<()>(
+            Err(anyhow::anyhow!("injected terminal heartbeat failure")),
+            &set.heartbeat,
+            "test-terminal-heartbeat-failure",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("immediate retained GPIO59 cutoff"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+        assert!(PreparedBoardEnable::assert_checked(&mut set.runtime).is_err());
+    }
+
+    #[test]
+    fn non_active_high_gpio59_topology_is_refused_before_any_gpio_mutation() {
+        let root = TempGpioRoot::new();
+        let gpio = root.add_gpio(59);
+        std::fs::write(gpio.join("direction"), "inherited").unwrap();
+        std::fs::write(gpio.join("active_low"), "1").unwrap();
+        std::fs::write(gpio.join("value"), "1").unwrap();
+
+        let error = am3_bb_prepare_board_cutoff_set_at(root.path(), 59, false)
+            .err()
+            .expect("inactive-high topology must be rejected")
+            .to_string();
+
+        assert!(error.contains("active-high"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("direction")).unwrap(),
+            "inherited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("active_low")).unwrap(),
+            "1"
+        );
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "1");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("export")).unwrap(),
+            ""
+        );
     }
 
     #[test]
@@ -6295,47 +8805,675 @@ mod tests {
     }
 
     #[test]
+    fn admitted_platform_topology_is_captured_once_and_moved_into_the_engine() {
+        let source = include_str!("am3_bb_mining.rs");
+        let receipt_start = source
+            .find("impl Am3BbRouteReceipt {")
+            .expect("AM3-BB route receipt implementation");
+        let receipt_end = source[receipt_start..]
+            .find("pub(crate) struct Am3BbSafetyAdmission")
+            .map(|offset| receipt_start + offset)
+            .unwrap();
+        let receipt = &source[receipt_start..receipt_end];
+        assert_eq!(receipt.matches("BeagleBonePlatform::new()").count(), 1);
+        let capture = receipt
+            .split_once("fn capture(")
+            .unwrap()
+            .1
+            .split_once("fn api_identity(")
+            .unwrap()
+            .0;
+        assert!(capture.contains("AM3_BB_TOPOLOGY_CAPTURE_RECEIPT schema=v2"));
+        assert!(!capture.contains("AM3_BB_ROUTE_ADMISSION_RECEIPT"));
+
+        let admission_start = source
+            .find("pub(crate) async fn start(")
+            .expect("AM3-BB safety admission constructor");
+        let admission_end = source[admission_start..]
+            .find("pub async fn run_am3_bb_mining(")
+            .map(|offset| admission_start + offset)
+            .unwrap();
+        let admission = &source[admission_start..admission_end];
+        assert_eq!(
+            admission
+                .matches("Am3BbRouteReceipt::capture(identity)")
+                .count(),
+            1
+        );
+        let topology_capture = admission
+            .find("Am3BbRouteReceipt::capture(identity)")
+            .unwrap();
+        let watchdog = admission
+            .find("SafetyWatchdogOwner::start_before_energizing")
+            .unwrap();
+        assert!(topology_capture < watchdog);
+        let armed = admission
+            .find("WatchdogAdmission::Armed(receipt) => receipt")
+            .unwrap();
+        let route_scope = admission
+            .find("watchdog.claim_am3_bb_route_scope()")
+            .unwrap();
+        let admitted_receipt = admission
+            .find("route_receipt.publish_admission_receipt()")
+            .unwrap();
+        assert!(watchdog < armed && armed < route_scope && route_scope < admitted_receipt);
+        assert!(
+            admission.contains("runtime_dispatch_admission")
+                && admission.contains(".require_asic_protocol(")
+        );
+        assert!(admission.contains("Ok(Self {\n            route_receipt,"));
+
+        let blocking_start = source.find("fn run_am3_bb_blocking(").unwrap();
+        let blocking_end = source[blocking_start..]
+            .find("fn bm1362_command_wire_frame(")
+            .map(|offset| blocking_start + offset)
+            .unwrap();
+        let blocking = &source[blocking_start..blocking_end];
+        assert!(!blocking.contains("BeagleBonePlatform::new()"));
+        assert!(blocking.contains("let Am3BbSafetyAdmission {\n        route_receipt,"));
+        assert!(blocking.contains("let platform = route_receipt.platform;"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stratum_task_guard_joins_publishers_before_terminal_state() {
+        let mut initial = dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard);
+        initial.hashrate_ghs = 123.0;
+        initial.hashrate_5s_ghs = 99.0;
+        initial.pool.status = "mining".to_string();
+        let (state_tx, state_rx) = watch::channel(initial);
+        let shutdown = CancellationToken::new();
+        let router_stopped = Arc::new(AtomicBool::new(false));
+        let publisher_closed = Arc::new(AtomicBool::new(false));
+        let mut guard = Am3BbStratumTaskGuard::pending(
+            tokio::runtime::Handle::current(),
+            shutdown.clone(),
+            publisher_closed.clone(),
+        );
+
+        let router_shutdown = shutdown.clone();
+        let router_stopped_task = router_stopped.clone();
+        guard.spawn_router(async move {
+            router_shutdown.cancelled().await;
+            router_stopped_task.store(true, Ordering::Release);
+        });
+        let status_shutdown = shutdown.clone();
+        let late_state_tx = state_tx.clone();
+        let late_publisher_closed = publisher_closed.clone();
+        guard.spawn_status(async move {
+            status_shutdown.cancelled().await;
+            late_state_tx.send_modify(|state| {
+                if late_publisher_closed.load(Ordering::Acquire) {
+                    return;
+                }
+                state.hashrate_ghs = 777.0;
+                state.pool.status = "late-publisher".to_string();
+            });
+        });
+
+        tokio::task::spawn_blocking(move || {
+            guard.stop_and_join(Instant::now() + Duration::from_secs(1))
+        })
+        .await
+        .expect("blocking join task")
+        .expect("Stratum tasks join cleanly");
+
+        assert!(router_stopped.load(Ordering::Acquire));
+        let after_join = state_rx.borrow().clone();
+        assert_eq!(after_join.hashrate_ghs, 123.0);
+        assert_eq!(after_join.pool.status, "mining");
+
+        let mut terminal = Am3BbTerminalStatePublisher::new(state_tx);
+        terminal.begin_stopping();
+        terminal.record_safe_off(false);
+        terminal.finish_stopped();
+        let terminal = state_rx.borrow().clone();
+        assert_eq!(terminal.hashrate_ghs, 0.0);
+        assert_eq!(terminal.hashrate_5s_ghs, 0.0);
+        assert_eq!(terminal.pool.status, "stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stratum_abort_never_waits_beyond_the_original_absolute_deadline() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let shutdown = CancellationToken::new();
+        let publisher_closed = Arc::new(AtomicBool::new(false));
+        let router_dropped = Arc::new(AtomicBool::new(false));
+        let status_dropped = Arc::new(AtomicBool::new(false));
+        let mut guard = Am3BbStratumTaskGuard::pending(
+            tokio::runtime::Handle::current(),
+            shutdown,
+            publisher_closed,
+        );
+        let router_drop = DropFlag(router_dropped.clone());
+        guard.spawn_router(async move {
+            let _drop = router_drop;
+            std::future::pending::<()>().await
+        });
+        let status_drop = DropFlag(status_dropped.clone());
+        guard.spawn_status(async move {
+            let _drop = status_drop;
+            std::future::pending::<()>().await
+        });
+        tokio::task::yield_now().await;
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(20);
+
+        let error = tokio::task::spawn_blocking(move || guard.stop_and_join(deadline))
+            .await
+            .expect("blocking join task")
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("without an unbounded follow-up join"));
+        assert!(started_at.elapsed() < Duration::from_millis(150));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !(router_dropped.load(Ordering::Acquire)
+                && status_dropped.load(Ordering::Acquire))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both aborted Stratum futures must be destroyed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stratum_partial_roster_error_retains_and_aborts_all_owned_tasks() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let shutdown = CancellationToken::new();
+        let publisher_closed = Arc::new(AtomicBool::new(false));
+        let router_dropped = Arc::new(AtomicBool::new(false));
+        let mut guard = Am3BbStratumTaskGuard::pending(
+            tokio::runtime::Handle::current(),
+            shutdown.clone(),
+            publisher_closed.clone(),
+        );
+        let router_drop = DropFlag(router_dropped.clone());
+        guard.spawn_router(async move {
+            let _drop = router_drop;
+            std::future::pending::<()>().await
+        });
+        tokio::task::yield_now().await;
+
+        let (guard, error) = tokio::task::spawn_blocking(move || {
+            let error = guard
+                .stop_and_join(Instant::now() + Duration::from_secs(1))
+                .expect_err("partial roster cannot produce join evidence");
+            (guard, error)
+        })
+        .await
+        .expect("blocking partial-roster check");
+        assert!(error.to_string().contains("incomplete Stratum task roster"));
+        assert!(
+            guard.router.is_some(),
+            "router ownership must remain retained"
+        );
+        assert!(shutdown.is_cancelled());
+        assert!(publisher_closed.load(Ordering::Acquire));
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !router_dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained router future must be destroyed by guard Drop");
+    }
+
+    #[tokio::test]
+    async fn stratum_guard_owns_cancellation_before_first_spawn() {
+        let shutdown = CancellationToken::new();
+        let publisher_closed = Arc::new(AtomicBool::new(false));
+        let mut guard = Am3BbStratumTaskGuard::pending(
+            tokio::runtime::Handle::current(),
+            shutdown.clone(),
+            publisher_closed.clone(),
+        );
+        guard.spawn_router(std::future::pending::<()>());
+
+        drop(guard);
+
+        assert!(shutdown.is_cancelled());
+        assert!(publisher_closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stratum_and_cleanup_deadlines_are_strictly_capped() {
+        let now = Instant::now();
+        let cleanup = now + Duration::from_secs(26);
+        assert_eq!(
+            am3_bb_capped_cleanup_deadline(cleanup, now, Duration::from_secs(2)),
+            now + Duration::from_secs(2)
+        );
+        let nearly_expired = now + Duration::from_millis(10);
+        assert_eq!(
+            am3_bb_capped_cleanup_deadline(nearly_expired, now, Duration::from_secs(2)),
+            nearly_expired
+        );
+    }
+
+    #[test]
+    fn mining_loop_top_level_error_is_structurally_pre_spawn() {
+        let source = include_str!("am3_bb_mining.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production AM3 source");
+        let preparation = production
+            .split_once("fn run_mining_loop<U: ChainUart>(")
+            .expect("AM3 mining loop")
+            .1;
+        let (pre_spawn, started_and_after) = preparation
+            .split_once("fn run_started_mining_loop<U: ChainUart>(")
+            .expect("explicit AM3 started phase");
+        let started = started_and_after
+            .split_once("/// Monotonic microseconds")
+            .expect("AM3 started-loop boundary")
+            .0;
+
+        assert!(pre_spawn.contains("Am3BbMiningLoopNotStarted"));
+        assert!(!production.contains("impl From<anyhow::Error> for Am3BbMiningLoopNotStarted"));
+        assert!(pre_spawn.contains(".map_err(Am3BbMiningLoopNotStarted)?"));
+        assert!(pre_spawn.contains("Ok(run_started_mining_loop("));
+        assert!(!pre_spawn.contains("Am3BbStratumTaskGuard::pending("));
+        assert!(!pre_spawn.contains("stratum_tasks.spawn_"));
+        assert!(!pre_spawn.contains("rt_handle.spawn("));
+        assert!(started.contains(") -> Am3BbMiningLoopExit"));
+        assert!(started.contains("Am3BbStratumTaskGuard::pending("));
+        assert!(started.contains("stratum_tasks.spawn_router("));
+        assert!(started.contains("let mining_result = (|| -> Result<()>"));
+        assert!(started.contains("Am3BbMiningLoopExit {"));
+        assert!(!started.contains("Am3BbMiningLoopNotStarted"));
+    }
+
+    #[test]
+    fn started_and_pre_stratum_errors_share_typed_terminal_closeout() {
+        let source = include_str!("am3_bb_mining.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production AM3 source");
+        let blocking = production
+            .split_once("fn run_am3_bb_blocking(")
+            .expect("AM3 blocking engine")
+            .1;
+        let (mining_dispatch, closeout) = blocking
+            .split_once("// Every mining-loop exit after asynchronous ownership transfers")
+            .expect("AM3 terminal closeout funnel");
+
+        assert!(mining_dispatch
+            .contains("Ok(exit) => (exit.mining_result, Some(exit.stratum_tasks), Ok(()))"));
+        assert!(mining_dispatch
+            .contains("am3-bb: mining loop admission failed before any Stratum task was spawned"));
+        assert!(mining_dispatch.contains("None,\n                Ok(()),"));
+
+        let disarm = closeout
+            .find("watchdog.disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT)")
+            .expect("AM3 watchdog closeout");
+        let typed_closeout = closeout
+            .find("let terminal_closeout = Am3BbTerminalSafeOffCloseout")
+            .expect("typed terminal-safe-off closeout");
+        let error_disposition = closeout
+            .find("Am3BbLifecycleError::terminal_safe_off_closed(")
+            .expect("terminal-safe-off lifecycle disposition");
+        assert!(disarm < typed_closeout && typed_closeout < error_disposition);
+        assert!(closeout.contains("if let Err(mining_error) = mining_result {"));
+        assert!(closeout.contains("terminal_closeout,"));
+        assert!(!closeout.contains("mining_result?;"));
+    }
+
+    #[test]
+    fn post_energization_cancellation_never_reports_clean_shutdown() {
+        let source = include_str!("am3_bb_mining.rs");
+        let boundary = source.find("drop(energizing_boundary);").unwrap();
+        let closeout = source[boundary..]
+            .find("let revoked_api_commit_fence")
+            .map(|offset| boundary + offset)
+            .unwrap();
+        let bringup = &source[boundary..closeout];
+
+        assert!(bringup.contains(
+            "shutdown requested after cold-boot; safety guard will attempt cutoff during unwind; safe-off remains unproven and watchdog reset is pending"
+        ));
+        assert!(bringup.contains(
+            "shutdown requested after dsPIC init; safety guard will attempt cutoff during unwind; safe-off remains unproven and watchdog reset is pending"
+        ));
+        assert!(!bringup.contains("return Ok(());"));
+    }
+
+    #[test]
+    fn terminal_state_drop_never_claims_stopped_without_safeoff_receipt() {
+        let mut initial = dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard);
+        initial.pool.status = "mining".to_string();
+        let (state_tx, state_rx) = watch::channel(initial);
+        {
+            let terminal = Am3BbTerminalStatePublisher::new(state_tx);
+            terminal.begin_stopping();
+            assert_eq!(state_rx.borrow().pool.status, "stopping");
+        }
+        assert_eq!(state_rx.borrow().pool.status, "faulted_safe_off_unproven");
+    }
+
+    #[test]
     fn heartbeat_owner_has_no_unbounded_join_path() {
         let source = include_str!("am3_bb_mining.rs");
+        let production = source
+            .split("//  Tests (host-safe")
+            .next()
+            .expect("AM3 production source");
         let forbidden_join = [".", "join", "()"].concat();
-        assert!(!source.contains(&forbidden_join));
-        assert!(source.contains("stop_and_join(&rt_handle)"));
-        assert!(source.contains("dspic-heartbeat-stop-timeout"));
-        assert!(source.contains("dspic-heartbeat-owner-drop-without-quiescence"));
-        assert!(source.contains("catch_unwind(AssertUnwindSafe"));
-        assert!(source.contains("Am3BbHeartbeatEvent::WorkerPanicked"));
+        assert!(!production.contains(&forbidden_join));
+        assert!(production.contains("stop_and_join_until(&rt_handle, heartbeat_stop_deadline)"));
+        assert!(production.contains("dspic-heartbeat-stop-failure"));
+        assert!(production.contains("dspic-heartbeat-owner-drop-without-quiescence"));
+        assert!(production.contains("catch_unwind(AssertUnwindSafe"));
+        assert!(production.contains("Am3BbHeartbeatEvent::WorkerPanicked"));
+    }
+
+    #[test]
+    fn heartbeat_roster_is_watchdog_issued_reserved_before_spawn_and_manifest_typed() {
+        let source = include_str!("am3_bb_mining.rs");
+        let production = source
+            .split("//  Tests (host-safe")
+            .next()
+            .expect("AM3 production source");
+        let heartbeat_start = production
+            .split_once("fn start_am3_bb_dspic_heartbeat(")
+            .expect("AM3 heartbeat owner")
+            .1
+            .split_once("fn am3_bb_require_heartbeat_for_energizing_boundary(")
+            .expect("AM3 heartbeat owner boundary")
+            .0;
+        let reserve = heartbeat_start
+            .find("threads.reserve(Am3BbThreadSlot::DspicHeartbeat)")
+            .expect("typed dsPIC slot reservation");
+        let spawn = heartbeat_start
+            .find(".spawn(move ||")
+            .expect("dsPIC heartbeat spawn");
+        let attach = heartbeat_start
+            .find("actor_slot.attach(handle)")
+            .expect("typed dsPIC slot attachment");
+        assert!(reserve < spawn && spawn < attach);
+        assert!(heartbeat_start.contains("actor_owner.activate(worker_stop)"));
+        assert!(!heartbeat_start.contains("RuntimeThreadGuard::new"));
+
+        let closeout = production
+            .split_once("// Every mining-loop exit after asynchronous ownership transfers")
+            .expect("AM3 closeout")
+            .1
+            .split_once("if let Err(mining_error) = mining_result {")
+            .expect("AM3 closeout boundary")
+            .0;
+        assert!(closeout.contains(".into_actor_receipt()"));
+        assert!(!closeout.contains("heartbeat_shutdown.summary"));
+
+        let watchdog = include_str!("runtime/safety_watchdog.rs");
+        let manifest = watchdog
+            .split_once("pub(crate) struct Am3BbWatchdogShutdownManifest")
+            .expect("AM3 manifest")
+            .1
+            .split_once("/// Move-only standard-daemon authority")
+            .expect("AM3 manifest boundary")
+            .0;
+        assert!(manifest.contains("actors: ThreadRosterQuiescenceReceipt<Am3BbThreadSlot>"));
+        assert!(!manifest.contains("actors: ThreadStopSummary"));
     }
 
     #[test]
     fn watchdog_closeout_orders_barriers_quiescence_and_safeoff_before_disarm() {
         let source = include_str!("am3_bb_mining.rs");
         let start = source
-            .find("// Every exit, including a mining-loop error")
+            .find("// Every mining-loop exit after asynchronous ownership transfers")
             .unwrap();
         let end = source[start..]
-            .find("mining_result?;")
+            .find("if let Err(mining_error) = mining_result {")
             .map(|offset| start + offset)
             .unwrap();
         let closeout = &source[start..end];
 
-        let teardown = closeout.find("watchdog.begin_teardown(").unwrap();
-        let api_barrier = closeout.find("close_and_drain(").unwrap();
+        let teardown_request = closeout
+            .find("watchdog\n        .request_teardown_budget(")
+            .unwrap();
+        let api_commit_revocation = closeout
+            .find("hardware_mutation_owner.revoke_commit_fence()")
+            .unwrap();
+        let heartbeat_feeder_stop = closeout
+            .find("heartbeat_feeder_owner.request_stop()")
+            .unwrap();
+        let hard_cutoff = closeout
+            .find("cut_board_enable_checked(teardown_view.clone())")
+            .unwrap();
+        let stratum_publisher_close = closeout.find("tasks.request_stop()").unwrap();
+        let terminal_stopping = closeout.find("terminal_state.begin_stopping()").unwrap();
+        let stratum_join = closeout
+            .find("tasks.stop_and_join(stratum_join_deadline)")
+            .unwrap();
+        let teardown_acknowledgement = closeout
+            .find("watchdog.observe_teardown_admission(")
+            .unwrap();
+        let api_barrier = closeout.find("close_and_drain_until(").unwrap();
+        let api_commit_fence = closeout
+            .find("revoked_api_commit_fence.try_wait()")
+            .unwrap();
         let i2c_latch = closeout.find("latch_terminal_safe_off()").unwrap();
-        let actor_join = closeout.find("stop_and_join(&rt_handle)").unwrap();
-        let safeoff = closeout.find("teardown_checked()").unwrap();
+        let actor_join = closeout
+            .find("stop_and_join_until(&rt_handle, heartbeat_stop_deadline)")
+            .unwrap();
+        let safeoff = closeout
+            .find("teardown_checked(board_cutoff_result.ok(), teardown_view.clone())")
+            .unwrap();
+        let terminal_safeoff = closeout
+            .find("terminal_state.record_safe_off(mining_result.is_err())")
+            .unwrap();
+        let negative_evidence_gate = closeout
+            .find("let api_barrier = api_barrier_result?;")
+            .unwrap();
+        let stratum_evidence_gate = closeout.find("stratum_tasks_result?;").unwrap();
+        let disarm_authority = closeout
+            .find("teardown_budget.begin_disarm_at(Instant::now())")
+            .unwrap();
+        let manifest = closeout
+            .find("Am3BbWatchdogShutdownManifest::new(")
+            .unwrap();
         let permit = closeout
-            .find("WatchdogDisarmPermit::from_evidence_set")
+            .find("WatchdogDisarmPermit::from_am3_bb_manifest")
             .unwrap();
         let disarm = closeout.find("watchdog.disarm_and_join(").unwrap();
+        let terminal_closeout = closeout
+            .find("let terminal_closeout = Am3BbTerminalSafeOffCloseout")
+            .unwrap();
 
         assert!(
-            teardown < api_barrier
-                && api_barrier < i2c_latch
+            api_commit_revocation < teardown_request
+                && teardown_request < heartbeat_feeder_stop
+                && heartbeat_feeder_stop < hard_cutoff
+                && hard_cutoff < stratum_publisher_close
+                && stratum_publisher_close < terminal_stopping
+                && terminal_stopping < teardown_acknowledgement
+                && teardown_acknowledgement < api_barrier
+                && api_barrier < api_commit_fence
+                && api_commit_fence < i2c_latch
                 && i2c_latch < actor_join
                 && actor_join < safeoff
-                && safeoff < permit
+                && safeoff < terminal_safeoff
+                && terminal_safeoff < stratum_join
+                && terminal_safeoff < negative_evidence_gate
+                && stratum_join < negative_evidence_gate
+                && negative_evidence_gate < stratum_evidence_gate
+                && stratum_evidence_gate < disarm_authority
+                && disarm_authority < manifest
+                && manifest < permit
                 && permit < disarm
+                && disarm < terminal_closeout
         );
+    }
+
+    #[test]
+    fn gpio59_cutoff_receipt_precedes_dspic_and_reset_defense_in_depth() {
+        let source = include_str!("am3_bb_mining.rs");
+        let closeout_start = source
+            .find("// GPIO59 is the load-bearing physical cut")
+            .unwrap();
+        let closeout_end = source[closeout_start..]
+            .find("if let Err(mining_error) = mining_result {")
+            .map(|offset| closeout_start + offset)
+            .unwrap();
+        let closeout = &source[closeout_start..closeout_end];
+        assert!(
+            closeout
+                .find("cut_board_enable_checked(teardown_view.clone())")
+                .unwrap()
+                < closeout.find("latch_terminal_safe_off()").unwrap()
+        );
+        assert!(
+            closeout
+                .find("cut_board_enable_checked(teardown_view.clone())")
+                .unwrap()
+                < closeout
+                    .find("stop_and_join_until(&rt_handle, heartbeat_stop_deadline)")
+                    .unwrap()
+        );
+        assert!(
+            closeout
+                .find("cut_board_enable_checked(teardown_view.clone())")
+                .unwrap()
+                < closeout
+                    .find("teardown_checked(board_cutoff_result.ok(), teardown_view.clone())")
+                    .unwrap()
+        );
+
+        let guard_start = source
+            .find("    fn run_defense_in_depth(&mut self)")
+            .expect("AM3 shared defense-in-depth method");
+        let guard_end = source[guard_start..]
+            .find("    fn teardown_checked(\n")
+            .map(|offset| guard_start + offset)
+            .expect("AM3 checked teardown boundary");
+        let guard = &source[guard_start..guard_end];
+        assert!(guard.contains("am3_bb_disable_dspics_two_phase("));
+        assert!(guard.contains("am3_bb_prepare_output_gpio(gpio, true)"));
+        assert!(!guard.contains("am3_bb_prepare_output_gpio(self.board_enable_gpio"));
+
+        let drop_start = source
+            .find("impl Drop for Am3BbRunSafetyGuard")
+            .expect("AM3 fail-closed Drop");
+        let drop_end = source[drop_start..]
+            .find("fn am3_bb_post_dspic_reset_chains")
+            .map(|offset| drop_start + offset)
+            .expect("AM3 Drop boundary");
+        let drop_guard = &source[drop_start..drop_end];
+        assert!(drop_guard.contains("cut_board_enable_fallback()"));
+        assert!(drop_guard.contains("run_defense_in_depth()"));
+        assert!(!drop_guard.contains("teardown_checked("));
+        assert!(!drop_guard.contains("TeardownBudget"));
+
+        let teardown_start = source
+            .find("    fn teardown_checked(\n")
+            .expect("AM3 checked teardown");
+        let teardown_end = source[teardown_start..]
+            .find("impl Drop for Am3BbRunSafetyGuard")
+            .map(|offset| teardown_start + offset)
+            .expect("AM3 checked teardown boundary");
+        let teardown = &source[teardown_start..teardown_end];
+        let retry = teardown
+            .find("self.cut_board_enable_checked(teardown_budget.clone())")
+            .expect("checked GPIO59 cutoff retry");
+        let defense = teardown
+            .find("self.run_defense_in_depth()")
+            .expect("defense-in-depth attempt");
+        let fallback = teardown
+            .find("self.cut_board_enable_fallback()")
+            .expect("non-authorizing physical cutoff retry");
+        let completed = teardown
+            .find("self.teardown_done = true;")
+            .expect("successful safe-off completion marker");
+        assert!(retry < defense && defense < fallback && fallback < completed);
+        assert_eq!(teardown.matches("self.teardown_done = true;").count(), 1);
+    }
+
+    #[test]
+    fn retained_gpio59_authority_is_preopened_once_and_panic_cut_runs_first() {
+        let source = include_str!("am3_bb_mining.rs");
+        let production = source
+            .split("//  Tests (host-safe")
+            .next()
+            .expect("AM3 production source");
+
+        let guard_new = production
+            .split_once("    fn new(\n        platform: &BeagleBonePlatform,")
+            .expect("AM3 run guard constructor")
+            .1
+            .split_once("    fn set_dspic(")
+            .expect("AM3 run guard constructor boundary")
+            .0;
+        assert!(
+            guard_new.find("am3_bb_prepare_board_cutoff_set(").unwrap()
+                < guard_new.find(".open_fan()").unwrap()
+        );
+
+        let blocking = production
+            .split_once("fn run_am3_bb_blocking(")
+            .expect("AM3 blocking engine")
+            .1
+            .split_once("fn bm1362_command_wire_frame(")
+            .expect("AM3 blocking engine boundary")
+            .0;
+        let guard_arm = blocking.find("Am3BbRunSafetyGuard::new(").unwrap();
+        let panic_arm = blocking.find("arm_am3_bb_teardown(").unwrap();
+        let cold_boot = blocking.find(".run_cold_boot(").unwrap();
+        assert!(guard_arm < panic_arm && panic_arm < cold_boot);
+        assert!(blocking.contains(".take_heartbeat_board_cutoff()?"));
+        assert!(blocking.contains("let mut runtime_cutoff = run_guard.runtime_cutoff();"));
+
+        let panic_hook = production
+            .split_once("pub fn am3_bb_panic_hook_best_effort_teardown()")
+            .expect("AM3 panic hook")
+            .1
+            .split_once("#[derive(Debug, Default")
+            .expect("AM3 panic hook boundary")
+            .0;
+        assert!(
+            panic_hook
+                .find("watchdog_feed_stop.close_terminal_lock_free()")
+                .unwrap()
+                < panic_hook.find("cut_raw_noalloc()").unwrap()
+        );
+        assert!(
+            panic_hook.find("cut_raw_noalloc()").unwrap()
+                < panic_hook.find("for &gpio in &params.reset_gpios").unwrap()
+        );
+
+        let prepared_impl =
+            "impl dcentrald_hal::platform::beaglebone_cold_boot::PreparedBoardEnable for";
+        assert_eq!(production.matches(prepared_impl).count(), 1);
+        assert!(production.contains(&format!("{prepared_impl} Am3BbBoardEnableOwner")));
+
+        let cold_boot_source =
+            include_str!("../../dcentrald-hal/src/platform/beaglebone_cold_boot.rs");
+        let v2_cold_boot = cold_boot_source
+            .split_once("pub fn cold_boot_sequence_s19j_io_v2")
+            .expect("AM3 V2 cold boot")
+            .1
+            .split_once("//  Tests")
+            .expect("AM3 V2 cold-boot boundary")
+            .0;
+        assert!(v2_cold_boot.contains("board_enable.assert_checked()?"));
+        assert!(!v2_cold_boot.contains("export_sysfs_gpio(opts.board_enable_gpio)"));
+        assert!(!v2_cold_boot.contains("write_sysfs_gpio_value(opts.board_enable_gpio"));
     }
 
     #[test]
@@ -6553,6 +9691,163 @@ mod tests {
         assert_eq!(am3_bb_dspic_addr_for_chain(2), 0x22);
     }
 
+    /// UB-20. Every frame below is verbatim from
+    /// *.log` on `a lab unit`.
+    #[test]
+    fn lm75_bridge_decoder_rejects_malformed_replies_structurally() {
+        // --- Well-formed replies still decode, and to the right value. ---
+        // `a lab unit` 2026-05-14T00:06:09 chain0 sensor 0x48, logged as 38.1875 C.
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x07, 0x3C, 0x01, 0x26, 0x30, 0x00, 0x9A]),
+            Some(38.1875)
+        );
+        // `a lab unit` 2026-05-14T00:05:36 chain0 sensor 0x4B, logged as 41.25 C.
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x07, 0x3C, 0x01, 0x29, 0x40, 0x00, 0xAD]),
+            Some(41.25)
+        );
+
+        // --- Reject 1: status byte reply[5] != 0. ---
+        // `a lab unit` 2026-05-14T00:06:13 chain2 sensor 0x48 — logged "invalid".
+        // Its checksum over the device's true reply[0..=4] span is VALID
+        // (0x07+0x3C+0x01+0x25+0xB0 = 0x19), so only the status byte
+        // distinguishes it from a good read. This is the frame class that the
+        // old accidental checksum span happened to catch; pin it explicitly.
+        let status_bad = [0x07u8, 0x3C, 0x01, 0x25, 0xB0, 0x01, 0x19];
+        assert_eq!(
+            status_bad[..5].iter().fold(0u8, |a, b| a.wrapping_add(*b)),
+            status_bad[6],
+            "fixture precondition: the device checksum (reply[0..=4]) must PASS, \
+             so this frame can only be rejected by the status byte"
+        );
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&status_bad),
+            None,
+            "non-zero bridge status byte must reject (ePIC's reply[2] is our reply[5]); \
+             a status flag is not a temperature"
+        );
+        // Same payload with the status byte cleared is a good 37.6875 C read —
+        // proves the status byte alone is what rejects, not the payload.
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x07, 0x3C, 0x01, 0x25, 0xB0, 0x00, 0x19]),
+            Some(37.6875)
+        );
+
+        // --- Reject 2: raw & 0x0F != 0. ---
+        // `a lab unit` guard-failclosed 2026-05-13T22:47 — status byte is GOOD (0x00),
+        // so only the low-nibble rule stands between this frame and a
+        // plausible-looking, dangerously COOL 6.00 C reading.
+        let low_nibble_set = [0x07u8, 0x3C, 0x01, 0x06, 0x01, 0x00, 0x1D];
+        assert_eq!(low_nibble_set[5], AM3_BB_LM75_STATUS_OK);
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&low_nibble_set),
+            None,
+            "raw & 0x0F != 0 must reject as a framing/bus error, never as a cold sensor"
+        );
+        // Synthetic: a frame whose checksum is valid on BOTH spans and whose
+        // status is good, but whose low nibble is set. The additive checksum
+        // provably cannot catch this class; the nibble rule must.
+        let mut compensating = [0x07u8, 0x3C, 0x01, 0x26, 0x31, 0x00, 0x00];
+        compensating[6] = compensating[..6]
+            .iter()
+            .fold(0u8, |a, b| a.wrapping_add(*b));
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&compensating),
+            None,
+            "a checksum-valid, status-OK frame with a non-zero low nibble must still reject"
+        );
+
+        // --- Header and checksum rejects remain in force. ---
+        // `a lab unit` guard-failclosed: fully desynchronised frame.
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x3C, 0x1C, 0xF0, 0x50, 0xFF, 0xFF, 0xFF]),
+            None
+        );
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x07, 0x3C, 0x01, 0x1D, 0x20, 0x00, 0x80]),
+            None,
+            "LM75 bridge checksum must be enforced before mining"
+        );
+        assert_eq!(
+            am3_bb_decode_lm75_bridge_reply(&[0x07, 0x3C, 0x01, 0x1D, 0x20, 0x00]),
+            None,
+            "a short reply is not a temperature"
+        );
+
+        // --- Conversion parity with ePIC's (raw >> 4) * 62.5 m°C. ---
+        // Exact for every accepted raw value, including negatives.
+        for raw in (-8_000i16..=32_752).step_by(16) {
+            let hi = (raw >> 8) as u8;
+            let lo = (raw & 0xFF) as u8;
+            let mut frame = [0x07u8, 0x3C, 0x01, hi, lo, 0x00, 0x00];
+            frame[6] = frame[..6].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+            let epic_c = f32::from(raw >> 4) * 62.5 / 1000.0;
+            let decoded = am3_bb_decode_lm75_bridge_reply(&frame);
+            if (AM3_BB_LM75_MIN_VALID_C..=AM3_BB_LM75_MAX_VALID_C).contains(&epic_c) {
+                assert_eq!(
+                    decoded,
+                    Some(epic_c),
+                    "raw {:#06X}: our /256.0 must equal ePIC's (raw>>4)*62.5 m°C",
+                    raw
+                );
+            } else {
+                assert_eq!(decoded, None, "raw {:#06X} is out of the valid band", raw);
+            }
+        }
+    }
+
+    /// UB-20 fail-safe direction: a rejected read must never surface as a
+    /// plausible temperature, and must never read as "cool" to fan policy.
+    #[test]
+    fn rejected_lm75_read_never_surfaces_as_a_plausible_temperature() {
+        // Every frame the decoder rejects yields None — not 0.0, not a default.
+        for bad in [
+            [0x07u8, 0x3C, 0x01, 0x25, 0xB0, 0x01, 0x19], // status byte set
+            [0x07, 0x3C, 0x01, 0x06, 0x01, 0x00, 0x1D],   // low nibble set -> "6.0 C"
+            [0x3C, 0x1C, 0xF0, 0x50, 0xFF, 0xFF, 0xFF],   // desynchronised
+        ] {
+            assert_eq!(am3_bb_decode_lm75_bridge_reply(&bad), None);
+        }
+
+        // A poll in which every reply was rejected produces zero samples. The
+        // snapshot must be un-fresh and must NOT carry a finite temperature
+        // that downstream fan policy could mistake for a cool board.
+        let all_rejected =
+            am3_bb_thermal_snapshot_from_chain_samples(&[0, 0, 0], f32::NEG_INFINITY);
+        assert_eq!(all_rejected.samples, 0);
+        assert_eq!(all_rejected.covered_chains, 0);
+        assert!(
+            !all_rejected.fresh,
+            "zero decoded samples must never be reported as fresh thermal proof"
+        );
+        assert!(
+            !all_rejected.max_temp_c.is_finite(),
+            "an empty poll must not synthesise a finite temperature"
+        );
+        assert_ne!(
+            all_rejected.max_temp_c, 0.0,
+            "a rejected read must never be laundered into 0 C"
+        );
+
+        // A partially rejected poll (one chain fully silent) is also un-fresh,
+        // so a healthy peer can never mask a blind chain.
+        let partial = am3_bb_thermal_snapshot_from_chain_samples(&[4, 0, 4], 45.0);
+        assert!(!partial.fresh);
+
+        // ...and the fan PID refuses to act on either, holding station rather
+        // than treating absent data as permission to relax.
+        assert_eq!(
+            am3_bb_thermal_action(all_rejected.max_temp_c, 75.0),
+            Am3BbThermalAction::PidWithinCap,
+            "-inf must not read as dangerous..."
+        );
+        assert_eq!(
+            am3_bb_thermal_action(80.0, 75.0),
+            Am3BbThermalAction::CutHashThenFan,
+            "...while a real over-temperature still cuts hash power first"
+        );
+    }
+
     #[test]
     fn auto_detect_is_false_on_a_dev_host() {
         // On the dev host there is no /etc/dcentos/board_target and no
@@ -6691,6 +9986,7 @@ mod tests {
         //   [82..86] = version LE  ·  [86..88] = CRC16-CCITT-FALSE, BE-appended,
         //              over frame[2..86] (the 84 bytes from 0x21)
         let work = dcentrald_stratum::share_pipeline::MiningWork {
+            work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
             midstates: vec![[0u8; 32]],
             merkle4: [0u8; 4],
             ntime: 0x1122_3344,
@@ -6765,6 +10061,7 @@ mod tests {
             *b = 0x40 + i as u8;
         }
         let work = dcentrald_stratum::share_pipeline::MiningWork {
+            work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
             midstates: vec![midstate],
             merkle4: [0u8; 4],
             ntime: 0x1122_3344,
@@ -6925,6 +10222,7 @@ mod tests {
         // [76..80] — the byte order WorkBuilder produces / serial_build_header
         // uses + validate_full_header hashes.
         let dw = DispatchedWork {
+            work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
             job_id: "deadbeef".to_string(),
             extranonce2: "00000000".to_string(),
             ntime: 0x1122_3344,

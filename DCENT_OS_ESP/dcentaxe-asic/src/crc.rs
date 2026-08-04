@@ -100,6 +100,77 @@ pub fn crc16_false(data: &[u8]) -> u16 {
     crc
 }
 
+// ─── MSBT0501 / LT0051 (Hammer DC0x, Scrypt) CRCs ───────────────────────────
+//
+// 🔴 THE SHARPEST TRAP IN THE MSBT0501 PROTOCOL (MSBT0501_PROTOCOL.md §3, §8):
+// the chip uses TWO different CRCs and only ONE of them is Bitmain's.
+//
+//   * CRC-5  (register commands + every response) IS Bitmain's, byte for byte
+//     — verified, not assumed, across 29,585 vectors. So [`crc5`] above is
+//     reused directly and [`crc5_bits`] is only its bit-length generalisation.
+//   * CRC-16 (93-byte work packets) is poly **0x8005** / CRC-16/CMS —
+//     **NOT** Bitmain's 0x1021. No 0x1021 constant exists anywhere in any of
+//     the five DC/BC-lineage vendor images.
+//
+// The asymmetry is what makes it dangerous: checking the CRC-5 against BM1485
+// SUCCEEDS, which breeds false confidence in the CRC-16. [`crc16_false`] above
+// is the 0x1021 CCITT-FALSE table CRC used by every BM13xx job packet and
+// **must never be used for LT0051** — a wrong work-packet CRC gives a
+// perfectly-formed frame that the chip silently discards, i.e. link health
+// looks perfect and the hashrate is zero.
+
+/// CRC-16/CMS — poly `0x8005`, init `0xFFFF`, non-reflected, no final XOR.
+///
+/// The MSBT0501 work-packet checksum (`FUN_4205a23c` @ IROM `0x4205a23c`;
+/// constants read from the DC02 v2.0.2 literal pool at `0x4203f4ac` = `0x8005`
+/// and `0x4203ebe4` = `0xFFFF`). Transmitted **big-endian** in the frame's last
+/// two bytes: `frame[len-2] = crc >> 8`, `frame[len-1] = crc & 0xFF`.
+///
+/// ⚠ This is a DIFFERENT algorithm from [`crc16_false`] (poly `0x1021`). On the
+/// same input they give `0xAEE7` vs `0x29B1`. Do not "unify" them.
+///
+/// Check value: `crc16_cms(b"123456789") == 0xAEE7`.
+#[inline]
+pub fn crc16_cms(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// CRC-5 over an explicit number of **bits** (poly `0x05`, init `0x1F`,
+/// MSB-first, no final XOR).
+///
+/// The MSBT0501 receive validator calls its CRC-5 with a bit count
+/// (`FUN_4205a178(buf + 2, 0x40)` — 64 bits = response bytes 2..9), so the
+/// driver mirrors that signature exactly rather than assuming byte alignment.
+/// For a byte-aligned `nbits` this is identical to [`crc5`]; a pinned test
+/// asserts that equivalence so the two implementations cannot drift.
+///
+/// `nbits` is clamped to the bits actually available in `data`.
+#[inline]
+pub fn crc5_bits(data: &[u8], nbits: usize) -> u8 {
+    let nbits = nbits.min(data.len() * 8);
+    let mut crc: u8 = 0x1F;
+    for i in 0..nbits {
+        let bit = (data[i >> 3] >> (7 - (i & 7))) & 1;
+        let top = (crc >> 4) & 1;
+        crc = (crc << 1) & 0x1F;
+        if (top ^ bit) != 0 {
+            crc ^= 0x05;
+        }
+    }
+    crc
+}
+
 // ─── KF1950 (WhatsMiner K-series) CRC ───────────────────────────────────────
 //
 // UNTESTED — RESEARCH DRIVER. Used only when the `asic-kf1950` Cargo feature
@@ -209,6 +280,70 @@ mod tests {
                 "unrolled crc16 diverged from the naive reference at len={len}"
             );
         }
+    }
+
+    // ── MSBT0501 / LT0051 ───────────────────────────────────────────────
+
+    #[test]
+    fn crc16_cms_published_check_value() {
+        // THE pin the protocol contract demands (MSBT0501_PROTOCOL.md §8 #1):
+        // the catalogue check value for CRC-16/CMS. If this ever reads 0x29B1
+        // somebody swapped in the Bitmain 0x1021 CRC and every Scrypt work
+        // packet is silently discarded by the chip (perfect link, zero shares).
+        assert_eq!(crc16_cms(b"123456789"), 0xAEE7);
+    }
+
+    #[test]
+    fn crc16_cms_is_not_the_bitmain_job_crc() {
+        // Explicit anti-confusion pin: the two CRC-16s must disagree, and
+        // crc16_false must still be CCITT-FALSE.
+        assert_eq!(crc16_false(b"123456789"), 0x29B1);
+        assert_ne!(crc16_cms(b"123456789"), crc16_false(b"123456789"));
+        for len in 0..48usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            if len > 0 {
+                assert_ne!(
+                    crc16_cms(&data),
+                    crc16_false(&data),
+                    "CMS(0x8005) and CCITT-FALSE(0x1021) collided at len={len} — \
+                     check that crc16_cms really uses poly 0x8005"
+                );
+            }
+        }
+        // Empty input: both are just the shared init value.
+        assert_eq!(crc16_cms(&[]), 0xFFFF);
+    }
+
+    #[test]
+    fn crc5_bits_matches_the_documented_msbt0501_vectors() {
+        // Regression vectors published in MSBT0501_PROTOCOL.md §3.1, produced
+        // from a literal transliteration of the instruction-level read of
+        // FUN_4205a178 and cross-checked against a conventional
+        // poly-0x05/init-0x1F CRC-5 over 29,585 vectors.
+        assert_eq!(crc5_bits(&[0x00, 0x00, 0x00, 0x00], 32), 0x1B);
+        assert_eq!(crc5_bits(&[0x52, 0x05, 0x00, 0x00], 32), 0x0A);
+        assert_eq!(crc5_bits(&[0x41, 0x09, 0x00, 0x0C], 32), 0x1D);
+        // nbits == 0 returns the seed.
+        assert_eq!(crc5_bits(&[0xFF; 4], 0), 0x1F);
+    }
+
+    #[test]
+    fn crc5_bits_is_the_byte_crc5_generalised() {
+        // The bit-length form must be EXACTLY the existing byte-oriented CRC-5
+        // on byte-aligned inputs — that equivalence is what lets the LT0051
+        // driver reuse the proven Bitmain CRC-5 rather than fork it.
+        for len in 0..40usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 91 + 3) as u8).collect();
+            assert_eq!(
+                crc5_bits(&data, len * 8),
+                crc5(&data),
+                "crc5_bits diverged from crc5 at len={len}"
+            );
+        }
+        // Sub-byte lengths are honoured (not rounded up to a whole byte).
+        assert_ne!(crc5_bits(&[0xFF], 4), crc5_bits(&[0xFF], 8));
+        // Over-long nbits clamps to the available data instead of reading OOB.
+        assert_eq!(crc5_bits(&[0xAA, 0x55], 9999), crc5(&[0xAA, 0x55]));
     }
 
     // ── crc8_0x31 (KF1950) ──────────────────────────────────────────────

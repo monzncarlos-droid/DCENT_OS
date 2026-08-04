@@ -36,7 +36,9 @@ pub struct ThermalCompensator {
     /// Prevents frequency oscillation near the threshold. Default: 3.0.
     hysteresis_band_c: f32,
     /// Chip-specific PLL frequency table for snapping derated frequencies.
-    /// Defaults to BM1387 table for backward compatibility.
+    /// Defaults to BM1387 table for the S9-compatible default constructor.
+    /// Unknown chips via [`Self::with_chip_id`] get an empty table (P1-4) —
+    /// derating then returns a conservative floor without panicking.
     pll_table: &'static [u16],
 }
 
@@ -47,6 +49,7 @@ impl ThermalCompensator {
     ///   - reference_temp: 55C (matches thermal config target_temp_c)
     ///   - derating: 0.3% per degree C above 60C
     ///   - emergency: 75C (matches thermal critical threshold)
+    ///   - PLL table: BM1387 (S9 default; call [`Self::with_chip_id`] for others)
     pub fn new() -> Self {
         Self {
             reference_temp_c: 55.0,
@@ -60,12 +63,37 @@ impl ThermalCompensator {
 
     /// Set chip-specific PLL table from a chip ID.
     ///
-    /// Uses `MinerProfile::pll_frequencies_for_chip()` to look up the correct
-    /// discrete frequency table for the given ASIC chip type. Falls back to
-    /// BM1387 table for unknown chip IDs.
+    /// Uses [`MinerProfile::try_pll_frequencies_for_chip`]. Unknown chip IDs
+    /// receive an **empty** table (P1-4 fail-closed) — never a silent BM1387
+    /// alias. Prefer [`Self::try_with_chip_id`] when the caller must refuse
+    /// construction for unknown silicon.
     pub fn with_chip_id(mut self, chip_id: u16) -> Self {
-        self.pll_table = MinerProfile::pll_frequencies_for_chip(chip_id);
+        self.pll_table = MinerProfile::try_pll_frequencies_for_chip(chip_id).unwrap_or(&[]);
         self
+    }
+
+    /// Construct with a known chip's PLL table, or `None` if the chip is unknown.
+    pub fn try_with_chip_id(self, chip_id: u16) -> Option<Self> {
+        let pll = MinerProfile::try_pll_frequencies_for_chip(chip_id)?;
+        if pll.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pll_table: pll,
+            ..self
+        })
+    }
+
+    /// True when a non-empty discrete PLL table is loaded.
+    pub fn has_pll_table(&self) -> bool {
+        !self.pll_table.is_empty()
+    }
+
+    /// Snap a derated target to the PLL floor without panicking on empty tables.
+    fn snap_derated(&self, derated: u16, base_freq_mhz: u16) -> u16 {
+        MinerProfile::snap_pll_floor(self.pll_table, derated)
+            // Empty table: fail closed to min(derated, base) — never index [0].
+            .unwrap_or_else(|| derated.min(base_freq_mhz).max(1))
     }
 
     /// Create a thermal compensator with custom derating coefficient.
@@ -113,13 +141,7 @@ impl ThermalCompensator {
         // Clamp: never derate below 50% of base frequency
         let derated = (base_freq_mhz as f32 * factor.max(0.5)) as u16;
 
-        // Snap to nearest valid PLL entry at or below the derated value
-        self.pll_table
-            .iter()
-            .rev()
-            .find(|&&f| f <= derated)
-            .copied()
-            .unwrap_or(self.pll_table[0])
+        self.snap_derated(derated, base_freq_mhz)
     }
 
     /// Compute position-weighted derated frequency for a chip.
@@ -155,12 +177,7 @@ impl ThermalCompensator {
         let factor = 1.0 - (effective_derating * delta_t);
         let derated = (base_freq_mhz as f32 * factor.max(0.5)) as u16;
 
-        self.pll_table
-            .iter()
-            .rev()
-            .find(|&&f| f <= derated)
-            .copied()
-            .unwrap_or(self.pll_table[0])
+        self.snap_derated(derated, base_freq_mhz)
     }
 
     /// Check if temperature is at emergency level requiring immediate throttle.
@@ -439,5 +456,32 @@ mod tests {
 
         // Rising but predicted temp still below threshold
         assert!(comp.predict_temperature(50.0, 0.6).is_none());
+    }
+
+    /// P1-4: unknown chip must not panic on empty PLL (was `pll_table[0]`).
+    #[test]
+    fn unknown_chip_empty_pll_does_not_panic_on_derate() {
+        let comp = ThermalCompensator::new().with_chip_id(0xFFFF);
+        assert!(!comp.has_pll_table());
+        // Above threshold so snap path runs
+        let d = comp.derate_freq(650, 70.0);
+        assert!(d > 0);
+        assert!(d <= 650);
+        let p = comp.derate_freq_positioned(650, 70.0, 10, 63);
+        assert!(p > 0);
+        assert!(p <= 650);
+        assert!(ThermalCompensator::new().try_with_chip_id(0xFFFF).is_none());
+        assert!(ThermalCompensator::new()
+            .try_with_chip_id(0x1387)
+            .is_some_and(|c| c.has_pll_table()));
+    }
+
+    #[test]
+    fn known_chip_with_chip_id_loads_non_empty_table() {
+        let c = ThermalCompensator::new().with_chip_id(0x1362);
+        assert!(c.has_pll_table());
+        let derated = c.derate_freq(500, 70.0);
+        // Must land on a real BM1362 PLL entry when table is present
+        assert!(MinerProfile::pll_frequencies_for_chip(0x1362).contains(&derated));
     }
 }

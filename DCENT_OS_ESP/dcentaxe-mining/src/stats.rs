@@ -31,8 +31,32 @@ const DEFAULT_TICKET_DIFF: f64 = 256.0;
 /// evidence after a pool stall or stale work period.
 const SHARE_FLOW_FRESH_WINDOW_SECS: u64 = 600;
 
-/// Maximum number of chips tracked per-chip (covers Hex boards with 6 chips).
-pub const MAX_CHIPS: usize = 6;
+/// Maximum number of chips tracked in the per-chip counters.
+///
+/// **16, deliberately NOT 9** (SPEC §5, Lucky Miner LV08 enablement).
+///
+/// The largest supported chain today is the Lucky LV08 — 9× BM1366 on one UART
+/// daisy chain. The BM1366 address interval is `256 / chip_count`, so at 9 chips
+/// the interval truncates to `28` and the driver's per-nonce decode
+/// (`((nonce_h >> 17) & 0xff) / interval`, `bm1366.rs`) can legitimately produce
+/// `asic_nr` values up to `255 / 28 = 9` — i.e. ONE PAST the last real chip —
+/// for raw nonce bytes 252..=255. Sizing this array to exactly 9 would push
+/// those decodes back onto the silent-drop path the LV08 wave is fixing.
+///
+/// 16 is the next power of two above 9 and leaves headroom for the next
+/// multi-chip board without another array resize — headroom the NerdEKO has
+/// since spent down to 4 slots at 12 chips. Consumers must keep treating
+/// this as a CAPACITY, never as "the number of chips on this board" — the live
+/// count is `BoardConfig::asic_count` and the `.min(MAX_CHIPS)` clamps that
+/// bound telemetry loops stay load-bearing (see `dcentaxe-core`
+/// `mainapi_guards::per_chip_loop_is_bounded`).
+pub const MAX_CHIPS: usize = 16;
+
+/// Largest chip count any shipped `BoardConfig` declares (NerdEKO = 12; the
+/// previous holder was the Lucky LV08 at 9).
+/// `MAX_CHIPS` must stay at or above this, plus one slot of decode headroom —
+/// pinned by `max_chips_covers_the_largest_supported_board` below.
+pub const LARGEST_SUPPORTED_ASIC_COUNT: usize = 12;
 
 /// Snapshot of the block currently being mined, populated from the latest
 /// `mining.notify` pushed by the active pool. Used by the dashboard's
@@ -231,7 +255,9 @@ pub struct MiningStats {
     pub mood_history: [u8; 16],
     mood_history_idx: usize,
 
-    /// Per-chip nonce and error counters (fixed-size, max 6 chips).
+    /// Per-chip nonce and error counters (fixed-size, `MAX_CHIPS` slots).
+    /// Indexed by the driver-decoded `asic_nr`; slots past the board's real
+    /// `asic_count` stay zero.
     pub per_chip: [PerChipStats; MAX_CHIPS],
 
     /// Current block being mined, populated from the latest mining.notify.
@@ -475,6 +501,12 @@ impl MiningStats {
     }
 
     /// Record a valid nonce from a specific chip.
+    ///
+    /// The `idx < MAX_CHIPS` guard is a bounds check, NOT a policy filter: with
+    /// `MAX_CHIPS = 16` every chip on the largest supported chain (LV08, 9) is
+    /// tracked, so it no longer silently discards chips 6..8 the way the old
+    /// 6-slot array did. Only a physically impossible decode (`asic_nr >= 16`)
+    /// is dropped.
     pub fn record_chip_nonce(&mut self, chip_id: u8) {
         let idx = chip_id as usize;
         if idx < MAX_CHIPS {
@@ -482,7 +514,8 @@ impl MiningStats {
         }
     }
 
-    /// Record a HW error from a specific chip.
+    /// Record a HW error from a specific chip. Same bounds-check semantics as
+    /// [`MiningStats::record_chip_nonce`].
     pub fn record_chip_error(&mut self, chip_id: u8) {
         let idx = chip_id as usize;
         if idx < MAX_CHIPS {
@@ -764,6 +797,8 @@ pub struct MiningStatsSnapshot {
     pub last_rejected_share_age_secs: Option<u64>,
     pub best_streak: u32,
     pub hashrate_sparkline: [f32; 16],
+    /// Per-chip counters, `MAX_CHIPS` slots wide (capacity, not chip count).
+    /// Serde has array impls up to 32 elements, so 16 round-trips natively.
     pub per_chip: [PerChipStats; MAX_CHIPS],
     pub stale_nonces: u64,
     pub slot_recoveries: u64,
@@ -997,5 +1032,105 @@ mod tests {
             let stats = shared.lock().unwrap();
             assert_eq!(stats.accepted, 42);
         }
+    }
+
+    // ── LV08 9-chip scaling (SPEC §5) ────────────────────────────────────────
+
+    /// The capacity invariant. `MAX_CHIPS` must cover the largest supported
+    /// board PLUS one slot, because the BM1366 `asic_nr` decode at a 9-chip
+    /// interval (28) yields 9 for raw nonce bytes 252..=255.
+    #[test]
+    fn max_chips_covers_the_largest_supported_board() {
+        assert!(
+            MAX_CHIPS > LARGEST_SUPPORTED_ASIC_COUNT,
+            "MAX_CHIPS ({MAX_CHIPS}) must exceed the largest supported chain \
+             ({LARGEST_SUPPORTED_ASIC_COUNT}) so the one-past decode has a slot"
+        );
+        // Regression pin on the specific defect this replaced: a 6-slot array
+        // silently dropped chips 6..8 on an LV08.
+        assert!(
+            MAX_CHIPS >= 16,
+            "MAX_CHIPS regressed below the 16 chosen for LV08 headroom"
+        );
+        // The array really is that wide (not just the constant).
+        assert_eq!(MiningStats::new().per_chip.len(), MAX_CHIPS);
+    }
+
+    /// H-3: chips 6, 7 and 8 must be TRACKED, not silently dropped. This is the
+    /// exact index range the old `MAX_CHIPS = 6` array discarded while the
+    /// hashrate counters still counted their nonces — making a dead chip 7
+    /// undetectable.
+    #[test]
+    fn chips_past_the_old_six_slot_ceiling_are_tracked() {
+        let mut stats = MiningStats::new();
+        for chip in 6u8..=8 {
+            stats.record_chip_nonce(chip);
+            stats.record_chip_nonce(chip);
+            stats.record_chip_error(chip);
+        }
+        for chip in 6usize..=8 {
+            assert_eq!(
+                stats.per_chip[chip].nonces, 2,
+                "chip {chip} nonces must be recorded, not dropped"
+            );
+            assert_eq!(
+                stats.per_chip[chip].errors, 1,
+                "chip {chip} HW errors must be recorded, not dropped"
+            );
+        }
+        // And they survive into the serialized snapshot the API/dashboard read.
+        let snap = stats.snapshot();
+        assert_eq!(snap.per_chip[8].nonces, 2);
+        assert_eq!(snap.per_chip[8].errors, 1);
+    }
+
+    /// A full 9-chip LV08 chain is fully represented.
+    #[test]
+    fn all_nine_lv08_chips_are_tracked() {
+        let mut stats = MiningStats::new();
+        for chip in 0u8..9 {
+            stats.record_chip_nonce(chip);
+        }
+        let live = stats.per_chip.iter().filter(|c| c.nonces > 0).count();
+        assert_eq!(live, 9, "all 9 LV08 chips must appear in per_chip");
+    }
+
+    /// SPEC §5: at a 9-chip address interval of 28, raw nonce bytes 252..=255
+    /// decode to `asic_nr = 9` — one past the last real chip. That must land in
+    /// a real slot (no panic, no out-of-bounds), which is exactly why
+    /// `MAX_CHIPS` is 16 and not 9.
+    #[test]
+    fn asic_nr_decode_at_raw_bytes_252_to_255_is_in_bounds() {
+        const INTERVAL: u16 = 256 / 9; // = 28, the BM1366 LV08 interval
+        assert_eq!(INTERVAL, 28);
+        let mut stats = MiningStats::new();
+        for raw in 252u16..=255 {
+            let asic_nr = (raw / INTERVAL) as u8;
+            assert_eq!(asic_nr, 9, "raw {raw} must decode to the one-past index");
+            // Must not panic and must not be silently discarded.
+            stats.record_chip_nonce(asic_nr);
+            stats.record_chip_error(asic_nr);
+        }
+        assert_eq!(stats.per_chip[9].nonces, 4);
+        assert_eq!(stats.per_chip[9].errors, 4);
+        // Every real address (0, 28, .. 224) also decodes inside the array.
+        for i in 0u16..9 {
+            let asic_nr = ((i * INTERVAL) / INTERVAL) as usize;
+            assert!(asic_nr < MAX_CHIPS);
+        }
+    }
+
+    /// The bounds check is still a real bounds check: a physically impossible
+    /// decode is dropped rather than panicking.
+    #[test]
+    fn out_of_range_chip_index_is_still_dropped_not_panicking() {
+        let mut stats = MiningStats::new();
+        stats.record_chip_nonce(MAX_CHIPS as u8);
+        stats.record_chip_nonce(255);
+        stats.record_chip_error(255);
+        assert!(stats
+            .per_chip
+            .iter()
+            .all(|c| c.nonces == 0 && c.errors == 0));
     }
 }

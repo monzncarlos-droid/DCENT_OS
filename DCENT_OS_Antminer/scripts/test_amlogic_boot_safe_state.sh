@@ -114,7 +114,7 @@ require_literal "$LATCH" 'REASON=${REASON}-safeoff-failed' \
 require_literal "$LATCH" '[ "$SAFETY_OK" -eq 1 ] || return 1' \
     'session supervisor cannot return success after emergency-cut failure'
 SAFETY_LINE=$(grep -n -F 'if "$SAFETY_SCRIPT" safety' "$LATCH" | head -n 1 | cut -d: -f1)
-PROMOTE_LINE=$(grep -n -F 'if ! promote_unresolved "$REASON"' "$LATCH" | head -n 1 | cut -d: -f1)
+PROMOTE_LINE=$(grep -n -F 'if ! promote_unresolved "$TERMINAL_REASON"' "$LATCH" | head -n 1 | cut -d: -f1)
 if [ -n "$SAFETY_LINE" ] && [ -n "$PROMOTE_LINE" ] && [ "$SAFETY_LINE" -lt "$PROMOTE_LINE" ]; then
     pass 'post-exit emergency cut precedes potentially blocking journal promotion'
 else

@@ -129,11 +129,43 @@ pub struct PowerTelemetry {
 /// - Overcurrent/overvoltage/overtemperature protection
 ///
 /// Communication is via PMBus (I2C-based) at 400 kHz.
-pub struct Tps546 {
-    /// I2C address (typically 0x24)
+///
+/// ## Multi-regulator boards (Lucky LV08)
+///
+/// Most boards have exactly ONE TPS546 at 0x24, but the Lucky Miner LV08
+/// carries THREE independent paralleled single-phase regulators on one
+/// ~1.2 V rail (`0x24, 0x7F, 0x14` — vendor order, LVXX `TPS546.c:35`).
+/// `Tps546` therefore holds an ordered set of per-regulator channels:
+/// init, limit configuration, set-voltage, enable/disable, and fault checks
+/// all iterate EVERY channel; telemetry aggregates (SUM power/current, MAX
+/// vout/vin/temp per LVXX `power.c`/`vcore.c`). For a single-channel set the
+/// I2C operation sequence is byte-identical to the historical single-`addr`
+/// driver. This is NOT the GT `stack_config` multi-phase path — that is a
+/// current-sharing phase stack behind one PMBus target and stays untouched.
+struct Tps546Channel {
+    /// I2C address of this regulator (0x24, or 0x7F/0x14 on LV08).
     addr: u8,
-    /// VOUT_MODE exponent for ULINEAR16 conversions
+    /// VOUT_MODE exponent for ULINEAR16 conversions (read per device).
     vout_exponent: i8,
+    /// CML faults observed within the current 60s window. This two-strike
+    /// window is genuinely protective: a single transient CML/PMBus glitch is
+    /// TOLERATED (silent CLEAR_FAULTS, returns Ok — no false kill), but a
+    /// SECOND CML in the same window escalates to a `RegulatorFault` so the
+    /// `main.rs` supervisor performs an immediate fail-closed power-off
+    /// instead of clearing the fault forever while the chips silently hang.
+    /// (There is no soft "mining_paused → cooldown → re-enable" FSM today;
+    /// escalation goes straight to the conservative hard-kill.) Tracked PER
+    /// REGULATOR so one channel's strike can never mask another's.
+    cml_fault_count: u8,
+    /// Wall-clock-ish ms (esp_timer_get_time / 1000) at which the current CML
+    /// counting window started. 0 = no window active.
+    cml_window_start_ms: u64,
+}
+
+pub struct Tps546 {
+    /// Ordered per-regulator channels. Exactly one entry for every board
+    /// except the Lucky LV08 (three). Never empty.
+    channels: Vec<Tps546Channel>,
     /// Number of voltage domains (1 for single-ASIC, 3 for Hex with 2 ASICs per domain)
     voltage_domains: u16,
     /// Whether this board expects a 12V input supply.
@@ -142,18 +174,6 @@ pub struct Tps546 {
     /// traffic. Treat those as recoverable unless detail bytes indicate a real
     /// internal regulator fault.
     tolerate_isolated_cml: bool,
-    /// CML faults observed within the current 60s window. This two-strike
-    /// window is genuinely protective: a single transient CML/PMBus glitch is
-    /// TOLERATED (silent CLEAR_FAULTS, returns Ok — no false kill), but a
-    /// SECOND CML in the same window escalates to a `RegulatorFault` so the
-    /// `main.rs` supervisor performs an immediate fail-closed power-off
-    /// instead of clearing the fault forever while the chips silently hang.
-    /// (There is no soft "mining_paused → cooldown → re-enable" FSM today;
-    /// escalation goes straight to the conservative hard-kill.)
-    cml_fault_count: u8,
-    /// Wall-clock-ish ms (esp_timer_get_time / 1000) at which the current CML
-    /// counting window started. 0 = no window active.
-    cml_window_start_ms: u64,
 }
 
 /// TPS546 default I2C address (PMBus)
@@ -435,48 +455,131 @@ impl Tps546Config {
             phase_register: 0xFF,
         }
     }
+
+    /// Shared builder for the Lucky LVxx family. The numeric limit set is the
+    /// HOST-TESTED single source of truth in `tps546_guard::LUCKY_TPS546_LIMITS`
+    /// (vendor ground truth LVXX `vcore.c:63-80`, case LV06/LV07/LV08) — do NOT
+    /// re-introduce literal copies here; the guard-module tests pin the values,
+    /// including the "no Lucky setpoint above 2.0 V" 3.6 V-trap regression.
+    fn lucky_from_limits() -> Self {
+        let l = &crate::tps546_guard::LUCKY_TPS546_LIMITS;
+        Self {
+            vin_on: l.vin_on,
+            vin_off: l.vin_off,
+            vin_uv_warn: l.vin_uv_warn,
+            vin_ov_fault: l.vin_ov_fault,
+            vout_min: l.vout_min,
+            vout_max: l.vout_max,
+            // ⚠️ 1.2 V nominal — NEVER 3.6 V. The LV08's nine BM1366 are
+            // PARALLEL on one domain (SPEC §1.1); the deleted LVXX 3.6 V /
+            // 0.125-scale / 45-50 A case must never be resurrected.
+            vout_default: l.vout_nominal,
+            iout_oc_warn: l.iout_oc_warn_a,
+            iout_oc_fault: l.iout_oc_fault_a,
+            scale_loop: l.scale_loop,
+            // Three INDEPENDENT single-phase parts (LV08) or one part
+            // (LV06/LV07) — never the GT current-sharing phase stack.
+            stack_config: 0x0000, // single module
+            sync_config: 0x10,    // SYNC disabled
+            compensation: None,
+            tolerate_isolated_cml: false,
+            vout_ov_fault_ratio: l.vout_ov_fault_ratio,
+            vout_ov_warn_ratio: l.vout_ov_warn_ratio,
+            vout_uv_warn_ratio: l.vout_uv_warn_ratio,
+            vout_uv_fault_ratio: l.vout_uv_fault_ratio,
+            vout_margin_high_ratio: 1.10,
+            vout_margin_low_ratio: 0.90,
+            switch_freq_khz: l.switch_freq_khz,
+            ton_rise_ms: 3,
+            ot_warn_c: 105,
+            ot_fault_c: 145,
+            phase_register: 0x00, // single-phase per part — no PHASE broadcast
+        }
+    }
+
+    /// Config for the Lucky Miner LV08 (9x BM1366 parallel on one ~1.2 V rail,
+    /// THREE paralleled TPS546 at 0x24/0x7F/0x14, 12 V input). The limits are
+    /// applied to EVERY regulator in the set; the 35 A warn / 40 A fault OC
+    /// limits are PER REGULATOR (~39 A total load shared three ways).
+    pub fn lucky_lv08() -> Self {
+        Self::lucky_from_limits()
+    }
+
+    /// Config for the Lucky Miner LV06/LV07 (1-2x BM1366, ONE TPS546 at 0x24,
+    /// 12 V input). Same vendor limit set as LV08 (LVXX shares one case for
+    /// LV06/LV07/LV08); only the address-set size differs.
+    pub fn lucky_single() -> Self {
+        Self::lucky_from_limits()
+    }
 }
 
 impl Tps546 {
-    /// Initialize the TPS546 voltage regulator.
+    /// Initialize the TPS546 voltage regulator set.
     ///
-    /// Probes the I2C bus, reads the VOUT_MODE exponent, and configures
-    /// protection limits according to the provided configuration.
+    /// `addrs` is the ORDERED regulator address set: `[0x24]` for every board
+    /// except the Lucky LV08, which passes
+    /// `tps546_guard::LUCKY_LV08_TPS546_ADDRS` (`[0x24, 0x7F, 0x14]`).
+    /// Probes EVERY address, reads each device's VOUT_MODE exponent, and
+    /// configures protection limits on each regulator. Fail-closed by
+    /// construction: if ANY regulator in the set is missing or refuses init,
+    /// the whole init fails and the supervisor never permits mining on a
+    /// partially-initialized / partially-limited power stage — driving only
+    /// 0x24 on an LV08 would leave two-thirds of a ~140 W stage unlimited
+    /// and invisible.
     pub fn new(
         i2c: &mut I2cBus,
-        addr: u8,
+        addrs: &[u8],
         config: &Tps546Config,
         voltage_domains: u16,
         expects_12v_input: bool,
     ) -> Result<Self, PowerError> {
-        // Verify device is present
-        if !i2c.probe(addr) {
-            return Err(PowerError::NoRegulatorFound);
+        if addrs.is_empty() {
+            return Err(PowerError::InitFailed(
+                "empty TPS546 address set".to_string(),
+            ));
         }
 
-        // Read VOUT_MODE to get the exponent for ULINEAR16 conversions
-        let vout_mode = i2c.read_reg_u8(addr, pmbus::VOUT_MODE)?;
-        // VOUT_MODE bits[4:0] = signed exponent (two's complement, 5 bits)
-        let exponent_raw = vout_mode & 0x1F;
-        let vout_exponent = if exponent_raw > 15 {
-            exponent_raw as i8 - 32
-        } else {
-            exponent_raw as i8
-        };
+        let mut channels = Vec::with_capacity(addrs.len());
+        for &addr in addrs {
+            // Verify device is present
+            if !i2c.probe(addr) {
+                error!(
+                    "TPS546 at 0x{:02x} did not ACK ({} of {} in set) — refusing partial power-stage init",
+                    addr,
+                    channels.len() + 1,
+                    addrs.len()
+                );
+                return Err(PowerError::NoRegulatorFound);
+            }
 
-        info!(
-            "TPS546 at 0x{:02x}: VOUT_MODE=0x{:02x}, exponent={}",
-            addr, vout_mode, vout_exponent
-        );
+            // Read VOUT_MODE to get the exponent for ULINEAR16 conversions
+            let vout_mode = i2c.read_reg_u8(addr, pmbus::VOUT_MODE)?;
+            // VOUT_MODE bits[4:0] = signed exponent (two's complement, 5 bits)
+            let exponent_raw = vout_mode & 0x1F;
+            let vout_exponent = if exponent_raw > 15 {
+                exponent_raw as i8 - 32
+            } else {
+                exponent_raw as i8
+            };
 
-        let mut tps = Self {
-            addr,
-            vout_exponent,
+            info!(
+                "TPS546 at 0x{:02x}: VOUT_MODE=0x{:02x}, exponent={}",
+                addr, vout_mode, vout_exponent
+            );
+
+            channels.push(Tps546Channel {
+                addr,
+                vout_exponent,
+                cml_fault_count: 0,
+                cml_window_start_ms: 0,
+            });
+        }
+
+        let tps = Self {
+            channels,
             voltage_domains,
             expects_12v_input,
             tolerate_isolated_cml: config.tolerate_isolated_cml,
-            cml_fault_count: 0,
-            cml_window_start_ms: 0,
         };
 
         // XPSAFE-2 (default-off feature): ARM the HAL fault-limit write guard
@@ -485,24 +588,27 @@ impl Tps546 {
         // write to a protection-limit register is refused. Cross-pollinated from
         // DCENT_OS's per-bus EEPROM write denylist. No-op unless the
         // `tps546-fault-limit-guard` feature is enabled — field-proven boards are
-        // byte-for-byte unchanged.
+        // byte-for-byte unchanged. One arm/latch covers the WHOLE address set
+        // (the guard predicate spans all guarded TPS546 addresses).
         #[cfg(feature = "tps546-fault-limit-guard")]
         i2c.arm_tps546_fault_limit_guard();
 
-        // Turn off output first while configuring
-        i2c.write_reg_u8(addr, pmbus::OPERATION, pmbus::OPERATION_OFF)?;
+        for ch in &tps.channels {
+            // Turn off output first while configuring
+            i2c.write_reg_u8(ch.addr, pmbus::OPERATION, pmbus::OPERATION_OFF)?;
 
-        // Configure ON_OFF_CONFIG so TPS546 responds to OPERATION commands
-        // Bits: PU(0x10) | CMD(0x08) | POLARITY(0x02) | DELAY(0x01) = 0x1B
-        i2c.write_reg_u8(addr, 0x02, 0x1B)?; // PMBUS_ON_OFF_CONFIG = 0x02
-        info!("TPS546: ON_OFF_CONFIG set to 0x1B");
+            // Configure ON_OFF_CONFIG so TPS546 responds to OPERATION commands
+            // Bits: PU(0x10) | CMD(0x08) | POLARITY(0x02) | DELAY(0x01) = 0x1B
+            i2c.write_reg_u8(ch.addr, 0x02, 0x1B)?; // PMBUS_ON_OFF_CONFIG = 0x02
+            info!("TPS546 0x{:02x}: ON_OFF_CONFIG set to 0x1B", ch.addr);
 
-        // Clear any latched faults from previous run
-        let _ = i2c.write(addr, &[0x03]); // PMBUS_CLEAR_FAULTS
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        info!("TPS546: Faults cleared");
+            // Clear any latched faults from previous run
+            let _ = i2c.write(ch.addr, &[0x03]); // PMBUS_CLEAR_FAULTS
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            info!("TPS546 0x{:02x}: Faults cleared", ch.addr);
+        }
 
-        // Configure protection limits
+        // Configure protection limits (on every regulator in the set)
         tps.configure_limits(i2c, config)?;
 
         // XPSAFE-2: init's legitimate fault-limit writes are done — LATCH the
@@ -512,25 +618,51 @@ impl Tps546 {
         i2c.latch_tps546_fault_limit_guard();
 
         info!(
-            "TPS546 initialized: VIN_ON={:.1}V, VOUT_DEFAULT={:.1}V, domains={}",
-            config.vin_on, config.vout_default, voltage_domains
+            "TPS546 initialized: {} regulator(s), VIN_ON={:.1}V, VOUT_DEFAULT={:.1}V, domains={}",
+            tps.channels.len(),
+            config.vin_on,
+            config.vout_default,
+            voltage_domains
         );
 
         Ok(tps)
     }
 
-    /// Initialize with default address (0x24).
+    /// Initialize with the default single-regulator set (0x24).
     pub fn new_default(
         i2c: &mut I2cBus,
         config: &Tps546Config,
         voltage_domains: u16,
         expects_12v_input: bool,
     ) -> Result<Self, PowerError> {
-        Self::new(i2c, TPS546_ADDR, config, voltage_domains, expects_12v_input)
+        Self::new(
+            i2c,
+            crate::tps546_guard::SINGLE_TPS546_ADDR_SET,
+            config,
+            voltage_domains,
+            expects_12v_input,
+        )
     }
 
-    /// Configure all protection limits on the TPS546.
+    /// Configure all protection limits on EVERY TPS546 in the set.
+    ///
+    /// Kept as the single `configure_limits(i2c, config)` entry point (the
+    /// XPSAFE-2 arm→configure→latch ordering contract in `dcentaxe-core`
+    /// pins this call site); iterates the per-regulator body over each channel.
     fn configure_limits(&self, i2c: &mut I2cBus, config: &Tps546Config) -> Result<(), PowerError> {
+        for ch in &self.channels {
+            self.configure_limits_channel(i2c, config, ch)?;
+        }
+        Ok(())
+    }
+
+    /// Configure all protection limits on ONE regulator channel.
+    fn configure_limits_channel(
+        &self,
+        i2c: &mut I2cBus,
+        config: &Tps546Config,
+        ch: &Tps546Channel,
+    ) -> Result<(), PowerError> {
         // PMBus writes need inter-command delays — the TPS546 clock-stretches
         // and can timeout if commands are sent back-to-back too fast.
         // ESP-Miner's TPS546 init takes ~400ms for 20+ register writes.
@@ -539,69 +671,65 @@ impl Tps546 {
         const PMBUS_DELAY: Duration = Duration::from_millis(5);
 
         // VIN thresholds (Linear11 format)
-        i2c.write_reg_u16_le(
-            self.addr,
-            pmbus::VIN_ON,
-            f32_to_pmbus_linear11(config.vin_on),
-        )
-        .map_err(|e| {
-            error!("TPS546: VIN_ON write failed: {}", e);
-            e
-        })?;
+        i2c.write_reg_u16_le(ch.addr, pmbus::VIN_ON, f32_to_pmbus_linear11(config.vin_on))
+            .map_err(|e| {
+                error!("TPS546 0x{:02x}: VIN_ON write failed: {}", ch.addr, e);
+                e
+            })?;
         thread::sleep(PMBUS_DELAY);
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::VIN_OFF,
             f32_to_pmbus_linear11(config.vin_off),
         )
         .map_err(|e| {
-            error!("TPS546: VIN_OFF write failed: {}", e);
+            error!("TPS546 0x{:02x}: VIN_OFF write failed: {}", ch.addr, e);
             e
         })?;
         thread::sleep(PMBUS_DELAY);
 
         if config.vin_uv_warn > 0.0 {
             i2c.write_reg_u16_le(
-                self.addr,
+                ch.addr,
                 pmbus::VIN_UV_WARN_LIMIT,
                 f32_to_pmbus_linear11(config.vin_uv_warn),
             )
             .map_err(|e| {
-                error!("TPS546: VIN_UV_WARN write failed: {}", e);
+                error!("TPS546 0x{:02x}: VIN_UV_WARN write failed: {}", ch.addr, e);
                 e
             })?;
             thread::sleep(PMBUS_DELAY);
         }
 
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::VIN_OV_FAULT_LIMIT,
             f32_to_pmbus_linear11(config.vin_ov_fault),
         )
         .map_err(|e| {
-            error!("TPS546: VIN_OV_FAULT write failed: {}", e);
+            error!("TPS546 0x{:02x}: VIN_OV_FAULT write failed: {}", ch.addr, e);
             e
         })?;
         thread::sleep(PMBUS_DELAY);
 
         // VOUT limits (ULINEAR16 format)
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::VOUT_MIN,
-            f32_to_pmbus_ulinear16(config.vout_min, self.vout_exponent),
+            f32_to_pmbus_ulinear16(config.vout_min, ch.vout_exponent),
         )
         .map_err(|e| {
-            error!("TPS546: VOUT_MIN write failed: {}", e);
+            error!("TPS546 0x{:02x}: VOUT_MIN write failed: {}", ch.addr, e);
             e
         })?;
         thread::sleep(PMBUS_DELAY);
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::VOUT_MAX,
-            f32_to_pmbus_ulinear16(config.vout_max, self.vout_exponent),
+            f32_to_pmbus_ulinear16(config.vout_max, ch.vout_exponent),
         )
         .map_err(|e| {
-            error!("TPS546: VOUT_MAX write failed: {}", e);
+            error!("TPS546 0x{:02x}: VOUT_MAX write failed: {}", ch.addr, e);
             e
         })?;
         thread::sleep(PMBUS_DELAY);
@@ -648,12 +776,12 @@ impl Tps546 {
             if *ratio <= 0.0 {
                 continue;
             }
-            let raw = f32_to_pmbus_ulinear16(config.vout_default * ratio, self.vout_exponent);
-            match i2c.write_reg_u16_le(self.addr, *reg, raw) {
+            let raw = f32_to_pmbus_ulinear16(config.vout_default * ratio, ch.vout_exponent);
+            match i2c.write_reg_u16_le(ch.addr, *reg, raw) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
                 }
-                Err(e) => warn!("TPS546: {} write failed: {}", name, e),
+                Err(e) => warn!("TPS546 0x{:02x}: {} write failed: {}", ch.addr, name, e),
             }
         }
 
@@ -666,64 +794,76 @@ impl Tps546 {
             (pmbus::OT_FAULT_RESPONSE, "OT_FAULT_RESP", 0xFF),
         ];
         for (reg, name, val) in fault_responses {
-            match i2c.write_reg_u8(self.addr, *reg, *val) {
+            match i2c.write_reg_u8(ch.addr, *reg, *val) {
                 Ok(()) => thread::sleep(PMBUS_DELAY),
-                Err(e) => warn!("TPS546: {} write failed: {}", name, e),
+                Err(e) => warn!("TPS546 0x{:02x}: {} write failed: {}", ch.addr, name, e),
             }
         }
 
         // ── Pass-5 audit: TPS546 die over-temp thresholds ───────────────
         if config.ot_warn_c > 0 {
             match i2c.write_reg_u16_le(
-                self.addr,
+                ch.addr,
                 pmbus::OT_WARN_LIMIT,
                 f32_to_pmbus_linear11(config.ot_warn_c as f32),
             ) {
                 Ok(()) => thread::sleep(PMBUS_DELAY),
-                Err(e) => warn!("TPS546: OT_WARN_LIMIT write failed: {}", e),
+                Err(e) => warn!(
+                    "TPS546 0x{:02x}: OT_WARN_LIMIT write failed: {}",
+                    ch.addr, e
+                ),
             }
         }
         if config.ot_fault_c > 0 {
             match i2c.write_reg_u16_le(
-                self.addr,
+                ch.addr,
                 pmbus::OT_FAULT_LIMIT,
                 f32_to_pmbus_linear11(config.ot_fault_c as f32),
             ) {
                 Ok(()) => thread::sleep(PMBUS_DELAY),
-                Err(e) => warn!("TPS546: OT_FAULT_LIMIT write failed: {}", e),
+                Err(e) => warn!(
+                    "TPS546 0x{:02x}: OT_FAULT_LIMIT write failed: {}",
+                    ch.addr, e
+                ),
             }
         }
 
         // Output current limits (Linear11 format)
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::IOUT_OC_WARN_LIMIT,
             f32_to_pmbus_linear11(config.iout_oc_warn),
         )
         .map_err(|e| {
-            error!("TPS546: IOUT_OC_WARN write failed: {}", e);
+            error!("TPS546 0x{:02x}: IOUT_OC_WARN write failed: {}", ch.addr, e);
             e
         })?;
         thread::sleep(PMBUS_DELAY);
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::IOUT_OC_FAULT_LIMIT,
             f32_to_pmbus_linear11(config.iout_oc_fault),
         )
         .map_err(|e| {
-            error!("TPS546: IOUT_OC_FAULT write failed: {}", e);
+            error!(
+                "TPS546 0x{:02x}: IOUT_OC_FAULT write failed: {}",
+                ch.addr, e
+            );
             e
         })?;
         thread::sleep(PMBUS_DELAY);
 
         // Scale loop gain
         i2c.write_reg_u16_le(
-            self.addr,
+            ch.addr,
             pmbus::VOUT_SCALE_LOOP,
             f32_to_pmbus_linear11(config.scale_loop),
         )
         .map_err(|e| {
-            error!("TPS546: VOUT_SCALE_LOOP write failed: {}", e);
+            error!(
+                "TPS546 0x{:02x}: VOUT_SCALE_LOOP write failed: {}",
+                ch.addr, e
+            );
             e
         })?;
         thread::sleep(PMBUS_DELAY);
@@ -733,15 +873,21 @@ impl Tps546 {
         // wrong frequency increases ripple and is a co-factor in VOUT_OV.
         if config.switch_freq_khz > 0 {
             match i2c.write_reg_u16_le(
-                self.addr,
+                ch.addr,
                 pmbus::FREQUENCY_SWITCH,
                 f32_to_pmbus_linear11(config.switch_freq_khz as f32),
             ) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
-                    info!("TPS546: FREQUENCY_SWITCH = {} kHz", config.switch_freq_khz);
+                    info!(
+                        "TPS546 0x{:02x}: FREQUENCY_SWITCH = {} kHz",
+                        ch.addr, config.switch_freq_khz
+                    );
                 }
-                Err(e) => warn!("TPS546: FREQUENCY_SWITCH write failed: {}", e),
+                Err(e) => warn!(
+                    "TPS546 0x{:02x}: FREQUENCY_SWITCH write failed: {}",
+                    ch.addr, e
+                ),
             }
         }
 
@@ -749,19 +895,22 @@ impl Tps546 {
         // 3 ms ramp avoids overshoot at enable on multi-phase GT (POR=2 ms).
         if config.ton_rise_ms > 0 {
             match i2c.write_reg_u16_le(
-                self.addr,
+                ch.addr,
                 pmbus::TON_RISE,
                 f32_to_pmbus_linear11(config.ton_rise_ms as f32),
             ) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
-                    info!("TPS546: TON_RISE = {} ms", config.ton_rise_ms);
+                    info!(
+                        "TPS546 0x{:02x}: TON_RISE = {} ms",
+                        ch.addr, config.ton_rise_ms
+                    );
                 }
-                Err(e) => warn!("TPS546: TON_RISE write failed: {}", e),
+                Err(e) => warn!("TPS546 0x{:02x}: TON_RISE write failed: {}", ch.addr, e),
             }
-            match i2c.write_reg_u16_le(self.addr, pmbus::TON_DELAY, f32_to_pmbus_linear11(0.0)) {
+            match i2c.write_reg_u16_le(ch.addr, pmbus::TON_DELAY, f32_to_pmbus_linear11(0.0)) {
                 Ok(()) => thread::sleep(PMBUS_DELAY),
-                Err(e) => warn!("TPS546: TON_DELAY write failed: {}", e),
+                Err(e) => warn!("TPS546 0x{:02x}: TON_DELAY write failed: {}", ch.addr, e),
             }
         }
 
@@ -776,9 +925,12 @@ impl Tps546 {
             || config.sync_config != 0x10
             || config.compensation.is_some();
         if needs_mfr_writes {
-            match i2c.read_reg_u16_le(self.addr, pmbus::MFR_SPECIFIC_21) {
+            match i2c.read_reg_u16_le(ch.addr, pmbus::MFR_SPECIFIC_21) {
                 Ok(current) => {
-                    info!("TPS546: live STACK_CONFIG=0x{:04x}", current);
+                    info!(
+                        "TPS546 0x{:02x}: live STACK_CONFIG=0x{:04x}",
+                        ch.addr, current
+                    );
                     if current == config.stack_config && current != 0x0000 {
                         info!(
                             "TPS546: strapped board detected (STACK_CONFIG matches) — skipping MFR writes"
@@ -799,7 +951,7 @@ impl Tps546 {
         }
 
         if needs_mfr_writes && config.stack_config != 0x0000 {
-            match i2c.write_reg_u16_le(self.addr, pmbus::MFR_SPECIFIC_21, config.stack_config) {
+            match i2c.write_reg_u16_le(ch.addr, pmbus::MFR_SPECIFIC_21, config.stack_config) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
                     info!("TPS546: STACK_CONFIG=0x{:04x} written", config.stack_config);
@@ -811,7 +963,7 @@ impl Tps546 {
         }
 
         if needs_mfr_writes && config.sync_config != 0x10 {
-            match i2c.write_reg_u8(self.addr, pmbus::MFR_SPECIFIC_32, config.sync_config) {
+            match i2c.write_reg_u8(ch.addr, pmbus::MFR_SPECIFIC_32, config.sync_config) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
                     info!("TPS546: SYNC_CONFIG=0x{:02x} written", config.sync_config);
@@ -827,7 +979,7 @@ impl Tps546 {
                 let mut buf = [0u8; 6];
                 buf[0] = pmbus::MFR_SPECIFIC_12;
                 buf[1..6].copy_from_slice(comp);
-                match i2c.write(self.addr, &buf) {
+                match i2c.write(ch.addr, &buf) {
                     Ok(()) => {
                         thread::sleep(PMBUS_DELAY);
                         info!("TPS546: COMPENSATION written ({} bytes)", comp.len());
@@ -842,9 +994,11 @@ impl Tps546 {
         // ── Pass-5 audit: PHASE register for multi-TPS546 stacks ──────────
         // 0xFF broadcasts OPERATION/VOUT_COMMAND to all phases on strapless
         // GT v801. Skipped on strapped v800 (would NACK). Single-phase
-        // boards leave at 0x00.
+        // boards leave at 0x00. (Lucky LV08 is deliberately NOT this path:
+        // its three regulators are independent single-phase parts, each
+        // configured through this per-channel loop with phase_register=0x00.)
         if needs_mfr_writes && config.phase_register != 0x00 {
-            match i2c.write_reg_u8(self.addr, pmbus::PHASE, config.phase_register) {
+            match i2c.write_reg_u8(ch.addr, pmbus::PHASE, config.phase_register) {
                 Ok(()) => {
                     thread::sleep(PMBUS_DELAY);
                     info!("TPS546: PHASE=0x{:02x} written", config.phase_register);
@@ -853,19 +1007,43 @@ impl Tps546 {
             }
         }
 
-        // Set default output voltage
-        self.set_vout_raw(i2c, config.vout_default)?;
+        // Set default output voltage (this regulator)
+        self.set_vout_raw_channel(i2c, ch, config.vout_default)?;
 
         Ok(())
     }
 
-    /// Set the output voltage in volts (total across all voltage domains).
+    /// Write VOUT_COMMAND on ONE regulator channel.
+    fn set_vout_raw_channel(
+        &self,
+        i2c: &mut I2cBus,
+        ch: &Tps546Channel,
+        voltage_v: f32,
+    ) -> Result<(), PowerError> {
+        let raw = f32_to_pmbus_ulinear16(voltage_v, ch.vout_exponent);
+        i2c.write_reg_u16_le(ch.addr, pmbus::VOUT_COMMAND, raw)
+            .map_err(|e| {
+                error!("TPS546 0x{:02x}: VOUT_COMMAND write failed: {}", ch.addr, e);
+                e
+            })?;
+        Ok(())
+    }
+
+    /// Set the output voltage in volts (total across all voltage domains),
+    /// BROADCAST to every regulator in the set with the same setpoint
+    /// (LVXX `vcore.c:182-187` loops all three LV08 addresses).
     ///
     /// For single-ASIC boards, this sets the per-ASIC voltage directly.
     /// For Hex boards, the per-ASIC voltage is total_voltage / voltage_domains.
+    ///
+    /// A mid-broadcast write failure propagates `Err` immediately; the
+    /// `main.rs` supervisor treats any power error on this path as
+    /// fail-closed, so paralleled regulators can never be left mining at
+    /// diverged setpoints.
     fn set_vout_raw(&self, i2c: &mut I2cBus, voltage_v: f32) -> Result<(), PowerError> {
-        let raw = f32_to_pmbus_ulinear16(voltage_v, self.vout_exponent);
-        i2c.write_reg_u16_le(self.addr, pmbus::VOUT_COMMAND, raw)?;
+        for ch in &self.channels {
+            self.set_vout_raw_channel(i2c, ch, voltage_v)?;
+        }
         Ok(())
     }
 
@@ -902,8 +1080,11 @@ impl Tps546 {
             });
         }
 
-        let per_asic_v = voltage_mv as f32 / 1000.0;
-        let total_v = per_asic_v * self.voltage_domains as f32;
+        // Rail derivation lives in `safety::rail_voltage_v` so it is host-testable:
+        // this method needs a live `I2cBus`, so an inline multiply here was
+        // unpinned — deleting it left the whole host suite green while every
+        // multi-domain rail collapsed to the per-ASIC value.
+        let total_v = crate::safety::rail_voltage_v(voltage_mv, self.voltage_domains);
 
         if self.voltage_domains > 1 {
             info!(
@@ -920,10 +1101,43 @@ impl Tps546 {
         self.set_vout_raw(i2c, total_v)
     }
 
+    /// Read one channel's READ_VOUT (volts). A failure names the regulator so
+    /// a dead LV08 part is identifiable on the bench, then propagates `Err` —
+    /// aggregates must NEVER silently skip a regulator that stopped answering.
+    fn read_vout_channel(&self, i2c: &mut I2cBus, ch: &Tps546Channel) -> Result<f32, PowerError> {
+        let raw = i2c
+            .read_reg_u16_le(ch.addr, pmbus::READ_VOUT)
+            .map_err(|e| {
+                error!("TPS546 0x{:02x}: READ_VOUT failed: {}", ch.addr, e);
+                e
+            })?;
+        Ok(pmbus_ulinear16_to_f32(raw, ch.vout_exponent))
+    }
+
+    /// Read one channel's READ_IOUT (amps); failure names the regulator.
+    fn read_iout_channel(&self, i2c: &mut I2cBus, ch: &Tps546Channel) -> Result<f32, PowerError> {
+        let raw = i2c
+            .read_reg_u16_le(ch.addr, pmbus::READ_IOUT)
+            .map_err(|e| {
+                error!("TPS546 0x{:02x}: READ_IOUT failed: {}", ch.addr, e);
+                e
+            })?;
+        Ok(pmbus_linear11_to_f32(raw))
+    }
+
     /// Read the actual output voltage in volts.
+    ///
+    /// Multi-regulator sets report the MAX across regulators (LVXX
+    /// `vcore.c:197-207`) — on a shared parallel rail the readings agree to
+    /// within regulation tolerance, and max is the conservative choice for
+    /// over-voltage-facing consumers. Any regulator failing to answer makes
+    /// the whole read fail (visible, not averaged away).
     pub fn get_vout(&self, i2c: &mut I2cBus) -> Result<f32, PowerError> {
-        let raw = i2c.read_reg_u16_le(self.addr, pmbus::READ_VOUT)?;
-        Ok(pmbus_ulinear16_to_f32(raw, self.vout_exponent))
+        let mut readings: Vec<f32> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            readings.push(self.read_vout_channel(i2c, ch)?);
+        }
+        crate::tps546_guard::max_regulator_reading(&readings).ok_or(PowerError::NoRegulatorFound)
     }
 
     /// Read the per-ASIC voltage in millivolts.
@@ -933,10 +1147,15 @@ impl Tps546 {
         Ok(per_asic_v * 1000.0)
     }
 
-    /// Read the output current in amps.
+    /// Read the output current in amps — the SUM across all regulators in the
+    /// set (LVXX `power.c:24-37`): three paralleled parts each carry a share
+    /// of the rail current. Any regulator failing to answer fails the read.
     pub fn get_iout(&self, i2c: &mut I2cBus) -> Result<f32, PowerError> {
-        let raw = i2c.read_reg_u16_le(self.addr, pmbus::READ_IOUT)?;
-        Ok(pmbus_linear11_to_f32(raw))
+        let mut readings: Vec<f32> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            readings.push(self.read_iout_channel(i2c, ch)?);
+        }
+        Ok(crate::tps546_guard::sum_regulator_current_a(&readings))
     }
 
     /// Read the output current in milliamps.
@@ -944,10 +1163,35 @@ impl Tps546 {
         Ok(self.get_iout(i2c)? * 1000.0)
     }
 
-    /// Read the input (supply) voltage in volts.
+    /// Combined per-regulator output power and current:
+    /// `(Σ vout_i × iout_i, Σ iout_i)` — the vendor LV08 aggregation
+    /// (LVXX `power.c:24-37`), degenerate `(v×i, i)` for a single regulator.
+    /// Does NOT include the board power offset; `PowerManager` adds it once.
+    pub fn get_output_power_and_current(&self, i2c: &mut I2cBus) -> Result<(f32, f32), PowerError> {
+        let mut pairs: Vec<(f32, f32)> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            let vout = self.read_vout_channel(i2c, ch)?;
+            let iout = self.read_iout_channel(i2c, ch)?;
+            pairs.push((vout, iout));
+        }
+        let power_w = crate::tps546_guard::sum_regulator_power_w(&pairs, 0.0);
+        let iouts: Vec<f32> = pairs.iter().map(|&(_, i)| i).collect();
+        let current_a = crate::tps546_guard::sum_regulator_current_a(&iouts);
+        Ok((power_w, current_a))
+    }
+
+    /// Read the input (supply) voltage in volts (MAX across the set — all
+    /// regulators share one input rail; LVXX `power.c:51-61`).
     pub fn get_vin(&self, i2c: &mut I2cBus) -> Result<f32, PowerError> {
-        let raw = i2c.read_reg_u16_le(self.addr, pmbus::READ_VIN)?;
-        Ok(pmbus_linear11_to_f32(raw))
+        let mut readings: Vec<f32> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            let raw = i2c.read_reg_u16_le(ch.addr, pmbus::READ_VIN).map_err(|e| {
+                error!("TPS546 0x{:02x}: READ_VIN failed: {}", ch.addr, e);
+                e
+            })?;
+            readings.push(pmbus_linear11_to_f32(raw));
+        }
+        crate::tps546_guard::max_regulator_reading(&readings).ok_or(PowerError::NoRegulatorFound)
     }
 
     /// Read the input voltage in millivolts.
@@ -955,10 +1199,21 @@ impl Tps546 {
         Ok(self.get_vin(i2c)? * 1000.0)
     }
 
-    /// Read the regulator junction temperature in degrees C.
+    /// Read the regulator junction temperature in degrees C (MAX across the
+    /// set — the hottest of the LV08's three parts is the safety-relevant one;
+    /// LVXX `power.c:66-84`).
     pub fn get_temperature(&self, i2c: &mut I2cBus) -> Result<f32, PowerError> {
-        let raw = i2c.read_reg_u16_le(self.addr, pmbus::READ_TEMPERATURE_1)?;
-        Ok(pmbus_linear11_to_f32(raw))
+        let mut readings: Vec<f32> = Vec::with_capacity(self.channels.len());
+        for ch in &self.channels {
+            let raw = i2c
+                .read_reg_u16_le(ch.addr, pmbus::READ_TEMPERATURE_1)
+                .map_err(|e| {
+                    error!("TPS546 0x{:02x}: READ_TEMPERATURE_1 failed: {}", ch.addr, e);
+                    e
+                })?;
+            readings.push(pmbus_linear11_to_f32(raw));
+        }
+        crate::tps546_guard::max_regulator_reading(&readings).ok_or(PowerError::NoRegulatorFound)
     }
 
     /// Enable the TPS546 output.
@@ -968,15 +1223,25 @@ impl Tps546 {
     /// threshold will prevent output anyway, but this gives a clear log
     /// message for debugging.
     pub fn enable(&self, i2c: &mut I2cBus) -> Result<(), PowerError> {
+        for ch in &self.channels {
+            self.enable_channel(i2c, ch)?;
+        }
+        Ok(())
+    }
+
+    /// Enable ONE regulator channel (full clear → VIN pre-check → ON →
+    /// status/VOUT verify sequence per regulator, matching the historical
+    /// single-regulator flow byte-for-byte when the set has one entry).
+    fn enable_channel(&self, i2c: &mut I2cBus, ch: &Tps546Channel) -> Result<(), PowerError> {
         // Clear any latched faults before enabling
-        let _ = i2c.write(self.addr, &[0x03]); // CLEAR_FAULTS
+        let _ = i2c.write(ch.addr, &[0x03]); // CLEAR_FAULTS
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Pre-check: read VIN to detect wrong power supply
-        match i2c.read_reg_u16_le(self.addr, pmbus::READ_VIN) {
+        match i2c.read_reg_u16_le(ch.addr, pmbus::READ_VIN) {
             Ok(raw) => {
                 let vin = pmbus_linear11_to_f32(raw);
-                info!("TPS546: VIN = {:.2}V", vin);
+                info!("TPS546 0x{:02x}: VIN = {:.2}V", ch.addr, vin);
                 if self.expects_12v_input && vin < 10.0 {
                     error!(
                         "TPS546: VIN={:.1}V too low for 12V board! \
@@ -994,44 +1259,54 @@ impl Tps546 {
                     );
                 }
             }
-            Err(_) => warn!("TPS546: Could not read VIN (device may not be powered)"),
+            Err(_) => warn!(
+                "TPS546 0x{:02x}: Could not read VIN (device may not be powered)",
+                ch.addr
+            ),
         }
 
-        i2c.write_reg_u8(self.addr, pmbus::OPERATION, pmbus::OPERATION_ON)?;
+        i2c.write_reg_u8(ch.addr, pmbus::OPERATION, pmbus::OPERATION_ON)?;
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Read STATUS_WORD to check for faults
-        match i2c.read_reg_u16_le(self.addr, pmbus::STATUS_WORD) {
+        match i2c.read_reg_u16_le(ch.addr, pmbus::STATUS_WORD) {
             Ok(status) => {
                 if status & 0xFF00 != 0 {
                     warn!(
-                        "TPS546: STATUS_WORD after enable: 0x{:04X} (faults present!)",
-                        status
+                        "TPS546 0x{:02x}: STATUS_WORD after enable: 0x{:04X} (faults present!)",
+                        ch.addr, status
                     );
                     // Decode specific Hex-relevant faults
                     if status & (1 << 3) != 0 {
                         error!("TPS546: VIN undervoltage! Check the 12V supply for Hex/GT boards.");
                     }
                 } else {
-                    info!("TPS546: Output ENABLED (STATUS=0x{:04X})", status);
+                    info!(
+                        "TPS546 0x{:02x}: Output ENABLED (STATUS=0x{:04X})",
+                        ch.addr, status
+                    );
                 }
             }
-            Err(_) => info!("TPS546: Output ENABLED (status read failed)"),
+            Err(_) => info!(
+                "TPS546 0x{:02x}: Output ENABLED (status read failed)",
+                ch.addr
+            ),
         }
 
         // Read actual VOUT to verify
-        match i2c.read_reg_u16_le(self.addr, pmbus::READ_VOUT) {
+        match i2c.read_reg_u16_le(ch.addr, pmbus::READ_VOUT) {
             Ok(raw) => {
-                let vout = pmbus_ulinear16_to_f32(raw, self.vout_exponent);
+                let vout = pmbus_ulinear16_to_f32(raw, ch.vout_exponent);
                 if self.voltage_domains > 1 {
                     info!(
-                        "TPS546: Actual VOUT = {:.3}V ({:.0}mV per domain, {} domains)",
+                        "TPS546 0x{:02x}: Actual VOUT = {:.3}V ({:.0}mV per domain, {} domains)",
+                        ch.addr,
                         vout,
                         vout / self.voltage_domains as f32 * 1000.0,
                         self.voltage_domains
                     );
                 } else {
-                    info!("TPS546: Actual VOUT = {:.3}V", vout);
+                    info!("TPS546 0x{:02x}: Actual VOUT = {:.3}V", ch.addr, vout);
                 }
 
                 // HALPWR-7: compare READ_VOUT against the commanded setpoint. A
@@ -1041,8 +1316,8 @@ impl Tps546 {
                 // sagging rail instead of mining on it. Under-volt is benign for
                 // the silicon, so we do NOT fail enable() — the per-domain-scaled
                 // tolerance decision is the pure `safety::vout_reached_setpoint`.
-                if let Ok(cmd_raw) = i2c.read_reg_u16_le(self.addr, pmbus::VOUT_COMMAND) {
-                    let cmd_v = pmbus_ulinear16_to_f32(cmd_raw, self.vout_exponent);
+                if let Ok(cmd_raw) = i2c.read_reg_u16_le(ch.addr, pmbus::VOUT_COMMAND) {
+                    let cmd_v = pmbus_ulinear16_to_f32(cmd_raw, ch.vout_exponent);
                     if !crate::safety::vout_reached_setpoint(
                         vout,
                         cmd_v,
@@ -1050,7 +1325,8 @@ impl Tps546 {
                         crate::safety::VOUT_SETTLE_TOL_PER_DOMAIN_MV,
                     ) {
                         warn!(
-                            "TPS546: rail did not reach setpoint after enable — READ_VOUT={:.3}V vs VOUT_CMD={:.3}V (Δ={:.0}mV, {} domains). Check supply/phase before relying on hashrate.",
+                            "TPS546 0x{:02x}: rail did not reach setpoint after enable — READ_VOUT={:.3}V vs VOUT_CMD={:.3}V (Δ={:.0}mV, {} domains). Check supply/phase before relying on hashrate.",
+                            ch.addr,
                             vout,
                             cmd_v,
                             (vout - cmd_v).abs() * 1000.0,
@@ -1065,11 +1341,32 @@ impl Tps546 {
         Ok(())
     }
 
-    /// Disable the TPS546 output (immediate shutdown).
+    /// Disable the TPS546 output (immediate shutdown) on EVERY regulator.
+    ///
+    /// Fail-closed detail: even if one channel's OPERATION_OFF write errors,
+    /// the remaining channels are STILL commanded off (a partial shutdown that
+    /// stops at the first error could leave two LV08 regulators energized).
+    /// The first error is returned after all channels were attempted.
     pub fn disable(&self, i2c: &mut I2cBus) -> Result<(), PowerError> {
-        i2c.write_reg_u8(self.addr, pmbus::OPERATION, pmbus::OPERATION_OFF)?;
-        info!("TPS546: Output DISABLED");
-        Ok(())
+        let mut first_err: Option<PowerError> = None;
+        for ch in &self.channels {
+            match i2c.write_reg_u8(ch.addr, pmbus::OPERATION, pmbus::OPERATION_OFF) {
+                Ok(()) => info!("TPS546 0x{:02x}: Output DISABLED", ch.addr),
+                Err(e) => {
+                    error!(
+                        "TPS546 0x{:02x}: OPERATION_OFF write failed: {}",
+                        ch.addr, e
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e.into());
+                    }
+                }
+            }
+        }
+        match first_err {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 
     /// RESERVED: clear any latched fault bits via PMBus CLEAR_FAULTS (single
@@ -1079,11 +1376,20 @@ impl Tps546 {
     /// performs an immediate fail-closed power-off on any fault. Kept because
     /// it is correct, harmless, and the building block such an FSM would need.
     pub fn clear_faults(&self, i2c: &mut I2cBus) -> Result<u16, PowerError> {
-        let _ = i2c.write(self.addr, &[0x03]);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let status = i2c.read_reg_u16_le(self.addr, pmbus::STATUS_WORD)?;
-        info!("TPS546: CLEAR_FAULTS → STATUS_WORD=0x{:04x}", status);
-        Ok(status)
+        let mut combined: u16 = 0;
+        for ch in &self.channels {
+            let _ = i2c.write(ch.addr, &[0x03]);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let status = i2c.read_reg_u16_le(ch.addr, pmbus::STATUS_WORD)?;
+            info!(
+                "TPS546 0x{:02x}: CLEAR_FAULTS → STATUS_WORD=0x{:04x}",
+                ch.addr, status
+            );
+            // OR the per-regulator words so any still-asserted fault anywhere
+            // in the set stays visible in the combined return value.
+            combined |= status;
+        }
+        Ok(combined)
     }
 
     /// Diagnose the input power supply.
@@ -1132,11 +1438,35 @@ impl Tps546 {
         Ok(vin)
     }
 
-    /// Check the TPS546 status register for fault conditions.
+    /// Check EVERY TPS546 in the set for fault conditions.
     ///
-    /// Returns Ok(()) if no faults, or a descriptive error string.
+    /// Returns Ok(()) if no faults. A fault on ANY regulator — including a
+    /// STATUS_WORD read failure (dead/unreachable part) — propagates `Err`,
+    /// which the `main.rs` supervisor turns into the unconditional
+    /// `fail_closed_power_off` hard-kill. On an LV08, one of three paralleled
+    /// regulators faulting or going silent kills the whole power stage; there
+    /// is NO per-regulator soft recovery. The CML two-strike window and
+    /// phantom-VOUT_OV detection run PER REGULATOR (each channel keeps its own
+    /// strike state), preserving the existing tolerance semantics exactly.
     pub fn check_fault(&mut self, i2c: &mut I2cBus) -> Result<(), PowerError> {
-        let status = i2c.read_reg_u16_le(self.addr, pmbus::STATUS_WORD)?;
+        for idx in 0..self.channels.len() {
+            self.check_fault_channel(idx, i2c)?;
+        }
+        Ok(())
+    }
+
+    /// Fault check for ONE regulator channel (historical single-regulator
+    /// body, with the CML strike state held per channel).
+    fn check_fault_channel(&mut self, idx: usize, i2c: &mut I2cBus) -> Result<(), PowerError> {
+        let addr = self.channels[idx].addr;
+        let vout_exponent = self.channels[idx].vout_exponent;
+        let status = i2c.read_reg_u16_le(addr, pmbus::STATUS_WORD).map_err(|e| {
+            error!(
+                "TPS546 0x{:02x}: STATUS_WORD read failed ({}) — regulator not answering",
+                addr, e
+            );
+            e
+        })?;
 
         if status == 0 {
             // Age the CML window by wall-clock. A clean poll INSIDE the 60s
@@ -1148,12 +1478,12 @@ impl Tps546 {
             let dec = advance_cml_window(
                 CmlEvent::Clean,
                 now_ms,
-                self.cml_window_start_ms,
-                self.cml_fault_count,
+                self.channels[idx].cml_window_start_ms,
+                self.channels[idx].cml_fault_count,
                 WINDOW_MS,
             );
-            self.cml_fault_count = dec.new_count;
-            self.cml_window_start_ms = dec.new_window_start_ms;
+            self.channels[idx].cml_fault_count = dec.new_count;
+            self.channels[idx].cml_window_start_ms = dec.new_window_start_ms;
             return Ok(());
         }
 
@@ -1162,7 +1492,7 @@ impl Tps546 {
         // Preserve real protection shutdowns, but clear these recoverable alerts.
         let isolated_cml = self.tolerate_isolated_cml && (status & !(0x0002 | 0x0200)) == 0;
         if isolated_cml {
-            let cml = i2c.read_reg_u8(self.addr, pmbus::STATUS_CML).unwrap_or(0);
+            let cml = i2c.read_reg_u8(addr, pmbus::STATUS_CML).unwrap_or(0);
             let fatal_cml = (cml & 0x18) != 0; // MEM or PROC
             if !fatal_cml {
                 let mut cml_bits = Vec::new();
@@ -1198,14 +1528,14 @@ impl Tps546 {
                 let dec = advance_cml_window(
                     CmlEvent::Cml,
                     now_ms,
-                    self.cml_window_start_ms,
-                    self.cml_fault_count,
+                    self.channels[idx].cml_window_start_ms,
+                    self.channels[idx].cml_fault_count,
                     WINDOW_MS,
                 );
-                self.cml_fault_count = dec.new_count;
-                self.cml_window_start_ms = dec.new_window_start_ms;
+                self.channels[idx].cml_fault_count = dec.new_count;
+                self.channels[idx].cml_window_start_ms = dec.new_window_start_ms;
 
-                let _ = i2c.write(self.addr, &[0x03]);
+                let _ = i2c.write(addr, &[0x03]);
                 std::thread::sleep(std::time::Duration::from_millis(10));
 
                 if dec.escalate {
@@ -1244,19 +1574,15 @@ impl Tps546 {
         if self.tolerate_isolated_cml && has_cml_bit && has_vout_ov_bit {
             // Verify the rail is actually within tolerance (±100 mV of cmd).
             // If true → phantom OV; treat as the same two-strike CML pattern.
-            let cmd_raw = i2c
-                .read_reg_u16_le(self.addr, pmbus::VOUT_COMMAND)
-                .unwrap_or(0);
-            let cmd_v = pmbus_ulinear16_to_f32(cmd_raw, self.vout_exponent);
-            let read_raw = i2c
-                .read_reg_u16_le(self.addr, pmbus::READ_VOUT)
-                .unwrap_or(0);
-            let read_v = pmbus_ulinear16_to_f32(read_raw, self.vout_exponent);
+            let cmd_raw = i2c.read_reg_u16_le(addr, pmbus::VOUT_COMMAND).unwrap_or(0);
+            let cmd_v = pmbus_ulinear16_to_f32(cmd_raw, vout_exponent);
+            let read_raw = i2c.read_reg_u16_le(addr, pmbus::READ_VOUT).unwrap_or(0);
+            let read_v = pmbus_ulinear16_to_f32(read_raw, vout_exponent);
             // Per-domain compare; for stacked GT the read is the stack total
             // but the cmd is also stack-total so the diff math holds.
             let phantom = cmd_v > 0.0 && read_v > 0.0 && (read_v - cmd_v).abs() < 0.100;
             if phantom {
-                let cml = i2c.read_reg_u8(self.addr, pmbus::STATUS_CML).unwrap_or(0);
+                let cml = i2c.read_reg_u8(addr, pmbus::STATUS_CML).unwrap_or(0);
                 warn!(
                     "TPS546 phantom VOUT_OV-with-CML: STATUS_WORD=0x{:04x} CML=0x{:02x} \
                      READ_VOUT={:.3}V vs VOUT_CMD={:.3}V (Δ={:.0}mV) — clearing as recoverable",
@@ -1272,14 +1598,14 @@ impl Tps546 {
                 let dec = advance_cml_window(
                     CmlEvent::Cml,
                     now_ms,
-                    self.cml_window_start_ms,
-                    self.cml_fault_count,
+                    self.channels[idx].cml_window_start_ms,
+                    self.channels[idx].cml_fault_count,
                     WINDOW_MS,
                 );
-                self.cml_fault_count = dec.new_count;
-                self.cml_window_start_ms = dec.new_window_start_ms;
+                self.channels[idx].cml_fault_count = dec.new_count;
+                self.channels[idx].cml_window_start_ms = dec.new_window_start_ms;
 
-                let _ = i2c.write(self.addr, &[0x03]); // CLEAR_FAULTS
+                let _ = i2c.write(addr, &[0x03]); // CLEAR_FAULTS
                 std::thread::sleep(std::time::Duration::from_millis(10));
 
                 if dec.escalate {
@@ -1351,11 +1677,17 @@ impl Tps546 {
         }
 
         if !faults.is_empty() {
-            let msg = format!("STATUS_WORD=0x{:04x}: {}", status, faults.join(", "));
+            let msg = format!(
+                "TPS546 0x{:02x}: STATUS_WORD=0x{:04x}: {}",
+                addr,
+                status,
+                faults.join(", ")
+            );
             warn!("TPS546 fault: {}", msg);
             // Diagnostic snapshot — read all detail registers + live readings
-            // so the operator can root-cause the fault without re-running.
-            self.snapshot_status(i2c, status);
+            // from the FAULTING regulator so the operator can root-cause the
+            // fault without re-running.
+            self.snapshot_status_channel(i2c, status, &self.channels[idx]);
             return Err(PowerError::RegulatorFault {
                 status_word: status,
                 msg,
@@ -1366,44 +1698,52 @@ impl Tps546 {
     }
 
     /// Read all TPS546 detail status bytes plus live VOUT/VIN/IOUT/TEMP and
-    /// VOUT_COMMAND, emit one structured warn-level log line. Called from
-    /// `check_fault` on any non-zero STATUS_WORD that isn't tolerated as
-    /// isolated CML. Mirrors ESP-Miner's `TPS546_log_snapshot()`.
+    /// VOUT_COMMAND for EVERY regulator in the set, one structured warn-level
+    /// log line each. Mirrors ESP-Miner's `TPS546_log_snapshot()`.
     pub fn snapshot_status(&self, i2c: &mut I2cBus, status_word: u16) {
-        let s_vout = i2c.read_reg_u8(self.addr, pmbus::STATUS_VOUT).unwrap_or(0);
-        let s_iout = i2c.read_reg_u8(self.addr, pmbus::STATUS_IOUT).unwrap_or(0);
-        let s_input = i2c.read_reg_u8(self.addr, pmbus::STATUS_INPUT).unwrap_or(0);
+        for ch in &self.channels {
+            self.snapshot_status_channel(i2c, status_word, ch);
+        }
+    }
+
+    /// Diagnostic snapshot of ONE regulator channel. Called from `check_fault`
+    /// with the faulting channel on any non-zero STATUS_WORD that isn't
+    /// tolerated as isolated CML.
+    fn snapshot_status_channel(&self, i2c: &mut I2cBus, status_word: u16, ch: &Tps546Channel) {
+        let s_vout = i2c.read_reg_u8(ch.addr, pmbus::STATUS_VOUT).unwrap_or(0);
+        let s_iout = i2c.read_reg_u8(ch.addr, pmbus::STATUS_IOUT).unwrap_or(0);
+        let s_input = i2c.read_reg_u8(ch.addr, pmbus::STATUS_INPUT).unwrap_or(0);
         let s_temp = i2c
-            .read_reg_u8(self.addr, pmbus::STATUS_TEMPERATURE)
+            .read_reg_u8(ch.addr, pmbus::STATUS_TEMPERATURE)
             .unwrap_or(0);
-        let s_cml = i2c.read_reg_u8(self.addr, pmbus::STATUS_CML).unwrap_or(0);
-        let s_other = i2c.read_reg_u8(self.addr, pmbus::STATUS_OTHER).unwrap_or(0);
+        let s_cml = i2c.read_reg_u8(ch.addr, pmbus::STATUS_CML).unwrap_or(0);
+        let s_other = i2c.read_reg_u8(ch.addr, pmbus::STATUS_OTHER).unwrap_or(0);
         let s_mfr = i2c
-            .read_reg_u8(self.addr, pmbus::STATUS_MFR_SPECIFIC)
+            .read_reg_u8(ch.addr, pmbus::STATUS_MFR_SPECIFIC)
             .unwrap_or(0);
         let vout_cmd = i2c
-            .read_reg_u16_le(self.addr, pmbus::VOUT_COMMAND)
-            .map(|raw| pmbus_ulinear16_to_f32(raw, self.vout_exponent))
+            .read_reg_u16_le(ch.addr, pmbus::VOUT_COMMAND)
+            .map(|raw| pmbus_ulinear16_to_f32(raw, ch.vout_exponent))
             .unwrap_or(0.0);
         let read_vout = i2c
-            .read_reg_u16_le(self.addr, pmbus::READ_VOUT)
-            .map(|raw| pmbus_ulinear16_to_f32(raw, self.vout_exponent))
+            .read_reg_u16_le(ch.addr, pmbus::READ_VOUT)
+            .map(|raw| pmbus_ulinear16_to_f32(raw, ch.vout_exponent))
             .unwrap_or(0.0);
         let read_vin = i2c
-            .read_reg_u16_le(self.addr, pmbus::READ_VIN)
+            .read_reg_u16_le(ch.addr, pmbus::READ_VIN)
             .map(pmbus_linear11_to_f32)
             .unwrap_or(0.0);
         let read_iout = i2c
-            .read_reg_u16_le(self.addr, pmbus::READ_IOUT)
+            .read_reg_u16_le(ch.addr, pmbus::READ_IOUT)
             .map(pmbus_linear11_to_f32)
             .unwrap_or(0.0);
         let read_temp = i2c
-            .read_reg_u16_le(self.addr, pmbus::READ_TEMPERATURE_1)
+            .read_reg_u16_le(ch.addr, pmbus::READ_TEMPERATURE_1)
             .map(pmbus_linear11_to_f32)
             .unwrap_or(0.0);
         warn!(
-            "TPS546 snapshot: STATUS_WORD=0x{:04x} VOUT=0x{:02x} IOUT=0x{:02x} INPUT=0x{:02x} TEMP=0x{:02x} CML=0x{:02x} OTHER=0x{:02x} MFR=0x{:02x} | VOUT_CMD={:.3}V READ_VOUT={:.3}V READ_VIN={:.2}V READ_IOUT={:.2}A READ_TEMP={:.1}C",
-            status_word, s_vout, s_iout, s_input, s_temp, s_cml, s_other, s_mfr,
+            "TPS546 0x{:02x} snapshot: STATUS_WORD=0x{:04x} VOUT=0x{:02x} IOUT=0x{:02x} INPUT=0x{:02x} TEMP=0x{:02x} CML=0x{:02x} OTHER=0x{:02x} MFR=0x{:02x} | VOUT_CMD={:.3}V READ_VOUT={:.3}V READ_VIN={:.2}V READ_IOUT={:.2}A READ_TEMP={:.1}C",
+            ch.addr, status_word, s_vout, s_iout, s_input, s_temp, s_cml, s_other, s_mfr,
             vout_cmd, read_vout, read_vin, read_iout, read_temp
         );
     }
@@ -1596,6 +1936,35 @@ pub enum PowerIcType {
     Tps546,
     /// DS4432U I2C DAC (older boards)
     Ds4432u,
+    /// TPS53647 / TPS53667 multi-phase PMBus VRM (Nerd multi-ASIC boards, and
+    /// the Q-series). Commands voltage over PMBus, but **cannot switch the
+    /// output** — see [`PowerManager::can_cut_rail_over_i2c`].
+    Tps5364x,
+}
+
+impl PowerIcType {
+    /// Whether this regulator can remove ASIC power on its own, over I2C.
+    ///
+    /// This is the capability the rail bring-up path actually needs, and it is
+    /// deliberately not a part-name comparison: a board may only skip its
+    /// enable-GPIO step if something else can still bring the rail DOWN.
+    ///
+    /// * `Tps546` — yes. Init writes `ON_OFF_CONFIG = 0x1B`, whose CMD bit is
+    ///   set, so `OPERATION_OFF` switches the stage.
+    /// * `Ds4432u` — no. It is a current DAC with no output switch; `disable()`
+    ///   returns `RequiresBuckCut`.
+    /// * `Tps5364x` — no, and this one is easy to get wrong because the part
+    ///   *does* speak PMBus. Its init writes `ON_OFF_CONFIG = 0b0001_0111`,
+    ///   where the CMD bit (0x08) is **clear** and the CONTROL-pin bit (0x04) is
+    ///   set: the stage follows its EN pin and ignores `OPERATION` entirely.
+    ///   That is the vendor's own configuration, and upstream's `set_vout` has
+    ///   the `OPERATION_ON` write commented out for exactly this reason.
+    pub fn can_cut_rail_over_i2c(&self) -> bool {
+        match self {
+            Self::Tps546 => true,
+            Self::Ds4432u | Self::Tps5364x => false,
+        }
+    }
 }
 
 /// Unified power management interface.
@@ -1613,6 +1982,9 @@ pub struct PowerManager {
     regulator: PowerIcType,
     /// TPS546 driver (if present)
     tps546: Option<Tps546>,
+    /// TPS53647/TPS53667 multi-phase VRM driver (if present)
+    #[cfg(feature = "power-tps5364x")]
+    tps5364x: Option<crate::tps5364x::Tps5364x>,
     /// DS4432U driver (if present)
     ds4432u: Option<Ds4432u>,
     /// INA260 power monitor (if present)
@@ -1646,7 +2018,14 @@ impl PowerManager {
         if i2c.probe(TPS546_ADDR) {
             info!("TPS546 detected at 0x{:02x}", TPS546_ADDR);
 
-            let tps_config = if config.model.is_hex() {
+            let tps_config = if config.model == BitAxeModel::LuckyLv08 {
+                // 9x BM1366 parallel, THREE paralleled TPS546 — 1.2 V nominal,
+                // 35/40 A OC per regulator (SPEC §4; LVXX vcore.c LV08 case).
+                Tps546Config::lucky_lv08()
+            } else if config.model.is_lucky() {
+                // LV06/LV07: single regulator, same Lucky 12 V / 1.2 V limits.
+                Tps546Config::lucky_single()
+            } else if config.model.is_hex() {
                 Tps546Config::hex()
             } else if config.model == BitAxeModel::GammaTurbo {
                 Tps546Config::gamma_turbo() // Gamma Turbo runs on 12V, not 5V
@@ -1654,18 +2033,77 @@ impl PowerManager {
                 Tps546Config::single_asic()
             };
 
+            // Ordered regulator address set: [0x24, 0x7F, 0x14] ONLY for the
+            // Lucky LV08 (three paralleled regulators, vendor order); exactly
+            // [0x24] for every other board. `Tps546::new` fails closed if any
+            // set member is missing — an LV08 with a silent secondary regulator
+            // must never mine on a partially-controlled 140 W power stage.
+            let addrs =
+                crate::tps546_guard::tps546_addr_set(config.model == BitAxeModel::LuckyLv08);
+
             tps546 = Some(Tps546::new(
                 i2c,
-                TPS546_ADDR,
+                addrs,
                 &tps_config,
                 config.voltage_domains,
-                config.model.is_hex() || config.model == BitAxeModel::GammaTurbo,
+                model_expects_12v_input(config.model),
             )?);
             regulator = PowerIcType::Tps546;
         }
 
-        // Detect DS4432U (only if no TPS546 found)
-        if tps546.is_none() && i2c.probe(DS4432U_ADDR) {
+        // Detect the multi-phase TPS53647/TPS53667 (only if no TPS546 found).
+        //
+        // Capability negotiation, in this order on purpose: probe the address,
+        // read the part's OWN device code, then ask the board table for the
+        // envelope THAT part supports. A 6-phase profile landing on a 4-phase
+        // TPS53647 — the real NerdOCTAXE-γ rev3.3-vs-rev3.4 split — is refused
+        // by `Tps5364x::new` before any register is written, instead of being
+        // half-applied. No strap pin is read and none is claimed.
+        #[cfg(feature = "power-tps5364x")]
+        let mut tps5364x = None;
+        #[cfg(feature = "power-tps5364x")]
+        if tps546.is_none() && i2c.probe(crate::tps5364x_convert::TPS5364X_ADDR) {
+            let addr = crate::tps5364x_convert::TPS5364X_ADDR;
+            match crate::tps5364x::Tps5364x::identify(i2c, addr) {
+                Ok(variant) => match config.model.tps5364x_envelope(variant) {
+                    Some(vrm_config) => {
+                        let dev = crate::tps5364x::Tps5364x::new(
+                            i2c,
+                            addr,
+                            &vrm_config,
+                            config.voltage_domains,
+                        )
+                        .map_err(|e| PowerError::InitFailed(e.to_string()))?;
+                        tps5364x = Some(dev);
+                        regulator = PowerIcType::Tps5364x;
+                    }
+                    None => {
+                        // The part is real and identified, but this board has no
+                        // characterized envelope for it. Guessing phases or a
+                        // current-sense full scale on a 100-300 W stage is the
+                        // one thing that must not happen here.
+                        error!(
+                            "{} found at 0x{addr:02x} but {:?} has no characterized envelope for it \
+                             — refusing to configure the power stage",
+                            variant.name(),
+                            config.model
+                        );
+                        return Err(PowerError::NoRegulatorFound);
+                    }
+                },
+                Err(e) => {
+                    error!("device at 0x{addr:02x} is not a supported multi-phase VRM: {e}");
+                    return Err(PowerError::NoRegulatorFound);
+                }
+            }
+        }
+
+        // Detect DS4432U (only if no TPS546 or TPS5364x found)
+        #[cfg(feature = "power-tps5364x")]
+        let vrm_claimed = tps5364x.is_some();
+        #[cfg(not(feature = "power-tps5364x"))]
+        let vrm_claimed = false;
+        if tps546.is_none() && !vrm_claimed && i2c.probe(DS4432U_ADDR) {
             info!("DS4432U detected at 0x{:02x}", DS4432U_ADDR);
             ds4432u = Some(Ds4432u::new(i2c, DS4432U_ADDR)?);
             regulator = PowerIcType::Ds4432u;
@@ -1678,7 +2116,7 @@ impl PowerManager {
         }
 
         // Ensure we found at least one voltage regulator
-        if tps546.is_none() && ds4432u.is_none() {
+        if tps546.is_none() && !vrm_claimed && ds4432u.is_none() {
             return Err(PowerError::NoRegulatorFound);
         }
 
@@ -1693,6 +2131,8 @@ impl PowerManager {
         Ok(Self {
             regulator,
             tps546,
+            #[cfg(feature = "power-tps5364x")]
+            tps5364x,
             ds4432u,
             ina260,
             min_voltage_mv: config.min_voltage_mv,
@@ -1709,6 +2149,8 @@ impl PowerManager {
         Self {
             regulator: PowerIcType::Tps546, // placeholder — never used
             tps546: None,
+            #[cfg(feature = "power-tps5364x")]
+            tps5364x: None,
             ds4432u: None,
             ina260: None,
             min_voltage_mv: 0,
@@ -1754,6 +2196,29 @@ impl PowerManager {
                     }
                 }
             }
+            PowerIcType::Tps5364x => {
+                // No `enable()` counterpart, and that is faithful rather than
+                // missing: this stage follows its EN pin, so upstream's
+                // `set_vout` writes VOUT_COMMAND and has the `OPERATION_ON`
+                // write commented out. Writing it here would be a no-op that
+                // reads like a rail-up.
+                if voltage_mv == 0 {
+                    return Err(PowerError::RequiresBuckCut(
+                        "TPS5364x follows its EN pin (ON_OFF_CONFIG CMD bit clear); \
+                         removing power needs the board enable, not a PMBus write"
+                            .to_string(),
+                    ));
+                }
+                #[cfg(feature = "power-tps5364x")]
+                if let Some(ref vrm) = self.tps5364x {
+                    vrm.set_voltage_mv(i2c, voltage_mv)
+                        .map_err(|e| PowerError::InitFailed(e.to_string()))?;
+                }
+                // Without the feature nothing can construct this variant, so
+                // this arm is unreachable rather than silently permissive.
+                #[cfg(not(feature = "power-tps5364x"))]
+                return Err(PowerError::NoRegulatorFound);
+            }
             PowerIcType::Ds4432u => {
                 if voltage_mv == 0 {
                     return Err(PowerError::RequiresBuckCut(
@@ -1777,6 +2242,17 @@ impl PowerManager {
             PowerIcType::Tps546 => {
                 if let Some(ref tps) = self.tps546 {
                     return tps.get_voltage_mv(i2c);
+                }
+            }
+            PowerIcType::Tps5364x => {
+                // Real readback, but from MFR_SPECIFIC_04 with a ULINEAR16 2^-9
+                // encoding — a DIFFERENT encoding from the VID ladder used to
+                // command the rail. The driver owns that asymmetry.
+                #[cfg(feature = "power-tps5364x")]
+                if let Some(ref vrm) = self.tps5364x {
+                    return vrm
+                        .get_voltage_mv(i2c)
+                        .map_err(|e| PowerError::InitFailed(e.to_string()));
                 }
             }
             PowerIcType::Ds4432u => {
@@ -1806,9 +2282,12 @@ impl PowerManager {
     /// For INA260, uses the built-in power measurement.
     pub fn get_power_w(&self, i2c: &mut I2cBus) -> Result<f32, PowerError> {
         if let Some(ref tps) = self.tps546 {
-            let vout = tps.get_vout(i2c)?;
-            let iout = tps.get_iout(i2c)?;
-            let regulator_power = vout * iout;
+            // Σ(vout_i × iout_i) across the regulator set (one term on single-
+            // regulator boards — identical reads and math to the historical
+            // path), plus the board offset added exactly ONCE. On the Lucky
+            // family the offset is the 18 W from LVXX power.c:24-37, carried
+            // by the board row's `power_offset_w`.
+            let (regulator_power, _current_a) = tps.get_output_power_and_current(i2c)?;
             return Ok(regulator_power + self.power_offset_w);
         }
         if let Some(ref ina) = self.ina260 {
@@ -1818,15 +2297,15 @@ impl PowerManager {
     }
 
     /// Pass-5 audit: combined power + current accessor that issues a SINGLE
-    /// READ_IOUT (and READ_VOUT for power calc) instead of doing them twice
-    /// when the caller wants both. Mirrors ESP-Miner PR #1641 fix.
+    /// READ_IOUT (and READ_VOUT for power calc) per regulator instead of doing
+    /// them twice when the caller wants both. Mirrors ESP-Miner PR #1641 fix.
+    /// Multi-regulator sets return (Σ vᵢ·iᵢ + offset, Σ iᵢ).
     /// Returns (power_w, current_a).
     pub fn get_output(&self, i2c: &mut I2cBus) -> Result<(f32, f32), PowerError> {
         if let Some(ref tps) = self.tps546 {
-            let vout = tps.get_vout(i2c)?;
-            let iout = tps.get_iout(i2c)?;
-            let power_w = vout * iout + self.power_offset_w;
-            return Ok((power_w, iout));
+            let (regulator_power, current_a) = tps.get_output_power_and_current(i2c)?;
+            let power_w = regulator_power + self.power_offset_w;
+            return Ok((power_w, current_a));
         }
         if let Some(ref ina) = self.ina260 {
             let power_w = ina.get_power_mw(i2c)? / 1000.0;
@@ -1918,6 +2397,29 @@ impl PowerManager {
                 "DS4432U boards require buck-enable GPIO off for power removal".to_string(),
             ));
         }
+        // A TPS5364x CANNOT switch its own output. Its `ON_OFF_CONFIG` is
+        // `0b0001_0111` — CMD bit CLEAR, CONTROL-pin bit SET — so `OPERATION`
+        // is ignored and only the EN pin gates the stage. This used to fall
+        // through to `Ok(())` below, which reported a successful power-off to
+        // the fail-closed path while doing NOTHING.
+        //
+        // On the Nerd boards that lie was survivable: they carry an enable GPIO
+        // and `fail_closed_power_off` drives it right afterwards, so the rail
+        // still came down and only the log was wrong. On a board whose enable
+        // is NOT a GPIO the same `Ok(())` means nothing cuts the rail at all.
+        //
+        // `RequiresBuckCut` is the accurate answer and already has a handler:
+        // the caller warns and proceeds to the actuator. It also matches what
+        // `PowerIcType::can_cut_rail_over_i2c()` reports for this part, so the
+        // classifier and the runtime can no longer disagree.
+        #[cfg(feature = "power-tps5364x")]
+        if self.tps5364x.is_some() {
+            return Err(PowerError::RequiresBuckCut(
+                "TPS5364x ignores OPERATION (ON_OFF_CONFIG CMD bit clear); the rail must be \
+                 cut at its enable"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1983,5 +2485,65 @@ impl PowerManager {
     /// Get the power offset in watts.
     pub fn power_offset_w(&self) -> f32 {
         self.power_offset_w
+    }
+}
+
+// ===========================================================================
+// Model → power-input policy + LV08 disambiguation probe
+// ===========================================================================
+
+/// Whether this board model runs from a 12 V input supply (drives both the
+/// `Tps546` VIN sanity checks and, indirectly, which config preset is safe).
+///
+/// The whole Lucky family (LV06/LV07/LV08) is 12 V input (SPEC §1) — without
+/// this they would inherit `single_asic()` (VIN_OV_FAULT 6.5 V) and fault
+/// instantly on a 12 V supply.
+///
+/// KNOWN LATENT BUG (out of scope here, do not fix silently): `GtTouch` is
+/// electrically a GammaTurbo (2× BM1370, 12 V) but is NOT matched below, so it
+/// inherits the 5 V `single_asic()` limits — pre-existing behavior deliberately
+/// left unchanged pending a separate decision (SPEC wave note, 2026-07-27).
+pub fn model_expects_12v_input(model: BitAxeModel) -> bool {
+    model.is_hex() || model == BitAxeModel::GammaTurbo || model.is_lucky()
+}
+
+/// Result of the read-only Lucky LV08 secondary-regulator probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuckySecondaryProbeResult {
+    /// Whether a device ACKed at 0x7F (LV08 regulator U1).
+    pub addr_7f_answers: bool,
+    /// Whether a device ACKed at 0x14 (LV08 regulator U3).
+    pub addr_14_answers: bool,
+    /// Pure classification (`tps546_guard::classify_lucky_probe`): both ⇒
+    /// LV08 triple-regulator signature; neither ⇒ genuine BitAxe; one ⇒
+    /// Inconclusive (caller must refuse to energize, SPEC §3 step 5).
+    pub verdict: crate::tps546_guard::LuckyProbeVerdict,
+}
+
+/// READ-ONLY probe of the two LV08-only TPS546 addresses (0x7F, 0x14) for the
+/// SPEC §3 step-4 disambiguation gate ("is this ambiguous unit an LV08?").
+///
+/// Safety contract:
+/// - **Read-only**: each probe is an address-only ACK check (zero data bytes
+///   written — `I2cBus::probe`); no register on any device is ever touched.
+/// - **Lucky-gated**: 0x7F is an I2C spec-reserved address. Callers MUST only
+///   invoke this from the inbound-identification AMBIGUOUS branch (a unit
+///   already suspected to be Lucky hardware) — never as a generic bus scan on
+///   known non-Lucky boards. The identification agent owns that gate; this
+///   function is the probe primitive it wires up.
+/// - The verdict is a *board-identity* signal only. It never energizes,
+///   configures, or writes anything.
+pub fn probe_lucky_lv08_secondary_regulators(i2c: &mut I2cBus) -> LuckySecondaryProbeResult {
+    let addr_7f_answers = i2c.probe(0x7F);
+    let addr_14_answers = i2c.probe(0x14);
+    let verdict = crate::tps546_guard::classify_lucky_probe(addr_7f_answers, addr_14_answers);
+    info!(
+        "LV08 secondary-regulator probe (read-only): 0x7F={} 0x14={} → {:?}",
+        addr_7f_answers, addr_14_answers, verdict
+    );
+    LuckySecondaryProbeResult {
+        addr_7f_answers,
+        addr_14_answers,
+        verdict,
     }
 }

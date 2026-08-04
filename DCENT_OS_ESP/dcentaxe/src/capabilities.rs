@@ -222,7 +222,8 @@ fn cores_per_chip(chip_model: &str) -> u32 {
         "BM1397" => 168,
         "BM1366" => 112,
         "BM1368" => 80,
-        "BM1370" => 128,
+        // BM1373 grouped with BM1370 — PROJECTED (matches api.rs:1014).
+        "BM1370" | "BM1373" => 128,
         _ => 0,
     }
 }
@@ -232,7 +233,8 @@ fn nonce_attribution_cores(chip_model: &str) -> u32 {
         "BM1397" => 672,
         "BM1366" => 894,
         "BM1368" => 1276,
-        "BM1370" => 2040,
+        // BM1373 grouped with BM1370 — PROJECTED (matches main.rs:460).
+        "BM1370" | "BM1373" => 2040,
         _ => 0,
     }
 }
@@ -277,6 +279,10 @@ fn temp_sensors(temp: TempSensorKind, power: PowerControllerKind) -> Vec<String>
         TempSensorKind::Emc2101 => sensors.push("emc2101".to_string()),
         TempSensorKind::Tmp1075 => sensors.push("tmp1075".to_string()),
         TempSensorKind::Emc2103 => sensors.push("emc2103".to_string()),
+        // Deliberately generic: the muxed Nerd boards fit a TMP451 or an
+        // ADT7461-family equivalent, and the capability string must not assert
+        // a specific part we have never read a device ID from.
+        TempSensorKind::Tmp451 => sensors.push("tmp451".to_string()),
     }
     if power == PowerControllerKind::Tps546 {
         sensors.push("tps546-vr".to_string());
@@ -310,6 +316,11 @@ fn power_controller_label(kind: PowerControllerKind) -> &'static str {
         PowerControllerKind::None => "fixed-or-none",
         PowerControllerKind::Tps546 => "tps546",
         PowerControllerKind::Ds4432u => "ds4432u",
+        // Deliberately generic: which of TPS53647/TPS53667 is fitted is only
+        // known after the runtime device-code read, and the NerdOCTAXE-γ ships
+        // both across revisions. Naming one part here would be a claim the
+        // board row cannot back.
+        PowerControllerKind::Tps5364x => "tps5364x",
     }
 }
 

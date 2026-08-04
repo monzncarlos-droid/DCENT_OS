@@ -16,6 +16,9 @@ pub const METRICS_DIR_ENV: &str = "DCENTOS_METRICS_DIR";
 pub const DEFAULT_METRICS_DIR: &str = "/data/metrics";
 
 pub fn metrics_storage_dir() -> PathBuf {
+    if crate::runtime_policy::ephemeral_runtime_enabled() {
+        return PathBuf::from("/tmp/dcent/metrics");
+    }
     std::env::var_os(METRICS_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| {

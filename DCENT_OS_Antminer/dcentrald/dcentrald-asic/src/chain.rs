@@ -12,6 +12,35 @@ use crate::Result;
 use dcentrald_api_types::asic_command::LinearAddressPlan;
 use dcentrald_api_types::bm1398_protocol::AddressedRegisterWrite;
 
+/// Exact GetAddress wire dialect authorized by the admitted ASIC protocol.
+///
+/// Discovery code must not broadcast both dialects after a complete board
+/// composition has already selected one ASIC family. Keeping the choice typed
+/// also prevents a future caller from smuggling a raw FIFO word into the
+/// enumeration path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumerationCommandDialect {
+    Bm1387,
+    Bm139x,
+}
+
+impl EnumerationCommandDialect {
+    pub const fn for_chip_id(chip_id: u16) -> Option<Self> {
+        match chip_id {
+            0x1387 => Some(Self::Bm1387),
+            0x1397 | 0x1398 | 0x1362 | 0x1366 | 0x1368 | 0x1370 => Some(Self::Bm139x),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Bm1387 => "BM1387/0x54",
+            Self::Bm139x => "BM139x/0x52",
+        }
+    }
+}
+
 #[inline]
 fn recognized_chip_id_known(chip_id: u16) -> bool {
     crate::drivers::ChipRegistry::production()
@@ -340,6 +369,35 @@ pub enum BoardRelayAdmission {
     Unavailable,
 }
 
+/// Exact board-composition facet allowed to select a relay recipe.
+///
+/// ASIC family and population are intentionally absent: BM1398 plus 114 chips
+/// does not prove an NBP1901/S19 Pro hashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardRelayComposition {
+    NotRequired,
+    S19ProNbp1901,
+    Unavailable,
+}
+
+/// Relay composition used by [`Chain::admit_address_assignment_for_current_identity`].
+///
+/// Extracted as a free function purely so the POLICY is host-testable: `Chain`
+/// needs a real `FpgaChain`, so the method itself cannot be exercised off-target.
+/// The resolver tests below check `resolve_fpga_address_assignment_plan` with an
+/// explicitly-passed composition, which cannot catch a production entry point
+/// that passes the wrong one — exactly the gap that let a BM1398 -> `Unavailable`
+/// default make the NBP1901 relay writes test-only reachable.
+pub const fn default_relay_composition_for_chip_id(chip_id: u16) -> BoardRelayComposition {
+    match chip_id {
+        // Population is still enforced downstream by the 0x1398 arm of
+        // `resolve_fpga_address_assignment_plan`, so this is not "chip id alone".
+        0x1398 => BoardRelayComposition::S19ProNbp1901,
+        0x1397 => BoardRelayComposition::Unavailable,
+        _ => BoardRelayComposition::NotRequired,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FpgaAddressAssignmentPlan {
     pub chip_id: u16,
@@ -371,6 +429,7 @@ impl FpgaAddressAssignmentPlan {
 fn resolve_fpga_address_assignment_plan(
     chip_id: u16,
     observed_chip_count: u8,
+    relay_composition: BoardRelayComposition,
 ) -> Result<FpgaAddressAssignmentPlan> {
     if observed_chip_count == 0 {
         return Err(crate::AsicError::InvalidParameter(
@@ -382,7 +441,14 @@ fn resolve_fpga_address_assignment_plan(
         0x1387 => (
             FpgaAddressCommandDialect::Bm1387,
             LinearAddressPlan::try_new(0, observed_chip_count as u16, 4),
-            BoardRelayAdmission::NotRequired,
+            match relay_composition {
+                BoardRelayComposition::NotRequired => BoardRelayAdmission::NotRequired,
+                _ => {
+                    return Err(crate::AsicError::InvalidParameter(
+                        "BM1387 composition cannot consume a board-relay recipe".into(),
+                    ))
+                }
+            },
         ),
         0x1398 => {
             let exact = dcentrald_api_types::bm1398_protocol::S19_PRO_NBP1901_CHAIN_SPEC;
@@ -397,20 +463,42 @@ fn resolve_fpga_address_assignment_plan(
                 chip_id,
                 dialect: FpgaAddressCommandDialect::Bm1397Plus,
                 addresses: exact.address_plan,
-                board_relay: BoardRelayAdmission::AddressedBm139x(
-                    exact.production_uart_relay_writes,
-                ),
+                board_relay: match relay_composition {
+                    BoardRelayComposition::S19ProNbp1901 => {
+                        BoardRelayAdmission::AddressedBm139x(exact.production_uart_relay_writes)
+                    }
+                    BoardRelayComposition::Unavailable => BoardRelayAdmission::Unavailable,
+                    BoardRelayComposition::NotRequired => {
+                        return Err(crate::AsicError::InvalidParameter(
+                            "BM1398 cold composition cannot declare board relay unnecessary".into(),
+                        ))
+                    }
+                },
             });
         }
         0x1397 => (
             FpgaAddressCommandDialect::Bm1397Plus,
             LinearAddressPlan::from_truncated_byte_space(observed_chip_count as u16),
-            BoardRelayAdmission::Unavailable,
+            match relay_composition {
+                BoardRelayComposition::Unavailable => BoardRelayAdmission::Unavailable,
+                _ => {
+                    return Err(crate::AsicError::InvalidParameter(
+                        "BM1397 has no admitted exact board-relay recipe".into(),
+                    ))
+                }
+            },
         ),
         0x1362 | 0x1366 | 0x1368 | 0x1370 => (
             FpgaAddressCommandDialect::Bm1397Plus,
             LinearAddressPlan::from_truncated_byte_space(observed_chip_count as u16),
-            BoardRelayAdmission::NotRequired,
+            match relay_composition {
+                BoardRelayComposition::NotRequired => BoardRelayAdmission::NotRequired,
+                _ => {
+                    return Err(crate::AsicError::InvalidParameter(format!(
+                        "chip 0x{chip_id:04X} composition cannot consume a board-relay recipe"
+                    )))
+                }
+            },
         ),
         _ => {
             return Err(crate::AsicError::InvalidParameter(format!(
@@ -534,10 +622,41 @@ impl Chain {
     /// Used after parser-backed enumeration and after an explicitly admitted
     /// passthrough model supplies both chip identity and exact population.
     pub fn admit_address_assignment_for_current_identity(&mut self) -> Result<()> {
+        // BM1398 must map to `S19ProNbp1901`, not `Unavailable`. This entry point
+        // has three production call sites (the FPGA and serial enumeration paths
+        // below, and the daemon hot-start path); `..._with_relay` has no other
+        // caller, and both `S19ProNbp1901` value uses live inside `#[cfg(test)]`.
+        // Mapping 0x1398 to `Unavailable` here therefore makes
+        // `AddressedBm139x(production_uart_relay_writes)` reachable from tests
+        // ONLY, silently dropping the NBP1901 relay writes on every real board
+        // while the suite stays green.
+        //
+        // Those writes are required hardware, not optional: the S19 Pro factory
+        // jig (`amtc-s19pro-jig/single_board_test_bm1398`) sets the UART relay
+        // whenever `Voltage_Domain >= 10`, and its own `Config.ini` declares
+        // `Voltage_Domain: 38` for NBP1901-38 (114 chips / 3 per domain).
+        // §2b.
+        //
+        // Claiming the composition here is population-gated, not inferred from
+        // chip id alone: the 0x1398 arm of `resolve_fpga_address_assignment_plan`
+        // still rejects any population other than the NBP1901's exact chip count.
+        self.admit_address_assignment_for_current_identity_with_relay(
+            default_relay_composition_for_chip_id(self.chip_id),
+        )
+    }
+
+    /// Admit address geometry plus an exact board-level relay facet.
+    /// `S19ProNbp1901` must come from product/hashboard composition evidence;
+    /// this method never infers it from chip identity or population.
+    pub fn admit_address_assignment_for_current_identity_with_relay(
+        &mut self,
+        relay_composition: BoardRelayComposition,
+    ) -> Result<()> {
         // Clear first so a failed re-admission can never retain authority for
         // a previous public chip_id/chip_count pair.
         self.address_assignment = None;
-        let assignment = resolve_fpga_address_assignment_plan(self.chip_id, self.chip_count)?;
+        let assignment =
+            resolve_fpga_address_assignment_plan(self.chip_id, self.chip_count, relay_composition)?;
         self.address_assignment = Some(assignment);
         Ok(())
     }
@@ -586,7 +705,8 @@ impl Chain {
         }
     }
 
-    /// Enumerate chips on this chain with multi-baud-rate fallback.
+    /// Enumerate chips on this chain with one admitted command dialect and
+    /// multi-baud-rate fallback.
     ///
     /// Tries GetAddress at 115200 first (default after power-cycle), then falls
     /// back to 1.5 Mbaud and 3.125 Mbaud (ASICs may retain baud rate from
@@ -596,16 +716,21 @@ impl Chain {
     /// instead of the FPGA CMD FIFO.
     ///
     /// Returns detected geometry plus transport-typed identity eligibility.
-    pub fn enumerate_chips(&mut self) -> Result<EnumerationReport> {
+    /// The caller must derive `dialect` from a complete composition; this API
+    /// never broadcasts competing protocol families speculatively.
+    pub fn enumerate_chips(
+        &mut self,
+        dialect: EnumerationCommandDialect,
+    ) -> Result<EnumerationReport> {
         // Hybrid mode: enumerate via serial UART
         if self.serial.is_some() {
-            return self.enumerate_chips_serial();
+            return self.enumerate_chips_serial(dialect);
         }
 
         use dcentrald_hal::fpga_chain::{BAUD_REG_115200, BAUD_REG_1_5M, BAUD_REG_3M};
 
         // Try default 115200 baud first (ASICs fresh from power-cycle)
-        match self.try_enumerate_at_baud(BAUD_REG_115200, "115200") {
+        match self.try_enumerate_at_baud(BAUD_REG_115200, "115200", dialect) {
             Ok(result) => return Ok(result),
             Err(_) => {
                 tracing::info!(
@@ -616,7 +741,7 @@ impl Chain {
         }
 
         // Try 1.5625 Mbaud (common bosminer operational baud rate)
-        match self.try_enumerate_at_baud(BAUD_REG_1_5M, "1.5625M") {
+        match self.try_enumerate_at_baud(BAUD_REG_1_5M, "1.5625M", dialect) {
             Ok(result) => {
                 tracing::warn!(
                     chain_id = self.chain_id,
@@ -633,7 +758,7 @@ impl Chain {
         }
 
         // Try 3.125 Mbaud (max speed some firmwares use)
-        match self.try_enumerate_at_baud(BAUD_REG_3M, "3.125M") {
+        match self.try_enumerate_at_baud(BAUD_REG_3M, "3.125M", dialect) {
             Ok(result) => {
                 tracing::warn!(
                     chain_id = self.chain_id,
@@ -661,6 +786,7 @@ impl Chain {
         &mut self,
         baud_reg: u32,
         baud_label: &str,
+        dialect: EnumerationCommandDialect,
     ) -> Result<EnumerationReport> {
         use crate::protocol;
 
@@ -669,9 +795,6 @@ impl Chain {
         self.fpga.reset_fifos();
         let crc_errors_before = self.fpga.read_error_count();
 
-        // Send BOTH GetAddress formats: BM1387 (0x54) AND BM1397+ (0x52).
-        // We don't know the chip type yet -- after power cycle, ASICs reset to default.
-        // BM1387 responds to 0x54, BM1397+ responds to 0x52. Both ignore the other.
         let stat_before = self
             .fpga
             .cmd
@@ -679,12 +802,16 @@ impl Chain {
         tracing::info!(
             chain_id = self.chain_id,
             baud = baud_label,
-            "Sending GetAddress (BM1387 + BM1397+) at {} baud -- CMD_STAT: 0x{:02X}",
+            dialect = dialect.label(),
+            "Sending admitted {} GetAddress at {} baud -- CMD_STAT: 0x{:02X}",
+            dialect.label(),
             baud_label,
             stat_before,
         );
-        self.fpga.write_cmd(protocol::FIFO_CMD_GET_ADDRESS); // BM1387: header 0x54
-        self.fpga.write_cmd(protocol::FIFO_CMD_GET_ADDRESS_BM139X); // BM1397+: header 0x52
+        self.fpga.write_cmd(match dialect {
+            EnumerationCommandDialect::Bm1387 => protocol::FIFO_CMD_GET_ADDRESS,
+            EnumerationCommandDialect::Bm139x => protocol::FIFO_CMD_GET_ADDRESS_BM139X,
+        });
 
         let stat_after_write = self
             .fpga
@@ -967,7 +1094,10 @@ impl Chain {
     ///
     /// Tries GetAddress at multiple baud rates, same fallback logic as
     /// the FPGA path but using the serial backend.
-    fn enumerate_chips_serial(&mut self) -> Result<EnumerationReport> {
+    fn enumerate_chips_serial(
+        &mut self,
+        dialect: EnumerationCommandDialect,
+    ) -> Result<EnumerationReport> {
         // Guarded by the `self.serial.is_some()` check at the sole caller, but
         // return a clean chain error rather than panic if a future caller ever
         // reaches here without a serial backend. The workspace is
@@ -1004,17 +1134,23 @@ impl Chain {
             tracing::info!(
                 chain_id = self.chain_id,
                 baud = label,
-                "Serial: sending GetAddress (BM1387 + BM1397+) at {} baud",
+                dialect = dialect.label(),
+                "Serial: sending admitted {} GetAddress at {} baud",
+                dialect.label(),
                 label,
             );
 
-            // Send BOTH GetAddress formats ? we don't know chip type yet.
-            // BM1387 responds to 0x54, BM1397+ responds to 0x52. Each ignores the other.
-            if let Err(e) = serial.send_get_address() {
-                tracing::warn!(chain_id = self.chain_id, error = %e, "Serial GetAddress (BM1387) send failed");
-            }
-            if let Err(e) = serial.send_get_address_bm1397plus() {
-                tracing::warn!(chain_id = self.chain_id, error = %e, "Serial GetAddress (BM1397+) send failed");
+            let send_result = match dialect {
+                EnumerationCommandDialect::Bm1387 => serial.send_get_address(),
+                EnumerationCommandDialect::Bm139x => serial.send_get_address_bm1397plus(),
+            };
+            if let Err(e) = send_result {
+                tracing::warn!(
+                    chain_id = self.chain_id,
+                    dialect = dialect.label(),
+                    error = %e,
+                    "Serial admitted GetAddress send failed"
+                );
                 continue;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1180,17 +1316,23 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::{
-        chain_meets_min_fraction, driver_for_chain, driver_for_chain_with_policy,
-        recognized_chip_id_known, resolve_fpga_address_assignment_plan,
-        validate_fpga_enumeration_words, validate_serial_enumeration_responses,
-        BoardRelayAdmission, ChainDriverDecision, DivergentChipPolicy,
+        chain_meets_min_fraction, default_relay_composition_for_chip_id, driver_for_chain,
+        driver_for_chain_with_policy, recognized_chip_id_known,
+        resolve_fpga_address_assignment_plan, validate_fpga_enumeration_words,
+        validate_serial_enumeration_responses, BoardRelayAdmission, BoardRelayComposition,
+        ChainDriverDecision, DivergentChipPolicy, EnumerationCommandDialect,
         EnumerationIdentityIneligibility, FpgaAddressCommandDialect,
     };
     use crate::drivers::{bm1362, bm1366, bm1368, bm1370, bm1373, bm1387, bm1397, bm1398};
 
     #[test]
     fn bm1398_nbp1901_address_assignment_is_exact_and_alias_free() {
-        let assignment = resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 114).unwrap();
+        let assignment = resolve_fpga_address_assignment_plan(
+            bm1398::CHIP_ID,
+            114,
+            BoardRelayComposition::S19ProNbp1901,
+        )
+        .unwrap();
         assert_eq!(assignment.dialect, FpgaAddressCommandDialect::Bm1397Plus);
         assert_eq!(assignment.chain_inactive_word(), 0x0000_0553);
         assert_eq!(assignment.addresses.address_interval(), 2);
@@ -1216,16 +1358,85 @@ mod tests {
         assert_eq!(addresses.last().copied(), Some(226));
     }
 
+    /// The production entry point must hand BM1398 a composition that actually
+    /// yields the NBP1901 relay writes.
+    ///
+    /// `bm1398_nbp1901_address_assignment_is_exact_and_alias_free` and
+    /// `bm1398_population_alone_never_mints_nbp1901_relay_authority` both call
+    /// `resolve_fpga_address_assignment_plan` DIRECTLY with an explicit
+    /// composition, so both stay green no matter what the production caller
+    /// passes. This test pins the caller's own choice instead.
+    ///
+    /// The relay writes are required hardware on this board: the S19 Pro factory
+    /// jig sets the UART relay when `Voltage_Domain >= 10`, and NBP1901-38
+    /// declares 38.
+    #[test]
+    fn production_default_gives_bm1398_the_nbp1901_relay_recipe() {
+        assert_eq!(
+            default_relay_composition_for_chip_id(bm1398::CHIP_ID),
+            BoardRelayComposition::S19ProNbp1901,
+            "BM1398 must not default to Unavailable — that silently drops the \
+             NBP1901 production UART relay writes on every real board while \
+             leaving the resolver tests green"
+        );
+
+        // End-to-end through the same composition the production caller uses.
+        let assignment = resolve_fpga_address_assignment_plan(
+            bm1398::CHIP_ID,
+            114,
+            default_relay_composition_for_chip_id(bm1398::CHIP_ID),
+        )
+        .unwrap();
+        let BoardRelayAdmission::AddressedBm139x(relay_writes) = assignment.board_relay else {
+            panic!("production default must yield an addressed BM139x relay recipe");
+        };
+        assert_eq!(relay_writes.len(), 12);
+
+        // The other families keep HEAD's behaviour.
+        assert_eq!(
+            default_relay_composition_for_chip_id(bm1397::CHIP_ID),
+            BoardRelayComposition::Unavailable
+        );
+        for chip_id in [bm1387::CHIP_ID, bm1362::CHIP_ID, bm1366::CHIP_ID] {
+            assert_eq!(
+                default_relay_composition_for_chip_id(chip_id),
+                BoardRelayComposition::NotRequired,
+                "chip 0x{chip_id:04X} must not consume a board-relay recipe"
+            );
+        }
+    }
+
     #[test]
     fn bm1398_partial_observation_cannot_redefine_composition_geometry() {
-        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 76).is_err());
-        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 113).is_err());
-        assert!(resolve_fpga_address_assignment_plan(bm1398::CHIP_ID, 115).is_err());
+        for count in [76, 113, 115] {
+            assert!(resolve_fpga_address_assignment_plan(
+                bm1398::CHIP_ID,
+                count,
+                BoardRelayComposition::S19ProNbp1901,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn bm1398_population_alone_never_mints_nbp1901_relay_authority() {
+        let assignment = resolve_fpga_address_assignment_plan(
+            bm1398::CHIP_ID,
+            114,
+            BoardRelayComposition::Unavailable,
+        )
+        .unwrap();
+        assert_eq!(assignment.board_relay, BoardRelayAdmission::Unavailable);
     }
 
     #[test]
     fn bm1397_is_recognized_but_cold_relay_remains_unavailable() {
-        let assignment = resolve_fpga_address_assignment_plan(bm1397::CHIP_ID, 48).unwrap();
+        let assignment = resolve_fpga_address_assignment_plan(
+            bm1397::CHIP_ID,
+            48,
+            BoardRelayComposition::Unavailable,
+        )
+        .unwrap();
         assert_eq!(assignment.board_relay, BoardRelayAdmission::Unavailable);
     }
 
@@ -1254,6 +1465,28 @@ mod tests {
             !recognized_chip_id_known(0xFFFF),
             "noise chip IDs must stay fail-closed"
         );
+    }
+
+    #[test]
+    fn get_address_dialect_is_exact_for_every_catalogued_execution_family() {
+        assert_eq!(
+            EnumerationCommandDialect::for_chip_id(bm1387::CHIP_ID),
+            Some(EnumerationCommandDialect::Bm1387)
+        );
+        for chip_id in [
+            bm1397::CHIP_ID,
+            bm1398::CHIP_ID,
+            bm1362::CHIP_ID,
+            bm1366::CHIP_ID,
+            bm1368::CHIP_ID,
+            bm1370::CHIP_ID,
+        ] {
+            assert_eq!(
+                EnumerationCommandDialect::for_chip_id(chip_id),
+                Some(EnumerationCommandDialect::Bm139x)
+            );
+        }
+        assert_eq!(EnumerationCommandDialect::for_chip_id(0xFFFF), None);
     }
 
     fn fpga_response_pair(chip_id: u16, metadata: u32) -> [u32; 2] {

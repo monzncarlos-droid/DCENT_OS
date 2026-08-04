@@ -1,4 +1,4 @@
-//! S19j Pro hybrid mining — serial ASIC init + FPGA work dispatch via /dev/mem.
+//! S19j Pro hybrid mining Ã¢â‚¬â€ serial ASIC init + FPGA work dispatch via /dev/mem.
 //!
 //! The S19j Pro (am2) has a hybrid architecture:
 //!   - ASIC init commands go via the PL serial UARTs at 115200 -> 3.125M baud.
@@ -15,10 +15,10 @@
 //!     `0x43D00000` is diagnostic/status-like; stock CV1835/AM335x/AML/S9
 //!     hardware does NOT populate this IP.
 //!   - PIC heartbeat via kernel I2C /dev/i2c-0 at the selected hashboard's
-//!     dsPIC address (`Pic0x89` driver — RESET is banned per
+//!     dsPIC address (`Pic0x89` driver Ã¢â‚¬â€ RESET is banned per
 //!     ).
 //!   - **APW121215a PSU @ I2C 0x10 must be brought up FIRST** with a 1 Hz
-//!     heartbeat loop — without the heartbeat the PSU self-disables in ~30 s
+//!     heartbeat loop Ã¢â‚¬â€ without the heartbeat the PSU self-disables in ~30 s
 //!     and the hashboards lose their 15.2 V rail mid-enumeration
 //!.
 //!
@@ -26,46 +26,46 @@
 //!   chain1-common   0x43C00000 (uio0)   CTRL/BAUD/WORK_TIME/BUILD_ID
 //!   chain1-cmd-rx   0x43C01000 (uio1)   cmd FIFO (DEAD on am2, see note above)
 //!   chain1-work-rx  0x43C02000 (uio2)   nonce FIFO
-//!   chain1-work-tx  0x43C03000 (uio3)   work FIFO — **depth 20, never queue >20 deep**
+//!   chain1-work-tx  0x43C03000 (uio3)   work FIFO Ã¢â‚¬â€ **depth 20, never queue >20 deep**
 //!   chain4 mirrors at 0x43C30000 + stride (uio12-15).
-//!   glitch-monitor   0x43D00000 (uio18) Braiins-am2 only — diagnostic mirror of BM1362 reg 0x2C @ +0x30 (chain1) / +0x34 (chain4).
+//!   glitch-monitor   0x43D00000 (uio18) Braiins-am2 only Ã¢â‚¬â€ diagnostic mirror of BM1362 reg 0x2C @ +0x30 (chain1) / +0x34 (chain4).
 //!
-//! Chain id → physical idx mapping (Phase 1 live probe .139):
+//! Chain id Ã¢â€ â€™ physical idx mapping (Phase 1 live probe .139):
 //!   logical chain1 = phys-addr-2 (only populated boards), chain4 = phys-addr-3,
-//!   phys-addr-1 is unpopulated. This module is single-chain by design — the
+//!   phys-addr-1 is unpopulated. This module is single-chain by design Ã¢â‚¬â€ the
 //!   multi-chain orchestrator owns per-chain independence.
 //!
-//! BM1362 work format (am2, Phase 4A): 20 x 32-bit words (4 header + 2 × 8
-//! midstate words). CTRL=0x00901002, MIDSTATE_CNT=1 → 2 midstate slots.
+//! BM1362 work format (am2, Phase 4A): 20 x 32-bit words (4 header + 2 Ãƒâ€” 8
+//! midstate words). CTRL=0x00901002, MIDSTATE_CNT=1 Ã¢â€ â€™ 2 midstate slots.
 //! S9-style 36-word / 4-slot layout does NOT apply here.
 //!
 //! ### Safety rules enforced here (verify on every edit)
 //!   - MiscCtrl (reg 0x18) is ALWAYS triple-written with 5 ms spacing via
-//!     `misc_ctrl_triple_write`. Never single-write — see
+//!     `misc_ctrl_triple_write`. Never single-write Ã¢â‚¬â€ see
 //!     .
 //!   - Register writes use BM1397+ headers (0x51 broadcast / 0x41 single) via
 //!     `send_write_reg_broadcast_bm1397plus` / `send_write_reg_bm1397plus`.
-//!     NEVER the BM1387 SETCONFIG headers (0x58/0x48) —
+//!     NEVER the BM1387 SETCONFIG headers (0x58/0x48) Ã¢â‚¬â€
 //!      cost Codex-found regressions.
 //!   - Serial dispatch is rate-limited during init (~50/s) to avoid UART flood
 //!.
 //!   - FPGA work_id is 8 bits; `asic_job_id`
 //!     is a `u8` that wraps naturally.
 //!   - FPGA work-tx depth is 20 on am2. `fpga.work_tx_full()` reads the
-//!     STAT_TX_FULL bit which is hardware-enforced — we never push past it.
+//!     STAT_TX_FULL bit which is hardware-enforced Ã¢â‚¬â€ we never push past it.
 //!   - PIC SetVoltage is gated by 5 stable heartbeat ticks (same rule as PSU)
-//!     —.
-//!   - PSU SetVoltage calls outside of `cold_boot_sequence` are also gated —
+//!     Ã¢â‚¬â€.
+//!   - PSU SetVoltage calls outside of `cold_boot_sequence` are also gated Ã¢â‚¬â€
 //!     enforced by the `Apw121215a` driver itself.
 //!   - Graceful shutdown MUST stop the feeder, ramp to minimum, then disarm the PSU watchdog so
 //!     bosminer can cleanly restart afterwards.
-//!   - Passthrough relay to bosminer needs SIGKILL (not SIGTERM) —
+//!   - Passthrough relay to bosminer needs SIGKILL (not SIGTERM) Ã¢â‚¬â€
 //!     . Owned by the caller, not this module.
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -75,19 +75,42 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::am2_chain_plan::{build_am2_chain_plan, Am2ChainContext};
-use crate::runtime::thread_guard::RuntimeThreadGuard;
+use crate::hardware_mutation_fence::wait_revoked_hardware_mutation_commit_fence;
+use crate::runtime::safety_watchdog::{
+    watchdog_reset_pending_error, HybridThreadSlot, HybridWatchdogRouteScope,
+    HybridWatchdogShutdownManifest, SafetyLiveness, SafetyWatchdogOwner, WatchdogCloseoutReceipt,
+    WatchdogDisarmPermit, DEFAULT_WATCHDOG_STOP_TIMEOUT,
+};
+use crate::runtime::teardown_budget::{TeardownBudgetView, TeardownDisarmAuthority, TeardownStage};
+use crate::runtime::thread_guard::{FixedThreadRosterGuard, ThreadRosterStop};
+use crate::runtime::watchdog_feed_gate::WatchdogFeedStopSignal;
 use dcentrald_asic::bm1362::{bip320_reconstruct_rolled_version, parse_bm1362_serial_nonce};
 use dcentrald_asic::drivers::bm1362::{
     build_serial_work_frame, decode_pll_reg_to_freq, jig_pll1_reclock_regs, pll_lookup_extended,
     pll_ramp_sequence as bm1362_pll_ramp_sequence, BM1362_INIT_PLAN, PLL_LOCK_BIT,
 };
 use dcentrald_asic::drivers::MiningWork as AsicMiningWork;
+use dcentrald_asic::voltage_rail_adapters::Pic0x89VoltageRail;
+use dcentrald_common::{
+    apply_safety_action, bm1397plus_addr_interval, energize_voltage_rail,
+    plan_bm1397plus_chain_inactive_burst, plan_bm1397plus_set_address_ladder,
+    plan_hot_start_baud_wake_ladder, plan_hot_start_hybrid_wake_ops,
+    plan_misc_ctrl_triple_write_broadcast, plan_misc_ctrl_triple_write_chip, plan_serial_bring_up,
+    safe_off_voltage_rail, ChainTransportKind, ControllerHeartbeatObservation,
+    DispatchRevocationCause, HeartbeatRequirement, HotStartHostClass, MultiChainEnableAuthority,
+    PowerCut, SafetyAction, SerialBringUpPlanParams, SerialBringUpPluginKind,
+    SerialWorkBookkeeping, StaggerConfig, ThermalSafetyState, TransportOp, VoltageRail,
+    WatchdogSafetyState, WorkDispatchAdmissionReceipt, WorkDispatchLifecycle,
+    WorkDispatchSafetyError, WorkDispatchSafetyInputs, HOT_START_POST_LADDER_SETTLE_MS,
+};
 use dcentrald_hal::board_control::BoardControl;
 use dcentrald_hal::fpga_chain::{self, DevmemFpgaChain, FpgaChain};
 use dcentrald_hal::platform::{
     bind_am2_hashboard_presence, discover_am2_controller_endpoint,
-    discover_system_am2_controller_plan, Am2HashboardPresence, VoltageControllerEndpoint,
+    discover_system_am2_controller_plan, Am2HashboardPresence, HardwareMutationGate,
+    HardwareMutationGateOwner, VoltageControllerEndpoint,
 };
+use dcentrald_hal::transport_op_execute::execute_transport_op_bm1397plus;
 use dcentrald_hal::xadc::Xadc;
 // W13.B1 (2026-05-10) merged glitch_monitor + uart_relay imports below.
 use dcentrald_hal::i2c::{
@@ -96,22 +119,25 @@ use dcentrald_hal::i2c::{
     I2cServiceHandle, I2cTransactionStep,
 };
 use dcentrald_hal::psu::Apw121215a;
+use dcentrald_hal::psu_gpio_gate::PsuGpioSafeOffReceipt;
 // PsuGpioGate is now owned by `Apw121215a` and asserted automatically
 // inside `cold_boot_sequence_gated` / `cold_boot_sequence_write_only`
 // when `set_psu_gate_spec` has been called. The explicit hybrid-side
-// assert/deassert call sites have been removed; deassertion happens
-// when the `Arc<Mutex<Apw121215a>>` is dropped at function scope-end
-// (after the heartbeat thread join). See
+// assert/deassert call sites have been removed. Terminal hybrid shutdown now
+// drives the owned gate to OFF with readback and retires its later scoped
+// restoration before software-watchdog closeout; Drop remains the fallback on
+// early-return paths. See
 //  and `Apw121215a::Drop`.
 //
 // `PsuBypassGate` is the Phase-0 alternative used *instead of* `Apw121215a`
-// when `[power.psu_override].enabled` is set (the "Loki bypass" — a non-smart
+// when `[power.psu_override].enabled` is set (the "Loki bypass" Ã¢â‚¬â€ a non-smart
 // PSU like an APW3 @ ~12.8 V): it owns the same `PWR_CONTROL` line, performs
-// no I²C, and records the operator-declared PSU model + rail voltage. The two
+// no IÃ‚Â²C, and records the operator-declared PSU model + rail voltage. The two
 // are mutually exclusive on a given unit. See
 // .
 use dcentrald_hal::psu_bypass_gate::PsuBypassGate;
 use dcentrald_hal::serial_chain::SerialChainBackend;
+use dcentrald_hal::HalError;
 // W13.B1 (2026-05-10): renamed from `uart_relay::{chain_relay_offset, UartRelay,
 // RELAY_ENABLE_VALUE}`. The `0x43D000xx` window is a Braiins-am2 diagnostic
 // mirror, NOT control. R6-7 keeps the BM1362 ASIC-side 0x2C/0x34 candidate
@@ -129,19 +155,143 @@ use dcentrald_asic::dspic::{
 use crate::config::DcentraldConfig;
 
 const HW_DIFFICULTY: u64 = 256;
+const S19J_HYBRID_WATCHDOG_BRINGUP_GRACE: Duration = Duration::from_secs(180);
+const S19J_HYBRID_API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 2^32 — the per-nonce hash-space constant. A single share at difficulty `d`
+// ---------------------------------------------------------------------------
+// Work-dispatch safety (shared pure policy Ã¢â€ â€™ hybrid adapter)
+// ---------------------------------------------------------------------------
+
+/// Map hybrid bring-up observations into the shared
+/// [`WorkDispatchSafetyInputs`] matrix.
+///
+/// Pure and host-testable: the hybrid engine must not invent a second
+/// admission matrix. Lifecycle latch owns the terminal revoke bit.
+pub(crate) fn hybrid_work_dispatch_inputs(
+    soc_watchdog: WatchdogSafetyState,
+    heartbeat_requirement: HeartbeatRequirement,
+    controller_heartbeats: &[ControllerHeartbeatObservation],
+    thermal: ThermalSafetyState,
+) -> WorkDispatchSafetyInputs {
+    WorkDispatchSafetyInputs {
+        watchdog: soc_watchdog,
+        heartbeat_requirement,
+        controllers: controller_heartbeats.to_vec(),
+        thermal,
+        previously_revoked: false,
+    }
+}
+
+/// Hybrid SoC watchdog contribution after pre-energize ownership.
+///
+/// Hybrid `S19jHybridSafetyAdmission::start` requires an armed watchdog when
+/// the config enables it (`require_armed`). When config disables the WDT the
+/// start path refuses; callers that reach mining with a disabled config map
+/// to [`WatchdogSafetyState::DisabledByConfiguration`] only for host tests of
+/// that matrix corner.
+pub(crate) fn hybrid_watchdog_safety_state(
+    config_enabled: bool,
+    mining_enter_succeeded: bool,
+) -> WatchdogSafetyState {
+    match (config_enabled, mining_enter_succeeded) {
+        (false, _) => WatchdogSafetyState::DisabledByConfiguration,
+        (true, true) => WatchdogSafetyState::Armed,
+        (true, false) => WatchdogSafetyState::NotPositivelyAdmitted,
+    }
+}
+
+/// Thermal pillar for hybrid after the pre-stratum hard proof (or lab skip).
+///
+/// - Supervisor present and pre-stratum poll passed Ã¢â€ â€™ [`ThermalSafetyState::Ready`]
+/// - Supervisor skipped via lab override Ã¢â€ â€™ Ready (operator accepted residual;
+///   runtime still has no supervisor Ã¢â‚¬â€ same honesty class as stock residual)
+/// - Supervisor required but missing Ã¢â€ â€™ [`ThermalSafetyState::NotReady`]
+pub(crate) fn hybrid_thermal_safety_state(
+    supervisor_present: bool,
+    lab_skip_override: bool,
+) -> ThermalSafetyState {
+    if supervisor_present || lab_skip_override {
+        ThermalSafetyState::Ready
+    } else {
+        ThermalSafetyState::NotReady
+    }
+}
+
+/// Heartbeat requirement + observations for hybrid PIC custody.
+///
+/// Passthrough inherits voltage watchdog from prior firmware Ã¢â€ â€™ no PIC HB.
+/// Non-passthrough requires same-cycle observations for every active PIC.
+pub(crate) fn hybrid_heartbeat_inputs(
+    passthrough: bool,
+    selected_pic_addr: u8,
+    selected_heartbeat_ok: bool,
+    additional_pic_ok: &[(u8, bool)],
+    cycle_id: u64,
+) -> (HeartbeatRequirement, Vec<ControllerHeartbeatObservation>) {
+    if passthrough {
+        return (HeartbeatRequirement::NoneRequired, Vec::new());
+    }
+    let mut controllers = vec![ControllerHeartbeatObservation {
+        controller_id: selected_pic_addr,
+        heartbeat_ok: selected_heartbeat_ok,
+        cycle_id,
+    }];
+    for &(addr, ok) in additional_pic_ok {
+        controllers.push(ControllerHeartbeatObservation {
+            controller_id: addr,
+            heartbeat_ok: ok,
+            cycle_id,
+        });
+    }
+    (HeartbeatRequirement::AllControllersSameCycle, controllers)
+}
+
+/// Admit standard work dispatch on the hybrid lifecycle latch.
+///
+/// Call **before** FPGA WORK_TX or serial-work-dispatch frames.
+pub(crate) fn hybrid_admit_standard_work_dispatch<'a>(
+    life: &'a mut WorkDispatchLifecycle,
+    inputs: &WorkDispatchSafetyInputs,
+) -> Result<&'a WorkDispatchAdmissionReceipt, WorkDispatchSafetyError> {
+    life.admit(inputs)
+}
+
+/// Terminal revoke for the hybrid lifecycle (HB miss, thermal, operator stop).
+pub(crate) fn hybrid_revoke_work_dispatch(
+    life: &mut WorkDispatchLifecycle,
+    cause: DispatchRevocationCause,
+    profile_max_pwm: u8,
+) -> (SafetyAction, bool) {
+    life.revoke(cause, profile_max_pwm)
+}
+
+/// Revoke hybrid work dispatch and honor `stop_feed` by terminally closing the
+/// SoC WDT feed gate (stock parity — mid-run revoke must stop kicks immediately).
+pub(crate) fn hybrid_revoke_and_stop_watchdog_feed(
+    life: &mut WorkDispatchLifecycle,
+    cause: DispatchRevocationCause,
+    profile_max_pwm: u8,
+    feed_stop: &WatchdogFeedStopSignal,
+) -> SafetyAction {
+    let (action, stop_feed) = hybrid_revoke_work_dispatch(life, cause, profile_max_pwm);
+    if stop_feed {
+        feed_stop.close_terminal_lock_free();
+    }
+    action
+}
+
+/// 2^32 Ã¢â‚¬â€ the per-nonce hash-space constant. A single share at difficulty `d`
 /// represents `d * 2^32` expected hashes (`feedback`/serial_mining.rs parity).
 const TWO_POW_32: f64 = 4_294_967_296.0;
 
 /// AT-DASH (2026-06-14): additive, fail-closed pool-share accounting shared
 /// between the Stratum status-handler task (writer) and the am2 mining loops
 /// (reader). All fields are lock-free atomics so neither the status handler nor
-/// the hot mining loop can ever block on the other — a publish/counter error
+/// the hot mining loop can ever block on the other Ã¢â‚¬â€ a publish/counter error
 /// must NEVER slow or stall mining.
 ///
 /// `achieved_difficulty_milli_sum` accumulates the *achieved* (locally proven)
-/// difficulty of every accepted share scaled ×1000 (so we can sum into a u64
+/// difficulty of every accepted share scaled Ãƒâ€”1000 (so we can sum into a u64
 /// without floats), which lets the dashboard hashrate estimate use real
 /// per-share difficulty rather than a flat diff-256 nonce count. When a pool
 /// reports no achieved difficulty for a share, the share still counts toward
@@ -154,11 +304,11 @@ struct Am2ShareAccounting {
     /// Total pool-rejected shares.
     rejected: AtomicU64,
     /// Sum of achieved (locally proven) difficulty across accepted shares,
-    /// scaled ×1000 and rounded so it fits a `u64` with milli-precision.
+    /// scaled Ãƒâ€”1000 and rounded so it fits a `u64` with milli-precision.
     achieved_difficulty_milli_sum: AtomicU64,
     /// Unix-ms timestamp of the most recent accepted share (0 = none yet).
     last_share_at_ms: AtomicU64,
-    /// Most recent pool target difficulty (×1000), for the pool tile.
+    /// Most recent pool target difficulty (Ãƒâ€”1000), for the pool tile.
     pool_difficulty_milli: AtomicU64,
 }
 
@@ -216,7 +366,7 @@ impl Am2ShareAccounting {
     }
 
     /// Real hashrate estimate in GH/s from the accepted-share *achieved*
-    /// difficulty accumulated since `since`. `H/s = Σd · 2^32 / elapsed_s`,
+    /// difficulty accumulated since `since`. `H/s = ÃŽÂ£d Ã‚Â· 2^32 / elapsed_s`,
     /// then `/1e9` for GH/s. Returns 0 for a zero/negative window.
     fn hashrate_ghs_since(&self, since: Instant) -> f64 {
         let elapsed = since.elapsed().as_secs_f64();
@@ -228,7 +378,7 @@ impl Am2ShareAccounting {
 
     /// MINE-LIFE-2: REAL recent-window hashrate (GH/s) from the achieved-
     /// difficulty accrued since the previous tick snapshot `prev_achieved_sum`
-    /// over `window_s` seconds. This is the HONEST "current"/5 s tile value —
+    /// over `window_s` seconds. This is the HONEST "current"/5 s tile value Ã¢â‚¬â€
     /// distinct from the cumulative lifetime average `hashrate_ghs_since`, which
     /// keeps showing a healthy number long after a chain has stalled. Returns 0
     /// for a non-positive window (the caller falls back to the cumulative figure
@@ -247,11 +397,11 @@ impl Am2ShareAccounting {
 /// hashrate tile. The per-tick achieved-difficulty delta is ZERO on the many
 /// 5 s ticks BETWEEN a sparse eco unit's accepted shares (a healthy ~1 TH/s @
 /// ~50 MHz unit lands a share only every ~10-60 s), so a single-tick 5 s window
-/// flickered to 0 GH/s while the unit was mining normally — the very distrust
+/// flickered to 0 GH/s while the unit was mining normally Ã¢â‚¬â€ the very distrust
 /// the truthfulness work exists to prevent. A wide rolling window almost always
 /// contains a recent share, so the tile stays a STABLE non-zero value; it is
 /// short enough to still decay to ~0 within ~a minute of a genuine sustained
-/// stall. Telemetry only — never a control input.
+/// stall. Telemetry only Ã¢â‚¬â€ never a control input.
 const AM2_RECENT_HASHRATE_WINDOW_S: f64 = 60.0;
 
 /// MINE-LIFE-2 (eco-stable): pick the rolling recent-window baseline for the
@@ -261,12 +411,12 @@ const AM2_RECENT_HASHRATE_WINDOW_S: f64 = 60.0;
 /// (front = largest age); `horizon_s` is the rolling window length. Returns
 /// `(span_s, baseline_sum)` to hand to `Am2ShareAccounting::hashrate_ghs_window`
 /// (which still credits ONLY the achieved-difficulty delta since `baseline_sum`,
-/// so this is a REAL measured value over a wider window — NOT the
+/// so this is a REAL measured value over a wider window Ã¢â‚¬â€ NOT the
 /// cumulative-since-boot average that was the original bug). The baseline is the
 /// NEWEST prior snapshot still at least `horizon_s` old (so the window spans the
 /// full horizon once that much history exists), or the OLDEST retained snapshot
 /// before that much history accrues. `None` only when `history` is empty (the
-/// first tick — no prior window yet) so the caller can show the cumulative
+/// first tick Ã¢â‚¬â€ no prior window yet) so the caller can show the cumulative
 /// figure exactly once.
 fn am2_rolling_window_baseline(history: &[(f64, f64)], horizon_s: f64) -> Option<(f64, f64)> {
     let mut baseline: Option<(f64, f64)> = None;
@@ -275,7 +425,7 @@ fn am2_rolling_window_baseline(history: &[(f64, f64)], horizon_s: f64) -> Option
             baseline = Some((age_s, sum));
         } else {
             // `history` is oldest-first (ages descending), so once a snapshot is
-            // younger than the horizon every later one is too — stop scanning.
+            // younger than the horizon every later one is too Ã¢â‚¬â€ stop scanning.
             break;
         }
     }
@@ -295,7 +445,7 @@ const S19J_HYBRID_CHIP_RAIL_TARGET_MV: u16 = 13_700;
 /// `DCENT_AM2_OPEN_CORE_MV` into `[S19J_HYBRID_CHIP_RAIL_TARGET_MV,
 /// S19J_OPEN_CORE_MAX_MV]`. NOTE: the dsPIC service still enforces the
 /// `DSPIC_VOLTAGE_HARD_CAP_MV` 14500 mV input clamp unless
-/// `DCENT_AM2_ALLOW_LAB_OVERVOLT=1` lifts it — so anything above 14500 is
+/// `DCENT_AM2_ALLOW_LAB_OVERVOLT=1` lifts it Ã¢â‚¬â€ so anything above 14500 is
 /// SILENTLY clamped down at the rail boundary without the lab over-volt flag.
 const S19J_OPEN_CORE_MAX_MV: u16 = 15_140;
 
@@ -303,7 +453,7 @@ const AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS_ENV: &str = "DCENT_AM2_VOLTAGE_ENABLE_A
 
 /// One admitted rail target for the whole open-core experiment lifetime.
 ///
-/// Resolving this once before each hashboard rail mutation prevents environment
+/// Resolving this once before the first hashboard rail mutation prevents environment
 /// changes or duplicated gate logic from selecting a different demotion policy
 /// after the elevated rail has already been applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,14 +507,16 @@ const fn admit_open_core_rail_plan(
     })
 }
 
-// Distinct clamp conditions intentionally share the `1` result; keeping them
-// as separate arms documents each reason the budget floors to one attempt.
-#[allow(clippy::if_same_then_else)]
 const fn am2_hb_reset_attempt_budget(
     faithful_retry_enabled: bool,
     requested_attempts: u8,
     elevated_rail: bool,
 ) -> u8 {
+    // clippy::if_same_then_else: the arms agree ON PURPOSE. "elevated rail or
+    // retry disabled" and "caller asked for < 1 attempt" are different reasons to
+    // land on a single attempt, and each is independently meaningful at a call
+    // site. Merging them would erase why a 1 was chosen.
+    #[allow(clippy::if_same_then_else)]
     if elevated_rail || !faithful_retry_enabled {
         1
     } else if requested_attempts < 1 {
@@ -420,7 +572,48 @@ fn parse_gpio_number_spec(spec: Option<&str>) -> Option<u32> {
     }
 }
 
-pub fn force_pwr_control_low_checked(spec: Option<&str>, reason: &str) -> Result<()> {
+struct PreparedPwrControlCut {
+    gpio: u32,
+    active_low: bool,
+    value_path: String,
+    off_value: &'static str,
+}
+
+impl PreparedPwrControlCut {
+    fn write_checked(self, reason: &str) -> Result<()> {
+        fs::write(&self.value_path, self.off_value).with_context(|| {
+            format!(
+                "AM2 home hard-stop failed to force gpio{} PWR_CONTROL to the OFF level",
+                self.gpio
+            )
+        })?;
+        let readback = fs::read_to_string(&self.value_path)
+            .map(|v| v.trim().to_string())
+            .with_context(|| {
+                "AM2 home hard-stop could not read back PWR_CONTROL after OFF write"
+            })?;
+        if readback != self.off_value {
+            anyhow::bail!(
+                "AM2 home hard-stop PWR_CONTROL readback mismatch after OFF write: gpio{} active_low={} expected={} readback={}",
+                self.gpio,
+                self.active_low,
+                self.off_value,
+                readback
+            );
+        }
+        info!(
+            gpio = self.gpio,
+            reason,
+            active_low = self.active_low,
+            off_value = self.off_value,
+            readback,
+            "AM2 home hard-stop forced PWR_CONTROL to the OFF level (readback confirmed)"
+        );
+        Ok(())
+    }
+}
+
+fn prepare_pwr_control_cut(spec: Option<&str>, reason: &str) -> Result<PreparedPwrControlCut> {
     let Some(gpio) = parse_gpio_number_spec(spec) else {
         anyhow::bail!(
             "AM2 home hard-stop could not parse pwr_control_gpio {:?}; PWR_CONTROL not forced low",
@@ -453,37 +646,20 @@ pub fn force_pwr_control_low_checked(spec: Option<&str>, reason: &str) -> Result
     // 2026-06-07 (.25 active-LOW PWR_CONTROL): writing "0" is the CUT-POWER
     // action only on an active-HIGH line. On `a lab unit` gpio907 is ACTIVE-LOW
     // (RE-018 true-cold strace: "0"=rail ON, "1"=rail OFF), so the hard-stop
-    // must write "1" to actually de-energize — writing "0" here would ENERGIZE
+    // must write "1" to actually de-energize Ã¢â‚¬â€ writing "0" here would ENERGIZE
     // the rail during a safety teardown on the operator's HOME unit. Gate on
-    // DCENT_AM2_PWR_CONTROL_ACTIVE_LOW (default-OFF → fleet unchanged).
+    // DCENT_AM2_PWR_CONTROL_ACTIVE_LOW (default-OFF Ã¢â€ â€™ fleet unchanged).
     let off_value = if active_low { "1" } else { "0" };
-    fs::write(&value_path, off_value).with_context(|| {
-        format!(
-            "AM2 home hard-stop failed to force gpio{} PWR_CONTROL to the OFF level",
-            gpio
-        )
-    })?;
-    let readback = fs::read_to_string(&value_path)
-        .map(|v| v.trim().to_string())
-        .with_context(|| "AM2 home hard-stop could not read back PWR_CONTROL after OFF write")?;
-    if readback != off_value {
-        anyhow::bail!(
-            "AM2 home hard-stop PWR_CONTROL readback mismatch after OFF write: gpio{} active_low={} expected={} readback={}",
-            gpio,
-            active_low,
-            off_value,
-            readback
-        );
-    }
-    info!(
+    Ok(PreparedPwrControlCut {
         gpio,
-        reason,
         active_low,
+        value_path,
         off_value,
-        readback,
-        "AM2 home hard-stop forced PWR_CONTROL to the OFF level (readback confirmed)"
-    );
-    Ok(())
+    })
+}
+
+pub fn force_pwr_control_low_checked(spec: Option<&str>, reason: &str) -> Result<()> {
+    prepare_pwr_control_cut(spec, reason)?.write_checked(reason)
 }
 
 fn am2_pwr_control_active_low_for_gpio(gpio: u32) -> Result<bool> {
@@ -542,7 +718,9 @@ fn am2_wave56_override_runtime_preflight(config: &DcentraldConfig) -> Result<()>
         );
     }
     if !config.pool.worker.to_ascii_lowercase().contains("xil") {
-        anyhow::bail!("Wave56 .25 proof run requires [pool].worker to include xil for attribution");
+        anyhow::bail!(
+            "Wave56 .25 proof run requires [pool].worker to include xil for attribution"
+        );
     }
     if config.pool.failover1.is_some()
         || config.pool.failover2.is_some()
@@ -594,7 +772,7 @@ fn am2_wave56_override_runtime_preflight(config: &DcentraldConfig) -> Result<()>
     // resolver defaults to /dev/ttyS2. The only chain that has EVER enumerated on
     // `a lab unit` is /dev/ttyS1 (). A direct launch with serial_device
     // unset/wrong selects ttyS2/ttyS3 and is a guaranteed enum=0 that looks like
-    // chip-wake failure but is transport-selection error — the exact ambiguity a
+    // chip-wake failure but is transport-selection error Ã¢â‚¬â€ the exact ambiguity a
     // decisive proof run must eliminate. `.first()` mirrors the runtime's own
     // selection (resolved_serial_devices(..).first()).
     if config
@@ -622,13 +800,34 @@ pub fn force_pwr_control_low(spec: Option<&str>, reason: &str) {
     }
 }
 
+/// Open the AM2 fan-control block with an EXPLICIT board-mode policy.
+///
+/// The policy is a parameter, not a constant, because the callers of this
+/// helper do not all carry the same product evidence:
+///
+///   * The in-`run()` bring-up sites (Phase 0b / Phase 2c) are reached only on
+///     the board-target-gated AM2 S19j-family hybrid route Ã¢â‚¬â€ the exact evidence
+///     base for the C49 -> C52 `board-control +0x04` write (operator-confirmed
+///     live on `a lab unit`, 2026-05-21). Those pass `EnableC52`.
+///   * `force_am2_fans_to_configured_cap` and the module-external
+///     `force_am2_fans_to_quiet_idle` are gated by callers only on the
+///     `zynq-bm3-am2` platform marker, which the am2-s17pro image also writes.
+///     They therefore carry NO product identity and must pass `Preserve` Ã¢â‚¬â€
+///     `main.rs` documents "S17 and ambiguous identities preserve the current
+///     board mode", and `ZynqVariant::S17` maps to `Am2FanModePolicy::Preserve`
+///     because S17's `+0x04` semantics are unproven. Those paths lose nothing:
+///     on a genuine S19j unit the bring-up sites above already established C52.
+///
+/// Letting the four-tach *layout* imply board-mode *mutation authority* is the
+/// exact inference this change-set bans in `fan.rs` and `zynq.rs`.
 fn open_am2_fan_controller(
     reason: &str,
+    mode_policy: dcentrald_hal::fan::Am2FanModePolicy,
 ) -> Option<(
     dcentrald_hal::fan::FanUioDiscovery,
     dcentrald_hal::fan::FanController,
 )> {
-    match dcentrald_hal::fan::FanController::open_discovered() {
+    match dcentrald_hal::fan::FanController::open_discovered_with_mode_policy(mode_policy) {
         Ok((discovery, fan)) => {
             if !matches!(discovery.variant, dcentrald_hal::fan::FanVariant::Am2Uio16) {
                 warn!(
@@ -655,11 +854,11 @@ fn open_am2_fan_controller(
 /// Truthful AM2 fan tach for the dashboard: read-only fan-controller open with
 /// the `Am2Uio16` variant (all 4 tach channels) WITHOUT the board-control C52
 /// write. Uses `new_with_variant` (NOT `open_with_variant`) so it only mmaps +
-/// reads — the C52 fan mode is already set at cold boot, so no board-control
+/// reads Ã¢â‚¬â€ the C52 fan mode is already set at cold boot, so no board-control
 /// poke is needed. Returns the max per-fan rpm, or 0 if the fan UIO can't be
 /// read. This replaces a hardcoded `rpm: 0` in the standalone status publish
 /// (which the dashboard misreads as a STOPPED fan while mining, a false alarm).
-/// Telemetry ONLY — it never writes a PWM/board-control register (no fan command).
+/// Telemetry ONLY Ã¢â‚¬â€ it never writes a PWM/board-control register (no fan command).
 fn am2_read_fan_rpm_max() -> u32 {
     let Some(disc) = dcentrald_hal::fan::discover_fan_uio() else {
         return 0;
@@ -679,11 +878,11 @@ fn am2_read_fan_rpm_max() -> u32 {
 }
 
 fn force_am2_fans_to_configured_cap(fan_max_pwm: u8, reason: &str) {
-    // Policy chokepoint: FanCommand intersects profile max ∩ home safety (30).
+    // Policy chokepoint: FanCommand intersects profile max Ã¢Ë†Â© home safety (30).
     let cap = dcentrald_common::FanCommand::emergency_cap(fan_max_pwm)
         .effective_pwm()
         .min(dcentrald_hal::fan::PWM_MAX);
-    match open_am2_fan_controller(reason) {
+    match open_am2_fan_controller(reason, dcentrald_hal::fan::Am2FanModePolicy::Preserve) {
         Some((discovery, fan)) => {
             fan.set_speed(cap);
             let (commanded_pwm0, commanded_pwm1) = fan.get_speed_pwm_channels();
@@ -713,27 +912,86 @@ fn force_am2_fans_to_configured_cap(fan_max_pwm: u8, reason: &str) {
 }
 
 fn force_am2_home_hard_stop(config: &DcentraldConfig, reason: &str) {
-    // Order matters for home use: remove hashboard power first, then leave the
-    // fan command at idle. PWM 30 is for uncertain powered/thermal state; once
-    // PWR_CONTROL is low, the last writer should not be the louder cap.
-    force_pwr_control_low(config.psu.pwr_control_gpio.as_deref(), reason);
-    force_am2_fans_to_quiet_idle(
-        config.thermal.fan_idle_pwm,
-        config.thermal.fan_max_pwm,
-        reason,
-    );
+    // P1-6: execute pure SafetyAction steps (cut-hash-before-noise), not ad-hoc order.
+    // Park uses quiet idle after power cut (not the louder emergency fan cap).
+    let action = PowerCut::home_panic_park_action(config.thermal.fan_max_pwm);
+    let idle = config.thermal.fan_idle_pwm;
+    let max_pwm = config.thermal.fan_max_pwm;
+    let gpio = config.psu.pwr_control_gpio.as_deref();
+    match apply_safety_action(
+        action,
+        |_cut| {
+            force_pwr_control_low(gpio, reason);
+            Ok::<(), ()>(())
+        },
+        |_pwm| {
+            // Quiet park: honor idle setpoint under home cap (not emergency cap PWM).
+            force_am2_fans_to_quiet_idle(idle, max_pwm, reason);
+            Ok(())
+        },
+    ) {
+        Ok(report) => info!(
+            reason,
+            steps = report.steps_attempted,
+            cut = report.cut_power_applied,
+            "AM2 home hard-stop applied via SafetyAction (P1-6)"
+        ),
+        Err((report, _)) => error!(
+            reason,
+            steps = report.steps_attempted,
+            "AM2 home hard-stop SafetyAction callback failed"
+        ),
+    }
+}
+
+/// Dispatch synchronous sysfs/UIO terminal I/O away from Tokio workers. A
+/// failed join is negative shutdown evidence; the PIC/PSU watchdog remains the
+/// independent cutoff backstop.
+async fn force_am2_home_hard_stop_blocking(config: &DcentraldConfig, reason: &str) -> bool {
+    let config = config.clone();
+    let reason = reason.to_string();
+    match tokio::task::spawn_blocking(move || force_am2_home_hard_stop(&config, &reason)).await {
+        Ok(()) => true,
+        Err(join_error) => {
+            error!(
+                error = %join_error,
+                "AM2 terminal hard-stop worker failed; retaining watchdog fallback"
+            );
+            false
+        }
+    }
 }
 
 fn force_am2_thermal_hard_stop(config: &DcentraldConfig, reason: &str) {
-    // Measured thermal failure is different from a normal park/no-nonce stop:
-    // cut hashboard power first, then keep the home safety cooling cap instead
-    // of immediately dropping to idle.
-    // Policy order is `PowerCut::home_thermal_hard_stop_action` (cut then fans).
-    let _policy =
-        dcentrald_common::PowerCut::home_thermal_hard_stop_action(config.thermal.fan_max_pwm);
-    debug_assert!(dcentrald_common::power_precedes_fan_raise(&_policy.steps()));
-    force_pwr_control_low(config.psu.pwr_control_gpio.as_deref(), reason);
-    force_am2_fans_to_configured_cap(config.thermal.fan_max_pwm, reason);
+    // Measured thermal failure: cut hashboard power first, then home safety
+    // cooling cap (never industrial blast). P1-6 executes SafetyAction steps.
+    let action = PowerCut::home_thermal_hard_stop_action(config.thermal.fan_max_pwm);
+    debug_assert!(dcentrald_common::power_precedes_fan_raise(&action.steps()));
+    let max_pwm = config.thermal.fan_max_pwm;
+    let gpio = config.psu.pwr_control_gpio.as_deref();
+    match apply_safety_action(
+        action,
+        |_cut| {
+            force_pwr_control_low(gpio, reason);
+            Ok::<(), ()>(())
+        },
+        |_pwm| {
+            force_am2_fans_to_configured_cap(max_pwm, reason);
+            Ok(())
+        },
+    ) {
+        Ok(report) => info!(
+            reason,
+            steps = report.steps_attempted,
+            fan_pwm = ?report.fan_pwm_applied,
+            "AM2 thermal hard-stop applied via SafetyAction (P1-6)"
+        ),
+        Err((report, _)) => error!(
+            reason,
+            steps = report.steps_attempted,
+            "AM2 thermal hard-stop SafetyAction callback failed"
+        ),
+    }
 }
 
 /// Pure PWM computation for the am2 low-idle command setpoint.
@@ -756,22 +1014,22 @@ fn compute_quiet_idle_pwm(idle_pwm: u8, fan_max_pwm: u8) -> u8 {
 /// am2 low-idle fan setter for the management-only park paths.
 ///
 /// This is the SAME command mechanism as the hard-stop's
-/// `force_am2_fans_to_configured_cap` — the uio16-mmap `FanController`
+/// `force_am2_fans_to_configured_cap` Ã¢â‚¬â€ the uio16-mmap `FanController`
 /// (: devmem is a
-/// no-op on the am2 UIO-bound fan IP) — just with a LOWER setpoint for a
+/// no-op on the am2 UIO-bound fan IP) Ã¢â‚¬â€ just with a LOWER setpoint for a
 /// parked, non-mining unit. It does NOT replace, reorder, or weaken the
 /// hard-stop (which keeps its own `fan_max_pwm`/30 setpoint); it is a
 /// separate, additional, strictly-lower park setpoint.
 ///
 /// PWM is only ever driven DOWN (see `compute_quiet_idle_pwm`). A
-/// `FanController` open failure is tolerated with a `tracing::warn!` — the
+/// `FanController` open failure is tolerated with a `tracing::warn!` Ã¢â‚¬â€ the
 /// park must not panic/abort just because the fan device couldn't be opened
 /// (the PIC/PSU watchdog and the run-scope hard-stop guard remain the safety
 /// nets; this is a low-PWM command on an already-safe-off unit, not proof of
 /// acoustic quiet without tach/RPM/operator confirmation).
 pub fn force_am2_fans_to_quiet_idle(idle_pwm: u8, fan_max_pwm: u8, reason: &str) {
     let pwm = compute_quiet_idle_pwm(idle_pwm, fan_max_pwm);
-    match open_am2_fan_controller(reason) {
+    match open_am2_fan_controller(reason, dcentrald_hal::fan::Am2FanModePolicy::Preserve) {
         Some((discovery, fan)) => {
             fan.set_speed(pwm);
             let (commanded_pwm0, commanded_pwm1) = fan.get_speed_pwm_channels();
@@ -798,18 +1056,18 @@ pub fn force_am2_fans_to_quiet_idle(idle_pwm: u8, fan_max_pwm: u8, reason: &str)
         None => warn!(
             pwm,
             reason,
-            "AM2 low-idle: could not open fan controller — fans left at \
+            "AM2 low-idle: could not open fan controller Ã¢â‚¬â€ fans left at \
              current state (PIC/PSU watchdog + hard-stop guard remain the \
              safety nets; park continues)"
         ),
     }
 }
 
-/// SAFE-TEARDOWN — Phase 3A AC-cycle-elimination. **Default-ON** (CE-010 /
+/// SAFE-TEARDOWN Ã¢â‚¬â€ Phase 3A AC-cycle-elimination. **Default-ON** (CE-010 /
 /// RE-003 / PERF-008); opt OUT with `DCENT_AM2_SAFE_TEARDOWN=0`.
 ///
 /// The clean-stop teardown walks chip rail to floor + pulses HBx_RESET + waits
-/// 1.5 s for rail decay BEFORE deasserting PWR_CONTROL — leaving the chain in a
+/// 1.5 s for rail decay BEFORE deasserting PWR_CONTROL Ã¢â‚¬â€ leaving the chain in a
 /// state the next `dcentrald` launch can re-init in software, eliminating the
 /// operator AC-cycle-per-attempt blocker.
 ///
@@ -818,7 +1076,7 @@ pub fn force_am2_fans_to_quiet_idle(idle_pwm: u8, fan_max_pwm: u8, reason: &str)
 /// `disable_voltage`, and never raises fans (the run-scope hard-stop guard
 /// still owns PWR_CONTROL deassert + the PWM-30 cap). It does NOT touch the
 /// cold-boot/mining drive path, so it does not make the daemon push the chip
-/// harder — it only makes a SHUTDOWN cleaner. Per the live-hardware-default
+/// harder Ã¢â‚¬â€ it only makes a SHUTDOWN cleaner. Per the live-hardware-default
 /// principle, strictly-safer-on-failure de-energization MAY default ON.
 ///
 /// Override precedence: an explicit `DCENT_AM2_SAFE_TEARDOWN=0` (off) wins over
@@ -827,7 +1085,7 @@ pub fn force_am2_fans_to_quiet_idle(idle_pwm: u8, fan_max_pwm: u8, reason: &str)
 /// value) the safe teardown runs.
 ///
 /// F4 (AC-cycle root cause;
-/// the F3 citation in this file was historically wrong — Wave D RE-CORPUS-001
+/// the F3 citation in this file was historically wrong Ã¢â‚¬â€ Wave D RE-CORPUS-001
 /// closure fixed it to F4) +
 /// F2 and Phase 3A of the multi-phase plan.
 fn am2_safe_teardown_enabled() -> bool {
@@ -853,11 +1111,11 @@ const fn pic0x89_clean_stop_owner_policy(
     }
 }
 
-/// Phase 3A — graceful chain teardown so the next `dcentrald` launch can
+/// Phase 3A Ã¢â‚¬â€ graceful chain teardown so the next `dcentrald` launch can
 /// re-init the chain in software, eliminating the operator AC-cycle-per-
 /// attempt blocker.
 ///
-/// EE root cause ( F4 —
+/// EE root cause ( F4 Ã¢â‚¬â€
 /// "AC-cycle-per-attempt root cause: electrical state retained across
 /// software teardown"; cited as F3 pre-Wave-D, corrected per RE-CORPUS-001):
 /// the prior teardown skipped the voltage walk + HBx_RESET drain, so the
@@ -867,14 +1125,15 @@ const fn pic0x89_clean_stop_owner_policy(
 /// failure mode from the 2026-05-15 .109 session).
 ///
 /// Sequence:
-///   1. SetVoltage(11500 mV) — walk rail to floor (chips coast down).
-///   2. Sleep 200 ms — let the dsPIC track to the new setpoint.
-///   3. HBx_RESET pulse on slots 0..=3 (20 ms LOW each) — drain rail caps.
-///   4. Sleep 1500 ms — rail-decay window per EE.
-///   5. PIC disable_voltage — formal shutdown.
+///   1. SetVoltage(11500 mV) Ã¢â‚¬â€ walk rail to floor (chips coast down).
+///   2. Sleep 200 ms Ã¢â‚¬â€ let the dsPIC track to the new setpoint.
+///   3. HBx_RESET pulse on slots 0..=3 (20 ms LOW each) Ã¢â‚¬â€ drain rail caps.
+///   4. Sleep 1500 ms Ã¢â‚¬â€ rail-decay window per EE.
+///   5. PIC disable_voltage Ã¢â‚¬â€ formal shutdown.
 ///
-/// Caller is responsible for the final PWR_CONTROL deassert + fan cap —
-/// handled by `Am2HomeHardStopGuard::Drop` (run-scope) or by an explicit
+/// Caller is responsible for the final PWR_CONTROL deassert + fan cap Ã¢â‚¬â€
+/// handled by the `Am2HomeHardStopGuard` run-scope cleanup (queued by Drop on
+/// the terminal-I/O owner) or by an explicit
 /// `force_am2_home_hard_stop` call on the fail-closed path. Hardware-operation
 /// errors remain best-effort because the run-scope hard-stop guard is the final
 /// safety net. Losing a required exact endpoint session returns an error and
@@ -913,27 +1172,33 @@ fn am2_safe_teardown_sequence(
         );
     }
 
-    // Step 1: walk chip rail to floor so the chips coast down rather than
-    // dropping voltage in one step (which leaves more charge on the caps).
+    // Step 1 + 5 (P1-2 VoltageRail): walk floor then disable via Pic0x89VoltageRail.
+    // Caps drain (steps 3–4) still sit between set_mv and disable for hardware
+    // reasons; pure helper `walk_down_and_safe_off` is for unit/host paths only.
+    let trust_degraded = dspic_fw86_trust_degraded_override_enabled();
     let step1_result = match owner_policy {
-        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session
-            .as_deref_mut()
-            .map(|session| session.controller_mut().set_voltage(11500)),
-        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => legacy_controller
-            .as_mut()
-            .map(|controller| controller.set_voltage(11500)),
+        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session.as_deref_mut().map(|session| {
+            let mut rail = Pic0x89VoltageRail::new(session.controller_mut(), trust_degraded);
+            rail.set_mv(11_500)
+        }),
+        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
+            legacy_controller.as_mut().map(|controller| {
+                let mut rail = Pic0x89VoltageRail::new(controller, trust_degraded);
+                rail.set_mv(11_500)
+            })
+        }
         Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => None,
     };
     if let Some(result) = step1_result {
         match result {
             Ok(()) => info!(
                 addr = format_args!("0x{:02X}", pic_addr),
-                "teardown step 1/5: walked chip rail to 11500 mV floor"
+                "teardown step 1/5: walked chip rail to 11500 mV floor (VoltageRail)"
             ),
             Err(e) => warn!(
                 error = %e,
                 addr = format_args!("0x{:02X}", pic_addr),
-                "teardown step 1/5: set_voltage(11500) failed; chips will see a sharp drop instead of a walk"
+                "teardown step 1/5: VoltageRail set_mv(11500) failed; chips will see a sharp drop instead of a walk"
             ),
         }
         // Step 2: small wait for the dsPIC to track to the new setpoint
@@ -944,7 +1209,7 @@ fn am2_safe_teardown_sequence(
         warn!("teardown step 1/5: no PIC service available — skipping voltage walk");
     }
 
-    // Step 3: HBx_RESET pulse all 4 slots — drain rail caps via the chip's
+    // Step 3: HBx_RESET pulse all 4 slots Ã¢â‚¬â€ drain rail caps via the chip's
     // internal reset clamps. Slot mapping isn't guaranteed; pulse all 4
     // (unpopulated slots no-op, populated ones drain).
     // CE-003: discover the board-control UIO by name instead of hardcoding 17.
@@ -965,7 +1230,7 @@ fn am2_safe_teardown_sequence(
         }
         Err(e) => warn!(
             error = %e,
-            "teardown step 3/5: BoardControl::open(uio17) failed — chain caps may not drain"
+            "teardown step 3/5: BoardControl::open(uio17) failed Ã¢â‚¬â€ chain caps may not drain"
         ),
     }
 
@@ -975,27 +1240,31 @@ fn am2_safe_teardown_sequence(
     info!("teardown step 4/5: 1500 ms rail-decay window starting");
     std::thread::sleep(Duration::from_millis(1500));
 
-    // Step 5: formal disable_voltage. By this point chips are coasted +
-    // caps drained; this is the dsPIC bookkeeping more than a power cut.
+    // Step 5: formal rail disable via VoltageRail (P1-2). By this point chips
+    // are coasted + caps drained; this is dsPIC bookkeeping more than a power cut.
     let step5_result = match owner_policy {
-        Pic0x89CleanStopOwnerPolicy::Endpoint => {
-            endpoint_session.map(|session| session.controller_mut().disable_voltage())
+        Pic0x89CleanStopOwnerPolicy::Endpoint => endpoint_session.map(|session| {
+            let mut rail = Pic0x89VoltageRail::new(session.controller_mut(), trust_degraded);
+            safe_off_voltage_rail(&mut rail)
+        }),
+        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
+            legacy_controller.as_mut().map(|controller| {
+                let mut rail = Pic0x89VoltageRail::new(controller, trust_degraded);
+                safe_off_voltage_rail(&mut rail)
+            })
         }
-        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => legacy_controller
-            .as_mut()
-            .map(|controller| controller.disable_voltage()),
         Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => None,
     };
     if let Some(result) = step5_result {
         match result {
             Ok(()) => info!(
                 addr = format_args!("0x{:02X}", pic_addr),
-                "teardown step 5/5: PIC voltage disabled"
+                "teardown step 5/5: PIC voltage disabled (VoltageRail safe_off)"
             ),
             Err(e) => warn!(
                 error = %e,
                 addr = format_args!("0x{:02X}", pic_addr),
-                "teardown step 5/5: PIC disable_voltage failed; rail is already at floor + caps drained"
+                "teardown step 5/5: VoltageRail safe_off failed; rail is already at floor + caps drained"
             ),
         }
     }
@@ -1051,37 +1320,40 @@ fn process_name_running(target: &str) -> bool {
 }
 
 struct Am2HomeHardStopGuard {
+    armed: bool,
     pwr_control_gpio: Option<String>,
     fan_idle_pwm: u8,
     fan_max_pwm: u8,
     /// Optional dsPIC teardown state, armed AFTER the I2C service + chain
     /// topology are known (the guard is constructed at the top of `run()`,
     /// before `i2c0_service` exists). `None` until `arm_dspic_teardown` is
-    /// called → Drop then behaves byte-for-byte like the historical
-    /// PWR_CONTROL-low + fans-only teardown. Once armed, Drop disables
-    /// voltage on EVERY active dsPIC (incl. the effective chain dsPIC 0x22)
-    /// FIRST, then drops PWR_CONTROL + fans — cut-hash-before-noise.
+    /// called Ã¢â€ â€™ queued Drop cleanup behaves byte-for-byte like the historical
+    /// PWR_CONTROL-low + fans-only teardown. Once armed, queued cleanup
+    /// disables voltage on EVERY active dsPIC (incl. the effective chain dsPIC
+    /// 0x22) FIRST, then drops PWR_CONTROL + fans Ã¢â‚¬â€ cut-hash-before-noise.
     ///
     /// `I2cServiceHandle` is a `Clone` wrapper around the service-thread
     /// `SyncSender`, so holding a clone here keeps the service worker alive
     /// until this guard drops. Drop order matters: this guard is constructed
     /// BEFORE `i2c0_service` in `run()`, so by reverse-declaration drop order
-    /// `i2c0_service` drops first — but the worker thread only exits once the
-    /// LAST sender (this clone) is gone, so the dsPIC disable in Drop still
-    /// reaches a live service.
+    /// `i2c0_service` drops first Ã¢â‚¬â€ but the worker thread only exits once the
+    /// LAST sender (this clone, moved into queued cleanup) is gone, so the
+    /// dsPIC disable still reaches a live service after the guard itself drops.
     dspic_service: Option<I2cServiceHandle>,
-    /// Active dsPIC I²C addresses to disable on teardown (e.g. 0x20/0x21/0x22).
+    /// Active dsPIC IÃ‚Â²C addresses to disable on teardown (e.g. 0x20/0x21/0x22).
     dspic_disable_addrs: Vec<u8>,
     /// The selected/primary dsPIC address (gets the firmware hint below).
     selected_pic_addr: u8,
-    /// Observed firmware byte of the selected dsPIC, if known — used only as a
+    /// Observed firmware byte of the selected dsPIC, if known Ã¢â‚¬â€ used only as a
     /// decode hint for the selected address (non-selected addrs auto-detect).
     selected_pic_fw: Option<u8>,
 }
 
 impl Am2HomeHardStopGuard {
     fn new(config: &DcentraldConfig) -> Self {
+        crate::terminal_io_owner::prepare();
         Self {
+            armed: true,
             pwr_control_gpio: config.psu.pwr_control_gpio.clone(),
             fan_idle_pwm: config.thermal.fan_idle_pwm,
             fan_max_pwm: config.thermal.fan_max_pwm,
@@ -1092,13 +1364,40 @@ impl Am2HomeHardStopGuard {
         }
     }
 
+    /// Execute and retire the run-scope fallback on a caller-provided blocking
+    /// thread. Clean shutdown uses this path so it can await physical teardown
+    /// before deriving terminal evidence or disarming the watchdog.
+    fn execute_blocking(&mut self, reason: &'static str) {
+        if !self.armed {
+            return;
+        }
+        if let Some(service) = self.dspic_service.as_ref() {
+            if !self.dspic_disable_addrs.is_empty() {
+                disable_dspic_addrs_best_effort(
+                    service,
+                    &self.dspic_disable_addrs,
+                    self.selected_pic_addr,
+                    self.selected_pic_fw,
+                    reason,
+                );
+            }
+        }
+        force_pwr_control_low(self.pwr_control_gpio.as_deref(), reason);
+        force_am2_fans_to_quiet_idle(self.fan_idle_pwm, self.fan_max_pwm, reason);
+        self.armed = false;
+        self.pwr_control_gpio.take();
+        self.dspic_service.take();
+        self.dspic_disable_addrs.clear();
+        self.selected_pic_fw = None;
+    }
+
     /// Arm the dsPIC-disable leg of the run-scope teardown.
     ///
     /// Called once from `run()` after the single-owner `/dev/i2c-0` service is
     /// up and the active-chain topology + selected dsPIC are resolved, so a
     /// later bare `?` early-return (which skips the explicit clean-stop
     /// teardown) still disables voltage on every active dsPIC instead of
-    /// leaving the chain rail energized — the root cause of the
+    /// leaving the chain rail energized Ã¢â‚¬â€ the root cause of the
     /// "every standalone attempt needs a fresh AC-cycle" iteration tax.
     /// Idempotent-safe to call once; clones the service handle so the worker
     /// stays alive for the Drop.
@@ -1114,6 +1413,15 @@ impl Am2HomeHardStopGuard {
         self.selected_pic_addr = selected_pic_addr;
         self.selected_pic_fw = selected_pic_fw;
     }
+
+    /// A timed-out feeder may still own the serialized controller transport.
+    /// Retain the independent PWR_CONTROL/fan hard stop while preventing Drop
+    /// from issuing new dsPIC traffic into that unresolved ownership domain.
+    fn retain_transport_independent_hard_stop_only(&mut self) {
+        self.dspic_service = None;
+        self.dspic_disable_addrs.clear();
+        self.selected_pic_fw = None;
+    }
 }
 
 impl Drop for Am2HomeHardStopGuard {
@@ -1123,26 +1431,48 @@ impl Drop for Am2HomeHardStopGuard {
         // 0x22) before touching PWR_CONTROL or fans. On a bare `?` early-return
         // the explicit clean-stop teardown never ran, so without this the chain
         // rail stayed energized and the next standalone launch needed an
-        // AC-cycle. When NOT armed (`dspic_service == None` — e.g. an early
+        // AC-cycle. When NOT armed (`dspic_service == None` Ã¢â‚¬â€ e.g. an early
         // return before the I2C service was up, or the passthrough path which
         // never constructs this guard) this leg is a no-op and the teardown is
         // byte-for-byte identical to the historical PWR_CONTROL-low + fans-only
         // behaviour. `disable_voltage` is the same operation already issued on
         // the normal clean-shutdown path, so a redundant disable on clean exit
         // is benign + idempotent. Never raises fans (see below).
-        if let Some(service) = self.dspic_service.as_ref() {
-            if !self.dspic_disable_addrs.is_empty() {
-                disable_dspic_addrs_best_effort(
-                    service,
-                    &self.dspic_disable_addrs,
-                    self.selected_pic_addr,
-                    self.selected_pic_fw,
-                    "run-scope-drop-dspic-disable",
-                );
-            }
+        if !self.armed {
+            return;
         }
-        force_pwr_control_low(self.pwr_control_gpio.as_deref(), "run-scope-drop");
-        force_am2_fans_to_quiet_idle(self.fan_idle_pwm, self.fan_max_pwm, "run-scope-drop");
+        self.armed = false;
+        let dspic_service = self.dspic_service.take();
+        let dspic_disable_addrs = std::mem::take(&mut self.dspic_disable_addrs);
+        let selected_pic_addr = self.selected_pic_addr;
+        let selected_pic_fw = self.selected_pic_fw.take();
+        let pwr_control_gpio = self.pwr_control_gpio.take();
+        let fan_idle_pwm = self.fan_idle_pwm;
+        let fan_max_pwm = self.fan_max_pwm;
+        crate::terminal_io_owner::dispatch("am2-hybrid-drop-hard-stop", move || {
+            if let Some(service) = dspic_service.as_ref() {
+                if !dspic_disable_addrs.is_empty() {
+                    disable_dspic_addrs_best_effort(
+                        service,
+                        &dspic_disable_addrs,
+                        selected_pic_addr,
+                        selected_pic_fw,
+                        "run-scope-drop-dspic-disable",
+                    );
+                }
+            }
+            force_pwr_control_low(pwr_control_gpio.as_deref(), "run-scope-drop");
+            force_am2_fans_to_quiet_idle(fan_idle_pwm, fan_max_pwm, "run-scope-drop");
+        });
+    }
+}
+
+fn retire_am2_home_hard_stop_blocking(
+    mut guard: Option<Am2HomeHardStopGuard>,
+    reason: &'static str,
+) {
+    if let Some(guard) = guard.as_mut() {
+        guard.execute_blocking(reason);
     }
 }
 
@@ -1150,8 +1480,8 @@ impl Drop for Am2HomeHardStopGuard {
 /// cut-hash-before-noise teardown when the daemon panics under
 /// `panic = "abort"` (W24-CRASH-1 / w24-thermal-safety F-1).
 ///
-/// `Am2HomeHardStopGuard::Drop` does NOT run on a `panic = "abort"` build —
-/// the process aborts before any `Drop` impl fires — so the run-scope RAII net
+/// `Am2HomeHardStopGuard::Drop` does NOT run on a `panic = "abort"` build Ã¢â‚¬â€
+/// the process aborts before any `Drop` impl fires Ã¢â‚¬â€ so the run-scope RAII net
 /// is bypassed on a crash. The only remaining backstop is then the ~30 s
 /// hardware PIC/PSU heartbeat watchdog. To make the cut-hash-on-crash guarantee
 /// real again, the am2 hybrid run-scope stashes these teardown parameters into
@@ -1161,8 +1491,8 @@ impl Drop for Am2HomeHardStopGuard {
 /// The fields mirror `Am2HomeHardStopGuard` exactly so the hook performs the
 /// same cut-hash-before-noise sequence the Drop would have. The `String` is
 /// allocated once at arm time (NOT in the hook), so the hook itself only reads
-/// already-resident data — no allocation that could re-panic inside the hook.
-#[derive(Debug, Clone)]
+/// already-resident data Ã¢â‚¬â€ no allocation that could re-panic inside the hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Am2TeardownParams {
     pub pwr_control_gpio: Option<String>,
     pub fan_idle_pwm: u8,
@@ -1174,6 +1504,15 @@ pub struct Am2TeardownParams {
 /// hook does nothing (there is nothing to cut). Set exactly once, the first
 /// time a non-passthrough am2 hybrid run arms its `Am2HomeHardStopGuard`.
 static AM2_TEARDOWN_PARAMS: OnceLock<Am2TeardownParams> = OnceLock::new();
+static AM2_PANIC_TEARDOWN_AUTHORITY: RwLock<bool> = RwLock::new(true);
+
+/// Proof that no panic hook can still be inside, or newly enter, the AM2
+/// hardware teardown path. The write-lock close waits for an already-entered
+/// hook's read guard before returning.
+#[derive(Debug)]
+struct Am2PanicTeardownBarrierReceipt {
+    _private: (),
+}
 
 /// Arm the process-global panic-hook teardown params for the am2 hybrid path.
 ///
@@ -1182,12 +1521,28 @@ static AM2_TEARDOWN_PARAMS: OnceLock<Am2TeardownParams> = OnceLock::new();
 /// `OnceLock::set` only succeeds the first time; subsequent calls are no-ops,
 /// which is correct because every am2 hybrid run uses the same home-capped
 /// teardown parameters from the same config shape.
-pub fn arm_am2_teardown_params(config: &DcentraldConfig) {
-    let _ = AM2_TEARDOWN_PARAMS.set(Am2TeardownParams {
+pub fn arm_am2_teardown_params(config: &DcentraldConfig) -> Result<()> {
+    let authority = AM2_PANIC_TEARDOWN_AUTHORITY
+        .read()
+        .map_err(|_| anyhow::anyhow!("AM2 panic-teardown authority lock is poisoned"))?;
+    if !*authority {
+        anyhow::bail!("AM2 panic-teardown authority was terminally retired by an earlier run");
+    }
+    let requested = Am2TeardownParams {
         pwr_control_gpio: config.psu.pwr_control_gpio.clone(),
         fan_idle_pwm: config.thermal.fan_idle_pwm,
         fan_max_pwm: config.thermal.fan_max_pwm,
-    });
+    };
+    if let Some(existing) = AM2_TEARDOWN_PARAMS.get() {
+        if existing != &requested {
+            anyhow::bail!("AM2 panic-teardown parameters changed within one process lifecycle");
+        }
+        return Ok(());
+    }
+    AM2_TEARDOWN_PARAMS
+        .set(requested)
+        .map_err(|_| anyhow::anyhow!("AM2 panic-teardown parameters raced another owner"))?;
+    Ok(())
 }
 
 /// Read the armed panic-hook teardown params, if any. `None` means no am2
@@ -1201,7 +1556,7 @@ pub fn am2_teardown_params() -> Option<&'static Am2TeardownParams> {
 /// Safe to call from a `std::panic` hook on a `panic = "abort"` build: it reads
 /// the process-global params (no allocation), and if they are armed it (1) cuts
 /// hashboard power FIRST by driving `PWR_CONTROL` low, then (2) commands fans to
-/// quiet idle — the same order, and the same home-capped (`PWM_SAFETY_MAX = 30`)
+/// quiet idle Ã¢â‚¬â€ the same order, and the same home-capped (`PWM_SAFETY_MAX = 30`)
 /// clamp, as `Am2HomeHardStopGuard::Drop`. Never blasts fans: the fan command
 /// goes through `force_am2_fans_to_quiet_idle`, which only ever drives PWM DOWN
 /// (min of idle / fan_max / 30). If params are unset, this is a no-op (the
@@ -1209,15 +1564,29 @@ pub fn am2_teardown_params() -> Option<&'static Am2TeardownParams> {
 /// helpers are swallowed (they only `warn!`/`info!`); there are no `unwrap`s,
 /// no `catch_unwind`, and no allocation in this function's own body.
 pub fn panic_hook_best_effort_teardown() {
+    let Ok(authority) = AM2_PANIC_TEARDOWN_AUTHORITY.read() else {
+        return;
+    };
+    if !*authority {
+        return;
+    }
     if let Some(params) = am2_teardown_params() {
         // Cut hash power FIRST (cut-hash-before-noise), then ensure fans are at
-        // the quiet home idle setpoint — never a blast.
+        // the quiet home idle setpoint Ã¢â‚¬â€ never a blast.
         force_pwr_control_low(params.pwr_control_gpio.as_deref(), "panic-hook");
         force_am2_fans_to_quiet_idle(params.fan_idle_pwm, params.fan_max_pwm, "panic-hook");
     }
 }
 
-/// `DCENT_AM2_SKIP_THERMAL_SUPERVISOR` — lab override that disables the am2
+fn close_am2_panic_teardown_authority() -> Result<Am2PanicTeardownBarrierReceipt> {
+    let mut authority = AM2_PANIC_TEARDOWN_AUTHORITY
+        .write()
+        .map_err(|_| anyhow::anyhow!("AM2 panic-teardown authority lock is poisoned"))?;
+    *authority = false;
+    Ok(Am2PanicTeardownBarrierReceipt { _private: () })
+}
+
+/// `DCENT_AM2_SKIP_THERMAL_SUPERVISOR` Ã¢â‚¬â€ lab override that disables the am2
 /// thermal supervisor entirely. Never set this for an unattended home soak.
 const ENV_AM2_SKIP_THERMAL_SUPERVISOR: &str = "DCENT_AM2_SKIP_THERMAL_SUPERVISOR";
 
@@ -1226,7 +1595,7 @@ const ENV_AM2_SKIP_THERMAL_SUPERVISOR: &str = "DCENT_AM2_SKIP_THERMAL_SUPERVISOR
 /// flag. DEFAULT-OFF. Calibration is fail-safe (a bad/missing/not-cold baseline
 /// falls back to raw, and the safety reading is never below raw), but it is
 /// still gated because a live bench calibration proof is owed before flipping
-/// it on by default — see
+/// it on by default Ã¢â‚¬â€ see
 /// .
 const ENV_AM2_DIE_TEMP_CALIBRATION: &str = "DCENT_AM2_DIE_TEMP_CALIBRATION";
 
@@ -1248,7 +1617,7 @@ const AM2_FAN_FAULT_STRIKES: u8 = 3;
 
 /// THERM-1(b): graded thermal-throttle step (MHz) shed per runtime poll once
 /// `hot_temp_c` is reached, down to the PLL floor. Matches the BM1362 PLL ramp
-/// 25 MHz cadence — small steps, not a slam.
+/// 25 MHz cadence Ã¢â‚¬â€ small steps, not a slam.
 const AM2_THERMAL_THROTTLE_STEP_MHZ: u16 = 25;
 
 /// THERM-1(b) gate. The graded freq throttle is a CONTROL action (it writes the
@@ -1259,7 +1628,7 @@ const AM2_THERMAL_THROTTLE_STEP_MHZ: u16 = 25;
 const ENV_AM2_THERMAL_GRADED_THROTTLE: &str = "DCENT_AM2_THERMAL_GRADED_THROTTLE";
 
 /// MINE-LIFE-1: env override for the GENEROUS mid-run nonce-stall fail-closed
-/// timeout (seconds). Absent ⇒ a derived generous default (see
+/// timeout (seconds). Absent Ã¢â€¡â€™ a derived generous default (see
 /// `am2_mid_run_nonce_stall_timeout`). `0` disables the mid-run guard.
 const ENV_AM2_MID_RUN_NONCE_STALL_TIMEOUT_S: &str = "DCENT_AM2_MID_RUN_NONCE_STALL_TIMEOUT_S";
 
@@ -1271,19 +1640,19 @@ const AM2_MID_RUN_STALL_MIN_DEFAULT_S: u64 = 300;
 /// Quiet fail-closed thermal supervisor for the am2 hybrid mining path.
 ///
 /// `--s19j-hybrid` bypasses `Daemon::run()`, so the am2 hybrid mining loop
-/// inherited NO thermal supervision — a wedged-hot ASIC on an unattended home
+/// inherited NO thermal supervision Ã¢â‚¬â€ a wedged-hot ASIC on an unattended home
 /// unit had nothing watching it. This mirrors the am3-bb `a lab unit` supervisor
 /// contract (pre-stratum hard proof + bounded runtime polling + fail-closed)
 /// but is am2-correct: board temps come from the fw=0x89 dsPIC LM75A
 /// passthrough, and the Zynq XADC die temp is the MANDATORY fallback when
 /// board temps are empty/NaN ( die-temp rule).
-/// Fail-closed = cut hash power, fans stay at the configured cap — never a
+/// Fail-closed = cut hash power, fans stay at the configured cap Ã¢â‚¬â€ never a
 /// fan blast.
-struct Am2ThermalSupervisor {
+pub(crate) struct Am2ThermalSupervisor {
     pic: Option<Pic0x89Service>,
     hot_temp_c: f32,
     dangerous_temp_c: f32,
-    last_good: Option<(Instant, f32)>,
+    last_good: Option<(Instant, f32, Am2ThermalSource)>,
     consecutive_misses: u8,
     /// THERM-1(a): consecutive confident, temperature-corroborated fan-fault
     /// observations (see `am2_fan_fault_step`). Runtime-only; any airflow / zero
@@ -1291,13 +1660,37 @@ struct Am2ThermalSupervisor {
     fan_fault_strikes: u8,
     /// R-13: per-chip die-temperature calibration. DEFAULT-OFF (fail-safe to
     /// raw). When enabled it captures a cold baseline at the pre-stratum poll
-    /// and applies the offset to the XADC die read — but only ever RAISES the
+    /// and applies the offset to the XADC die read Ã¢â‚¬â€ but only ever RAISES the
     /// reading (never below raw), so it can never suppress an over-temp trip.
     die_calibration: dcentrald_thermal::die_calibration::DieCalibration,
 }
 
+/// Provenance of the effective (hottest) AM2 thermal sample. This must travel
+/// with the numeric value so an XADC fallback is never published as a physical
+/// hashboard sensor reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Am2ThermalSource {
+    DspicBoardSensor,
+    XadcSocDie,
+}
+
+fn select_am2_thermal_sample(
+    board_c: Option<f32>,
+    calibrated_die_c: Option<f32>,
+) -> Option<(f32, Am2ThermalSource)> {
+    match (board_c, calibrated_die_c) {
+        (Some(board_c), Some(die_c)) if board_c >= die_c => {
+            Some((board_c, Am2ThermalSource::DspicBoardSensor))
+        }
+        (Some(_), Some(die_c)) => Some((die_c, Am2ThermalSource::XadcSocDie)),
+        (Some(board_c), None) => Some((board_c, Am2ThermalSource::DspicBoardSensor)),
+        (None, Some(die_c)) => Some((die_c, Am2ThermalSource::XadcSocDie)),
+        (None, None) => None,
+    }
+}
+
 impl Am2ThermalSupervisor {
-    fn new(
+    pub(crate) fn new(
         pic: Option<Pic0x89Service>,
         hot_temp_c: u8,
         dangerous_temp_c: u8,
@@ -1315,17 +1708,17 @@ impl Am2ThermalSupervisor {
     }
 
     /// THERM-1(a): runtime fan-fault poll, CORROBORATED by `temp_c` (the max
-    /// die/board temperature the supervisor measured THIS poll). `true` ⇒ the
-    /// caller MUST fail closed (cut hash; fans are NEVER raised —
+    /// die/board temperature the supervisor measured THIS poll). `true` Ã¢â€¡â€™ the
+    /// caller MUST fail closed (cut hash; fans are NEVER raised Ã¢â‚¬â€
     /// cut-hash-before-noise). Reads the fan tach + commanded PWM read-only (no
     /// board-control write) and runs the conservative, temperature-corroborated
     /// 3-strike decision (`am2_fan_fault_step`): only a confident "commanded
     /// PWM>0 but ALL fans 0 RPM" observed WHILE the unit is at/above the hot
     /// threshold adds a strike; airflow / zero command / an inconclusive read /
     /// a cool (or non-finite) temperature resets it. So a healthy unit (e.g. the
-    /// `a lab unit` eco path at PWM 10 / ~2880 RPM / ~49 C) — and, crucially, any
+    /// `a lab unit` eco path at PWM 10 / ~2880 RPM / ~49 C) Ã¢â‚¬â€ and, crucially, any
     /// adequately-cooled sister am2-zynq unit with an unverified / wrong-mode /
-    /// transient-zero tach — can never be false-cut while running cool.
+    /// transient-zero tach Ã¢â‚¬â€ can never be false-cut while running cool.
     fn poll_fan_fault(&mut self, temp_c: f32) -> bool {
         let reading = am2_read_fan_rpm_and_pwm();
         let (next, faulted) =
@@ -1337,7 +1730,7 @@ impl Am2ThermalSupervisor {
     /// Read the two raw temperature sources this poll, kept SEPARATE:
     /// `(max valid dsPIC LM75A board temp, raw Zynq XADC SoC-die temp)`. Either
     /// may be `None` if that source produced no finite, in-range reading. The
-    /// XADC die read is ALWAYS attempted — the die source is never skipped
+    /// XADC die read is ALWAYS attempted Ã¢â‚¬â€ the die source is never skipped
     /// ( die-temp fallback rule).
     ///
     /// The board temp is treated as the ABSOLUTE reference (an off-die PCB-class
@@ -1373,40 +1766,32 @@ impl Am2ThermalSupervisor {
     ///
     /// R-13: when die-temp calibration is enabled AND a valid cold baseline was
     /// captured, the die reading is corrected by its per-chip offset before
-    /// being folded in — but the correction is fail-safe: it can only ever
+    /// being folded in Ã¢â‚¬â€ but the correction is fail-safe: it can only ever
     /// RAISE the die reading (never below raw), so this max can only ever be
     /// `>=` the pre-calibration max. Calibration therefore never delays or
     /// suppresses an over-temp trip. When calibration is off/uncaptured the die
     /// value passes through raw and this is byte-identical to the prior path.
-    fn poll_max_temp(&mut self) -> Option<f32> {
+    fn poll_max_temp(&mut self) -> Option<(f32, Am2ThermalSource)> {
         let (board, die) = self.read_board_and_die();
-        let mut max_c = f32::NEG_INFINITY;
-        if let Some(b) = board {
-            max_c = max_c.max(b);
-        }
-        if let Some(die_c) = die {
+        let calibrated_die = die.map(|die_c| {
             // apply_one is a raw passthrough unless calibration is enabled AND a
             // valid baseline exists; it is guaranteed to never return below raw.
-            max_c = max_c.max(self.die_calibration.apply_one(die_c));
-        }
-        if max_c.is_finite() {
-            Some(max_c)
-        } else {
-            None
-        }
+            self.die_calibration.apply_one(die_c)
+        });
+        select_am2_thermal_sample(board, calibrated_die)
     }
 
     /// R-13: capture the cold die-calibration baseline, ONCE, from this poll's
     /// separate board (reference) + raw die readings. No-op unless calibration
-    /// is enabled and not yet captured. Fail-safe by construction — the pure
+    /// is enabled and not yet captured. Fail-safe by construction Ã¢â‚¬â€ the pure
     /// [`dcentrald_thermal::die_calibration::DieCalibration::capture_baseline`]
     /// rejects a missing / non-finite / not-cold / implausible sample and
     /// leaves the calibrator in raw-passthrough mode. Logs the outcome.
     ///
     /// Intended to run at the cold pre-stratum stage (before any hash load),
-    /// where board ≈ die ≈ ambient, so the captured offset reflects the die
+    /// where board Ã¢â€°Ë† die Ã¢â€°Ë† ambient, so the captured offset reflects the die
     /// ADC's per-chip bias rather than a thermal gradient.
-    fn maybe_capture_die_baseline(&mut self) {
+    pub(crate) fn maybe_capture_die_baseline(&mut self) {
         if !self.die_calibration.enabled() || self.die_calibration.is_calibrated() {
             return;
         }
@@ -1415,7 +1800,7 @@ impl Am2ThermalSupervisor {
             info!(
                 board_present = board.is_some(),
                 die_present = die.is_some(),
-                "R-13 die-calibration baseline skipped — need BOTH a board (reference) and XADC die reading; staying on RAW die temp"
+                "R-13 die-calibration baseline skipped Ã¢â‚¬â€ need BOTH a board (reference) and XADC die reading; staying on RAW die temp"
             );
             return;
         };
@@ -1427,31 +1812,32 @@ impl Am2ThermalSupervisor {
                 chips = self.die_calibration.chip_count(),
                 reference_pcb_c,
                 raw_die_c,
-                "R-13 die-calibration cold baseline captured — die temp is now offset-corrected (never below raw)"
+                "R-13 die-calibration cold baseline captured Ã¢â‚¬â€ die temp is now offset-corrected (never below raw)"
             );
         } else {
             warn!(
                 outcome = ?outcome,
                 reference_pcb_c,
                 raw_die_c,
-                "R-13 die-calibration baseline NOT captured — staying on RAW die temp (fail-safe)"
+                "R-13 die-calibration baseline NOT captured Ã¢â‚¬â€ staying on RAW die temp (fail-safe)"
             );
         }
     }
 
     /// Poll once and enforce the fail-closed contract for `stage`. `Ok(temp)`
     /// = safe to proceed; `Err` = the caller MUST fail closed (cut hash power).
-    fn poll_and_check(&mut self, stage: &'static str) -> Result<f32> {
+    pub(crate) fn poll_and_check(&mut self, stage: Am2ThermalPollStage) -> Result<f32> {
+        let stage_label = stage.label();
         match self.poll_max_temp() {
-            Some(max_c) => {
-                self.last_good = Some((Instant::now(), max_c));
+            Some((max_c, source)) => {
+                self.last_good = Some((Instant::now(), max_c, source));
                 self.consecutive_misses = 0;
                 if max_c >= self.dangerous_temp_c {
                     anyhow::bail!(
                         "AM2 thermal supervisor: max temp {:.1}C reached dangerous threshold {:.1}C during {}",
                         max_c,
                         self.dangerous_temp_c,
-                        stage
+                        stage_label
                     );
                 }
                 if max_c >= self.hot_temp_c {
@@ -1459,21 +1845,22 @@ impl Am2ThermalSupervisor {
                         max_temp_c = max_c,
                         hot_temp_c = self.hot_temp_c,
                         dangerous_temp_c = self.dangerous_temp_c,
-                        stage,
-                        "AM2 thermal supervisor: hot — fail-closed arms at the dangerous threshold"
+                        stage = stage_label,
+                        "AM2 thermal supervisor: hot Ã¢â‚¬â€ fail-closed arms at the dangerous threshold"
                     );
                 } else {
                     info!(
                         max_temp_c = max_c,
-                        stage, "AM2 thermal supervisor sample OK"
+                        stage = stage_label,
+                        "AM2 thermal supervisor sample OK"
                     );
                 }
                 Ok(max_c)
             }
             None => {
                 self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-                if stage == "runtime" {
-                    if let Some((at, t)) = self.last_good {
+                if stage.allows_bounded_last_good() {
+                    if let Some((at, t, _source)) = self.last_good {
                         if self.consecutive_misses <= AM2_THERMAL_MAX_CONSECUTIVE_MISSES
                             && at.elapsed() <= Duration::from_millis(AM2_THERMAL_MAX_STALE_MS)
                         {
@@ -1481,39 +1868,63 @@ impl Am2ThermalSupervisor {
                                 consecutive_misses = self.consecutive_misses,
                                 last_good_age_ms = at.elapsed().as_millis() as u64,
                                 last_good_temp_c = t,
-                                "AM2 thermal supervisor: runtime poll empty — using bounded last-known-good"
+                                "AM2 thermal supervisor: runtime poll empty Ã¢â‚¬â€ using bounded last-known-good"
                             );
                             return Ok(t);
                         }
                     }
                 }
                 anyhow::bail!(
-                    "AM2 thermal supervisor: no valid temperature (dsPIC LM75A + XADC die) during {} after {} consecutive miss(es) — refusing to mine without thermal proof",
-                    stage,
+                    "AM2 thermal supervisor: no valid temperature (dsPIC LM75A + XADC die) during {} after {} consecutive miss(es) Ã¢â‚¬â€ refusing to mine without thermal proof",
+                    stage_label,
                     self.consecutive_misses
                 )
             }
         }
     }
+
+    pub(crate) fn effective_source(&self) -> Option<Am2ThermalSource> {
+        self.last_good.map(|(_, _, source)| source)
+    }
 }
 
-/// PIC heartbeat interval — 1 s (same cadence bosminer uses for fw 0x89).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Am2ThermalPollStage {
+    PreStratum(&'static str),
+    Runtime(&'static str),
+}
+
+impl Am2ThermalPollStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PreStratum(label) | Self::Runtime(label) => label,
+        }
+    }
+
+    fn allows_bounded_last_good(self) -> bool {
+        matches!(self, Self::Runtime(_))
+    }
+}
+
+/// PIC heartbeat interval Ã¢â‚¬â€ 1 s (same cadence bosminer uses for fw 0x89).
 /// Shorter than the S9 PIC watchdog so we have margin before voltage cut.
 ///
 /// See [`dcentrald_silicon_profiles::pic_heartbeat::pic_heartbeat_config`]
 /// for the per-`(Platform, PicFw)` matrix
-/// (`Platform::S19jProAm2` × `PicFw::Dspic33epHealthy` = 1 s tick).
-/// The matrix is the canonical source — keep this constant in sync.
+/// (`Platform::S19jProAm2` Ãƒâ€” `PicFw::Dspic33epHealthy` = 1 s tick).
+/// The matrix is the canonical source Ã¢â‚¬â€ keep this constant in sync.
 const PIC_HEARTBEAT_INTERVAL_MS: u64 = 1000;
 /// One aggregate deadline for all blocking AM2 heartbeat/feed workers.
 const AM2_FEEDER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+type HybridThreadGuard = FixedThreadRosterGuard<HybridThreadSlot>;
+type HybridThreadStop = ThreadRosterStop<HybridThreadSlot>;
 
 /// Consecutive selected-dsPIC heartbeat failures after which the am2 hybrid run
 /// cancels itself so teardown de-energizes the chain rail.
 ///
 /// Load-bearing safety rule (: "When PIC
 /// heartbeats fail, the response MUST be voltage cut", as the am3-bb path already
-/// does). Sized to act at ~20 s (20 × `PIC_HEARTBEAT_INTERVAL_MS`) — comfortably
+/// does). Sized to act at ~20 s (20 Ãƒâ€” `PIC_HEARTBEAT_INTERVAL_MS`) Ã¢â‚¬â€ comfortably
 /// above transient dsPIC read noise (the counter resets on ANY successful
 /// heartbeat) yet below the PSU's own ~30 s heartbeat-loss self-disable, so the
 /// software cut LEADS the hardware backstop without ever tripping on a
@@ -1570,10 +1981,10 @@ fn active_dspic_addrs(active_chains: u8) -> Vec<u8> {
 ///  all-active bus-prime ordering, extracted as a pure fn ( B05)
 /// so the ordering is asserted by a REAL runtime unit test instead of a
 /// source-string parse. Returns the active dsPIC addresses EXCEPT `selected`,
-/// sorted ascending — these are warmed BEFORE the selected PIC. This pins the
+/// sorted ascending Ã¢â‚¬â€ these are warmed BEFORE the selected PIC. This pins the
 /// deterministic order the loop uses (non-selected first, ascending); it makes
 /// NO claim that a specific "0x20-first" sequence is required (that dependency
-/// is unverified at runtime — see the loop comment + the memory rule).
+/// is unverified at runtime Ã¢â‚¬â€ see the loop comment + the memory rule).
 fn am2_bus_prime_order(active: &[u8], selected: u8) -> Vec<u8> {
     let mut others: Vec<u8> = active.iter().copied().filter(|&a| a != selected).collect();
     others.sort_unstable();
@@ -1698,7 +2109,7 @@ fn probe_dspic_addrs(i2c: &I2cServiceHandle) -> Result<u8> {
 ///
 /// Returns `true` only when the address replies with a NON-`0xFF` byte. An
 /// EIO (transaction error) or a `0xFF` reply both mean "absent / not present"
-/// → `false`. This lets the Phase-0d bus-prime loop skip a physically-absent
+/// Ã¢â€ â€™ `false`. This lets the Phase-0d bus-prime loop skip a physically-absent
 /// dsPIC (e.g. `a lab unit` slot-2 0x21) BEFORE issuing the multi-retry warmup, which
 /// otherwise produces an EIO storm that desyncs the AXI-IIC controller faster
 /// than the rate-limited (1/sec) fd-reopen can recover.
@@ -1729,13 +2140,13 @@ fn am2_dspic_present(i2c: &I2cServiceHandle, addr: u8) -> bool {
 /// BM1362 job ID increment. Phase 4A: am2 MIDSTATE_CNT=1 (2 midstate slots)
 /// so the ExtWorkId stride is (1 << MIDSTATE_CNT_LOG2) = 2.
 /// Braiins encodes `ExtWorkId(wid,ms).to_hw() = (wid << LOG2) | ms` and the
-/// driver increments `wid` by 1 per job → hardware work_id increments by 2.
+/// driver increments `wid` by 1 per job Ã¢â€ â€™ hardware work_id increments by 2.
 const JOB_ID_INCREMENT: u8 = 2;
 const JOB_ID_MASK: u8 = 0x7F;
 const WORK_HISTORY_PER_ID: usize = dcentrald_common::DEFAULT_WORK_HISTORY_PER_ID;
 
 /// BM1362 FPGA work size (am2, Phase 4A authoritative):
-/// 4 header words + 2 midstate slots × 8 words = 20 words.
+/// 4 header words + 2 midstate slots Ãƒâ€” 8 words = 20 words.
 const WORK_WORDS: usize = 20;
 
 /// Log2 of the midstate count that fits into this WORK_WORDS payload.
@@ -1763,7 +2174,7 @@ const BM1362_RESP_BODY_LEN: usize = 9;
 /// Ensure `/dev/i2c-0` exists and is bound to the xiic-i2c kernel driver.
 ///
 /// NEVER unbind/SOFTR the controller here.
-/// This only binds — never unbinds — and never touches AXI timing.
+/// This only binds Ã¢â‚¬â€ never unbinds Ã¢â‚¬â€ and never touches AXI timing.
 fn ensure_i2c0_kernel_bound() -> Result<()> {
     if std::path::Path::new("/dev/i2c-0").exists() {
         return Ok(());
@@ -1822,7 +2233,7 @@ const BM1362_TRACE_PLL_PARAM_525: u32 = 0x40A8_0265;
 
 // ===========================================================================
 // RE-018 byte-exact bosminer cold-wake values (decoded 2026-05-31 from
-// `/data/re018-cold-strace.log` on `a lab unit` — a strace of bosminer's COLD chain
+// `/data/re018-cold-strace.log` on `a lab unit` Ã¢â‚¬â€ a strace of bosminer's COLD chain
 // bring-up on /dev/ttyS1). These are the EXACT register values + ORDER
 // bosminer uses to cold-wake the BM1362 chain on `a lab unit` standalone (no prior
 // engagement). Used ONLY by the default-OFF, `a lab unit`-fingerprinted
@@ -1834,7 +2245,7 @@ const BM1362_TRACE_PLL_PARAM_525: u32 = 0x40A8_0265;
 //   CHAIN_INACTIVE x3
 //   SET_ADDRESS 0x00..0xFE stride-2 (blind, all 128 positions)
 //   BCAST 0x3C=0x80008540 -> 0x3C=0x80008008 -> 0x54=0x00000003 -> 0x58=0x00011111
-//   GET_ADDRESS (0x52) x1  (single late presence poll — NON-FATAL)
+//   GET_ADDRESS (0x52) x1  (single late presence poll Ã¢â‚¬â€ NON-FATAL)
 //   BCAST 0x70=0x00000000 -> 0x08=0x40A80265 -> 0x70=0x00000000 -> 0x08=0x40A80265 -> 0x28=0x11300000
 //   PER-CHIP (0x41), each enumerated addr, in order:
 //     0xA8=0x00000002, 0x18=0xB000C100, 0x3C=0x80008540, 0x3C=0x80008008,
@@ -1849,7 +2260,8 @@ const BM1362_TRACE_PLL_PARAM_525: u32 = 0x40A8_0265;
 //  - GetAddress is a single LATE poll AFTER the broadcast 0x3C/0x54/0x58
 //    block, NOT a per-chip enumeration gate; bosminer NEVER bails on it.
 const RE018_BCAST_A8: u32 = 0x0000_0000;
-const RE018_MISC_CTRL: u32 = 0xB000_C100;
+/// RE-018 path MiscCtrl — same held word as bosminer cold pre-baud (G34 pure SSOT).
+const RE018_MISC_CTRL: u32 = dcentrald_common::AM2_MISC_CTRL_PRE_BAUD_BOSMINER_COLD;
 const RE018_VERSION_MASK: u32 = 0x9000_FFFF;
 const RE018_CORE_3C_HASH_CLK: u32 = 0x8000_8540;
 const RE018_CORE_3C_CLK_DELAY: u32 = 0x8000_8008;
@@ -1876,7 +2288,7 @@ const RE018_NONCE_SPACE_STRIDE: u32 = 0x0000_0104;
 // PROVEN BM1362 init (am3_bb / legacy s19j per-chip A8) the same register is
 //   broadcast  INIT_CONTROL_BCAST    = 0x0007_0000  (BM1362_INIT_PLAN)
 //   per-chip   INIT_CONTROL_PER_CHIP = 0x0007_01F0  (BM1362_INIT_PLAN)
-// The 0x0007 high bits are the core/clock ENABLE cluster — without them the
+// The 0x0007 high bits are the core/clock ENABLE cluster Ã¢â‚¬â€ without them the
 // PLL clocks the chip but the SHA cores stay gated (idle), so the chain draws
 // power at the PLL freq yet produces almost no useful hashing. A live
 // ticket-mask A/B already proved the useful hashrate is unchanged by the
@@ -1894,16 +2306,16 @@ const RE018_FULL_CORE_PER_CHIP_A8: u32 = INIT_CONTROL_PER_CHIP; // 0x0007_01F0 (
 // POWER: un-idling the cores at the RE-018 default 525 MHz would draw ~1.5 kW
 // for one board = breaker TRIP. Power scales ~linearly with frequency at fixed
 // voltage, so we MUST drop the freq when we enable the cores. Target 150 MHz:
-//   est. board watts ≈ 1500 W * (150 / 525) ≈ ~430 W  (one board)
-//   est. board hashrate ≈ 50 TH/s * (150 / 525) ≈ ~14 TH/s
-// Conservative — lands clearly under the 550 W ceiling with headroom for the
+//   est. board watts Ã¢â€°Ë† 1500 W * (150 / 525) Ã¢â€°Ë† ~430 W  (one board)
+//   est. board hashrate Ã¢â€°Ë† 50 TH/s * (150 / 525) Ã¢â€°Ë† ~14 TH/s
+// Conservative Ã¢â‚¬â€ lands clearly under the 550 W ceiling with headroom for the
 // PSU/fan overhead, and is a ~120x jump from today's ~120 GH/s useful.
 //
-// ENCODING (bm1362 crate `BM1362_PLL_TABLE` layout — accepted-share-proven on
+// ENCODING (bm1362 crate `BM1362_PLL_TABLE` layout Ã¢â‚¬â€ accepted-share-proven on
 // .79/.109/.139): reg 0x08 = [VCO_SCALE 0x50][FBDIV][REFDIV 0x01][POSTDIV],
 // POSTDIV byte = ((PD1-1)<<4) | (PD2-1), freq = 25 MHz * FBDIV / (REFDIV*PD1*PD2).
-// We deliberately KEEP FBDIV=210 / REFDIV=1 (VCO = 25*210 = 5250 MHz) — the
-// SAME VCO the chip already locks at 525 MHz on `a lab unit` today — and only raise
+// We deliberately KEEP FBDIV=210 / REFDIV=1 (VCO = 25*210 = 5250 MHz) Ã¢â‚¬â€ the
+// SAME VCO the chip already locks at 525 MHz on `a lab unit` today Ã¢â‚¬â€ and only raise
 // the postdivider, so the VCO never has to re-lock to a new band:
 //   FBDIV=210 (0xD2), REFDIV=1, PD1=7, PD2=5  ->  5250 / (7*5) = 150 MHz
 //   POSTDIV byte = ((7-1)<<4)|(5-1) = 0x64
@@ -1915,23 +2327,23 @@ const RE018_FULL_CORE_PER_CHIP_A8: u32 = INIT_CONTROL_PER_CHIP; // 0x0007_01F0 (
 // because it is the accepted-share-proven one on the sibling BM1362 units.
 // 2026-06-14 (option-B, SUPERSEDES the 150 MHz attempt above): the freq-OVERRIDE default is the
 // PROVEN 320 MHz efficiency sweet spot in the table byte order (FBDIV=128/REFDIV=1/PD1=5/PD2=2 ->
-// ÷10, 0x50800141 — same encoding bm1362::pll_lookup_extended computes). NOT the live-REJECTED
-// off-table 150 MHz (0x50D2_0164, ÷35, VCO re-lock -> zero nonces). Configurable via
+// ÃƒÂ·10, 0x50800141 Ã¢â‚¬â€ same encoding bm1362::pll_lookup_extended computes). NOT the live-REJECTED
+// off-table 150 MHz (0x50D2_0164, ÃƒÂ·35, VCO re-lock -> zero nonces). Configurable via
 // DCENT_AM2_RE018_TARGET_MHZ (240-597 proven) or DCENT_AM2_RE018_PLL_HEX (raw), and INDEPENDENT of
-// the A8 regression. The ~50 MHz RE018_PLL_08 stays the DEFAULT (eco/heater floor — a feature, lower
+// the A8 regression. The ~50 MHz RE018_PLL_08 stays the DEFAULT (eco/heater floor Ã¢â‚¬â€ a feature, lower
 // than any competitor's floor); this override is opt-in + POWER-RAISING (wattmeter-gated live test).
-const RE018_LOW_FREQ_PLL_08: u32 = 0x5080_0141; // 320 MHz: FBDIV=128, REFDIV=1, PD1=5, PD2=2 (proven ÷10)
+const RE018_LOW_FREQ_PLL_08: u32 = 0x5080_0141; // 320 MHz: FBDIV=128, REFDIV=1, PD1=5, PD2=2 (proven ÃƒÂ·10)
 const RE018_LOW_FREQ_MHZ: u16 = 320;
 
 /// The REAL applied chip frequency (MHz), decoded from the RE-018 PLL reg-0x08 and
 /// published from the cold sequence so the dashboard reports the ACTUAL frequency
 /// (~50 MHz eco/heater default, or the gated bump) instead of the config label
-/// (which historically showed a misleading 525). 0 = unset → non-RE-018 units
+/// (which historically showed a misleading 525). 0 = unset Ã¢â€ â€™ non-RE-018 units
 /// fall back to `config.mining.frequency_mhz` (fleet byte-identical).
 static AM2_RE018_APPLIED_FREQ_MHZ: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(0);
 
-/// Serial dispatch pacing during init — ~50 writes/sec max.
+/// Serial dispatch pacing during init Ã¢â‚¬â€ ~50 writes/sec max.
 const SERIAL_PACE_MIN_MS: u64 = 20;
 
 /// am2 work-tx FIFO depth.
@@ -2109,13 +2521,19 @@ impl Am2FpgaChain {
     }
 }
 
-/// Triple-write MiscCtrl (reg 0x18) on the serial transport with 5 ms spacing.
+/// Triple-write MiscCtrl on the serial transport.
+///
+/// Cadence + reg address: pure `plan_misc_ctrl_triple_write_*` (P1-1 residual).
+/// Value selection (pre-baud / post-fast / RE018 / env) remains hybrid policy.
 fn misc_ctrl_triple_write_serial(serial: &SerialChainBackend, value: u32) -> Result<()> {
-    for i in 0..3 {
-        serial
-            .send_write_reg_broadcast_bm1397plus(REG_MISC_CONTROL, value)
-            .with_context(|| format!("MiscCtrl triple-write attempt {}/3", i + 1))?;
-        std::thread::sleep(Duration::from_millis(5));
+    // REG_MISC_CONTROL must stay 0x18 (pure MISC_CTRL_REG_BM1397PLUS).
+    debug_assert_eq!(REG_MISC_CONTROL, dcentrald_common::MISC_CTRL_REG_BM1397PLUS);
+    for (i, op) in plan_misc_ctrl_triple_write_broadcast(value)
+        .into_iter()
+        .enumerate()
+    {
+        hybrid_execute_bm1397plus_op(serial, op)
+            .with_context(|| format!("MiscCtrl triple-write op {}/6", i + 1))?;
     }
     Ok(())
 }
@@ -2125,27 +2543,28 @@ fn misc_ctrl_triple_write_chip_serial(
     chip_addr: u8,
     value: u32,
 ) -> Result<()> {
-    for i in 0..3 {
-        serial
-            .send_write_reg_bm1397plus(chip_addr, REG_MISC_CONTROL, value)
-            .with_context(|| {
-                format!(
-                    "MiscCtrl chip 0x{:02X} triple-write attempt {}/3",
-                    chip_addr,
-                    i + 1
-                )
-            })?;
-        std::thread::sleep(Duration::from_millis(5));
+    debug_assert_eq!(REG_MISC_CONTROL, dcentrald_common::MISC_CTRL_REG_BM1397PLUS);
+    for (i, op) in plan_misc_ctrl_triple_write_chip(chip_addr, value)
+        .into_iter()
+        .enumerate()
+    {
+        hybrid_execute_bm1397plus_op(serial, op).with_context(|| {
+            format!(
+                "MiscCtrl chip 0x{:02X} triple-write op {}/6",
+                chip_addr,
+                i + 1
+            )
+        })?;
     }
     Ok(())
 }
 
-/// BM1362 per-chip init — the full per-chip `A8 / MiscCtrl×3 / 3C×3` loop.
+/// BM1362 per-chip init Ã¢â‚¬â€ the full per-chip `A8 / MiscCtrlÃƒâ€”3 / 3CÃƒâ€”3` loop.
 ///
 /// Stock bosminer and the accepted-share-proven BM1362 paths
 /// (`serial_mining.rs` Amlogic, `am3_bb_mining.rs` on `a lab unit`) all run this
-/// per-chip pass. `init_asic_chain` ran it only as Step 7 — *after* the
-/// FastUART transition — so the `DCENT_AM2_SKIP_FAST_UART=1` path (which
+/// per-chip pass. `init_asic_chain` ran it only as Step 7 Ã¢â‚¬â€ *after* the
+/// FastUART transition Ã¢â‚¬â€ so the `DCENT_AM2_SKIP_FAST_UART=1` path (which
 /// early-returns before Step 7) skipped per-chip core activation entirely.
 /// Broadcast `0xA8 = INIT_CONTROL_BCAST` alone does not activate the cores;
 /// the per-chip `0xA8 = INIT_CONTROL_PER_CHIP` write is the BM1362 analogue
@@ -2159,11 +2578,11 @@ fn bm1362_per_chip_fast_init(
     // G2 / R10-2 ablation knob (default None = full loop, unchanged). Read
     // ONCE before the loop so the hot path takes only cheap local branches;
     // the self-describing log fires ONLY when the env is set (mirrors
-    // PR-019's [AM2-ABLATION-PARAMS] contract — default path stays silent).
+    // PR-019's [AM2-ABLATION-PARAMS] contract Ã¢â‚¬â€ default path stays silent).
     let stop_after = am2_ablation_per_chip_stop_after();
     if let Some(mode) = stop_after {
         warn!(
-            "[AM2-ABLATION-PERCHIP] stop_after={} — G2/R10-2 per-chip substep \
+            "[AM2-ABLATION-PERCHIP] stop_after={} Ã¢â‚¬â€ G2/R10-2 per-chip substep \
              bisection; read the post_per_chip_loop_115200 [AM2-ABLATION] \
              unique_chip_ids (requires DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE=1)",
             mode
@@ -2171,13 +2590,13 @@ fn bm1362_per_chip_fast_init(
     }
     for i in 0..chip_count {
         let chip_addr = (i as u16 * addr_interval) as u8;
-        serial.send_write_reg_bm1397plus(chip_addr, 0xA8, INIT_CONTROL_PER_CHIP)?;
+        hybrid_send_write_reg(serial, chip_addr, 0xA8, INIT_CONTROL_PER_CHIP)?;
         if stop_after != Some("a8") {
             misc_ctrl_triple_write_chip_serial(serial, chip_addr, am2_misc_control_post_fast())?;
             if stop_after != Some("miscctrl") {
-                serial.send_write_reg_bm1397plus(chip_addr, 0x3C, CORE_REG_HASH_CLK)?;
-                serial.send_write_reg_bm1397plus(chip_addr, 0x3C, CORE_REG_CLK_DELAY)?;
-                serial.send_write_reg_bm1397plus(chip_addr, 0x3C, CORE_REG_UNKNOWN)?;
+                hybrid_send_write_reg(serial, chip_addr, 0x3C, CORE_REG_HASH_CLK)?;
+                hybrid_send_write_reg(serial, chip_addr, 0x3C, CORE_REG_CLK_DELAY)?;
+                hybrid_send_write_reg(serial, chip_addr, 0x3C, CORE_REG_UNKNOWN)?;
             }
         }
         if i % 16 == 15 {
@@ -2228,38 +2647,11 @@ fn build_am2_serial_work_frame(
     build_serial_work_frame(&asic_work, asic_job_id)
 }
 
-const BM1362_PLL_TABLE: &[(u16, u32)] = &[
-    (400, 0x50A0_0141),
-    (412, 0x50A5_0141),
-    (425, 0x50AA_0141),
-    (437, 0x50AF_0141),
-    (450, 0x50B4_0141),
-    (462, 0x50B9_0141),
-    (475, 0x50BE_0141),
-    (487, 0x50C3_0141),
-    (500, 0x50C8_0141),
-    (512, 0x50CD_0141),
-    (525, 0x50D2_0141),
-    (537, 0x50D7_0141),
-    (550, 0x50DC_0141),
-    (562, 0x50E1_0141),
-    (575, 0x50E6_0141),
-    (587, 0x50EB_0141),
-    (597, 0x50EF_0141),
-];
-
+/// G26: hybrid uses ChipDriver thin-wrap of pure BM1362 PLL table (no local fork).
+/// Rated 545 + live 531/556 live in `dcentrald_common::BM1362_PLL_TABLE`.
+#[inline]
 fn bm1362_pll_lookup(target_mhz: u16) -> (u32, u16) {
-    let target = target_mhz.clamp(400, 597);
-    let mut best = BM1362_PLL_TABLE[0];
-    let mut best_diff = (target as i32 - best.0 as i32).unsigned_abs();
-    for &entry in &BM1362_PLL_TABLE[1..] {
-        let diff = (target as i32 - entry.0 as i32).unsigned_abs();
-        if diff < best_diff {
-            best = entry;
-            best_diff = diff;
-        }
-    }
-    (best.1, best.0)
+    dcentrald_asic::drivers::bm1362::pll_lookup(target_mhz)
 }
 
 fn log_bm1362_voltage_topology(chain_id: u8, chip_count: u8) {
@@ -2286,7 +2678,7 @@ fn log_bm1362_voltage_topology(chain_id: u8, chip_count: u8) {
 }
 
 // ---------------------------------------------------------------------------
-// PIC (Pic0x89) helpers — GET_VERSION without I2C_RDWR
+// PIC (Pic0x89) helpers Ã¢â‚¬â€ GET_VERSION without I2C_RDWR
 // ---------------------------------------------------------------------------
 //
 // Keep the command write, response wait, and byte-wise reads inside one
@@ -2338,13 +2730,13 @@ fn am2_fast_uart_switch_host_first_enabled() -> bool {
     am2_env_flag("DCENT_AM2_FASTUART_SWITCH_HOST_FIRST")
 }
 
-/// PERF/T1 — opt-in BM1362 factory-jig baud method (default-OFF).
+/// PERF/T1 Ã¢â‚¬â€ opt-in BM1362 factory-jig baud method (default-OFF).
 ///
 /// When set, the fast-baud switch uses the chip's OWN `set_chain_baud`
 /// procedure decoded first-hand from the AMTC S19j Pro repair-jig
 /// `single_board_test` (BM1362, `FUN_0002cb14`): a register read-modify-write
 /// that, at baud >= 3,000,001, reclocks the command UART off PLL1 (reg `0x60`,
-/// ×2 @ 10 ms) and takes the reg `0x28` divider from 400 MHz — instead of
+/// Ãƒâ€”2 @ 10 ms) and takes the reg `0x28` divider from 400 MHz Ã¢â‚¬â€ instead of
 /// DCENT's fixed `reg 0x28 = 0x3011` + `reg 0x18` MiscCtrl (which never writes
 /// reg `0x60` and measures `0/126` at 3.125 M). A/B candidate for the BM1362
 /// fast-baud zero-nonce blocker. Reversible per run; writes only ASIC config
@@ -2355,12 +2747,12 @@ fn am2_baud_jig_pll1_reclock_enabled() -> bool {
 }
 
 /// Read one BM1362 chip register value via a broadcast READ at the current
-/// (115200) baud. Returns `None` if the chain UART RX is silent — the caller
+/// (115200) baud. Returns `None` if the chain UART RX is silent Ã¢â‚¬â€ the caller
 /// MUST treat that as fail-closed and abort before issuing any write, so the
 /// chain is never left half-reclocked. Mirrors the existing PLL-lock readback
 /// pattern (`send_read_reg_bm1397plus` + `read_all_responses` + `from_be_bytes`).
 fn read_bm1362_reg_value(serial: &SerialChainBackend, chip_addr: u8, reg: u8) -> Option<u32> {
-    serial.send_read_reg_bm1397plus(chip_addr, reg).ok()?;
+    hybrid_send_read_reg(serial, chip_addr, reg).ok()?;
     let resps = serial.read_all_responses(50).unwrap_or_default();
     for r in &resps {
         if r.len() >= 4 {
@@ -2378,11 +2770,11 @@ fn read_bm1362_reg_value(serial: &SerialChainBackend, chip_addr: u8, reg: u8) ->
 /// MiscCtrl-post-fast write while this gate is on.
 fn apply_bm1362_jig_pll1_reclock(serial: &SerialChainBackend, target_baud: u32) -> Result<()> {
     let r60 = read_bm1362_reg_value(serial, 0x00, 0x60).context(
-        "jig-reclock: BM1362 reg 0x60 (PLL1) readback silent at 115200 — \
+        "jig-reclock: BM1362 reg 0x60 (PLL1) readback silent at 115200 Ã¢â‚¬â€ \
          aborting before any baud-register write (fail-closed; chain untouched)",
     )?;
     let r28 = read_bm1362_reg_value(serial, 0x00, 0x28).context(
-        "jig-reclock: BM1362 reg 0x28 (FastUART) readback silent at 115200 — \
+        "jig-reclock: BM1362 reg 0x28 (FastUART) readback silent at 115200 Ã¢â‚¬â€ \
          aborting before any baud-register write (fail-closed; chain untouched)",
     )?;
     let (w60, w28) = jig_pll1_reclock_regs(r60, r28, target_baud);
@@ -2394,16 +2786,16 @@ fn apply_bm1362_jig_pll1_reclock(serial: &SerialChainBackend, target_baud: u32) 
             .unwrap_or_else(|| "(none, low-baud path)".to_string()),
         reg28_write = format_args!("0x{:08X}", w28),
         target_baud,
-        "DCENT_AM2_BAUD_JIG_PLL1_RECLOCK=1 — applying BM1362 factory-jig set_chain_baud (PLL1 reclock RMW); reg 0x18 MiscCtrl skipped (jig does not write it in set_chain_baud)"
+        "DCENT_AM2_BAUD_JIG_PLL1_RECLOCK=1 Ã¢â‚¬â€ applying BM1362 factory-jig set_chain_baud (PLL1 reclock RMW); reg 0x18 MiscCtrl skipped (jig does not write it in set_chain_baud)"
     );
     if let Some(w60) = w60 {
         // reg 0x60 = PLL1, written twice @ 10 ms (jig order).
-        serial.send_write_reg_broadcast_bm1397plus(0x60, w60)?;
+        hybrid_send_write_reg_broadcast(serial, 0x60, w60)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x60, w60)?;
+        hybrid_send_write_reg_broadcast(serial, 0x60, w60)?;
         std::thread::sleep(Duration::from_millis(10));
     }
-    serial.send_write_reg_broadcast_bm1397plus(0x28, w28)?;
+    hybrid_send_write_reg_broadcast(serial, 0x28, w28)?;
     serial.drain_tx().ok();
     // Jig timing: usleep(10ms) + usleep(50ms) after the reg 0x28 write.
     std::thread::sleep(Duration::from_millis(60));
@@ -2419,7 +2811,7 @@ fn am2_work_tx_bosminer_idle_enabled() -> bool {
 //
 // The `/dev/ttyS1` (MMIO 0x41001000) + `/dev/ttyS3` (0x41021000) PL UARTs that
 // DCENT_OS uses for BM1362 chain I/O are AXI UART 16550 cores that exist ONLY in
-// the BraiinsOS FPGA bitstream — the STOCK Bitmain devicetree has NO nodes at
+// the BraiinsOS FPGA bitstream Ã¢â‚¬â€ the STOCK Bitmain devicetree has NO nodes at
 // those addresses (s14 F25). Stock Bitmain instead drives all chain UART through
 // `bitmain_axi.ko` -> `/dev/axi_fpga_dev` -> `ioremap(0x40000000, 0x1400)`
 // (s14 F16-F18/F23-F24), which DCENT does NOT load. So the ttyS1/ttyS3 path here
@@ -2427,14 +2819,14 @@ fn am2_work_tx_bosminer_idle_enabled() -> bool {
 // stock-bitstream board those devices are absent and the 0x40000000 AXI UART is
 // the only chain transport. This is why a `a lab unit` standalone bring-up must keep the
 // BraiinsOS bitstream and MUST NOT fall back to bitmain_axi.ko. Documentation
-// only — no transport behavior change. Source:
+// only Ã¢â‚¬â€ no transport behavior change. Source:
 //
 // ---------------------------------------------------------------------------
 
 ///  (2026-05-23): route the BM1362 chain init through the FPGA
 /// FIFO IP blocks (`chain1-common` / `chain1-cmd-rx` / `chain1-work-rx`
 /// / `chain1-work-tx` UIO devices at `0x43C0Nxxx`) instead of the PL
-/// UART at `0x41001000`. Default-OFF — `a lab unit`'s 2026-05-15 first-shares
+/// UART at `0x41001000`. Default-OFF Ã¢â‚¬â€ `a lab unit`'s 2026-05-15 first-shares
 /// path stays byte-identical when the flag is unset.
 ///
 /// Set `DCENT_AM2_USE_FPGA_CHAIN=1` to opt in. Phase-1 wiring is
@@ -2446,7 +2838,7 @@ fn am2_work_tx_bosminer_idle_enabled() -> bool {
 /// Live-evidence rationale: `a lab unit`'s BraiinsOS bitstream wires the chain
 /// UART through the FPGA FIFO IP blocks (`/dev/uio0..3` for chain 0,
 /// `/dev/uio4..7` for chain 1). Bosminer on `a lab unit` opens NO `/dev/ttyS*`
-/// device — strong signal that the PL UART path is wrong for this
+/// device Ã¢â‚¬â€ strong signal that the PL UART path is wrong for this
 /// bitstream. See
 /// .
 fn am2_use_fpga_chain_enabled() -> bool {
@@ -2455,7 +2847,7 @@ fn am2_use_fpga_chain_enabled() -> bool {
 
 /// Opt-OUT of running the BM1362 per-chip init loop on the 115200
 /// skip-FastUART path. Default behaviour (flag unset) is to RUN the per-chip
-/// loop at 115200 — the proven BM1362 paths all do, and skipping it left the
+/// loop at 115200 Ã¢â‚¬â€ the proven BM1362 paths all do, and skipping it left the
 /// cores broadcast-only-activated (suspected `DCENT_AM2_SKIP_FAST_UART`
 /// zero-nonce cause). Set this only to restore the pre-fix behaviour for an
 /// A/B comparison.
@@ -2468,7 +2860,7 @@ fn am2_skip_115200_per_chip_enabled() -> bool {
 /// Replace `init_asic_chain`'s 115200 chain bring-up with the BYTE-EXACT
 /// bosminer cold-wake sequence decoded from `/data/re018-cold-strace.log`
 /// (a strace of bosminer COLD-engaging the `a lab unit` BM1362 chain on /dev/ttyS1).
-/// This replicates the exact register VALUES and ORDER bosminer uses — most
+/// This replicates the exact register VALUES and ORDER bosminer uses Ã¢â‚¬â€ most
 /// notably the per-chip reg 0x0C nonce-space base write DCENT was missing, the
 /// per-chip 0xA8=0x00000002 / 0x18=0xB000C100 values, and the single LATE
 /// GetAddress poll (vs DCENT's per-chip GetAddress bail). See
@@ -2562,7 +2954,7 @@ fn am2_free_chain1_work_tx_irq_for_kernel_uart() {
 /// warning and continue into the PLL/baud-upgrade + the later GetAddress
 /// re-probes. Tests the chicken-and-egg hypothesis that a BM1362 at POR
 /// (~50 MHz) cannot drive a clean 115200 UART reply until its per-chip PLL
-/// block is programmed — the proven `a lab unit` am3-bb path never gates on the
+/// block is programmed Ã¢â‚¬â€ the proven `a lab unit` am3-bb path never gates on the
 /// GetAddress count, and the `a lab unit` Amlogic BM1368 driver never
 /// GetAddress-enumerates at all, so neither working path depends on a
 /// pre-clock enum succeeding. DIAGNOSTIC ONLY, default-OFF: when unset the
@@ -2574,7 +2966,7 @@ fn am2_continue_past_zero_enum_enabled() -> bool {
 }
 
 /// `DCENT_AM2_SKIP_HOTSTART_BAUD_RESET=1` (swarm wf_e0647147 H-skip-baud-reset,
-/// 2026-05-29) — skip the `reset_asic_baud()` pre-enum step.
+/// 2026-05-29) Ã¢â‚¬â€ skip the `reset_asic_baud()` pre-enum step.
 ///
 /// `reset_asic_baud()` is a HOT-restart helper: it opens the chain UART at
 /// 3.125M then 1.5625M baud and sends ChainInactive + MiscCtrl, on the
@@ -2582,10 +2974,10 @@ fn am2_continue_past_zero_enum_enabled() -> bool {
 /// bosminer / DCENT_OS run. On a TRUE cold-boot standalone (`a lab unit` after an
 /// AC-cycle, chain at the 115200 default) that high-baud traffic is seen by
 /// the 115200 chips as line garbage and can leave the chain UART perturbed
-/// right before the first enum — a candidate contributor to the standalone
+/// right before the first enum Ã¢â‚¬â€ a candidate contributor to the standalone
 /// `enum=0`. This gate lets the cold-boot standalone launchers skip it.
 ///
-/// Default-OFF → the proven hot-restart / bosminer-handoff path
+/// Default-OFF Ã¢â€ â€™ the proven hot-restart / bosminer-handoff path
 /// (`run_wave54_25_PROVEN_MINING.sh`, which restarts after bosminer left the
 /// chain at fast baud) is byte-for-byte unchanged. Only set it on a verified
 /// cold-boot standalone run.
@@ -2594,21 +2986,21 @@ fn am2_skip_hotstart_baud_reset_enabled() -> bool {
 }
 
 /// `DCENT_AM2_HEARTBEAT_ALL_ACTIVE_PICS=1` (swarm wf_e0647147 H-heartbeat-0x22,
-/// 2026-05-29) — heartbeat EVERY active dsPIC after ENABLE, not just the
+/// 2026-05-29) Ã¢â‚¬â€ heartbeat EVERY active dsPIC after ENABLE, not just the
 /// selected one.
 ///
 /// The post-ENABLE 1 Hz heartbeat is spawned for `selected_pic_addr` only
 /// (default 0x20). On the `a lab unit` standalone path the EFFECTIVE chain dsPIC is
 /// 0x22 (slot 3, the chain UART routed via `DCENT_AM2_CHAIN_UART_OVERRIDE`),
 /// so 0x22's voltage controller can hit its ~30 s no-heartbeat watchdog and
-/// cut slot-3's rail BEFORE the first BM1362 enum — a candidate root cause of
+/// cut slot-3's rail BEFORE the first BM1362 enum Ã¢â‚¬â€ a candidate root cause of
 /// the standalone `enum=0`. When set, the heartbeat thread also keepalives the
 /// other active dsPICs (incl. the effective chain dsPIC 0x22) using the same
-/// 1 Hz cadence and the same heartbeat command — no new protocol. The thread
+/// 1 Hz cadence and the same heartbeat command Ã¢â‚¬â€ no new protocol. The thread
 /// is still spawned in Phase 3d, immediately after ENABLE (< 10 s), so no rail
 /// is left un-heartbeated through the post-ENABLE settle window.
 ///
-/// Default-OFF → the proven fleet (`a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/s9) and the
+/// Default-OFF Ã¢â€ â€™ the proven fleet (`a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/s9) and the
 ///  `a lab unit` bosminer-handoff path keep heartbeating ONLY
 /// `selected_pic_addr`, byte-for-byte unchanged on the wire. Only the wave55
 /// standalone launchers set it.
@@ -2621,23 +3013,23 @@ fn am2_heartbeat_all_active_pics_enabled() -> bool {
 /// TRUNCATES the per-chip `bm1362_per_chip_fast_init` loop after a named
 /// substep so the EXISTING safe between-phase `post_per_chip_loop_115200`
 /// probe (PR-019, gated by `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE`)
-/// can bisect WHICH per-chip substep collapses the chain's 126→1+62 chip
-/// addressing — WITHOUT injecting any new chain traffic *inside* the
+/// can bisect WHICH per-chip substep collapses the chain's 126Ã¢â€ â€™1+62 chip
+/// addressing Ã¢â‚¬â€ WITHOUT injecting any new chain traffic *inside* the
 /// tight init loop (a GetAddress probe mid-loop would perturb the very
 /// addressing it measures; this truncation reads out via the existing
 /// post-loop probe instead).
 ///
-/// - `a8`       → per chip do ONLY the `0xA8` write.
-/// - `miscctrl` → per chip do `0xA8` + MiscCtrl×3, skip the `0x3C×3`.
-/// - unset/other → run the FULL loop. **DEFAULT — byte-for-byte
+/// - `a8`       Ã¢â€ â€™ per chip do ONLY the `0xA8` write.
+/// - `miscctrl` Ã¢â€ â€™ per chip do `0xA8` + MiscCtrlÃƒâ€”3, skip the `0x3CÃƒâ€”3`.
+/// - unset/other Ã¢â€ â€™ run the FULL loop. **DEFAULT Ã¢â‚¬â€ byte-for-byte
 ///   unchanged behaviour, timing, and on-wire traffic. This is the
 ///   load-bearing no-op contract, identical to PR-019's.**
 ///
-/// Operator ablation (Loki-IN, quiet fan≤30, `/tmp`, AC-cycle-gated):
+/// Operator ablation (Loki-IN, quiet fanÃ¢â€°Â¤30, `/tmp`, AC-cycle-gated):
 /// run the proven milestone command WITHOUT
 /// `DCENT_AM2_SKIP_115200_PER_CHIP`, WITH
-/// `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE=1`, three passes —
-/// `=a8`, `=miscctrl`, unset(full) — and diff the
+/// `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE=1`, three passes Ã¢â‚¬â€
+/// `=a8`, `=miscctrl`, unset(full) Ã¢â‚¬â€ and diff the
 /// `post_per_chip_loop_115200` `[AM2-ABLATION]` `unique_chip_ids`: the
 /// first pass whose value COLLAPSES names the culprit substep, which
 /// directly determines the G2 fix.
@@ -2662,11 +3054,11 @@ fn am2_serial_work_dispatch_enabled() -> bool {
     am2_env_flag("DCENT_AM2_SERIAL_WORK_DISPATCH")
 }
 
-/// 2026-06-02 (W8 production-parity drive, GROUP B) — opt-in env gate for the
+/// 2026-06-02 (W8 production-parity drive, GROUP B) Ã¢â‚¬â€ opt-in env gate for the
 /// `a lab unit` DUAL-CHAIN serial-dispatch capability.
 ///
 /// W8 parity gap: BraiinsOS / VNish / stock all mine BOTH hashboards on `a lab unit`
-/// (PL UART 0 + PL UART 2 → `/dev/ttyS1` + `/dev/ttyS3`), but DCENT_OS today
+/// (PL UART 0 + PL UART 2 Ã¢â€ â€™ `/dev/ttyS1` + `/dev/ttyS3`), but DCENT_OS today
 /// dispatches work to chain 1 ONLY (the first planned chain context / the
 /// `serial_device`-derived chain). That leaves ~50 % of the unit's hashrate on
 /// the table. When the operator sets `DCENT_AM2_DUAL_CHAIN_TTYS3=1`, the
@@ -2676,7 +3068,7 @@ fn am2_serial_work_dispatch_enabled() -> bool {
 /// collects/attributes nonces from BOTH with per-chain `WorkEntry` history,
 /// per-chain dedup, and per-chain BIP320 share reconstruction.
 ///
-/// **DEFAULT-OFF — gate-off is byte-identical to the proven single-chain
+/// **DEFAULT-OFF Ã¢â‚¬â€ gate-off is byte-identical to the proven single-chain
 /// `run_am2_serial_dispatch_loop` path.** When unset, `run()` never opens the
 /// second UART, never spawns the second chain, and calls the exact same
 /// single-chain loop as before. The EXACT 2nd-chain cold bring-up ORDER/TIMING
@@ -2692,9 +3084,9 @@ fn am2_dual_chain_ttys3_enabled() -> bool {
 
 /// Canonical second-chain UART for the `a lab unit` dual-chain capability. `a lab unit` has
 /// hashboards on PL UART 0 (`/dev/ttyS1`, slot 0, dsPIC 0x20) and PL UART 2
-/// (`/dev/ttyS3`, slot 2, dsPIC 0x22) — the absent middle slot maps to ttyS2.
+/// (`/dev/ttyS3`, slot 2, dsPIC 0x22) Ã¢â‚¬â€ the absent middle slot maps to ttyS2.
 /// The operator can override via `DCENT_AM2_DUAL_CHAIN_SECOND_UART` (defense in
-/// depth — a future topology with a different second slot stays expressible
+/// depth Ã¢â‚¬â€ a future topology with a different second slot stays expressible
 /// without a code change). Default is the `a lab unit`-proven `/dev/ttyS3`.
 const AM2_DUAL_CHAIN_SECOND_UART_DEFAULT: &str = "/dev/ttyS3";
 
@@ -2707,7 +3099,7 @@ fn am2_dual_chain_second_uart() -> String {
 
 /// RANK-5 (2026-06-13, "make-it-work" + live operator signal). The cold test of
 /// WAKE-DSPIC-BEFORE-RAIL delivered power (operator confirmed the hashboard WARMS)
-/// but enum stayed 0 with zero RX — so the residual is TRANSPORT, not power.
+/// but enum stayed 0 with zero RX Ã¢â‚¬â€ so the residual is TRANSPORT, not power.
 /// bosminer's cold block-B opens BOTH `/dev/ttyS1` AND `/dev/ttyS3` before enum;
 /// DCENT-standalone opens only ttyS1. On `a lab unit` the two PL-UART cores
 /// (`41001000.uart` + `41021000.uart`) may share a chain-TX-clock / reset gate in
@@ -2722,7 +3114,7 @@ fn am2_open_both_uarts_before_enum_enabled() -> bool {
     am2_env_flag("DCENT_AM2_OPEN_BOTH_UARTS_BEFORE_ENUM") && am2_zynq_bm1362_recipe_gate_matches()
 }
 
-/// 2026-05-22 (XIL `a lab unit` recovery, Layer 1) — opt-in env gate for the
+/// 2026-05-22 (XIL `a lab unit` recovery, Layer 1) Ã¢â‚¬â€ opt-in env gate for the
 /// bosminer-faithful PIC reset+start-app warmup.
 ///
 /// When the operator sets `DCENT_AM2_PIC_RESET_AND_START_APP=1`, Phase 0d
@@ -2732,7 +3124,7 @@ fn am2_open_both_uarts_before_enum_enabled() -> bool {
 ///
 /// **Default off so the first commit stays byte-identical to today's `a lab unit`
 /// behaviour.** The `[mining].am2_dspic_warmup_before_get_version` TOML knob
-/// is ALSO required (default true) — both must be true for the prelude to
+/// is ALSO required (default true) Ã¢â‚¬â€ both must be true for the prelude to
 /// actually run. The double-gate is intentional: the config knob is the
 /// "is this feature on for this fleet at all?" switch, the env gate is the
 /// "I'm explicitly green-lighting this on THIS unit for an A/B run" switch.
@@ -2742,7 +3134,7 @@ fn am2_pic_reset_and_start_app_enabled() -> bool {
     am2_env_flag("DCENT_AM2_PIC_RESET_AND_START_APP")
 }
 
-/// 2026-05-24 () — opt-in env gate for the STANDALONE Loki spoof
+/// 2026-05-24 () Ã¢â‚¬â€ opt-in env gate for the STANDALONE Loki spoof
 /// cold-boot bring-up path on `a lab unit`-class XIL units.
 ///
 /// When `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1`, Phase 0 calls
@@ -2750,32 +3142,32 @@ fn am2_pic_reset_and_start_app_enabled() -> bool {
 /// bosminer-handoff path's `cold_boot_sequence_write_only`. The standalone
 /// path emits the  captured cold-wake byte sequence
 /// (init-frame + poll + follow-up-frame + poll, up to 4 cycles) BEFORE
-/// the standard 3× Disable + Ramp + Enable body, so the Loki spoof can
+/// the standard 3Ãƒâ€” Disable + Ramp + Enable body, so the Loki spoof can
 /// engage from a true cold AC-cycled state WITHOUT bosminer pre-engaging
 /// the chip rail.
 ///
 /// **Fleet safety**: this env is ADDITIVE to the  PROVEN MINING
 /// RECIPE (NOT in the 4-forbidden list at `wave55a_recipe_guard.rs`).
-/// Default OFF — unset env → original behavior preserved byte-identically.
+/// Default OFF Ã¢â‚¬â€ unset env Ã¢â€ â€™ original behavior preserved byte-identically.
 /// Only fires when ALL of the following hold:
 ///   1. `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1` is set.
 ///   2. PSU transport == `gpio_bitbang` (Loki spoof is the only documented
-///      gpio_bitbang PSU on the fleet — `a lab unit` BB / `a lab unit` XIL / `a lab unit`
+///      gpio_bitbang PSU on the fleet Ã¢â‚¬â€ `a lab unit` BB / `a lab unit` XIL / `a lab unit`
 ///      S19 Pro all use kernel-i2c or no-PSU paths).
 ///   3. The `a lab unit`-class hardware fingerprint matches (platform ==
 ///      `zynq-bm3-am2` AND board_target ends with `xil`).
-///   4. `DCENT_AM2_TRUST_RAIL_FALLBACK != 1` — operator is NOT asking
+///   4. `DCENT_AM2_TRUST_RAIL_FALLBACK != 1` Ã¢â‚¬â€ operator is NOT asking
 ///      for the bosminer-handoff fallback (the two paths are mutually
 ///      exclusive: handoff requires the chip rail already engaged by
 ///      bosminer; standalone tries to engage it without bosminer).
 ///
 ///
-/// for the  →  byte mapping and the test plan.
+/// for the  Ã¢â€ â€™  byte mapping and the test plan.
 fn am2_psu_loki_cold_boot_full_enabled() -> bool {
     am2_env_flag("DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL")
 }
 
-/// 2026-05-25 () — opt-in umbrella env gate for the Phase 2c RE
+/// 2026-05-25 () Ã¢â‚¬â€ opt-in umbrella env gate for the Phase 2c RE
 /// finding fix on `a lab unit`-class XIL hardware (DCENT_OS-from-NAND
 /// standalone cold-boot).
 ///
@@ -2784,18 +3176,18 @@ fn am2_psu_loki_cold_boot_full_enabled() -> bool {
 /// (SetVoltage) and ZERO `0x15` (ENABLE_VOLTAGE) opcodes. The
 /// chip-rail engagement actually happens through:
 ///   1. The Loki spoof's `0x83` SetVoltageStep opcode (per
-///      `PHASE2B-APW12-PIC-PROTOCOL.md`) at the *PWM-DAC layer* — this
+///      `PHASE2B-APW12-PIC-PROTOCOL.md`) at the *PWM-DAC layer* Ã¢â‚¬â€ this
 ///      is what `` adds to `cold_boot_sequence_loki_standalone`.
 ///   2. The 17-transaction LM75A passthrough sequence (dsPIC opcodes
 ///      `0x3B`/`0x3C` on sensor addresses `0x48..0x4B`) that warms the
-///      dsPIC's MSSP I²C handler state machine — this is what
+///      dsPIC's MSSP IÃ‚Â²C handler state machine Ã¢â‚¬â€ this is what
 ///      `am2_dspic_lm75_passthrough_warmup` emits.
 ///
 /// When `DCENT_AM2_STANDALONE_RE_FIX=1` AND the `a lab unit` fingerprint
 /// matches AND the  standalone Loki cold-boot path is also
 /// engaged (`DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1`), Phase 0:
 ///   1. Runs `cold_boot_sequence_loki_standalone` (which now emits
-///      Loki SetVoltage(13700) at end — per change 2 above).
+///      Loki SetVoltage(13700) at end Ã¢â‚¬â€ per change 2 above).
 ///   2. Runs the 17-tx LM75A passthrough warmup.
 ///   3. Preserves the standard dsPIC `cold_boot_init` call.  live
 ///      testing falsified the  skip hypothesis: skipping SetVoltage +
@@ -2804,7 +3196,7 @@ fn am2_psu_loki_cold_boot_full_enabled() -> bool {
 ///   4. Proceeds through the normal Phase 3 rail-engage path, then Phase 4-7
 ///      chain enum on `/dev/ttyS1`.
 ///
-/// **Fleet safety**: default-OFF — when unset, all paths preserve
+/// **Fleet safety**: default-OFF Ã¢â‚¬â€ when unset, all paths preserve
 /// byte-identical behavior. Even when set, takes no effect unless the
 /// `a lab unit` fingerprint matches AND the Loki cold-boot path is also
 /// engaged (compound gate).
@@ -2816,21 +3208,21 @@ fn am2_standalone_re_fix_enabled() -> bool {
     am2_env_flag("DCENT_AM2_STANDALONE_RE_FIX")
 }
 
-/// `DCENT_AM2_FPGA_UART_RELAY_COLD=1` (2026-06-11, LIVE-PINNED) — enable the
+/// `DCENT_AM2_FPGA_UART_RELAY_COLD=1` (2026-06-11, LIVE-PINNED) Ã¢â‚¬â€ enable the
 /// FPGA UART **return** relay on the am2 `gpio@41220000` AXI-GPIO BEFORE the
-/// chain enum walk, so the BM1362 daisy-chain RETURN line (chip RO →
+/// chain enum walk, so the BM1362 daisy-chain RETURN line (chip RO Ã¢â€ â€™
 /// chip-id/enum/nonce frames) reaches the PL soft-UART RX.
 ///
 /// H1 candidate for `a lab unit` standalone enum=0 (multi-agent RE + live probe
 /// 2026-06-11): the RETURN line is gated by a 2-bit AXI-GPIO at `0x41220000`
-/// (bit0 `co_relay_en`, bit1 `ro_relay_en`) — the ONLY `/dev/mem` map bosminer
+/// (bit0 `co_relay_en`, bit1 `ro_relay_en`) Ã¢â‚¬â€ the ONLY `/dev/mem` map bosminer
 /// makes. bosminer drives it to `DATA=0x3` / `TRI=0x0` (both bits output,
 /// driven); DCENT's `a lab unit` standalone path never mapped it, so the cold-boot
 /// reset default (`tri=0xffffffff` = input/floating = relay OFF) left the
-/// return path open → commands out, **0 RX**. See
+/// return path open Ã¢â€ â€™ commands out, **0 RX**. See
 /// [`dcentrald_hal::fpga_uart_relay`]. This was the H1 candidate from
 /// ; keep the
-/// EBR choreography + `0x15` ENABLE (bosminer/luxminer both send ENABLE — the
+/// EBR choreography + `0x15` ENABLE (bosminer/luxminer both send ENABLE Ã¢â‚¬â€ the
 /// "withhold-0x15" idea was falsified).
 ///
 /// LIVE FALSIFICATION BOUNDARY: the v+2 run drove this GPIO to the bosminer
@@ -2848,7 +3240,7 @@ fn am2_standalone_re_fix_enabled() -> bool {
 /// Default-OFF + AM2-Zynq/BM1362 recipe gate + NOT-handoff
 /// (`!DCENT_AM2_TRUST_RAIL_FALLBACK`,
 /// since the  handoff inherits the relay bosminer already latched). It
-/// is intentionally NOT in `WAVE54_FORBIDDEN_ENV_VARS` (it touches no dsPIC) —
+/// is intentionally NOT in `WAVE54_FORBIDDEN_ENV_VARS` (it touches no dsPIC) Ã¢â‚¬â€
 /// adding it there would block the cold path it enables. Byte-identical on
 /// `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9/handoff and whenever the env is unset.
 fn am2_fpga_uart_relay_cold_enabled() -> bool {
@@ -2858,13 +3250,13 @@ fn am2_fpga_uart_relay_cold_enabled() -> bool {
 }
 
 /// Gated, fail-closed when enabled, **idempotent** FPGA UART return-relay enable. No-op unless
-/// [`am2_fpga_uart_relay_cold_enabled`]. Safe to call multiple times — the
+/// [`am2_fpga_uart_relay_cold_enabled`]. Safe to call multiple times Ã¢â‚¬â€ the
 /// underlying AXI-GPIO write at `0x41220000` is an idempotent read-modify-write
 /// (DATA bits[1:0]=0b11, TRI bits[1:0]=0b00). It is called at BOTH the
 /// pre-rail-evidence-probe point AND the pre-enum point: the relay MUST be up
 /// before `post_enable_chain_uart_probe` so that probe's `rx_bytes_pre_init`
 /// can be a true rail+transport signal (otherwise the RETURN line is physically
-/// open and the probe is a structurally-guaranteed 0-RX false negative —
+/// open and the probe is a structurally-guaranteed 0-RX false negative Ã¢â‚¬â€
 /// DCENT_FPGA review 2026-06-11), AND before the SET_ADDRESS enum walk.
 /// `stage` labels the call site in the log. When the env gate is set, readback
 /// failure aborts before enum.
@@ -2884,7 +3276,7 @@ fn am2_try_enable_fpga_uart_relay_cold(stage: &str) -> Result<()> {
                 tri_post = format_args!("0x{:08X}", r.tri_post),
                 relay_confirmed,
                 "RE-018 relay: FPGA UART return-relay enabled (gpio@41220000 \
-             co_relay_en+ro_relay_en) — expect data_post bits[1:0]=0b11, \
+             co_relay_en+ro_relay_en) Ã¢â‚¬â€ expect data_post bits[1:0]=0b11, \
              tri_post bits[1:0]=0b00 (matches live bosminer)"
             );
             if !relay_confirmed {
@@ -2900,12 +3292,12 @@ fn am2_try_enable_fpga_uart_relay_cold(stage: &str) -> Result<()> {
     Ok(())
 }
 
-/// `DCENT_AM2_BOARD_CONTROL_BIT8=1` (W2 register-diff, 2026-06-14) — gate for the
+/// `DCENT_AM2_BOARD_CONTROL_BIT8=1` (W2 register-diff, 2026-06-14) Ã¢â‚¬â€ gate for the
 /// board-control `+0x04` bit 8 set. Default-OFF + `a lab unit`-fingerprinted: the live
 /// paired `dump_fpga_regs_25.sh` diff proved bosminer-engaged `+0x04 = 0x134`
-/// while DCENT standalone enum=0 reads `0x034` — bit 8 (`0x100`) is the only
+/// while DCENT standalone enum=0 reads `0x034` Ã¢â‚¬â€ bit 8 (`0x100`) is the only
 /// persistent-fabric register DCENT never matches. Default-OFF + `a lab unit` fingerprint
-/// ⇒ byte-identical for `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9 and the  handoff
+/// Ã¢â€¡â€™ byte-identical for `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9 and the  handoff
 /// (which inherits the value bosminer latched). `a lab unit` requires its explicit
 /// class-recipe proof envs. Touches no dsPIC, so it is NOT a  forbidden
 /// var.
@@ -2913,7 +3305,7 @@ fn am2_board_control_bit8_enabled() -> bool {
     am2_env_flag("DCENT_AM2_BOARD_CONTROL_BIT8") && am2_zynq_bm1362_recipe_gate_matches()
 }
 
-/// `DCENT_AM2_RE018_WRITE_TICKET_HASHCOUNT=1` (perf audit, 2026-06-14) — gate to
+/// `DCENT_AM2_RE018_WRITE_TICKET_HASHCOUNT=1` (perf audit, 2026-06-14) Ã¢â‚¬â€ gate to
 /// add the TICKET_MASK (reg 0x14) + HASH_COUNTING_NUMBER (reg 0x10) broadcast
 /// writes to the RE-018 cold sequence. The RE-018 path replays a bosminer strace
 /// that captured only the FIRST init cycle (ending at the per-chip 0x0C write);
@@ -2922,16 +3314,16 @@ fn am2_board_control_bit8_enabled() -> bool {
 /// production); without 0x10 all 126 chips hash the SAME nonce range. This is the
 /// root cause of the ~1000x-low `a lab unit` standalone hashrate (even the
 /// "proven" run was 5 nonces/165s). The legacy init path already writes both
-/// (Step 4b). POWER-NEUTRAL: same freq/voltage — the cores already hash; this
+/// (Step 4b). POWER-NEUTRAL: same freq/voltage Ã¢â‚¬â€ the cores already hash; this
 /// only lets them REPORT nonces at the correct rate + distribute the range.
-/// Default-OFF + AM2-Zynq/BM1362 recipe gate ⇒ fleet stays byte-identical unless
+/// Default-OFF + AM2-Zynq/BM1362 recipe gate Ã¢â€¡â€™ fleet stays byte-identical unless
 /// a sibling unit supplies its explicit class-recipe proof envs; the
 /// handoff stays byte-identical.
 fn am2_re018_write_ticket_hashcount_enabled() -> bool {
     am2_env_flag("DCENT_AM2_RE018_WRITE_TICKET_HASHCOUNT") && am2_zynq_bm1362_recipe_gate_matches()
 }
 
-/// `DCENT_AM2_RE018_FULL_CORE_INIT=1` (perf audit, 2026-06-14) — gate to swap
+/// `DCENT_AM2_RE018_FULL_CORE_INIT=1` (perf audit, 2026-06-14) Ã¢â‚¬â€ gate to swap
 /// the RE-018 cold sequence's INIT_CONTROL (reg 0xA8) writes from the
 /// strace-captured cores-IDLE values
 ///   broadcast 0x0000_0000 / per-chip 0x0000_0002
@@ -2943,10 +3335,10 @@ fn am2_re018_write_ticket_hashcount_enabled() -> bool {
 /// the core/clock enable cluster the RE-018 capture's first cycle omitted; a
 /// prior live ticket-mask A/B proved the idle is UPSTREAM of nonce reporting
 /// (= core enable), so this is the load-bearing fix for the ~400x-low useful
-/// hashrate. Default-OFF + AM2-Zynq/BM1362 recipe gate ⇒ fleet stays
+/// hashrate. Default-OFF + AM2-Zynq/BM1362 recipe gate Ã¢â€¡â€™ fleet stays
 /// byte-identical unless a sibling unit supplies its explicit class-recipe proof
 /// envs; the  handoff stays byte-identical.
-/// POWER-AWARE: enabling cores REQUIRES the low PLL — the two are coupled in
+/// POWER-AWARE: enabling cores REQUIRES the low PLL Ã¢â‚¬â€ the two are coupled in
 /// this one gate so cores can never be un-idled at the high freq by mistake.
 fn am2_re018_full_core_init_enabled() -> bool {
     am2_env_flag("DCENT_AM2_RE018_FULL_CORE_INIT") && am2_zynq_bm1362_recipe_gate_matches()
@@ -2966,8 +3358,8 @@ const RE018_PLL_VCO_MAX_MHZ: u32 = 5975;
 ///
 /// This refuses BOTH a grossly out-of-lock VCO (a fat-fingered overclock/under-lock
 /// hex) AND the live-FALSIFIED high-VCO-plus-huge-postdiv shape: e.g.
-/// `0x50D2_0164` decodes to VCO 5250 (in band) but a ÷35 postdiv -> 150 MHz, off
-/// the proven low-VCO regime the BM1362 jig uses for sub-400 — it returned zero
+/// `0x50D2_0164` decodes to VCO 5250 (in band) but a ÃƒÂ·35 postdiv -> 150 MHz, off
+/// the proven low-VCO regime the BM1362 jig uses for sub-400 Ã¢â‚¬â€ it returned zero
 /// nonces live. Both failure modes land OUTSIDE one of the two checks, so the
 /// lab escape hatch can never silently drive the chip to an unsafe / zero-nonce
 /// PLL. Returns `true` iff the value is in-envelope.
@@ -2988,12 +3380,12 @@ fn am2_re018_pll_hex_within_envelope(reg: u32) -> bool {
 /// Resolve the RE-018 frequency-override PLL reg-0x08 (only consulted when the
 /// `DCENT_AM2_RE018_LOW_FREQ_PLL` gate is set). Precedence:
 ///   1. `DCENT_AM2_RE018_TARGET_MHZ` -> `bm1362::pll_lookup_extended` (PROVEN, 240-597; sub-400 uses
-///      the proven ÷10 divider, >=400 the table). Lets the operator dial the eco<->hash range.
+///      the proven ÃƒÂ·10 divider, >=400 the table). Lets the operator dial the eco<->hash range.
 ///   2. `DCENT_AM2_RE018_PLL_HEX` -> raw reg 0x08 (lab/escape hatch; e.g. 0x50800141), VALIDATED
 ///      against the `pll_lookup_extended` VCO/operating envelope; out-of-envelope is REFUSED and
 ///      falls through to the proven default so a fat-fingered hex can't drive an unsafe PLL.
 ///   3. default [`RE018_LOW_FREQ_PLL_08`] = the proven 320 MHz efficiency sweet spot.
-/// POWER-RAISING vs the ~50 MHz eco/heater default ([`RE018_PLL_08`]) — wattmeter-gated live test.
+/// POWER-RAISING vs the ~50 MHz eco/heater default ([`RE018_PLL_08`]) Ã¢â‚¬â€ wattmeter-gated live test.
 fn am2_re018_resolve_pll_override_reg() -> u32 {
     if let Ok(s) = std::env::var("DCENT_AM2_RE018_TARGET_MHZ") {
         if let Ok(mhz) = s.trim().parse::<u16>() {
@@ -3006,7 +3398,7 @@ fn am2_re018_resolve_pll_override_reg() -> u32 {
             // Clamp the raw lab escape-hatch to the SAME VCO/operating envelope
             // `pll_lookup_extended` enforces so a fat-fingered hex can't drive an
             // unsafe / zero-nonce PLL. Out-of-envelope -> REFUSE, fall through to
-            // the proven default. (Lab-only knob — the `a lab unit` proven recipe never
+            // the proven default. (Lab-only knob Ã¢â‚¬â€ the `a lab unit` proven recipe never
             // sets `DCENT_AM2_RE018_PLL_HEX`, so the proven path is byte-unchanged.)
             if am2_re018_pll_hex_within_envelope(reg) {
                 return reg;
@@ -3015,7 +3407,7 @@ fn am2_re018_resolve_pll_override_reg() -> u32 {
                 raw_reg = format_args!("0x{:08X}", reg),
                 fallback = format_args!("0x{:08X}", RE018_LOW_FREQ_PLL_08),
                 "DCENT_AM2_RE018_PLL_HEX outside the BM1362 PLL VCO/operating envelope \
-                 (VCO 2400-5975 MHz, freq 240-597 MHz) — REFUSING the raw value and using the \
+                 (VCO 2400-5975 MHz, freq 240-597 MHz) Ã¢â‚¬â€ REFUSING the raw value and using the \
                  proven default to avoid an unsafe / zero-nonce PLL"
             );
             return RE018_LOW_FREQ_PLL_08;
@@ -3045,7 +3437,7 @@ fn am2_try_set_board_control_bit8(stage: &str) -> Result<()> {
                     env = "DCENT_AM2_BOARD_CONTROL_BIT8=1",
                     before = format_args!("0x{:08X}", s.before),
                     after = format_args!("0x{:08X}", s.after),
-                    "W2-diff board-control: +0x04 bit 8 (0x100) set — expect \
+                    "W2-diff board-control: +0x04 bit 8 (0x100) set Ã¢â‚¬â€ expect \
                      after=0x...134 (byte-identical to live bosminer-engaged)"
                 );
             }
@@ -3062,46 +3454,46 @@ fn am2_try_set_board_control_bit8(stage: &str) -> Result<()> {
     Ok(())
 }
 
-/// `DCENT_AM2_DSPIC_FW_FROM_OBSERVED=1` ( / RE-018, 2026-05-30) — on the
+/// `DCENT_AM2_DSPIC_FW_FROM_OBSERVED=1` ( / RE-018, 2026-05-30) Ã¢â‚¬â€ on the
 /// `a lab unit` effective-chain dsPIC, construct the `Pic0x89Service` with the OBSERVED
 /// firmware-family echo byte (`0x8A`) instead of `None` (which defaults to
 /// `Fw89`). On `a lab unit` the effective-chain dsPIC (0x22) answers GET_VERSION with
-/// fw=0x89 but its idle/echo byte is `0x8A` — and `dspic_enable_disable_encoding`
+/// fw=0x89 but its idle/echo byte is `0x8A` Ã¢â‚¬â€ and `dspic_enable_disable_encoding`
 /// selects the **7-byte VnishPadded** ENABLE form for `Fw89` (which `a lab unit` echoes
-/// `[0x8A,0x8A]`) vs the **6-byte Canonical** form for `Fw8A` — and the 6-byte
+/// `[0x8A,0x8A]`) vs the **6-byte Canonical** form for `Fw8A` Ã¢â‚¬â€ and the 6-byte
 /// Canonical form is the one that produced a real `[0x15,0x00]` ACK on the live
 /// ttyS3 cold-cycle (2026-05-30). Passing `Some(0x8A)` also makes
 /// `classify_enable_ack` expect `0x8A` so a legitimate echo is `FirmwareEcho`
 /// (not `FirmwareEchoMismatch`). Default-OFF + `a lab unit`-fingerprint + effective-chain
-/// only → byte-identical for `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9/handoff (they keep
-/// `None`⇒`Fw89`). Workflow `wf_ce77f2f8` Change #1 (SAFE_BEHIND_FLAG).
+/// only Ã¢â€ â€™ byte-identical for `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9/handoff (they keep
+/// `None`Ã¢â€¡â€™`Fw89`). Workflow `wf_ce77f2f8` Change #1 (SAFE_BEHIND_FLAG).
 fn am2_dspic_fw_from_observed_enabled() -> bool {
     am2_env_flag("DCENT_AM2_DSPIC_FW_FROM_OBSERVED")
 }
 
-/// `DCENT_AM2_LM75_RAIL_PROXY=1` (2026-05-31) — on the `a lab unit` standalone path,
+/// `DCENT_AM2_LM75_RAIL_PROXY=1` (2026-05-31) Ã¢â‚¬â€ on the `a lab unit` standalone path,
 /// read the chain dsPIC's LM75 die-temp via the 0x3B/0x3C 6-byte PASSTHROUGH
 /// protocol (the bosminer-proven `a lab unit` shape) instead of the legacy
 /// `read_temperature` (0x30 + 4-byte read), which returns NaN on `a lab unit` because
 /// 0x30 is not the LM75-passthrough opcode there. With the passthrough decode
 /// working, the rail proxy can emit a 3-state autonomous (no-DMM) verdict:
-/// `DECODES` (dsPIC passthrough alive) → `ABOVE-AMBIENT` (>28 °C ⇒ chips
-/// drawing power ⇒ rail up) → `DELTA` (≥1.5 °C rise after ENABLE ⇒ rail
-/// CONFIRMED up). DIAGNOSTIC/observability ONLY — reads LM75 temps and logs a
+/// `DECODES` (dsPIC passthrough alive) Ã¢â€ â€™ `ABOVE-AMBIENT` (>28 Ã‚Â°C Ã¢â€¡â€™ chips
+/// drawing power Ã¢â€¡â€™ rail up) Ã¢â€ â€™ `DELTA` (Ã¢â€°Â¥1.5 Ã‚Â°C rise after ENABLE Ã¢â€¡â€™ rail
+/// CONFIRMED up). DIAGNOSTIC/observability ONLY Ã¢â‚¬â€ reads LM75 temps and logs a
 /// verdict; changes NO mining/voltage/enum control flow and is safe if the
 /// dsPIC doesn't answer (verdict = UNAVAILABLE, never panics/aborts).
 ///
 /// **Default off** + `a lab unit`-fingerprinted (`am2_xil_25_fingerprint_matches`):
-/// absent env OR any non-`a lab unit` unit ⇒ byte-identical (keeps calling
+/// absent env OR any non-`a lab unit` unit Ã¢â€¡â€™ byte-identical (keeps calling
 /// `read_temperature`). So `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9/handoff are untouched.
 ///
-/// ⚠️ RE CORRECTION (R5, 2026-05-31 — ):
-/// 0x3B/0x3C-with-arg-0x48 are LM75A **TEMPERATURE** passthrough reads (°C), NOT
+/// Ã¢Å¡Â Ã¯Â¸Â RE CORRECTION (R5, 2026-05-31 Ã¢â‚¬â€ ):
+/// 0x3B/0x3C-with-arg-0x48 are LM75A **TEMPERATURE** passthrough reads (Ã‚Â°C), NOT
 /// a rail-voltage read (Ghidra: bosminer.bin carries `hwmon/src/lm75a.rs`; the
-/// 0x3C reply `[3C 01 1A E0 01 3E]` decodes to ~26.9 °C, NOT millivolts). This
+/// 0x3C reply `[3C 01 1A E0 01 3E]` decodes to ~26.9 Ã‚Â°C, NOT millivolts). This
 /// proxy therefore produces a HEURISTIC die-temperature inference ("chips warm
-/// ⇒ likely drawing power ⇒ rail probably up"), NEVER a direct rail-mV reading.
-/// It is observability-only and gates NOTHING — see the verdict site, which
+/// Ã¢â€¡â€™ likely drawing power Ã¢â€¡â€™ rail probably up"), NEVER a direct rail-mV reading.
+/// It is observability-only and gates NOTHING Ã¢â‚¬â€ see the verdict site, which
 /// changes no mining/voltage/enum control flow and is fail-safe (UNAVAILABLE) if
 /// the dsPIC doesn't answer. Do NOT promote its verdict into a rail-mV decision
 /// or a mining gate: a temperature is not a voltage. The TRUE actual-rail proxy
@@ -3111,7 +3503,7 @@ fn am2_lm75_rail_proxy_enabled() -> bool {
     am2_env_flag("DCENT_AM2_LM75_RAIL_PROXY")
 }
 
-/// 2026-05-24 () — `a lab unit`-class XIL fingerprint check using the
+/// 2026-05-24 () Ã¢â‚¬â€ `a lab unit`-class XIL fingerprint check using the
 /// same conventions as `wave55a_recipe_guard::fingerprint_matches_xil_25`.
 /// Reads `/etc/dcentos/platform` and `/etc/dcentos/board_target`; returns
 /// `true` when they match the canonical `a lab unit` stamps. The  launcher may
@@ -3121,7 +3513,7 @@ fn am2_lm75_rail_proxy_enabled() -> bool {
 /// have to match.
 ///
 /// Held here (not delegated to `wave55a_recipe_guard`) because Phase 0 is
-/// already deep into `Apw121215a` lifetime — adding the cross-module
+/// already deep into `Apw121215a` lifetime Ã¢â‚¬â€ adding the cross-module
 /// dependency would force a refactor of the guard module's
 /// `evaluate_guard` signature. The fingerprint check is intentionally
 /// duplicated; the  regression test pins that both copies stay
@@ -3153,7 +3545,7 @@ fn am2_xil_25_fingerprint_matches() -> bool {
     }
     // psu_hardware_variant is optional. If explicitly declared as
     // something OTHER than "loki", do NOT fire  (operator has
-    // declared a non-Loki PSU topology — 's bytes only make
+    // declared a non-Loki PSU topology Ã¢â‚¬â€ 's bytes only make
     // sense for the Loki spoof).
     match psu_hardware_variant.as_deref().map(str::trim) {
         Some("") | None => true,
@@ -3216,9 +3608,9 @@ fn am2_zynq_bm1362_recipe_gate_matches() -> bool {
             && am2_zynq_bm1362_class_matches())
 }
 
-/// 2026-06-07 (COLD-BYTE-DIFF Fix B) — opt-in env gate for emitting the `a lab unit`
+/// 2026-06-07 (COLD-BYTE-DIFF Fix B) Ã¢â‚¬â€ opt-in env gate for emitting the `a lab unit`
 /// cold dsPIC strace-derived warmup as ONE atomic typed I2C transaction (vs the
-/// proven N separate transactions). When set, the entire flush→RESET→JUMP
+/// proven N separate transactions). When set, the entire flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMP
 /// warmup runs as a single service request, so no other i2c-0 producer
 /// (thermal LM75 reads, PIC heartbeats, absent-slave probes) can interleave
 /// between the warmup's transactions and desync the cold dsPIC MSSP bootloader
@@ -3226,9 +3618,9 @@ fn am2_zynq_bm1362_recipe_gate_matches() -> bool {
 /// RESET/JUMP).
 ///
 /// **Default-OFF + AM2-Zynq/BM1362 recipe-gated**:
-/// absent env OR no `a lab unit`/explicit sibling recipe proof ⇒ the byte-identical
+/// absent env OR no `a lab unit`/explicit sibling recipe proof Ã¢â€¡â€™ the byte-identical
 /// N-transaction path (the proven fleet / handoff / legacy behaviour). The
-/// on-wire bytes + dwells are UNCHANGED either way — only the transaction
+/// on-wire bytes + dwells are UNCHANGED either way Ã¢â‚¬â€ only the transaction
 /// boundary changes. See
 ///  (Fix B).
 fn am2_dspic_cold_warmup_exclusive_enabled() -> bool {
@@ -3250,13 +3642,13 @@ fn am2_run_strace_derived_warmup(i2c: &I2cServiceHandle, addr: u8) -> dcentrald_
     }
 }
 
-/// 2026-05-23 (XIL `a lab unit` ) — opt-in env gate for the
+/// 2026-05-23 (XIL `a lab unit` ) Ã¢â‚¬â€ opt-in env gate for the
 /// bosminer-plus-tuner 0.9.0 STRACE-DERIVED FRAMED warmup variant.
 ///
 /// When `DCENT_AM2_PIC_RESET_STRACE_DERIVED=1`, Phase 0d uses the new
 /// `bosminer_warmup::am2_pic_reset_and_start_app_strace_derived` chain
 /// (8 single-byte 0x00 sync heartbeats + framed `[55 AA 04 07 00 0B]` + ACK +
-/// 500 ms + framed `[55 AA 04 06 00 0A]` + ACK + 500 ms) — the byte sequence
+/// 500 ms + framed `[55 AA 04 06 00 0A]` + ACK + 500 ms) Ã¢â‚¬â€ the byte sequence
 /// captured by `strace -e write,read` on bosminer-plus-tuner 0.9.0 / LEDE
 /// `zynq-bm3-am2` while it successfully mined on `a lab unit` (per
 /// ).
@@ -3264,7 +3656,7 @@ fn am2_run_strace_derived_warmup(i2c: &I2cServiceHandle, addr: u8) -> dcentrald_
 /// **Takes precedence** over `DCENT_AM2_PIC_RESET_AND_START_APP` and
 /// `DCENT_AM2_PIC_RESET_NO_JUMP`. When both `DCENT_AM2_PIC_RESET_STRACE_DERIVED`
 /// and `DCENT_AM2_PIC_RESET_AND_START_APP` are set, the strace-derived path
-/// wins (mutually exclusive — only one warmup chain can run per Phase 0d).
+/// wins (mutually exclusive Ã¢â‚¬â€ only one warmup chain can run per Phase 0d).
 ///
 /// **Default off** so the very first deploy of this binary on `a lab unit` stays
 /// byte-identical to today's behaviour. Operator flips this on `a lab unit` for the
@@ -3274,7 +3666,7 @@ fn am2_pic_reset_strace_derived_enabled() -> bool {
     am2_env_flag("DCENT_AM2_PIC_RESET_STRACE_DERIVED")
 }
 
-/// 2026-05-23 (XIL `a lab unit` ) — opt-in env gate for the
+/// 2026-05-23 (XIL `a lab unit` ) Ã¢â‚¬â€ opt-in env gate for the
 /// bosminer-plus-tuner 0.9.0 STRACE-DERIVED FRAMED GET_VERSION read shape.
 ///
 /// When `DCENT_AM2_GET_VERSION_FRAMED_4B=1`, `pic_read_fw_version_service`
@@ -3283,22 +3675,22 @@ fn am2_pic_reset_strace_derived_enabled() -> bool {
 /// bosminer-plus-tuner 0.9.0 response shape captured on `a lab unit`:
 /// `[0x17, FW, 0x00, CKSUM]` where the firmware byte is at INDEX 1 (not
 /// index 2 like older lineages). On older lineages the 4-byte read either
-/// returns a known fw byte at index 1 OR is rejected by the parser → we
+/// returns a known fw byte at index 1 OR is rejected by the parser Ã¢â€ â€™ we
 /// fall through to the existing 1-byte probes.
 ///
 /// Companion to `DCENT_AM2_PIC_RESET_STRACE_DERIVED`. The two gates are
-/// INDEPENDENT: warmup-only, read-only, both, or neither — operator picks
+/// INDEPENDENT: warmup-only, read-only, both, or neither Ã¢â‚¬â€ operator picks
 /// per A/B run. Default-off so unset env = byte-identical to today.
 ///
 /// Tipping point: if  reset+start-app lands the chip in fw=0x89
 /// but `pic_read_fw_version_service` still reads fw=0x82, it's because the
-/// read path is the wrong shape — flip THIS gate to land the matching
+/// read path is the wrong shape Ã¢â‚¬â€ flip THIS gate to land the matching
 /// 4-byte read shape and pick up the fw=0x89 byte at index 1.
 fn am2_get_version_framed_4b_enabled() -> bool {
     am2_env_flag("DCENT_AM2_GET_VERSION_FRAMED_4B")
 }
 
-/// 2026-05-23 (XIL `a lab unit` ) — bosminer-faithful Phase 0d timing.
+/// 2026-05-23 (XIL `a lab unit` ) Ã¢â‚¬â€ bosminer-faithful Phase 0d timing.
 ///
 ///  (commit `60a2ab3d`) shipped three faithful timing fixes
 /// (parser-flush skip, 6-ms inter-byte sleep, 7-byte sync prelude) behind
@@ -3307,27 +3699,27 @@ fn am2_get_version_framed_4b_enabled() -> bool {
 /// GET_VERSION now NACKs with EIO instead of all-FF.
 ///
 /// Diagnosis: bosminer's i2c-0 strace shows NO intervening heartbeats
-/// between START_APP ACK and GET_VERSION — just a single ~500-ms wall
-/// sleep. DCENT_OS inserts a 5×1-s "stable heartbeat" warmup loop in
+/// between START_APP ACK and GET_VERSION Ã¢â‚¬â€ just a single ~500-ms wall
+/// sleep. DCENT_OS inserts a 5Ãƒâ€”1-s "stable heartbeat" warmup loop in
 /// `s19j_hybrid_mining.rs::Phase 0d` between the warmup-prelude end and
 /// the GET_VERSION probe. The hypothesis tested by : those 5
 /// extra heartbeats wedge the dsPIC into the EIO/NACK state.
 ///
 /// When `DCENT_AM2_DSPIC_BOSMINER_FAITHFUL=1`,  replaces the
-/// 5×1-s loop with a single `Duration::from_millis(500)` sleep —
-/// byte-faithful to the strace evidence — and treats warmup as OK
+/// 5Ãƒâ€”1-s loop with a single `Duration::from_millis(500)` sleep Ã¢â‚¬â€
+/// byte-faithful to the strace evidence Ã¢â‚¬â€ and treats warmup as OK
 /// (so `cold_boot_init_with_skip(skip_warmup_loop=true)` runs once
 /// downstream, exactly like the env-off path that just succeeded with
-/// 5×1-s heartbeats).
+/// 5Ãƒâ€”1-s heartbeats).
 ///
-/// Same env gate as  — operator opts into the WHOLE
+/// Same env gate as  Ã¢â‚¬â€ operator opts into the WHOLE
 /// bosminer-faithful Phase 0d shape (timing + protocol). Default-off
-/// → `a lab unit` and the rest of the fleet stay byte-identical.
+/// Ã¢â€ â€™ `a lab unit` and the rest of the fleet stay byte-identical.
 fn am2_dspic_bosminer_faithful_enabled() -> bool {
     am2_env_flag("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL")
 }
 
-/// 2026-05-24 (XIL `a lab unit` ) — EEPROM bus-warmup before dsPIC init.
+/// 2026-05-24 (XIL `a lab unit` ) Ã¢â‚¬â€ EEPROM bus-warmup before dsPIC init.
 ///
 ///  strace on DCENT_OS daemon vs  bosminer ground-truth
 /// strace revealed a HUGE divergence: bosminer reads ~20 bytes from
@@ -3335,18 +3727,18 @@ fn am2_dspic_bosminer_faithful_enabled() -> bool {
 /// dsPIC at 0x20. DCENT_OS jumps straight to 0x20 (the  strace
 /// shows only 2 `I2C_SLAVE_FORCE` ioctls in the entire run, both
 /// 0x20). The dsPIC responds to DCENT_OS with CMD echoes (0x07 after
-/// RESET, 0x06 after START_APP) instead of 0x01 ACKs — bootloader
+/// RESET, 0x06 after START_APP) instead of 0x01 ACKs Ã¢â‚¬â€ bootloader
 /// CMD-echo-mode behaviour, not app-mode.
 ///
 /// Hypothesis: the EEPROM read bus activity wakes the dsPIC's MSSP
 /// I2C slave peripheral. Without it the dsPIC stays in CMD-echo mode
 /// and START_APP `[55 AA 04 06 00 0A]` doesn't transition the chip
-/// to app firmware → GET_VERSION returns CMD echoes or all-FF.
+/// to app firmware Ã¢â€ â€™ GET_VERSION returns CMD echoes or all-FF.
 ///
 /// When `DCENT_AM2_EEPROM_BUS_WARMUP=1`, Phase 0d emits a Read(32)
 /// transaction to 0x50 (and 0x52) BEFORE the dsPIC warmup chain.
-/// Read-only — the EEPROM denylist (`I2cBus::write_denylist
-/// [0x50..=0x57]`) is preserved. Default-OFF — fleet byte-identical
+/// Read-only Ã¢â‚¬â€ the EEPROM denylist (`I2cBus::write_denylist
+/// [0x50..=0x57]`) is preserved. Default-OFF Ã¢â‚¬â€ fleet byte-identical
 /// when unset.
 fn am2_eeprom_bus_warmup_enabled() -> bool {
     am2_env_flag("DCENT_AM2_EEPROM_BUS_WARMUP")
@@ -3356,32 +3748,58 @@ fn am2_eeprom_bus_warmup_enabled() -> bool {
 /// `psu_override` (the "Loki bypass" branch).
 ///
 /// On a Loki-board-equipped unit (`a lab unit`, `a lab unit`) the spoof responds and the
-/// full bosminer-canonical `3× Disable → Ramp → Enable` + 1 Hz heartbeat
-/// completes — matching what BraiinsOS does. On a genuinely Loki-removed
+/// full bosminer-canonical `3Ãƒâ€” Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable` + 1 Hz heartbeat
+/// completes Ã¢â‚¬â€ matching what BraiinsOS does. On a genuinely Loki-removed
 /// unit the bus is silent on the first opcode and we fall through with
 /// `psu = None`, matching today's `psu_override` branch behaviour
 /// byte-for-byte.
 struct SmartApw12HandshakeOutcome {
     psu: Option<Arc<Mutex<Apw121215a>>>,
-    heartbeat: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Layer-2 (FIX-A) — opportunistically drive the smart-APW12 handshake on
+/// Errors that mean an opportunistic smart peer may simply be absent or not
+/// protocol-ready. Ownership, safety-generation, policy, and outcome-unknown
+/// failures are never lenient: continuing would misrepresent bus authority.
+fn smart_apw_lenient_peer_failure(error: &HalError) -> bool {
+    matches!(
+        error,
+        HalError::I2c { .. } | HalError::I2cEndpointNotReady { .. } | HalError::PsuProtocol(_)
+    )
+}
+
+fn smart_apw_heartbeat_retryable(error: &HalError) -> bool {
+    matches!(
+        error,
+        HalError::I2c { .. } | HalError::PsuHeartbeatExhausted { .. }
+    )
+}
+
+/// Device type is diagnostic after fw71 identity has already been proven.
+/// Ordinary wire loss or a malformed optional reply may be logged and ignored;
+/// typed controller, safety, policy, and dialect failures remain terminal.
+fn optional_apw_device_type_failure(error: &HalError) -> bool {
+    matches!(error, HalError::I2c { .. } | HalError::PsuProtocol(_))
+}
+
+/// Layer-2 (FIX-A) Ã¢â‚¬â€ opportunistically drive the smart-APW12 handshake on
 /// the Loki spoof under `psu_override`.
 ///
 /// Reuses `Apw121215a`'s existing `probe`/`disable`/`set_voltage_init_bypass`/
 /// `enable`/`heartbeat` public methods + the 1 Hz heartbeat loop, but with
-/// a tightened probe budget (1 attempt × 200 ms instead of full retry budget)
-/// so a genuinely-silent bus (real Loki-removed APW3) returns Ok(None) quickly
-/// rather than burning the cold-boot budget on a non-existent peer.
+/// a tightened probe budget (1 attempt Ãƒâ€” 200 ms instead of full retry budget)
+/// so a genuinely-silent bus (real Loki-removed APW3) returns a successful
+/// `psu = None` outcome quickly rather than burning the cold-boot budget on a
+/// non-existent peer. Typed ownership, safety-generation, policy, and
+/// outcome-unknown failures are returned to the lifecycle owner; they never
+/// create a degraded success or a heartbeat thread.
 ///
 /// **The PWR_CONTROL GPIO MUST be owned by the caller's `PsuBypassGate`
 /// BEFORE calling this helper.** The `Apw121215a` opened here is configured
 /// WITHOUT a gate_spec so it does NOT double-assert the same GPIO. The
 /// `PsuBypassGate`'s Drop is the PWR_CONTROL release on shutdown.
 ///
-/// §(d) FIX-A
-/// and §(e) Step 3.
+/// Ã‚Â§(d) FIX-A
+/// and Ã‚Â§(e) Step 3.
 fn bring_up_apw121215a_smart_lenient(
     i2c0_service: &I2cServiceHandle,
     psu_address: u8,
@@ -3389,10 +3807,11 @@ fn bring_up_apw121215a_smart_lenient(
     psu_heartbeat_interval: Duration,
     shutdown: CancellationToken,
     psu_transport: &str,
-) -> SmartApw12HandshakeOutcome {
+    runtime_threads: &mut HybridThreadGuard,
+) -> Result<SmartApw12HandshakeOutcome> {
     use std::time::Instant;
 
-    //  (2026-05-23 — `a lab unit` cold-wake gap closure):
+    //  (2026-05-23 Ã¢â‚¬â€ `a lab unit` cold-wake gap closure):
     //
     // The FIX-A author assumed the smart-APW12 spoof was reachable via the
     // kernel `/dev/i2c-0` bus (matching the non-override path's default).
@@ -3400,10 +3819,10 @@ fn bring_up_apw121215a_smart_lenient(
     // `[psu].transport = "gpio_bitbang"`: the PSU SMBus is BIT-BANGED
     // on dedicated `PSU_GPIO_SDA` / `PSU_GPIO_SCL` lines, NOT the kernel
     // i2c-0 bus. Probing 0x10 on kernel i2c-0 returns silence (the bus
-    // has no peer at that address) → 200 ms probe deadline always expires
-    // → FIX-A returns `psu=None` → daemon proceeds in PWR_CONTROL-only mode
-    // → the Loki spoof never gets the bosminer-canonical Disable/Ramp/Enable
-    // sequence → APW3 rail stays underpowered → dsPIC stays in standby →
+    // has no peer at that address) Ã¢â€ â€™ 200 ms probe deadline always expires
+    // Ã¢â€ â€™ FIX-A returns `psu=None` Ã¢â€ â€™ daemon proceeds in PWR_CONTROL-only mode
+    // Ã¢â€ â€™ the Loki spoof never gets the bosminer-canonical Disable/Ramp/Enable
+    // sequence Ã¢â€ â€™ APW3 rail stays underpowered Ã¢â€ â€™ dsPIC stays in standby Ã¢â€ â€™
     // GET_VERSION returns all-0xFF.
     //
     // Live evidence for this gap: 2026-05-23 BraiinsOS slot cold-wake test
@@ -3418,7 +3837,7 @@ fn bring_up_apw121215a_smart_lenient(
     //
     //  fix: honour `[psu].transport` here. On `gpio_bitbang` open via
     // `Apw121215a::open_gpio_bitbang_at` + skip the probe (bit-bang transport
-    // is write-only by convention — no read-back) + run
+    // is write-only by convention Ã¢â‚¬â€ no read-back) + run
     // `cold_boot_sequence_write_only(target, APW12_139_ASSUMED_FW)` + spawn
     // the heartbeat. On any other transport keep the existing service-backed
     // probe + cold-boot-gated path (this is what `a lab unit`-class Loki-attached
@@ -3427,7 +3846,7 @@ fn bring_up_apw121215a_smart_lenient(
         addr = format_args!("0x{:02X}", psu_address),
         target_rail_v = psu_target_rail_v,
         transport = psu_transport,
-        "Phase 0 (b): smart-APW12 opportunistic handshake on Loki spoof — \
+        "Phase 0 (b): smart-APW12 opportunistic handshake on Loki spoof Ã¢â‚¬â€ \
          transport-aware (Wave-30); gpio_bitbang skips probe + write-only \
          cold-boot, i2c0 path keeps 200 ms lenient probe"
     );
@@ -3437,19 +3856,16 @@ fn bring_up_apw121215a_smart_lenient(
         let mut psu = match Apw121215a::open_gpio_bitbang_at(psu_address) {
             Ok(p) => p,
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
                     addr = format_args!("0x{:02X}", psu_address),
-                    "smart-APW12 lenient (gpio_bitbang): open_gpio_bitbang_at FAILED — \
-                     falling through with psu=None (PWR_CONTROL-only mode)"
+                    "smart-APW12 lenient (gpio_bitbang): open_gpio_bitbang_at FAILED Ã¢â‚¬â€ \
+                     refusing to infer an absent peer from controller-open failure"
                 );
-                return SmartApw12HandshakeOutcome {
-                    psu: None,
-                    heartbeat: None,
-                };
+                return Err(e.into());
             }
         };
-        // DO NOT propagate any gate spec — the PsuBypassGate above already
+        // DO NOT propagate any gate spec Ã¢â‚¬â€ the PsuBypassGate above already
         // owns PWR_CONTROL. We're an opportunistic add-on, not a replacement
         // for the bypass gate's ownership.
         psu.set_psu_gate_spec(None);
@@ -3460,22 +3876,22 @@ fn bring_up_apw121215a_smart_lenient(
         //  wired the gpio_bitbang branch correctly but  alone
         // wasn't enough to wake the Loki spoof's state machine. Live evidence:
         //
-        // wave28-live-runs/wave30-full-run3-20260523.log` — FIX-A logged
+        // wave28-live-runs/wave30-full-run3-20260523.log` Ã¢â‚¬â€ FIX-A logged
         // `smart-APW12 spoof handshake SUCCEEDED on Loki bus` but the dsPIC
         // still returned all-FF on GET_VERSION afterwards.
         //
         // Comparing against bosminer's actual sequence on `a lab unit` (per the
         // morning strace + bosminer.log timing):
         //
-        //   Bosminer order:  Detect(READ) → Disable → CalibrationProbe(×4)
-        //                    → Disable(×3) → Ramp → Enable → ChainInit
-        //   DCENT_OS order:  Disable(×3) → Ramp → Enable → Heartbeat
-        //                    → ChainInit  (NO initial Detect READ)
+        //   Bosminer order:  Detect(READ) Ã¢â€ â€™ Disable Ã¢â€ â€™ CalibrationProbe(Ãƒâ€”4)
+        //                    Ã¢â€ â€™ Disable(Ãƒâ€”3) Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable Ã¢â€ â€™ ChainInit
+        //   DCENT_OS order:  Disable(Ãƒâ€”3) Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable Ã¢â€ â€™ Heartbeat
+        //                    Ã¢â€ â€™ ChainInit  (NO initial Detect READ)
         //
         // Bosminer's first action on the PSU bus is a READ (GetVersion). It
         // logs `PSU: Version '0x71' (APW121215a) detected` AFTER that read
         // succeeds. The Loki spoof appears to need this initial read-handshake
-        // to engage its application state — without it, subsequent writes are
+        // to engage its application state Ã¢â‚¬â€ without it, subsequent writes are
         // ACKed at the bit level but not processed into rail-engagement.
         //
         //  fix: add an explicit best-effort `psu.probe()` BEFORE the
@@ -3491,17 +3907,17 @@ fn bring_up_apw121215a_smart_lenient(
         //  added the initial probe but gave up on first NAK.
         //  forensics showed the Loki spoof's first response to
         // GetFwVersion is 0xF5 = NAK. Bosminer's log shows it tolerates
-        // multiple NAKs in a row (calibration table empty × 4 over 30s)
+        // multiple NAKs in a row (calibration table empty Ãƒâ€” 4 over 30s)
         // before getting a successful response.  adds retry until
-        // ACK OR retry budget exhausted (8 × 250 ms = 2 s total). Two
+        // ACK OR retry budget exhausted (8 Ãƒâ€” 250 ms = 2 s total). Two
         // exit conditions:
-        //   - Probe Ok → spoof acknowledged; proceed to write-only cold-boot
-        //   - Budget exhausted → log + proceed anyway (bare-APW3 with no
+        //   - Probe Ok Ã¢â€ â€™ spoof acknowledged; proceed to write-only cold-boot
+        //   - Budget exhausted Ã¢â€ â€™ log + proceed anyway (bare-APW3 with no
         //     peer still falls through cleanly; write-only is silently
         //     absorbed in that case)
         info!(
-            "smart-APW12 lenient (gpio_bitbang) — Wave-31+34: emitting initial Detect READ \
-             with NAK-tolerant retry (8 × 250 ms) — bosminer-pattern wake for Loki spoof"
+            "smart-APW12 lenient (gpio_bitbang) Ã¢â‚¬â€ Wave-31+34: emitting initial Detect READ \
+             with NAK-tolerant retry (8 Ãƒâ€” 250 ms) Ã¢â‚¬â€ bosminer-pattern wake for Loki spoof"
         );
         const PROBE_RETRY_BUDGET: u32 = 8;
         const PROBE_RETRY_DELAY_MS: u64 = 250;
@@ -3514,7 +3930,7 @@ fn bring_up_apw121215a_smart_lenient(
                         model = model.name(),
                         fw = format_args!("0x{:02X}", psu.fw_byte().unwrap_or(0)),
                         "smart-APW12 lenient (gpio_bitbang) Wave-31+34: Detect READ succeeded \
-                         on attempt {} — Loki spoof responded; proceeding to write-only cold-boot",
+                         on attempt {} Ã¢â‚¬â€ Loki spoof responded; proceeding to write-only cold-boot",
                         attempt
                     );
                     probe_succeeded = true;
@@ -3529,11 +3945,17 @@ fn bring_up_apw121215a_smart_lenient(
                                 "smart-APW12 lenient observed a non-fw71 PSU dialect; \
                                  refusing the write-only fallback"
                             );
-                            return SmartApw12HandshakeOutcome {
-                                psu: None,
-                                heartbeat: None,
-                            };
+                            return Err(e.into());
                         }
+                    }
+                    if !smart_apw_lenient_peer_failure(&e) {
+                        error!(
+                            error = %e,
+                            attempt,
+                            "smart-APW12 lenient (gpio_bitbang) lost typed controller authority; \
+                             refusing write-only fallback and heartbeat spawn"
+                        );
+                        return Err(e.into());
                     }
                     let err_str = e.to_string();
                     let is_nak = err_str.contains("PSU NAK") || err_str.contains("0xF5");
@@ -3542,7 +3964,7 @@ fn bring_up_apw121215a_smart_lenient(
                             attempt,
                             budget = PROBE_RETRY_BUDGET,
                             "smart-APW12 lenient (gpio_bitbang) Wave-34: NAK on Detect READ \
-                             attempt {} — sleeping {}ms then retrying (bosminer-tolerance \
+                             attempt {} Ã¢â‚¬â€ sleeping {}ms then retrying (bosminer-tolerance \
                              pattern; spoof may need ~4 retries to wake)",
                             attempt,
                             PROBE_RETRY_DELAY_MS
@@ -3555,7 +3977,7 @@ fn bring_up_apw121215a_smart_lenient(
                         error = %e,
                         "smart-APW12 lenient (gpio_bitbang) Wave-31+34: Detect READ returned \
                          error (expected on bare-APW3 / silent bus, OR NAK budget exhausted on \
-                         Loki spoof) — proceeding to write-only cold-boot anyway"
+                         Loki spoof) Ã¢â‚¬â€ proceeding to write-only cold-boot anyway"
                     );
                     break;
                 }
@@ -3569,7 +3991,7 @@ fn bring_up_apw121215a_smart_lenient(
         // at line ~5440 (the i2c0-service transport branch). On `a lab unit` cold-cold
         // with `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1` + xil fingerprint +
         // no TRUST_RAIL_FALLBACK, we MUST run the standalone cold-wake here
-        // BEFORE the write-only body — that's the  ground-truth path
+        // BEFORE the write-only body Ã¢â‚¬â€ that's the  ground-truth path
         // (per-byte register-pointer init-frame + bare follow-frame + poll).
         // Without this fix, 's full_cycle never fires on the
         // gpio_bitbang transport and the Loki spoof never wakes up.
@@ -3580,104 +4002,91 @@ fn bring_up_apw121215a_smart_lenient(
             warn!(
                 target_v = psu_target_rail_v,
                 env_gate = "DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1",
-                "Wave-55b STANDALONE Loki cold-boot path ENGAGED (gpio_bitbang transport) — \
-                 emitting Wave-38 cold-wake bytes before standard 3× Disable + Ramp + Enable. \
+                "Wave-55b STANDALONE Loki cold-boot path ENGAGED (gpio_bitbang transport) Ã¢â‚¬â€ \
+                 emitting Wave-38 cold-wake bytes before standard 3Ãƒâ€” Disable + Ramp + Enable. \
                  This is the no-bosminer-handoff bring-up path for cold-cold .25-class XIL."
             );
-            if let Err(e) = psu.cold_boot_sequence_loki_standalone(psu_target_rail_v) {
-                warn!(
-                    error = %e,
-                    "Wave-55b standalone Loki cold-boot FAILED on gpio_bitbang transport — \
-                     partial-handshake state; spawning heartbeat anyway to keep the spoof \
-                     acknowledged (PsuBypassGate still owns PWR_CONTROL)"
-                );
-            } else {
-                info!(
+            match psu.cold_boot_sequence_loki_standalone(psu_target_rail_v) {
+                Ok(()) => info!(
                     target_rail_v = psu_target_rail_v,
-                    "Wave-55b standalone Loki cold-boot complete on gpio_bitbang transport — \
-                     Wave-38 cold-wake bytes emitted + write-only body (3× Disable → Ramp → Enable) done"
-                );
+                    "Wave-55b standalone Loki cold-boot complete on gpio_bitbang transport Ã¢â‚¬â€ \
+                     Wave-38 cold-wake bytes emitted + write-only body (3Ãƒâ€” Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable) done"
+                ),
+                Err(e) if smart_apw_lenient_peer_failure(&e) => warn!(
+                    error = %e,
+                    "Wave-55b standalone Loki cold-boot wire/protocol handshake remained partial; \
+                     spawning heartbeat while PsuBypassGate retains PWR_CONTROL"
+                ),
+                Err(e) => return Err(e.into()),
             }
         } else {
             info!(
                 target_rail_v = psu_target_rail_v,
                 assumed_fw = format_args!("0x{:02X}", APW12_139_ASSUMED_FW),
                 "smart-APW12 lenient (gpio_bitbang): running cold_boot_sequence_write_only \
-                 (3× Disable → Ramp → Enable) after Wave-31 Detect-READ wake \
-                 (legacy path — Wave-55b not gated for this run)"
+                 (3Ãƒâ€” Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable) after Wave-31 Detect-READ wake \
+                 (legacy path Ã¢â‚¬â€ Wave-55b not gated for this run)"
             );
-            if let Err(e) =
-                psu.cold_boot_sequence_write_only(psu_target_rail_v, APW12_139_ASSUMED_FW)
-            {
-                warn!(
-                    error = %e,
-                    "smart-APW12 lenient (gpio_bitbang): cold_boot_sequence_write_only FAILED — \
-                     partial-handshake state; spawning heartbeat anyway to keep the spoof \
-                     acknowledged (PsuBypassGate still owns PWR_CONTROL)"
-                );
-            } else {
-                info!(
+            match psu.cold_boot_sequence_write_only(psu_target_rail_v, APW12_139_ASSUMED_FW) {
+                Ok(()) => info!(
                     target_rail_v = psu_target_rail_v,
-                    "smart-APW12 lenient (gpio_bitbang): write-only cold-boot complete — \
+                    "smart-APW12 lenient (gpio_bitbang): write-only cold-boot complete Ã¢â‚¬â€ \
                      bosminer-parity init achieved on Loki spoof (or silently absorbed by \
-                     bare-APW3 fleet — write-only is safe either way)"
-                );
+                     bare-APW3 fleet Ã¢â‚¬â€ write-only is safe either way)"
+                ),
+                Err(e) if smart_apw_lenient_peer_failure(&e) => warn!(
+                    error = %e,
+                    "smart-APW12 lenient (gpio_bitbang): write-only wire/protocol handshake \
+                     remained partial; spawning heartbeat while PsuBypassGate retains PWR_CONTROL"
+                ),
+                Err(e) => return Err(e.into()),
             }
         }
 
         let psu_arc = Arc::new(Mutex::new(psu));
         let psu_hb = psu_arc.clone();
         let shutdown_hb = shutdown.clone();
+        let heartbeat_slot = runtime_threads
+            .reserve(HybridThreadSlot::PsuHeartbeat)
+            .context("failed to reserve hybrid PSU-heartbeat roster slot")?;
         let heartbeat = std::thread::Builder::new()
             .name("s19j-psu-hb-lenient-bitbang".into())
             .spawn(move || psu_heartbeat_loop(psu_hb, shutdown_hb, psu_heartbeat_interval))
-            .ok();
-        if heartbeat.is_some() {
-            info!(
-                interval_ms = psu_heartbeat_interval.as_millis() as u64,
-                "smart-APW12 lenient (gpio_bitbang): 1 Hz heartbeat thread spawned \
-                 (keeps Loki spoof acknowledged so it doesn't self-disable the rail)"
-            );
-        } else {
-            warn!(
-                "smart-APW12 lenient (gpio_bitbang): heartbeat thread spawn FAILED — \
-                 spoof watchdog will cut in ~30 s; continuing with psu=Some, heartbeat=None"
-            );
-        }
+            .context("failed to spawn lenient gpio-bitbang PSU heartbeat thread")?;
+        heartbeat_slot.attach(heartbeat);
+        info!(
+            interval_ms = psu_heartbeat_interval.as_millis() as u64,
+            "smart-APW12 lenient (gpio_bitbang): 1 Hz heartbeat thread spawned \
+             (keeps Loki spoof acknowledged so it doesn't self-disable the rail)"
+        );
 
-        return SmartApw12HandshakeOutcome {
-            psu: Some(psu_arc),
-            heartbeat,
-        };
+        return Ok(SmartApw12HandshakeOutcome { psu: Some(psu_arc) });
     }
 
-    // --- service-backed (kernel /dev/i2c-0) transport — pre- path ---
+    // --- service-backed (kernel /dev/i2c-0) transport Ã¢â‚¬â€ pre- path ---
     let mut psu = match Apw121215a::open_service_at(i2c0_service.clone(), 0, psu_address) {
         Ok(p) => p,
         Err(e) => {
-            warn!(
+            error!(
                 error = %e,
                 addr = format_args!("0x{:02X}", psu_address),
-                "smart-APW12 lenient: open_service_at failed — \
-                 falling through with psu=None (PWR_CONTROL-only mode)"
+                "smart-APW12 lenient: open_service_at failed; refusing to infer an absent peer \
+                 from a controller-allocation failure"
             );
-            return SmartApw12HandshakeOutcome {
-                psu: None,
-                heartbeat: None,
-            };
+            return Err(e.into());
         }
     };
-    // DO NOT propagate the PsuBypassGate spec — the bypass gate already
+    // DO NOT propagate the PsuBypassGate spec Ã¢â‚¬â€ the bypass gate already
     // owns PWR_CONTROL. Setting gate_spec here would cause Apw121215a to
     // double-assert the same GPIO (`KernelClaimed` error or worse).
     psu.set_psu_gate_spec(None);
 
-    // Lenient probe — 1 attempt × 200 ms timeout window. If the spoof is
+    // Lenient probe Ã¢â‚¬â€ 1 attempt Ãƒâ€” 200 ms timeout window. If the spoof is
     // there it answers within ~tens of ms (per bosminer log timing on `a lab unit`).
     // If the bus is genuinely silent (real Loki-removed APW3), we drop out
-    // immediately rather than waste the 3×100 ms cold_boot probe budget.
+    // immediately rather than waste the 3Ãƒâ€”100 ms cold_boot probe budget.
     let probe_deadline = Instant::now() + Duration::from_millis(200);
-    let _ = psu.flush_buffer();
+    psu.flush_buffer()?;
     let mut probe_ok = false;
     while Instant::now() < probe_deadline {
         match psu.probe() {
@@ -3685,97 +4094,88 @@ fn bring_up_apw121215a_smart_lenient(
                 info!(
                     model = model.name(),
                     fw = format_args!("0x{:02X}", psu.fw_byte().unwrap_or(0)),
-                    "smart-APW12 lenient: probe OK (Loki spoof responded — \
+                    "smart-APW12 lenient: probe OK (Loki spoof responded Ã¢â‚¬â€ \
                      proceeding to disable/ramp/enable)"
                 );
                 probe_ok = true;
                 break;
             }
-            Err(e) => {
+            Err(e) if smart_apw_lenient_peer_failure(&e) => {
                 tracing::debug!(
                     error = %e,
                     "smart-APW12 lenient: probe attempt failed; checking deadline"
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(e) => return Err(e.into()),
         }
     }
     if !probe_ok {
         info!(
-            "smart-APW12 lenient: probe deadline expired (200 ms) — assuming \
+            "smart-APW12 lenient: probe deadline expired (200 ms) Ã¢â‚¬â€ assuming \
              Loki-removed / genuinely-silent bus; falling through with psu=None \
              (PWR_CONTROL-only mode, byte-identical to legacy psu_override branch)"
         );
-        return SmartApw12HandshakeOutcome {
-            psu: None,
-            heartbeat: None,
-        };
+        return Ok(SmartApw12HandshakeOutcome { psu: None });
     }
 
-    // The spoof is responding — run the bosminer-canonical
-    // `3× Disable → Ramp → Enable` sequence. Each step is best-effort; a
+    // The spoof is responding Ã¢â‚¬â€ run the bosminer-canonical
+    // `3Ãƒâ€” Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable` sequence. Each step is best-effort; a
     // partial-success outcome (e.g. disable OK but ramp NACKs on a flaky
     // spoof firmware) still spawns the heartbeat to keep PWR_CONTROL armed.
     //
     // NOTE: we use the existing `cold_boot_sequence_gated` here BUT the
-    // gate spec is None, so the gated path performs no GPIO work — the I²C
+    // gate spec is None, so the gated path performs no GPIO work Ã¢â‚¬â€ the IÃ‚Â²C
     // history is byte-identical to the bosminer-RE'd canonical path
-    // (Step 1 flush + Step 2 probe + Step 3 disable×3 + Step 4 ramp +
+    // (Step 1 flush + Step 2 probe + Step 3 disableÃƒâ€”3 + Step 4 ramp +
     // Step 5 enable; see psu.rs:1698-1779).
-    if let Err(e) = psu.cold_boot_sequence_gated(psu_target_rail_v) {
-        warn!(
-            error = %e,
-            "smart-APW12 lenient: cold_boot_sequence_gated failed AFTER successful probe — \
-             this is a partial-handshake state; spawning heartbeat anyway to keep the \
-             spoof acknowledged (PsuBypassGate still owns PWR_CONTROL)"
-        );
-    } else {
-        info!(
+    match psu.cold_boot_sequence_gated(psu_target_rail_v) {
+        Ok(()) => info!(
             target_rail_v = psu_target_rail_v,
-            "smart-APW12 lenient: 3×Disable → Ramp → Enable sequence completed — \
+            "smart-APW12 lenient: 3Ãƒâ€”Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable sequence completed Ã¢â‚¬â€ \
              bosminer-parity init achieved on Loki spoof"
-        );
+        ),
+        Err(e) if smart_apw_lenient_peer_failure(&e) => warn!(
+            error = %e,
+            "smart-APW12 lenient: cold-boot wire/protocol handshake remained partial after \
+             successful probe; spawning heartbeat while PsuBypassGate retains PWR_CONTROL"
+        ),
+        Err(e) => return Err(e.into()),
     }
 
     let psu_arc = Arc::new(Mutex::new(psu));
     let psu_hb = psu_arc.clone();
     let shutdown_hb = shutdown.clone();
+    let heartbeat_slot = runtime_threads
+        .reserve(HybridThreadSlot::PsuHeartbeat)
+        .context("failed to reserve hybrid PSU-heartbeat roster slot")?;
     let heartbeat = std::thread::Builder::new()
         .name("s19j-psu-hb-lenient".into())
         .spawn(move || psu_heartbeat_loop(psu_hb, shutdown_hb, psu_heartbeat_interval))
-        .ok();
-    if heartbeat.is_some() {
-        info!(
-            interval_ms = psu_heartbeat_interval.as_millis() as u64,
-            "smart-APW12 lenient: 1 Hz heartbeat thread spawned (keeps Loki spoof acknowledged)"
-        );
-    } else {
-        warn!(
-            "smart-APW12 lenient: heartbeat thread spawn FAILED — spoof watchdog will cut \
-             in ~30s; continuing with psu=Some but heartbeat=None"
-        );
-    }
+        .context("failed to spawn lenient service-backed PSU heartbeat thread")?;
+    heartbeat_slot.attach(heartbeat);
+    info!(
+        interval_ms = psu_heartbeat_interval.as_millis() as u64,
+        "smart-APW12 lenient: 1 Hz heartbeat thread spawned (keeps Loki spoof acknowledged)"
+    );
 
-    SmartApw12HandshakeOutcome {
-        psu: Some(psu_arc),
-        heartbeat,
-    }
+    Ok(SmartApw12HandshakeOutcome { psu: Some(psu_arc) })
 }
 
 // ====================================================================
-//  am2/BM1362 FREQUENCY-ONLY autotuner — hybrid-path spawn wiring.
+//  am2/BM1362 FREQUENCY-ONLY autotuner Ã¢â‚¬â€ hybrid-path spawn wiring.
 //
 // W1-C (commit 2d2cf0d8) added the *gate* in `daemon.rs::Daemon::run()`,
 // but `--s19j-hybrid` bypasses `Daemon::run()` entirely (the proven
-// `a lab unit`/XIL/.109 path is `S19jHybridMiner::run()` →
+// `a lab unit`/XIL/.109 path is `S19jHybridMiner::run()` Ã¢â€ â€™
 // `run_am2_serial_dispatch_loop`). W1-C explicitly DEFERRED the
-// hybrid-path spawn wiring to "a separate safety-reviewed wave" — this
+// hybrid-path spawn wiring to "a separate safety-reviewed wave" Ã¢â‚¬â€ this
 // is that wave.
 //
 // BRICK-CRITICAL discipline (`a lab unit` is a live home unit):
 //   * DEFAULT-OFF. Without an explicit operator opt-in
 //     (`[autotuner] am2_frequency_autotune = true` OR
-//     `DCENT_AM2_FREQUENCY_AUTOTUNE=1`) NONE of this code runs — the
+//     `DCENT_AM2_FREQUENCY_AUTOTUNE=1`) NONE of this code runs Ã¢â‚¬â€ the
 //     serial-dispatch loop is byte-identical to the proven milestone
 //     path. The opt-in resolver returns `None`, the loop never gains a
 //     `freq_cmd_rx` select arm, never accumulates stats, never spawns a
@@ -3799,12 +4199,12 @@ fn bring_up_apw121215a_smart_lenient(
 //   * Frequency search clamped to the home-safe nameplate band
 //     `[245, 545]` MHz by `pin_am2_bm1362_frequency_only()`, AND every
 //     *applied* PLL is additionally clamped to the proven on-this-path
-//     `BM1362_PLL_TABLE` register range `[400, 545]` — see
+//     `BM1362_PLL_TABLE` register range `[400, 545]` Ã¢â‚¬â€ see
 //     `am2_freq_only_clamp_applied_mhz`. Walking below 400 MHz would
 //     require PLL register words this serial path has never proven on
 //     hardware; on a home unit we never apply an unproven register.
 //
-// Other families (S9/BM1387, am3-aml, am3-bb) never reach this code —
+// Other families (S9/BM1387, am3-aml, am3-bb) never reach this code Ã¢â‚¬â€
 // it lives only inside the am2 serial-dispatch loop.
 // ====================================================================
 
@@ -3838,13 +4238,13 @@ fn am2_freq_only_clamp_applied_mhz(requested_mhz: u16) -> u16 {
 /// Mirrors `daemon.rs`'s W1-C gate exactly: opted-in iff
 /// `[autotuner] am2_frequency_autotune = true` OR
 /// `DCENT_AM2_FREQUENCY_AUTOTUNE` is env-truthy. Default (neither) =
-/// `false` → the serial-dispatch loop stays byte-identical to the
+/// `false` Ã¢â€ â€™ the serial-dispatch loop stays byte-identical to the
 /// proven `a lab unit` milestone path.
 ///
 /// The am2 hybrid path is am2/BM1362/dsPIC by construction (this whole
 /// module only runs for `zynq-bm3-am2` + `model="s19jpro"`), so unlike
 /// `daemon.rs` we don't need the `chip_id == 0x1362 && pic==DsPic33EP`
-/// family guard — reaching `run_am2_serial_dispatch_loop` *is* the
+/// family guard Ã¢â‚¬â€ reaching `run_am2_serial_dispatch_loop` *is* the
 /// family proof. We still read the same TOML key + env var so a single
 /// operator opt-in works identically across both entry points.
 fn am2_frequency_autotune_opted_in(config: &DcentraldConfig) -> bool {
@@ -3860,7 +4260,7 @@ fn am2_frequency_autotune_opted_in(config: &DcentraldConfig) -> bool {
 ///
 /// Opted-in iff `[autotuner] at3_rail_read = true` OR `DCENT_AM2_AT3_RAIL_READ`
 /// is env-truthy (mirrors `am2_frequency_autotune_opted_in`). **This is only
-/// half the gate** — the AT-3 `rail_timer` arm additionally requires
+/// half the gate** Ã¢â‚¬â€ the AT-3 `rail_timer` arm additionally requires
 /// `am2_frequency_autotune_opted_in` (the daemon ANDs the two, the most
 /// conservative reading of the design's "default-OFF behind a NEW env AND the
 /// autotuner-enabled flag"). Default (neither set) keeps AT-3 fully closed, so
@@ -3880,11 +4280,11 @@ fn am2_at3_rail_read_interval_s(config: &DcentraldConfig) -> u64 {
     config.autotuner.at3_rail_read_interval_s_clamped()
 }
 
-/// AT-3: map a dsPIC I²C address (0x20..=0x23) to the canonical AM2 hashboard
+/// AT-3: map a dsPIC IÃ‚Â²C address (0x20..=0x23) to the canonical AM2 hashboard
 /// slot index, used as the per-chain telemetry key the API projection looks up
 /// (`ChainState.id`). Mirrors `S19_DSPIC_ADDRS` / `am2_chain_plan`'s
 /// `AM2_SLOT_DSPIC_ADDRS`. Returns `None` for an unrecognized address (AT-3
-/// then publishes nothing — a clean no-op, never a wrong-keyed reading).
+/// then publishes nothing Ã¢â‚¬â€ a clean no-op, never a wrong-keyed reading).
 fn am2_chain_id_for_pic_addr(pic_addr: u8) -> Option<u8> {
     match pic_addr {
         0x20 => Some(0),
@@ -3900,14 +4300,14 @@ fn am2_chain_id_for_pic_addr(pic_addr: u8) -> Option<u8> {
 ///
 /// Returns `Some(mv)` ONLY when ALL of the following hold; otherwise `None`
 /// (the AT-1 projection then degrades cleanly to commanded-tagged):
-///   1. `fw` resolves to the framed byte-wise family (fw=0x89/0x8A) — enforced
+///   1. `fw` resolves to the framed byte-wise family (fw=0x89/0x8A) Ã¢â‚¬â€ enforced
 ///      by `dspic::at3_measure_voltage_firmware_allowed` so AT-3 never reaches
 ///      `measure_voltage`'s `I2C_RDWR` fallback for bare/unknown firmware;
 ///   2. `DspicService::measure_voltage` (the parser-safe `[55 AA 04 3A 00 3E]`
 ///      byte-wise framed read) succeeds;
 ///   3. the decoded value passes AT-1's plausibility gate (`> 0`, `<= DAC span`).
 ///
-/// READ-ONLY: this issues a read trigger only — no `SET_VOLTAGE` (0x10), no
+/// READ-ONLY: this issues a read trigger only Ã¢â‚¬â€ no `SET_VOLTAGE` (0x10), no
 /// `ENABLE` (0x15), no frequency change. The clone of the single-owner
 /// `I2cServiceHandle` queues one serialized transaction exactly as the thermal
 /// supervisor's `poll_max_temp` does, so the bus is never double-owned.
@@ -3917,8 +4317,8 @@ fn at3_read_measured_rail(i2c: &I2cServiceHandle, addr: u8, fw: Option<u8>) -> O
     };
 
     let fw_class = DspicFirmware::from_version(fw?);
-    // Independent firmware gate — do NOT trust measure_voltage's internal
-    // branching to keep AT-3 off the I2C_RDWR fallback (DESIGN 1 §1.5).
+    // Independent firmware gate Ã¢â‚¬â€ do NOT trust measure_voltage's internal
+    // branching to keep AT-3 off the I2C_RDWR fallback (DESIGN 1 Ã‚Â§1.5).
     if !at3_measure_voltage_firmware_allowed(fw_class) {
         return None;
     }
@@ -3931,12 +4331,12 @@ fn at3_read_measured_rail(i2c: &I2cServiceHandle, addr: u8, fw: Option<u8>) -> O
             debug!(
                 addr = format_args!("0x{:02X}", addr),
                 measured_mv = mv,
-                "AT-3 0x3A read returned an implausible value — skipping (commanded fallback)"
+                "AT-3 0x3A read returned an implausible value Ã¢â‚¬â€ skipping (commanded fallback)"
             );
             None
         }
         Err(e) => {
-            // Misframe / 0xFFFF / short read / service busy — best-effort, never
+            // Misframe / 0xFFFF / short read / service busy Ã¢â‚¬â€ best-effort, never
             // a retry on the hot path. Next tick tries again.
             debug!(error = %e, addr = format_args!("0x{:02X}", addr), "AT-3 0x3A read skipped");
             None
@@ -3950,16 +4350,16 @@ fn at3_read_measured_rail(i2c: &I2cServiceHandle, addr: u8, fw: Option<u8>) -> O
 ///   1. force `enabled = true` (the operator opted in via
 ///      `am2_frequency_autotune`; the generic `[autotuner] enabled`
 ///      flag is a separate switch that the hybrid path historically
-///      never consulted — opting into the am2 freq-only layer IS the
+///      never consulted Ã¢â‚¬â€ opting into the am2 freq-only layer IS the
 ///      enable signal here);
-///   2. apply `pin_am2_bm1362_frequency_only()` — the single
+///   2. apply `pin_am2_bm1362_frequency_only()` Ã¢â‚¬â€ the single
 ///      load-bearing transform: `voltage_optimization=false` +
 ///      `dvfs_enabled=false` (HARD) + freq band clamped `[245, 545]`;
 ///   3. apply the W1.3 mode-aware target default: if the loaded config
 ///      still has the structural `Efficiency` default, resolve it via
-///      `TuneTarget::for_mode(mode)` (Heater/Mining → Efficiency,
-///      Hacker → Hashrate). An explicit operator `target_mode` (e.g.
-///      `"hashrate"`, `"power"`) is preserved — opting *out* of the
+///      `TuneTarget::for_mode(mode)` (Heater/Mining Ã¢â€ â€™ Efficiency,
+///      Hacker Ã¢â€ â€™ Hashrate). An explicit operator `target_mode` (e.g.
+///      `"hashrate"`, `"power"`) is preserved Ã¢â‚¬â€ opting *out* of the
 ///      quiet default is the operator's call, never silent.
 ///
 /// The QUIET HOME PROFILE (`Efficiency`) is the default: a home unit
@@ -3979,7 +4379,7 @@ fn build_am2_freq_only_autotuner_config(
     autotune_config.pin_am2_bm1362_frequency_only();
 
     // (3) W1.3 mode-aware quiet default. Only override the *structural*
-    //     Efficiency default — an explicit operator target_mode is
+    //     Efficiency default Ã¢â‚¬â€ an explicit operator target_mode is
     //     preserved (opting out of quiet is explicit, never silent).
     if matches!(
         autotune_config.target_mode,
@@ -3993,7 +4393,7 @@ fn build_am2_freq_only_autotuner_config(
                 old = ?autotune_config.target_mode,
                 new = ?mode_default,
                 "am2 freq-only autotuner target_mode adjusted by operating-mode default \
-                 (Heater/Mining → Efficiency [quiet home], Hacker → Hashrate)"
+                 (Heater/Mining Ã¢â€ â€™ Efficiency [quiet home], Hacker Ã¢â€ â€™ Hashrate)"
             );
             autotune_config.target_mode = mode_default;
         }
@@ -4006,13 +4406,13 @@ fn build_am2_freq_only_autotuner_config(
 ///
 /// The 11-byte BM1362 serial nonce frame carries `small_core` + `job_id`
 /// but **no chip address** (`parse_bm1362_serial_nonce` /
-/// `Bm1362SerialNonce` — there is no chip field on the wire). True
+/// `Bm1362SerialNonce` Ã¢â‚¬â€ there is no chip field on the wire). True
 /// per-chip TABS attribution is therefore impossible on the serial path
 /// the way it is on the FPGA path. The conservative, correct choice for
 /// a home unit is **chain-level** frequency-only tuning: one synthetic
 /// chain whose single "chip" slot aggregates every enumerated chip's
 /// nonces, and a broadcast PLL applied to all chips at once (exactly the
-/// init's proven `send_write_reg_broadcast_bm1397plus(0x08, …)`
+/// init's proven `send_write_reg_broadcast_bm1397plus(0x08, Ã¢â‚¬Â¦)`
 /// primitive). The autotuner walks the single chain frequency down
 /// toward the J/TH minimum under `Efficiency`.
 struct Am2SerialChainStats {
@@ -4024,7 +4424,7 @@ struct Am2SerialChainStats {
     window_start: Instant,
     epoch: u64,
     /// Last board/die temperature handed in (best-effort; the thermal
-    /// supervisor remains the safety authority — this is informational
+    /// supervisor remains the safety authority Ã¢â‚¬â€ this is informational
     /// for the tuner's thermal refinement only).
     last_temp_c: Option<f32>,
     current_difficulty: u32,
@@ -4063,8 +4463,8 @@ impl Am2SerialChainStats {
     /// Produce a single-synthetic-chain snapshot and reset the window.
     /// `chip_count` is the LIVE enumerated chip count for this AC cycle
     /// (28..110 on XIL) so the autotuner's expected-NPS math
-    /// (`expected_nps_for_chip` × chip_count, 894 nonce-attribution
-    /// slots per BM1362 chip — W6.8) scales with the real chain.
+    /// (`expected_nps_for_chip` Ãƒâ€” chip_count, 894 nonce-attribution
+    /// slots per BM1362 chip Ã¢â‚¬â€ W6.8) scales with the real chain.
     fn take_snapshot(&mut self, chip_count: u8) -> dcentrald_autotuner::ChipStatsSnapshot {
         let now = Instant::now();
         let window_duration_s = now.duration_since(self.window_start).as_secs_f64();
@@ -4097,14 +4497,14 @@ impl Am2SerialChainStats {
     }
 }
 
-/// Per-chain serial-dispatch state — the pure, host-testable nucleus of the
+/// Per-chain serial-dispatch state Ã¢â‚¬â€ the pure, host-testable nucleus of the
 /// proven single-chain `run_am2_serial_dispatch_loop` per-chain logic, factored
 /// out so the DUAL-CHAIN capability (`DCENT_AM2_DUAL_CHAIN_TTYS3=1`) can run the
 /// IDENTICAL dispatch + nonce-attribution + dedup + BIP320 reconstruction on
 /// each chain independently.
 ///
 /// This struct owns ONLY the per-chain bookkeeping (work history, dedup set,
-/// rolling job id, RX carry buffer, counters). It performs NO I/O — the caller
+/// rolling job id, RX carry buffer, counters). It performs NO I/O Ã¢â‚¬â€ the caller
 /// owns the `SerialChainBackend` and feeds RX bytes in / takes the work frame
 /// out. That keeps every byte of UART transport (and therefore every byte of
 /// the gate-OFF single-chain path) unchanged while making the share-decode
@@ -4126,19 +4526,16 @@ struct Am2SerialChainState {
     chain_id: u8,
     work_builder: dcentrald_stratum::share_pipeline::WorkBuilder,
     current_job: Option<dcentrald_stratum::types::JobTemplate>,
-    asic_job_id: u8,
-    work_history: Vec<VecDeque<WorkEntry>>,
-    /// Dedup key includes version_bits_raw: BM1362 rolls BIP320 internally and
-    /// can report the SAME nonce at the SAME job under DIFFERENT rolled
-    /// versions — genuinely-different 80-byte headers (two valid shares). When
-    /// the chip rolls 0 the key collapses to (job_id, nonce).
-    seen_shares: BTreeSet<(u8, u32, u16)>,
+    /// P1-1 pure SerialWorkBookkeeping façade (history + job-id + SeenShareSet).
+    /// Rich engine `WorkEntry` is the history generic; dedup key stays
+    /// (job_id, nonce, version_bits_raw) for BIP320 multi-version nonces.
+    bookkeeping: SerialWorkBookkeeping<WorkEntry>,
     /// RX byte carry buffer for frame resync across reads.
     carry: Vec<u8>,
     total_work: u64,
     total_nonces: u64,
     /// AT-DASH: distinct (job_id,nonce,vbits) reports that survived dedup.
-    /// `total_nonces - unique_nonces` is this chain's duplicate spam — the
+    /// `total_nonces - unique_nonces` is this chain's duplicate spam Ã¢â‚¬â€ the
     /// per-chain diagnostic for the ~400x hashrate gap.
     unique_nonces: u64,
     /// AT-DASH: full-length frames that failed BM1362 nonce parse (HW errors).
@@ -4164,11 +4561,7 @@ impl Am2SerialChainState {
             chain_id,
             work_builder: dcentrald_stratum::share_pipeline::WorkBuilder::new(),
             current_job: None,
-            asic_job_id: 0,
-            work_history: (0..128)
-                .map(|_| VecDeque::with_capacity(WORK_HISTORY_PER_ID))
-                .collect(),
-            seen_shares: BTreeSet::new(),
+            bookkeeping: SerialWorkBookkeeping::hybrid_defaults(),
             carry: Vec::with_capacity(256),
             total_work: 0,
             total_nonces: 0,
@@ -4186,9 +4579,8 @@ impl Am2SerialChainState {
     /// vs chip-side version rolling rule (`set_version_mask(0)`).
     fn on_job(&mut self, job: dcentrald_stratum::types::JobTemplate) {
         if job.clean_jobs {
-            self.work_history.iter_mut().for_each(VecDeque::clear);
+            self.bookkeeping.on_clean_jobs();
             self.work_builder.reset_extranonce2();
-            self.seen_shares.clear();
         }
         if job.is_flush_only() {
             self.current_job = None;
@@ -4206,27 +4598,34 @@ impl Am2SerialChainState {
     /// returned 88-byte frame is what the caller writes to this chain's UART.
     fn next_work_frame(&mut self) -> Option<[u8; 88]> {
         let job = self.current_job.as_ref()?;
-        let work = self.work_builder.next_work(job);
-        let frame = build_am2_serial_work_frame(&work, self.asic_job_id);
-        let slot = am2_serial_echoed_job_id(self.asic_job_id) as usize;
-        let history = &mut self.work_history[slot];
-        if history.len() >= WORK_HISTORY_PER_ID {
-            history.pop_front();
-        }
-        history.push_back(WorkEntry {
-            job_id: work.job_id.clone(),
-            extranonce2: work.extranonce2.clone(),
-            ntime: work.ntime,
-            nbits: work.nbits,
-            version: work.version,
-            share_target: work.share_target,
-            prev_block_hash: work.prev_block_hash,
-            merkle_root: work.merkle_root,
-            version_bits_per_midstate: vec![None],
-            version_rolling_enabled: false,
-        });
-        self.asic_job_id =
-            dcentrald_common::next_asic_job_id(self.asic_job_id, AM2_SERIAL_JOB_ID_STEP);
+        let work = match self.work_builder.next_work(job) {
+            Ok(work) => work,
+            Err(error) => {
+                warn!(%error, chain = self.chain_id, "AM2 dual-chain V1 work domain unavailable; pausing this chain until a fresh generation arrives");
+                self.current_job = None;
+                return None;
+            }
+        };
+        let asic_job_id = self.bookkeeping.job_ids.current();
+        let frame = build_am2_serial_work_frame(&work, asic_job_id);
+        let slot = am2_serial_echoed_job_id(asic_job_id);
+        self.bookkeeping.history.push(
+            slot,
+            WorkEntry {
+                work_generation: work.work_generation,
+                job_id: work.job_id.clone(),
+                extranonce2: work.extranonce2.clone(),
+                ntime: work.ntime,
+                nbits: work.nbits,
+                version: work.version,
+                share_target: work.share_target,
+                prev_block_hash: work.prev_block_hash,
+                merkle_root: work.merkle_root,
+                version_bits_per_midstate: vec![None],
+                version_rolling_enabled: false,
+            },
+        );
+        let _ = self.bookkeeping.job_ids.take_and_advance();
         self.total_work += 1;
         if self.first_work_at.is_none() {
             self.first_work_at = Some(Instant::now());
@@ -4239,7 +4638,7 @@ impl Am2SerialChainState {
     /// own history. Returns the `ValidShare`s ready to submit (worker name is
     /// applied by the caller, which owns the pool config). HW-error /
     /// unparseable full-length frames are counted via `errors_out` so the
-    /// caller can feed the freq-only tuner's error signal. Pure — no I/O.
+    /// caller can feed the freq-only tuner's error signal. Pure Ã¢â‚¬â€ no I/O.
     fn ingest_rx(
         &mut self,
         rx: &[u8],
@@ -4259,7 +4658,7 @@ impl Am2SerialChainState {
                 }
             }
             let Some(start) = start else {
-                // No preamble — keep only the last byte (a possible split 0xAA).
+                // No preamble Ã¢â‚¬â€ keep only the last byte (a possible split 0xAA).
                 if self.carry.len() > 1 {
                     let tail = self.carry.split_off(self.carry.len() - 1);
                     self.carry = tail;
@@ -4270,7 +4669,7 @@ impl Am2SerialChainState {
                 self.carry.drain(0..start);
             }
             if self.carry.len() < AM2_SERIAL_NONCE_LEN {
-                break; // incomplete frame — wait for more bytes
+                break; // incomplete frame Ã¢â‚¬â€ wait for more bytes
             }
             let frame: Vec<u8> = self.carry.drain(0..AM2_SERIAL_NONCE_LEN).collect();
             self.total_rx_frames += 1;
@@ -4285,26 +4684,25 @@ impl Am2SerialChainState {
             let (_, vbits_delta) = am2_hybrid_reconstruct_rolled_version(0, nr.version_bits_raw);
             self.total_nonces += 1;
             self.hr_nonces += 1;
-            let history = &self.work_history[nr.job_id as usize];
-            if history.is_empty() {
+            if self.bookkeeping.history.is_empty_slot(nr.job_id) {
                 continue;
             }
+            // P1-1 pure SerialWorkBookkeeping.seen: insert clears over-cap before
+            // membership (SSOT; replaces post-insert wipe that dropped the survivor).
             if !self
-                .seen_shares
-                .insert((nr.job_id, nr.nonce, nr.version_bits_raw))
+                .bookkeeping
+                .seen
+                .insert(nr.job_id, nr.nonce, nr.version_bits_raw)
             {
                 continue; // duplicate (same job + nonce + rolled version)
             }
-            // AT-DASH: dedup-survivor — a genuinely distinct nonce for this chain.
+            // AT-DASH: dedup-survivor Ã¢â‚¬â€ a genuinely distinct nonce for this chain.
             self.unique_nonces = self.unique_nonces.saturating_add(1);
-            if dcentrald_common::should_clear_seen_shares(
-                self.seen_shares.len(),
-                dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
-            ) {
-                self.seen_shares.clear();
-            }
-            if let Some((entry, rolled_version, achieved_difficulty)) =
-                history.iter().rev().find_map(|candidate| {
+            if let Some((entry, rolled_version, achieved_difficulty)) = self
+                .bookkeeping
+                .history
+                .iter_newest_first(nr.job_id)
+                .find_map(|candidate| {
                     let (rolled_version, candidate_vbits_delta) =
                         am2_hybrid_reconstruct_rolled_version(
                             candidate.version,
@@ -4325,6 +4723,7 @@ impl Am2SerialChainState {
             {
                 self.shares_submitted += 1;
                 let share = dcentrald_stratum::types::ValidShare {
+                    work_generation: entry.work_generation,
                     worker_name: worker_name.to_string(),
                     job_id: entry.job_id.clone(),
                     extranonce2: entry.extranonce2.clone(),
@@ -4356,7 +4755,7 @@ impl Am2SerialChainState {
 /// (`am2_freq_only_clamp_applied_mhz`) so the PLL register word always
 /// comes from the live-proven `BM1362_PLL_TABLE`.
 ///
-/// This is a chain-wide broadcast (no per-chip addressing) — correct for
+/// This is a chain-wide broadcast (no per-chip addressing) Ã¢â‚¬â€ correct for
 /// the serial path where nonce frames carry no chip address. NEVER
 /// writes voltage. Returns the actually-applied frequency for the ack.
 fn apply_am2_bm1362_chain_pll(serial: &SerialChainBackend, requested_mhz: u16) -> Result<u16> {
@@ -4364,10 +4763,9 @@ fn apply_am2_bm1362_chain_pll(serial: &SerialChainBackend, requested_mhz: u16) -
     let (pll_reg, table_mhz) = bm1362_pll_lookup(applied_mhz);
     // Same two-write settle the init's ramp/slam tail uses: re-seat the
     // PLL0 divider, then write the target PLL word.
-    serial
-        .send_write_reg_broadcast_bm1397plus(BM1362_PLL0_DIVIDER_REG, BM1362_TRACE_PLL0_DIVIDER)?;
+    hybrid_send_write_reg_broadcast(serial, BM1362_PLL0_DIVIDER_REG, BM1362_TRACE_PLL0_DIVIDER)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x08, pll_reg)?;
+    hybrid_send_write_reg_broadcast(serial, 0x08, pll_reg)?;
     std::thread::sleep(Duration::from_millis(10));
     info!(
         requested_mhz,
@@ -4382,15 +4780,15 @@ fn apply_am2_bm1362_chain_pll(serial: &SerialChainBackend, requested_mhz: u16) -
 /// `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE=1` (PR-019 / R11-2 ablation).
 ///
 /// Default-OFF additive instrumentation for the AM2 BM1362 per-chip-init
-/// 126→28 chip-collapse root cause. When set, `init_asic_chain` issues the
+/// 126Ã¢â€ â€™28 chip-collapse root cause. When set, `init_asic_chain` issues the
 /// existing read-only `verify_bm1362_get_address` enumeration *after each
-/// init phase* (pre-init baseline, post-A8, post-MiscCtrl×3, post-3C×3,
+/// init phase* (pre-init baseline, post-A8, post-MiscCtrlÃƒâ€”3, post-3CÃƒâ€”3,
 /// post-fast-baud-switch, pre-mining) and logs a greppable `[AM2-ABLATION]`
 /// line per phase plus a single `[AM2-ABLATION-PARAMS]` 5-parameter summary
 /// so successive operator AC-cycle runs can be diffed mechanically.
 ///
 /// LOAD-BEARING: when this flag is unset the proven path's behaviour,
-/// timing, and on-wire traffic are byte-for-byte unchanged — every added
+/// timing, and on-wire traffic are byte-for-byte unchanged Ã¢â‚¬â€ every added
 /// GetAddress read AND every added log line is gated behind this check. The
 /// extra reads are the exact read-only enumeration form the proven path
 /// already uses for its own presence gate; they do not perturb addressing.
@@ -4402,7 +4800,7 @@ fn am2_verify_presence_after_each_phase_enabled() -> bool {
 ///
 /// Reorders the BM1362 115200 init block so `CHAIN_INACTIVE x3` +
 /// `SET_CHIP_ADDRESS x126` run BEFORE the A8/MiscCtrl x3/A4 broadcasts.
-/// Default-OFF — when unset, the proven path's existing order is preserved
+/// Default-OFF Ã¢â‚¬â€ when unset, the proven path's existing order is preserved
 /// byte-for-byte (`a lab unit` / `a lab unit` / `a lab unit` regression-safe).
 ///
 /// Background: Agent A's 2026-05-22 RE swarm finding (LEAD hypothesis in
@@ -4421,7 +4819,7 @@ fn am2_init_chain_inactive_first_enabled() -> bool {
 /// `DCENT_AM2_PIC_RESET_NO_JUMP=1` (5 / xil-`a lab unit` SetVoltage-path fix).
 ///
 /// When set with `DCENT_AM2_PIC_RESET_AND_START_APP=1`, Phase 0d emits only
-/// the bosminer-faithful flush + 0x07 RESET + 500 ms — skipping the
+/// the bosminer-faithful flush + 0x07 RESET + 500 ms Ã¢â‚¬â€ skipping the
 /// `[0x55, 0xAA, 0x06]` JUMP_TO_APP step. The dsPIC stays in fw=0x89
 /// bootloader mode for the rest of the daemon's lifecycle.
 ///
@@ -4431,7 +4829,7 @@ fn am2_init_chain_inactive_first_enabled() -> bool {
 /// The fw=0x89 bootloader path uses the BOS-proven framed-DAC encoding
 /// (DAC=6 for 13.7 V) per `dcentrald-asic::dspic::mod.rs:framed_voltage_dac`.
 ///
-/// Default OFF — when unset, the existing full-chain (flush + RESET +
+/// Default OFF Ã¢â‚¬â€ when unset, the existing full-chain (flush + RESET +
 /// JUMP) behaviour is preserved byte-for-byte. `a lab unit` / `a lab unit` /`a lab unit`
 /// regression-safe.
 fn am2_pic_reset_no_jump_enabled() -> bool {
@@ -4449,7 +4847,7 @@ fn am2_pic_reset_no_jump_enabled() -> bool {
 /// chip_preview)`. `total_responding` is the `count=` token (total frames
 /// the chain drove back), `unique_chip_ids` is `unique_chip_addrs=`,
 /// `duplicate_collisions` is `duplicate_chipid=` (chipid_like minus
-/// unique — the 126→28 collapse signature), and `chip_preview` is the
+/// unique Ã¢â‚¬â€ the 126Ã¢â€ â€™28 collapse signature), and `chip_preview` is the
 /// first ~8 chip-ids the summary already truncated to.
 fn parse_ablation_fields(summary: &str) -> (usize, usize, usize, String) {
     fn usize_tok(summary: &str, key: &str) -> usize {
@@ -4470,12 +4868,12 @@ fn parse_ablation_fields(summary: &str) -> (usize, usize, usize, String) {
     (total, unique, duplicates, preview)
 }
 
-/// `DCENT_AM2_LOG_RX_FRAMES=N` — when set to a positive integer, the am2
+/// `DCENT_AM2_LOG_RX_FRAMES=N` Ã¢â‚¬â€ when set to a positive integer, the am2
 /// serial-dispatch RX loop hex-dumps the first N raw 11-byte frames (after
 /// preamble alignment) along with whether `parse_bm1362_serial_nonce`
 /// accepted them and what the job-response / version-rolled flag bits were.
 /// Lab-only diagnostic for the 2026-05-15 .109 finding that 4655 RX frames
-/// arrive in 90 s but none parse as nonces — captures the actual on-wire
+/// arrive in 90 s but none parse as nonces Ã¢â‚¬â€ captures the actual on-wire
 /// shape vs the .79 BB serial-nonce frame the parser was tuned for. Default
 /// 0 = disabled.
 fn am2_log_rx_frames_max() -> u64 {
@@ -4545,13 +4943,13 @@ fn am2_env_u64(name: &str, default: u64) -> u64 {
 /// this generous window. Returns `None` (guard disabled) when the startup
 /// no-nonce guard is disabled and no explicit override is set, or when the
 /// resolved value is `0`.
-fn am2_mid_run_nonce_stall_timeout(no_nonce_timeout_s: u64) -> Option<Duration> {
+pub(crate) fn am2_mid_run_nonce_stall_timeout(no_nonce_timeout_s: u64) -> Option<Duration> {
     let default_s = if no_nonce_timeout_s == 0 {
-        // Startup guard disabled (deep lab capture) ⇒ mid-run guard off too
+        // Startup guard disabled (deep lab capture) Ã¢â€¡â€™ mid-run guard off too
         // unless the operator explicitly opts in via the env override.
         0
     } else {
-        // GENEROUS: at least 2× the startup no-nonce timeout AND never below the
+        // GENEROUS: at least 2Ãƒâ€” the startup no-nonce timeout AND never below the
         // 5-minute floor, so a healthy eco unit producing sparse nonces cannot
         // false-trip it.
         no_nonce_timeout_s
@@ -4566,12 +4964,12 @@ fn am2_mid_run_nonce_stall_timeout(no_nonce_timeout_s: u64) -> Option<Duration> 
     }
 }
 
-/// MINE-LIFE-1: pure mid-run stall decision. `true` ⇒ the loop must fail closed.
+/// MINE-LIFE-1: pure mid-run stall decision. `true` Ã¢â€¡â€™ the loop must fail closed.
 ///
 /// Fires ONLY when a timeout is configured AND at least one nonce has been seen
 /// (`last_nonce_elapsed` is `Some`) AND the time since that last nonce meets or
 /// exceeds the generous timeout. When no nonce has ever arrived
-/// (`last_nonce_elapsed` is `None`) this returns `false` — that startup case is
+/// (`last_nonce_elapsed` is `None`) this returns `false` Ã¢â‚¬â€ that startup case is
 /// owned by the separate no-nonce guard, so the two never overlap.
 fn am2_mid_run_nonce_stalled(
     timeout: Option<Duration>,
@@ -4584,7 +4982,7 @@ fn am2_mid_run_nonce_stalled(
 /// generous stall window)? Used to derive an honest live status so a stalled
 /// chain stops reporting "mining". Conservative: when the guard is disabled
 /// (`timeout` is `None`) or no nonce has arrived yet (`last_nonce_elapsed` is
-/// `None`), returns `true` so the status logic is never falsely downgraded —
+/// `None`), returns `true` so the status logic is never falsely downgraded Ã¢â‚¬â€
 /// the proven path stays byte-equivalent.
 fn am2_nonce_recently_active(
     timeout: Option<Duration>,
@@ -4603,16 +5001,16 @@ fn am2_nonce_recently_active(
 /// (`max_rpm == 0`) AND the unit is actually running warm (`temp_c` finite and
 /// `>= hot_c`). The temperature gate is the load-bearing false-cut guard: a
 /// confirmed-cool unit (`temp_c < hot_c`) is provably cooling adequately
-/// REGARDLESS of what the tach reports, so it must never accumulate a strike —
+/// REGARDLESS of what the tach reports, so it must never accumulate a strike Ã¢â‚¬â€
 /// the `Am2Uio16` tach is only live-verified on `a lab unit` (which itself read 0 on
-/// some channels before the C49→C52 fan-mode fix), so a sister am2-zynq unit
+/// some channels before the C49Ã¢â€ â€™C52 fan-mode fix), so a sister am2-zynq unit
 /// (`a lab unit`/`a lab unit`) with an unverified / wrong-mode / transient-zero tach would
 /// otherwise be cut while running cool and adequately cooled. Any airflow, any
 /// zero command, an inconclusive read (`reading == None`, e.g. the fan UIO could
 /// not be opened), a non-finite temperature, OR a cool temperature RESETS the
 /// counter, so a healthy, cool, or flaky unit can never accumulate to a
 /// fail-closed cut. The genuine-failure protection is preserved: a truly stalled
-/// fan → temp climbs → reaches `hot_c` → strikes accumulate → cut, still before
+/// fan Ã¢â€ â€™ temp climbs Ã¢â€ â€™ reaches `hot_c` Ã¢â€ â€™ strikes accumulate Ã¢â€ â€™ cut, still before
 /// the dangerous-threshold hard-cut.
 fn am2_fan_fault_step(
     strikes: u8,
@@ -4641,7 +5039,7 @@ fn am2_fan_fault_step(
 ///     eco unit never reaches hot, so this never fires);
 ///   * `None` once `current_mhz <= floor_mhz`. This means the `a lab unit` eco ~50 MHz
 ///     chip (well below the 400 MHz PLL floor) is NEVER PLL-throttled, so it can
-///     never be accidentally clocked UP toward the floor — only genuinely
+///     never be accidentally clocked UP toward the floor Ã¢â‚¬â€ only genuinely
 ///     high-frequency units (e.g. `a lab unit`/`a lab unit` at 525 MHz) step down.
 fn am2_graded_throttle_target_mhz(
     current_mhz: u16,
@@ -4678,8 +5076,8 @@ fn am2_current_effective_freq_mhz(config: &DcentraldConfig) -> u16 {
 }
 
 /// THERM-1(a): read max fan RPM + max commanded PWM via a read-only fan-UIO open
-/// (NO board-control write — C52 fan mode is already set at cold boot). Returns
-/// `None` when the fan UIO can't be opened (inconclusive — NEVER treated as a
+/// (NO board-control write Ã¢â‚¬â€ C52 fan mode is already set at cold boot). Returns
+/// `None` when the fan UIO can't be opened (inconclusive Ã¢â‚¬â€ NEVER treated as a
 /// fault). Telemetry only; never commands a PWM.
 fn am2_read_fan_rpm_and_pwm() -> Option<(u32, u8)> {
     let disc = dcentrald_hal::fan::discover_fan_uio()?;
@@ -4702,11 +5100,10 @@ fn am2_fast_uart_value() -> u32 {
     am2_env_u32("DCENT_AM2_FAST_UART_VALUE", FAST_UART_VALUE)
 }
 
-/// Bosminer's MiscCtrl value on the `a lab unit` cold path: `0xB000_C100`. Our plan
-/// defaults differ (`MISC_CONTROL_PRE_BAUD=0xFF0F_C100`,
-/// `MISC_CONTROL_POST_FAST_BAUD=0x00C1_00B0`). Captured by the RE swarm
-/// (`wf_b7891b82-31f`) from the healthy bosminer `a lab unit`/`a lab unit` cold-boot trace.
-const MISC_CONTROL_BOSMINER: u32 = 0xB000_C100;
+/// Bosminer's MiscCtrl value on the `a lab unit` cold path (G34 pure SSOT alias).
+/// Captured by the RE swarm (`wf_b7891b82-31f`) from the healthy bosminer
+/// `a lab unit`/`a lab unit` cold-boot trace. Canonical: `AM2_MISC_CTRL_PRE_BAUD_BOSMINER_COLD`.
+const MISC_CONTROL_BOSMINER: u32 = dcentrald_common::AM2_MISC_CTRL_PRE_BAUD_BOSMINER_COLD;
 
 /// Bosminer's cold A8/INIT_CONTROL broadcast value. On a true `a lab unit` cold-boot
 /// bosminer's first healthy chain4 A8 write is `0x0000_0000`, NOT our
@@ -4714,7 +5111,7 @@ const MISC_CONTROL_BOSMINER: u32 = 0xB000_C100;
 const BM1362_COLD_BROADCAST_BOSMINER_A8: u32 = 0x0000_0000;
 
 /// `DCENT_AM2_BM1362_COLD_BROADCAST_BOSMINER=1` (RE swarm `wf_b7891b82-31f`
-/// Candidate #2) — replace the cold 115200 broadcast A8 + MiscCtrl-pre values
+/// Candidate #2) Ã¢â‚¬â€ replace the cold 115200 broadcast A8 + MiscCtrl-pre values
 /// with bosminer's captured cold values (A8=`0x0000_0000`,
 /// MiscCtrl=`0xB000_C100`). Default-OFF: when unset, the `a lab unit`-proven
 /// `INIT_CONTROL_BCAST` / `MISC_CONTROL_PRE_BAUD` defaults are byte-identical,
@@ -4734,22 +5131,21 @@ fn am2_init_control_bcast() -> u32 {
     }
 }
 
-/// MiscCtrl value written pre-baud (triple-write). Default
-/// `MISC_CONTROL_PRE_BAUD`; bosminer's `0xB000_C100` is opt-in behind
-/// `DCENT_AM2_BM1362_COLD_BROADCAST_BOSMINER`.
+/// MiscCtrl value written pre-baud (triple-write).
+///
+/// G34: pure SSOT owns the two held constants; this helper only maps the
+/// existing `DCENT_AM2_BM1362_COLD_BROADCAST_BOSMINER` opt-in flag.
 fn am2_misc_control_pre_baud() -> u32 {
-    if am2_bm1362_cold_broadcast_bosminer() {
-        MISC_CONTROL_BOSMINER
-    } else {
-        MISC_CONTROL_PRE_BAUD
-    }
+    dcentrald_common::am2_misc_ctrl_pre_baud_from_bosminer_cold_opt_in(
+        am2_bm1362_cold_broadcast_bosminer(),
+    )
 }
 
 /// MiscCtrl value written immediately after the FastUART register write
 /// (triple-write, broadcast + per-chip). Default `MISC_CONTROL_POST_FAST_BAUD`
 /// (`0x00C1_00B0`); bosminer's `0xB000_C100` is opt-in behind
 /// `DCENT_AM2_MISC_CTRL_POST_FAST_BOSMINER` (RE swarm `wf_b7891b82-31f`
-/// Candidate #1 — pairs with `DCENT_AM2_FAST_UART_VALUE=0x11300000`, the
+/// Candidate #1 Ã¢â‚¬â€ pairs with `DCENT_AM2_FAST_UART_VALUE=0x11300000`, the
 /// byte-order-corrected FastUART value the wave52 fast-baud enum=0 implicated).
 /// Default-OFF: when unset the `a lab unit`-proven post-fast value is byte-identical.
 fn am2_misc_control_post_fast() -> u32 {
@@ -4767,7 +5163,7 @@ fn am2_fast_uart_baud() -> u32 {
     )
 }
 
-/// Default host-side settle delay (ms) after the 115200→3.125M host UART
+/// Default host-side settle delay (ms) after the 115200Ã¢â€ â€™3.125M host UART
 /// switch, BEFORE the first fast-baud GetAddress probe. The chip UART
 /// divider needs time to re-lock after the FastUART register write; 300 ms
 /// was live-proven too short on `a lab unit`, ~1000 ms is the canonical value.
@@ -4782,9 +5178,9 @@ const AM2_FASTUART_SETTLE_MS_MAX: u64 = 3000;
 /// Resolve the post-fast-baud-switch settle delay (ms).
 ///
 /// `DCENT_AM2_FASTUART_SETTLE_MS` overrides the [`AM2_FASTUART_SETTLE_MS_DEFAULT`]
-/// hardcoded value, CLAMPED to `[100, 3000]`. ABSENT env ⇒ byte-identical
+/// hardcoded value, CLAMPED to `[100, 3000]`. ABSENT env Ã¢â€¡â€™ byte-identical
 /// behaviour (returns the default 1000 ms). This gates ONLY the host-side
-/// settle sleep — the 0x28/0x18/MiscCtrl sequence, the fail-closed GetAddress
+/// settle sleep Ã¢â‚¬â€ the 0x28/0x18/MiscCtrl sequence, the fail-closed GetAddress
 /// sentinel, and every other timing are untouched. Makes the R11-7 live
 /// settle-delay sweep on `a lab unit` turnkey without N rebuilds.
 fn am2_fast_uart_settle_ms() -> u64 {
@@ -4805,30 +5201,30 @@ fn am2_fast_uart_settle_ms() -> u64 {
     clamped
 }
 
-/// Default post-chain-reset / pre-enumeration settle delay (ms) — the gap
+/// Default post-chain-reset / pre-enumeration settle delay (ms) Ã¢â‚¬â€ the gap
 /// between the chain UART coming up (HB_RESET released, serial port open at
 /// 115200) and the FIRST CHAIN_INACTIVE / SET_ADDRESS broadcast. Historically
 /// hardcoded at 50 ms.
 const AM2_POST_RESET_SETTLE_MS_DEFAULT: u64 = 50;
-/// Clamp floor for the post-reset settle delay (ms) — the proven 50 ms.
+/// Clamp floor for the post-reset settle delay (ms) Ã¢â‚¬â€ the proven 50 ms.
 const AM2_POST_RESET_SETTLE_MS_MIN: u64 = 50;
-/// Clamp ceiling for the post-reset settle delay (ms) — generous for cold
+/// Clamp ceiling for the post-reset settle delay (ms) Ã¢â‚¬â€ generous for cold
 /// chip-wake; well below any thermal concern (no hashing happens here).
 const AM2_POST_RESET_SETTLE_MS_MAX: u64 = 5000;
 
 /// Resolve the post-chain-reset / pre-enumeration settle delay (ms).
 ///
-///  (2026-05-31) — the `a lab unit` standalone cold-wake P1 lever. The
+///  (2026-05-31) Ã¢â‚¬â€ the `a lab unit` standalone cold-wake P1 lever. The
 /// 7-agent swarm (+ the  HB_RESET third-mechanism RE) converged on:
 /// the enum=0 blocker is chip-wake, NOT the PSU/Loki layer (the rail is up via
 /// PWR_CONTROL on the dumb APW3; DCENT does not gate its flow on the APW12
 /// spoof). bosminer's cold choreography holds HB_RESET LOW, releases it, then
-/// waits **~1 s** before its first (blind) address — DCENT waited only the
+/// waits **~1 s** before its first (blind) address Ã¢â‚¬â€ DCENT waited only the
 /// hardcoded 50 ms. This env-gated knob lets the operator extend that
 /// post-release settle to bosminer-faithful ~1 s WITHOUT a rebuild per sweep.
 ///
 /// `DCENT_AM2_POST_RESET_SETTLE_MS` overrides the [`AM2_POST_RESET_SETTLE_MS_DEFAULT`]
-/// 50 ms, CLAMPED to `[50, 5000]`. ABSENT env ⇒ byte-identical behaviour (50 ms),
+/// 50 ms, CLAMPED to `[50, 5000]`. ABSENT env Ã¢â€¡â€™ byte-identical behaviour (50 ms),
 /// so `a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9 are untouched. SAFE: this sleep sits before
 /// any chip enumerates, so 0 chips = no hashing = no thermal risk; the home fan
 /// cap (PWM 30) stands on every teardown regardless.
@@ -4851,18 +5247,18 @@ fn am2_post_reset_settle_ms() -> u64 {
     clamped
 }
 
-/// 2026-05-31 — opt-in env gate for the AM2 `a lab unit` open-core voltage-ramp
+/// 2026-05-31 Ã¢â‚¬â€ opt-in env gate for the AM2 `a lab unit` open-core voltage-ramp
 /// experiment (ported from the proven AM3-BB `a lab unit` open-core rail stage).
 ///
 /// When `DCENT_AM2_OPEN_CORE_VOLTAGE=1` AND the `a lab unit` fingerprint matches AND
 /// the lab over-volt cap is lifted, the Phase-3 dsPIC `cold_boot_init` targets
 /// an explicitly configured elevated `s19j_open_core_mv()` instead of the steady
-/// 13700 mV — so the BM1362 chip string enumerates AT the open-core voltage,
+/// 13700 mV Ã¢â‚¬â€ so the BM1362 chip string enumerates AT the open-core voltage,
 /// matching what LuxOS/`a lab unit` (same BM1362) + bosminer + the AMTC fixture do on
 /// every cold boot. After enum > 0, Phase 4-7 ramps the rail back DOWN to
 /// `S19J_HYBRID_CHIP_RAIL_TARGET_MV` (13700) for steady operation.
 ///
-/// **Default off.** Absent env ⇒ byte-identical behaviour on every unit
+/// **Default off.** Absent env Ã¢â€¡â€™ byte-identical behaviour on every unit
 /// (`a lab unit`/`a lab unit`/`a lab unit`/`a lab unit`/S9/handoff): the 13700 mV path is unchanged.
 /// The gate is also `a lab unit`-fingerprinted (`am2_xil_25_fingerprint_matches`) so
 /// even with the env set, no other AM2 unit elevates.
@@ -4876,7 +5272,7 @@ fn am2_open_core_voltage_enabled() -> bool {
 /// `S19J_HYBRID_CHIP_RAIL_TARGET_MV` 13700), clamped to
 /// `[S19J_HYBRID_CHIP_RAIL_TARGET_MV, S19J_OPEN_CORE_MAX_MV]` =
 /// `[13700, 15140]`. Returns the steady 13700 mV UNLESS the open-core
-/// experiment gate is active — `am2_open_core_voltage_enabled()` AND the
+/// experiment gate is active Ã¢â‚¬â€ `am2_open_core_voltage_enabled()` AND the
 /// `a lab unit` fingerprint matches. This keeps the elevated voltage strictly
 /// `a lab unit`-only and behind the explicit env flag; everything else stays at
 /// 13700 and the call sites remain byte-identical to today. Admission later
@@ -4921,8 +5317,8 @@ fn s19j_open_core_mv() -> u16 {
 ///
 /// If the open-core env is set + `a lab unit` matches but the over-volt cap is NOT
 /// lifted, emits a LOUD `warn!` (so the operator sees WHY the rail will be
-/// silently clamped to ~14500) and returns `false` — the steady 13700 mV path
-/// runs unchanged. Default-OFF (env unset) ⇒ silent, byte-identical.
+/// silently clamped to ~14500) and returns `false` Ã¢â‚¬â€ the steady 13700 mV path
+/// runs unchanged. Default-OFF (env unset) Ã¢â€¡â€™ silent, byte-identical.
 fn am2_open_core_gate_active() -> bool {
     if !(am2_open_core_voltage_enabled() && am2_xil_25_fingerprint_matches()) {
         return false;
@@ -4934,7 +5330,7 @@ fn am2_open_core_gate_active() -> bool {
             hard_cap_mv = dcentrald_asic::dspic::DSPIC_VOLTAGE_HARD_CAP_MV,
             requested_open_core_mv = s19j_open_core_mv(),
             "DCENT_AM2_OPEN_CORE_VOLTAGE is set on .25 but the dsPIC lab over-volt cap is NOT lifted \
-             — any open-core target above {} mV will be SILENTLY CLAMPED to {} mV at the rail boundary. \
+             Ã¢â‚¬â€ any open-core target above {} mV will be SILENTLY CLAMPED to {} mV at the rail boundary. \
              Set {}=1 to actually reach the open-core voltage. Open-core ramp NOT armed.",
             dcentrald_asic::dspic::DSPIC_VOLTAGE_HARD_CAP_MV,
             dcentrald_asic::dspic::DSPIC_VOLTAGE_HARD_CAP_MV,
@@ -4954,9 +5350,10 @@ fn maybe_write_bm1362_uart_relay(serial: &SerialChainBackend, stage: &'static st
         return Ok(());
     }
 
-    serial.send_write_reg_broadcast_bm1397plus(BM1362_UART_RELAY_REG, BM1362_UART_RELAY_ENABLE)?;
+    hybrid_send_write_reg_broadcast(serial, BM1362_UART_RELAY_REG, BM1362_UART_RELAY_ENABLE)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(
+    hybrid_send_write_reg_broadcast(
+        serial,
         BM1362_UART_RELAY_REG_ALT,
         BM1362_UART_RELAY_ENABLE_ALT,
     )?;
@@ -4968,7 +5365,7 @@ fn maybe_write_bm1362_uart_relay(serial: &SerialChainBackend, stage: &'static st
 /// Non-destructive post-ENABLE chain UART rail-engagement probe.
 ///
 /// APW121215a (FW `0x71`) has NO voltage/current/power feedback, and dsPIC
-/// fw=0x86 in bare protocol returns only its FW echo byte for any read —
+/// fw=0x86 in bare protocol returns only its FW echo byte for any read Ã¢â‚¬â€
 /// including GET_VOLTAGE (0x3B). The ENABLE_VOLTAGE bare ACK only confirms
 /// protocol-level acceptance, NOT actual rail engagement. The only software
 /// signal that the chain DC-DC has actually engaged 13.7 V is whether the
@@ -5005,7 +5402,7 @@ fn post_enable_chain_uart_probe(
             warn!(
                 error = %e,
                 chain_uart_device,
-                "Post-ENABLE chain UART probe: DevmemUart::open failed — \
+                "Post-ENABLE chain UART probe: DevmemUart::open failed Ã¢â‚¬â€ \
                  failing closed before Phase 4-7"
             );
             return Err(e).context("Post-ENABLE chain UART probe failed to open UART");
@@ -5049,7 +5446,7 @@ fn post_enable_chain_uart_probe(
             chain_id,
             chain_uart_device,
             rx_bytes_pre_init = total,
-            "Post-ENABLE chain UART probe: chain is electrically alive — \
+            "Post-ENABLE chain UART probe: chain is electrically alive Ã¢â‚¬â€ \
              BM1362 init may still need adjustment but the rail is up."
         );
     }
@@ -5150,8 +5547,8 @@ fn collect_single_byte_reads(reads: Vec<Vec<u8>>) -> Vec<u8> {
 /// bosminer-faithful clean-frame retry budget for GET_VERSION. bosminer
 /// (`braiins_power.rs::I2cBackend::read`) retries the WHOLE clean frame up to
 /// `I2C_NUM_RETRIES = 15` spaced `I2C_RETRY_DELAY = 100 ms` on a hard bus
-/// error (EIO) — it never injects a speculative zero-byte parser flush between
-/// tries (the flush is what wedges the dsPIC MSSP parser → all-FF).
+/// error (EIO) Ã¢â‚¬â€ it never injects a speculative zero-byte parser flush between
+/// tries (the flush is what wedges the dsPIC MSSP parser Ã¢â€ â€™ all-FF).
 #[cfg(test)]
 const PIC_GET_VERSION_CLEAN_RETRIES: u32 = 15;
 #[cfg(test)]
@@ -5167,20 +5564,20 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     // behave like bosminer = do LESS to the bus. The previous probe pre-flushed
     // 8/16 zero bytes and bulk-read 5 framed bytes across 2 encodings (6
     // attempts); DCENT's own `a lab unit` evidence (the early-probe note ~line 4285)
-    // proves the speculative zero-flush wedges the dsPIC MSSP parser → all-FF,
+    // proves the speculative zero-flush wedges the dsPIC MSSP parser Ã¢â€ â€™ all-FF,
     // and over-reading past the 1 staged version byte invites the kernel xiic
     // shift-left tail / idle-FF. The fix:
-    //   R1: the FIRST attempt is bosminer-faithful — one clean framed write
+    //   R1: the FIRST attempt is bosminer-faithful Ã¢â‚¬â€ one clean framed write
     //       [55 AA 04 17 00 1B] then ONE 1-byte read, NO speculative flush.
     //   R2: the framed read length is 1 (the dsPIC stages exactly one byte).
     //   R5: re-issue the CLEAN whole frame (no inter-attempt zero-flush) up to
-    //       `PIC_GET_VERSION_CLEAN_RETRIES` × @`PIC_GET_VERSION_RETRY_DELAY_MS`
+    //       `PIC_GET_VERSION_CLEAN_RETRIES` Ãƒâ€” @`PIC_GET_VERSION_RETRY_DELAY_MS`
     //       on a hard transaction error (EIO). A valid reply returns
     //       immediately; an FF/garbage-but-no-error reply is retried within the
     //       same clean budget.
     // The short [55 AA 17] form stays as a fallback but is ALSO issued WITHOUT
     // a preceding flush. No RESET/JUMP is ever emitted (feedback_pic_no_reset_s19j).
-    // This is fail-closed-safe: worst case is still all-FF → the caller's
+    // This is fail-closed-safe: worst case is still all-FF Ã¢â€ â€™ the caller's
     // trust-rail / fw-whitelist gates refuse voltage. Best case: the dsPIC
     // versions cleanly and mining is unblocked.
     const GET_VERSION_FRAMED: [u8; 6] = [0x55, 0xAA, 0x04, 0x17, 0x00, 0x1B];
@@ -5188,19 +5585,19 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     //  (2026-05-23, strace-derived): when bosminer-plus-tuner 0.9.0
     // on `a lab unit` reads GET_VERSION it gets a **4-byte response**
     // `[0x17, FW, 0x00, CKSUM]` (opcode echo + fw byte at INDEX 1 + status +
-    // checksum) — NOT the 1-byte response R1/R2 documented above. R2 was
+    // checksum) Ã¢â‚¬â€ NOT the 1-byte response R1/R2 documented above. R2 was
     // accurate for fw=0x86 / older bosminer firmware lineages but the newer
     // bosminer-plus-tuner 0.9.0 stages all 4 bytes. Reading only 1 returns
     // the opcode-echo byte `0x17` which `parse_hybrid_pic_fw_reply` correctly
-    // rejects as "not a known fw byte" → caller errors. Strace evidence:
+    // rejects as "not a known fw byte" Ã¢â€ â€™ caller errors. Strace evidence:
     // `bosminer-strace-init-full.log` lines 13178-13184 (PWR/1: read 4 bytes
     // `[17 89 00 a5]` after `[55 AA 04 17 00 1B]` write).
     //
     // When `DCENT_AM2_GET_VERSION_FRAMED_4B=1` we INSERT a 4-byte-read
-    // framed probe BEFORE the existing 1-byte probes — that's the
+    // framed probe BEFORE the existing 1-byte probes Ã¢â‚¬â€ that's the
     // bosminer-plus-tuner 0.9.0 byte-exact read shape. On older lineages
     // the 4-byte read either succeeds with a known fw byte at index 1 OR
-    // returns garbage that `parse_strace_derived_pic_fw_reply` rejects → we
+    // returns garbage that `parse_strace_derived_pic_fw_reply` rejects Ã¢â€ â€™ we
     // fall through to the original 1-byte probes. Default-off so unset env
     // = byte-identical to today. Companion to 's framed reset+start-app
     // gate `DCENT_AM2_PIC_RESET_STRACE_DERIVED`.
@@ -5220,7 +5617,7 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
         ("short-55aa17-bytewise", &GET_VERSION_SHORT, 1),
     ];
     let use_strace_first = am2_get_version_framed_4b_enabled();
-    // (variant, frame, read_len) — read_len = 1 for both (R2). NO flush in
+    // (variant, frame, read_len) Ã¢â‚¬â€ read_len = 1 for both (R2). NO flush in
     // either probe's steps.
     let probes: &[(&str, &[u8], usize)] = if use_strace_first {
         &probes_strace_first
@@ -5299,7 +5696,7 @@ fn pic_read_fw_version_service(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
 /// kernel xiic-i2c bus-noise. Used as the FINAL trust-rail fallback to
 /// recover the FW byte when the standard probes fail. Two consecutive
 /// reads must agree on a known FW byte (0x82/0x86/0x89/0x8A) to count
-/// as stable — this is the same liveness check `dspic-flash proto-probe`
+/// as stable Ã¢â‚¬â€ this is the same liveness check `dspic-flash proto-probe`
 /// uses (see dspic_flash.rs::probe_protocol).
 fn pic_dumy_read_fw_byte(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     let mut samples = Vec::new();
@@ -5341,16 +5738,17 @@ fn pic_dumy_read_fw_byte(i2c: &I2cServiceHandle, addr: u8) -> Result<u8> {
     ))
 }
 
-async fn stop_am2_runtime_feeders_bounded(
+async fn stop_am2_runtime_feeders_with_evidence(
     config: &DcentraldConfig,
-    runtime_threads: &mut RuntimeThreadGuard,
+    runtime_threads: &mut HybridThreadGuard,
     reason: &str,
-) -> bool {
-    let summary = runtime_threads.stop_and_join(AM2_FEEDER_STOP_TIMEOUT).await;
+    timeout: Duration,
+) -> HybridThreadStop {
+    let summary = runtime_threads.stop_and_join(timeout).await;
     if summary.any_timed_out() {
         error!(
             reason,
-            timeout_ms = AM2_FEEDER_STOP_TIMEOUT.as_millis(),
+            timeout_ms = timeout.as_millis(),
             "AM2 feeder shutdown deadline expired; asserting transport-independent hard stop"
         );
         // Never take the PSU mutex here: the timed-out feeder may still own
@@ -5359,24 +5757,55 @@ async fn stop_am2_runtime_feeders_bounded(
         // A transport call already in flight may complete once after this
         // point, but the post-sleep/post-lock cancellation fences prevent a
         // subsequent intentional feed.
-        force_am2_home_hard_stop(config, reason);
-        false
-    } else {
-        true
+        let _ = force_am2_home_hard_stop_blocking(config, reason).await;
+    }
+    summary
+}
+
+async fn stop_am2_runtime_feeders_bounded(
+    config: &DcentraldConfig,
+    runtime_threads: &mut HybridThreadGuard,
+    reason: &str,
+) -> bool {
+    stop_am2_runtime_feeders_with_evidence(config, runtime_threads, reason, AM2_FEEDER_STOP_TIMEOUT)
+        .await
+        .all_started_threads_quiesced()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Am2ShutdownLegOutcome {
+    Succeeded,
+    NotApplicable,
+    Failed,
+}
+
+impl Am2ShutdownLegOutcome {
+    fn completed(self) -> bool {
+        matches!(self, Self::Succeeded | Self::NotApplicable)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Am2PowerShutdownEvidence {
+pub(crate) struct Am2PowerShutdownEvidence {
     feeders_quiesced: bool,
     hard_stop_asserted: bool,
     psu_present: bool,
-    psu_shutdown_succeeded: Option<bool>,
+    controller_shutdown: Am2ShutdownLegOutcome,
+    psu_shutdown: Am2ShutdownLegOutcome,
 }
 
 impl Am2PowerShutdownEvidence {
-    fn completed_gracefully(self) -> bool {
-        self.feeders_quiesced && self.psu_shutdown_succeeded.unwrap_or(true)
+    pub(crate) fn completed_gracefully(&self) -> bool {
+        self.feeders_quiesced
+            && !self.hard_stop_asserted
+            && self.controller_shutdown.completed()
+            && self.psu_shutdown.completed()
+            && (self.psu_present == matches!(self.psu_shutdown, Am2ShutdownLegOutcome::Succeeded))
+    }
+
+    fn with_controller_shutdown(mut self, outcome: Am2ShutdownLegOutcome) -> Self {
+        self.controller_shutdown = outcome;
+        self
     }
 
     fn hard_stop_after_timeout(psu_present: bool) -> Self {
@@ -5384,8 +5813,192 @@ impl Am2PowerShutdownEvidence {
             feeders_quiesced: false,
             hard_stop_asserted: true,
             psu_present,
-            psu_shutdown_succeeded: None,
+            controller_shutdown: Am2ShutdownLegOutcome::Failed,
+            psu_shutdown: if psu_present {
+                Am2ShutdownLegOutcome::Failed
+            } else {
+                Am2ShutdownLegOutcome::NotApplicable
+            },
         }
+    }
+}
+
+/// Terminal ownership closeout for the AM2 `PWR_CONTROL` line.
+///
+/// Each variant carries HAL-issued proof that the exact daemon-owned gate was
+/// driven OFF with readback and that its later scoped restoration was retired.
+/// Passthrough has no variant because external ownership cannot authorize this
+/// daemon to magic-close its safety watchdog.
+#[derive(Debug)]
+enum Am2PowerControlCloseout {
+    SmartPsu(PsuGpioSafeOffReceipt),
+    Bypass(PsuGpioSafeOffReceipt),
+}
+
+/// Complete AM2 safe-off evidence used exclusively to mint software-watchdog
+/// disarm authority. Ordinary PIC/PSU command evidence is intentionally not
+/// sufficient without terminal `PWR_CONTROL` closeout.
+#[derive(Debug)]
+pub(crate) struct Am2TerminalSafeOffEvidence {
+    shutdown: Am2PowerShutdownEvidence,
+    power_control: Am2PowerControlCloseout,
+    panic_teardown_barrier: Am2PanicTeardownBarrierReceipt,
+    teardown_budget: TeardownBudgetView,
+}
+
+/// Checked load-bearing cutoff performed before shared-controller cleanup.
+/// The later HAL closeout still retires the exact GPIO owner; this receipt
+/// proves the independent early write/readback met the watchdog schedule.
+#[derive(Debug)]
+struct Am2EarlyPowerCutReceipt {
+    gpio: u32,
+    started_at: Instant,
+    completed_at: Instant,
+    teardown_budget: TeardownBudgetView,
+}
+
+fn cut_am2_power_control_early_checked(
+    pwr_control_gpio: Option<&str>,
+    teardown_budget: TeardownBudgetView,
+) -> Result<Am2EarlyPowerCutReceipt> {
+    let prepared = prepare_pwr_control_cut(pwr_control_gpio, "normal-shutdown-early-cut")?;
+    let gpio = prepared.gpio;
+    // Classify entry into the physical OFF value write. GPIO parsing, export,
+    // and direction setup above cannot manufacture timely CutoffStart evidence
+    // after consuming the watchdog's reserved cutoff window.
+    let started_at = Instant::now();
+    let timely_start = teardown_budget.require_completed_at(TeardownStage::CutoffStart, started_at);
+
+    // Always attempt the physical cut even if scheduling already ran late.
+    // Timing controls evidence and Disarm, never whether safe-off is attempted.
+    let cutoff = prepared.write_checked("normal-shutdown-early-cut");
+    let completed_at = Instant::now();
+    cutoff?;
+    timely_start?;
+    teardown_budget.require_completed_at(TeardownStage::CutoffComplete, completed_at)?;
+
+    Ok(Am2EarlyPowerCutReceipt {
+        gpio,
+        started_at,
+        completed_at,
+        teardown_budget,
+    })
+}
+
+impl Am2TerminalSafeOffEvidence {
+    fn from_completed_shutdown(
+        shutdown: Am2PowerShutdownEvidence,
+        power_control: Am2PowerControlCloseout,
+        panic_teardown_barrier: Am2PanicTeardownBarrierReceipt,
+        early_power_cut: Am2EarlyPowerCutReceipt,
+    ) -> Result<Self> {
+        if !shutdown.completed_gracefully() {
+            anyhow::bail!(
+                "AM2 terminal safe-off cannot be admitted from incomplete shutdown evidence: {:?}",
+                shutdown
+            );
+        }
+        if let (Am2PowerControlCloseout::SmartPsu(_), false) =
+            (&power_control, shutdown.psu_present)
+        {
+            anyhow::bail!(
+                "AM2 terminal safe-off received smart-PSU gate evidence without a smart PSU owner"
+            )
+        }
+        let terminal_gpio = match &power_control {
+            Am2PowerControlCloseout::SmartPsu(receipt)
+            | Am2PowerControlCloseout::Bypass(receipt) => receipt.gpio(),
+        };
+        anyhow::ensure!(
+            early_power_cut.gpio == terminal_gpio,
+            "AM2 early PWR_CONTROL cutoff GPIO{} did not match terminal owner GPIO{}",
+            early_power_cut.gpio,
+            terminal_gpio
+        );
+        early_power_cut
+            .teardown_budget
+            .require_not_before_start(early_power_cut.started_at)?;
+        early_power_cut
+            .teardown_budget
+            .require_completed_at(TeardownStage::CutoffStart, early_power_cut.started_at)?;
+        early_power_cut
+            .teardown_budget
+            .require_completed_at(TeardownStage::CutoffComplete, early_power_cut.completed_at)?;
+        early_power_cut
+            .teardown_budget
+            .require_completed_at(TeardownStage::CleanupComplete, Instant::now())?;
+        Ok(Self {
+            shutdown,
+            power_control,
+            panic_teardown_barrier,
+            teardown_budget: early_power_cut.teardown_budget,
+        })
+    }
+
+    pub(crate) fn completed_gracefully(&self) -> bool {
+        let _panic_hook_is_fenced = &self.panic_teardown_barrier;
+        self.shutdown.completed_gracefully()
+            && match &self.power_control {
+                Am2PowerControlCloseout::SmartPsu(receipt)
+                | Am2PowerControlCloseout::Bypass(receipt) => {
+                    let _observed_terminal_level = (receipt.gpio(), receipt.off_level());
+                    true
+                }
+            }
+    }
+
+    pub(crate) fn smart_psu_present(&self) -> bool {
+        self.shutdown.psu_present
+    }
+
+    pub(crate) fn same_teardown_budget(&self, authority: &TeardownDisarmAuthority) -> bool {
+        self.teardown_budget.same_budget(authority)
+    }
+}
+
+fn close_am2_power_control_after_safe_off(
+    psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
+    psu_bypass_gate: &mut Option<PsuBypassGate>,
+    passthrough: bool,
+) -> Result<Am2PowerControlCloseout> {
+    if passthrough {
+        anyhow::bail!("AM2 passthrough cannot provide daemon-owned terminal safe-off evidence");
+    }
+
+    match (psu_arc.as_ref(), psu_bypass_gate.as_mut()) {
+        (Some(psu_mutex), Some(gate)) => {
+            // Attempt both transitions before diagnosing the invariant. Each
+            // attempt terminally retires its inherited-state restore before
+            // fallible I/O, so neither later Drop can undo the hard stop.
+            let mut psu = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let smart_closeout = psu.force_psu_gate_safe_off_verified();
+            drop(psu);
+            let bypass_closeout = gate.force_safe_off_verified();
+            match (smart_closeout, bypass_closeout) {
+                (Ok(None), Ok(receipt)) => Ok(Am2PowerControlCloseout::Bypass(receipt)),
+                (Ok(Some(_)), Ok(_)) => anyhow::bail!(
+                    "AM2 terminal safe-off found simultaneous smart-PSU and bypass PWR_CONTROL owners; both were terminally driven OFF"
+                ),
+                (smart_result, bypass_result) => anyhow::bail!(
+                    "AM2 terminal safe-off could not close every retained PWR_CONTROL owner: smart={:?}, bypass={:?}",
+                    smart_result,
+                    bypass_result
+                ),
+            }
+        }
+        (Some(psu_mutex), None) => {
+            let mut psu = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let receipt = psu
+                .force_psu_gate_safe_off_verified()?
+                .context("AM2 smart PSU had no retained PWR_CONTROL gate at terminal safe-off")?;
+            Ok(Am2PowerControlCloseout::SmartPsu(receipt))
+        }
+        (None, Some(gate)) => Ok(Am2PowerControlCloseout::Bypass(
+            gate.force_safe_off_verified()?,
+        )),
+        (None, None) => anyhow::bail!(
+            "AM2 native terminal safe-off had no smart-PSU or bypass PWR_CONTROL owner"
+        ),
     }
 }
 
@@ -5410,7 +6023,8 @@ fn finalize_am2_dispatch_shutdown(
 #[cfg(test)]
 mod am2_power_shutdown_evidence_tests {
     use super::{
-        finalize_am2_dispatch_shutdown, pic0x89_clean_stop_owner_policy, Am2PowerShutdownEvidence,
+        finalize_am2_dispatch_shutdown, pic0x89_clean_stop_owner_policy, Am2PowerControlCloseout,
+        Am2PowerShutdownEvidence, Am2ShutdownLegOutcome, Am2TerminalSafeOffEvidence,
         Pic0x89CleanStopOwnerPolicy,
     };
 
@@ -5436,7 +6050,8 @@ mod am2_power_shutdown_evidence_tests {
             feeders_quiesced: true,
             hard_stop_asserted: false,
             psu_present: true,
-            psu_shutdown_succeeded: Some(true),
+            controller_shutdown: Am2ShutdownLegOutcome::Succeeded,
+            psu_shutdown: Am2ShutdownLegOutcome::Succeeded,
         };
 
         assert!(evidence.completed_gracefully());
@@ -5449,7 +6064,8 @@ mod am2_power_shutdown_evidence_tests {
             feeders_quiesced: false,
             hard_stop_asserted: true,
             psu_present: true,
-            psu_shutdown_succeeded: None,
+            controller_shutdown: Am2ShutdownLegOutcome::Failed,
+            psu_shutdown: Am2ShutdownLegOutcome::Failed,
         };
 
         assert!(!evidence.completed_gracefully());
@@ -5464,7 +6080,34 @@ mod am2_power_shutdown_evidence_tests {
             feeders_quiesced: true,
             hard_stop_asserted: false,
             psu_present: true,
-            psu_shutdown_succeeded: Some(false),
+            controller_shutdown: Am2ShutdownLegOutcome::Succeeded,
+            psu_shutdown: Am2ShutdownLegOutcome::Failed,
+        };
+
+        assert!(!evidence.completed_gracefully());
+    }
+
+    #[test]
+    fn applicable_but_missing_psu_leg_cannot_be_reported_as_graceful() {
+        let evidence = Am2PowerShutdownEvidence {
+            feeders_quiesced: true,
+            hard_stop_asserted: false,
+            psu_present: true,
+            controller_shutdown: Am2ShutdownLegOutcome::Succeeded,
+            psu_shutdown: Am2ShutdownLegOutcome::NotApplicable,
+        };
+
+        assert!(!evidence.completed_gracefully());
+    }
+
+    #[test]
+    fn failed_controller_shutdown_cannot_be_reported_as_graceful() {
+        let evidence = Am2PowerShutdownEvidence {
+            feeders_quiesced: true,
+            hard_stop_asserted: false,
+            psu_present: false,
+            controller_shutdown: Am2ShutdownLegOutcome::Failed,
+            psu_shutdown: Am2ShutdownLegOutcome::NotApplicable,
         };
 
         assert!(!evidence.completed_gracefully());
@@ -5479,7 +6122,7 @@ mod am2_power_shutdown_evidence_tests {
 /// second cutoff path after any already in-flight transfer drains.
 async fn shutdown_am2_psu_after_feeders_bounded(
     config: &DcentraldConfig,
-    runtime_threads: &mut RuntimeThreadGuard,
+    runtime_threads: &mut HybridThreadGuard,
     psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
     reason: &str,
 ) -> Am2PowerShutdownEvidence {
@@ -5492,7 +6135,27 @@ async fn shutdown_am2_psu_after_feeders_bounded(
         return Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_present);
     }
 
-    shutdown_am2_psu_after_feeders_quiesced(psu_arc, reason)
+    let shutdown_psu = psu_arc.clone();
+    let reason = reason.to_string();
+    match tokio::task::spawn_blocking(move || {
+        shutdown_am2_psu_after_feeders_quiesced(&shutdown_psu, &reason)
+    })
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            error!(%error, "AM2 PSU safe-direction worker failed after feeders quiesced");
+            let hard_stop_config = config.clone();
+            if let Err(hard_stop_error) = tokio::task::spawn_blocking(move || {
+                force_am2_home_hard_stop(&hard_stop_config, "psu-safe-direction-worker-failed");
+            })
+            .await
+            {
+                error!(%hard_stop_error, "AM2 PSU-worker fallback hard-stop worker failed");
+            }
+            Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
+        }
+    }
 }
 
 fn shutdown_am2_psu_after_feeders_quiesced(
@@ -5500,13 +6163,13 @@ fn shutdown_am2_psu_after_feeders_quiesced(
     reason: &str,
 ) -> Am2PowerShutdownEvidence {
     let psu_present = psu_arc.is_some();
-    let mut psu_shutdown_succeeded = None;
+    let mut psu_shutdown = Am2ShutdownLegOutcome::NotApplicable;
     if let Some(psu_mutex) = psu_arc.as_ref() {
         let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
         match psu_guard.safe_shutdown_to_min() {
-            Ok(()) => psu_shutdown_succeeded = Some(true),
+            Ok(()) => psu_shutdown = Am2ShutdownLegOutcome::Succeeded,
             Err(e) => {
-                psu_shutdown_succeeded = Some(false);
+                psu_shutdown = Am2ShutdownLegOutcome::Failed;
                 warn!(
                     reason,
                     error = %e,
@@ -5519,13 +6182,14 @@ fn shutdown_am2_psu_after_feeders_quiesced(
         feeders_quiesced: true,
         hard_stop_asserted: false,
         psu_present,
-        psu_shutdown_succeeded,
+        controller_shutdown: Am2ShutdownLegOutcome::NotApplicable,
+        psu_shutdown,
     }
 }
 
 async fn teardown_am2_power_after_failed_pic_preflight(
     config: &DcentraldConfig,
-    runtime_threads: &mut RuntimeThreadGuard,
+    runtime_threads: &mut HybridThreadGuard,
     psu_arc: &Option<Arc<Mutex<Apw121215a>>>,
 ) {
     if stop_am2_runtime_feeders_bounded(config, runtime_threads, "PIC preflight failure").await {
@@ -5533,14 +6197,33 @@ async fn teardown_am2_power_after_failed_pic_preflight(
             return;
         };
         // FWSTAB-2: recover from a poisoned lock (a panic elsewhere while holding
-        // the shared PSU mutex) instead of panicking again — this teardown is the
+        // the shared PSU mutex) instead of panicking again Ã¢â‚¬â€ this teardown is the
         // graceful safe-off path (watchdog-disable + set-voltage-min) and must
         // still run a best-effort cut even if the lock was poisoned. (The PSU
         // hardware watchdog + Apw121215a::Drop remain the ultimate backstops.)
         // All PSU-mutex lock sites in this file use the same poison-tolerant form.
-        let mut psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = psu_guard.safe_shutdown_to_min() {
-            warn!(error = %e, "PSU safe-direction shutdown failed after PIC preflight failure");
+        let shutdown_psu = Arc::clone(psu_mutex);
+        match tokio::task::spawn_blocking(move || {
+            let mut psu_guard = shutdown_psu.lock().unwrap_or_else(|e| e.into_inner());
+            psu_guard.safe_shutdown_to_min()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "PSU safe-direction shutdown failed after PIC preflight failure");
+            }
+            Err(error) => {
+                error!(%error, "PSU safe-direction worker failed after PIC preflight failure");
+                let hard_stop_config = config.clone();
+                if let Err(hard_stop_error) = tokio::task::spawn_blocking(move || {
+                    force_am2_home_hard_stop(&hard_stop_config, "pic-preflight-psu-worker-failed");
+                })
+                .await
+                {
+                    error!(%hard_stop_error, "PIC-preflight fallback hard-stop worker failed");
+                }
+            }
         }
     }
 
@@ -5554,7 +6237,9 @@ async fn teardown_am2_power_after_failed_pic_preflight(
 // PSU heartbeat loop (1 Hz, shared Arc<Mutex<Apw121215a>>)
 // ---------------------------------------------------------------------------
 
-/// 1 Hz PSU heartbeat loop. Runs forever until the process exits.
+/// 1 Hz PSU heartbeat loop. Runs until cancellation or a typed loss of
+/// controller/safety authority. The latter cancels the shared lifecycle token
+/// so the mining run cannot continue after its PSU owner has been superseded.
 ///
 /// Missing 3 consecutive heartbeats on APW121215a triggers the PSU self-disable
 /// (~30 s typical grace, <=60 s worst-case). This loop logs at progressively
@@ -5594,22 +6279,30 @@ fn psu_heartbeat_loop(
                     consecutive_fails = 0;
                 }
             }
-            Err(e) => {
+            Err(e) if smart_apw_heartbeat_retryable(&e) => {
                 consecutive_fails += 1;
                 if consecutive_fails < 3 {
                     warn!(fails = consecutive_fails, "PSU heartbeat fail: {}", e);
                 } else if consecutive_fails == 3 {
                     error!(
                         fails = consecutive_fails,
-                        "PSU heartbeat failing {} consecutive — PSU watchdog will cut in <30s",
+                        "PSU heartbeat failing {} consecutive Ã¢â‚¬â€ PSU watchdog will cut in <30s",
                         consecutive_fails,
                     );
                 } else if consecutive_fails == 25 {
                     error!(
                         fails = consecutive_fails,
-                        "PSU heartbeat dead for 25s — voltage likely already cut. Consider shutdown.",
+                        "PSU heartbeat dead for 25s Ã¢â‚¬â€ voltage likely already cut. Consider shutdown.",
                     );
                 }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "PSU heartbeat lost typed controller/safety authority; cancelling the hybrid run"
+                );
+                shutdown.cancel();
+                return;
             }
         }
     }
@@ -5627,14 +6320,18 @@ fn psu_heartbeat_loop(
 /// ONLY `addr` (the selected dsPIC) with byte-for-byte the same wire traffic
 /// and timing as before this gate existed. When non-empty, the SAME single
 /// thread additionally keepalives each extra dsPIC per tick (incl. the
-/// effective chain dsPIC 0x22) using the same heartbeat command — so slot-3's
+/// effective chain dsPIC 0x22) using the same heartbeat command Ã¢â‚¬â€ so slot-3's
 /// rail isn't watchdog-cut before the first enum. One thread, one
-/// `JoinHandle`, one `CancellationToken` → the teardown contract is unchanged.
+/// `JoinHandle`, one `CancellationToken` Ã¢â€ â€™ the teardown contract is unchanged.
 fn spawn_pic_heartbeat_thread(
     i2c: I2cServiceHandle,
     mut pic: Pic0x89Service,
     additional_addrs: Vec<u8>,
     shutdown: CancellationToken,
+    // When terminal consecutive failures trip, store true so the mining loop
+    // can terminal-revoke the shared work-dispatch lifecycle (HeartbeatFailure)
+    // instead of treating the cancel as a generic operator stop.
+    terminal_failure: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("s19j-pic-hb".to_string())
@@ -5647,10 +6344,10 @@ fn spawn_pic_heartbeat_thread(
 
             // H-heartbeat-0x22: one extra Pic0x89Service per additional active
             // dsPIC (e.g. the effective chain dsPIC 0x22). fw is unknown for
-            // these, so `None` → default fw=0x89 FRAMED semantics, which is the
+            // these, so `None` Ã¢â€ â€™ default fw=0x89 FRAMED semantics, which is the
             // correct shape for the `a lab unit` slot-3 0x22 (fw=0x89). Empty unless
             // `DCENT_AM2_HEARTBEAT_ALL_ACTIVE_PICS=1`. The heartbeat command is
-            // a non-destructive 1 Hz keepalive — same frame as the selected
+            // a non-destructive 1 Hz keepalive Ã¢â‚¬â€ same frame as the selected
             // PIC, just to a different address.
             let mut extra_pics: Vec<(u8, Pic0x89Service)> = additional_addrs
                 .iter()
@@ -5689,7 +6386,7 @@ fn spawn_pic_heartbeat_thread(
                         // Load-bearing rule: a sustained selected-dsPIC heartbeat
                         // failure MUST cut voltage (not just warn). After
                         // AM2_HYBRID_PIC_HEARTBEAT_MAX_FAILURES consecutive silences
-                        // the PIC is dead — cancel the run so the teardown
+                        // the PIC is dead Ã¢â‚¬â€ cancel the run so the teardown
                         // de-energizes the chain rail, leading the PSU's own ~30 s
                         // self-disable instead of leaving the boards energized under
                         // an unmaintained rail. `fails` resets on any Ok above, so a
@@ -5698,16 +6395,17 @@ fn spawn_pic_heartbeat_thread(
                             error!(
                                 fails,
                                 error = %e,
-                                "PIC heartbeat dead for {} consecutive ticks — cancelling run to cut chain voltage (load-bearing safety rule)",
+                                "PIC heartbeat dead for {} consecutive ticks Ã¢â‚¬â€ cancelling run to cut chain voltage (load-bearing safety rule)",
                                 fails
                             );
+                            terminal_failure.store(true, Ordering::SeqCst);
                             shutdown.cancel();
                             break;
                         }
                     }
                 }
                 // Keepalive each additional active dsPIC. A failure here is
-                // logged but never fatal — the selected-PIC heartbeat above is
+                // logged but never fatal Ã¢â‚¬â€ the selected-PIC heartbeat above is
                 // the primary watchdog feed and its loop semantics are
                 // untouched.
                 for (idx, (extra_addr, extra_pic)) in extra_pics.iter_mut().enumerate() {
@@ -5841,7 +6539,7 @@ fn open_braiins_glitch_monitor_for_logging() -> Option<BraiinsGlitchMonitor> {
 /// am2 board-control UIO number, fallback if discovery finds no match.
 ///
 /// `uio17` is the canonical am2/.25/.139 number (the HAL doc-comment on
-/// `BoardControl::open` and the `a lab unit` C49→C52 fan-fix runbook both cite
+/// `BoardControl::open` and the `a lab unit` C49Ã¢â€ â€™C52 fan-fix runbook both cite
 /// `/sys/class/uio/uio17/name == board-control`), but the kernel assigns
 /// `uioN` numbers in probe order and they are NOT guaranteed stable across
 /// bitstreams/DTBs. Discover by name first, fall back to 17.
@@ -5884,7 +6582,7 @@ fn find_board_control_uio_number() -> Option<u8> {
 /// reset / C52-fan / teardown paths stop hardcoding `uio17`. Falls back to
 /// `BOARD_CONTROL_UIO_FALLBACK` (17) when nothing in `/sys/class/uio` is named
 /// `board-control` (e.g. a host build, or a stock bitstream that does not
-/// populate the node — same behaviour as before this change on those targets).
+/// populate the node Ã¢â‚¬â€ same behaviour as before this change on those targets).
 fn board_control_uio_number() -> u8 {
     static CACHED: OnceLock<u8> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -5931,7 +6629,7 @@ fn log_am2_glitch_window(phase: &str) {
         None => {
             warn!(
                 phase,
-                "am2_glitch_window_unavailable (Braiins-am2 glitch monitor not present — stock hw)"
+                "am2_glitch_window_unavailable (Braiins-am2 glitch monitor not present Ã¢â‚¬â€ stock hw)"
             );
         }
     }
@@ -6140,14 +6838,64 @@ fn bm1362_unique_chip_count_from_summary(summary: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// P1-3: hybrid BM1397+ commands share pure TransportOp + HAL execute adapter.
+///
+/// All hybrid SerialChainBackend BM1397+ command traffic must go through these
+/// façades (not inherent backend methods) so serial_mining and hybrid share one
+/// op surface with the pure planner / HAL execute adapter.
+fn hybrid_execute_bm1397plus_op(serial: &SerialChainBackend, op: TransportOp) -> Result<()> {
+    execute_transport_op_bm1397plus(serial, &op)
+        .map_err(|e| anyhow::anyhow!("hybrid transport op execute: {e}"))
+}
+
+fn hybrid_send_get_address(serial: &SerialChainBackend) -> Result<()> {
+    hybrid_execute_bm1397plus_op(serial, TransportOp::SendGetAddressBm1397Plus)
+}
+
+fn hybrid_send_chain_inactive(serial: &SerialChainBackend) -> Result<()> {
+    hybrid_execute_bm1397plus_op(serial, TransportOp::SendChainInactiveBm1397Plus)
+}
+
+fn hybrid_send_set_address(serial: &SerialChainBackend, addr: u8) -> Result<()> {
+    hybrid_execute_bm1397plus_op(serial, TransportOp::SendSetAddressBm1397Plus { addr })
+}
+
+fn hybrid_send_write_reg_broadcast(serial: &SerialChainBackend, reg: u8, value: u32) -> Result<()> {
+    hybrid_execute_bm1397plus_op(
+        serial,
+        TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value },
+    )
+}
+
+fn hybrid_send_write_reg(
+    serial: &SerialChainBackend,
+    chip_addr: u8,
+    reg: u8,
+    value: u32,
+) -> Result<()> {
+    hybrid_execute_bm1397plus_op(
+        serial,
+        TransportOp::SendWriteRegBm1397Plus {
+            chip_addr,
+            reg,
+            value,
+        },
+    )
+}
+
+fn hybrid_send_read_reg(serial: &SerialChainBackend, chip_addr: u8, reg: u8) -> Result<()> {
+    hybrid_execute_bm1397plus_op(
+        serial,
+        TransportOp::SendReadRegBm1397Plus { chip_addr, reg },
+    )
+}
+
 fn verify_bm1362_get_address(
     serial: &SerialChainBackend,
     max_wait_ms: u64,
 ) -> Result<(String, usize)> {
     let _ = serial.read_all_responses(0); // drain any stale bytes first
-    serial
-        .send_get_address_bm1397plus()
-        .context("send_get_address_bm1397plus failed")?;
+    hybrid_send_get_address(serial).context("send_get_address_bm1397plus failed")?;
     serial
         .drain_tx()
         .context("drain_tx after GetAddress failed")?;
@@ -6158,22 +6906,22 @@ fn verify_bm1362_get_address(
 }
 
 fn probe_bm1362_get_address_summary(serial: &SerialChainBackend, max_wait_ms: u64) -> String {
-    match serial.send_get_address_bm1397plus() {
+    match hybrid_send_get_address(serial) {
         Ok(()) => read_bm1362_serial_drain_summary(serial, max_wait_ms),
         Err(e) => format!("send_error={}", e),
     }
 }
 
-/// PR-019 / R11-2 per-phase ablation probe — read-only, GATED.
+/// PR-019 / R11-2 per-phase ablation probe Ã¢â‚¬â€ read-only, GATED.
 ///
 /// Does NOTHING and issues NO chain traffic unless
 /// `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE` is set. When the gate is on,
 /// it reuses the proven read-only `verify_bm1362_get_address` enumeration
-/// (the exact same GetAddress/drain the proven path's presence gate uses —
+/// (the exact same GetAddress/drain the proven path's presence gate uses Ã¢â‚¬â€
 /// no new chain transaction is invented) and emits one greppable
 /// `[AM2-ABLATION]` log line for `phase`: total responding frames, unique
-/// chip-ids, duplicate-id collisions (the 126→28 collapse signature), and
-/// the first ~8 chip-ids. A probe read failure is logged but never bails —
+/// chip-ids, duplicate-id collisions (the 126Ã¢â€ â€™28 collapse signature), and
+/// the first ~8 chip-ids. A probe read failure is logged but never bails Ã¢â‚¬â€
 /// instrumentation must never change control flow of the proven path.
 fn am2_ablation_probe(serial: &SerialChainBackend, phase: &str) {
     if !am2_verify_presence_after_each_phase_enabled() {
@@ -6184,7 +6932,7 @@ fn am2_ablation_probe(serial: &SerialChainBackend, phase: &str) {
     // instrumentation probe could leak state into the proven path. The
     // early-phase probes (pre-init/post-A8/post-MiscCtrl) may therefore see
     // some frames counted as `malformed` if the response length has not yet
-    // been set by the proven path's own Step-4c gate — that is acceptable:
+    // been set by the proven path's own Step-4c gate Ã¢â‚¬â€ that is acceptable:
     // `parse_ablation_fields` degrades to zeros, and the post-3C / post-
     // fast-baud / pre-mining probes (the ones that matter for the 126->28
     // localization) all run *after* the proven path has set the length.
@@ -6218,13 +6966,13 @@ fn am2_ablation_probe(serial: &SerialChainBackend, phase: &str) {
     }
 }
 
-/// PR-019 / R11-2 5-parameter A/B run summary line — GATED.
+/// PR-019 / R11-2 5-parameter A/B run summary line Ã¢â‚¬â€ GATED.
 ///
 /// Emits a single stable `[AM2-ABLATION-PARAMS]` line capturing the 5 init
 /// parameters in play for this run so successive operator AC-cycle runs can
 /// be diffed mechanically. No-op unless
 /// `DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE` is set. Reads only existing
-/// env-gates / config values already resolved by the proven path — no
+/// env-gates / config values already resolved by the proven path Ã¢â‚¬â€ no
 /// hardware access, no behaviour change.
 fn am2_ablation_log_params(target_freq_mhz: u16, pll_ramp: bool, baud: u32) {
     if !am2_verify_presence_after_each_phase_enabled() {
@@ -6252,11 +7000,12 @@ fn am2_ablation_log_params(target_freq_mhz: u16, pll_ramp: bool, baud: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Work entry for nonce→share lookup
+// Work entry for nonceÃ¢â€ â€™share lookup
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct WorkEntry {
+    work_generation: dcentrald_stratum::WorkGeneration,
     job_id: String,
     extranonce2: String,
     ntime: u32,
@@ -6278,18 +7027,18 @@ struct WorkEntry {
 /// reaches this branch when the gate fires, so every other platform / the
 /// `a lab unit` first-shares path / the  handoff are byte-identical.
 ///
-/// Returns the SerialChainBackend (still at 115200 — bosminer switches to fast
+/// Returns the SerialChainBackend (still at 115200 Ã¢â‚¬â€ bosminer switches to fast
 /// baud via reg 0x28 inside this sequence, but DCENT's work dispatch on `a lab unit`
 /// uses the proven 115200 serial path, so the host UART stays at 115200) plus
 /// the unique-chip-reply count from the single late GetAddress poll.
 ///
 /// The GetAddress poll here is bosminer-faithful: a SINGLE late presence check
-/// AFTER the broadcast 0x3C/0x54/0x58 block, and it is NEVER fatal — bosminer
+/// AFTER the broadcast 0x3C/0x54/0x58 block, and it is NEVER fatal Ã¢â‚¬â€ bosminer
 /// blind-addresses and proves life by nonces, never by a GetAddress gate. A
 /// zero reply is logged and the sequence completes anyway (work dispatch +
 /// nonce flow is the authoritative success signal).
 fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Result<usize> {
-    let addr_interval = 256u16 / (chip_count as u16).max(1);
+    let addr_interval = u16::from(bm1397plus_addr_interval(chip_count));
     info!(
         chip_count,
         addr_interval,
@@ -6305,14 +7054,14 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     // bound to the same gate so cores can never be activated at the high freq.
     let full_core_init = am2_re018_full_core_init_enabled();
     // DE-COUPLED (2026-06-14): the off-table low-freq PLL (RE018_LOW_FREQ_PLL_08 = 0x50D2_0164) was
-    // LIVE-REJECTED — it gave ZERO nonces (total_rx_frames=0) where the existing PLL produced a nonce
+    // LIVE-REJECTED Ã¢â‚¬â€ it gave ZERO nonces (total_rx_frames=0) where the existing PLL produced a nonce
     // flood. Root cause: it is a VCO RE-LOCK (existing RE018_PLL_08=0x40A80265 is VCO-scale 0x40 = VCO
     // 2100 MHz; the "150 MHz" value is VCO-scale 0x50 = VCO 5250 MHz) and/or an unaccepted off-table
     // postdiv (7x5 vs the proven 5x2). So FULL_CORE_INIT now enables ONLY the A8 core-ENABLE at the
-    // EXISTING chip-ACCEPTED PLL (RE018_PLL_08, ~50 MHz — the freq the chip already enumerates + clocks
-    // at). A8-cores at ~50 MHz ≈ ~4.8 TH/s at ~143 W (a ~40x bump from 120 GH/s, WELL within the home
+    // EXISTING chip-ACCEPTED PLL (RE018_PLL_08, ~50 MHz Ã¢â‚¬â€ the freq the chip already enumerates + clocks
+    // at). A8-cores at ~50 MHz Ã¢â€°Ë† ~4.8 TH/s at ~143 W (a ~40x bump from 120 GH/s, WELL within the home
     // breaker). The low-freq PLL is now behind a SEPARATE opt-in gate (DCENT_AM2_RE018_LOW_FREQ_PLL) so
-    // a PROVEN table PLL value can be re-tried later for more freq — never coupled, never off-table by
+    // a PROVEN table PLL value can be re-tried later for more freq Ã¢â‚¬â€ never coupled, never off-table by
     // default. Fleet/handoff byte-identical (both gates default-OFF + .25-fingerprint).
     // option-B (2026-06-14): the freq override is INDEPENDENT of A8 (full_core_init). A8 is a
     // live-confirmed zero-nonce regression, so coupling the freq bump to it left it unusable. This is
@@ -6354,7 +7103,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
             freq_mhz = decode_pll_reg_to_freq(pll_08).unwrap_or(0),
             "RE-018 FREQ-OVERRIDE: applying a PROVEN PLL (default 320 MHz sweet spot; set \
              DCENT_AM2_RE018_TARGET_MHZ to pick 240-597). POWER-RAISING vs the ~50 MHz eco/heater \
-             default — wattmeter-gated. A8 stays OFF (independent gate)."
+             default Ã¢â‚¬â€ wattmeter-gated. A8 stays OFF (independent gate)."
         );
     }
 
@@ -6417,44 +7166,46 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     // --- Phase A: broadcast pre-config (bosminer t+0.0 .. t+0.25) ---
     // A8 = INIT_CONTROL: `bcast_a8` is RE018_BCAST_A8 (0x0) by default, or the
     // `a lab unit`-proven core-ENABLE 0x0007_0000 when DCENT_AM2_RE018_FULL_CORE_INIT=1.
-    serial.send_write_reg_broadcast_bm1397plus(0xA8, bcast_a8)?;
+    hybrid_send_write_reg_broadcast(serial, 0xA8, bcast_a8)?;
     std::thread::sleep(Duration::from_millis(100));
     misc_ctrl_triple_write_serial(serial, RE018_MISC_CTRL)?;
     std::thread::sleep(Duration::from_millis(100));
-    serial.send_write_reg_broadcast_bm1397plus(0xA4, RE018_VERSION_MASK)?;
+    hybrid_send_write_reg_broadcast(serial, 0xA4, RE018_VERSION_MASK)?;
     std::thread::sleep(Duration::from_millis(100));
 
-    // --- Phase B: CHAIN_INACTIVE x3 (bosminer t+0.356) ---
-    for _ in 0..3 {
-        serial.send_chain_inactive_bm1397plus()?;
+    // --- Phase B/C: SerialBringUpPlugin soft_reset + address_ladder (P1-1) ---
+    // GetAddress is intentionally NOT inserted mid-sequence (RE-018: enum from
+    // unsolicited register-report frames during SET_ADDRESS, not 0x52).
+    // Dwells / mid-walk drain remain engine policy.
+    let bring_up = plan_serial_bring_up(
+        SerialBringUpPluginKind::Am2ZynqBm1362,
+        ChainTransportKind::Serial,
+        &SerialBringUpPlanParams {
+            chip_count,
+            frequency_mhz: 0,
+            chain_inactive_count: 3,
+            inactive_dwell_ms: 0,
+            post_enum_delay_ms: 0,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("hybrid RE-018 bring-up plan refused: {e}"))?;
+    let phases = bring_up.phases();
+    debug_assert_eq!(addr_interval as u8, bm1397plus_addr_interval(chip_count));
+
+    for op in phases.soft_reset {
+        hybrid_execute_bm1397plus_op(serial, op)?;
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // --- Phase C: blind SET_ADDRESS for every assigned position (t+1.3) ---
-    // bosminer addresses 0x00..0xFE stride-2 (all 128). DCENT uses
-    // addr_interval derived from chip_count so a 126-chip config produces the
-    // same stride-2 0x00..0xFA assignment. Blind, fire-and-forget.
-    // RE-018 FIX 1 (2026-06-09, LIVE TEST 7 follow-up): the true-cold bosminer
-    // strace PROVES the chain enumerates from the UNSOLICITED register-report
-    // frames the chips emit DURING this SET_ADDRESS walk at 115200
-    // (`AA 55 13 62 03 <addr> ...`), NOT from a GetAddress(0x52) reply (the lone
-    // 0x52 fires once, very late, in 662k lines). DCENT's Phase E
-    // `verify_bm1362_get_address` DRAINS those frames (`read_all_responses(0)`)
-    // before its 0x52, so even a fully-woken chain reports `unique_chip_replies=0`.
-    // Capture + count them HERE, draining mid-walk (replacing the old 2 ms idle
-    // sleep) so the small Zynq PL-UART RX FIFO does not overflow before we read.
-    // This fn only runs on the `a lab unit` RE-018 standalone path
-    // (`DCENT_AM2_BM1362_RE018_COLD_SEQUENCE`), so the proven handoff + fleet are
-    // byte-identical.
     serial.set_response_len(BM1362_RESP_BODY_LEN);
     let mut walk_responses: Vec<Vec<u8>> = Vec::new();
-    for i in 0..chip_count as u16 {
-        let addr = (i * addr_interval) as u8;
-        serial.send_set_address_bm1397plus(addr)?;
+    let address_ops = phases.address_ladder;
+    for (i, op) in address_ops.into_iter().enumerate() {
+        hybrid_execute_bm1397plus_op(serial, op)?;
         if i % 16 == 15 {
             // BLK-1b mid-walk forensics: on the FIRST drain, snapshot MCR/IER/LSR so
             // a live run shows OUT2 (mcr bit 0x08) and TX-drain (LSR bit 0x40) DURING
-            // the walk — the decisive observation Team M R-11 flagged as missing.
+            // the walk Ã¢â‚¬â€ the decisive observation Team M R-11 flagged as missing.
             if i == 15 {
                 if let Some((mcr, ier, lsr)) = serial.diagnostic_registers() {
                     info!(
@@ -6487,32 +7238,32 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     );
 
     // --- Phase D: broadcast core/analog/io config (bosminer t+2.2 .. t+2.36) ---
-    serial.send_write_reg_broadcast_bm1397plus(0x3C, RE018_CORE_3C_HASH_CLK)?;
+    hybrid_send_write_reg_broadcast(serial, 0x3C, RE018_CORE_3C_HASH_CLK)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x3C, RE018_CORE_3C_CLK_DELAY)?;
+    hybrid_send_write_reg_broadcast(serial, 0x3C, RE018_CORE_3C_CLK_DELAY)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x54, RE018_ANALOG_MUX_54)?;
+    hybrid_send_write_reg_broadcast(serial, 0x54, RE018_ANALOG_MUX_54)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x58, RE018_IO_DRIVER_58)?;
+    hybrid_send_write_reg_broadcast(serial, 0x58, RE018_IO_DRIVER_58)?;
     std::thread::sleep(Duration::from_millis(10));
 
     // --- Phase D.5: TICKET_MASK (0x14) + HASH_COUNTING_NUMBER (0x10) ---
     // PERF FIX (2026-06-14 audit): the bosminer strace this sequence replays
     // captured only the FIRST init cycle (ending at the per-chip 0x0C write), so
-    // it OMITS 0x14/0x10 — which bosminer writes in a later, un-captured phase.
+    // it OMITS 0x14/0x10 Ã¢â‚¬â€ which bosminer writes in a later, un-captured phase.
     // Without 0x14 (TICKET_MASK) the chip drops EVERY nonce at the hardware
     // difficulty filter (~silent zero production); without 0x10 (HASH_COUNTING /
     // nonce-range) all 126 chips hash the SAME range. That is the root cause of
     // the ~1000x-low standalone hashrate (the cores run at 525 MHz drawing power
     // but report almost nothing; even  was 5 nonces/165s). The legacy init
-    // path writes both (Step 4b). POWER-NEUTRAL — same freq/voltage; this only
+    // path writes both (Step 4b). POWER-NEUTRAL Ã¢â‚¬â€ same freq/voltage; this only
     // lets the already-running cores REPORT nonces at the correct rate. Gated
     // default-OFF + `a lab unit`-fingerprint so the fleet +  handoff are
     // byte-identical; fail-closed (a write error aborts the cold sequence).
     if am2_re018_write_ticket_hashcount_enabled() {
-        serial.send_write_reg_broadcast_bm1397plus(0x14, TICKET_MASK_256)?;
+        hybrid_send_write_reg_broadcast(serial, 0x14, TICKET_MASK_256)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x10, NONCE_RANGE_126)?;
+        hybrid_send_write_reg_broadcast(serial, 0x10, NONCE_RANGE_126)?;
         std::thread::sleep(Duration::from_millis(10));
         info!(
             ticket_mask = format_args!("0x{:08X}", TICKET_MASK_256),
@@ -6520,7 +7271,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
             env = "DCENT_AM2_RE018_WRITE_TICKET_HASHCOUNT=1",
             "RE-018 PERF FIX: TICKET_MASK(0x14)+HASH_COUNTING(0x10) written (were \
              missing on the RE-018 path = the ~1000x-low-hashrate root cause; \
-             power-neutral — same freq/voltage, cores now report nonces)"
+             power-neutral Ã¢â‚¬â€ same freq/voltage, cores now report nonces)"
         );
     }
 
@@ -6532,7 +7283,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     let (presence_summary, unique_count) = match verify_bm1362_get_address(serial, 300) {
         Ok(v) => v,
         Err(e) => {
-            warn!(error = %e, "RE-018: late GetAddress poll errored (non-fatal) — continuing per bosminer");
+            warn!(error = %e, "RE-018: late GetAddress poll errored (non-fatal) Ã¢â‚¬â€ continuing per bosminer");
             (String::from("getaddr-error"), 0)
         }
     };
@@ -6548,56 +7299,56 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     // 0x70=0 -> 0x08=PLL -> 0x70=0 -> 0x08=PLL (x2) -> 0x28=FastUART.
     // reg 0x08 = PLL0 (frequency). `pll_08` is RE018_PLL_08 (525 MHz, bosminer
     // byte order) by default, or the LOW RE018_LOW_FREQ_PLL_08 (150 MHz, DCENT
-    // table byte order) when DCENT_AM2_RE018_FULL_CORE_INIT=1 — the low freq is
+    // table byte order) when DCENT_AM2_RE018_FULL_CORE_INIT=1 Ã¢â‚¬â€ the low freq is
     // MANDATORY whenever the cores are enabled (power budget). Written twice
     // (bosminer slams it twice with the 0x70 divider re-write between).
-    serial.send_write_reg_broadcast_bm1397plus(BM1362_PLL0_DIVIDER_REG, RE018_PLL0_DIVIDER_70)?;
+    hybrid_send_write_reg_broadcast(serial, BM1362_PLL0_DIVIDER_REG, RE018_PLL0_DIVIDER_70)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x08, pll_08)?;
+    hybrid_send_write_reg_broadcast(serial, 0x08, pll_08)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(BM1362_PLL0_DIVIDER_REG, RE018_PLL0_DIVIDER_70)?;
+    hybrid_send_write_reg_broadcast(serial, BM1362_PLL0_DIVIDER_REG, RE018_PLL0_DIVIDER_70)?;
     std::thread::sleep(Duration::from_millis(10));
-    serial.send_write_reg_broadcast_bm1397plus(0x08, pll_08)?;
+    hybrid_send_write_reg_broadcast(serial, 0x08, pll_08)?;
     std::thread::sleep(Duration::from_millis(10));
     // reg 0x28 FastUART (0x11300000). BLK-3 (2026-06-10): DEFAULT-OFF. Writing 0x28
     // chip-side switches the BM1362 UART to FastUART baud, but DCENT keeps the HOST
-    // UART at 115200 (the proven `a lab unit`/`a lab unit` work-dispatch baud) — so after this write
+    // UART at 115200 (the proven `a lab unit`/`a lab unit` work-dispatch baud) Ã¢â‚¬â€ so after this write
     // chip and host are DESYNCED: the entire Phase-G per-chip config (incl. the 0x0C
     // nonce-space base) and the final GetAddress are sent at the wrong baud and are
     // structurally 0, AND it poisons same-process retries. It is NOT the enum cause
     // (the walk precedes this), but it is the GUARANTEED next blocker once enum>0, so it
     // is gated off by default; the chip stays at 115200, coherent with the host. Set
     // `DCENT_AM2_RE018_WRITE_FASTUART_0X28=1` only if a future run also switches the host
-    // baud to match (3.125M) — until then leave it off. Byte-parity diagnostic value
+    // baud to match (3.125M) Ã¢â‚¬â€ until then leave it off. Byte-parity diagnostic value
     // RE018_FAST_UART_28 is preserved.
     // D6-3 (2026-06-13): FAIL-CLOSED. This gate writes the chip-side FastUART baud
     // (reg 0x28) but NO host-baud switch is wired here, so chip and host desync and
-    // Phase-G/final-enum run at the wrong baud → structurally 0 RX (and it poisons
+    // Phase-G/final-enum run at the wrong baud Ã¢â€ â€™ structurally 0 RX (and it poisons
     // same-process retries). Rather than proceed into a guaranteed-broken state
     // (the old behaviour), REFUSE. Re-enable only once a matching host
-    // set_baud(3.125M) is wired alongside — and note host fast-baud is itself
+    // set_baud(3.125M) is wired alongside Ã¢â‚¬â€ and note host fast-baud is itself
     // live-falsified on `a lab unit` (0/126 at 3.125M). The byte-parity diagnostic
     // constant RE018_FAST_UART_28 is retained for reference elsewhere.
     if am2_env_u64("DCENT_AM2_RE018_WRITE_FASTUART_0X28", 0) != 0 {
         anyhow::bail!(
-            "DCENT_AM2_RE018_WRITE_FASTUART_0X28=1 but no host-baud switch is wired here — chip/host \
+            "DCENT_AM2_RE018_WRITE_FASTUART_0X28=1 but no host-baud switch is wired here Ã¢â‚¬â€ chip/host \
              would desync (guaranteed 0 RX). Refusing; leave it unset so the chip stays at 115200 \
              (the proven .109/.79 work-dispatch baud)."
         );
     }
     info!(
-        "RE-018 Phase F: chip-side FastUART 0x28 write SKIPPED (default) — chip + host stay \
+        "RE-018 Phase F: chip-side FastUART 0x28 write SKIPPED (default) Ã¢â‚¬â€ chip + host stay \
          coherent at 115200 (proven .109/.79 work-dispatch baud)"
     );
 
     // Fix-B (2026-06-07): post-PLL cold-lock settle. bosminer slams PLL0 at
-    // t+2.8 and does the per-chip loop at t+4.2 — a ~1.4 s gap that lets a
+    // t+2.8 and does the per-chip loop at t+4.2 Ã¢â‚¬â€ a ~1.4 s gap that lets a
     // pristine cold PLL lock so the chips can clock their UART to RECEIVE the
     // per-chip writes below AND answer the final enum. DCENT previously went
     // straight from the PLL slam into the per-chip loop with only 10 ms, so on a
     // cold chain the PLL may not have locked and both the per-chip config and the
-    // final GetAddress landed on un-clocked chips (→ enum 0). `a lab unit`-only RE-018
-    // path. Tunable; ~1.2 s ≈ bosminer's PLL→per-chip gap.
+    // final GetAddress landed on un-clocked chips (Ã¢â€ â€™ enum 0). `a lab unit`-only RE-018
+    // path. Tunable; ~1.2 s Ã¢â€°Ë† bosminer's PLLÃ¢â€ â€™per-chip gap.
     std::thread::sleep(Duration::from_millis(
         am2_env_u64("DCENT_AM2_POST_PLL_SETTLE_MS", 1200).clamp(0, 5000),
     ));
@@ -6607,7 +7358,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     //   0xA8=0x00000002, MiscCtrl(0x18)=0xB000C100, 0x3C x3, then the
     //   per-chip nonce-space base 0x0C=(0x80000000 | addr*0x104).
     // The reg 0x0C nonce-space base is the register DCENT's init_asic_chain
-    // NEVER wrote — without it every chip hashes from the same base and the
+    // NEVER wrote Ã¢â‚¬â€ without it every chip hashes from the same base and the
     // FPGA nonce-RX FIFO never sees a valid per-chip nonce -> 0 nonces.
     info!("RE-018: per-chip config loop (0xA8/MiscCtrl/0x3Cx3/0x0C nonce-space base)");
     for i in 0..chip_count as u16 {
@@ -6615,21 +7366,21 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
         // A8 = INIT_CONTROL per-chip: `per_chip_a8` is RE018_PER_CHIP_A8 (0x2)
         // by default, or the `a lab unit`-proven core-ENABLE 0x0007_01F0 (the BM1362
         // analogue of BM1387 open-core) under DCENT_AM2_RE018_FULL_CORE_INIT=1.
-        serial.send_write_reg_bm1397plus(addr, 0xA8, per_chip_a8)?;
+        hybrid_send_write_reg(serial, addr, 0xA8, per_chip_a8)?;
         misc_ctrl_triple_write_chip_serial(serial, addr, RE018_MISC_CTRL)?;
-        serial.send_write_reg_bm1397plus(addr, 0x3C, RE018_CORE_3C_HASH_CLK)?;
-        serial.send_write_reg_bm1397plus(addr, 0x3C, RE018_CORE_3C_CLK_DELAY)?;
-        serial.send_write_reg_bm1397plus(addr, 0x3C, RE018_CORE_3C_FAMILY)?;
+        hybrid_send_write_reg(serial, addr, 0x3C, RE018_CORE_3C_HASH_CLK)?;
+        hybrid_send_write_reg(serial, addr, 0x3C, RE018_CORE_3C_CLK_DELAY)?;
+        hybrid_send_write_reg(serial, addr, 0x3C, RE018_CORE_3C_FAMILY)?;
         let nonce_space = RE018_NONCE_SPACE_BASE
             .wrapping_add((addr as u32).wrapping_mul(RE018_NONCE_SPACE_STRIDE));
-        serial.send_write_reg_bm1397plus(addr, RE018_NONCE_SPACE_REG, nonce_space)?;
+        hybrid_send_write_reg(serial, addr, RE018_NONCE_SPACE_REG, nonce_space)?;
         if i % 16 == 15 {
             std::thread::sleep(Duration::from_millis(SERIAL_PACE_MIN_MS));
         }
     }
     std::thread::sleep(Duration::from_millis(100));
 
-    // Final presence re-poll (informational only — non-fatal, same as bosminer).
+    // Final presence re-poll (informational only Ã¢â‚¬â€ non-fatal, same as bosminer).
     let (final_summary, final_count) =
         verify_bm1362_get_address(serial, 300).unwrap_or((String::from("final-getaddr-error"), 0));
     info!(
@@ -6637,7 +7388,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
         expected = chip_count,
         unique_chip_replies = final_count,
         summary = %final_summary,
-        "=== RE-018 COLD-WAKE COMPLETE — chain configured byte-exact to bosminer, work dispatch is authoritative ==="
+        "=== RE-018 COLD-WAKE COMPLETE Ã¢â‚¬â€ chain configured byte-exact to bosminer, work dispatch is authoritative ==="
     );
     // RE-018 FIX 1: the SET_ADDRESS-walk report-frame count is the bosminer-faithful
     // enum signal (Phase C above); fold it in so a populated walk count is honored
@@ -6645,7 +7396,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     let result_count = final_count.max(unique_count).max(walk_count);
     // Fix-B (2026-06-07): on the standalone cold-wake path, an enum of 0 after
     // the full byte-exact replay + PLL settle must request the bosminer-faithful
-    // HB_RESET re-pulse retry — the caller's retry loop only fires on `Err`.
+    // HB_RESET re-pulse retry Ã¢â‚¬â€ the caller's retry loop only fires on `Err`.
     // Previously this returned `Ok(0)`, which silently starved BOTH the
     // DCENT_AM2_HB_RESET_BOSMINER_FAITHFUL re-pulse loop AND CONTINUE_PAST_ZERO_ENUM,
     // so the headline sysfs-reset retry never actually ran. Gated on the same env
@@ -6653,7 +7404,7 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
     // never runs this RE-018 branch) is byte-identical.
     if result_count == 0 && am2_env_flag("DCENT_AM2_HB_RESET_BOSMINER_FAITHFUL") {
         anyhow::bail!(
-            "RE-018 cold sequence enumerated 0 chips after PLL+settle — requesting \
+            "RE-018 cold sequence enumerated 0 chips after PLL+settle Ã¢â‚¬â€ requesting \
              HB_RESET re-pulse retry (bosminer re-pulses many times before chips answer)"
         );
     }
@@ -6664,12 +7415,117 @@ fn bm1362_re018_cold_sequence(serial: &SerialChainBackend, chip_count: u8) -> Re
 // S19j Hybrid Miner
 // ---------------------------------------------------------------------------
 
+/// Pre-energize ownership bundle for one exact AM2/Zynq BM1362 hybrid run.
+///
+/// The generic dispatch proof and the narrower carrier proof are both consumed
+/// before the API or engine can own hardware. The SoC watchdog must report its
+/// initial kick before this value is returned; its pending mutation owner is
+/// the only capability that may later open API mutation admission.
+#[must_use = "hybrid safety admission must be moved into exactly one mining lifecycle"]
+pub(crate) struct S19jHybridSafetyAdmission {
+    route_admission: crate::s19j_hybrid_admission::S19jHybridRouteAdmission,
+    watchdog: SafetyWatchdogOwner,
+    watchdog_route_scope: HybridWatchdogRouteScope,
+    liveness: SafetyLiveness,
+    hardware_mutation_owner: HardwareMutationGateOwner,
+}
+
+/// Marker returned only after receipt-backed terminal safe-off and successful
+/// software-watchdog magic-close. Main uses it to keep the API reachable
+/// without starting any new fan/MMIO actor after the terminal proof boundary.
+#[derive(Debug)]
+pub(crate) struct S19jHybridTerminalSafeOffError {
+    source: anyhow::Error,
+    _closeout: WatchdogCloseoutReceipt,
+}
+
+impl std::fmt::Display for S19jHybridTerminalSafeOffError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for S19jHybridTerminalSafeOffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn is_terminal_safe_off_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<S19jHybridTerminalSafeOffError>()
+            .is_some()
+    })
+}
+
+fn terminal_safe_off_error(
+    source: anyhow::Error,
+    closeout: WatchdogCloseoutReceipt,
+) -> anyhow::Error {
+    anyhow::Error::new(S19jHybridTerminalSafeOffError {
+        source,
+        _closeout: closeout,
+    })
+}
+
+impl S19jHybridSafetyAdmission {
+    pub(crate) async fn start(
+        config: &DcentraldConfig,
+        runtime_dispatch_admission: crate::RuntimeDispatchAdmission,
+        route_admission: crate::s19j_hybrid_admission::S19jHybridRouteAdmission,
+    ) -> Result<Self> {
+        let _protocol_admission = runtime_dispatch_admission
+            .require_asic_protocol(
+                crate::RuntimeDispatchKind::S19jHybrid,
+                "am2-s19j",
+                dcentrald_common::AsicProtocolIdentity::Bm1362,
+            )
+            .map_err(anyhow::Error::msg)?;
+
+        let liveness = SafetyLiveness::default();
+        let expected_liveness = Duration::from_secs_f32(config.thermal.pid_interval_s.max(1.0));
+        let (mut watchdog, admission) = SafetyWatchdogOwner::start_before_energizing(
+            &config.watchdog,
+            S19J_HYBRID_WATCHDOG_BRINGUP_GRACE,
+            expected_liveness,
+            liveness.clone(),
+        )
+        .await?;
+        let receipt = admission.require_armed("s19j-hybrid")?;
+        let watchdog_route_scope = watchdog.claim_hybrid_route_scope().map_err(|error| {
+            watchdog_reset_pending_error(
+                "s19j-hybrid",
+                format!("post-arm route-scope claim failed: {error:#}"),
+            )
+        })?;
+        info!(
+            requested_timeout_s = receipt.requested_timeout_s,
+            effective_timeout_s = receipt.effective_timeout_s,
+            kick_interval_s = receipt.kick_interval_s,
+            bringup_grace_s = S19J_HYBRID_WATCHDOG_BRINGUP_GRACE.as_secs(),
+            expected_liveness_ms = expected_liveness.as_millis(),
+            "s19j-hybrid: pre-energize watchdog ownership admitted"
+        );
+
+        Ok(Self {
+            route_admission,
+            watchdog,
+            watchdog_route_scope,
+            liveness,
+            hardware_mutation_owner: HardwareMutationGateOwner::new_pending(),
+        })
+    }
+
+    pub(crate) fn hardware_mutation_gate(&self) -> HardwareMutationGate {
+        self.hardware_mutation_owner.gate()
+    }
+}
+
 pub struct S19jHybridMiner {
-    /// One-shot proof that immutable startup identity, the exact AM2/Zynq
-    /// BoardDesc, configured BM1362 identity, and this runtime route agreed
-    /// before construction. Taken at `run()` entry so the same admission
-    /// cannot authorize a second hardware lifecycle.
-    route_admission: Option<crate::s19j_hybrid_admission::S19jHybridRouteAdmission>,
+    /// One-shot route, watchdog, and API-mutation ownership bundle. Taken at
+    /// `run()` entry so no part can authorize a second hardware lifecycle.
+    safety_admission: Option<S19jHybridSafetyAdmission>,
     config: DcentraldConfig,
     shutdown: CancellationToken,
     /// Long-lived `miner-glitch-monitor` UIO handle (Braiins-am2 only).
@@ -6692,7 +7548,7 @@ pub struct S19jHybridMiner {
     /// a fresh `MinerState` on each `am2_serial_status`/hashrate tick so the REST
     /// `/api/status` (and the dashboard) reflect real hashrate, per-dsPIC
     /// `ChainState`, and accepted/rejected shares instead of a default-empty
-    /// snapshot. `None` keeps the prior (blank) behaviour — purely additive and
+    /// snapshot. `None` keeps the prior (blank) behaviour Ã¢â‚¬â€ purely additive and
     /// fail-closed: a closed/missing channel only drops the publish, never the
     /// share.
     state_tx: Option<watch::Sender<dcentrald_api::MinerState>>,
@@ -6700,7 +7556,7 @@ pub struct S19jHybridMiner {
     /// CE-011 (2026-07-08): the Phase-0s energize-gate `SkuBinding`s that were
     /// ACCEPTED for this run (one per bound chain). Populated ONLY from the
     /// `Ok((bindings, _))` arm of the energize gate in `run()`; left EMPTY in
-    /// the `accept_degraded` lab-override arm (fail-closed — an unverified
+    /// the `accept_degraded` lab-override arm (fail-closed Ã¢â‚¬â€ an unverified
     /// hardware set never widens or registers a PVT ceiling). The freq-only
     /// tuner spawn reads this to register a CEILING-ONLY per-SKU PVT clamp via
     /// `AutoTuner::set_chain_sku`. Empty (the default, and the accept_degraded
@@ -6718,10 +7574,10 @@ impl S19jHybridMiner {
     pub fn new(
         config: DcentraldConfig,
         shutdown: CancellationToken,
-        route_admission: crate::s19j_hybrid_admission::S19jHybridRouteAdmission,
+        safety_admission: S19jHybridSafetyAdmission,
     ) -> Result<Self> {
         Ok(Self {
-            route_admission: Some(route_admission),
+            safety_admission: Some(safety_admission),
             config,
             shutdown,
             glitch_monitor: None,
@@ -6746,7 +7602,7 @@ impl S19jHybridMiner {
     /// `ChainState` per driven hashboard, keyed by `am2_chain_id_for_pic_addr`).
     /// `hashrate_ghs` is the cumulative real estimate (achieved-difficulty based)
     /// and `hashrate_5s_ghs` the rolling-window estimate. Fail-closed: a closed
-    /// channel is silently ignored — a dashboard publish must NEVER affect the
+    /// channel is silently ignored Ã¢â‚¬â€ a dashboard publish must NEVER affect the
     /// mining hot path.
     #[allow(clippy::too_many_arguments)]
     fn publish_miner_state(
@@ -6759,7 +7615,7 @@ impl S19jHybridMiner {
         uptime_s: u64,
         // MINE-LIFE-2: whether the unit has produced a nonce within the generous
         // recent-activity window (single-chain: this chain; dual-chain: EITHER
-        // chain). `true` on a healthy unit ⇒ the status logic is unchanged.
+        // chain). `true` on a healthy unit Ã¢â€¡â€™ the status logic is unchanged.
         mining_recently_active: bool,
     ) {
         let Some(tx) = self.state_tx.as_ref() else {
@@ -6819,7 +7675,7 @@ impl S19jHybridMiner {
         //     unit must never read "connecting").
         //   - connected/authorized but every share is rejected => "rejecting",
         //     the single most actionable signal for a home miner (the reject
-        //     reason is in reject_reason_counts) — never a reassuring "mining".
+        //     reason is in reject_reason_counts) Ã¢â‚¬â€ never a reassuring "mining".
         // The >= 3 grace avoids a transient false "rejecting" on a healthy
         // unit whose very first submitted share happens to be a stale-job
         // reject before the first accept lands; a genuinely all-rejecting pool
@@ -6837,7 +7693,7 @@ impl S19jHybridMiner {
         // MINE-LIFE-2: a unit that has gone quiet (no nonce within the generous
         // recent-activity window) must NOT keep reporting a reassuring "mining"
         // off a cumulative accepted()>0 latch. Only DOWNGRADE an otherwise-
-        // "mining" status — never upgrade, never touch rejecting/connecting/
+        // "mining" status Ã¢â‚¬â€ never upgrade, never touch rejecting/connecting/
         // disconnected states. On a healthy unit `mining_recently_active` is
         // true, so this is a no-op and the proven path stays byte-equivalent.
         if !mining_recently_active && pool.status == "mining" {
@@ -6857,7 +7713,7 @@ impl S19jHybridMiner {
                 // Truthful tach: the REAL max fan rpm via a read-only fan-UIO
                 // open (no board-control write) instead of a hardcoded 0 (which
                 // the dashboard misreads as a stopped fan while mining). 0 only
-                // if the read fails — honest, never fabricated.
+                // if the read fails Ã¢â‚¬â€ honest, never fabricated.
                 rpm: am2_read_fan_rpm_max(),
                 per_fan: vec![],
             },
@@ -6867,7 +7723,7 @@ impl S19jHybridMiner {
             mode: dcentrald_api::OperatingMode::from_config_str(&self.config.mode.active),
         };
         // `watch::Sender::send` only errs when every receiver was dropped (API
-        // task gone). That is a clean no-op for mining — ignore it.
+        // task gone). That is a clean no-op for mining Ã¢â‚¬â€ ignore it.
         let _ = tx.send(state);
     }
 
@@ -6885,15 +7741,15 @@ impl S19jHybridMiner {
         // generous recent-activity window. A chain that produced nonces earlier
         // but has since gone quiet must report "stalled", not a reassuring
         // "mining" off a cumulative unique-nonce latch. `true` on a healthy unit
-        // ⇒ byte-equivalent to the prior status.
+        // Ã¢â€¡â€™ byte-equivalent to the prior status.
         recently_active: bool,
     ) -> dcentrald_api::ChainState {
         // Truthful per-chain temperature: report the REAL XADC SoC die temp
         // (honest proxy, labeled `soc_die_fallback`) instead of a misleading
-        // 0.0°C. On `a lab unit` the LM75 hashboard sensor returns NaN (cold-board
+        // 0.0Ã‚Â°C. On `a lab unit` the LM75 hashboard sensor returns NaN (cold-board
         // artifact) so the SoC die temp is the reliable live reading; the
         // dashboard shows the value + its provenance. Falls back to honest
-        // "unknown" (0.0 / None) only if the XADC read itself fails — never a
+        // "unknown" (0.0 / None) only if the XADC read itself fails Ã¢â‚¬â€ never a
         // fabricated number. This is telemetry only, never a thermal command
         // (the thermal supervisor still owns the safety reading separately).
         let (temp_c, temp_source) = match Xadc::read_temp() {
@@ -6939,8 +7795,8 @@ impl S19jHybridMiner {
 
     /// Probe each candidate `/dev/ttyS*` device for chip responses.
     ///
-    /// On am2 the FPGA→ASIC UART mapping isn't documented; chain1 may be on
-    /// any of `/dev/ttyS{1,2,3,4}` (MMIO bases `0x41001000 … 0x41031000`
+    /// On am2 the FPGAÃ¢â€ â€™ASIC UART mapping isn't documented; chain1 may be on
+    /// any of `/dev/ttyS{1,2,3,4}` (MMIO bases `0x41001000 Ã¢â‚¬Â¦ 0x41031000`
     /// per `dcentrald-hal/src/serial.rs:685`). We default to `/dev/ttyS2`
     /// but live evidence on `a lab unit` (2026-04-25) showed 0 chip replies there
     /// even with PIC voltage commanded ON, suggesting wrong UART.
@@ -6949,7 +7805,7 @@ impl S19jHybridMiner {
     /// read for 300 ms, count CHIPID-like replies. Return the device with
     /// the highest reply count, or `None` if all are silent.
     /// Caller is responsible for ensuring chain voltage is on before
-    /// calling — chips need power to respond.
+    /// calling Ã¢â‚¬â€ chips need power to respond.
     fn probe_uart_for_chips(default_device: &str) -> Option<(String, usize)> {
         // Live ground truth on XIL (2026-05-12): never include `/dev/ttyPS0`
         // in this fallback sweep. It is the Zynq PS console/control UART, not a
@@ -6972,7 +7828,7 @@ impl S19jHybridMiner {
             };
             serial.set_response_len(BM1362_RESP_BODY_LEN);
             let _ = serial.read_all_responses(0); // drain
-            if let Err(e) = serial.send_get_address_bm1397plus() {
+            if let Err(e) = hybrid_send_get_address(&serial) {
                 warn!(path, error = %e, "UART probe: send_get_address failed");
                 continue;
             }
@@ -7018,23 +7874,45 @@ impl S19jHybridMiner {
 
     /// Reset ASICs to 115200 baud from any previous baud rate.
     ///
-    /// Uses BM1397+ headers (0x51 broadcast) via `send_chain_inactive_bm1397plus`
-    /// and the triple-write helper for MiscCtrl.
+    /// Baud **ladder** is pure SSOT (`plan_hot_start_baud_wake_ladder(Zynq)` —
+    /// same 3.125M → 1.5625M order as serial_mining). Per-stage **ops** are pure
+    /// `plan_hot_start_hybrid_wake_ops` (ChainInactive + MiscCtrl triple + delay).
+    /// AM2 **value** residual: `am2_misc_control_pre_baud()` may differ from
+    /// pure single-write `HOT_START_MISC_CTRL_BAUD_RESET`. Not dual-spray
+    /// (serial-only; hybrid path stays BM1397+ composition).
     fn reset_asic_baud(serial_device: &str) {
-        info!("Hot-start baud reset");
-        if let Ok(serial) =
-            SerialChainBackend::open(0, serial_device, dcentrald_hal::serial::BAUD_3125000)
-        {
-            let _ = serial.send_chain_inactive_bm1397plus();
-            let _ = misc_ctrl_triple_write_serial(&serial, am2_misc_control_pre_baud());
-            std::thread::sleep(Duration::from_millis(SERIAL_PACE_MIN_MS));
+        // AM2 hybrid is Zynq-class (BAUD_3125000 = pure HOT_START_ZYNQ_FAST_BAUD).
+        let stages = plan_hot_start_baud_wake_ladder(HotStartHostClass::Zynq);
+        let misc_value = am2_misc_control_pre_baud();
+        let wake_ops = plan_hot_start_hybrid_wake_ops(misc_value);
+        info!(
+            stages = stages.len(),
+            wake_ops = wake_ops.len(),
+            misc = format_args!("0x{:08X}", misc_value),
+            "Hot-start baud reset (pure Zynq ladder + pure hybrid wake plan + AM2 value residual)"
+        );
+        for stage in stages {
+            if let Ok(serial) = SerialChainBackend::open(0, serial_device, stage.baud) {
+                info!(
+                    baud = stage.baud,
+                    label = stage.label,
+                    "Hot-start baud-wake stage (pure hybrid wake plan)"
+                );
+                for (i, op) in wake_ops.iter().cloned().enumerate() {
+                    let _ = hybrid_execute_bm1397plus_op(&serial, op).map_err(|e| {
+                        tracing::debug!(
+                            op = i + 1,
+                            error = %e,
+                            "hybrid hot-start wake op failed (best-effort stage)"
+                        );
+                        e
+                    });
+                }
+            }
         }
-        if let Ok(serial) = SerialChainBackend::open(0, serial_device, 1_562_500) {
-            let _ = serial.send_chain_inactive_bm1397plus();
-            let _ = misc_ctrl_triple_write_serial(&serial, am2_misc_control_pre_baud());
-            std::thread::sleep(Duration::from_millis(SERIAL_PACE_MIN_MS));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(u64::from(
+            HOT_START_POST_LADDER_SETTLE_MS,
+        )));
         info!("Baud reset complete");
     }
 
@@ -7071,12 +7949,12 @@ impl S19jHybridMiner {
         // BM1362 init register sequence (BUILD_ID check, CTRL preserve-or-write
         // 0x00901002, BAUD 0x6C, FIFO reset), and report. The downstream
         // per-chip init (CHAIN_INACTIVE / SET_CHIP_ADDRESS / MiscCtrl x3 /
-        // A8 / 3C / PLL ramp) is NOT yet ported through the trait — that
+        // A8 / 3C / PLL ramp) is NOT yet ported through the trait Ã¢â‚¬â€ that
         // refactor is Phase 2.5 and lands in a follow-up wave. Until then,
         // this sentinel fails closed with a clear error so an operator who
         // opted into the gate sees exactly why the daemon stops.
         //
-        // Default-off path (env-gate UNSET) is byte-identical — the entire
+        // Default-off path (env-gate UNSET) is byte-identical Ã¢â‚¬â€ the entire
         // legacy SerialChainBackend init below is untouched.
         //
         // Standalone validation of the FpgaChainBackend open + init sequence
@@ -7093,7 +7971,7 @@ impl S19jHybridMiner {
                     info!(
                         chain_id = Bm1397PlusChainBackend::chain_id(&backend),
                         transport = backend.transport_label(),
-                        "FpgaChainBackend opened — running initialize_chain_for_bm1362()"
+                        "FpgaChainBackend opened Ã¢â‚¬â€ running initialize_chain_for_bm1362()"
                     );
                     if let Err(e) = backend.initialize_chain_for_bm1362() {
                         warn!(error = %e, "FpgaChainBackend::initialize_chain_for_bm1362 failed");
@@ -7104,7 +7982,7 @@ impl S19jHybridMiner {
                 }
             }
             return Err(anyhow::anyhow!(
-                "DCENT_AM2_USE_FPGA_CHAIN=1 — FPGA-chain init sequence executed for \
+                "DCENT_AM2_USE_FPGA_CHAIN=1 Ã¢â‚¬â€ FPGA-chain init sequence executed for \
                  Phase-0 probe, but full per-chip init through the trait is Phase 2.5 \
                  future work. Unset the env flag to use the proven SerialChainBackend \
                  path; meanwhile validate the FPGA register state via the \
@@ -7177,7 +8055,7 @@ impl S19jHybridMiner {
 
         if am2_skip_hotstart_baud_reset_enabled() {
             info!(
-                "DCENT_AM2_SKIP_HOTSTART_BAUD_RESET=1 — skipping reset_asic_baud() \
+                "DCENT_AM2_SKIP_HOTSTART_BAUD_RESET=1 Ã¢â‚¬â€ skipping reset_asic_baud() \
                  (cold-boot standalone: chain already at 115200, hot-baud reset would \
                  perturb the chain UART before the first enum)"
             );
@@ -7193,12 +8071,12 @@ impl S19jHybridMiner {
         // platform). On `a lab unit` standalone the launcher sets
         // DCENT_AM2_POST_RESET_SETTLE_MS=1000 to give cold chips bosminer's
         // ~1 s post-HB_RESET-release settle before the first CHAIN_INACTIVE /
-        // GetAddress — the P1 chip-wake lever (see am2_post_reset_settle_ms).
+        // GetAddress Ã¢â‚¬â€ the P1 chip-wake lever (see am2_post_reset_settle_ms).
         std::thread::sleep(Duration::from_millis(am2_post_reset_settle_ms()));
 
-        // 2026-06-11 (LIVE-PINNED) — ensure the FPGA UART RETURN relay is enabled
+        // 2026-06-11 (LIVE-PINNED) Ã¢â‚¬â€ ensure the FPGA UART RETURN relay is enabled
         // before the SET_ADDRESS enum walk (idempotent RMW; it is ALSO enabled
-        // earlier, before the rail-evidence probe — see the call in run()). The
+        // earlier, before the rail-evidence probe Ã¢â‚¬â€ see the call in run()). The
         // BM1362 daisy-chain RETURN (RO) line is routed into the PL soft-UART RX
         // through the FPGA fabric, gated by the 2-bit `gpio@41220000` AXI-GPIO
         // (bit0 co_relay_en + bit1 ro_relay_en); without it, TX drains but 0 RX.
@@ -7219,7 +8097,7 @@ impl S19jHybridMiner {
         // RE-018 cold sequence. `assert_mcr_out2()` is self-gating (a no-op unless
         // am2_mcr_out2_mode selects EnvOverride/Xil25Fingerprint), so this is
         // byte-identical on every non-.25 platform. The RE-018 branch re-asserts
-        // (with a hard readback bail) after its port-wake — idempotent — but the
+        // (with a hard readback bail) after its port-wake Ã¢â‚¬â€ idempotent Ã¢â‚¬â€ but the
         // LEGACY enum path below previously NEVER asserted OUT2 on the kernel File
         // backend, so on `a lab unit` the FPGA UART TX clock-out stayed gated and the
         // chain went silent (enum=0). Now an RE-018 A/B (gate OFF) cannot silently
@@ -7235,7 +8113,7 @@ impl S19jHybridMiner {
         // + `a lab unit`-fingerprint-gated (am2_bm1362_re018_cold_sequence_enabled()).
         // When set on `a lab unit`, run the full decoded bosminer cold sequence (incl.
         // the per-chip reg 0x0C nonce-space base DCENT was missing + the
-        // non-fatal late GetAddress poll) and return — bypassing the legacy
+        // non-fatal late GetAddress poll) and return Ã¢â‚¬â€ bypassing the legacy
         // GetAddress-bail init entirely. Byte-identical to today on every other
         // platform / when the gate is unset (this branch is unreachable).
         if am2_bm1362_re018_cold_sequence_enabled() {
@@ -7249,15 +8127,29 @@ impl S19jHybridMiner {
         }
 
         // PR-019 / R11-2 ablation (default-OFF). When the gate is unset every
-        // call below is an immediate no-op — proven-path behaviour, timing,
+        // call below is an immediate no-op Ã¢â‚¬â€ proven-path behaviour, timing,
         // and on-wire traffic are byte-for-byte unchanged.
         am2_ablation_log_params(target_freq_mhz, pll_ramp, 115_200);
         am2_ablation_probe(&serial, "pre_init_baseline");
 
         let chain_inactive_first = am2_init_chain_inactive_first_enabled();
-        // .max(1): chip_count is operator-config-derived (serial_chip_count);
-        // config validate() rejects 0, but guard the divide too (panic=abort).
-        let addr_interval = 256u16 / (chip_count as u16).max(1);
+        // Pure SerialBringUpPlugin phases (P1-1); full-population stride SSOT.
+        let addr_interval = u16::from(bm1397plus_addr_interval(chip_count));
+        let bring_up = plan_serial_bring_up(
+            SerialBringUpPluginKind::Am2ZynqBm1362,
+            ChainTransportKind::Serial,
+            &SerialBringUpPlanParams {
+                chip_count,
+                frequency_mhz: 0,
+                chain_inactive_count: 3,
+                inactive_dwell_ms: 0,
+                post_enum_delay_ms: 0,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("hybrid chain init bring-up plan refused: {e}"))?;
+        let phases = bring_up.phases();
+        let inactive_ops = phases.soft_reset;
+        let address_ops = phases.address_ladder;
 
         if chain_inactive_first {
             info!(
@@ -7267,9 +8159,9 @@ impl S19jHybridMiner {
 
             // Step 1 ( swap): CHAIN_INACTIVE x3 FIRST so chips drop any
             // stale per-chip address state and accept the upcoming address
-            // assignment.
-            for _ in 0..3 {
-                serial.send_chain_inactive_bm1397plus()?;
+            // assignment. Ops from pure planner; 300 ms dwell is engine policy.
+            for op in inactive_ops.iter().cloned() {
+                hybrid_execute_bm1397plus_op(&serial, op)?;
                 std::thread::sleep(Duration::from_millis(300));
             }
 
@@ -7278,9 +8170,8 @@ impl S19jHybridMiner {
             // GetAddress queries arrive. This is the load-bearing fix per
             // Agent A's RE finding: unaddressed chips can't answer
             // GetAddress -> 0/126 by construction.
-            for i in 0..chip_count as u16 {
-                let addr = (i * addr_interval) as u8;
-                serial.send_set_address_bm1397plus(addr)?;
+            for (i, op) in address_ops.iter().cloned().enumerate() {
+                hybrid_execute_bm1397plus_op(&serial, op)?;
                 if i % 16 == 15 {
                     std::thread::sleep(Duration::from_millis(2));
                 }
@@ -7294,35 +8185,34 @@ impl S19jHybridMiner {
             // Step 3 ( swap): A8 / MiscCtrl x3 / A4 AFTER address
             // assignment, matching bosminer's canonical chain4 order
             // (`SUMMARY.md:80`).
-            serial.send_write_reg_broadcast_bm1397plus(0xA8, am2_init_control_bcast())?;
+            hybrid_send_write_reg_broadcast(&serial, 0xA8, am2_init_control_bcast())?;
             std::thread::sleep(Duration::from_millis(10));
             am2_ablation_probe(&serial, "post_a8");
             misc_ctrl_triple_write_serial(&serial, am2_misc_control_pre_baud())?;
             std::thread::sleep(Duration::from_millis(10));
             am2_ablation_probe(&serial, "post_miscctrl_x3");
-            serial.send_write_reg_broadcast_bm1397plus(0xA4, VERSION_MASK_DEFAULT)?;
+            hybrid_send_write_reg_broadcast(&serial, 0xA4, VERSION_MASK_DEFAULT)?;
             std::thread::sleep(Duration::from_millis(10));
         } else {
             // Step 1: bosminer's first healthy chain4 writes at 115200.
-            serial.send_write_reg_broadcast_bm1397plus(0xA8, am2_init_control_bcast())?;
+            hybrid_send_write_reg_broadcast(&serial, 0xA8, am2_init_control_bcast())?;
             std::thread::sleep(Duration::from_millis(10));
             am2_ablation_probe(&serial, "post_a8");
             misc_ctrl_triple_write_serial(&serial, am2_misc_control_pre_baud())?;
             std::thread::sleep(Duration::from_millis(10));
             am2_ablation_probe(&serial, "post_miscctrl_x3");
-            serial.send_write_reg_broadcast_bm1397plus(0xA4, VERSION_MASK_DEFAULT)?;
+            hybrid_send_write_reg_broadcast(&serial, 0xA4, VERSION_MASK_DEFAULT)?;
             std::thread::sleep(Duration::from_millis(10));
 
-            // Step 2: Chain Inactive x3.
-            for _ in 0..3 {
-                serial.send_chain_inactive_bm1397plus()?;
+            // Step 2: Chain Inactive x3 (pure planner).
+            for op in inactive_ops.iter().cloned() {
+                hybrid_execute_bm1397plus_op(&serial, op)?;
                 std::thread::sleep(Duration::from_millis(300));
             }
 
-            // Step 3: Assign addresses (BM1397+ framing)
-            for i in 0..chip_count as u16 {
-                let addr = (i * addr_interval) as u8;
-                serial.send_set_address_bm1397plus(addr)?;
+            // Step 3: Assign addresses (pure ladder SSOT).
+            for (i, op) in address_ops.into_iter().enumerate() {
+                hybrid_execute_bm1397plus_op(&serial, op)?;
                 if i % 16 == 15 {
                     std::thread::sleep(Duration::from_millis(2));
                 }
@@ -7342,33 +8232,33 @@ impl S19jHybridMiner {
         // lives after the stock-style 3C/54/58/ticket/relay block below.
 
         // Step 4: Remaining healthy 115200 broadcast block.
-        serial.send_write_reg_broadcast_bm1397plus(0x3C, CORE_REG_HASH_CLK)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x3C, CORE_REG_HASH_CLK)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x3C, CORE_REG_CLK_DELAY)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x3C, CORE_REG_CLK_DELAY)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x54, ANALOG_MUX_VALUE)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x54, ANALOG_MUX_VALUE)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x58, IO_DRIVER_NORMAL)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x58, IO_DRIVER_NORMAL)?;
         std::thread::sleep(Duration::from_millis(10));
         am2_ablation_probe(&serial, "post_3c_x3_broadcast_block");
 
         // Step 4b: TICKET_MASK + HASH_COUNTING_NUMBER + UART relay.
         //
         // TICKET_MASK (reg 0x14) is the hardware difficulty filter. Without
-        // it the chip drops every nonce at hardware level — silent zero
+        // it the chip drops every nonce at hardware level Ã¢â‚¬â€ silent zero
         // production regardless of work dispatch.
         // HASH_COUNTING_NUMBER (reg 0x10) tells the chain how to distribute
         // the 32-bit nonce range across N chips. With 126 chips the value
         // is 0x0000_1381 (per `NONCE_RANGE_126` constant). Without this all
-        // 126 chips hash the same range — wasted silicon and rare nonces.
+        // 126 chips hash the same range Ã¢â‚¬â€ wasted silicon and rare nonces.
         // UART_RELAY candidate writes (0x2C BM1366-style + 0x34
         // BM1397+style) are preserved for R6-7 capture work but skipped
         // by default. The diagnostic-only glitch monitor mirror at
         // 0x43D00030/0x43D00034 (Braiins-am2 only) reflects state; it is
         // NOT a control surface (W13.B1 reclass).
-        serial.send_write_reg_broadcast_bm1397plus(0x14, TICKET_MASK_256)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x14, TICKET_MASK_256)?;
         std::thread::sleep(Duration::from_millis(10));
-        serial.send_write_reg_broadcast_bm1397plus(0x10, NONCE_RANGE_126)?;
+        hybrid_send_write_reg_broadcast(&serial, 0x10, NONCE_RANGE_126)?;
         std::thread::sleep(Duration::from_millis(10));
         maybe_write_bm1362_uart_relay(&serial, "bm1362_step4_115200")?;
         info!(
@@ -7402,7 +8292,7 @@ impl S19jHybridMiner {
                 warn!(
                     serial_device = %serial_device,
                     summary = %presence_summary,
-                    "DCENT_AM2_CONTINUE_PAST_ZERO_ENUM=1: 0 chips responded to GetAddress at 115200 — \
+                    "DCENT_AM2_CONTINUE_PAST_ZERO_ENUM=1: 0 chips responded to GetAddress at 115200 Ã¢â‚¬â€ \
                      DOWNGRADING the enum=0 hard-bail to a warning (DIAGNOSTIC). Continuing into \
                      PLL/baud-upgrade so the later post-clock GetAddress re-probes can test whether the \
                      chips needed clocking before they enumerate (H5). No chips detected => no hashing \
@@ -7410,7 +8300,7 @@ impl S19jHybridMiner {
                 );
             } else {
                 anyhow::bail!(
-                    "Chain presence verification FAILED — 0 chips responded to GetAddress at 115200 on {} after the full 115200 setup block. \
+                    "Chain presence verification FAILED Ã¢â‚¬â€ 0 chips responded to GetAddress at 115200 on {} after the full 115200 setup block. \
                      Either the chain is not powered (PIC enable_voltage didn't actually engage 13.7V), \
                      the wrong /dev/ttyS* is wired to this chain, the BM1362 UART relay/setup register mix is still incomplete, \
                      or the chips themselves are dead. Aborting before PLL/baud-upgrade so the silent-init failure mode \
@@ -7425,7 +8315,7 @@ impl S19jHybridMiner {
             warn!(
                 expected = chip_count,
                 got = unique_count,
-                "Chain presence: only some chips replied — continuing but expect partial yield"
+                "Chain presence: only some chips replied Ã¢â‚¬â€ continuing but expect partial yield"
             );
         } else {
             info!(
@@ -7438,17 +8328,17 @@ impl S19jHybridMiner {
         //
         // Two paths, gated by `mining.am2_pll_ramp` (default ON):
         //
-        // (A) RAMP (BM1368 .135 cadence) —  hypothesis fix.
+        // (A) RAMP (BM1368 .135 cadence) Ã¢â‚¬â€  hypothesis fix.
         //     BM1362 default state is ~50 MHz on POR. Slamming straight to
         //     525 MHz in two writes (the legacy path) does not give the on-die
-        //     PLL/postdiv chain time to acquire lock — most likely root cause
+        //     PLL/postdiv chain time to acquire lock Ã¢â‚¬â€ most likely root cause
         //     of `a lab unit` chain UART silence at 13.7 V engaged rail.
-        //     BM1368 (working on `a lab unit`) ramps `200 → 525 MHz` in 25 MHz steps
-        //     × 100 ms settle (`serial_mining.rs::init_bm1368_chain` Step 7).
+        //     BM1368 (working on `a lab unit`) ramps `200 Ã¢â€ â€™ 525 MHz` in 25 MHz steps
+        //     Ãƒâ€” 100 ms settle (`serial_mining.rs::init_bm1368_chain` Step 7).
         //     We replicate that here for BM1362 starting at 400 MHz (BM1362
         //     PLL-table minimum) and ramping up to the target in 25 MHz steps.
         //
-        // (B) SLAM (legacy, traced) — fall-back if the ramp introduces a
+        // (B) SLAM (legacy, traced) Ã¢â‚¬â€ fall-back if the ramp introduces a
         //     regression on a known-good unit. Two writes of the traced
         //     `0x40A8_0265` value (or lookup-derived for non-525 targets)
         //     with the PLL0 divider preconfig in between, 10 ms spacing.
@@ -7461,10 +8351,11 @@ impl S19jHybridMiner {
         let target_clamped = target_freq_mhz.clamp(400, 597);
         let (final_pll_reg, _) = bm1362_pll_lookup(target_clamped);
         if pll_ramp {
-            // PLL0 divider preconfig — same value bosminer uses, kept at the
+            // PLL0 divider preconfig Ã¢â‚¬â€ same value bosminer uses, kept at the
             // head of the ramp so the divider chain is sane before we touch
             // the multiplier/postdiv settings via reg 0x08.
-            serial.send_write_reg_broadcast_bm1397plus(
+            hybrid_send_write_reg_broadcast(
+                &serial,
                 BM1362_PLL0_DIVIDER_REG,
                 BM1362_TRACE_PLL0_DIVIDER,
             )?;
@@ -7483,15 +8374,15 @@ impl S19jHybridMiner {
                 "BM1362 PLL ramp engaged (Wave-6 hypothesis fix)"
             );
             for (i, (pll_reg, freq_mhz)) in steps.iter().enumerate() {
-                serial.send_write_reg_broadcast_bm1397plus(0x08, *pll_reg)?;
+                hybrid_send_write_reg_broadcast(&serial, 0x08, *pll_reg)?;
                 std::thread::sleep(Duration::from_millis(ramp_settle_ms));
                 // Best-effort PLL-lock readback. We send a broadcast READ on
                 // reg 0x08 and drain whatever response frames come back; if
                 // ANY reply has the lock bit set we log it. If no replies
-                // arrive (chain UART RX silent — which is the actual blocker
+                // arrive (chain UART RX silent Ã¢â‚¬â€ which is the actual blocker
                 // we're testing for) we log warn and proceed. Never bail on
                 // an absent readback.
-                if let Err(e) = serial.send_read_reg_bm1397plus(0x00, 0x08) {
+                if let Err(e) = hybrid_send_read_reg(&serial, 0x00, 0x08) {
                     debug!(
                         step = i + 1,
                         of = steps.len(),
@@ -7521,14 +8412,15 @@ impl S19jHybridMiner {
             }
             // Re-write PLL0 divider after ramp (mirror legacy slam tail) so
             // the divider chain is settled at the post-ramp clock.
-            serial.send_write_reg_broadcast_bm1397plus(
+            hybrid_send_write_reg_broadcast(
+                &serial,
                 BM1362_PLL0_DIVIDER_REG,
                 BM1362_TRACE_PLL0_DIVIDER,
             )?;
             std::thread::sleep(Duration::from_millis(10));
             // Final write at exactly the target PLL value so downstream
             // FastUART/MiscCtrl writes hit a steady-state PLL.
-            serial.send_write_reg_broadcast_bm1397plus(0x08, final_pll_reg)?;
+            hybrid_send_write_reg_broadcast(&serial, 0x08, final_pll_reg)?;
             std::thread::sleep(Duration::from_millis(ramp_settle_ms));
             info!(
                 final_pll = format_args!("0x{:08X}", final_pll_reg),
@@ -7550,19 +8442,21 @@ impl S19jHybridMiner {
                 );
                 pll_reg
             };
-            serial.send_write_reg_broadcast_bm1397plus(
+            hybrid_send_write_reg_broadcast(
+                &serial,
                 BM1362_PLL0_DIVIDER_REG,
                 BM1362_TRACE_PLL0_DIVIDER,
             )?;
             std::thread::sleep(Duration::from_millis(10));
-            serial.send_write_reg_broadcast_bm1397plus(0x08, traced_pll_param)?;
+            hybrid_send_write_reg_broadcast(&serial, 0x08, traced_pll_param)?;
             std::thread::sleep(Duration::from_millis(10));
-            serial.send_write_reg_broadcast_bm1397plus(
+            hybrid_send_write_reg_broadcast(
+                &serial,
                 BM1362_PLL0_DIVIDER_REG,
                 BM1362_TRACE_PLL0_DIVIDER,
             )?;
             std::thread::sleep(Duration::from_millis(10));
-            serial.send_write_reg_broadcast_bm1397plus(0x08, traced_pll_param)?;
+            hybrid_send_write_reg_broadcast(&serial, 0x08, traced_pll_param)?;
             std::thread::sleep(Duration::from_millis(10));
             info!(
                 pll = format_args!("0x{:08X}", traced_pll_param),
@@ -7580,7 +8474,7 @@ impl S19jHybridMiner {
             // The proven BM1362 paths (serial_mining.rs, am3_bb_mining.rs) run
             // the per-chip A8/MiscCtrl/3C loop to activate the cores.
             // init_asic_chain ran it only as fast-baud Step 7, so skip-FastUART
-            // previously left the cores broadcast-only-activated — a suspected
+            // previously left the cores broadcast-only-activated Ã¢â‚¬â€ a suspected
             // cause of the skip-FastUART zero-nonce result. Run it here at
             // 115200 unless explicitly opted out for an A/B comparison.
             let mut skip_count = unique_count;
@@ -7604,7 +8498,7 @@ impl S19jHybridMiner {
                 );
                 if skip_unique == 0 {
                     anyhow::bail!(
-                        "BM1362 post-per-chip verification FAILED at 115200 on {} — chain replied before the per-chip loop but went silent after it. summary: {}",
+                        "BM1362 post-per-chip verification FAILED at 115200 on {} Ã¢â‚¬â€ chain replied before the per-chip loop but went silent after it. summary: {}",
                         serial_device,
                         skip_summary
                     );
@@ -7640,7 +8534,7 @@ impl S19jHybridMiner {
         if jig_reclock {
             apply_bm1362_jig_pll1_reclock(&serial, fast_uart_baud)?;
         } else {
-            serial.send_write_reg_broadcast_bm1397plus(0x28, fast_uart_value)?;
+            hybrid_send_write_reg_broadcast(&serial, 0x28, fast_uart_value)?;
             serial.drain_tx()?;
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -7659,7 +8553,7 @@ impl S19jHybridMiner {
                 requested = fast_uart_baud,
                 "FastUART (host-switch-first): host UART backend baud transition"
             );
-            // 300 ms was too short vs the canonical path's 1000 ms — the chip
+            // 300 ms was too short vs the canonical path's 1000 ms Ã¢â‚¬â€ the chip
             // UART divider needs time to re-lock after the FastUART register
             // write before a fast-baud GetAddress probe reads cleanly. Tunable
             // via DCENT_AM2_FASTUART_SETTLE_MS (default 1000, clamp [100,3000]).
@@ -7741,7 +8635,7 @@ impl S19jHybridMiner {
         );
         if immediate_fast_unique_count == 0 {
             anyhow::bail!(
-                "BM1362 immediate fast-baud verification FAILED — 0 chips responded to GetAddress at {} baud on {} immediately after the baud switch. \
+                "BM1362 immediate fast-baud verification FAILED Ã¢â‚¬â€ 0 chips responded to GetAddress at {} baud on {} immediately after the baud switch. \
                  The chain replied at 115200 but the FastUART handoff itself did not produce a readable fast-baud chain. summary: {}",
                 fast_uart_baud,
                 serial_device,
@@ -7766,13 +8660,13 @@ impl S19jHybridMiner {
         if am2_env_flag("DCENT_AM2_SKIP_FAST_PER_CHIP_LOOP") {
             warn!(
                 unique_chip_replies = immediate_fast_unique_count,
-                "DCENT_AM2_SKIP_FAST_PER_CHIP_LOOP=1 — skipping post-fast per-chip A8/18/3C loop; proceeding with immediate fast-baud verified chain"
+                "DCENT_AM2_SKIP_FAST_PER_CHIP_LOOP=1 Ã¢â‚¬â€ skipping post-fast per-chip A8/18/3C loop; proceeding with immediate fast-baud verified chain"
             );
             am2_ablation_probe(&serial, "pre_mining");
             info!(
                 pll = format_args!("0x{:08X}", final_pll_reg),
                 unique_chip_replies = immediate_fast_unique_count,
-                "=== BM1362 INIT COMPLETE — {} unique chip replies at {} MHz (post-fast per-chip loop skipped) ===",
+                "=== BM1362 INIT COMPLETE Ã¢â‚¬â€ {} unique chip replies at {} MHz (post-fast per-chip loop skipped) ===",
                 immediate_fast_unique_count,
                 target_freq_mhz
             );
@@ -7805,7 +8699,7 @@ impl S19jHybridMiner {
         );
         if fast_baud_unique_count == 0 {
             anyhow::bail!(
-                "BM1362 post-per-chip fast-baud verification FAILED — 0 chips responded to GetAddress at 3.125M on {}. \
+                "BM1362 post-per-chip fast-baud verification FAILED Ã¢â‚¬â€ 0 chips responded to GetAddress at 3.125M on {}. \
                  The chain replied immediately after FastUART but disappeared after the post-fast per-chip loop; \
                  refusing to dispatch FPGA work into a silent chain. summary: {}",
                 serial_device,
@@ -7816,7 +8710,7 @@ impl S19jHybridMiner {
             warn!(
                 expected = chip_count,
                 got = fast_baud_unique_count,
-                "BM1362 post-per-chip fast-baud verification: only some chips replied — continuing but expect partial yield"
+                "BM1362 post-per-chip fast-baud verification: only some chips replied Ã¢â‚¬â€ continuing but expect partial yield"
             );
         } else {
             info!(
@@ -7829,25 +8723,25 @@ impl S19jHybridMiner {
         info!(
             pll = format_args!("0x{:08X}", final_pll_reg),
             unique_chip_replies = fast_baud_unique_count,
-            "=== BM1362 INIT COMPLETE — {} unique chip replies at {} MHz ===",
+            "=== BM1362 INIT COMPLETE Ã¢â‚¬â€ {} unique chip replies at {} MHz ===",
             fast_baud_unique_count,
             target_freq_mhz
         );
         Ok((serial, fast_baud_unique_count))
     }
 
-    /// Alternative am2 work-dispatch loop — `DCENT_AM2_SERIAL_WORK_DISPATCH=1`.
+    /// Alternative am2 work-dispatch loop Ã¢â‚¬â€ `DCENT_AM2_SERIAL_WORK_DISPATCH=1`.
     ///
     /// Sends the proven BM1362 88-byte serial work frame over the chain UART
     /// (`DevmemUart`, already proven for GetAddress at 115200 on XIL) and parses
-    /// 11-byte serial nonce frames — bypassing the am2 FPGA WORK_TX/WORK_RX
+    /// 11-byte serial nonce frames Ã¢â‚¬â€ bypassing the am2 FPGA WORK_TX/WORK_RX
     /// FIFO entirely. Reuses the exact codec
     /// (`build_serial_work_frame` / `parse_bm1362_serial_nonce`) proven on the
     /// am3-bb `a lab unit` accepted-share milestone. This sidesteps the long-standing
     /// am2 FPGA-FIFO own-dispatch zero-nonce question. This path reconstructs
     /// BM1362 BIP320 rolled versions from nonce metadata, so the Stratum router
     /// may negotiate BIP310 here; the FPGA loop keeps version rolling disabled.
-    /// Runtime-only, env-gated, default-off — `a lab unit` is unaffected.
+    /// Runtime-only, env-gated, default-off Ã¢â‚¬â€ `a lab unit` is unaffected.
     #[allow(clippy::too_many_arguments)]
     async fn run_am2_serial_dispatch_loop(
         &self,
@@ -7860,12 +8754,16 @@ impl S19jHybridMiner {
         pic_fw: Option<u8>,
         mut thermal_supervisor: Option<Am2ThermalSupervisor>,
         thermal_poll_ms: u64,
-        watchdog_liveness: Arc<AtomicU64>,
+        watchdog_liveness: SafetyLiveness,
         // AT-DASH: shared pool-share accounting (written by the status task),
         // read here on each hashrate tick to compute the real GH/s estimate and
         // publish a live `MinerState` for `/api/status` + the dashboard.
         share_accounting: Arc<Am2ShareAccounting>,
         pool_quality: Arc<RwLock<dcentrald_stratum::pool_quality::PoolQualitySnapshot>>,
+        dispatch_life: &mut WorkDispatchLifecycle,
+        profile_max_pwm: u8,
+        pic_heartbeat_terminal_failed: Arc<AtomicBool>,
+        watchdog_feed_stop: &WatchdogFeedStopSignal,
     ) -> Result<()> {
         info!(
             chip_count,
@@ -7874,18 +8772,12 @@ impl S19jHybridMiner {
 
         let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
-        let mut asic_job_id: u8 = 0;
-        let mut work_history: Vec<VecDeque<WorkEntry>> = (0..128)
-            .map(|_| VecDeque::with_capacity(WORK_HISTORY_PER_ID))
-            .collect();
+        // P1-1 pure SerialWorkBookkeeping façade (same spine as dual-chain).
         // Key includes version_bits_raw: BM1362 rolls BIP320 internally and can
         // find the SAME nonce at the SAME job under DIFFERENT rolled versions —
-        // those are genuinely-different 80-byte headers (two valid shares), so the
-        // version bits must be part of the dedup key or the second is dropped (lost
-        // revenue). Mirrors work_dispatcher.rs keying midstate_idx. When the chip
-        // rolls 0 (non-rolling configs) all reports carry vbits=0 and the key
-        // collapses to the prior (job_id, nonce) behaviour.
-        let mut seen_shares: BTreeSet<(u8, u32, u16)> = BTreeSet::new();
+        // those are genuinely-different 80-byte headers (two valid shares).
+        let mut bookkeeping: SerialWorkBookkeeping<WorkEntry> =
+            SerialWorkBookkeeping::hybrid_defaults();
 
         let mut total_work: u64 = 0;
         let mut total_nonces: u64 = 0;
@@ -7893,11 +8785,11 @@ impl S19jHybridMiner {
         let mut shares_submitted: u64 = 0;
         let mut hr_nonces: u64 = 0;
         // AT-DASH telemetry (diagnostic for the ~400x hashrate gap):
-        //   `unique_nonces` — distinct (job_id,nonce,vbits) reports, the
+        //   `unique_nonces` Ã¢â‚¬â€ distinct (job_id,nonce,vbits) reports, the
         //     dedup-survivor count. `total_nonces - unique_nonces` is the
         //     duplicate spam the chain is re-presenting.
-        //   `crc_errors` — full-length frames that failed BM1362 nonce parse.
-        //   `dsPIC nonce attribution` — this single-chain loop drives ONE dsPIC,
+        //   `crc_errors` Ã¢â‚¬â€ full-length frames that failed BM1362 nonce parse.
+        //   `dsPIC nonce attribution` Ã¢â‚¬â€ this single-chain loop drives ONE dsPIC,
         //     so every unique nonce attributes to `pic_addr`'s chain.
         let mut unique_nonces: u64 = 0;
         let mut crc_errors: u32 = 0;
@@ -7915,10 +8807,10 @@ impl S19jHybridMiner {
         // to ~AM2_RECENT_HASHRATE_WINDOW_S. Drives the REAL recent-window
         // ("current"/5 s tile) hashrate over a WIDE window so a sparse-share eco
         // unit shows a STABLE non-zero value instead of flickering to 0 between
-        // shares — distinct from the cumulative-since-boot average.
+        // shares Ã¢â‚¬â€ distinct from the cumulative-since-boot average.
         let mut hr_window: VecDeque<(Instant, f64)> = VecDeque::new();
         let mut carry: Vec<u8> = Vec::with_capacity(256);
-        // DCENT_AM2_LOG_RX_FRAMES — lab-only diagnostic, hex-dump first N
+        // DCENT_AM2_LOG_RX_FRAMES Ã¢â‚¬â€ lab-only diagnostic, hex-dump first N
         // raw RX frames to identify the on-wire shape vs the .79 BB
         // 11-byte serial-nonce parser. See am2_log_rx_frames_max() above.
         let log_rx_max: u64 = am2_log_rx_frames_max();
@@ -7942,7 +8834,7 @@ impl S19jHybridMiner {
         }
 
         // MINE-LIFE-1: GENEROUS mid-run nonce-stall guard (trips only AFTER
-        // nonces have flowed and then stop for the generous window — separate
+        // nonces have flowed and then stop for the generous window Ã¢â‚¬â€ separate
         // from the startup no-nonce guard above).
         let mid_run_stall_timeout =
             am2_mid_run_nonce_stall_timeout(self.config.mining.am2_no_nonce_timeout_s);
@@ -7960,7 +8852,7 @@ impl S19jHybridMiner {
         // the operator set `[autotuner] am2_frequency_autotune = true`
         // OR `DCENT_AM2_FREQUENCY_AUTOTUNE=1`. When false, EVERYTHING
         // below is skipped: `freq_cmd_rx` stays `None` (its select arm
-        // is `future::pending()` — never fires), `chain_stats` stays
+        // is `future::pending()` Ã¢â‚¬â€ never fires), `chain_stats` stays
         // `None` (no nonce/error accumulation, no snapshot timer), no
         // tuner task is spawned. The serial-dispatch loop is then
         // byte-identical to the proven `a lab unit`/.109 milestone path:
@@ -7982,7 +8874,7 @@ impl S19jHybridMiner {
         > = None;
         // Fingerprint-gated warm-start guard: the autotuner's own
         // state-resume path is fingerprint/chip-count gated (it will not
-        // replay an N-chip profile at a different count — see
+        // replay an N-chip profile at a different count Ã¢â‚¬â€ see
         // `state_persistence` tests). We additionally pin the live
         // enumerated chip count this AC cycle so a mid-run chip-count
         // change is a StepUpGate-blocking event (recompute expected NPS
@@ -7991,7 +8883,7 @@ impl S19jHybridMiner {
         let autotune_chip_count_at_start = chip_count;
         let mut autotune_chip_count_warned = false;
         // Snapshot cadence: feed the tuner a fresh chain snapshot every
-        // `measurement_window_s` (default 30 s). Bounded ≥5 s so a
+        // `measurement_window_s` (default 30 s). Bounded Ã¢â€°Â¥5 s so a
         // pathological config can't busy-spin the snapshot timer.
         let mut snapshot_timer = {
             let win_s = self.config.autotuner.measurement_window_s.max(5);
@@ -8009,7 +8901,7 @@ impl S19jHybridMiner {
                 error!(
                     voltage_optimization = autotune_config.voltage_optimization,
                     dvfs_enabled = autotune_config.dvfs_enabled,
-                    "am2 freq-only autotuner: voltage/DVFS pin REGRESSED — refusing to spawn the tuner (NO live am2 voltage this wave). Falling back to the proven static-frequency path."
+                    "am2 freq-only autotuner: voltage/DVFS pin REGRESSED Ã¢â‚¬â€ refusing to spawn the tuner (NO live am2 voltage this wave). Falling back to the proven static-frequency path."
                 );
             } else {
                 let (fc_tx, fc_rx) = mpsc::channel::<dcentrald_autotuner::FreqCommand>(64);
@@ -8026,7 +8918,7 @@ impl S19jHybridMiner {
                 // Single synthetic chain carrying the LIVE enumerated
                 // chip count so the autotuner's expected-NPS prediction
                 // (894 nonce-attribution slots per BM1362 chip, W6.8)
-                // scales 28..126 with the actual chain — not a fixed
+                // scales 28..126 with the actual chain Ã¢â‚¬â€ not a fixed
                 // 126 and not the 4-engine count.
                 let chain_infos = vec![dcentrald_autotuner::ChainTuneInfo {
                     chain_id: 0,
@@ -8053,7 +8945,7 @@ impl S19jHybridMiner {
                     voltage_optimization = autotune_config.voltage_optimization,
                     dvfs_enabled = autotune_config.dvfs_enabled,
                     nominal_mhz,
-                    "am2/BM1362 FREQUENCY-ONLY autotuner ENABLED (opted in) — \
+                    "am2/BM1362 FREQUENCY-ONLY autotuner ENABLED (opted in) Ã¢â‚¬â€ \
                      QUIET home objective, NO live voltage, chip-count-aware NPS, \
                      broadcast-PLL via the proven serial init primitive"
                 );
@@ -8087,7 +8979,7 @@ impl S19jHybridMiner {
                     }
                     // Readiness gate: wait for the serial path to be
                     // producing nonces before characterizing. A fixed
-                    // sleep is not enough — the first snapshots after
+                    // sleep is not enough Ã¢â‚¬â€ the first snapshots after
                     // chain bring-up can be empty.
                     let mut ready_tick = tokio::time::interval(std::time::Duration::from_secs(5));
                     ready_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -8123,7 +9015,7 @@ impl S19jHybridMiner {
         // BOTH `[autotuner] at3_rail_read = true` (or `DCENT_AM2_AT3_RAIL_READ=1`)
         // AND opted into the freq autotuner (`freq_autotune_opt_in`). When false
         // the `rail_timer` select! arm below carries the `, if
-        // at3_rail_read_enabled` precondition — tokio never constructs/polls it,
+        // at3_rail_read_enabled` precondition Ã¢â‚¬â€ tokio never constructs/polls it,
         // so the loop is byte-identical to the proven `a lab unit`/`a lab unit` milestone path
         // (exactly the freq-autotuner arm's default-OFF pattern). `rail_timer`
         // itself is constructed unconditionally, mirroring `snapshot_timer`
@@ -8138,26 +9030,64 @@ impl S19jHybridMiner {
                 pic_addr = format_args!("0x{:02X}", pic_addr),
                 chain_id = ?at3_chain_id,
                 pic_fw = ?pic_fw,
-                "AT-3 quiet-window 0x3A measured-rail read ENABLED (opted in) — \
+                "AT-3 quiet-window 0x3A measured-rail read ENABLED (opted in) Ã¢â‚¬â€ \
                  READ-ONLY/measure-only, parser-safe byte-wise framed path \
                  (fw=0x89/0x8A only), feeds AT-1 telemetry tagged `measured`"
             );
         }
         let mut rail_timer = tokio::time::interval(Duration::from_secs(at3_interval_s));
         // Skip the immediate first tick so AT-3 never fires during the first
-        // loop turn right after bring-up — let the chain settle, exactly as a
+        // loop turn right after bring-up Ã¢â‚¬â€ let the chain settle, exactly as a
         // ~30 s cadence intends. (tokio intervals fire immediately on the first
         // tick otherwise.)
         rail_timer.reset();
 
         'mining: loop {
+            // Terminal revoke mid-run (PIC HB dead latch) Ã¢â‚¬â€ cut hash before
+            // noise via the shared lifecycle; recovered HB cannot re-admit.
+            if pic_heartbeat_terminal_failed.load(Ordering::SeqCst) && dispatch_life.is_admitted() {
+                let action = hybrid_revoke_and_stop_watchdog_feed(
+                    dispatch_life,
+                    DispatchRevocationCause::HeartbeatFailure,
+                    profile_max_pwm,
+                    watchdog_feed_stop,
+                );
+                error!(
+                    steps = action.steps().len(),
+                    "s19j-hybrid serial-dispatch work-dispatch TERMINALLY REVOKED after PIC heartbeat failure (watchdog feed stopped)"
+                );
+                self.shutdown.cancel();
+                break;
+            }
+
             tokio::select! {
-                _ = self.shutdown.cancelled() => { info!("Shutdown requested"); break; }
+                _ = self.shutdown.cancelled() => {
+                    info!("Shutdown requested");
+                    if dispatch_life.is_admitted() {
+                        let cause = if pic_heartbeat_terminal_failed.load(Ordering::SeqCst) {
+                            DispatchRevocationCause::HeartbeatFailure
+                        } else {
+                            DispatchRevocationCause::OperatorSafeOff
+                        };
+                        let action = hybrid_revoke_and_stop_watchdog_feed(
+                            dispatch_life,
+                            cause,
+                            profile_max_pwm,
+                            watchdog_feed_stop,
+                        );
+                        info!(
+                            ?cause,
+                            steps = action.steps().len(),
+                            "s19j-hybrid serial-dispatch work-dispatch revoked on shutdown (watchdog feed stopped if required)"
+                        );
+                    }
+                    break;
+                }
 
                 // ----  freq-only autotuner: FreqCommand consumer ----
                 //
                 // The `, if freq_cmd_rx.is_some()` precondition DISABLES
-                // this branch entirely when the gate is closed — tokio
+                // this branch entirely when the gate is closed Ã¢â‚¬â€ tokio
                 // never even constructs/polls the future, so the select!
                 // is STRICTLY byte-identical to the proven path (zero
                 // extra wakeups, zero behavior change). The inner
@@ -8166,7 +9096,7 @@ impl S19jHybridMiner {
                 // autotuner's chain-level frequency suggestions arrive
                 // here and are applied via the proven broadcast-PLL
                 // primitive. Voltage commands are HARD-REFUSED (last-line
-                // defense-in-depth — the pin + the BM1362 capability
+                // defense-in-depth Ã¢â‚¬â€ the pin + the BM1362 capability
                 // profile already prevent them).
                 maybe_cmd = async {
                     match freq_cmd_rx.as_mut() {
@@ -8189,7 +9119,7 @@ impl S19jHybridMiner {
                             }
                             FC::SetChipFreq { freq_mhz, ack_tx, .. } => {
                                 // No per-chip addressing on the 11-byte
-                                // serial nonce wire — a per-chip request
+                                // serial nonce wire Ã¢â‚¬â€ a per-chip request
                                 // collapses to the same chain-wide
                                 // broadcast PLL. ack is Result<u16,
                                 // String> (the applied freq).
@@ -8201,7 +9131,7 @@ impl S19jHybridMiner {
                             }
                             FC::SetVoltage { ack_tx, .. } => {
                                 error!(
-                                    "am2 freq-only autotuner: SetVoltage REFUSED — \
+                                    "am2 freq-only autotuner: SetVoltage REFUSED Ã¢â‚¬â€ \
                                      NO live am2 voltage write this wave (last-line \
                                      defense-in-depth; the freq-only pin should have \
                                      prevented this command being emitted at all)"
@@ -8215,7 +9145,7 @@ impl S19jHybridMiner {
                             }
                             FC::VerifyVoltage { ack_tx, .. } => {
                                 warn!(
-                                    "am2 freq-only autotuner: VerifyVoltage ignored — \
+                                    "am2 freq-only autotuner: VerifyVoltage ignored Ã¢â‚¬â€ \
                                      voltage is never written on this path"
                                 );
                                 if let Some(tx) = ack_tx {
@@ -8242,7 +9172,7 @@ impl S19jHybridMiner {
                             // serial path has no WORK_TIME register. The
                             // remaining limit/quiet-window commands are
                             // freq-ceiling bookkeeping the chain-level
-                            // path doesn't need to apply directly — ack
+                            // path doesn't need to apply directly Ã¢â‚¬â€ ack
                             // them so the tuner doesn't stall on a barrier.
                             FC::UpdateWorkTime { .. } => {}
                             FC::SetFrequencyLimit { ack_tx, .. }
@@ -8256,10 +9186,10 @@ impl S19jHybridMiner {
                             }
                         }
                     }
-                    // `maybe_cmd == None` ⇒ the tuner task ended (only
+                    // `maybe_cmd == None` Ã¢â€¡â€™ the tuner task ended (only
                     // on the shared `self.shutdown` token). We do NOT
                     // reassign `freq_cmd_rx` here (that would conflict
-                    // with the borrow the select branch holds — same
+                    // with the borrow the select branch holds Ã¢â‚¬â€ same
                     // proven pattern as `work_dispatcher.rs:2804`).
                     // The shared shutdown token means the next loop
                     // iteration's shutdown arm wins; mining holds the
@@ -8269,7 +9199,7 @@ impl S19jHybridMiner {
                 // ----  freq-only autotuner: chain snapshot feed ----
                 //
                 // The `, if chain_stats.is_some()` precondition DISABLES
-                // this branch entirely when the gate is closed — the
+                // this branch entirely when the gate is closed Ã¢â‚¬â€ the
                 // snapshot timer is never even polled, so the default-OFF
                 // path has ZERO extra wakeups (strictly byte-identical to
                 // the proven milestone path). When opted in, fires every
@@ -8278,7 +9208,7 @@ impl S19jHybridMiner {
                 // 28..126. A mid-run chip-count change vs the
                 // start-of-run count is a StepUpGate-blocking event:
                 // expected NPS changes, so we DON'T trust a stale N-chip
-                // frequency — log it and let the tuner re-measure from
+                // frequency Ã¢â‚¬â€ log it and let the tuner re-measure from
                 // the new epoch (the tuner's own resume/state path is
                 // additionally fingerprint+chip-count gated).
                 _ = snapshot_timer.tick(), if chain_stats.is_some() => {
@@ -8292,14 +9222,14 @@ impl S19jHybridMiner {
                                 start_chip_count = autotune_chip_count_at_start,
                                 live_chip_count,
                                 "am2 freq-only autotuner: enumerated chip count changed \
-                                 mid-run — expected NPS recomputed; the tuner re-measures \
+                                 mid-run Ã¢â‚¬â€ expected NPS recomputed; the tuner re-measures \
                                  from a fresh epoch (no stale N-chip frequency trusted)"
                             );
                         }
                         let snapshot = cs.take_snapshot(live_chip_count);
                         if let Some(tx) = autotune_stats_sender.as_ref() {
                             if tx.try_send(snapshot).is_err() {
-                                // Tuner busy/backpressured — drop this
+                                // Tuner busy/backpressured Ã¢â‚¬â€ drop this
                                 // window (next one carries fresh counts).
                                 debug!("am2 freq-only autotuner: stats channel full, dropping one window");
                             }
@@ -8309,10 +9239,9 @@ impl S19jHybridMiner {
 
                 Some(job) = job_rx.recv() => {
                     if job.clean_jobs {
-                        info!(job_id = %job.job_id, "NEW BLOCK — flushing serial work history");
-                        work_history.iter_mut().for_each(VecDeque::clear);
+                        info!(job_id = %job.job_id, "NEW BLOCK Ã¢â‚¬â€ flushing serial work history");
+                        bookkeeping.on_clean_jobs();
                         work_builder.reset_extranonce2();
-                        seen_shares.clear();
                     }
                     if job.is_flush_only() {
                         info!(job_id = %job.job_id, "Pool switch flush; serial dispatch paused until next notify");
@@ -8331,7 +9260,7 @@ impl S19jHybridMiner {
                     // is the SOLE gate; pools that understand BIP320 accept the
                     // submitted shares (Public Pool .109 milestone confirmed).
                     //
-                    // KEEP `work_builder.set_version_mask(0)` — work_builder
+                    // KEEP `work_builder.set_version_mask(0)` Ã¢â‚¬â€ work_builder
                     // does HOST-SIDE rolling when `version_mask != 0` (see
                     // `dcentrald_stratum::work::WorkBuilder::next_work` line
                     // 148-151). On the serial-dispatch path the CHIP rolls
@@ -8346,31 +9275,43 @@ impl S19jHybridMiner {
                 }
 
                 _ = dispatch_timer.tick() => {
+                    // Fail-closed: never write serial work without live admission.
+                    if !dispatch_life.is_admitted() {
+                        continue;
+                    }
                     if let Some(ref job) = current_job {
-                        let work = work_builder.next_work(job);
+                        let work = match work_builder.next_work(job) {
+                            Ok(work) => work,
+                            Err(error) => {
+                                warn!(%error, "AM2 serial V1 work domain unavailable; pausing dispatch until a fresh generation arrives");
+                                current_job = None;
+                                continue;
+                            }
+                        };
+                        let asic_job_id = bookkeeping.job_ids.current();
                         let frame = build_am2_serial_work_frame(&work, asic_job_id);
                         if let Err(e) = serial.write_raw_bytes(&frame) {
                             warn!(error = %e, "AM2 serial-dispatch: chain UART write failed");
                             continue;
                         }
-                        let slot = am2_serial_echoed_job_id(asic_job_id) as usize;
-                        let history = &mut work_history[slot];
-                        if history.len() >= WORK_HISTORY_PER_ID {
-                            history.pop_front();
-                        }
-                        history.push_back(WorkEntry {
-                            job_id: work.job_id.clone(),
-                            extranonce2: work.extranonce2.clone(),
-                            ntime: work.ntime,
-                            nbits: work.nbits,
-                            version: work.version,
-                            share_target: work.share_target,
-                            prev_block_hash: work.prev_block_hash,
-                            merkle_root: work.merkle_root,
-                            version_bits_per_midstate: vec![None],
-                            version_rolling_enabled: false,
-                        });
-                        asic_job_id = asic_job_id.wrapping_add(AM2_SERIAL_JOB_ID_STEP);
+                        let slot = am2_serial_echoed_job_id(asic_job_id);
+                        bookkeeping.history.push(
+                            slot,
+                            WorkEntry {
+                                work_generation: work.work_generation,
+                                job_id: work.job_id.clone(),
+                                extranonce2: work.extranonce2.clone(),
+                                ntime: work.ntime,
+                                nbits: work.nbits,
+                                version: work.version,
+                                share_target: work.share_target,
+                                prev_block_hash: work.prev_block_hash,
+                                merkle_root: work.merkle_root,
+                                version_bits_per_midstate: vec![None],
+                                version_rolling_enabled: false,
+                            },
+                        );
+                        let _ = bookkeeping.job_ids.take_and_advance();
                         total_work += 1;
                         if first_work_at.is_none() {
                             first_work_at = Some(Instant::now());
@@ -8408,7 +9349,7 @@ impl S19jHybridMiner {
                             }
                         }
                         let Some(start) = start else {
-                            // No preamble in the buffer — keep only the last
+                            // No preamble in the buffer Ã¢â‚¬â€ keep only the last
                             // byte (a possible split 0xAA) and wait for more.
                             if carry.len() > 1 {
                                 let tail = carry.split_off(carry.len() - 1);
@@ -8420,11 +9361,11 @@ impl S19jHybridMiner {
                             carry.drain(0..start);
                         }
                         if carry.len() < AM2_SERIAL_NONCE_LEN {
-                            break; // incomplete frame — wait for more bytes
+                            break; // incomplete frame Ã¢â‚¬â€ wait for more bytes
                         }
                         let frame: Vec<u8> = carry.drain(0..AM2_SERIAL_NONCE_LEN).collect();
                         total_rx_frames += 1;
-                        // DCENT_AM2_LOG_RX_FRAMES — lab diagnostic. Hex-dump
+                        // DCENT_AM2_LOG_RX_FRAMES Ã¢â‚¬â€ lab diagnostic. Hex-dump
                         // the first N raw frames + report parse status BEFORE
                         // the parse-and-continue chain consumes the unparsed
                         // ones via `continue`. Touches no control flow.
@@ -8462,7 +9403,7 @@ impl S19jHybridMiner {
                                         len = frame.len(),
                                         bytes = %hex,
                                         parsed = false,
-                                        "AM2 RX frame (lab dump) — failed to parse as .79 11-byte BM1362 serial nonce"
+                                        "AM2 RX frame (lab dump) Ã¢â‚¬â€ failed to parse as .79 11-byte BM1362 serial nonce"
                                     );
                                 }
                             }
@@ -8470,7 +9411,7 @@ impl S19jHybridMiner {
                         }
                         let Some(nr) = parse_bm1362_serial_nonce(&frame) else {
                             // A full-length frame that failed to parse is
-                            // a corrupt/HW-error frame — feed it to the
+                            // a corrupt/HW-error frame Ã¢â‚¬â€ feed it to the
                             // freq-only tuner's error signal so an
                             // over-clocked chain backs DOWN (Efficiency
                             // already walks down; this just accelerates
@@ -8492,11 +9433,11 @@ impl S19jHybridMiner {
                             am2_hybrid_reconstruct_rolled_version(0, nr.version_bits_raw);
                         total_nonces += 1;
                         hr_nonces += 1;
-                        // MINE-LIFE-1: mark liveness — the mid-run stall guard
+                        // MINE-LIFE-1: mark liveness Ã¢â‚¬â€ the mid-run stall guard
                         // measures the gap since this instant on each hashrate tick.
                         last_nonce_at = Some(Instant::now());
                         //  freq-only autotuner: aggregate this
-                        // chain's valid nonces (chain-level — the serial
+                        // chain's valid nonces (chain-level Ã¢â‚¬â€ the serial
                         // nonce frame carries no chip address). No-op
                         // when the gate is closed (`chain_stats` None).
                         if let Some(cs) = chain_stats.as_mut() {
@@ -8512,25 +9453,19 @@ impl S19jHybridMiner {
                                 total_nonces
                             );
                         }
-                        let history = &work_history[nr.job_id as usize];
-                        if history.is_empty() {
+                        if bookkeeping.history.is_empty_slot(nr.job_id) {
                             continue;
                         }
-                        if !seen_shares.insert((nr.job_id, nr.nonce, nr.version_bits_raw)) {
+                        // P1-1 pure SerialWorkBookkeeping.seen (clear-before-insert SSOT).
+                        if !bookkeeping.seen.insert(nr.job_id, nr.nonce, nr.version_bits_raw) {
                             continue; // duplicate (same job + nonce + rolled version)
                         }
-                        // AT-DASH: dedup-survivor — a genuinely distinct nonce.
+                        // AT-DASH: dedup-survivor Ã¢â‚¬â€ a genuinely distinct nonce.
                         // `total_nonces - unique_nonces` is the duplicate spam,
                         // the first number needed to crack the ~400x gap.
                         unique_nonces = unique_nonces.saturating_add(1);
-                        if dcentrald_common::should_clear_seen_shares(
-                            seen_shares.len(),
-                            dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
-                        ) {
-                            seen_shares.clear();
-                        }
                         if let Some((entry, rolled_version, achieved_difficulty)) =
-                            history.iter().rev().find_map(|candidate| {
+                            bookkeeping.history.iter_newest_first(nr.job_id).find_map(|candidate| {
                                 let (rolled_version, candidate_vbits_delta) =
                                     am2_hybrid_reconstruct_rolled_version(
                                         candidate.version,
@@ -8556,6 +9491,7 @@ impl S19jHybridMiner {
                         {
                             shares_submitted += 1;
                             let share = dcentrald_stratum::types::ValidShare {
+                                work_generation: entry.work_generation,
                                 worker_name: self.config.pool.worker.clone(),
                                 job_id: entry.job_id.clone(),
                                 extranonce2: entry.extranonce2.clone(),
@@ -8584,11 +9520,19 @@ impl S19jHybridMiner {
                 }
 
                 _ = thermal_timer.tick() => {
-                    watchdog_liveness.fetch_add(1, Ordering::Relaxed);
+                    watchdog_liveness.mark_progress();
                     if let Some(sup) = thermal_supervisor.as_mut() {
-                        match sup.poll_and_check("runtime") {
+                        match sup.poll_and_check(Am2ThermalPollStage::Runtime("runtime")) {
                             Err(e) => {
-                                error!(error = %e, "AM2 serial-dispatch runtime thermal supervisor tripped — forcing home hard-stop");
+                                error!(error = %e, "AM2 serial-dispatch runtime thermal supervisor tripped Ã¢â‚¬â€ forcing home hard-stop");
+                                if dispatch_life.is_admitted() {
+                                    let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                        dispatch_life,
+                                        DispatchRevocationCause::ThermalCutoff,
+                                        profile_max_pwm,
+                                        watchdog_feed_stop,
+                                    );
+                                }
                                 force_am2_thermal_hard_stop(&self.config, "serial-dispatch-runtime-thermal");
                                 self.shutdown.cancel();
                                 break;
@@ -8604,6 +9548,14 @@ impl S19jHybridMiner {
                                         strikes = AM2_FAN_FAULT_STRIKES,
                                         "AM2 serial-dispatch FAN FAULT (commanded PWM>0 but 0 RPM across all fans while at/above the hot threshold for 3 consecutive polls) — cutting hash POWER first, then holding fans at the configured home cap (<=30 PWM, NOT a blast)"
                                     );
+                                    if dispatch_life.is_admitted() {
+                                        let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                            dispatch_life,
+                                            DispatchRevocationCause::ThermalCutoff,
+                                            profile_max_pwm,
+                                            watchdog_feed_stop,
+                                        );
+                                    }
                                     force_am2_thermal_hard_stop(
                                         &self.config,
                                         "serial-dispatch-fan-fault",
@@ -8613,9 +9565,9 @@ impl S19jHybridMiner {
                                 }
                                 // THERM-1(b): CONSERVATIVE graded freq throttle
                                 // between hot and dangerous (opt-in; cut hash
-                                // before noise — fans NEVER raised). Floor-guarded
+                                // before noise Ã¢â‚¬â€ fans NEVER raised). Floor-guarded
                                 // so the eco ~50 MHz path is inert; only fires when
-                                // opted in AND temp ≥ hot AND current freq > floor.
+                                // opted in AND temp Ã¢â€°Â¥ hot AND current freq > floor.
                                 if am2_thermal_graded_throttle_enabled() {
                                     let current_mhz =
                                         am2_current_effective_freq_mhz(&self.config);
@@ -8645,7 +9597,7 @@ impl S19jHybridMiner {
                                         }
                                     }
                                 }
-                                // Informational only — the supervisor
+                                // Informational only Ã¢â‚¬â€ the supervisor
                                 // above remains the thermal SAFETY
                                 // authority. Feed the freq-only tuner's
                                 // thermal-refinement input (no-op when
@@ -8662,21 +9614,21 @@ impl S19jHybridMiner {
                 // ---- AT-3: gated, default-OFF, READ-ONLY quiet-window 0x3A read ----
                 //
                 // The `, if at3_rail_read_enabled` precondition DISABLES this
-                // branch entirely when the gate is closed — tokio never
+                // branch entirely when the gate is closed Ã¢â‚¬â€ tokio never
                 // constructs/polls the future, so the select! is STRICTLY
                 // byte-identical to the proven `a lab unit`/`a lab unit` milestone path
                 // (zero extra wakeups, zero behavior change), exactly like the
                 // freq-autotuner arm above. When opted in (operator set
                 // `DCENT_AM2_AT3_RAIL_READ=1`/TOML AND opted into the autotuner),
                 // read the dsPIC 0x3A analog-ADC ACTUAL rail via the parser-safe
-                // byte-wise framed path (fw=0x89/0x8A ONLY — `at3_read_measured_rail`
+                // byte-wise framed path (fw=0x89/0x8A ONLY Ã¢â‚¬â€ `at3_read_measured_rail`
                 // refuses bare/unknown firmware so it never reaches the I2C_RDWR
-                // fallback), cloning the existing single-owner I²C service handle
+                // fallback), cloning the existing single-owner IÃ‚Â²C service handle
                 // exactly as the thermal supervisor does, and publish the
                 // measured mV into the AT-1 telemetry slot tagged `measured`.
                 //
                 // READ-ONLY / measure-only: no SET_VOLTAGE, no ENABLE, no
-                // frequency change — AT-3 cannot influence the rail (the closed
+                // frequency change Ã¢â‚¬â€ AT-3 cannot influence the rail (the closed
                 // loop is AT-4+, out of scope). Best-effort: a miss publishes
                 // nothing and ages out of the AT-1 slot by TTL (clean degrade to
                 // commanded-tagged); no retry on the hot path. The voltage hard
@@ -8686,7 +9638,7 @@ impl S19jHybridMiner {
                     if let (Some(svc), Some(chain_id)) = (i2c.as_ref(), at3_chain_id) {
                         if let Some(mv) = at3_read_measured_rail(svc, pic_addr, pic_fw) {
                             // fw=0x8A 0x3A ADC scale is not yet live-verified
-                            // (RE-ASK-DSPIC-3A-FW8A-SCALE) — tag it advisory.
+                            // (RE-ASK-DSPIC-3A-FW8A-SCALE) Ã¢â‚¬â€ tag it advisory.
                             // It still flows to telemetry as `measured`, but the
                             // flag travels with it so no future consumer uses an
                             // fw=0x8A reading for a control decision.
@@ -8715,14 +9667,14 @@ impl S19jHybridMiner {
                     // difficulty over the elapsed window (NOT a flat diff-256 nonce
                     // count). `hashrate_ghs` is cumulative-since-loop-start;
                     // `hashrate_5s_ghs` is the just-elapsed window. Both are the
-                    // pool-credited truth — the diagnostic to separate dup-spam
-                    // (total_nonces ≫ unique_nonces) from real low hashing.
+                    // pool-credited truth Ã¢â‚¬â€ the diagnostic to separate dup-spam
+                    // (total_nonces Ã¢â€°Â« unique_nonces) from real low hashing.
                     let accepted = share_accounting.accepted();
                     let rejected = share_accounting.rejected();
                     let hashrate_ghs =
                         share_accounting.hashrate_ghs_since(loop_started);
                     // MINE-LIFE-2 (eco-stable): the "current"/5 s tile is a REAL
-                    // recent-window estimate — achieved-difficulty accrued over a
+                    // recent-window estimate Ã¢â‚¬â€ achieved-difficulty accrued over a
                     // WIDE rolling window (~AM2_RECENT_HASHRATE_WINDOW_S of PRIOR
                     // snapshots), NOT the cumulative lifetime average (presenting
                     // cumulative as "current" keeps showing a healthy number after
@@ -8816,7 +9768,7 @@ impl S19jHybridMiner {
                                 work_sent = total_work,
                                 rx_frames = total_rx_frames,
                                 timeout_s = timeout.as_secs(),
-                                "AM2 serial-dispatch no-nonce stall — forcing home hard-stop"
+                                "AM2 serial-dispatch no-nonce stall Ã¢â‚¬â€ forcing home hard-stop"
                             );
                             force_am2_home_hard_stop(&self.config, "serial-dispatch-no-nonce-stall");
                             self.shutdown.cancel();
@@ -8825,7 +9777,7 @@ impl S19jHybridMiner {
                     }
                     // MINE-LIFE-1: GENEROUS mid-run nonce-stall fail-closed.
                     // Trips only AFTER nonces have flowed (last_nonce_at is Some)
-                    // and then stop for the generous window — auto-restart is
+                    // and then stop for the generous window Ã¢â‚¬â€ auto-restart is
                     // unsafe on am2, so the recovery is the SAME safe teardown the
                     // no-nonce path uses (force_am2_home_hard_stop + shutdown).
                     if mid_run_stalled {
@@ -8837,7 +9789,7 @@ impl S19jHybridMiner {
                                 last_nonce_elapsed.map(|e| e.as_secs()).unwrap_or(0),
                             timeout_s =
                                 mid_run_stall_timeout.map(|t| t.as_secs()).unwrap_or(0),
-                            "AM2 serial-dispatch MID-RUN nonce stall (nonces flowed then stopped) — forcing home hard-stop"
+                            "AM2 serial-dispatch MID-RUN nonce stall (nonces flowed then stopped) Ã¢â‚¬â€ forcing home hard-stop"
                         );
                         force_am2_home_hard_stop(
                             &self.config,
@@ -8867,9 +9819,9 @@ impl S19jHybridMiner {
     /// DUAL-CHAIN serial-work-dispatch loop (`DCENT_AM2_DUAL_CHAIN_TTYS3=1`,
     /// GROUP B / W8 parity).
     ///
-    /// Drives TWO `SerialChainBackend`s in lockstep — the proven primary chain
-    /// plus a second chain on `/dev/ttyS3` (dsPIC 0x22) — so `a lab unit` mines BOTH
-    /// hashboards instead of chain 1 only (~2× the hashrate). Each chain owns an
+    /// Drives TWO `SerialChainBackend`s in lockstep Ã¢â‚¬â€ the proven primary chain
+    /// plus a second chain on `/dev/ttyS3` (dsPIC 0x22) Ã¢â‚¬â€ so `a lab unit` mines BOTH
+    /// hashboards instead of chain 1 only (~2Ãƒâ€” the hashrate). Each chain owns an
     /// independent `Am2SerialChainState` (per-chain `WorkEntry` history, dedup,
     /// rolling job id, RX carry) so nonces are attributed to the chain that
     /// produced them and BIP320 share reconstruction stays per-chain-correct.
@@ -8877,7 +9829,7 @@ impl S19jHybridMiner {
     /// Every pool job is broadcast to both chains; both chains dispatch on the
     /// same dispatch tick and are polled on the same nonce tick. The thermal
     /// supervisor and the no-nonce fail-closed guard are SHARED (the guard trips
-    /// only when NEITHER chain has produced a nonce within the window — a true
+    /// only when NEITHER chain has produced a nonce within the window Ã¢â‚¬â€ a true
     /// whole-unit stall). The freq-only autotuner is intentionally NOT wired
     /// here (it is single-synthetic-chain by design; dual-chain autotune is a
     /// separate follow-up). The run-scope owner disables voltage on BOTH
@@ -8901,12 +9853,16 @@ impl S19jHybridMiner {
         _pic_fw: Option<u8>,
         mut thermal_supervisor: Option<Am2ThermalSupervisor>,
         thermal_poll_ms: u64,
-        watchdog_liveness: Arc<AtomicU64>,
+        watchdog_liveness: SafetyLiveness,
         // AT-DASH: shared pool-share accounting (written by the status task),
         // read here on each hashrate tick to compute the real GH/s estimate and
         // publish a live `MinerState`.
         share_accounting: Arc<Am2ShareAccounting>,
         pool_quality: Arc<RwLock<dcentrald_stratum::pool_quality::PoolQualitySnapshot>>,
+        dispatch_life: &mut WorkDispatchLifecycle,
+        profile_max_pwm: u8,
+        pic_heartbeat_terminal_failed: Arc<AtomicBool>,
+        watchdog_feed_stop: &WatchdogFeedStopSignal,
     ) -> Result<()> {
         info!(
             chip_count,
@@ -8924,7 +9880,7 @@ impl S19jHybridMiner {
 
         let mut rxbuf_a = [0u8; 512];
         let mut rxbuf_b = [0u8; 512];
-        // Aggregate error counter fed to nothing today (no dual-chain tuner) —
+        // Aggregate error counter fed to nothing today (no dual-chain tuner) Ã¢â‚¬â€
         // kept so the pure `ingest_rx` signature is identical to the
         // host-tested contract; a HW-error frame still advances total_rx_frames.
         let mut errors_sink: u64 = 0;
@@ -8965,7 +9921,7 @@ impl S19jHybridMiner {
         let mut prev_b_nonces: u64 = 0;
         // MINE-LIFE-2 (eco-stable): rolling history of recent hashrate-tick
         // snapshots `(Instant, achieved_difficulty_sum)` (oldest first), pruned
-        // to ~AM2_RECENT_HASHRATE_WINDOW_S — same wide-window "current" hashrate
+        // to ~AM2_RECENT_HASHRATE_WINDOW_S Ã¢â‚¬â€ same wide-window "current" hashrate
         // as the single-chain loop so a sparse-share eco unit shows a STABLE
         // non-zero value instead of flickering to 0 between shares.
         let mut hr_window: VecDeque<(Instant, f64)> = VecDeque::new();
@@ -8978,12 +9934,43 @@ impl S19jHybridMiner {
         ));
 
         'mining: loop {
+            if pic_heartbeat_terminal_failed.load(Ordering::SeqCst) && dispatch_life.is_admitted() {
+                let action = hybrid_revoke_and_stop_watchdog_feed(
+                    dispatch_life,
+                    DispatchRevocationCause::HeartbeatFailure,
+                    profile_max_pwm,
+                    watchdog_feed_stop,
+                );
+                error!(
+                    steps = action.steps().len(),
+                    "s19j-hybrid dual-chain work-dispatch TERMINALLY REVOKED after PIC heartbeat failure (watchdog feed stopped)"
+                );
+                self.shutdown.cancel();
+                break;
+            }
+
             tokio::select! {
-                _ = self.shutdown.cancelled() => { info!("Shutdown requested"); break; }
+                _ = self.shutdown.cancelled() => {
+                    info!("Shutdown requested");
+                    if dispatch_life.is_admitted() {
+                        let cause = if pic_heartbeat_terminal_failed.load(Ordering::SeqCst) {
+                            DispatchRevocationCause::HeartbeatFailure
+                        } else {
+                            DispatchRevocationCause::OperatorSafeOff
+                        };
+                        let _ = hybrid_revoke_and_stop_watchdog_feed(
+                            dispatch_life,
+                            cause,
+                            profile_max_pwm,
+                            watchdog_feed_stop,
+                        );
+                    }
+                    break;
+                }
 
                 Some(job) = job_rx.recv() => {
                     if job.clean_jobs {
-                        info!(job_id = %job.job_id, "NEW BLOCK — flushing both chains' serial work history");
+                        info!(job_id = %job.job_id, "NEW BLOCK Ã¢â‚¬â€ flushing both chains' serial work history");
                     }
                     if job.is_flush_only() {
                         info!(job_id = %job.job_id, "Pool switch flush; dual-chain dispatch paused until next notify");
@@ -8995,6 +9982,9 @@ impl S19jHybridMiner {
                 }
 
                 _ = dispatch_timer.tick() => {
+                    if !dispatch_life.is_admitted() {
+                        continue;
+                    }
                     if let Some(frame) = chain_a.next_work_frame() {
                         if let Err(e) = serial_a.write_raw_bytes(&frame) {
                             warn!(error = %e, chain = 0, "AM2 dual-chain: chain-A UART write failed");
@@ -9052,11 +10042,19 @@ impl S19jHybridMiner {
                 }
 
                 _ = thermal_timer.tick() => {
-                    watchdog_liveness.fetch_add(1, Ordering::Relaxed);
+                    watchdog_liveness.mark_progress();
                     if let Some(sup) = thermal_supervisor.as_mut() {
-                        match sup.poll_and_check("runtime") {
+                        match sup.poll_and_check(Am2ThermalPollStage::Runtime("runtime")) {
                             Err(e) => {
-                                error!(error = %e, "AM2 dual-chain runtime thermal supervisor tripped — forcing home hard-stop");
+                                error!(error = %e, "AM2 dual-chain runtime thermal supervisor tripped Ã¢â‚¬â€ forcing home hard-stop");
+                                if dispatch_life.is_admitted() {
+                                    let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                        dispatch_life,
+                                        DispatchRevocationCause::ThermalCutoff,
+                                        profile_max_pwm,
+                                        watchdog_feed_stop,
+                                    );
+                                }
                                 force_am2_thermal_hard_stop(&self.config, "dual-chain-runtime-thermal");
                                 self.shutdown.cancel();
                                 break;
@@ -9069,14 +10067,22 @@ impl S19jHybridMiner {
                                         temp_c,
                                         hot_temp_c = sup.hot_temp_c,
                                         strikes = AM2_FAN_FAULT_STRIKES,
-                                        "AM2 dual-chain FAN FAULT (commanded PWM>0 but 0 RPM across all fans while at/above the hot threshold for 3 consecutive polls) — cutting hash POWER first, then holding fans at the configured home cap (<=30 PWM, NOT a blast)"
+                                        "AM2 dual-chain FAN FAULT (commanded PWM>0 but 0 RPM across all fans while at/above the hot threshold for 3 consecutive polls) Ã¢â‚¬â€ cutting hash POWER first, then holding fans at the configured home cap (<=30 PWM, NOT a blast)"
                                     );
+                                    if dispatch_life.is_admitted() {
+                                        let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                            dispatch_life,
+                                            DispatchRevocationCause::ThermalCutoff,
+                                            profile_max_pwm,
+                                            watchdog_feed_stop,
+                                        );
+                                    }
                                     force_am2_thermal_hard_stop(&self.config, "dual-chain-fan-fault");
                                     self.shutdown.cancel();
                                     break;
                                 }
                                 // THERM-1(b): CONSERVATIVE graded freq throttle on
-                                // BOTH chains (opt-in; cut hash before noise — fans
+                                // BOTH chains (opt-in; cut hash before noise Ã¢â‚¬â€ fans
                                 // NEVER raised). Floor-guarded so the eco path is inert.
                                 if am2_thermal_graded_throttle_enabled() {
                                     let current_mhz =
@@ -9196,7 +10202,7 @@ impl S19jHybridMiner {
                         "am2_dual_chain_status"
                     );
                     // Per-dsPIC ChainState: split the cumulative hashrate by each
-                    // chain's unique-nonce share (honest attribution — both chains
+                    // chain's unique-nonce share (honest attribution Ã¢â‚¬â€ both chains
                     // share one pool credit stream so we can't read per-chain pool
                     // difficulty, but unique-nonce ratio is the best proxy).
                     let denom = unique_total.max(1) as f64;
@@ -9243,14 +10249,14 @@ impl S19jHybridMiner {
                                 work_sent = chain_a.total_work + chain_b.total_work,
                                 rx_frames = chain_a.total_rx_frames + chain_b.total_rx_frames,
                                 timeout_s = timeout.as_secs(),
-                                "AM2 dual-chain no-nonce stall (NEITHER chain produced a nonce) — forcing home hard-stop"
+                                "AM2 dual-chain no-nonce stall (NEITHER chain produced a nonce) Ã¢â‚¬â€ forcing home hard-stop"
                             );
                             force_am2_home_hard_stop(&self.config, "dual-chain-no-nonce-stall");
                             self.shutdown.cancel();
                             break;
                         }
                     }
-                    // MINE-LIFE-1: GENEROUS unit-level mid-run stall fail-closed —
+                    // MINE-LIFE-1: GENEROUS unit-level mid-run stall fail-closed Ã¢â‚¬â€
                     // trips only when NEITHER chain has produced a nonce within the
                     // generous window after nonces had flowed (auto-restart is
                     // unsafe on am2, so recovery is the SAME safe teardown).
@@ -9262,7 +10268,7 @@ impl S19jHybridMiner {
                                 unit_last_nonce_elapsed.map(|e| e.as_secs()).unwrap_or(0),
                             timeout_s =
                                 mid_run_stall_timeout.map(|t| t.as_secs()).unwrap_or(0),
-                            "AM2 dual-chain MID-RUN nonce stall (NEITHER chain stayed active) — forcing home hard-stop"
+                            "AM2 dual-chain MID-RUN nonce stall (NEITHER chain stayed active) Ã¢â‚¬â€ forcing home hard-stop"
                         );
                         force_am2_home_hard_stop(&self.config, "dual-chain-mid-run-stall");
                         self.shutdown.cancel();
@@ -9286,10 +10292,19 @@ impl S19jHybridMiner {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let _route_admission = self
-            .route_admission
+        // Declare the fail-closed owner before every hardware resource created
+        // below. Early returns drop later owners first and never magic-close
+        // the watchdog without receipt-bearing teardown.
+        let S19jHybridSafetyAdmission {
+            route_admission: _route_admission,
+            mut watchdog,
+            mut watchdog_route_scope,
+            liveness: watchdog_liveness,
+            hardware_mutation_owner,
+        } = self
+            .safety_admission
             .take()
-            .ok_or_else(|| anyhow::anyhow!("AM2 hybrid route admission was already consumed"))?;
+            .ok_or_else(|| anyhow::anyhow!("AM2 hybrid safety admission was already consumed"))?;
         info!("=== S19J PRO HYBRID MINING (Serial init + FPGA work, APW121215a PSU) ===");
 
         if self.shutdown.is_cancelled() {
@@ -9341,6 +10356,10 @@ impl S19jHybridMiner {
                     serial_device
                 )
             })?;
+        // Mid-run PIC heartbeat terminal failure latch Ã¢â‚¬â€ shared with the
+        // work-dispatch lifecycle (Phase 10). Passthrough never starts the HB
+        // thread; the flag stays false.
+        let pic_heartbeat_terminal_failed = Arc::new(AtomicBool::new(false));
         let mut chain_uart_device = std::env::var("DCENT_AM2_CHAIN_UART_OVERRIDE")
             .ok()
             .filter(|s| !s.is_empty())
@@ -9389,6 +10408,8 @@ impl S19jHybridMiner {
             );
         }
         let chip_count = self.config.mining.serial_chip_count.unwrap_or(126);
+        // P2-9: capture live unique enum when ASIC init completes (preferred over config).
+        let mut live_enumerated_chips: Option<u32> = None;
         let target_freq = self.config.mining.frequency_mhz;
         if !passthrough && process_name_running("bosminer") {
             anyhow::bail!(
@@ -9407,7 +10428,7 @@ impl S19jHybridMiner {
             // does NOT run under `panic = "abort"`; the panic hook in `main()`
             // reads these params to perform the same best-effort
             // cut-hash-before-noise teardown on a crash.
-            arm_am2_teardown_params(&self.config);
+            arm_am2_teardown_params(&self.config)?;
             Some(Am2HomeHardStopGuard::new(&self.config))
         };
 
@@ -9422,15 +10443,15 @@ impl S19jHybridMiner {
             .context("Invalid fpga_chain_base hex address")?;
         let fpga_chain_id = self.config.mining.fpga_chain_id.unwrap_or(1);
 
-        // Map logical chain_id → physical chain index for the diagnostic
+        // Map logical chain_id Ã¢â€ â€™ physical chain index for the diagnostic
         // glitch-monitor mirror lookup (Braiins-am2 only).
         //
         // Per Phase 1 probe .139: chain1 is physical chain 2 (populated), chain4
         // is physical chain 3 (populated), physical chain 1 is unpopulated. The
         // BraiinsGlitchMonitor mirror layout matches bosminer's UartRelayReg
         // string-table layout:
-        //   phys_idx 2 → +0x30 (chain1)
-        //   phys_idx 3 → +0x34 (chain4)
+        //   phys_idx 2 Ã¢â€ â€™ +0x30 (chain1)
+        //   phys_idx 3 Ã¢â€ â€™ +0x34 (chain4)
         let relay_phys_idx: u8 = match fpga_chain_id {
             1 => 2,
             4 => 3,
@@ -9441,7 +10462,7 @@ impl S19jHybridMiner {
         };
 
         // ================================================================
-        // BraiinsGlitchMonitor (UIO) bring-up — BEFORE Phase 0.
+        // BraiinsGlitchMonitor (UIO) bring-up Ã¢â‚¬â€ BEFORE Phase 0.
         //
         // W13.B1 (2026-05-10) RECLASSIFIED: the `0x43D000xx` window is a
         // diagnostic-only glitch-monitor mirror, Braiins-am2 only. Stock
@@ -9466,7 +10487,7 @@ impl S19jHybridMiner {
                     Ok(gm) => {
                         info!(
                             uio = uio_n,
-                            "BraiinsGlitchMonitor opened (Braiins-am2 only — diagnostic mirror, NOT control)"
+                            "BraiinsGlitchMonitor opened (Braiins-am2 only Ã¢â‚¬â€ diagnostic mirror, NOT control)"
                         );
                         self.glitch_monitor = Some(gm);
                     }
@@ -9474,13 +10495,13 @@ impl S19jHybridMiner {
                         warn!(
                             uio = uio_n,
                             error = %e,
-                            "BraiinsGlitchMonitor::open() failed during early init — diagnostic-only telemetry skipped"
+                            "BraiinsGlitchMonitor::open() failed during early init Ã¢â‚¬â€ diagnostic-only telemetry skipped"
                         );
                     }
                 },
                 None => {
                     info!(
-                        "No miner-glitch-monitor UIO discovered — diagnostic-only telemetry skipped (stock hw or non-Braiins-am2 bitstream)"
+                        "No miner-glitch-monitor UIO discovered Ã¢â‚¬â€ diagnostic-only telemetry skipped (stock hw or non-Braiins-am2 bitstream)"
                     );
                 }
             }
@@ -9494,37 +10515,40 @@ impl S19jHybridMiner {
         }
 
         // ================================================================
-        // Phase 0: PSU bring-up — THREE mutually-exclusive branches:
-        //   (a) passthrough            — bosminer owns the PSU; do nothing here.
-        //   (b) psu_override.enabled   — "Loki bypass": a non-smart PSU
+        // Phase 0: PSU bring-up Ã¢â‚¬â€ THREE mutually-exclusive branches:
+        //   (a) passthrough            Ã¢â‚¬â€ bosminer owns the PSU; do nothing here.
+        //   (b) psu_override.enabled   Ã¢â‚¬â€ "Loki bypass": a non-smart PSU
         //                                (e.g. APW3 @ ~12.8 V). No APW121215a
         //                                to probe / no watchdog / no DAC.
         //                                Assert PWR_CONTROL via `PsuBypassGate`,
         //                                record the declared model + rail
         //                                voltage, NO heartbeat thread, NO 5 s
-        //                                stability sleep — then fall through.
-        //   (c) default                — APW121215a @ /dev/i2c-0 slave 0x10:
+        //                                stability sleep Ã¢â‚¬â€ then fall through.
+        //   (c) default                Ã¢â‚¬â€ APW121215a @ /dev/i2c-0 slave 0x10:
         //                                MUST be first (PSU self-disables in
         //                                ~30 s without a heartbeat). Bring the
-        //                                bus up, probe FW, run 3×Disable → Ramp
-        //                                → Enable (`set_voltage_init_bypass`,
+        //                                bus up, probe FW, run 3Ãƒâ€”Disable Ã¢â€ â€™ Ramp
+        //                                Ã¢â€ â€™ Enable (`set_voltage_init_bypass`,
         //                                heartbeat not started yet), spawn the
         //                                1 Hz heartbeat thread, wait 5 s so
         //                                downstream SetVoltage can pass its
         //                                stability gate. See `10-psu-watchdog.md`.
         //
         // In all three cases `i2c0_service` is still spawned below (Phase 1
-        // dsPIC + the EEPROM 0x50-0x57 write-denylist) — the override branch
+        // dsPIC + the EEPROM 0x50-0x57 write-denylist) Ã¢â‚¬â€ the override branch
         // simply never opens an `Apw121215a` on it.
         // ================================================================
         if self.shutdown.is_cancelled() {
             anyhow::bail!("AM2 hybrid run was cancelled before PSU/rail bring-up");
         }
         let psu_arc: Option<Arc<Mutex<Apw121215a>>>;
-        let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
+        let actor_owner = watchdog_route_scope
+            .take_actor_owner()
+            .context("s19j-hybrid: watchdog actor roster owner is unavailable")?;
+        let mut runtime_threads = actor_owner.activate(self.shutdown.clone());
         // RAII guard for the "Loki bypass" path: owns PWR_CONTROL when
         // `psu_override.enabled` and the APW121215a path is skipped. Lives to
-        // `run()` scope-end so its Drop deasserts PWR_CONTROL — the same
+        // `run()` scope-end so its Drop deasserts PWR_CONTROL Ã¢â‚¬â€ the same
         // teardown guarantee `Apw121215a::Drop` gives the default branch via
         // `psu_arc`. Underscore-prefixed: it is a pure guard, never read.
         // `mut` so the WAKE-DSPIC-BEFORE-RAIL path can bind the deferred rail gate
@@ -9561,8 +10585,8 @@ impl S19jHybridMiner {
         let i2c0_service: Option<I2cServiceHandle> = if passthrough {
             None
         } else {
-            // am2 hashboard EEPROM is at I²C addresses 0x50-0x57 (AT24C-series
-            // standard). dcentrald NEVER writes to these — only bosminer reads
+            // am2 hashboard EEPROM is at IÃ‚Â²C addresses 0x50-0x57 (AT24C-series
+            // standard). dcentrald NEVER writes to these Ã¢â‚¬â€ only bosminer reads
             // them at boot for board identity. Block writes at the bus layer to
             // defend against any future code-path bug or misrouted address.
             // (2026-04-29
@@ -9590,7 +10614,7 @@ impl S19jHybridMiner {
             );
             Some(service)
         };
-        // SKIP early chain probe — live `a lab unit` evidence (2026-04-26) shows
+        // SKIP early chain probe Ã¢â‚¬â€ live `a lab unit` evidence (2026-04-26) shows
         // the probe at fresh boot writes the parser-flush + GET_VERSION to
         // each candidate dsPIC, which corrupts the parser state of healthy
         // chains and breaks the subsequent Phase 1 GET_VERSION. Earlier runs
@@ -9605,24 +10629,24 @@ impl S19jHybridMiner {
         let active_chains: u8 = 0b111;
 
         if passthrough {
-            info!("PASSTHROUGH MODE — skipping Phase 0 PSU bring-up (bosminer owns PSU)");
+            info!("PASSTHROUGH MODE Ã¢â‚¬â€ skipping Phase 0 PSU bring-up (bosminer owns PSU)");
             psu_arc = None;
             _psu_bypass_gate = None;
         } else if psu_override_active {
             // -----------------------------------------------------------------
-            // Phase 0 branch (b): PSU OVERRIDE ("Loki bypass") — non-smart PSU.
+            // Phase 0 branch (b): PSU OVERRIDE ("Loki bypass") Ã¢â‚¬â€ non-smart PSU.
             //
             // The operator declared a PSU model + output voltage (e.g. an APW3
-            // tweaked to ~12.8 V — the "Loki Mod"). There is no APW121215a at
+            // tweaked to ~12.8 V Ã¢â‚¬â€ the "Loki Mod"). There is no APW121215a at
             // 0x10 to probe, nothing to disable-watchdog / set-DAC / arm. We
             // still MUST assert PWR_CONTROL (the APW3 output enable is wired
             // through it on a Loki-modded chassis, exactly like the stock
             // APW12 was), then proceed straight to Phase 1 (the hashboard
-            // dsPIC chip-voltage path is UNCHANGED — it regulates ~13.7 V on
+            // dsPIC chip-voltage path is UNCHANGED Ã¢â‚¬â€ it regulates ~13.7 V on
             // the chain from whatever the PSU delivers upstream).
             //
             // NOTE: `psu_override.voltage_v` is the PSU output / hashboard-DC-DC
-            // *input* rail (~12.8 V) — it is deliberately NOT used as the
+            // *input* rail (~12.8 V) Ã¢â‚¬â€ it is deliberately NOT used as the
             // per-chain chip-rail setpoint. Phase 3's `cold_boot_init(13_700)`
             // is the chip rail and is untouched here.
             // and
@@ -9639,7 +10663,7 @@ impl S19jHybridMiner {
                 warn!(
                     voltage_v = declared_rail_v,
                     "[power.psu_override].voltage_v looks unusual for an Antminer PSU rail \
-                     (expected ~12.0-14.5 V) — this is the PSU OUTPUT rail, not the ~1.3 V \
+                     (expected ~12.0-14.5 V) Ã¢â‚¬â€ this is the PSU OUTPUT rail, not the ~1.3 V \
                      chip voltage; proceeding anyway"
                 );
             }
@@ -9652,7 +10676,7 @@ impl S19jHybridMiner {
             {
                 warn!(
                     psu_model = %self.config.psu.model,
-                    "[psu].model says APW12 but [power.psu_override] is enabled — if this unit \
+                    "[psu].model says APW12 but [power.psu_override] is enabled Ã¢â‚¬â€ if this unit \
                      actually has a smart APW12/APW121215a it will self-disable the rail in \
                      ~30 s with no heartbeat; the override path runs NO heartbeat thread"
                 );
@@ -9678,7 +10702,7 @@ impl S19jHybridMiner {
                     model = %declared_model,
                     rail_v = declared_rail_v,
                     t_ms = t(),
-                    "[T+{}] Phase 0 (b): WAKE-DSPIC-BEFORE-RAIL — main 12.8 V rail HELD OFF; \
+                    "[T+{}] Phase 0 (b): WAKE-DSPIC-BEFORE-RAIL Ã¢â‚¬â€ main 12.8 V rail HELD OFF; \
                      dsPIC will wake on 3.3 V standby first (bosminer block-A order); rail \
                      asserted just before Phase 2b/EBR",
                     t()
@@ -9696,13 +10720,13 @@ impl S19jHybridMiner {
                     gpio = gate.gpio(),
                     efficiency = ?crate::runtime::efficiency::psu_efficiency_for_model_name(&declared_model),
                     t_ms = t(),
-                    "[T+{}] Phase 0 (b): PSU OVERRIDE (Loki bypass) — operator-declared non-smart PSU; \
+                    "[T+{}] Phase 0 (b): PSU OVERRIDE (Loki bypass) Ã¢â‚¬â€ operator-declared non-smart PSU; \
                      PWR_CONTROL asserted; rail voltage recorded (NOT the chip voltage)",
                     t()
                 );
 
-                // CE §10 #4: this `Some(gate)` is the PSU-override (Loki / bare-APW3)
-                // branch's PWR_CONTROL owner — a GPIO-only `PsuBypassGate` that holds
+                // CE Ã‚Â§10 #4: this `Some(gate)` is the PSU-override (Loki / bare-APW3)
+                // branch's PWR_CONTROL owner Ã¢â‚¬â€ a GPIO-only `PsuBypassGate` that holds
                 // the rail enable for the whole run (no smart-APW12 PSU object exists
                 // on this path). It is dropped at end-of-run scope, NOT reassigned to
                 // None mid-run (contrast the smart-APW12 success branch above, which
@@ -9710,7 +10734,7 @@ impl S19jHybridMiner {
                 _psu_bypass_gate = Some(gate);
             }
 
-            //  (2026-05-22) — log operator-declared psu_hardware_variant
+            //  (2026-05-22) Ã¢â‚¬â€ log operator-declared psu_hardware_variant
             // ( EE-LOKI-001 telemetry). Metadata only, not consumed by
             // any mining decision path; useful for fleet inventory + future
             // telemetry surfaces.
@@ -9723,17 +10747,17 @@ impl S19jHybridMiner {
 
             // W1.5 RE (2026-06-13, jig-decoded; CORRECTED 2026-06-13 after a code
             // re-read): the BM1362 factory jig (single_board_test `FUN_00015500`)
-            // waits `usleep(3000000)` = 3.0s AFTER "APW power on ok" — i.e. after the
-            // PSU output rail is enabled — BEFORE PIC-EN + the reset pulse + find-ASIC.
+            // waits `usleep(3000000)` = 3.0s AFTER "APW power on ok" Ã¢â‚¬â€ i.e. after the
+            // PSU output rail is enabled Ã¢â‚¬â€ BEFORE PIC-EN + the reset pulse + find-ASIC.
             // ACCURATE DCENT baseline: all three Phase-0 branches DO share the Phase-0p
             // post-EEPROM dsPIC-boot grace (~2s, `am2_post_eeprom_dspic_grace_ms`,
             // s19j ~8101) before Phase 1, and the smart-APW branch additionally has a
             // 5s SetVoltage-stability sleep (s19j ~8017, NOT on this Loki path). So the
-            // override path was NOT a zero-settle path — it had ~2s pre-PIC-EN, but
+            // override path was NOT a zero-settle path Ã¢â‚¬â€ it had ~2s pre-PIC-EN, but
             // that is 1s SHORT of the jig's 3s post-APW AND it is not positioned right
             // after the rail enable (it is post-EEPROM, dsPIC-boot-purposed). This adds
-            // the jig-POSITIONED ≥3s post-APW rail-stabilization settle ON TOP of
-            // Phase-0p — a timing REFINEMENT to reach/exceed the jig's 3s, not a
+            // the jig-POSITIONED Ã¢â€°Â¥3s post-APW rail-stabilization settle ON TOP of
+            // Phase-0p Ã¢â‚¬â€ a timing REFINEMENT to reach/exceed the jig's 3s, not a
             // from-zero missing settle. Plausible (not certain) contributor to the
             // class-B cold-rail signature; the DMM at the die is the real arbiter.
             // Gated: byte-identical (0 ms) for every current unit by default (incl.
@@ -9748,7 +10772,7 @@ impl S19jHybridMiner {
                 info!(
                     settle_ms = post_apw_settle_ms,
                     t_ms = t(),
-                    "[T+{}] Phase 0 (b): post-APW-power-on rail settle (jig-faithful, W1.5 RE) — \
+                    "[T+{}] Phase 0 (b): post-APW-power-on rail settle (jig-faithful, W1.5 RE) Ã¢â‚¬â€ \
                      {} ms before dsPIC ENABLE + enum",
                     t(),
                     post_apw_settle_ms
@@ -9756,18 +10780,18 @@ impl S19jHybridMiner {
                 std::thread::sleep(Duration::from_millis(post_apw_settle_ms));
             }
 
-            //  (2026-05-22) — EE-LOKI-001 hard-skip gate:
+            //  (2026-05-22) Ã¢â‚¬â€ EE-LOKI-001 hard-skip gate:
             //
             // When the operator declares `[power.psu_override].no_smbus_peer = true`
             // they have asserted "there is NO Loki spoof / APW12 peer on
-            // i2c-0@0x10 — this chassis is bare-modded-APW3". The lenient
-            // probe's 200 ms deadline + 3×100 ms retry adds latency for no
+            // i2c-0@0x10 Ã¢â‚¬â€ this chassis is bare-modded-APW3". The lenient
+            // probe's 200 ms deadline + 3Ãƒâ€”100 ms retry adds latency for no
             // benefit AND opens the EE-LOKI-001 phantom-device-on-0x10 SMBus
-            // hazard (per EE review §5/T3): a residual Loki carcass, test
+            // hazard (per EE review Ã‚Â§5/T3): a residual Loki carcass, test
             // fixture, or miswire could ACK the probe and receive the
             // bosminer-canonical SetVoltage 15.2V sequence intended for a
             // smart-APW12. The BM1362 chip itself is electrically isolated
-            // by the per-board buck, so this is not a chip-damage path —
+            // by the per-board buck, so this is not a chip-damage path Ã¢â‚¬â€
             // but the unintended-peer SMBus byte exposure is closed by
             // skipping the probe entirely.
             //
@@ -9775,7 +10799,7 @@ impl S19jHybridMiner {
             // that can return a heartbeat handle is never called. The daemon
             // proceeds to PWR_CONTROL-only mode through to Phase 1 unchanged.
             //
-            //  (2026-05-26) — zero-PSU-byte diagnostic gate:
+            //  (2026-05-26) Ã¢â‚¬â€ zero-PSU-byte diagnostic gate:
             //
             // Patch 8's launcher tried to prove the `a lab unit` path on `a lab unit` by
             // unsetting every Loki/APW env var, but the runtime still entered
@@ -9789,7 +10813,7 @@ impl S19jHybridMiner {
             if ovr.no_smbus_peer == Some(true) {
                 info!(
                     t_ms = t(),
-                    "[T+{}] Phase 0c: no_smbus_peer=true — hard-skipping smart-APW12 probe \
+                    "[T+{}] Phase 0c: no_smbus_peer=true Ã¢â‚¬â€ hard-skipping smart-APW12 probe \
                      (operator-declared bare APW3; closes EE-LOKI-001 phantom-device hazard)",
                     t()
                 );
@@ -9799,7 +10823,7 @@ impl S19jHybridMiner {
                     t_ms = t(),
                     env_gate = "DCENT_AM2_ZERO_PSU_BYTES=1",
                     transport = psu_transport,
-                    "[T+{}] Phase 0c: DCENT_AM2_ZERO_PSU_BYTES=1 — hard-skipping \
+                    "[T+{}] Phase 0c: DCENT_AM2_ZERO_PSU_BYTES=1 Ã¢â‚¬â€ hard-skipping \
                      smart-APW12/Loki gpio-bitbang branch under psu_override \
                      (zero PSU bytes; PWR_CONTROL-only mode)",
                     t()
@@ -9810,22 +10834,22 @@ impl S19jHybridMiner {
                 //
                 // 2026-05-22 (XIL `a lab unit` recovery): the operator's BraiinsOS log on
                 // `a lab unit` shows the Loki board IS a smart-APW12 spoof at 0x10
-                // (FW '0x71' (APW121215a)) — it answers GetFwVersion, accepts the
-                // canonical `3× Disable → Ramp → Enable` sequence, and grants
+                // (FW '0x71' (APW121215a)) Ã¢â‚¬â€ it answers GetFwVersion, accepts the
+                // canonical `3Ãƒâ€” Disable Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable` sequence, and grants
                 // a working rail. The legacy `psu_override` branch SKIPPED this
-                // handshake entirely on the assumption "non-smart PSU = no I²C
+                // handshake entirely on the assumption "non-smart PSU = no IÃ‚Â²C
                 // peer", which is wrong on Loki-equipped units. Opportunistically
                 // try the bosminer-canonical sequence here; on success spawn the
                 // 1 Hz heartbeat so the spoof watchdog doesn't drop the rail. On
                 // a genuinely silent bus (Loki-removed real APW3) this falls
-                // through cleanly in ~200 ms with `psu = None` — byte-identical
+                // through cleanly in ~200 ms with `psu = None` Ã¢â‚¬â€ byte-identical
                 // to today's `psu_override` branch behaviour from that point on.
                 //
                 // The PWR_CONTROL gate is owned by the `PsuBypassGate` above; the
                 // helper opens its `Apw121215a` WITHOUT a gate_spec to avoid
                 // double-asserting the same GPIO.
                 //
-                // §(d) FIX-A.
+                // Ã‚Â§(d) FIX-A.
                 match i2c0_service.as_ref() {
                     Some(i2c0) => {
                         let outcome = bring_up_apw121215a_smart_lenient(
@@ -9835,16 +10859,16 @@ impl S19jHybridMiner {
                             psu_heartbeat_interval,
                             self.shutdown.clone(),
                             psu_transport,
-                        );
+                            &mut runtime_threads,
+                        )?;
                         psu_arc = outcome.psu;
-                        if let Some(handle) = outcome.heartbeat {
-                            runtime_threads.push("s19j-psu-heartbeat", handle);
-                        }
-                        if psu_arc.is_some() && runtime_threads.contains("s19j-psu-heartbeat") {
+                        if psu_arc.is_some()
+                            && runtime_threads.slot_is_registered(HybridThreadSlot::PsuHeartbeat)
+                        {
                             info!(
                                 t_ms = t(),
                                 "[T+{}] Phase 0 (b): smart-APW12 spoof handshake SUCCEEDED on Loki bus \
-                                 — heartbeat thread spawned; bosminer-parity init achieved",
+                                 Ã¢â‚¬â€ heartbeat thread spawned; bosminer-parity init achieved",
                                 t()
                             );
                         } else if psu_arc.is_some() {
@@ -9853,7 +10877,7 @@ impl S19jHybridMiner {
                             // enum + work dispatch: without the heartbeat the spoof
                             // watchdog self-disables the rail in ~30 s, so proceeding
                             // would energize the chips and start mining on a PSU that
-                            // is about to drop (fail-open — brief mining under an
+                            // is about to drop (fail-open Ã¢â‚¬â€ brief mining under an
                             // unmaintained rail). Bail so the run tears down and the
                             // PsuBypassGate de-energizes PWR_CONTROL now. This branch
                             // is only reachable on a rare thread-spawn failure, never
@@ -9862,20 +10886,20 @@ impl S19jHybridMiner {
                             error!(
                                 t_ms = t(),
                                 "[T+{}] Phase 0 (b): smart-APW12 rail ENABLED but heartbeat thread \
-                                 spawn FAILED (psu=Some, heartbeat=None) — refusing to bring up the \
+                                 spawn FAILED (smart PSU present without its typed roster slot) Ã¢â‚¬â€ refusing to bring up the \
                                  chip rail on a PSU with no heartbeat; tearing down",
                                 t()
                             );
                             anyhow::bail!(
                                 "am2 hybrid: PSU rail enabled but the heartbeat thread failed to \
-                                 spawn — refusing to mine on an unmaintained rail (teardown \
+                                 spawn Ã¢â‚¬â€ refusing to mine on an unmaintained rail (teardown \
                                  de-energizes PWR_CONTROL)"
                             );
                         } else {
                             info!(
                                 t_ms = t(),
                                 "[T+{}] Phase 0 (b): smart-APW12 opportunistic bring-up returned no PSU \
-                                 (Loki-removed or genuinely-silent bus) — proceeding with \
+                                 (Loki-removed or genuinely-silent bus) Ã¢â‚¬â€ proceeding with \
                                  PWR_CONTROL-only (legacy psu_override behaviour)",
                                 t()
                             );
@@ -9885,7 +10909,7 @@ impl S19jHybridMiner {
                         // `i2c0_service` is None only in `passthrough` mode, which
                         // is a different branch above. Defensive log only.
                         warn!(
-                            "Phase 0 (b): i2c0_service is None in psu_override branch — \
+                            "Phase 0 (b): i2c0_service is None in psu_override branch Ã¢â‚¬â€ \
                              skipping smart-APW12 handshake (this should not happen)"
                         );
                         psu_arc = None;
@@ -9920,7 +10944,7 @@ impl S19jHybridMiner {
             // Phase 7A finding: PSU at 0x10 is silent until hashboard dsPICs + PSU
             // dsPIC finish booting (~97 s of bosminer's "hashboard EEPROM reads"
             // accidentally gates this). Probe 0x50 (hashboard EEPROM) in a bounded
-            // retry loop — once EEPROM ACKs, the hashboards are up and PSU should
+            // retry loop Ã¢â‚¬â€ once EEPROM ACKs, the hashboards are up and PSU should
             // be too. Max 120 s wait (bosminer sometimes takes the full 97 s).
             info!("Phase 0a: Waiting for hashboard dsPICs to boot (probing 0x50 ACK)...");
             let mut psu = match psu_transport {
@@ -9929,7 +10953,7 @@ impl S19jHybridMiner {
                         .context("Failed to open APW121215a via gpio bit-bang")?;
                     // Hand the gate spec to the PSU module before cold-boot;
                     // `cold_boot_sequence_write_only` will assert the gate
-                    // fail-closed before any I²C write reaches the APW.
+                    // fail-closed before any IÃ‚Â²C write reaches the APW.
                     psu.set_psu_gate_spec(psu_gate_spec.clone());
 
                     //  (2026-05-24): STANDALONE Loki cold-boot path.
@@ -9938,14 +10962,14 @@ impl S19jHybridMiner {
                     //   2. `a lab unit`-class XIL hardware fingerprint matches
                     //   3. env DCENT_AM2_TRUST_RAIL_FALLBACK != 1
                     //      (operator NOT asking for bosminer-handoff)
-                    // Default-OFF — when ANY condition fails, the call site
+                    // Default-OFF Ã¢â‚¬â€ when ANY condition fails, the call site
                     // falls through to the byte-identical
                     // `cold_boot_sequence_write_only` path ( proven
                     // recipe), preserving fleet behavior for `a lab unit` / `a lab unit` /
                     // `a lab unit` / `a lab unit` / S9 byte-for-byte.
                     //
                     //
-                    // PHASE2B-BYTE-LEVEL-GAPS.md` for the  →
+                    // PHASE2B-BYTE-LEVEL-GAPS.md` for the  Ã¢â€ â€™
                     // byte mapping. Regression-pinned by
                     // `tests/wave55b_loki_cold_boot_sequence.rs`.
                     let wave55b_loki_cold_boot_active = am2_psu_loki_cold_boot_full_enabled()
@@ -9955,7 +10979,7 @@ impl S19jHybridMiner {
                         warn!(
                             target_v = psu_target_rail_v,
                             env_gate = "DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1",
-                            "Wave-55b STANDALONE Loki cold-boot path ENGAGED — \
+                            "Wave-55b STANDALONE Loki cold-boot path ENGAGED Ã¢â‚¬â€ \
                              emitting Wave-38 cold-wake bytes before disable+ramp+enable. \
                              This is the no-bosminer-handoff bring-up path."
                         );
@@ -9986,7 +11010,7 @@ impl S19jHybridMiner {
                             Ok(_) => {
                                 info!(
                                     attempts,
-                                    "Hashboard EEPROM 0x50 identity prefix readable — dsPICs ready"
+                                    "Hashboard EEPROM 0x50 identity prefix readable Ã¢â‚¬â€ dsPICs ready"
                                 );
                                 eeprom_ready = true;
                                 break;
@@ -10008,7 +11032,7 @@ impl S19jHybridMiner {
                     if !eeprom_ready {
                         warn!(
                             attempts,
-                            "Hashboard EEPROM identity prefix remained unreadable for 60 s — proceeding with PSU init anyway"
+                            "Hashboard EEPROM identity prefix remained unreadable for 60 s Ã¢â‚¬â€ proceeding with PSU init anyway"
                         );
                     }
                     let mut psu = Apw121215a::open_service_at(probe_i2c.clone(), 0, psu_address)
@@ -10036,14 +11060,18 @@ impl S19jHybridMiner {
                             response_len = device_type.len(),
                             "PSU device-type bytes: {:02X?}", device_type
                         ),
-                        Err(e) => {
-                            warn!(error = %e, "PSU device-type read failed — non-fatal")
-                        }
+                        Err(e) if optional_apw_device_type_failure(&e) => warn!(
+                            error = %e,
+                            "PSU optional device-type observation failed on the wire Ã¢â‚¬â€ non-fatal"
+                        ),
+                        Err(e) => return Err(e).context(
+                            "PSU optional device-type observation lost typed controller authority",
+                        ),
                     }
 
                     info!(
                         t_ms = t(),
-                        "[T+{}] APW disable cycle start (3× → Ramp → Enable)",
+                        "[T+{}] APW disable cycle start (3Ãƒâ€” Ã¢â€ â€™ Ramp Ã¢â€ â€™ Enable)",
                         t()
                     );
                     psu.cold_boot_sequence(psu_target_rail_v)
@@ -10058,13 +11086,14 @@ impl S19jHybridMiner {
             // Spawn the 1 Hz heartbeat BEFORE anything that could take >30 s.
             let psu_hb = psu.clone();
             let shutdown_hb = self.shutdown.clone();
-            runtime_threads.push(
-                "s19j-psu-heartbeat",
-                std::thread::Builder::new()
-                    .name("s19j-psu-hb".into())
-                    .spawn(move || psu_heartbeat_loop(psu_hb, shutdown_hb, psu_heartbeat_interval))
-                    .context("Failed to spawn PSU heartbeat thread")?,
-            );
+            let heartbeat_slot = runtime_threads
+                .reserve(HybridThreadSlot::PsuHeartbeat)
+                .context("failed to reserve hybrid PSU-heartbeat roster slot")?;
+            let heartbeat = std::thread::Builder::new()
+                .name("s19j-psu-hb".into())
+                .spawn(move || psu_heartbeat_loop(psu_hb, shutdown_hb, psu_heartbeat_interval))
+                .context("Failed to spawn PSU heartbeat thread")?;
+            heartbeat_slot.attach(heartbeat);
             info!(
                 hz = psu_heartbeat_hz,
                 t_ms = t(),
@@ -10073,31 +11102,39 @@ impl S19jHybridMiner {
                 psu_heartbeat_hz
             );
 
-            // Wait ≥5 stable ticks before any runtime SetVoltage path is allowed.
+            // Wait Ã¢â€°Â¥5 stable ticks before any runtime SetVoltage path is allowed.
             // (cold_boot_sequence used set_voltage_init_bypass, which skips the gate
             // precisely for this opening window.)
             //
-            // CE-002: this is a PURE wall-clock settle window — nothing touches
-            // the I²C bus during it (the 1 Hz PSU heartbeat runs on its own
+            // CE-002: this is a PURE wall-clock settle window Ã¢â‚¬â€ nothing touches
+            // the IÃ‚Â²C bus during it (the 1 Hz PSU heartbeat runs on its own
             // `std::thread`, NOT this Tokio worker). Using `tokio::time::sleep`
             // instead of `std::thread::sleep` lets the executor service the
             // already-spawned :8080 API / dashboard / MCP / watchdog tasks
             // during the 5 s instead of starving them. Hardware semantics are
-            // byte-identical (same wall-clock delay, same ordering — no bus
+            // byte-identical (same wall-clock delay, same ordering Ã¢â‚¬â€ no bus
             // activity is interleaved here, so there is no async-reorder risk).
             tokio::time::sleep(Duration::from_secs(5)).await;
             psu_arc = Some(psu);
-            // CE §10 #4 ( expert review): the `= None` here is an
+            // CE Ã‚Â§10 #4 ( expert review): the `= None` here is an
             // INTENTIONAL ownership handoff, not dead state. The smart-APW12
             // `Apw121215a` (`psu`) has just taken PWR_CONTROL ownership for the
             // rest of the run; reassigning `_psu_bypass_gate = None` drops the
             // earlier GPIO-only `PsuBypassGate` whose `Drop` would otherwise
             // deassert PWR_CONTROL out from under the now-live PSU. Exactly one
-            // owner of PWR_CONTROL must exist at a time — do NOT remove this
+            // owner of PWR_CONTROL must exist at a time Ã¢â‚¬â€ do NOT remove this
             // line or move the gate's lifetime; the Drop ordering is the
-            // invariant. See `psu_bypass_gate.rs` and the §4.3 finding.
+            // invariant. See `psu_bypass_gate.rs` and the Ã‚Â§4.3 finding.
             _psu_bypass_gate = None;
         }
+
+        runtime_threads
+            .resolve_conditional(
+                HybridThreadSlot::PsuHeartbeat,
+                psu_arc.is_some(),
+                "AM2 route has no daemon-owned smart PSU heartbeat",
+            )
+            .context("s19j-hybrid: PSU-heartbeat roster does not match discovered topology")?;
 
         if am2_diag_stop_after_psu_enabled() {
             warn!(
@@ -10105,8 +11142,9 @@ impl S19jHybridMiner {
                 env_gate = "DCENT_AM2_DIAG_STOP_AFTER_PSU=1",
                 psu_override = psu_override_active,
                 psu_object_opened = psu_arc.is_some(),
-                psu_heartbeat_thread = runtime_threads.contains("s19j-psu-heartbeat"),
-                "AM2 diagnostic stop after Phase 0 PSU path — stopping before \
+                psu_heartbeat_thread =
+                    runtime_threads.slot_is_registered(HybridThreadSlot::PsuHeartbeat),
+                "AM2 diagnostic stop after Phase 0 PSU path Ã¢â‚¬â€ stopping before \
                  dsPIC voltage enable, chain UART init, Stratum, or work dispatch"
             );
             force_am2_home_hard_stop(&self.config, "diag-stop-after-psu");
@@ -10139,33 +11177,33 @@ impl S19jHybridMiner {
         }
 
         // ====================================================================
-        // Phase 0p (2026-05-22 XIL `a lab unit` recovery, Layer 3) — post-EEPROM
+        // Phase 0p (2026-05-22 XIL `a lab unit` recovery, Layer 3) Ã¢â‚¬â€ post-EEPROM
         // dsPIC firmware-boot grace window.
         //
         // EEPROM 0x50 ACK in Phase 0a proves the hashboard 3.3 V manageability
         // rail is up but does NOT prove the dsPIC has completed firmware boot
-        // + registered its I²C MSSP slave ISR. Bosminer's implicit minimum on
+        // + registered its IÃ‚Â²C MSSP slave ISR. Bosminer's implicit minimum on
         // `a lab unit`/`a lab unit` is ~48 s (incidental from its serial service tasks);
         // by datasheet the dsPIC needs only a few hundred ms. We sleep
-        // `am2_post_eeprom_dspic_grace_ms` (default 2000 ms = 4× BraiinsOS
+        // `am2_post_eeprom_dspic_grace_ms` (default 2000 ms = 4Ãƒâ€” BraiinsOS
         // `RESET_DELAY`) here, in ALL THREE Phase-0 branches (passthrough,
         // psu_override, default), so the dsPIC has a chance to be fully
         // resident before Phase 1's first GET_VERSION races at T+283 ms on
         // psu_override warm-boot. Skipped in `passthrough` mode if bosminer
         // is owning the bus.
         //
-        // §(a)+§(d).
+        // Ã‚Â§(a)+Ã‚Â§(d).
         // ====================================================================
         let dspic_boot_grace_ms = self.config.mining.am2_post_eeprom_dspic_grace_ms;
         if !passthrough && dspic_boot_grace_ms > 0 {
             info!(
                 t_ms = t(),
                 dspic_boot_grace_ms,
-                "[T+{}] Phase 0p: post-EEPROM dsPIC firmware-boot grace ({} ms — bosminer's implicit minimum)",
+                "[T+{}] Phase 0p: post-EEPROM dsPIC firmware-boot grace ({} ms Ã¢â‚¬â€ bosminer's implicit minimum)",
                 t(),
                 dspic_boot_grace_ms,
             );
-            // CE-002: pure dsPIC firmware-boot settle window — no bus activity
+            // CE-002: pure dsPIC firmware-boot settle window Ã¢â‚¬â€ no bus activity
             // is interleaved here, so yield the executor (tokio sleep) instead
             // of blocking the Tokio worker for up to ~2 s. Hardware semantics
             // unchanged (same wall-clock grace, same ordering).
@@ -10177,8 +11215,8 @@ impl S19jHybridMiner {
         }
 
         // ====================================================================
-        // Phase 0s ( B2, 2026-05-22) — hashboard-SKU energize-refusal
-        // gate (drive-half of matrix §7 #15).
+        // Phase 0s ( B2, 2026-05-22) Ã¢â‚¬â€ hashboard-SKU energize-refusal
+        // gate (drive-half of matrix Ã‚Â§7 #15).
         //
         // We've just proven the hashboard 3.3 V manageability rail is up
         // (Phase 0a EEPROM 0x50 ACK) and waited for the dsPIC to finish
@@ -10187,13 +11225,13 @@ impl S19jHybridMiner {
         // SetVoltage + ENABLE on the dsPIC). BEFORE that, classify EVERY
         // populated chain's EEPROM preamble + refuse to proceed if any
         // chain reports:
-        //   • malformed preamble (not 0x04 0x11 BHB42xxx, not 0x05 0x11
+        //   Ã¢â‚¬Â¢ malformed preamble (not 0x04 0x11 BHB42xxx, not 0x05 0x11
         //     BHB56902, not all-0x00/0xFF)
-        //   • EEPROM readiness timeout (the owned bus-0 service cannot read
+        //   Ã¢â‚¬Â¢ EEPROM readiness timeout (the owned bus-0 service cannot read
         //     the fixed AT24 identity prefix within the readiness budget)
-        //   • mixed-SKU pairing across chains (BHB42xxx + BHB56902 on the
-        //     same unit — refuse all)
-        //   • profile-bind failure (preamble readable but unknown family)
+        //   Ã¢â‚¬Â¢ mixed-SKU pairing across chains (BHB42xxx + BHB56902 on the
+        //     same unit Ã¢â‚¬â€ refuse all)
+        //   Ã¢â‚¬Â¢ profile-bind failure (preamble readable but unknown family)
         //
         // First-deploy rollout: `DCENT_AM2_STRICT_SKU_REFUSE` default OFF.
         // Refusal reasons LOG (so the operator can confirm `a lab unit` is clean)
@@ -10250,7 +11288,7 @@ impl S19jHybridMiner {
                         probes.push(ChainProbe::Timeout { chain_id: slot });
                     }
                     Err(OwnedEepromReadinessError::InvalidSlot { .. }) => {
-                        // Programmatic bug — log + treat as read error
+                        // Programmatic bug Ã¢â‚¬â€ log + treat as read error
                         // (silently skipped by the gate so we never accidentally
                         // brick a healthy chain over a bookkeeping error).
                         probes.push(ChainProbe::ReadError { chain_id: slot });
@@ -10291,13 +11329,13 @@ impl S19jHybridMiner {
                         bindings.len()
                     );
                     if !telemetry.is_empty() {
-                        // Strict mode is OFF but reasons surfaced — log
+                        // Strict mode is OFF but reasons surfaced Ã¢â‚¬â€ log
                         // LOUDLY so the operator sees the first-deploy
                         // telemetry-only signal.
                         warn!(
                             t_ms = t(),
                             reasons = %telemetry.summary(),
-                            "[T+{}] [ENERGIZE-REFUSED telemetry-only — would refuse if DCENT_AM2_STRICT_SKU_REFUSE=1] {}",
+                            "[T+{}] [ENERGIZE-REFUSED telemetry-only Ã¢â‚¬â€ would refuse if DCENT_AM2_STRICT_SKU_REFUSE=1] {}",
                             t(),
                             telemetry.summary()
                         );
@@ -10314,7 +11352,7 @@ impl S19jHybridMiner {
                         warn!(
                             t_ms = t(),
                             reasons = %refusal.summary(),
-                            "[T+{}] [ENERGIZE-REFUSED but proceeding — DCENT_AM2_ACCEPT_DEGRADED_HARDWARE=1 lab override] {}",
+                            "[T+{}] [ENERGIZE-REFUSED but proceeding Ã¢â‚¬â€ DCENT_AM2_ACCEPT_DEGRADED_HARDWARE=1 lab override] {}",
                             t(),
                             refusal.summary()
                         );
@@ -10341,12 +11379,12 @@ impl S19jHybridMiner {
         }
 
         // ====================================================================
-        // Phase 0b (2026-05-22 XIL `a lab unit` recovery, Layer 3) — early fan
+        // Phase 0b (2026-05-22 XIL `a lab unit` recovery, Layer 3) Ã¢â‚¬â€ early fan
         // autoconfig + RPM gate, BEFORE the first dsPIC GET_VERSION.
         //
         // Bosminer ordering: fans-OK at T+22 well before first PIC opcode at
         // T+58. The legacy Phase 2c-pre location (after PIC GET_VERSION +
-        // Phase 2b HBx_RESET) is reverse vs bosminer and means the C49→C52
+        // Phase 2b HBx_RESET) is reverse vs bosminer and means the C49Ã¢â€ â€™C52
         // `board-control` mode WRITE (inside `FanController::open_with_variant`)
         // happens AFTER PIC probe. Run the same fan-bring-up + RPM gate logic
         // here, BEFORE Phase 1, when `am2_fan_gate_before_pic` is true.
@@ -10354,47 +11392,114 @@ impl S19jHybridMiner {
         // When the early gate succeeds, the late Phase 2c-pre block below
         // becomes a no-op (we track via `early_fan_gate_passed`).
         //
-        // §(b).
+        // Ã‚Â§(b).
         // ====================================================================
         let mut early_fan_gate_passed = false;
         if !passthrough && self.config.mining.am2_fan_gate_before_pic {
             info!(
                 t_ms = t(),
-                "[T+{}] Phase 0b: early fan autoconfig + RPM gate (BEFORE PIC GET_VERSION — bosminer-faithful order)",
+                "[T+{}] Phase 0b: early fan autoconfig + RPM gate (BEFORE PIC GET_VERSION Ã¢â‚¬â€ bosminer-faithful order)",
                 t()
             );
-            match open_am2_fan_controller("phase-0b-early-fan-gate") {
+            match open_am2_fan_controller(
+                "phase-0b-early-fan-gate",
+                dcentrald_hal::fan::Am2FanModePolicy::EnableC52,
+            ) {
                 Some((discovery, fan)) => {
                     let configured_max = self.config.thermal.fan_max_pwm;
                     let spin_pwm = configured_max
                         .min(dcentrald_hal::fan::PWM_MAX)
                         .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
                     fan.set_speed(spin_pwm);
+                    // Report the OBSERVED board mode, never assert it.
+                    // `enable_am2_c52_fan_mode_from_board_control` returns false
+                    // (warn only) when board-control is missing, unopenable, or
+                    // fails readback, so a hardcoded "C52 flipped" line can be a
+                    // false claim in the operator's log Ã¢â‚¬â€ the same class of
+                    // dishonesty as a fail-open gate.
+                    let c52_status = fan.am2_c52_fan_mode_status();
                     info!(
                         pwm = spin_pwm,
                         uio = discovery.uio_number,
                         configured_fan_max_pwm = configured_max,
+                        am2_c52_fan_mode = ?c52_status,
                         t_ms = t(),
-                        "[T+{}] Phase 0b: fans commanded to home cap PWM {} (no cold-boot burst); C49→C52 board-control mode flipped",
+                        "[T+{}] Phase 0b: fans commanded to home cap PWM {} (no cold-boot burst); board-control C52 mode status {:?}",
                         t(),
-                        spin_pwm
+                        spin_pwm,
+                        c52_status
                     );
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                     let mut gate_cleared = false;
                     loop {
-                        let max_rpm = fan
-                            .get_per_fan_rpm()
+                        // Close the phantom-fan hole WITHOUT raising the RPM bar.
+                        //
+                        // The old gate was `max_rpm >= 1800` alone, which is
+                        // fail-OPEN: with two fans spinning and two stalled it
+                        // clears while half the airflow is missing Ã¢â‚¬â€ exactly the
+                        // state a C49 board mode produces (only 0x10/0x14 follow,
+                        // tach 2/3 read zero).
+                        //
+                        // But requiring EVERY channel >= 1800 would fail closed on
+                        // real hardware. Held evidence: bosminer's own C52 autoconfig
+                        // on `a lab unit` logged four channels at [1.6K 1.5K 5.8K 5.8K] Ã¢â‚¬â€
+                        // a legitimate mixed front/rear spread whose minimum is below
+                        // 1800. The 1800 constant is documented as the S9 curve
+                        // (dcentrald-hal/src/fan.rs) and is not transferable to AM2.
+                        // Bosminer requires min_fans=2, not all four.
+                        //
+                        // So: keep the original liveness threshold on `max`, and
+                        // additionally refuse when any OBSERVABLE channel reports
+                        // exactly zero. A slow-but-turning fan reports > 0; only a
+                        // stopped, absent, or uncommanded fan reports 0.
+                        // `FanTachSnapshot` does distinguish a declared-unwired
+                        // position (`None`) from an observable stall (`Some(0)`) Ã¢â‚¬â€
+                        // but do NOT read that as an escape hatch here. On the only
+                        // variant this gate runs on, `Am2Uio16`, ALL FOUR positions
+                        // are declared wired (`tach_channel_for_physical_fan` Ã¢â€ â€™
+                        // `(Am2Uio16, 0..=3) => Some(physical_fan)`,
+                        // dcentrald-hal/src/fan.rs), and `get_tach_snapshot` maps
+                        // that declaration statically rather than from observation.
+                        // `None` is therefore unreachable on AM2; the arm exists for
+                        // other variants (e.g. `Am1S9` position 0).
+                        //
+                        // CONSEQUENCE, stated plainly: this gate requires all four
+                        // AM2 positions to report non-zero. An AM2 chassis deliberately
+                        // run with fewer than four physical fans fails this gate and
+                        // refuses to mine. That is intended fail-closed behaviour on a
+                        // thermal path Ã¢â‚¬â€ a stopped fan in a 4-fan chassis is a real
+                        // hazard Ã¢â‚¬â€ but it is an availability cost for reduced-fan
+                        // quiet/home builds. The correct future relaxation is an
+                        // explicit declared-expected-fan-count input, NOT widening this
+                        // stall check, which would reopen the phantom-fan hole above.
+                        let snapshot = fan.get_tach_snapshot();
+                        let observed: Vec<u32> = snapshot
+                            .rpm_by_physical_fan
                             .iter()
-                            .map(|(_, r)| *r)
-                            .max()
-                            .unwrap_or(0);
-                        if max_rpm >= 1800 {
+                            .flatten()
+                            .copied()
+                            .collect();
+                        let max_rpm = observed.iter().copied().max().unwrap_or(0);
+                        let min_rpm = observed.iter().copied().min().unwrap_or(0);
+                        let stalled: Vec<usize> = snapshot
+                            .rpm_by_physical_fan
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, rpm)| match rpm {
+                                Some(0) => Some(idx),
+                                _ => None,
+                            })
+                            .collect();
+                        if max_rpm >= 1800 && stalled.is_empty() {
                             info!(
                                 max_rpm,
+                                min_rpm,
+                                observable_channels = observed.len(),
                                 t_ms = t(),
-                                "[T+{}] Phase 0b: early fans gate cleared at {} RPM",
+                                "[T+{}] Phase 0b: early fans gate cleared at {} RPM (no stalled tach channel; min {})",
                                 t(),
-                                max_rpm
+                                max_rpm,
+                                min_rpm
                             );
                             gate_cleared = true;
                             break;
@@ -10402,15 +11507,25 @@ impl S19jHybridMiner {
                         if std::time::Instant::now() >= deadline {
                             warn!(
                                 max_rpm,
+                                min_rpm,
+                                observable_channels = observed.len(),
+                                ?stalled,
                                 t_ms = t(),
-                                "[T+{}] Phase 0b: early fans <1800 RPM after 3 s — fail-closed before PIC GET_VERSION",
-                                t()
+                                "[T+{}] Phase 0b: fan gate failed after 3 s Ã¢â‚¬â€ max {} RPM (need >= 1800) with stalled tach channels {:?} Ã¢â‚¬â€ fail-closed before PIC GET_VERSION",
+                                t(),
+                                max_rpm,
+                                stalled
                             );
                             force_am2_home_hard_stop(&self.config, "am2-fan-rpm-gate-failed-early");
                             self.shutdown.cancel();
                             anyhow::bail!(
-                                "AM2 fan RPM gate (early Phase 0b) failed before PIC GET_VERSION: max_rpm={} after 3s",
-                                max_rpm
+                                "AM2 fan RPM gate (early Phase 0b) failed before PIC GET_VERSION: \
+                                 max_rpm={} (need >=1800) min_rpm={} over {} observable tach \
+                                 channels, stalled channels {:?}, after 3s",
+                                max_rpm,
+                                min_rpm,
+                                observed.len(),
+                                stalled
                             );
                         }
                         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -10422,7 +11537,7 @@ impl S19jHybridMiner {
                 None => {
                     warn!(
                         t_ms = t(),
-                        "[T+{}] Phase 0b: FanController open failed in early gate — fail-closed before PIC GET_VERSION",
+                        "[T+{}] Phase 0b: FanController open failed in early gate Ã¢â‚¬â€ fail-closed before PIC GET_VERSION",
                         t()
                     );
                     force_am2_home_hard_stop(&self.config, "am2-fan-uio-open-failed-early");
@@ -10436,11 +11551,11 @@ impl S19jHybridMiner {
 
         // ================================================================
         // Phase 1: PIC detect + enable  (Pic0x89, fw 0x89, RESET BANNED)
-        // Phase 2: Fan bring-up (owned by fan controller — we just wait "Fans OK")
+        // Phase 2: Fan bring-up (owned by fan controller Ã¢â‚¬â€ we just wait "Fans OK")
         // Phase 3: PIC SetOutputState per-chain 13.7 V
-        // Phase 4: Chain reset (UART reset baud — no board-control writes per Agent 14)
+        // Phase 4: Chain reset (UART reset baud Ã¢â‚¬â€ no board-control writes per Agent 14)
         // Phase 5: Chain enumeration @ 115200
-        // Phase 6: TicketMask → PLL → ADCControl → OpenDrain (inside init_asic_chain)
+        // Phase 6: TicketMask Ã¢â€ â€™ PLL Ã¢â€ â€™ ADCControl Ã¢â€ â€™ OpenDrain (inside init_asic_chain)
         // Phase 7: Baud upgrade to 3.125 Mbaud (inside init_asic_chain)
         // ================================================================
         let mut post_init_serial: Option<SerialChainBackend> = None;
@@ -10498,7 +11613,7 @@ impl S19jHybridMiner {
         // now that the single-owner `/dev/i2c-0` service is up and the active
         // chain topology + selected dsPIC are resolved. Before this point the
         // guard's Drop only dropped PWR_CONTROL + fans, so a bare `?`
-        // early-return in Phase 1-7 left the chain rail energized — the root
+        // early-return in Phase 1-7 left the chain rail energized Ã¢â‚¬â€ the root
         // cause of "every standalone attempt needs a fresh AC-cycle". With the
         // teardown armed, ANY return path (incl. `?`) now disables voltage on
         // EVERY active dsPIC (incl. the effective chain dsPIC, e.g. 0x22) FIRST,
@@ -10513,15 +11628,15 @@ impl S19jHybridMiner {
         if let Some(guard) = _home_hard_stop_guard.as_mut() {
             if let Some(i2c0) = i2c0_service.as_ref() {
                 // CE-012: arm the teardown with EVERY S19 dsPIC address
-                // (0x20/0x21/0x22) UNCONDITIONALLY — not just the
-                // active-mask subset — so every controller is de-energized on
+                // (0x20/0x21/0x22) UNCONDITIONALLY Ã¢â‚¬â€ not just the
+                // active-mask subset Ã¢â‚¬â€ so every controller is de-energized on
                 // teardown. This is strictly safer: if a chain was mis-probed
                 // as inactive (silent fw=0x86 / transient bus NACK during the
                 // Phase-0 probe) its rail would otherwise stay energized on a
                 // bare `?` early-return and force the operator AC-cycle. The
                 // disable is best-effort per-addr (`disable_dspic_addrs_best_effort`
-                // tolerates a NACK from a physically-absent slot — e.g. 0x21 on
-                // the `a lab unit` 2-board topology — and just logs a warn), so the
+                // tolerates a NACK from a physically-absent slot Ã¢â‚¬â€ e.g. 0x21 on
+                // the `a lab unit` 2-board topology Ã¢â‚¬â€ and just logs a warn), so the
                 // superset can never make teardown LESS safe. The active mask +
                 // effective-chain dsPIC are still logged for diagnostics.
                 let disable_addrs = S19_DSPIC_ADDRS.to_vec();
@@ -10581,7 +11696,7 @@ impl S19jHybridMiner {
             // 3 retries. Previously we logged a warn and defaulted to 0x89
             // semantics; this silently proceeded with a PIC in an unknown
             // state and tonight produced garbage reads (0xFC, 0x18) that
-            // reached `enable_voltage` — PIC may have ACK'd I²C without
+            // reached `enable_voltage` Ã¢â‚¬â€ PIC may have ACK'd IÃ‚Â²C without
             // actually setting the voltage DAC. Better to abort Phase 1 and
             // let the operator power-cycle than mine with no chain voltage.
             // 2026-04-26 .139 direct i2cget finding: 0x21 is alive and returns
@@ -10601,7 +11716,7 @@ impl S19jHybridMiner {
             // fallback lab-only. A silent or unvalidated PIC must not be
             // treated as production voltage control.
             // ============================================================
-            // Phase 0d (2026-05-22 XIL `a lab unit` recovery, Layer 1 + Layer 3) —
+            // Phase 0d (2026-05-22 XIL `a lab unit` recovery, Layer 1 + Layer 3) Ã¢â‚¬â€
             // bosminer-faithful dsPIC reset+start-app warmup BEFORE the first
             // GET_VERSION.
             //
@@ -10611,12 +11726,12 @@ impl S19jHybridMiner {
             // safe-by-construction `bosminer_warmup::am2_pic_reset_and_start_app_bosminer_faithful`
             // wrapper:
             //
-            //   1. PARSER FLUSH — [0x55, 0xAA, 0x00] + 16 × 0x00  (19 wire bytes)
-            //   2. RESET        — [0x55, 0xAA, 0x07] + 500 ms     ( 3 wire bytes)
-            //   3. JUMP_TO_APP  — [0x55, 0xAA, 0x06] + 100 ms     ( 3 wire bytes)
+            //   1. PARSER FLUSH Ã¢â‚¬â€ [0x55, 0xAA, 0x00] + 16 Ãƒâ€” 0x00  (19 wire bytes)
+            //   2. RESET        Ã¢â‚¬â€ [0x55, 0xAA, 0x07] + 500 ms     ( 3 wire bytes)
+            //   3. JUMP_TO_APP  Ã¢â‚¬â€ [0x55, 0xAA, 0x06] + 100 ms     ( 3 wire bytes)
             //
-            // Then 5×1Hz idle heartbeats so Phase 3's `cold_boot_init` can skip
-            // its internal 5-tick warmup loop (Layer 3 — see
+            // Then 5Ãƒâ€”1Hz idle heartbeats so Phase 3's `cold_boot_init` can skip
+            // its internal 5-tick warmup loop (Layer 3 Ã¢â‚¬â€ see
             // `Pic0x89Service::cold_boot_init_with_options(skip_warmup_loop=true)`).
             //
             // The double-gate (config knob + env var) means the very first deploy
@@ -10625,19 +11740,19 @@ impl S19jHybridMiner {
             // validation run; promote to env-off-by-default after success.
             //
             // The wrapper ALWAYS emits the 16-byte parser flush before the RESET
-            // opcode — the `a lab unit` 2026-04-24 bare-RESET-without-flush corruption
+            // opcode Ã¢â‚¬â€ the `a lab unit` 2026-04-24 bare-RESET-without-flush corruption
             // pattern is structurally impossible here. The narrow restatement of
             //  (RESET without flush stays banned;
             // bosminer-canonical chain with flush is permitted) is the load-
             // bearing safety contract; see
-            //  §3+§5.
+            //  Ã‚Â§3+Ã‚Â§5.
             // ============================================================
-            //  (2026-05-23) adds a 3rd warmup variant —
-            // `am2_pic_reset_and_start_app_strace_derived` — the byte-exact
+            //  (2026-05-23) adds a 3rd warmup variant Ã¢â‚¬â€
+            // `am2_pic_reset_and_start_app_strace_derived` Ã¢â‚¬â€ the byte-exact
             // bosminer-plus-tuner 0.9.0 FRAMED protocol captured from a live
             // strace on `a lab unit`. It takes precedence over the S9-era
             // bare-3-byte variants when its env gate is set (the two warmup
-            // chains are mutually exclusive — only one runs per Phase 0d).
+            // chains are mutually exclusive Ã¢â‚¬â€ only one runs per Phase 0d).
             //  (2026-05-24): EEPROM bus-warmup BEFORE the dsPIC
             // warmup chain. Bosminer's `a lab unit` cold-boot strace shows ~20
             // bytes read from EEPROM 0x50 (and 0x52) on /dev/i2c-0
@@ -10646,7 +11761,7 @@ impl S19jHybridMiner {
             // bus activity wakes the dsPIC's MSSP I2C slave peripheral
             // into command-accepting mode. Without it the dsPIC stays in
             // CMD-echo mode and START_APP doesn't transition to app
-            // firmware. Read-only (denylist preserved). Non-fatal —
+            // firmware. Read-only (denylist preserved). Non-fatal Ã¢â‚¬â€
             // missing EEPROM is logged but does not block dsPIC init.
             if am2_eeprom_bus_warmup_enabled() {
                 for eeprom_addr in [0x50u8, 0x52u8] {
@@ -10669,21 +11784,21 @@ impl S19jHybridMiner {
                                 eeprom_addr = format_args!("0x{:02X}", eeprom_addr),
                                 error = %e,
                                 "Phase 0d (Wave-46): EEPROM bus warmup read failed \
-                                 (non-fatal — bus activity may still have woken dsPIC)"
+                                 (non-fatal Ã¢â‚¬â€ bus activity may still have woken dsPIC)"
                             );
                         }
                     }
                 }
             }
 
-            //  (2026-05-25) — LM75A passthrough warmup moved from
+            //  (2026-05-25) Ã¢â‚¬â€ LM75A passthrough warmup moved from
             // BEFORE the BARE warmup to AFTER (see block ending ~line 6147+).
             // Rationale: on cold-cold dsPIC fw=0x82 BOOTLOADER (the
             // tonight's DCENT_OS-from-NAND scenario), the LM75A opcodes
-            // 0x3B/0x3C are not in the bootloader-sync opcode table —
+            // 0x3B/0x3C are not in the bootloader-sync opcode table Ã¢â‚¬â€
             // the chip echoes CMD bytes back instead of forwarding them
             // to the LM75A sensors. The BARE warmup must transition the
-            // chip from fw=0x82 BOOTLOADER → fw=0x82 APP MODE FIRST,
+            // chip from fw=0x82 BOOTLOADER Ã¢â€ â€™ fw=0x82 APP MODE FIRST,
             // then the LM75A passthrough can warm the dsPIC MSSP FSM
             // for the subsequent Loki SetVoltage. See
             // PHASE2C-DSPIC-RAIL-FAILURE-RE.md + the
@@ -10699,11 +11814,11 @@ impl S19jHybridMiner {
             // guard, so the ZERO_PSU_BYTES standalone diagnostic
             // (`run_wave56_25_CONSOLIDATED_STANDALONE.sh`) can actually reach
             // dsPIC ENABLE + chain enum instead of aborting in bootloader.
-            // Default-OFF + `a lab unit`-fingerprint-gated → zero effect on `a lab unit`, the
+            // Default-OFF + `a lab unit`-fingerprint-gated Ã¢â€ â€™ zero effect on `a lab unit`, the
             //  bosminer-handoff, or any non-`a lab unit` platform. Uses FRAMED
             // (strace-derived) per the /i/j/k LIVE evidence that FRAMED
             // is the proven cold-cold path to fw=0x89 (BARE alone does NOT lift
-            // the chip from fw=0x82 BOOTLOADER → fw=0x89 APP MODE). The
+            // the chip from fw=0x82 BOOTLOADER Ã¢â€ â€™ fw=0x89 APP MODE). The
             // strace-derived warmup self-skips if the chip already reports a
             // known app-mode FW ( HIGH-2 precondition probe), so this
             // can never re-break an already-engaged chip.
@@ -10735,7 +11850,7 @@ impl S19jHybridMiner {
                     t(),
                     variant_label
                 );
-                //  (2026-05-26) — when ALL_ACTIVE_PICS=1, warm up the
+                //  (2026-05-26) Ã¢â‚¬â€ when ALL_ACTIVE_PICS=1, warm up the
                 // OTHER active dsPIC addresses (i.e. every active dsPIC except
                 // `selected_pic_addr`) in ascending order, BEFORE the selected
                 // one, so the bus is primed regardless of which PIC
@@ -10746,14 +11861,14 @@ impl S19jHybridMiner {
                 //
                 //  B05 CORRECTION (2026-05-28): do NOT read this as a
                 // proven "0x20-first primes 0x22" dependency. With the real
-                // /p config (TOML keeps serial_device=/dev/ttyS1 →
+                // /p config (TOML keeps serial_device=/dev/ttyS1 Ã¢â€ â€™
                 // selected_pic_addr=0x20), this loop primes 0x21/0x22 and warms
-                // the selected 0x20 LAST — the opposite of "0x20 first" — yet
+                // the selected 0x20 LAST Ã¢â‚¬â€ the opposite of "0x20 first" Ã¢â‚¬â€ yet
                 // 0x22 still reaches fw=0x89. The ordering dependency is
                 // UNVERIFIED at runtime (most likely accumulated bus state from
-                // ANY prior warmup, or per-slot health, not a specific 0x20→0x22
+                // ANY prior warmup, or per-slot health, not a specific 0x20Ã¢â€ â€™0x22
                 // sequence).
-                // §" B05 correction".
+                // Ã‚Â§" B05 correction".
                 if all_active_voltage_enable {
                     let other_pics =
                         am2_bus_prime_order(&active_dspic_addrs(active_chains), selected_pic_addr);
@@ -10761,16 +11876,16 @@ impl S19jHybridMiner {
                         //  Fix #2 (2026-05-29): cheap presence probe
                         // BEFORE the multi-retry warmup. `active_chains` is
                         // hardcoded to 0b111, so this loop would otherwise warm
-                        // up the PHYSICALLY-ABSENT slot-2 dsPIC 0x21 on `a lab unit` →
+                        // up the PHYSICALLY-ABSENT slot-2 dsPIC 0x21 on `a lab unit` Ã¢â€ â€™
                         // EIO storm that desyncs the AXI-IIC controller faster
-                        // than the rate-limited (1/sec) fd-reopen can recover →
+                        // than the rate-limited (1/sec) fd-reopen can recover Ã¢â€ â€™
                         // the subsequent 0x20 sanity heartbeat EIOs and init
                         // aborts. Skip absent addresses (EIO or 0xFF) cleanly.
                         if !am2_dspic_present(pic_i2c, prime_addr) {
                             warn!(
                                 t_ms = t(),
                                 addr = format_args!("0x{:02X}", prime_addr),
-                                "Phase 0d (Wave-55l): bus-prime skipping ABSENT dsPIC 0x{:02X} (presence probe EIO/0xFF) — avoids AXI-IIC poison",
+                                "Phase 0d (Wave-55l): bus-prime skipping ABSENT dsPIC 0x{:02X} (presence probe EIO/0xFF) Ã¢â‚¬â€ avoids AXI-IIC poison",
                                 prime_addr
                             );
                             continue;
@@ -10814,7 +11929,7 @@ impl S19jHybridMiner {
                                 // before the next address / the downstream
                                 // 0x20 sanity heartbeat. Preserves the
                                 // wave55l_bus_prime_failure_is_non_fatal
-                                // "continue" contract — this is only a settle,
+                                // "continue" contract Ã¢â‚¬â€ this is only a settle,
                                 // not an abort.
                                 std::thread::sleep(std::time::Duration::from_millis(300));
                             }
@@ -10840,42 +11955,42 @@ impl S19jHybridMiner {
                 match warmup_call_result {
                     Ok(()) => {
                         //  (2026-05-23): under bosminer-faithful, skip
-                        // the 5×1Hz heartbeats and emit a single ~500-ms sleep
+                        // the 5Ãƒâ€”1Hz heartbeats and emit a single ~500-ms sleep
                         // (matches bosminer's i2c-0 strace exactly between the
                         // START_APP ACK and the first GET_VERSION write).
                         //  live evidence on `a lab unit` run #15: 5/5 stable
                         // heartbeats succeed but the subsequent GET_VERSION
-                        // NACKs with EIO — the heartbeat loop is the new
+                        // NACKs with EIO Ã¢â‚¬â€ the heartbeat loop is the new
                         // suspected wedge.  tests that hypothesis.
                         if am2_dspic_bosminer_faithful_enabled() {
                             info!(
                                 t_ms = t(),
-                                "[T+{}] Phase 0d (Wave-42): warmup prelude emitted OK — bosminer-faithful skip 5×1Hz heartbeats; single 500 ms settle before GET_VERSION",
+                                "[T+{}] Phase 0d (Wave-42): warmup prelude emitted OK Ã¢â‚¬â€ bosminer-faithful skip 5Ãƒâ€”1Hz heartbeats; single 500 ms settle before GET_VERSION",
                                 t()
                             );
                             std::thread::sleep(Duration::from_millis(500));
                             info!(
                                 t_ms = t(),
-                                "[T+{}] Phase 0d (Wave-42): 500 ms settle complete — proceeding to GET_VERSION",
+                                "[T+{}] Phase 0d (Wave-42): 500 ms settle complete Ã¢â‚¬â€ proceeding to GET_VERSION",
                                 t()
                             );
                             // Treat as warmup-OK so the downstream
                             // `cold_boot_init_with_skip(skip_warmup_loop=true)`
                             // runs once, exactly like the env-off path that
-                            // just succeeded with the 5×1-s heartbeats. This
+                            // just succeeded with the 5Ãƒâ€”1-s heartbeats. This
                             // is a strict subset of the prior behaviour (we
                             // already proved the dsPIC ACKs the warmup chain
-                            // — what we're removing is the redundant 5 s of
+                            // Ã¢â‚¬â€ what we're removing is the redundant 5 s of
                             // post-warmup heartbeats that the strace shows
                             // bosminer NEVER emits).
                             true
                         } else {
                             info!(
                                 t_ms = t(),
-                                "[T+{}] Phase 0d: warmup prelude emitted OK — running 5×1Hz idle heartbeats",
+                                "[T+{}] Phase 0d: warmup prelude emitted OK Ã¢â‚¬â€ running 5Ãƒâ€”1Hz idle heartbeats",
                                 t()
                             );
-                            // 5×1Hz idle heartbeats (no SetVoltage / no ENABLE).
+                            // 5Ãƒâ€”1Hz idle heartbeats (no SetVoltage / no ENABLE).
                             // Constructs a transient Pic0x89Service in firmware-
                             // unknown mode; the heartbeat opcode is byte-identical
                             // across all known fw bytes for the framed-protocol
@@ -10903,7 +12018,7 @@ impl S19jHybridMiner {
                             info!(
                                 t_ms = t(),
                                 warmup_ok,
-                                "[T+{}] Phase 0d: warmup complete ({}/5 stable heartbeats) — proceeding to GET_VERSION",
+                                "[T+{}] Phase 0d: warmup complete ({}/5 stable heartbeats) Ã¢â‚¬â€ proceeding to GET_VERSION",
                                 t(),
                                 warmup_ok
                             );
@@ -10911,13 +12026,13 @@ impl S19jHybridMiner {
                         }
                     }
                     Err(e) => {
-                        // Warmup prelude failure is non-fatal — we still want
+                        // Warmup prelude failure is non-fatal Ã¢â‚¬â€ we still want
                         // Phase 1 to try GET_VERSION. Worst case: same state
                         // as no-prelude. Best case: prelude unblocked it.
                         warn!(
                             error = %e,
                             addr = format_args!("0x{:02X}", selected_pic_addr),
-                            "Phase 0d: warmup prelude FAILED — falling through to legacy GET_VERSION (non-fatal)"
+                            "Phase 0d: warmup prelude FAILED Ã¢â‚¬â€ falling through to legacy GET_VERSION (non-fatal)"
                         );
                         false
                     }
@@ -10926,7 +12041,7 @@ impl S19jHybridMiner {
                 if self.config.mining.am2_dspic_warmup_before_get_version {
                     tracing::debug!(
                         "Phase 0d: warmup config enabled but env gate DCENT_AM2_PIC_RESET_AND_START_APP \
-                         is OFF — keeping byte-identical legacy behaviour (set env=1 to enable on this unit)"
+                         is OFF Ã¢â‚¬â€ keeping byte-identical legacy behaviour (set env=1 to enable on this unit)"
                     );
                 } else {
                     tracing::debug!(
@@ -10937,22 +12052,22 @@ impl S19jHybridMiner {
             };
 
             // ====================================================================
-            // Phase 0d-post (2026-05-25, REORDERED ) —
+            // Phase 0d-post (2026-05-25, REORDERED ) Ã¢â‚¬â€
             // bosminer-faithful 17-tx LM75A passthrough warmup. Per
             // PHASE2C-DSPIC-RAIL-FAILURE-RE.md, bosminer's healthy cold-boot
             // trace to dsPIC slave 0x20 is dominated by 17 LM75A passthrough
             // transactions (opcodes 0x3B/0x3C, sensor addresses 0x48..0x4B).
-            // Hypothesis: this polling warms the dsPIC's MSSP I²C handler
+            // Hypothesis: this polling warms the dsPIC's MSSP IÃ‚Â²C handler
             // state machine so the subsequent Loki SetVoltage(0x83) actually
-            // engages the chip rail — solving the chain-enum 0/126 failure
+            // engages the chip rail Ã¢â‚¬â€ solving the chain-enum 0/126 failure
             // on cold-boot .25-class hardware.
             //
             //  ordering fix (2026-05-25): this block now runs AFTER
             // the Phase 0d BARE warmup, NOT before. On cold-cold dsPIC
             // fw=0x82 BOOTLOADER, opcodes 0x3B/0x3C are not in the
-            // bootloader-sync opcode table — the chip echoes CMD bytes back
+            // bootloader-sync opcode table Ã¢â‚¬â€ the chip echoes CMD bytes back
             // instead of forwarding them to LM75A sensors. The BARE warmup
-            // must transition the chip from fw=0x82 BOOTLOADER → fw=0x82
+            // must transition the chip from fw=0x82 BOOTLOADER Ã¢â€ â€™ fw=0x82
             // APP MODE FIRST ( evidence), then the LM75A passthrough
             // can warm the MSSP FSM as the RE hypothesis describes. The
             //  live run on `a lab unit` worked despite this misordering
@@ -10964,7 +12079,7 @@ impl S19jHybridMiner {
             // primitive's own env helper) OR by the umbrella
             // `DCENT_AM2_STANDALONE_RE_FIX=1` (the  compound flag
             // which also engages the Loki SetVoltage path + dsPIC SetVoltage
-            // skip in Phase 3). Default-OFF — env unset → byte-identical to
+            // skip in Phase 3). Default-OFF Ã¢â‚¬â€ env unset Ã¢â€ â€™ byte-identical to
             // pre- behavior on .79 / .109 / .135 / .129 / S9.
             //
             // Best-effort: failures are non-fatal (the LM75A sensors may not
@@ -10974,7 +12089,7 @@ impl S19jHybridMiner {
             // ====================================================================
             // 2026-06-07 (RE-018 true-cold decode): bosminer's cold sequence does
             // NOT emit any LM75 0x3B/0x3C passthrough between the framed JUMP and the
-            // GET_VERSION — it goes flush→RESET→JUMP→GET_VER=0x89 directly. The 17-txn
+            // GET_VERSION Ã¢â‚¬â€ it goes flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMPÃ¢â€ â€™GET_VER=0x89 directly. The 17-txn
             //  passthrough is a non-faithful step that may desync the 0x20
             // bootloader parser (0x20 ends echoing 0x82). DCENT_AM2_SKIP_LM75_PASSTHROUGH=1
             // lets the standalone launcher run the clean faithful path.
@@ -10990,7 +12105,7 @@ impl S19jHybridMiner {
                     bare_warmup_did_run = warmup_did_run,
                     env_gate =
                         "DCENT_AM2_DSPIC_BOSMINER_LM75_PASSTHROUGH or DCENT_AM2_STANDALONE_RE_FIX",
-                    "[T+{}] Phase 0d-post (Wave-55f): LM75A passthrough warmup ENGAGED — \
+                    "[T+{}] Phase 0d-post (Wave-55f): LM75A passthrough warmup ENGAGED Ã¢â‚¬â€ \
                      emitting 17 bosminer-faithful 0x3B/0x3C transactions to dsPIC 0x{:02X} \
                      AFTER BARE warmup (Wave-55g order). See PHASE2C-DSPIC-RAIL-FAILURE-RE.md.",
                     t(),
@@ -11009,28 +12124,28 @@ impl S19jHybridMiner {
                         selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
                         error = %e,
                         "Phase 0d-post (Wave-55f): LM75A passthrough warmup FAILED \
-                         (continuing best-effort — chain-enum will reveal if dsPIC was wedged)"
+                         (continuing best-effort Ã¢â‚¬â€ chain-enum will reveal if dsPIC was wedged)"
                     ),
                 }
             }
 
             // ====================================================================
-            // Ghidra-RE PART B (2026-05-29, DCENT_AM2_DSPIC_SENSOR_ONLY) —
-            // also warm the EFFECTIVE-CHAIN dsPIC's I²C FSM via LM75A
+            // Ghidra-RE PART B (2026-05-29, DCENT_AM2_DSPIC_SENSOR_ONLY) Ã¢â‚¬â€
+            // also warm the EFFECTIVE-CHAIN dsPIC's IÃ‚Â²C FSM via LM75A
             // passthrough. Per
             //
             // (Ghidra static RE of bosminer.bin): bosminer uses the dsPIC ONLY
-            // for LM75A sensor passthrough (0x3B/0x3C ×17), which warms the
-            // chip's MSSP I²C slave FSM. dcentrald only ran that warmup on the
+            // for LM75A sensor passthrough (0x3B/0x3C Ãƒâ€”17), which warms the
+            // chip's MSSP IÃ‚Â²C slave FSM. dcentrald only ran that warmup on the
             // SELECTED pic (0x20), not the effective-CHAIN pic (0x22) that the
-            // chain UART actually maps to — so the chain dsPIC's parser stayed
+            // chain UART actually maps to Ã¢â‚¬â€ so the chain dsPIC's parser stayed
             // cold and echoed its FW byte (0x8A) to everything.
             //
             // When `DCENT_AM2_DSPIC_SENSOR_ONLY=1` AND there is an
             // effective-chain dsPIC addr that DIFFERS from the selected addr,
             // ALSO emit the 17-tx LM75A passthrough on that chain addr so its
             // FSM gets warmed too. Best-effort / non-fatal (log on error,
-            // continue) — the chain enumeration downstream is the real proof.
+            // continue) Ã¢â‚¬â€ the chain enumeration downstream is the real proof.
             //
             // Default-OFF: when the env gate is unset this block is inert and
             // the chain-pic warmup is not added (fleet byte-identical).
@@ -11044,7 +12159,7 @@ impl S19jHybridMiner {
                             effective_chain_dspic_addr = format_args!("0x{:02X}", chain_addr),
                             tx_count = bosminer_warmup::LM75_PASSTHROUGH_TX_COUNT,
                             env_gate = "DCENT_AM2_DSPIC_SENSOR_ONLY",
-                            "[T+{}] Ghidra-RE PART B: SENSOR_ONLY — also warming the \
+                            "[T+{}] Ghidra-RE PART B: SENSOR_ONLY Ã¢â‚¬â€ also warming the \
                              effective-chain dsPIC 0x{:02X} via LM75A passthrough \
                              (selected pic 0x{:02X} already warmed; bosminer warms the \
                              chain dsPIC's FSM the same way). \
@@ -11069,7 +12184,7 @@ impl S19jHybridMiner {
                                     format_args!("0x{:02X}", chain_addr),
                                 error = %e,
                                 "Ghidra-RE PART B: chain dsPIC LM75A passthrough warmup \
-                                 FAILED (non-fatal — continuing; chain-enum reveals if \
+                                 FAILED (non-fatal Ã¢â‚¬â€ continuing; chain-enum reveals if \
                                  the chain dsPIC was wedged)"
                             ),
                         }
@@ -11078,7 +12193,7 @@ impl S19jHybridMiner {
                             t_ms = t(),
                             selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
                             "Ghidra-RE PART B: SENSOR_ONLY set but effective-chain dsPIC \
-                             addr == selected addr (0x{:02X}) — chain pic already warmed, \
+                             addr == selected addr (0x{:02X}) Ã¢â‚¬â€ chain pic already warmed, \
                              no extra warmup needed",
                             selected_pic_addr
                         );
@@ -11087,7 +12202,7 @@ impl S19jHybridMiner {
                     tracing::debug!(
                         t_ms = t(),
                         "Ghidra-RE PART B: SENSOR_ONLY set but no effective-chain dsPIC \
-                         addr resolved from the chain UART device — skipping chain-pic warmup"
+                         addr resolved from the chain UART device Ã¢â‚¬â€ skipping chain-pic warmup"
                     );
                 }
             }
@@ -11138,10 +12253,10 @@ impl S19jHybridMiner {
                     // should report fw=0x82 (BARE bootloader) at the FIRST GET_VERSION
                     // (dual-state model). If it instead reports an app-mode fw
                     // (0x89/0x8A) here, the chip was ALREADY engaged by a prior
-                    // bosminer boot (WARM) — so any subsequent enum>0 is a FALSE
+                    // bosminer boot (WARM) Ã¢â‚¬â€ so any subsequent enum>0 is a FALSE
                     // standalone positive, not proof DCENT_OS woke the chain itself.
                     // Flag the run loudly as INVALID-FOR-STANDALONE-CLAIM. Additive
-                    // log only — does not gate the run (the operator may still want
+                    // log only Ã¢â‚¬â€ does not gate the run (the operator may still want
                     // diagnostics); the trust decision is the human's.
                     if !allow_trust_rail
                         && am2_xil_25_fingerprint_matches()
@@ -11149,7 +12264,7 @@ impl S19jHybridMiner {
                     {
                         warn!(
                             fw = format_args!("0x{:02X}", fw),
-                            "D8-6 COLD-PRECONDITION NOT MET: standalone run but dsPIC reports app-mode fw=0x{:02X} at the FIRST GET_VERSION — the chip is bosminer-pre-engaged (WARM), not cold. Any enum>0 from THIS run is INVALID-FOR-STANDALONE-CLAIM. AC-cycle + boot the DCENT_OS slot for a true cold (fw=0x82) standalone proof.",
+                            "D8-6 COLD-PRECONDITION NOT MET: standalone run but dsPIC reports app-mode fw=0x{:02X} at the FIRST GET_VERSION Ã¢â‚¬â€ the chip is bosminer-pre-engaged (WARM), not cold. Any enum>0 from THIS run is INVALID-FOR-STANDALONE-CLAIM. AC-cycle + boot the DCENT_OS slot for a true cold (fw=0x82) standalone proof.",
                             fw
                         );
                     }
@@ -11194,36 +12309,36 @@ impl S19jHybridMiner {
             };
 
             // ====================================================================
-            // Rung 2 — bounded re-verify when cold-engage left dsPIC in fw=0x82
-            // (2026-06-07, `a lab unit` standalone). TWO variants, RESET→JUMP precedence:
-            //   (a) RESET→JUMP variant (LIVE TEST 2, the stronger lever) — full
-            //       flush→RESET→(longer dwell)→JUMP ×N, env
+            // Rung 2 Ã¢â‚¬â€ bounded re-verify when cold-engage left dsPIC in fw=0x82
+            // (2026-06-07, `a lab unit` standalone). TWO variants, RESETÃ¢â€ â€™JUMP precedence:
+            //   (a) RESETÃ¢â€ â€™JUMP variant (LIVE TEST 2, the stronger lever) Ã¢â‚¬â€ full
+            //       flushÃ¢â€ â€™RESETÃ¢â€ â€™(longer dwell)Ã¢â€ â€™JUMP Ãƒâ€”N, env
             //       DCENT_AM2_DSPIC_RESET_JUMP_REVERIFY_MAX.
-            //   (b) JUMP-only variant (the original rung 2) — flush→JUMP ONLY ×N,
+            //   (b) JUMP-only variant (the original rung 2) Ã¢â‚¬â€ flushÃ¢â€ â€™JUMP ONLY Ãƒâ€”N,
             //       NEVER a 2nd RESET, env DCENT_AM2_DSPIC_JUMP_REVERIFY_MAX.
             // ====================================================================
             // LIVE evidence (`a lab unit` standalone, post commit 0a1bfa5a clean-path +
             // 2-read ack drain + commit 8a9113b8 heartbeat keep-alive): the cold
-            // dsPIC 0x20 REACHED fw=0x89 once (run 3) — proving the
-            // flush→RESET→JUMP sequence works — but the JUMP→0x89 transition is
+            // dsPIC 0x20 REACHED fw=0x89 once (run 3) Ã¢â‚¬â€ proving the
+            // flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMP sequence works Ã¢â‚¬â€ but the JUMPÃ¢â€ â€™0x89 transition is
             // INTERMITTENT. Subsequent cold-engages (incl. a fresh AC-cycle) read
-            // fw=0x82. The JUMP-only re-verify (×6) did NOT transition the chip
-            // (LIVE TEST 2 run 6). The strongest hypothesis (SESSION.md §"NEXT-
+            // fw=0x82. The JUMP-only re-verify (Ãƒâ€”6) did NOT transition the chip
+            // (LIVE TEST 2 run 6). The strongest hypothesis (SESSION.md Ã‚Â§"NEXT-
             // SESSION reliability frontier" #1) is that the chip needs MULTIPLE
-            // FULL RESET→JUMP cycles — the only 0x89 ever seen was effectively the
-            // 3rd RESET→JUMP cycle, and JUMP-only can't prime because it omits the
-            // RESET. So the RESET→JUMP variant runs the full flush→RESET→JUMP ×N
+            // FULL RESETÃ¢â€ â€™JUMP cycles Ã¢â‚¬â€ the only 0x89 ever seen was effectively the
+            // 3rd RESETÃ¢â€ â€™JUMP cycle, and JUMP-only can't prime because it omits the
+            // RESET. So the RESETÃ¢â€ â€™JUMP variant runs the full flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMP Ãƒâ€”N
             // (with a longer post-RESET dwell), and TAKES PRECEDENCE over the
             // JUMP-only variant when both envs are set.
             //
             // SAFETY (bible reconciliation): the "never abandon a chip in 0x82
             // after a RESET" invariant is about not DOWNGRADING a *working* fw=0x89
             // chip. Both variants here only run when GET_VERSION already read
-            // fw=0x82 (the cold bootloader), so re-cycling RESET→JUMP to bring a
+            // fw=0x82 (the cold bootloader), so re-cycling RESETÃ¢â€ â€™JUMP to bring a
             // cold-0x82 chip UP to 0x89 is non-destructive (an AC-cycle resets it
             // the same way). The JUMP-only "never a 2nd RESET" was written for the
             // *jumped-then-fell-back* case, a DIFFERENT failure than our
-            // never-transitions case (SESSION.md §"reliability frontier" #1).
+            // never-transitions case (SESSION.md Ã‚Â§"reliability frontier" #1).
             //
             // Default-OFF + `a lab unit`-fingerprinted: each variant only runs when its
             // env > 0 AND the `a lab unit` fingerprint matches AND the cold-engage left
@@ -11231,7 +12346,7 @@ impl S19jHybridMiner {
             // and the fleet/handoff/legacy paths are byte-identical. Both reuse the
             // same single-owner I2cServiceHandle (`pic_i2c`). On exhaustion both
             // fail-closed exactly as today (continue with fw=0x82; downstream
-            // cold_boot_init / chain enum decides — chip stays in recoverable 0x82).
+            // cold_boot_init / chain enum decides Ã¢â‚¬â€ chip stays in recoverable 0x82).
             let reset_jump_reverify_max =
                 bosminer_warmup::am2_dspic_reset_jump_reverify_max().min(16);
             let jump_reverify_max = bosminer_warmup::am2_dspic_jump_reverify_max().min(16);
@@ -11239,17 +12354,17 @@ impl S19jHybridMiner {
                 && am2_xil_25_fingerprint_matches()
                 && detected_fw == 0x82
             {
-                // (a) RESET→JUMP variant — precedence over JUMP-only.
+                // (a) RESETÃ¢â€ â€™JUMP variant Ã¢â‚¬â€ precedence over JUMP-only.
                 let reset_dwell_ms = bosminer_warmup::am2_dspic_reset_dwell_ms();
                 info!(
                     t_ms = t(),
                     addr = format_args!("0x{:02X}", selected_pic_addr),
                     reset_jump_reverify_max,
                     reset_dwell_ms,
-                    "[T+{}] Rung 2 (RESET→JUMP): cold-engage left dsPIC in fw=0x82 (bootloader) — \
-                     entering bounded FULL flush→RESET→JUMP re-verify (post-RESET dwell {}ms) up to \
-                     {} cycle(s) to reach fw=0x89 (LIVE TEST 2: JUMP-only ×6 did not transition; the \
-                     only 0x89 was effectively the 3rd full RESET→JUMP cycle)",
+                    "[T+{}] Rung 2 (RESETÃ¢â€ â€™JUMP): cold-engage left dsPIC in fw=0x82 (bootloader) Ã¢â‚¬â€ \
+                     entering bounded FULL flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMP re-verify (post-RESET dwell {}ms) up to \
+                     {} cycle(s) to reach fw=0x89 (LIVE TEST 2: JUMP-only Ãƒâ€”6 did not transition; the \
+                     only 0x89 was effectively the 3rd full RESETÃ¢â€ â€™JUMP cycle)",
                     t(),
                     reset_dwell_ms,
                     reset_jump_reverify_max
@@ -11265,7 +12380,7 @@ impl S19jHybridMiner {
                             addr = format_args!("0x{:02X}", selected_pic_addr),
                             attempt,
                             reset_jump_reverify_max,
-                            "[T+{}] Rung 2 (RESET→JUMP) attempt {}/{}: flush→RESET→JUMP re-issued; re-reading GET_VERSION",
+                            "[T+{}] Rung 2 (RESETÃ¢â€ â€™JUMP) attempt {}/{}: flushÃ¢â€ â€™RESETÃ¢â€ â€™JUMP re-issued; re-reading GET_VERSION",
                             t(),
                             attempt,
                             reset_jump_reverify_max
@@ -11274,7 +12389,7 @@ impl S19jHybridMiner {
                             addr = format_args!("0x{:02X}", selected_pic_addr),
                             attempt,
                             error = %e,
-                            "Rung 2 (RESET→JUMP) attempt {}/{}: re-verify emit failed (non-fatal); re-reading GET_VERSION anyway",
+                            "Rung 2 (RESETÃ¢â€ â€™JUMP) attempt {}/{}: re-verify emit failed (non-fatal); re-reading GET_VERSION anyway",
                             attempt,
                             reset_jump_reverify_max
                         ),
@@ -11290,7 +12405,7 @@ impl S19jHybridMiner {
                                 addr = format_args!("0x{:02X}", selected_pic_addr),
                                 attempt,
                                 fw = format_args!("0x{:02X}", fw),
-                                "[T+{}] Rung 2 (RESET→JUMP) attempt {}/{}: GET_VERSION fw_byte=0x{:02X}",
+                                "[T+{}] Rung 2 (RESETÃ¢â€ â€™JUMP) attempt {}/{}: GET_VERSION fw_byte=0x{:02X}",
                                 t(),
                                 attempt,
                                 reset_jump_reverify_max,
@@ -11302,20 +12417,20 @@ impl S19jHybridMiner {
                                     t_ms = t(),
                                     addr = format_args!("0x{:02X}", selected_pic_addr),
                                     attempt,
-                                    "[T+{}] Rung 2 (RESET→JUMP): dsPIC reached fw=0x89 (FRAMED app mode) after {} full RESET→JUMP cycle(s) — proceeding to cold_boot_init",
+                                    "[T+{}] Rung 2 (RESETÃ¢â€ â€™JUMP): dsPIC reached fw=0x89 (FRAMED app mode) after {} full RESETÃ¢â€ â€™JUMP cycle(s) Ã¢â‚¬â€ proceeding to cold_boot_init",
                                     t(),
                                     attempt
                                 );
                                 break;
                             }
                             if fw != 0x82 {
-                                // Unexpected fw (e.g. 0x86 degraded) — re-cycling
+                                // Unexpected fw (e.g. 0x86 degraded) Ã¢â‚¬â€ re-cycling
                                 // won't help and the downstream corruption gate
                                 // handles non-0x82/0x89 firmware; stop re-cycling.
                                 warn!(
                                     addr = format_args!("0x{:02X}", selected_pic_addr),
                                     fw = format_args!("0x{:02X}", fw),
-                                    "Rung 2 (RESET→JUMP): GET_VERSION read non-0x82/non-0x89 fw — stopping re-verify (downstream fw gate handles it)"
+                                    "Rung 2 (RESETÃ¢â€ â€™JUMP): GET_VERSION read non-0x82/non-0x89 fw Ã¢â‚¬â€ stopping re-verify (downstream fw gate handles it)"
                                 );
                                 break;
                             }
@@ -11324,7 +12439,7 @@ impl S19jHybridMiner {
                             addr = format_args!("0x{:02X}", selected_pic_addr),
                             attempt,
                             error = %e,
-                            "Rung 2 (RESET→JUMP) attempt {}/{}: GET_VERSION re-read failed (non-fatal); keeping fw=0x82 and retrying if cycles remain",
+                            "Rung 2 (RESETÃ¢â€ â€™JUMP) attempt {}/{}: GET_VERSION re-read failed (non-fatal); keeping fw=0x82 and retrying if cycles remain",
                             attempt,
                             reset_jump_reverify_max
                         ),
@@ -11336,7 +12451,7 @@ impl S19jHybridMiner {
                         addr = format_args!("0x{:02X}", selected_pic_addr),
                         reset_jump_reverify_max,
                         detected_fw = format_args!("0x{:02X}", detected_fw),
-                        "[T+{}] Rung 2 (RESET→JUMP): re-verify exhausted {} cycle(s) without reaching fw=0x89; continuing with fw=0x{:02X} (fail-closed exactly as today — chip stays in recoverable 0x82 bootloader)",
+                        "[T+{}] Rung 2 (RESETÃ¢â€ â€™JUMP): re-verify exhausted {} cycle(s) without reaching fw=0x89; continuing with fw=0x{:02X} (fail-closed exactly as today Ã¢â‚¬â€ chip stays in recoverable 0x82 bootloader)",
                         t(),
                         reset_jump_reverify_max,
                         detected_fw
@@ -11350,8 +12465,8 @@ impl S19jHybridMiner {
                     t_ms = t(),
                     addr = format_args!("0x{:02X}", selected_pic_addr),
                     jump_reverify_max,
-                    "[T+{}] Rung 2: cold-engage left dsPIC in fw=0x82 (bootloader) — \
-                     entering bounded JUMP-only re-verify (flush → framed JUMP, NEVER a \
+                    "[T+{}] Rung 2: cold-engage left dsPIC in fw=0x82 (bootloader) Ã¢â‚¬â€ \
+                     entering bounded JUMP-only re-verify (flush Ã¢â€ â€™ framed JUMP, NEVER a \
                      2nd RESET) up to {} attempt(s) to reach fw=0x89",
                     t(),
                     jump_reverify_max
@@ -11363,7 +12478,7 @@ impl S19jHybridMiner {
                             addr = format_args!("0x{:02X}", selected_pic_addr),
                             attempt,
                             jump_reverify_max,
-                            "[T+{}] Rung 2 attempt {}/{}: flush → framed JUMP re-issued (no RESET); re-reading GET_VERSION",
+                            "[T+{}] Rung 2 attempt {}/{}: flush Ã¢â€ â€™ framed JUMP re-issued (no RESET); re-reading GET_VERSION",
                             t(),
                             attempt,
                             jump_reverify_max
@@ -11400,20 +12515,20 @@ impl S19jHybridMiner {
                                     t_ms = t(),
                                     addr = format_args!("0x{:02X}", selected_pic_addr),
                                     attempt,
-                                    "[T+{}] Rung 2: dsPIC reached fw=0x89 (FRAMED app mode) after {} JUMP-only re-verify attempt(s) — proceeding to cold_boot_init",
+                                    "[T+{}] Rung 2: dsPIC reached fw=0x89 (FRAMED app mode) after {} JUMP-only re-verify attempt(s) Ã¢â‚¬â€ proceeding to cold_boot_init",
                                     t(),
                                     attempt
                                 );
                                 break;
                             }
                             if fw != 0x82 {
-                                // Unexpected fw (e.g. 0x86 degraded) — re-JUMPing
+                                // Unexpected fw (e.g. 0x86 degraded) Ã¢â‚¬â€ re-JUMPing
                                 // won't help and the downstream corruption gate
                                 // handles non-0x82/0x89 firmware; stop re-JUMPing.
                                 warn!(
                                     addr = format_args!("0x{:02X}", selected_pic_addr),
                                     fw = format_args!("0x{:02X}", fw),
-                                    "Rung 2: GET_VERSION read non-0x82/non-0x89 fw — stopping JUMP-only re-verify (downstream fw gate handles it)"
+                                    "Rung 2: GET_VERSION read non-0x82/non-0x89 fw Ã¢â‚¬â€ stopping JUMP-only re-verify (downstream fw gate handles it)"
                                 );
                                 break;
                             }
@@ -11434,7 +12549,7 @@ impl S19jHybridMiner {
                         addr = format_args!("0x{:02X}", selected_pic_addr),
                         jump_reverify_max,
                         detected_fw = format_args!("0x{:02X}", detected_fw),
-                        "[T+{}] Rung 2: JUMP-only re-verify exhausted {} attempt(s) without reaching fw=0x89; continuing with fw=0x{:02X} (fail-closed exactly as today — chip stays in recoverable 0x82 bootloader)",
+                        "[T+{}] Rung 2: JUMP-only re-verify exhausted {} attempt(s) without reaching fw=0x89; continuing with fw=0x{:02X} (fail-closed exactly as today Ã¢â‚¬â€ chip stays in recoverable 0x82 bootloader)",
                         t(),
                         jump_reverify_max,
                         detected_fw
@@ -11456,7 +12571,7 @@ impl S19jHybridMiner {
             //     2026-04-29 via slot-flip back to BraiinsOS+).
             //   - DCENT_OS bare-protocol ENABLE returns clean ACK but the
             //     DC-DC rail does NOT engage (chain UART RX = 0, GetAddress
-            //     = 0 chips — live-verified 2026-04-29 with the new
+            //     = 0 chips Ã¢â‚¬â€ live-verified 2026-04-29 with the new
             //     dumy_read fallback).
             //   - No production firmware (bosminer/VNish/Bitmain stock)
             //     supports fw=0x86. Recovery requires physical ICSP.
@@ -11523,7 +12638,7 @@ impl S19jHybridMiner {
                     gpio = gate.gpio(),
                     t_ms = t(),
                     "[T+{}] WAKE-DSPIC-BEFORE-RAIL: main 12.8 V rail ASSERTED now (bosminer \
-                     block-B order) — dsPIC already at fw=0x89 from the standby warmup; Phase \
+                     block-B order) Ã¢â‚¬â€ dsPIC already at fw=0x89 from the standby warmup; Phase \
                      2b/EBR ENABLE follows",
                     t()
                 );
@@ -11537,28 +12652,28 @@ impl S19jHybridMiner {
             // Bosminer's am2 cold_boot logs `CHAIN/N: Resetting hash board`
             // here (between PSU enable and PIC enable_voltage), pulsing the
             // hashboard reset GPIO active-LOW for ~10 ms then releasing HIGH.
-            // Without this, the BM1362 chips stay in their last reset state —
+            // Without this, the BM1362 chips stay in their last reset state Ã¢â‚¬â€
             // which after multiple init cycles is "wedged, not responding to
             // GetAddress", exactly what we see (0 chip replies on all 4 ttyS).
             //
-            // chain1 → phys slot 2, chain4 → phys slot 3 (per the
+            // chain1 Ã¢â€ â€™ phys slot 2, chain4 Ã¢â€ â€™ phys slot 3 (per the
             // `relay_phys_idx` map at the top of `run`). The devmem-based
             // pulse helper at `dcentrald-hal/src/board_control.rs:306`
             // preserves PWR_CONTROL HIGH (gpio:907) across the pulse via
             // RMW so the PSU stays armed.
             //
-            // (DCENT_RE / Codex 2026-04-25 — confirmed via bosminer wire
+            // (DCENT_RE / Codex 2026-04-25 Ã¢â‚¬â€ confirmed via bosminer wire
             // trace `12-bosminer-startup-timeline.md:80,85,94,95`.)
-            // Pulse ALL 4 HB resets — the configured `relay_phys_idx` is the
+            // Pulse ALL 4 HB resets Ã¢â‚¬â€ the configured `relay_phys_idx` is the
             // FPGA chain index (chain1=2, chain4=3), but the BoardControl
-            // slot↔hashboard physical wiring is not guaranteed to match. By
+            // slotÃ¢â€ â€hashboard physical wiring is not guaranteed to match. By
             // pulsing all 4 we cover both populated chains regardless of
             // which slot the operator's hashboards are physically plugged
             // into. All 4 resets are independent GPIOs (gpio-897..900);
             // pulsing an unpopulated slot is a no-op.
             info!(
                 t_ms = t(),
-                "[T+{}] Phase 2b: Pulsing HB0..3_RESET (~20 ms LOW → HIGH each) before voltage enable",
+                "[T+{}] Phase 2b: Pulsing HB0..3_RESET (~20 ms LOW Ã¢â€ â€™ HIGH each) before voltage enable",
                 t()
             );
             let doing_bosminer_faithful_reset = am2_env_flag("DCENT_AM2_HB_RESET_REPOINT")
@@ -11603,8 +12718,8 @@ impl S19jHybridMiner {
                     // ORIGINAL (broken on `a lab unit`): this used raw
                     // `std::fs::write("/sys/class/gpio/gpio{897+slot}/value", ..)`
                     // to drive the long hold. On `a lab unit` gpio-898/900 are kernel-
-                    // claimed and NOT sysfs-exportable → ENOENT → the hold never
-                    // fired → chips never reset → chain enum returned 0. The
+                    // claimed and NOT sysfs-exportable Ã¢â€ â€™ ENOENT Ã¢â€ â€™ the hold never
+                    // fired Ã¢â€ â€™ chips never reset Ã¢â€ â€™ chain enum returned 0. The
                     // proven mechanism is the AXI-GPIO mmap at 0x41210000 that
                     // `pulse_reset()`'s 20 ms pulse already succeeds through on
                     // the same run.  parameterized that devmem hold and
@@ -11623,7 +12738,7 @@ impl S19jHybridMiner {
                     // BM1362 chips are ALREADY out of reset + enumerated by
                     // bosminer. Now that the long HB_RESET actually fires via
                     // devmem (it previously no-op'd through a failing sysfs write
-                    // on `a lab unit` — gpio-898/900 unexportable), a multi-second reset
+                    // on `a lab unit` Ã¢â‚¬â€ gpio-898/900 unexportable), a multi-second reset
                     // here would re-reset bosminer's engaged chips and break the
                     // proven handoff ( recipe: "must not disturb the
                     // engaged state"). So skip the long hold when the rail is
@@ -11635,14 +12750,14 @@ impl S19jHybridMiner {
                     // suppress the long reset hold when we are EXPLICITLY doing the
                     // bosminer-faithful cold reset. The `a lab unit` standalone recipe sets
                     // DCENT_AM2_TRUST_RAIL_FALLBACK=1 (it is NOT the
-                    // standalone-vs-handoff discriminator — see the
+                    // standalone-vs-handoff discriminator Ã¢â‚¬â€ see the
                     // HB_RESET_BOSMINER_FAITHFUL note below), so the previous
                     // `handoff_rail_trusted`-only skip silently dropped the long
                     // reset hold on the very standalone cold-wake path that needs
                     // it. When the operator has armed the sysfs re-point
                     // (DCENT_AM2_HB_RESET_REPOINT) or the bosminer-faithful retry
                     // (DCENT_AM2_HB_RESET_BOSMINER_FAITHFUL), we are deliberately
-                    // re-resetting cold chips — keep the hold. The  handoff
+                    // re-resetting cold chips Ã¢â‚¬â€ keep the hold. The  handoff
                     // recipe sets NEITHER of those, so it still skips (chips already
                     // engaged by bosminer, must not re-reset).
                     let reset_slots: &[u8] =
@@ -11666,19 +12781,19 @@ impl S19jHybridMiner {
                         info!(
                             t_ms = t(),
                             reset_hold_ms,
-                            "[T+{}] Phase 2b-extended: SKIPPED long reset hold on bosminer-handoff path (DCENT_AM2_TRUST_RAIL_FALLBACK=1) — chips already engaged by bosminer, must not re-reset",
+                            "[T+{}] Phase 2b-extended: SKIPPED long reset hold on bosminer-handoff path (DCENT_AM2_TRUST_RAIL_FALLBACK=1) Ã¢â‚¬â€ chips already engaged by bosminer, must not re-reset",
                             t()
                         );
                     } else if reset_hold_ms > 20 {
                         // RE-018 ENABLE-BEFORE-RESET-RELEASE (2026-06-09): the in-tree
                         // cold bosminer strace PROVES (both populated chains) that
                         // ENABLE_VOLTAGE (0x15) fires WHILE HB_RESET is held LOW and
-                        // reset releases ~0.3-0.55 s AFTER the chip rail is up — so the
+                        // reset releases ~0.3-0.55 s AFTER the chip rail is up Ã¢â‚¬â€ so the
                         // BM1362 deassert reset into an ENERGIZED rail and latch a
                         // running on-die clock. DCENT historically released reset with
                         // the rail still cold (~0 V): chips POR with no core voltage,
                         // never clock, and the chain stays permanently silent
-                        // (count=0, malformed=0 — silence not garbage; LIVE TEST 7/8/9
+                        // (count=0, malformed=0 Ã¢â‚¬â€ silence not garbage; LIVE TEST 7/8/9
                         // 2026-06-09). Re-order to bosminer's only on the `a lab unit` RE-018
                         // standalone path; the proven  handoff + fleet keep the
                         // legacy order (NOT RE-018-gated -> byte-identical).
@@ -11713,7 +12828,7 @@ impl S19jHybridMiner {
                             info!(
                                 t_ms = t(),
                                 reset_hold_ms,
-                                "[T+{}] Phase 2b-ext(EBR): bosminer-faithful order — assert HB_RESET LOW, energize rail UNDER reset, release AFTER rail up",
+                                "[T+{}] Phase 2b-ext(EBR): bosminer-faithful order Ã¢â‚¬â€ assert HB_RESET LOW, energize rail UNDER reset, release AFTER rail up",
                                 t()
                             );
                             // 1. Assert all reset lines LOW and HOLD (sysfs-repoint split).
@@ -11811,7 +12926,7 @@ impl S19jHybridMiner {
                                 t_ms = t(),
                                 reset_hold_ms,
                                 hb_reset_repoint = doing_bosminer_faithful_reset,
-                                "[T+{}] Phase 2b-extended: S9-pattern long reset hold ({} ms LOW, all slots) — devmem (AXI-GPIO 0x41210000), or plain-kernel-sysfs when DCENT_AM2_HB_RESET_REPOINT=1 (mechanism logged by hold_resets_devmem)",
+                                "[T+{}] Phase 2b-extended: S9-pattern long reset hold ({} ms LOW, all slots) Ã¢â‚¬â€ devmem (AXI-GPIO 0x41210000), or plain-kernel-sysfs when DCENT_AM2_HB_RESET_REPOINT=1 (mechanism logged by hold_resets_devmem)",
                                 t(),
                                 reset_hold_ms
                             );
@@ -11864,7 +12979,7 @@ impl S19jHybridMiner {
                 }
                 Err(e) => warn!(
                     error = %e,
-                    "BoardControl::open(uio17) FAILED — skipping HB resets (chain may remain wedged)"
+                    "BoardControl::open(uio17) FAILED Ã¢â‚¬â€ skipping HB resets (chain may remain wedged)"
                 ),
             }
 
@@ -11883,10 +12998,10 @@ impl S19jHybridMiner {
             // settle HIGH.
             //
             // GPIO map (matches `AM2_RESET_GPIOS = [897, 898, 899, 900]`):
-            //   slot 0 → gpio897 (HB0_RESET)
-            //   slot 1 → gpio898 (HB1_RESET)
-            //   slot 2 → gpio899 (HB2_RESET)  ← .139 chain1 (relay_phys_idx=2)
-            //   slot 3 → gpio900 (HB3_RESET)  ← .139 chain4 (relay_phys_idx=3)
+            //   slot 0 Ã¢â€ â€™ gpio897 (HB0_RESET)
+            //   slot 1 Ã¢â€ â€™ gpio898 (HB1_RESET)
+            //   slot 2 Ã¢â€ â€™ gpio899 (HB2_RESET)  Ã¢â€ Â .139 chain1 (relay_phys_idx=2)
+            //   slot 3 Ã¢â€ â€™ gpio900 (HB3_RESET)  Ã¢â€ Â .139 chain4 (relay_phys_idx=3)
             //
             // DO NOT replace pulse_reset(); this only adds verification +
             // a recovery write if the pulse left reset asserted.
@@ -11915,7 +13030,7 @@ impl S19jHybridMiner {
                         t_ms = t(),
                         slot,
                         gpio = gpio_num,
-                        "[T+{}] HB{}_RESET still LOW post-pulse — forcing HIGH via sysfs",
+                        "[T+{}] HB{}_RESET still LOW post-pulse Ã¢â‚¬â€ forcing HIGH via sysfs",
                         t(),
                         slot
                     );
@@ -11954,14 +13069,14 @@ impl S19jHybridMiner {
             //
             // Bosminer's wire trace (`12-bosminer-startup-timeline.md`):
             //   T+163.689 CHAIN/2: Resetting hash board
-            //   T+164.691 CHAIN/2: Waiting for fans to spin up… (1 s)
-            //   T+166.693 CHAIN/2: Fans OK             ← gate clears
-            //   T+166.868 PWR/2:    Enable voltage     ← per-chain ENABLE
+            //   T+164.691 CHAIN/2: Waiting for fans to spin upÃ¢â‚¬Â¦ (1 s)
+            //   T+166.693 CHAIN/2: Fans OK             Ã¢â€ Â gate clears
+            //   T+166.868 PWR/2:    Enable voltage     Ã¢â€ Â per-chain ENABLE
             //
             // The hybrid mode bypasses `daemon.rs::Daemon::run()` (line ~4540
             // "Phase 2: Fan setup"), so cold-boot through `--s19j-hybrid` leaves
-            // the fan-control IP at PWM 0 → ASICs ramp into stopped airflow →
-            // thermal foldback → chain UART silent.  identified this as
+            // the fan-control IP at PWM 0 Ã¢â€ â€™ ASICs ramp into stopped airflow Ã¢â€ â€™
+            // thermal foldback Ã¢â€ â€™ chain UART silent.  identified this as
             // the most likely missing step blocking native mining on `a lab unit`.
             //
             // Fan-control is selected by UIO sysfs name, not by hard-coded
@@ -11980,7 +13095,7 @@ impl S19jHybridMiner {
             if early_fan_gate_passed {
                 info!(
                     t_ms = t(),
-                    "[T+{}] Phase 2c-pre: SKIPPED — early Phase 0b fan gate already cleared (am2_fan_gate_before_pic=true)",
+                    "[T+{}] Phase 2c-pre: SKIPPED Ã¢â‚¬â€ early Phase 0b fan gate already cleared (am2_fan_gate_before_pic=true)",
                     t()
                 );
                 fan_gate_pwm = Some(
@@ -11999,7 +13114,10 @@ impl S19jHybridMiner {
                 // NOTE on uio number: live probe `01-system-recon.md:106` confirms
                 // `uio16 fan-control 0x42800000` on `a lab unit`. Verify on a fresh unit
                 // with: `cat /sys/class/uio/uio*/name | grep fan`.
-                match open_am2_fan_controller("phase-2c-fan-gate") {
+                match open_am2_fan_controller(
+                    "phase-2c-fan-gate",
+                    dcentrald_hal::fan::Am2FanModePolicy::EnableC52,
+                ) {
                     Some((discovery, fan)) => {
                         let configured_max = self.config.thermal.fan_max_pwm;
                         // Home cap command: no cold-boot fan burst above the configured home
@@ -12045,7 +13163,7 @@ impl S19jHybridMiner {
                                 warn!(
                                     max_rpm,
                                     t_ms = t(),
-                                    "[T+{}] Phase 2c-pre: fans <1800 RPM after 3 s — fail-closed before voltage",
+                                    "[T+{}] Phase 2c-pre: fans <1800 RPM after 3 s Ã¢â‚¬â€ fail-closed before voltage",
                                     t()
                                 );
                                 force_am2_home_hard_stop(&self.config, "am2-fan-rpm-gate-failed");
@@ -12061,7 +13179,7 @@ impl S19jHybridMiner {
                     None => {
                         warn!(
                             t_ms = t(),
-                            "[T+{}] FanController open(fan-control UIO) FAILED — fail-closed before voltage",
+                            "[T+{}] FanController open(fan-control UIO) FAILED Ã¢â‚¬â€ fail-closed before voltage",
                             t()
                         );
                         force_am2_home_hard_stop(&self.config, "am2-fan-uio-open-failed");
@@ -12073,7 +13191,7 @@ impl S19jHybridMiner {
 
             // Phase 2c gate (legacy): keep the historical 2 s settling sleep AFTER
             // the explicit fans-OK gate above. Bosminer enables per-chain voltage
-            // ~175 ms after "Fans OK" — the small extra wait gives the dsPIC
+            // ~175 ms after "Fans OK" Ã¢â‚¬â€ the small extra wait gives the dsPIC
             // heartbeat thread a beat to stabilise before SetVoltage.
             info!(
                 t_ms = t(),
@@ -12083,9 +13201,9 @@ impl S19jHybridMiner {
             std::thread::sleep(Duration::from_secs(2));
 
             // Phase 3: per-chain voltage enable via the proper dsPIC cold-boot
-            // sequence (protocol probe → set_voltage → enable → 1 s DC-DC
-            // ramp → post-enable heartbeat). The simpler `enable_voltage()`
-            // alone was insufficient on `a lab unit` — chain stayed silent at
+            // sequence (protocol probe Ã¢â€ â€™ set_voltage Ã¢â€ â€™ enable Ã¢â€ â€™ 1 s DC-DC
+            // ramp Ã¢â€ â€™ post-enable heartbeat). The simpler `enable_voltage()`
+            // alone was insufficient on `a lab unit` Ã¢â‚¬â€ chain stayed silent at
             // 0 chip replies on all 4 ttyS UARTs. The 7-step `cold_boot_init`
             // matches BraiinsOS am2-s17's PWR/N init sequence (see
             // `dspic.rs:493-602`).
@@ -12138,7 +13256,7 @@ impl S19jHybridMiner {
             } else {
                 let chip_rail_target_mv = open_core_rail_plan.energization_mv;
 
-                // 2026-05-31 — AM2 `a lab unit` open-core voltage-ramp experiment
+                // 2026-05-31 Ã¢â‚¬â€ AM2 `a lab unit` open-core voltage-ramp experiment
                 // (Variant A: enumerate AT open-core, matching bosminer/AMTC,
                 // ported from the proven AM3-BB `a lab unit` open-core rail stage).
                 // When the compound gate is active (env
@@ -12147,7 +13265,7 @@ impl S19jHybridMiner {
                 // the admitted elevated target for enumeration +
                 // core activation, then ramp back DOWN to 13700 mV after enum
                 // succeeds (Phase 4-7 post-enum ramp-down below). Default-OFF +
-                // `a lab unit`-only ⇒ byte-identical for every other unit (the gate
+                // `a lab unit`-only Ã¢â€¡â€™ byte-identical for every other unit (the gate
                 // helpers short-circuit to the steady 13700 target when unset).
                 if open_core_rail_plan.requires_demotion() {
                     let open_core_mv = open_core_rail_plan.energization_mv;
@@ -12166,13 +13284,13 @@ impl S19jHybridMiner {
                     );
                 }
                 // Layer 3 (2026-05-22 XIL `a lab unit` recovery): if Phase 0d
-                // bosminer-warmup + 5×1Hz idle heartbeats already proved 5
+                // bosminer-warmup + 5Ãƒâ€”1Hz idle heartbeats already proved 5
                 // stable beats on this dsPIC, tell `cold_boot_init` to skip
                 // its internal duplicate 5-tick warmup loop (saves ~5 s on
                 // a clean cold boot and avoids racing the same gate twice).
                 let skip_warmup_loop = warmup_did_run;
 
-                //  (2026-05-25) — RE-finding-driven skip path for
+                //  (2026-05-25) Ã¢â‚¬â€ RE-finding-driven skip path for
                 // the dsPIC SetVoltage + ENABLE_VOLTAGE. Per
                 // `PHASE2C-DSPIC-RAIL-FAILURE-RE.md` H1:
                 //   bosminer's `a lab unit` cold-boot trace to dsPIC 0x20 contains
@@ -12189,14 +13307,14 @@ impl S19jHybridMiner {
                 // fingerprint matches AND we're in the  standalone
                 // Loki cold-boot path (PSU transport == gpio_bitbang +
                 // `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1`), SKIP the dsPIC
-                // SetVoltage + ENABLE_VOLTAGE — those are no-ops at best,
+                // SetVoltage + ENABLE_VOLTAGE Ã¢â‚¬â€ those are no-ops at best,
                 // and (per H1) may interfere with the rail state already
                 // engaged by Loki SetVoltage.
                 //
                 // The Phase 0d-post LM75A passthrough warmup (Change 3 above)
                 // has already warmed the dsPIC FSM by this point. Phase 4
                 // chain-enum will reveal whether the chip rail actually
-                // engaged — if it returns 0/126 chips, the Loki SetVoltage
+                // engaged Ã¢â‚¬â€ if it returns 0/126 chips, the Loki SetVoltage
                 // path didn't engage and the run aborts there. If it returns
                 // chips, the rail engaged via Loki and we proceed to mining.
                 //  (2026-05-25, LIVE-driven REVERT of ):
@@ -12206,14 +13324,14 @@ impl S19jHybridMiner {
                 // 0x83). Two LIVE tonights falsified this:
                 //
                 //   - -LIVE (2026-05-25 ~21:30): cold-cold NAND boot
-                //     DCENT_OS, Loki 0x83 sent, chain enum 0/126 — chip rail
+                //     DCENT_OS, Loki 0x83 sent, chain enum 0/126 Ã¢â‚¬â€ chip rail
                 //     NOT engaged.
                 //   -  FORCE_DSPIC_SETVOLTAGE override LIVE: dsPIC
                 //     0x10/0x15 ACKed but daemon was using BARE protocol
-                //     because chip state read fw=0x82 — chain enum still 0/126.
+                //     because chip state read fw=0x82 Ã¢â‚¬â€ chain enum still 0/126.
                 //
-                // But  LIVE (2026-05-24 ~23:41) — BEFORE the
-                // skip shipped — successfully engaged chip rail standalone:
+                // But  LIVE (2026-05-24 ~23:41) Ã¢â‚¬â€ BEFORE the
+                // skip shipped Ã¢â‚¬â€ successfully engaged chip rail standalone:
                 // chain presence 12 unique chips, 44+ SHARES ACCEPTED via the
                 // standalone path with `cold_boot_init_with_options` firing
                 // normally. The  optimisation was thus the actual
@@ -12221,14 +13339,14 @@ impl S19jHybridMiner {
                 //
                 //  REVERT: always call cold_boot_init_with_options.
                 // Whether the chip rail actually engages at 13.7 V depends on
-                // FRAMED vs BARE protocol (determined by GET_VERSION result —
+                // FRAMED vs BARE protocol (determined by GET_VERSION result Ã¢â‚¬â€
                 // see DCENT_AM2_GET_VERSION_FRAMED_4B) and on the Loki spoof
                 // sequence having pre-warmed the chip-rail control plane
                 // (/c/d/e standalone Loki cold-wake). Skipping the
                 // call cannot make rail engagement happen on its own.
                 //
                 // The legacy `DCENT_AM2_FORCE_DSPIC_SETVOLTAGE` env name is
-                // accepted but now unused — kept as a no-op so old launcher
+                // accepted but now unused Ã¢â‚¬â€ kept as a no-op so old launcher
                 // scripts don't trip an unknown-env check.
                 let _wave55i_legacy_no_op = am2_env_flag("DCENT_AM2_FORCE_DSPIC_SETVOLTAGE");
                 // Historical  skip condition was standalone-only:
@@ -12255,7 +13373,7 @@ impl S19jHybridMiner {
                         t_ms = t(),
                         target_mv = chip_rail_target_mv,
                         "[T+{}] dsPIC SetVoltage SKIPPED (Wave-55f RE-fix path); LM75A passthrough \
-                         warmup already ran in Phase 0d-post — proceeding to Phase 4 chain enum",
+                         warmup already ran in Phase 0d-post Ã¢â‚¬â€ proceeding to Phase 4 chain enum",
                         t()
                     );
                 } else {
@@ -12264,7 +13382,7 @@ impl S19jHybridMiner {
                     // when `DCENT_AM2_DSPIC_POSTJUMP_HEARTBEAT_KEEPALIVE=1` AND
                     // the `a lab unit` hardware fingerprint matches, tell cold_boot_init
                     // to keep the cold-engaged FRAMED (fw=0x89) dsPIC serviced
-                    // with framed 0x16 heartbeats through SetVoltage → ENABLE so
+                    // with framed 0x16 heartbeats through SetVoltage Ã¢â€ â€™ ENABLE so
                     // it does not drift back to fw=0x82 bootloader before the
                     // ENABLE (LIVE blocker: ENABLE returned ack_cmd=0x82). With
                     // the env unset OR the fingerprint not matching, this is a
@@ -12277,7 +13395,7 @@ impl S19jHybridMiner {
                             && am2_xil_25_fingerprint_matches();
                     pic.set_postjump_heartbeat_keepalive(postjump_keepalive_active);
                     // Re-JUMP-before-ENABLE (2026-06-07, `a lab unit` standalone
-                    // cold-engage) — prior dsPIC app-mode drift fix. It is
+                    // cold-engage) Ã¢â‚¬â€ prior dsPIC app-mode drift fix. It is
                     // still part of the standalone recipe when enabled, but
                     // later v+2 evidence proved the remaining enum=0 blocker is
                     // downstream of this. Default-OFF + `a lab unit`-fingerprint: when
@@ -12285,10 +13403,10 @@ impl S19jHybridMiner {
                     // hardware fingerprint matches, tell cold_boot_init to
                     // re-read GET_VERSION immediately before SetVoltage and, if
                     // the cold-engaged FRAMED (fw=0x89) dsPIC has drifted back to
-                    // fw=0x82 bootloader, re-JUMP it (flush → framed JUMP, NO
+                    // fw=0x82 bootloader, re-JUMP it (flush Ã¢â€ â€™ framed JUMP, NO
                     // RESET) to fw=0x89 so the ENABLE lands in app mode (the
-                    // framed 0x16 keep-alive FAILED — heartbeats don't hold app
-                    // mode nor transition 0x82→0x89). With the env unset OR the
+                    // framed 0x16 keep-alive FAILED Ã¢â‚¬â€ heartbeats don't hold app
+                    // mode nor transition 0x82Ã¢â€ â€™0x89). With the env unset OR the
                     // fingerprint not matching, this is a no-op and cold_boot_init
                     // is byte-identical for the fleet/handoff/legacy paths. The
                     // env is AND-gated with the `a lab unit` fingerprint HERE (the
@@ -12299,17 +13417,17 @@ impl S19jHybridMiner {
                             && am2_xil_25_fingerprint_matches();
                     pic.set_rejump_before_enable(rejump_before_enable_active);
                     // Skip-SetVoltage-keep-ENABLE (2026-06-07, `a lab unit` standalone
-                    // cold-engage) — prior ENABLE-drift fix
+                    // cold-engage) Ã¢â‚¬â€ prior ENABLE-drift fix
                     // (ENABLE-DRIFT-DIFF.md, commit fc4eef92). Not sufficient
                     // for standalone mining by itself. Default-OFF +
                     // `a lab unit`-fingerprint: when
                     // `DCENT_AM2_DSPIC_SKIP_SETVOLTAGE_KEEP_ENABLE=1` AND the
                     // `a lab unit` hardware fingerprint matches, tell cold_boot_init to
-                    // SKIP the dsPIC SetVoltage (0x10) — which bosminer never
+                    // SKIP the dsPIC SetVoltage (0x10) Ã¢â‚¬â€ which bosminer never
                     // sends to the `a lab unit` dsPIC (the rail is APW-PSU-side) and
                     // which faults the cold-engaged fw=0x89 app back to fw=0x82
-                    // bootloader → ENABLE reads [82,82] — and go GET_VERSION(0x89)
-                    // → [re-JUMP if drifted] → ENABLE(0x15) directly like
+                    // bootloader Ã¢â€ â€™ ENABLE reads [82,82] Ã¢â‚¬â€ and go GET_VERSION(0x89)
+                    // Ã¢â€ â€™ [re-JUMP if drifted] Ã¢â€ â€™ ENABLE(0x15) directly like
                     // bosminer. The ENABLE wire bytes are unchanged; the rail
                     // energizes via the ENABLE at the dsPIC power-on default
                     // voltage (bosminer-proven safe). With the env unset OR the
@@ -12323,14 +13441,14 @@ impl S19jHybridMiner {
                             && am2_xil_25_fingerprint_matches();
                     pic.set_skip_setvoltage_keep_enable(skip_setvoltage_keep_enable_active);
                     // Bosminer-minimal ENABLE (2026-06-07, `a lab unit` standalone
-                    // cold-engage) — the CONSOLIDATED fix for the LIVE-confirmed
+                    // cold-engage) Ã¢â‚¬â€ the CONSOLIDATED fix for the LIVE-confirmed
                     // ENABLE [82,82] drift. Default-OFF + `a lab unit`-fingerprint: when
                     // `DCENT_AM2_DSPIC_BOSMINER_MINIMAL_ENABLE=1` AND the `a lab unit`
                     // hardware fingerprint matches, tell cold_boot_init to send the
                     // dsPIC NOTHING between the confirmed-fw=0x89 GET_VERSION (run
-                    // in the external warmup) and the ENABLE — no flush, no 0x16
+                    // in the external warmup) and the ENABLE Ã¢â‚¬â€ no flush, no 0x16
                     // heartbeat, no 0x30 LM75A read, no second GET_VERSION/0x06
-                    // JUMP re-verify, no 0x10 SetVoltage — so the ONLY dsPIC
+                    // JUMP re-verify, no 0x10 SetVoltage Ã¢â‚¬â€ so the ONLY dsPIC
                     // traffic in that window is the byte-identical 0x15 ENABLE,
                     // exactly like bosminer (whose pre-ENABLE commands DCENT
                     // emitted from multiple code paths; LIVE TEST 6 still showed
@@ -12356,7 +13474,7 @@ impl S19jHybridMiner {
                         rejump_before_enable_active,
                         skip_setvoltage_keep_enable_active,
                         bosminer_minimal_enable_active,
-                        "[T+{}] Phase 3: PIC cold_boot_init starting (GET_VERSION → HB gate → SetVoltage target_mv=13700 → ENABLE; RESET/JUMP banned)",
+                        "[T+{}] Phase 3: PIC cold_boot_init starting (GET_VERSION Ã¢â€ â€™ HB gate Ã¢â€ â€™ SetVoltage target_mv=13700 Ã¢â€ â€™ ENABLE; RESET/JUMP banned)",
                         t()
                     );
                     if self.shutdown.is_cancelled() {
@@ -12375,7 +13493,7 @@ impl S19jHybridMiner {
                         pic.cold_boot_init_with_options(chip_rail_target_mv, skip_warmup_loop)
                     {
                         anyhow::bail!(
-                            "PIC cold_boot_init FAILED — without 13.7 V on the chain, ASICs are dead. \
+                            "PIC cold_boot_init FAILED Ã¢â‚¬â€ without 13.7 V on the chain, ASICs are dead. \
                              Aborting init. error: {}",
                             e
                         );
@@ -12397,7 +13515,7 @@ impl S19jHybridMiner {
                     info!(
                         t_ms = t(),
                         target_mv = chip_rail_target_mv,
-                        "[T+{}] dsPIC cold_boot_init returned OK (SetVoltage applied, ENABLE_VOLTAGE accepted at protocol level — firmware-byte ACK/echo, NOT a rail measurement); chain rail at target_mv=13700 is UNVERIFIED until Phase 4 chain enumeration",
+                        "[T+{}] dsPIC cold_boot_init returned OK (SetVoltage applied, ENABLE_VOLTAGE accepted at protocol level Ã¢â‚¬â€ firmware-byte ACK/echo, NOT a rail measurement); chain rail at target_mv=13700 is UNVERIFIED until Phase 4 chain enumeration",
                         t()
                     );
                 }
@@ -12413,7 +13531,7 @@ impl S19jHybridMiner {
                 // other PICs first, then cold_boot_init.
                 //
                 // Gated by `DCENT_AM2_VOLTAGE_ENABLE_ALL_ACTIVE_PICS=1`.
-                // Default-OFF — preserves `a lab unit`/`a lab unit`/`a lab unit` byte-parity.
+                // Default-OFF Ã¢â‚¬â€ preserves `a lab unit`/`a lab unit`/`a lab unit` byte-parity.
                 // Best-effort: each PIC's warmup AND init can fail independently
                 // without bailing the daemon.
                 if all_active_voltage_enable {
@@ -12428,38 +13546,187 @@ impl S19jHybridMiner {
                             "[T+{}] Wave-25.9: best-effort warmup + voltage-enable on other active dsPIC addresses",
                             t()
                         );
-                        // : if the strace-derived variant is the env-selected
-                        // warmup for the primary PIC, use it for the other PICs too so
-                        // all of `a lab unit`'s active dsPICs end up in the same fw=0x89 state.
-                        let use_strace_for_others = am2_pic_reset_strace_derived_enabled();
-                        for other_addr in other_pics {
-                            // Step 1: bosminer-faithful warmup chain on this PIC
-                            // ( strace-derived OR S9-era bare per env gate).
-                            let other_warmup_result = if use_strace_for_others {
-                                // COLD-BYTE-DIFF Fix B: single-atomic-transaction
-                                // form when env+`a lab unit`-fingerprint match, else the
-                                // proven N-transaction form (byte-identical).
-                                am2_run_strace_derived_warmup(pic_i2c, other_addr)
-                            } else {
-                                bosminer_warmup::am2_pic_reset_and_start_app_bosminer_faithful(
-                                    pic_i2c, other_addr,
-                                )
-                            };
-                            match other_warmup_result {
-                                Ok(()) => info!(
-                                    addr = format_args!("0x{:02X}", other_addr),
-                                    "Wave-25.9: warmup chain emitted OK on 0x{:02X}", other_addr
-                                ),
+                        // Decade backlog P1-5 (2026-07-29): multi-PIC ENABLE must not
+                        // simultaneous-burst. Prefer plan_production_multi_chain_enable: when early
+                        // dispatch pillars are green → Composed; otherwise PowerUpOnly
+                        // stagger (Phase 3 is before Phase-10 work-dispatch admit, so
+                        // PowerUpOnly is the common path). Hard refuse on burst policy.
+                        let lab_thermal_skip_early = am2_env_flag(ENV_AM2_SKIP_THERMAL_SUPERVISOR);
+                        let (early_hb_req, early_hb_obs) =
+                            hybrid_heartbeat_inputs(passthrough, selected_pic_addr, true, &[], 1);
+                        let early_dispatch_inputs = hybrid_work_dispatch_inputs(
+                            hybrid_watchdog_safety_state(self.config.watchdog.enabled, false),
+                            early_hb_req,
+                            &early_hb_obs,
+                            hybrid_thermal_safety_state(false, lab_thermal_skip_early),
+                        );
+                        let multi_pic_plan =
+                            match dcentrald_common::plan_production_multi_chain_enable(
+                                &other_pics,
+                                StaggerConfig::default(),
+                                Some(&early_dispatch_inputs),
+                            ) {
+                                Ok(plan) => Some(plan),
                                 Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        remaining = other_pics.len(),
+                                        "P1-5: refusing multi-PIC voltage enable under production power-up policy (no simultaneous enable)"
+                                    );
+                                    None
+                                }
+                            };
+                        if let Some(multi_pic_plan) = multi_pic_plan {
+                            match &multi_pic_plan.authority {
+                                MultiChainEnableAuthority::Composed { admission } => {
+                                    info!(
+                                    t_ms = t(),
+                                    controller_count = admission.controller_count,
+                                    "[T+{}] P1-5: multi-PIC enable schedule composed with early dispatch pillars",
+                                    t()
+                                );
+                                }
+                                MultiChainEnableAuthority::PowerUpOnly => {
+                                    info!(
+                                    t_ms = t(),
+                                    "[T+{}] P1-5: multi-PIC enable using power-up-only stagger (dispatch pillars not green yet; Phase-10 admit will re-authorize)",
+                                    t()
+                                );
+                                }
+                            }
+                            let multi_pic_enable_seq = multi_pic_plan.sequence;
+                            // : if the strace-derived variant is the env-selected
+                            // warmup for the primary PIC, use it for the other PICs too so
+                            // all of `a lab unit`'s active dsPICs end up in the same fw=0x89 state.
+                            let use_strace_for_others = am2_pic_reset_strace_derived_enabled();
+                            for (other_addr, delay_ms) in multi_pic_enable_seq {
+                                if delay_ms > 0 {
+                                    info!(
+                                    t_ms = t(),
+                                    delay_ms,
+                                    addr = format_args!("0x{:02X}", other_addr),
+                                    "[T+{}] P1-5: production stagger {delay_ms} ms before multi-PIC enable on 0x{other_addr:02X}",
+                                    t()
+                                );
+                                    std::thread::sleep(Duration::from_millis(u64::from(delay_ms)));
+                                }
+                                // Step 1: bosminer-faithful warmup chain on this PIC
+                                // ( strace-derived OR S9-era bare per env gate).
+                                let other_warmup_result = if use_strace_for_others {
+                                    // COLD-BYTE-DIFF Fix B: single-atomic-transaction
+                                    // form when env+`a lab unit`-fingerprint match, else the
+                                    // proven N-transaction form (byte-identical).
+                                    am2_run_strace_derived_warmup(pic_i2c, other_addr)
+                                } else {
+                                    bosminer_warmup::am2_pic_reset_and_start_app_bosminer_faithful(
+                                        pic_i2c, other_addr,
+                                    )
+                                };
+                                match other_warmup_result {
+                                    Ok(()) => info!(
+                                        addr = format_args!("0x{:02X}", other_addr),
+                                        "Wave-25.9: warmup chain emitted OK on 0x{:02X}",
+                                        other_addr
+                                    ),
+                                    Err(e) => {
+                                        let target_is_effective_chain =
+                                            effective_chain_dspic_addr == Some(other_addr);
+                                        warn!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            target_is_effective_chain,
+                                            error = %e,
+                                            "Wave-25.9: warmup chain on 0x{:02X} FAILED (best-effort, skipping cold_boot_init for this PIC)",
+                                            other_addr
+                                        );
+                                        if target_is_effective_chain
+                                            && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
+                                        {
+                                            if let Some(service) = i2c0_service.as_ref() {
+                                                let mut disable_addrs =
+                                                    vec![selected_pic_addr, other_addr];
+                                                disable_addrs.sort_unstable();
+                                                disable_addrs.dedup();
+                                                disable_dspic_addrs_best_effort(
+                                                    service,
+                                                    &disable_addrs,
+                                                    selected_pic_addr,
+                                                    heartbeat_pic_fw,
+                                                    "target-dspic-warmup-failed",
+                                                );
+                                            }
+                                            force_am2_home_hard_stop(
+                                                &self.config,
+                                                "target-dspic-warmup-failed",
+                                            );
+                                            self.shutdown.cancel();
+                                            anyhow::bail!(
+                                            "Target chain dsPIC 0x{:02X} warmup failed under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without target-rail proof",
+                                            other_addr,
+                                            chain_uart_device
+                                        );
+                                        }
+                                        continue;
+                                    }
+                                }
+                                // Step 2: 5Ãƒâ€”1Hz idle heartbeats (match Phase 0d).
+                                //  (RE-018, 2026-05-30, wf_ce77f2f8 Change #1): force the
+                                // OBSERVED fw-family byte (0x8A) for the `a lab unit` effective-chain dsPIC
+                                // (0x22) so ENABLE/SetVoltage use the 6-byte Canonical form Ã¢â‚¬â€ the
+                                // form that produced a real [0x15,0x00] ACK on the live ttyS3 cold-
+                                // cycle Ã¢â‚¬â€ instead of the 7-byte VnishPadded form (which `a lab unit` echoes
+                                // [0x8A,0x8A]). GET_VERSION reports 0x89 but the chip's idle/echo
+                                // family is 0x8A (the codebase already documents "0x22 fw=0x8A").
+                                // Also makes classify_enable_ack expect 0x8A so a legit echo is
+                                // FirmwareEcho, not FirmwareEchoMismatch. Default-OFF +
+                                // `a lab unit`-fingerprint + effective-chain only Ã¢â€ â€™ byte-identical for
+                                // .109/.79/.129/.135/S9/handoff (they keep NoneÃ¢â€¡â€™Fw89). This service
+                                // is reused for the 10 direct SetVoltage + ENABLE below.
+                                let other_fw_override: Option<u8> =
+                                    if am2_dspic_fw_from_observed_enabled()
+                                        && effective_chain_dspic_addr == Some(other_addr)
+                                        && am2_xil_25_fingerprint_matches()
+                                    {
+                                        Some(0x8A)
+                                    } else {
+                                        None
+                                    };
+                                let mut other_warmup_pic = Pic0x89Service::new_with_fw(
+                                    pic_i2c.clone(),
+                                    other_addr,
+                                    other_fw_override,
+                                );
+                                let mut beats_ok = 0u32;
+                                for tick in 1..=5 {
+                                    std::thread::sleep(Duration::from_secs(1));
+                                    match other_warmup_pic.send_heartbeat() {
+                                        Ok(()) => {
+                                            beats_ok += 1;
+                                            info!(
+                                                addr = format_args!("0x{:02X}", other_addr),
+                                                tick,
+                                                beats_ok,
+                                                "Wave-25.9: 0x{:02X} heartbeat OK",
+                                                other_addr
+                                            );
+                                        }
+                                        Err(e) => warn!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            tick, error = %e,
+                                            "Wave-25.9: 0x{:02X} heartbeat failed (non-fatal)",
+                                            other_addr
+                                        ),
+                                    }
+                                }
+                                if beats_ok < 5 {
                                     let target_is_effective_chain =
                                         effective_chain_dspic_addr == Some(other_addr);
                                     warn!(
-                                        addr = format_args!("0x{:02X}", other_addr),
-                                        target_is_effective_chain,
-                                        error = %e,
-                                        "Wave-25.9: warmup chain on 0x{:02X} FAILED (best-effort, skipping cold_boot_init for this PIC)",
-                                        other_addr
-                                    );
+                                    addr = format_args!("0x{:02X}", other_addr),
+                                    beats_ok,
+                                    target_is_effective_chain,
+                                    "Wave-25.9: 0x{:02X} fewer than 5 stable beats Ã¢â‚¬â€ skipping cold_boot_init",
+                                    other_addr
+                                );
                                     if target_is_effective_chain
                                         && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
                                     {
@@ -12473,260 +13740,130 @@ impl S19jHybridMiner {
                                                 &disable_addrs,
                                                 selected_pic_addr,
                                                 heartbeat_pic_fw,
-                                                "target-dspic-warmup-failed",
+                                                "target-dspic-heartbeat-failed",
                                             );
                                         }
                                         force_am2_home_hard_stop(
                                             &self.config,
-                                            "target-dspic-warmup-failed",
+                                            "target-dspic-heartbeat-failed",
                                         );
                                         self.shutdown.cancel();
                                         anyhow::bail!(
-                                            "Target chain dsPIC 0x{:02X} warmup failed under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without target-rail proof",
-                                            other_addr,
-                                            chain_uart_device
-                                        );
-                                    }
-                                    continue;
-                                }
-                            }
-                            // Step 2: 5×1Hz idle heartbeats (match Phase 0d).
-                            //  (RE-018, 2026-05-30, wf_ce77f2f8 Change #1): force the
-                            // OBSERVED fw-family byte (0x8A) for the `a lab unit` effective-chain dsPIC
-                            // (0x22) so ENABLE/SetVoltage use the 6-byte Canonical form — the
-                            // form that produced a real [0x15,0x00] ACK on the live ttyS3 cold-
-                            // cycle — instead of the 7-byte VnishPadded form (which `a lab unit` echoes
-                            // [0x8A,0x8A]). GET_VERSION reports 0x89 but the chip's idle/echo
-                            // family is 0x8A (the codebase already documents "0x22 fw=0x8A").
-                            // Also makes classify_enable_ack expect 0x8A so a legit echo is
-                            // FirmwareEcho, not FirmwareEchoMismatch. Default-OFF +
-                            // `a lab unit`-fingerprint + effective-chain only → byte-identical for
-                            // .109/.79/.129/.135/S9/handoff (they keep None⇒Fw89). This service
-                            // is reused for the 10 direct SetVoltage + ENABLE below.
-                            let other_fw_override: Option<u8> =
-                                if am2_dspic_fw_from_observed_enabled()
-                                    && effective_chain_dspic_addr == Some(other_addr)
-                                    && am2_xil_25_fingerprint_matches()
-                                {
-                                    Some(0x8A)
-                                } else {
-                                    None
-                                };
-                            let mut other_warmup_pic = Pic0x89Service::new_with_fw(
-                                pic_i2c.clone(),
-                                other_addr,
-                                other_fw_override,
-                            );
-                            let mut beats_ok = 0u32;
-                            for tick in 1..=5 {
-                                std::thread::sleep(Duration::from_secs(1));
-                                match other_warmup_pic.send_heartbeat() {
-                                    Ok(()) => {
-                                        beats_ok += 1;
-                                        info!(
-                                            addr = format_args!("0x{:02X}", other_addr),
-                                            tick,
-                                            beats_ok,
-                                            "Wave-25.9: 0x{:02X} heartbeat OK",
-                                            other_addr
-                                        );
-                                    }
-                                    Err(e) => warn!(
-                                        addr = format_args!("0x{:02X}", other_addr),
-                                        tick, error = %e,
-                                        "Wave-25.9: 0x{:02X} heartbeat failed (non-fatal)",
-                                        other_addr
-                                    ),
-                                }
-                            }
-                            if beats_ok < 5 {
-                                let target_is_effective_chain =
-                                    effective_chain_dspic_addr == Some(other_addr);
-                                warn!(
-                                    addr = format_args!("0x{:02X}", other_addr),
-                                    beats_ok,
-                                    target_is_effective_chain,
-                                    "Wave-25.9: 0x{:02X} fewer than 5 stable beats — skipping cold_boot_init",
-                                    other_addr
-                                );
-                                if target_is_effective_chain
-                                    && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
-                                {
-                                    if let Some(service) = i2c0_service.as_ref() {
-                                        let mut disable_addrs = vec![selected_pic_addr, other_addr];
-                                        disable_addrs.sort_unstable();
-                                        disable_addrs.dedup();
-                                        disable_dspic_addrs_best_effort(
-                                            service,
-                                            &disable_addrs,
-                                            selected_pic_addr,
-                                            heartbeat_pic_fw,
-                                            "target-dspic-heartbeat-failed",
-                                        );
-                                    }
-                                    force_am2_home_hard_stop(
-                                        &self.config,
-                                        "target-dspic-heartbeat-failed",
-                                    );
-                                    self.shutdown.cancel();
-                                    anyhow::bail!(
                                         "Target chain dsPIC 0x{:02X} had only {} stable heartbeat(s) under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without target-rail proof",
                                         other_addr,
                                         beats_ok,
                                         chain_uart_device
                                     );
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            // Step 3 (10): direct SetVoltage + ENABLE on this PIC,
-                            // bypassing cold_boot_init's internal heartbeat sanity which
-                            // was failing EIO in 9 even though our 5 heartbeats
-                            // above succeeded on the same address.
-                            //
-                            // Reuse the warmed Pic0x89Service from Step 2 — its firmware
-                            // protocol selection already settled and it shares state with
-                            // the successful heartbeats.
-                            info!(
+                                // Step 3 (10): direct SetVoltage + ENABLE on this PIC,
+                                // bypassing cold_boot_init's internal heartbeat sanity which
+                                // was failing EIO in 9 even though our 5 heartbeats
+                                // above succeeded on the same address.
+                                //
+                                // Reuse the warmed Pic0x89Service from Step 2 Ã¢â‚¬â€ its firmware
+                                // protocol selection already settled and it shares state with
+                                // the successful heartbeats.
+                                info!(
                                 addr = format_args!("0x{:02X}", other_addr),
                                 target_mv = chip_rail_target_mv,
                                 "Wave-25.10: direct SetVoltage on dsPIC 0x{:02X} (bypass cold_boot_init wrapper)",
                                 other_addr
                             );
-                            match other_warmup_pic.set_voltage(chip_rail_target_mv) {
-                                Ok(()) => {
-                                    info!(
-                                        addr = format_args!("0x{:02X}", other_addr),
-                                        "Wave-25.10: 0x{:02X} SetVoltage OK", other_addr
+                                // P1-2: VoltageRail facet + pure energize (set_mv then enable).
+                                let trust_degraded = dspic_fw86_trust_degraded_override_enabled();
+                                let energize_result = {
+                                    let mut rail = Pic0x89VoltageRail::new(
+                                        &mut other_warmup_pic,
+                                        trust_degraded,
                                     );
-                                    match other_warmup_pic.enable_voltage() {
-                                        Ok(()) => {
-                                            info!(
-                                                addr = format_args!("0x{:02X}", other_addr),
-                                                "Wave-25.10: 0x{:02X} ENABLE_VOLTAGE accepted; rail unverified until Phase 4 chain enumeration",
-                                                other_addr
-                                            );
-                                            //  (RE-018): framed rail-voltage readback right after
-                                            // the (now real) ENABLE ACK — READ-ONLY diagnostic, non-fatal.
-                                            // Disambiguates the enum=0 residual: ~13700 mV ⇒ rail engaged
-                                            // (chip-wake/transport is the residual, software-fixable);
-                                            // ~0/err ⇒ rail not energized despite the ACK (DMM on slot-3
-                                            // V+ warranted). Now that Change #1 lands the correct fw=0x8A
-                                            // framed encoding, the 0x3B/0x3A reads should decode (were
-                                            // all-0xFF before). Never gates init.
-                                            match other_warmup_pic.read_voltage() {
-                                                Ok(mv) => info!(
-                                                    addr = format_args!("0x{:02X}", other_addr),
-                                                    mv,
-                                                    "Wave-57: 0x{:02X} framed GET_VOLTAGE(0x3B) post-ENABLE rail readback mv={} (diagnostic; ~13700=engaged, ~0/low=dead)",
-                                                    other_addr, mv
-                                                ),
-                                                Err(e) => warn!(
-                                                    addr = format_args!("0x{:02X}", other_addr),
-                                                    error = %e,
-                                                    "Wave-57: 0x{:02X} framed GET_VOLTAGE(0x3B) post-ENABLE readback failed (diagnostic only)",
-                                                    other_addr
-                                                ),
-                                            }
-                                            match other_warmup_pic.measure_voltage() {
-                                                Ok(mv) => info!(
-                                                    addr = format_args!("0x{:02X}", other_addr),
-                                                    mv,
-                                                    "Wave-57: 0x{:02X} MEASURE_VOLTAGE(0x3A) analog-ADC rail readback mv={} (diagnostic; stronger rail proxy than 0x3B, still NOT physical/DMM proof)",
-                                                    other_addr, mv
-                                                ),
-                                                Err(e) => warn!(
-                                                    addr = format_args!("0x{:02X}", other_addr),
-                                                    error = %e,
-                                                    "Wave-57: 0x{:02X} MEASURE_VOLTAGE(0x3A) readback failed (diagnostic only)",
-                                                    other_addr
-                                                ),
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let target_is_effective_chain =
-                                                effective_chain_dspic_addr == Some(other_addr);
-                                            warn!(
-                                                addr = format_args!("0x{:02X}", other_addr),
-                                                error = %e,
-                                                target_is_effective_chain,
-                                                require_real_ack = am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK"),
-                                                "Wave-25.10: 0x{:02X} ENABLE_VOLTAGE FAILED",
-                                                other_addr
-                                            );
-                                            if target_is_effective_chain
-                                                && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
-                                            {
-                                                if let Some(service) = i2c0_service.as_ref() {
-                                                    let mut disable_addrs =
-                                                        vec![selected_pic_addr, other_addr];
-                                                    disable_addrs.sort_unstable();
-                                                    disable_addrs.dedup();
-                                                    disable_dspic_addrs_best_effort(
-                                                        service,
-                                                        &disable_addrs,
-                                                        selected_pic_addr,
-                                                        heartbeat_pic_fw,
-                                                        "target-dspic-enable-failed",
-                                                    );
-                                                }
-                                                force_am2_home_hard_stop(
-                                                    &self.config,
-                                                    "target-dspic-enable-failed",
-                                                );
-                                                self.shutdown.cancel();
-                                                anyhow::bail!(
-                                                    "Target chain dsPIC 0x{:02X} ENABLE_VOLTAGE failed under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without real target-rail ACK",
-                                                    other_addr,
-                                                    chain_uart_device
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let target_is_effective_chain =
-                                        effective_chain_dspic_addr == Some(other_addr);
-                                    warn!(
+                                    energize_voltage_rail(&mut rail, chip_rail_target_mv)
+                                };
+                                match energize_result {
+                                    Ok(()) => {
+                                        info!(
                                         addr = format_args!("0x{:02X}", other_addr),
-                                        error = %e,
-                                        target_is_effective_chain,
-                                        "Wave-25.10: 0x{:02X} SetVoltage FAILED (best-effort, continuing)",
+                                        "Wave-25.10: 0x{:02X} VoltageRail energize OK (set_mv+enable); rail unverified until Phase 4 chain enumeration",
                                         other_addr
                                     );
-                                    if target_is_effective_chain
-                                        && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
-                                    {
-                                        if let Some(service) = i2c0_service.as_ref() {
-                                            let mut disable_addrs =
-                                                vec![selected_pic_addr, other_addr];
-                                            disable_addrs.sort_unstable();
-                                            disable_addrs.dedup();
-                                            disable_dspic_addrs_best_effort(
-                                                service,
-                                                &disable_addrs,
-                                                selected_pic_addr,
-                                                heartbeat_pic_fw,
-                                                "target-dspic-setvoltage-failed",
-                                            );
-                                        }
-                                        force_am2_home_hard_stop(
-                                            &self.config,
-                                            "target-dspic-setvoltage-failed",
+                                        //  (RE-018): framed rail-voltage readback right after
+                                        // ENABLE — READ-ONLY diagnostic, non-fatal.
+                                        match other_warmup_pic.read_voltage() {
+                                        Ok(mv) => info!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            mv,
+                                            "Wave-57: 0x{:02X} framed GET_VOLTAGE(0x3B) post-ENABLE rail readback mv={} (diagnostic; ~13700=engaged, ~0/low=dead)",
+                                            other_addr, mv
+                                        ),
+                                        Err(e) => warn!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            error = %e,
+                                            "Wave-57: 0x{:02X} framed GET_VOLTAGE(0x3B) post-ENABLE readback failed (diagnostic only)",
+                                            other_addr
+                                        ),
+                                    }
+                                        match other_warmup_pic.measure_voltage() {
+                                        Ok(mv) => info!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            mv,
+                                            "Wave-57: 0x{:02X} MEASURE_VOLTAGE(0x3A) analog-ADC rail readback mv={} (diagnostic; stronger rail proxy than 0x3B, still NOT physical/DMM proof)",
+                                            other_addr, mv
+                                        ),
+                                        Err(e) => warn!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            error = %e,
+                                            "Wave-57: 0x{:02X} MEASURE_VOLTAGE(0x3A) readback failed (diagnostic only)",
+                                            other_addr
+                                        ),
+                                    }
+                                    }
+                                    Err(e) => {
+                                        let target_is_effective_chain =
+                                            effective_chain_dspic_addr == Some(other_addr);
+                                        warn!(
+                                            addr = format_args!("0x{:02X}", other_addr),
+                                            error = %e,
+                                            target_is_effective_chain,
+                                            require_real_ack = am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK"),
+                                            "Wave-25.10: 0x{:02X} VoltageRail energize FAILED (set_mv or enable)",
+                                            other_addr
                                         );
-                                        self.shutdown.cancel();
-                                        anyhow::bail!(
-                                            "Target chain dsPIC 0x{:02X} SetVoltage failed under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without target-rail proof",
+                                        if target_is_effective_chain
+                                            && am2_env_flag("DCENT_AM2_REQUIRE_REAL_ENABLE_ACK")
+                                        {
+                                            if let Some(service) = i2c0_service.as_ref() {
+                                                let mut disable_addrs =
+                                                    vec![selected_pic_addr, other_addr];
+                                                disable_addrs.sort_unstable();
+                                                disable_addrs.dedup();
+                                                disable_dspic_addrs_best_effort(
+                                                    service,
+                                                    &disable_addrs,
+                                                    selected_pic_addr,
+                                                    heartbeat_pic_fw,
+                                                    "target-dspic-energize-failed",
+                                                );
+                                            }
+                                            force_am2_home_hard_stop(
+                                                &self.config,
+                                                "target-dspic-energize-failed",
+                                            );
+                                            self.shutdown.cancel();
+                                            anyhow::bail!(
+                                            "Target chain dsPIC 0x{:02X} VoltageRail energize failed under DCENT_AM2_REQUIRE_REAL_ENABLE_ACK=1; refusing BM1362 enum on {} without real target-rail ACK",
                                             other_addr,
                                             chain_uart_device
                                         );
+                                        }
                                     }
                                 }
                             }
-                        }
+                        } // end P1-5 multi-pic enable (plan_production_multi_chain_enable Ok)
                     }
                 }
 
-                // Phase 3b: voltage feedback read — diagnostic only.
+                // Phase 3b: voltage feedback read Ã¢â‚¬â€ diagnostic only.
                 //
                 // B03 (2026-05-28): read BOTH the selected PIC and the
                 // EFFECTIVE chain dsPIC, each addr-tagged. Before this fix the
@@ -12741,7 +13878,7 @@ impl S19jHybridMiner {
                 // change the proven bosminer-handoff recipe: that path sets no
                 // chain-UART override, so `effective_chain_dspic_addr ==
                 // selected_pic_addr` and the second read below is skipped.
-                // NOTE: a dsPIC ADC readback is still NOT physical rail proof —
+                // NOTE: a dsPIC ADC readback is still NOT physical rail proof Ã¢â‚¬â€
                 // only a DMM/scope on the hashboard DC-DC V+ pad is (see
                 // ).
                 std::thread::sleep(Duration::from_millis(150));
@@ -12753,18 +13890,18 @@ impl S19jHybridMiner {
                             target_mv = chip_rail_target_mv,
                             rail_proof = "ack-readback-not-physical-rail-proof",
                             t_ms = t(),
-                            "[T+{}] dsPIC voltage feedback (selected PIC 0x{:02X}, mv={}, target_mv={}) — diagnostic only; readback is NOT physical rail proof",
+                            "[T+{}] dsPIC voltage feedback (selected PIC 0x{:02X}, mv={}, target_mv={}) Ã¢â‚¬â€ diagnostic only; readback is NOT physical rail proof",
                             t(),
                             selected_pic_addr,
                             mv,
                             chip_rail_target_mv
                         );
                         // G03 (gap-swarm, 2026-05-28): when the 0x3B read above
-                        // succeeded (⇒ dsPIC parser is healthy), ALSO read the
+                        // succeeded (Ã¢â€¡â€™ dsPIC parser is healthy), ALSO read the
                         // analog-ADC rail via MEASURE_VOLTAGE (0x3A =
                         // dspic33epxx_get_an_voltage2), distinct from 0x3B
                         // GET_VOLTAGE's setpoint/feedback path. 0x3A is the actual
-                        // measured rail — the stronger "is the rail truly
+                        // measured rail Ã¢â‚¬â€ the stronger "is the rail truly
                         // energized?" proxy for Procedure A. Read-only, non-fatal.
                         // Nested under the Ok arm (DCENT_EE N1) so we never add a
                         // back-to-back I2C_RDWR to an already-unhealthy parser.
@@ -12776,7 +13913,7 @@ impl S19jHybridMiner {
                                 opcode = "0x3A-measure-analog-adc",
                                 rail_proof = "ack-readback-not-physical-rail-proof",
                                 t_ms = t(),
-                                "[T+{}] dsPIC ANALOG-ADC rail measure (selected PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) — diagnostic only; stronger rail proxy than 0x3B, still NOT physical (DMM) proof",
+                                "[T+{}] dsPIC ANALOG-ADC rail measure (selected PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) Ã¢â‚¬â€ diagnostic only; stronger rail proxy than 0x3B, still NOT physical (DMM) proof",
                                 t(),
                                 selected_pic_addr,
                                 mv3a,
@@ -12785,7 +13922,7 @@ impl S19jHybridMiner {
                             Err(e) => warn!(
                                 addr = format_args!("0x{:02X}", selected_pic_addr),
                                 error = %e,
-                                "dsPIC analog-ADC rail measure failed (selected PIC 0x{:02X}, opcode=0x3A) — diagnostic only; firmware may not answer 0x3A",
+                                "dsPIC analog-ADC rail measure failed (selected PIC 0x{:02X}, opcode=0x3A) Ã¢â‚¬â€ diagnostic only; firmware may not answer 0x3A",
                                 selected_pic_addr
                             ),
                         }
@@ -12802,7 +13939,7 @@ impl S19jHybridMiner {
                             addr = format_args!("0x{:02X}", selected_pic_addr),
                             error = %e,
                             clean_3b_refusal,
-                            "dsPIC 0x3B read failed (selected PIC 0x{:02X}) — clean fw=0x89 wrong-opcode refusal falls through to 0x3A; parser-health error does NOT (DCENT_EE N1)",
+                            "dsPIC 0x3B read failed (selected PIC 0x{:02X}) Ã¢â‚¬â€ clean fw=0x89 wrong-opcode refusal falls through to 0x3A; parser-health error does NOT (DCENT_EE N1)",
                             selected_pic_addr
                         );
                         if am2_xil_25_fingerprint_matches() && clean_3b_refusal {
@@ -12814,7 +13951,7 @@ impl S19jHybridMiner {
                                     opcode = "0x3A-measure-analog-adc",
                                     rail_proof = "ack-readback-not-physical-rail-proof",
                                     t_ms = t(),
-                                    "[T+{}] dsPIC ANALOG-ADC rail measure via BLK-5 fall-through (selected PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) — RAIL_UP when mv ~ target_mv; diagnostic only",
+                                    "[T+{}] dsPIC ANALOG-ADC rail measure via BLK-5 fall-through (selected PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) Ã¢â‚¬â€ RAIL_UP when mv ~ target_mv; diagnostic only",
                                     t(),
                                     selected_pic_addr,
                                     mv3a,
@@ -12823,7 +13960,7 @@ impl S19jHybridMiner {
                                 Err(e2) => warn!(
                                     addr = format_args!("0x{:02X}", selected_pic_addr),
                                     error = %e2,
-                                    "dsPIC 0x3A measure also failed (selected PIC 0x{:02X}, BLK-5 fall-through) — firmware may not answer 0x3A",
+                                    "dsPIC 0x3A measure also failed (selected PIC 0x{:02X}, BLK-5 fall-through) Ã¢â‚¬â€ firmware may not answer 0x3A",
                                     selected_pic_addr
                                 ),
                             }
@@ -12835,7 +13972,7 @@ impl S19jHybridMiner {
                 // rail the BM1362 chips on the enumerated chain actually run
                 // from; an `mv` far below `target_mv` here is the strongest
                 // SOFTWARE signal that the on-hashboard DC-DC did not energize
-                // despite an ENABLE ACK. It remains a proxy — corroborate, never
+                // despite an ENABLE ACK. It remains a proxy Ã¢â‚¬â€ corroborate, never
                 // substitute, with a physical (DMM/scope) measurement.
                 if let (Some(effective_addr), Some(service)) =
                     (effective_chain_dspic_addr, i2c0_service.as_ref())
@@ -12843,9 +13980,9 @@ impl S19jHybridMiner {
                     // Fix-A (2026-06-07): on `a lab unit` also enter this rail-verdict
                     // block when the effective chain dsPIC == the selected PIC
                     // (the standalone ttyS1 path: 0x20 == 0x20). Without the
-                    // `|| fingerprint`, the whole block — including the LM75
+                    // `|| fingerprint`, the whole block Ã¢â‚¬â€ including the LM75
                     // die-temp RAIL_UP/RAIL_COLD verdict + the 0x3A analog-ADC
-                    // measure — is skipped on the ttyS1 path, so a standalone run
+                    // measure Ã¢â‚¬â€ is skipped on the ttyS1 path, so a standalone run
                     // produced NO rail verdict (the diagnostic the entire cold-wake
                     // decision tree depends on). Read-only/diagnostic; `a lab unit`-gated
                     // so the proven fleet + handoff are byte-identical.
@@ -12864,15 +14001,15 @@ impl S19jHybridMiner {
                                     target_mv = chip_rail_target_mv,
                                     rail_proof = "ack-readback-not-physical-rail-proof",
                                     t_ms = t(),
-                                    "[T+{}] dsPIC voltage feedback (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}) — diagnostic only; mv far below target_mv ⇒ on-hashboard DC-DC likely NOT energized despite ENABLE ACK (needs DMM proof)",
+                                    "[T+{}] dsPIC voltage feedback (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}) Ã¢â‚¬â€ diagnostic only; mv far below target_mv Ã¢â€¡â€™ on-hashboard DC-DC likely NOT energized despite ENABLE ACK (needs DMM proof)",
                                     t(),
                                     effective_addr,
                                     mv,
                                     chip_rail_target_mv
                                 );
-                                // G03: 0x3B succeeded ⇒ parser healthy ⇒ also take
+                                // G03: 0x3B succeeded Ã¢â€¡â€™ parser healthy Ã¢â€¡â€™ also take
                                 // the analog-ADC measure (0x3A) on the EFFECTIVE
-                                // chain dsPIC — the strongest SOFTWARE rail proxy
+                                // chain dsPIC Ã¢â‚¬â€ the strongest SOFTWARE rail proxy
                                 // for the chain the BM1362 chips actually run from.
                                 // Read-only, non-fatal. Nested per DCENT_EE N1.
                                 // Pair with a DMM (Procedure B) for physical proof.
@@ -12884,7 +14021,7 @@ impl S19jHybridMiner {
                                         opcode = "0x3A-measure-analog-adc",
                                         rail_proof = "ack-readback-not-physical-rail-proof",
                                         t_ms = t(),
-                                        "[T+{}] dsPIC ANALOG-ADC rail measure (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) — diagnostic only; mv far below target_mv ⇒ on-hashboard DC-DC likely NOT energized despite ENABLE ACK (corroborate with DMM, Procedure B)",
+                                        "[T+{}] dsPIC ANALOG-ADC rail measure (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) Ã¢â‚¬â€ diagnostic only; mv far below target_mv Ã¢â€¡â€™ on-hashboard DC-DC likely NOT energized despite ENABLE ACK (corroborate with DMM, Procedure B)",
                                         t(),
                                         effective_addr,
                                         mv3a,
@@ -12893,14 +14030,14 @@ impl S19jHybridMiner {
                                     Err(e) => warn!(
                                         addr = format_args!("0x{:02X}", effective_addr),
                                         error = %e,
-                                        "dsPIC analog-ADC rail measure failed (EFFECTIVE chain PIC 0x{:02X}, opcode=0x3A) — diagnostic only; firmware may not answer 0x3A",
+                                        "dsPIC analog-ADC rail measure failed (EFFECTIVE chain PIC 0x{:02X}, opcode=0x3A) Ã¢â‚¬â€ diagnostic only; firmware may not answer 0x3A",
                                         effective_addr
                                     ),
                                 }
                             }
                             Err(e) => {
                                 // BLK-5 / FWRE PATCH 4 (2026-06-10): read_voltage(0x3B) is
-                                // the WRONG opcode on fw=0x89/0x8A — its failure here is a
+                                // the WRONG opcode on fw=0x89/0x8A Ã¢â‚¬â€ its failure here is a
                                 // clean protocol "wrong command" (the error literally says
                                 // "use measure_voltage(0x3A)"), NOT a parser-health signal,
                                 // so unlike a bare/unhealthy parser it is SAFE to fall
@@ -12920,7 +14057,7 @@ impl S19jHybridMiner {
                                     addr = format_args!("0x{:02X}", effective_addr),
                                     error = %e,
                                     clean_3b_refusal,
-                                    "dsPIC 0x3B read failed (EFFECTIVE chain PIC 0x{:02X}) — a clean fw=0x89 wrong-opcode refusal falls through to 0x3A; a parser-health error does NOT (DCENT_EE N1)",
+                                    "dsPIC 0x3B read failed (EFFECTIVE chain PIC 0x{:02X}) Ã¢â‚¬â€ a clean fw=0x89 wrong-opcode refusal falls through to 0x3A; a parser-health error does NOT (DCENT_EE N1)",
                                     effective_addr
                                 );
                                 if am2_xil_25_fingerprint_matches() && clean_3b_refusal {
@@ -12932,7 +14069,7 @@ impl S19jHybridMiner {
                                             opcode = "0x3A-measure-analog-adc",
                                             rail_proof = "ack-readback-not-physical-rail-proof",
                                             t_ms = t(),
-                                            "[T+{}] dsPIC ANALOG-ADC rail measure via BLK-5 fall-through (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) — RAIL_UP when mv ~ target_mv; software ADC proxy, diagnostic only",
+                                            "[T+{}] dsPIC ANALOG-ADC rail measure via BLK-5 fall-through (EFFECTIVE chain PIC 0x{:02X}, mv={}, target_mv={}, opcode=0x3A) Ã¢â‚¬â€ RAIL_UP when mv ~ target_mv; software ADC proxy, diagnostic only",
                                             t(),
                                             effective_addr,
                                             mv3a,
@@ -12941,7 +14078,7 @@ impl S19jHybridMiner {
                                         Err(e2) => warn!(
                                             addr = format_args!("0x{:02X}", effective_addr),
                                             error = %e2,
-                                            "dsPIC 0x3A measure also failed (EFFECTIVE chain PIC 0x{:02X}, BLK-5 fall-through) — firmware may not answer 0x3A",
+                                            "dsPIC 0x3A measure also failed (EFFECTIVE chain PIC 0x{:02X}, BLK-5 fall-through) Ã¢â‚¬â€ firmware may not answer 0x3A",
                                             effective_addr
                                         ),
                                     }
@@ -12960,16 +14097,16 @@ impl S19jHybridMiner {
                         // Read-only, non-fatal. Pair with a DMM (Procedure B) for
                         // ground truth.
                         //
-                        // 2026-05-31 — the legacy `read_temperature` call below
+                        // 2026-05-31 Ã¢â‚¬â€ the legacy `read_temperature` call below
                         // uses CMD_READ_TEMP (0x30) + a 4-byte read, which on
-                        // `a lab unit` is NOT the LM75-passthrough opcode → returns NaN
+                        // `a lab unit` is NOT the LM75-passthrough opcode Ã¢â€ â€™ returns NaN
                         // ("rail signal unavailable"). When
                         // `DCENT_AM2_LM75_RAIL_PROXY=1` AND the `a lab unit` fingerprint
                         // matches, read instead via the bosminer-proven 0x3B/0x3C
                         // 6-byte PASSTHROUGH (`read_lm75_passthrough_temp`) and
                         // emit a 3-state autonomous (no-DMM) rail verdict
-                        // (DECODES → ABOVE-AMBIENT → DELTA). Default-off +
-                        // `a lab unit`-fingerprinted ⇒ every other unit keeps the legacy
+                        // (DECODES Ã¢â€ â€™ ABOVE-AMBIENT Ã¢â€ â€™ DELTA). Default-off +
+                        // `a lab unit`-fingerprinted Ã¢â€¡â€™ every other unit keeps the legacy
                         // `read_temperature` path byte-identically. DIAGNOSTIC
                         // ONLY: reads LM75 temps + logs a verdict; touches NO
                         // mining/voltage/enum control flow; safe if the dsPIC
@@ -12987,7 +14124,7 @@ impl S19jHybridMiner {
                                 for sensor in [0x48u8, 0x49, 0x4A, 0x4B] {
                                     if let Ok(c) = pic.read_lm75_passthrough_temp(sensor) {
                                         // Reject implausible decodes (sensor absent
-                                        // / bus noise) — only plausible board temps
+                                        // / bus noise) Ã¢â‚¬â€ only plausible board temps
                                         // count as "DECODES".
                                         if c.is_finite() && (5.0..=110.0).contains(&c) {
                                             ok += 1;
@@ -13004,7 +14141,7 @@ impl S19jHybridMiner {
                             let (temp1, sensors_ok1) = read_lm75_max(&mut chain_pic);
 
                             // Optional DELTA read ~25 s later (a quiet home unit
-                            // warms slowly — DELTA threshold is +1.5 C, NOT +5 C).
+                            // warms slowly Ã¢â‚¬â€ DELTA threshold is +1.5 C, NOT +5 C).
                             // Only attempt the 2nd read if the 1st DECODED, else
                             // the verdict is already UNAVAILABLE.
                             let delta_ms =
@@ -13034,20 +14171,20 @@ impl S19jHybridMiner {
                             };
 
                             // 3-state autonomous (no-DMM) rail verdict.
-                            // ⚠️ R5 (2026-05-31): this verdict is a HEURISTIC
-                            // INFERENCE from die TEMPERATURE — 0x3B/0x3C(0x48) are
-                            // LM75A temperature reads (°C), NOT a rail-voltage read
+                            // Ã¢Å¡Â Ã¯Â¸Â R5 (2026-05-31): this verdict is a HEURISTIC
+                            // INFERENCE from die TEMPERATURE Ã¢â‚¬â€ 0x3B/0x3C(0x48) are
+                            // LM75A temperature reads (Ã‚Â°C), NOT a rail-voltage read
                             // (RE: `reference_wave58_25_reanalysis_0x3c_is_lm75...`).
-                            // "RAIL_UP" here means "chips are warm ⇒ probably drawing
+                            // "RAIL_UP" here means "chips are warm Ã¢â€¡â€™ probably drawing
                             // power"; it is NOT a measured rail mV and must NEVER gate
                             // mining/voltage/enum. Observability-only.
-                            //  - UNAVAILABLE: nothing decoded → dsPIC passthrough
+                            //  - UNAVAILABLE: nothing decoded Ã¢â€ â€™ dsPIC passthrough
                             //    not alive.
-                            //  - RAIL_UP: chips are warming the board — either the
+                            //  - RAIL_UP: chips are warming the board Ã¢â‚¬â€ either the
                             //    DELTA rose >=1.5 C after ENABLE, OR the absolute
                             //    die temp is meaningfully above room temp (>28 C).
                             //  - RAIL_COLD: decoded but sitting at ~ambient and not
-                            //    rising → rail likely NOT energized.
+                            //    rising Ã¢â€ â€™ rail likely NOT energized.
                             let delta_up = delta.is_finite() && delta >= 1.5;
                             let above_ambient = lm75.is_finite() && lm75 > 28.0;
                             let verdict = if !lm75.is_finite() {
@@ -13071,7 +14208,7 @@ impl S19jHybridMiner {
                                 verdict,
                                 rail_proof = "lm75-die-temp-proxy-not-physical-dmm",
                                 t_ms = t(),
-                                "[T+{}] AM2 .25 rail-proxy verdict: lm75={:.2}C delta={:.2}C verdict={} (EFFECTIVE chain PIC 0x{:02X}, 0x3B/0x3C passthrough) — RAIL_UP = chips drawing power (warming board); RAIL_COLD = decoded but ~ambient & not rising; UNAVAILABLE = dsPIC passthrough silent. No-DMM rail-physical proxy (corroborate with DMM, Procedure B).",
+                                "[T+{}] AM2 .25 rail-proxy verdict: lm75={:.2}C delta={:.2}C verdict={} (EFFECTIVE chain PIC 0x{:02X}, 0x3B/0x3C passthrough) Ã¢â‚¬â€ RAIL_UP = chips drawing power (warming board); RAIL_COLD = decoded but ~ambient & not rising; UNAVAILABLE = dsPIC passthrough silent. No-DMM rail-physical proxy (corroborate with DMM, Procedure B).",
                                 t(),
                                 lm75,
                                 delta,
@@ -13101,7 +14238,7 @@ impl S19jHybridMiner {
                                     board_temp_c = board_temp_max,
                                     sensors_ok,
                                     t_ms = t(),
-                                    "[T+{}] DIE-TEMP RAIL PROXY (EFFECTIVE chain PIC 0x{:02X}): max LM75 board temp = {:.2} C across {} sensor(s) — WELL ABOVE ambient (~room temp) ⇒ chip rail is PHYSICALLY delivering power (chips drawing); ~ambient ⇒ rail NOT engaged. No-DMM rail-physical signal (corroborate with DMM, Procedure B).",
+                                    "[T+{}] DIE-TEMP RAIL PROXY (EFFECTIVE chain PIC 0x{:02X}): max LM75 board temp = {:.2} C across {} sensor(s) Ã¢â‚¬â€ WELL ABOVE ambient (~room temp) Ã¢â€¡â€™ chip rail is PHYSICALLY delivering power (chips drawing); ~ambient Ã¢â€¡â€™ rail NOT engaged. No-DMM rail-physical signal (corroborate with DMM, Procedure B).",
                                     t(),
                                     effective_addr,
                                     board_temp_max,
@@ -13111,7 +14248,7 @@ impl S19jHybridMiner {
                                 warn!(
                                     addr = format_args!("0x{:02X}", effective_addr),
                                     t_ms = t(),
-                                    "[T+{}] DIE-TEMP RAIL PROXY (EFFECTIVE chain PIC 0x{:02X}): LM75 board temp unreadable via dsPIC passthrough (all 4 sensors NaN/err) — rail-physical signal unavailable; DMM (Procedure B) is the remaining option",
+                                    "[T+{}] DIE-TEMP RAIL PROXY (EFFECTIVE chain PIC 0x{:02X}): LM75 board temp unreadable via dsPIC passthrough (all 4 sensors NaN/err) Ã¢â‚¬â€ rail-physical signal unavailable; DMM (Procedure B) is the remaining option",
                                     t(),
                                     effective_addr
                                 );
@@ -13123,16 +14260,16 @@ impl S19jHybridMiner {
                         // COMBINED 4-byte I2C_RDWR read, which garbles the FRAMED
                         // (fw=0x89) reply (live: dsPIC 0x22 decoded as 64760 mV).
                         // The framed reply is actually a longer BYTE-WISE frame
-                        // `[cmd_echo, status, v_hi, v_lo, …, CKSUM]` (~9 bytes).
+                        // `[cmd_echo, status, v_hi, v_lo, Ã¢â‚¬Â¦, CKSUM]` (~9 bytes).
                         // Dump the RAW byte-wise reply so we can SEE whether 0x22
                         // returns real data or only an all-echo (FW-byte 0x8A
-                        // repeated). Purely additive — does NOT replace the
+                        // repeated). Purely additive Ã¢â‚¬â€ does NOT replace the
                         // (failing) read_voltage/measure_voltage calls above.
                         // Read-only, non-fatal, NEVER on the hot mining path.
                         info!(
                             addr = format_args!("0x{:02X}", effective_addr),
                             t_ms = t(),
-                            "[T+{}] RAW FRAMED TELEMETRY DUMP (0x{:02X}): dumping byte-wise GET_VOLTAGE (0x3B) + MEASURE (0x3A) replies on the EFFECTIVE chain dsPIC — diagnostic only, read-only",
+                            "[T+{}] RAW FRAMED TELEMETRY DUMP (0x{:02X}): dumping byte-wise GET_VOLTAGE (0x3B) + MEASURE (0x3A) replies on the EFFECTIVE chain dsPIC Ã¢â‚¬â€ diagnostic only, read-only",
                             t(),
                             effective_addr
                         );
@@ -13150,7 +14287,7 @@ impl S19jHybridMiner {
                             measure_3a_len9 = format_args!("{:02X?}", raw_3a_9),
                             measure_3a_len6 = format_args!("{:02X?}", raw_3a_6),
                             t_ms = t(),
-                            "[T+{}] RAW FRAMED TELEMETRY DUMP (0x{:02X}) summary — empty Vec means the byte-wise read was incomplete (partial bytes are in the per-call warn line above). All-0x8A repeats ⇒ FW-byte echo only (no real telemetry); a leading [3B/3A echo, status, v_hi, v_lo, …] ⇒ real framed data. Diagnostic only.",
+                            "[T+{}] RAW FRAMED TELEMETRY DUMP (0x{:02X}) summary Ã¢â‚¬â€ empty Vec means the byte-wise read was incomplete (partial bytes are in the per-call warn line above). All-0x8A repeats Ã¢â€¡â€™ FW-byte echo only (no real telemetry); a leading [3B/3A echo, status, v_hi, v_lo, Ã¢â‚¬Â¦] Ã¢â€¡â€™ real framed data. Diagnostic only.",
                             t(),
                             effective_addr
                         );
@@ -13165,7 +14302,7 @@ impl S19jHybridMiner {
                     selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
                     active_chains = format_args!("0b{:03b}", active_chains),
                     active_dspic_addrs = format_args!("{:02X?}", active_dspic_addrs(active_chains)),
-                    "AM2 diagnostic stop after dsPIC SetVoltage/ENABLE classification — \
+                    "AM2 diagnostic stop after dsPIC SetVoltage/ENABLE classification Ã¢â‚¬â€ \
                      no chain UART probe, no BM1362 init, no Stratum, no work dispatch"
                 );
 
@@ -13237,7 +14374,7 @@ impl S19jHybridMiner {
             // thread IMMEDIATELY after ENABLE so the dsPIC's voltage controller
             // sees continuous heartbeat traffic during the DC-DC ramp window.
             // Live evidence on `a lab unit` showed: SetVoltage OK + ENABLE bare ACK
-            // + 1.85 s gap with no heartbeat → 0 bytes from chain UART. The
+            // + 1.85 s gap with no heartbeat Ã¢â€ â€™ 0 bytes from chain UART. The
             // dsPIC fw=0x86 may auto-disengage the rail on heartbeat timeout;
             // bosminer's heartbeat is ~1 Hz from boot, so we match.
             info!(
@@ -13257,13 +14394,13 @@ impl S19jHybridMiner {
             // CORRECTION (adversarial verify): the extras set is now the
             // effective-chain dsPIC ONLY, NOT a blanket `active_dspic_addrs(
             // active_chains)` enumeration. `active_chains` is hardcoded 0b111 at
-            // this call site, so the old base yielded `[0x20,0x21,0x22]` →
+            // this call site, so the old base yielded `[0x20,0x21,0x22]` Ã¢â€ â€™
             // included the PHYSICALLY ABSENT middle slot 0x21 on `a lab unit`. A
-            // heartbeat to 0x21 NACKs every tick → the I2C service tears down +
-            // reopens the shared `/dev/i2c-0` fd ~1×/s → bus instability during
+            // heartbeat to 0x21 NACKs every tick Ã¢â€ â€™ the I2C service tears down +
+            // reopens the shared `/dev/i2c-0` fd ~1Ãƒâ€”/s Ã¢â€ â€™ bus instability during
             // enum. The pure `heartbeat_extra_addrs` helper (host-tested in
             // dcentrald-common) returns at most the effective chain dsPIC and
-            // can never name an empty slot. Default-OFF → empty vec → only
+            // can never name an empty slot. Default-OFF Ã¢â€ â€™ empty vec Ã¢â€ â€™ only
             // `selected_pic_addr` is heartbeated, byte-for-byte unchanged for
             // the proven fleet and the  bosminer-handoff path.
             let heartbeat_additional_addrs: Vec<u8> = if am2_heartbeat_all_active_pics_enabled() {
@@ -13275,7 +14412,7 @@ impl S19jHybridMiner {
                     t_ms = t(),
                     selected_pic_addr = format_args!("0x{:02X}", selected_pic_addr),
                     additional_addrs = format_args!("{:02X?}", extras),
-                    "[T+{}] Phase 3d: DCENT_AM2_HEARTBEAT_ALL_ACTIVE_PICS — \
+                    "[T+{}] Phase 3d: DCENT_AM2_HEARTBEAT_ALL_ACTIVE_PICS Ã¢â‚¬â€ \
                          heartbeating selected dsPIC + every other active dsPIC \
                          (incl. effective chain dsPIC)",
                     t()
@@ -13284,17 +14421,19 @@ impl S19jHybridMiner {
             } else {
                 Vec::new()
             };
-            runtime_threads.push(
-                "s19j-pic-heartbeat",
-                spawn_pic_heartbeat_thread(
-                    heartbeat_i2c,
-                    selected_pic_heartbeat_controller.take().context(
-                        "exact AM2 Pic0x89 endpoint-issued controller missing before heartbeat ownership handoff",
-                    )?,
-                    heartbeat_additional_addrs,
-                    self.shutdown.clone(),
+            let heartbeat_slot = runtime_threads
+                .reserve(HybridThreadSlot::PicHeartbeat)
+                .context("failed to reserve hybrid PIC-heartbeat roster slot")?;
+            let heartbeat = spawn_pic_heartbeat_thread(
+                heartbeat_i2c,
+                selected_pic_heartbeat_controller.take().context(
+                    "exact AM2 Pic0x89 endpoint-issued controller missing before heartbeat ownership handoff",
                 )?,
-            );
+                heartbeat_additional_addrs,
+                self.shutdown.clone(),
+                pic_heartbeat_terminal_failed.clone(),
+            )?;
+            heartbeat_slot.attach(heartbeat);
 
             // Phase 3c: voltage settle window before chain UART activity.
             //
@@ -13303,9 +14442,9 @@ impl S19jHybridMiner {
             // traffic, allowing BM1362 PLL + clock distribution to stabilise
             // at 13.7V. Legacy am2 hybrid waited only 1200 ms.
             //
-            // Heartbeats continue firing 1× during this window keeping the
+            // Heartbeats continue firing 1Ãƒâ€” during this window keeping the
             // rail engaged. Configurable via `[mining] am2_post_enable_settle_ms`
-            // — set to 1200 to revert to the legacy short settle.
+            // Ã¢â‚¬â€ set to 1200 to revert to the legacy short settle.
             let settle_ms = self.config.mining.am2_post_enable_settle_ms;
             info!(
                 t_ms = t(),
@@ -13320,7 +14459,7 @@ impl S19jHybridMiner {
             // Braiins-am2 only (W13.B1, 2026-05-10).
             //
             // RECLASSIFIED: 0x43D00030/0x43D00034 are read-only Braiins-am2
-            // glitch monitor STATUS MIRRORS of BM1362 ASIC reg 0x2C — NOT
+            // glitch monitor STATUS MIRRORS of BM1362 ASIC reg 0x2C Ã¢â‚¬â€ NOT
             // a control surface. Stock CV1835/AM335x/AML/S9 do NOT populate
             // this IP. Phase 9A proved the writes are silent NO-OPs even
             // on Braiins-am2. BM1362 0x2C/0x34 candidate relay broadcasts
@@ -13382,15 +14521,15 @@ impl S19jHybridMiner {
                     }
                 }
             } else if passthrough {
-                info!("Phase 3c-pre-gate: passthrough mode — diagnostic-only glitch mirror write skipped");
+                info!("Phase 3c-pre-gate: passthrough mode Ã¢â‚¬â€ diagnostic-only glitch mirror write skipped");
             } else {
                 info!(
-                    "Phase 3c-pre-gate: am2_force_braiins_glitch_mirror_write disabled — skipping diagnostic-only mirror write"
+                    "Phase 3c-pre-gate: am2_force_braiins_glitch_mirror_write disabled Ã¢â‚¬â€ skipping diagnostic-only mirror write"
                 );
             }
 
             // Phase 3c-pre-gate (UIO path): diagnostic-only glitch monitor
-            // mirror write attempt — Braiins-am2 only (W13.B1, 2026-05-10).
+            // mirror write attempt Ã¢â‚¬â€ Braiins-am2 only (W13.B1, 2026-05-10).
             //
             // RECLASSIFIED: bosminer's `/dev/uio18` write through the
             // `miner-glitch-monitor` IP targets the SAME read-only mirror
@@ -13400,10 +14539,10 @@ impl S19jHybridMiner {
             // `DCENT_BM1362_ENABLE_UART_RELAY_LAB`.
             //
             // We retain this UIO write attempt for telemetry parity with
-            // bosminer (lab-only) — gated by `am2_force_braiins_glitch_mirror_write`.
+            // bosminer (lab-only) Ã¢â‚¬â€ gated by `am2_force_braiins_glitch_mirror_write`.
             if !passthrough && self.config.mining.am2_force_braiins_glitch_mirror_write {
                 // Use the long-lived BraiinsGlitchMonitor instance opened
-                // during early init (Braiins-am2 only — `None` on stock hw).
+                // during early init (Braiins-am2 only Ã¢â‚¬â€ `None` on stock hw).
                 match self.glitch_monitor.as_ref() {
                     Some(gm) => match gm.force_braiins_glitch_status_mirror_write(relay_phys_idx) {
                         Ok(attempt) => {
@@ -13433,7 +14572,7 @@ impl S19jHybridMiner {
                         info!(
                             chain_id = fpga_chain_id,
                             phys_idx = relay_phys_idx,
-                            "Phase 3c-pre-gate: no cached BraiinsGlitchMonitor — UIO mirror write skipped (stock hw or early-init log)"
+                            "Phase 3c-pre-gate: no cached BraiinsGlitchMonitor Ã¢â‚¬â€ UIO mirror write skipped (stock hw or early-init log)"
                         );
                     }
                 }
@@ -13441,11 +14580,11 @@ impl S19jHybridMiner {
 
             // Phase 3b1-relay: send BM1362 UART relay enable BEFORE the chain
             // UART RX gate ( kernel-module RE finding). The MMIO at
-            // 0x43D00030/34 is a read-only status mirror — the actual
+            // 0x43D00030/34 is a read-only status mirror Ã¢â‚¬â€ the actual
             // relay-enable mechanism is a serial broadcast write to BM1362
             // chip register 0x2C (and 0x34 alt). Chips do NOT emit on chain
             // UART until they receive this broadcast. The gate at Phase 3b2
-            // expects chip chatter that requires this broadcast — moving the
+            // expects chip chatter that requires this broadcast Ã¢â‚¬â€ moving the
             // broadcast BEFORE the gate breaks the chicken-and-egg problem.
             //
             // init_asic_chain (Phase 4-7) ALSO sends this broadcast (at
@@ -13501,7 +14640,7 @@ impl S19jHybridMiner {
             // Non-zero bytes are useful early evidence; GetAddress remains
             // authoritative. Gated default-OFF + `a lab unit` fp + !handoff; idempotent;
             // fail-closed when set.
-            // P3 (2026-06-13): the relay RMW drives gpio895/896 — which are ALSO the
+            // P3 (2026-06-13): the relay RMW drives gpio895/896 Ã¢â‚¬â€ which are ALSO the
             // PSU SMBus SDA/SCL bit-bang lines (psu_gpio_i2c.rs). The .25 fingerprint
             // already requires a Loki-or-unset psu_hardware_variant, but a smart-PSU
             // .25-class board with the variant UNSET could still reach here. Require
@@ -13511,7 +14650,7 @@ impl S19jHybridMiner {
             // so it covers both relay call sites. Uses the run-scope psu_override_active.
             if am2_fpga_uart_relay_cold_enabled() && !psu_override_active {
                 anyhow::bail!(
-                    "DCENT_AM2_FPGA_UART_RELAY_COLD set but [power.psu_override] is not active — the relay RMW drives gpio895/896 (PSU SMBus SDA/SCL); refusing unless the dumb-PSU bypass owns the bus"
+                    "DCENT_AM2_FPGA_UART_RELAY_COLD set but [power.psu_override] is not active Ã¢â‚¬â€ the relay RMW drives gpio895/896 (PSU SMBus SDA/SCL); refusing unless the dumb-PSU bypass owns the bus"
                 );
             }
             am2_try_enable_fpga_uart_relay_cold("pre-rail-probe (post-ENABLE)")?;
@@ -13580,7 +14719,7 @@ impl S19jHybridMiner {
 
                             // PWR_CONTROL gate auto-deasserts when the
                             // surviving `psu_arc` reference is dropped on
-                            // return — owned by `Apw121215a::Drop`.
+                            // return Ã¢â‚¬â€ owned by `Apw121215a::Drop`.
 
                             return Err(e).context("Post-ENABLE chain UART RX gate failed");
                         }
@@ -13613,7 +14752,7 @@ impl S19jHybridMiner {
                         .await;
 
                         // PWR_CONTROL gate auto-deasserts when the surviving
-                        // `psu_arc` reference is dropped on return — owned
+                        // `psu_arc` reference is dropped on return Ã¢â‚¬â€ owned
                         // by `Apw121215a::Drop`.
 
                         return Err(e).context("Post-ENABLE chain UART RX gate failed");
@@ -13657,7 +14796,7 @@ impl S19jHybridMiner {
             // Fix-C (2026-06-07): pre-program the FPGA chain-common block
             // (CTRL=0x00901002 + BAUD=0x6C) BEFORE the cold enum. In
             // SERIAL_WORK_DISPATCH mode the FPGA WORK_TX FIFO is bypassed, so DCENT
-            // only writes the chain-common CTRL at Phase 8 (POST-enum) — which on a
+            // only writes the chain-common CTRL at Phase 8 (POST-enum) Ã¢â‚¬â€ which on a
             // cold standalone boot never runs (enum fails first). Under bosminer
             // (the warm handoff) this register was already 0x00901002 when DCENT
             // took over. Per the OUT2 evidence (serial.rs: OUT2 gates "the FPGA UART
@@ -13665,7 +14804,7 @@ impl S19jHybridMiner {
             // bits can gate the chain UART TX clock, so set this before cold enum
             // to clear that confound. Later live evidence showed cold CTRL/BAUD
             // already matched bosminer in the failing standalone run, so this is
-            // not the complete blocker. Default-OFF + `a lab unit`-fingerprint → the
+            // not the complete blocker. Default-OFF + `a lab unit`-fingerprint Ã¢â€ â€™ the
             // proven fleet + handoff are byte-identical (they never set this gate).
             // Set once before the retry loop; the register persists in FPGA
             // hardware (HB_RESET re-pulses the chips, not the FPGA chain-common
@@ -13732,7 +14871,7 @@ impl S19jHybridMiner {
             // unset the loop runs EXACTLY once and is byte-identical to before.
             // Gated on the explicit opt-in env ALONE. CORRECTION (live-verified
             // 2026-05-30 against run_wave48_25.sh): the `a lab unit` STANDALONE recipe
-            // ALSO sets DCENT_AM2_TRUST_RAIL_FALLBACK=1 — it is NOT the
+            // ALSO sets DCENT_AM2_TRUST_RAIL_FALLBACK=1 Ã¢â‚¬â€ it is NOT the
             // standalone-vs-handoff discriminator (BOTH recipes set it; the real
             // discriminator is DCENT_AM2_PIC_RESET_AND_START_APP, which the handoff
             // path forbids). An earlier `&& !TRUST_RAIL_FALLBACK` guard therefore
@@ -13772,7 +14911,12 @@ impl S19jHybridMiner {
                     Self::init_asic_chain(&chain_uart_device, chip_count, target_freq, pll_ramp)
                 };
                 match init_result {
-                    Ok((serial, unique_count)) => break (serial, unique_count),
+                    Ok((serial, unique_count)) => {
+                        if unique_count > 0 {
+                            live_enumerated_chips = Some(unique_count as u32);
+                        }
+                        break (serial, unique_count);
+                    }
                     Err(e)
                         if hb_faithful
                             && !self.shutdown.is_cancelled()
@@ -13782,12 +14926,12 @@ impl S19jHybridMiner {
                             attempt = hb_attempt,
                             max_attempts = hb_max_attempts,
                             error = %e,
-                            "DCENT_AM2_HB_RESET_BOSMINER_FAITHFUL: BM1362 init failed — re-pulsing HB_RESET (bosminer-faithful reset->enum retry) then retrying"
+                            "DCENT_AM2_HB_RESET_BOSMINER_FAITHFUL: BM1362 init failed Ã¢â‚¬â€ re-pulsing HB_RESET (bosminer-faithful reset->enum retry) then retrying"
                         );
-                        // Re-pulse HB_RESET (rail stays up — HB_RESET is the chip reset
+                        // Re-pulse HB_RESET (rail stays up Ã¢â‚¬â€ HB_RESET is the chip reset
                         // line, not the DC-DC). Bounded hold; best-effort.
                         // R5 (2026-05-31): `hold_resets_devmem` is the single reset
-                        // dispatcher — when DCENT_AM2_HB_RESET_REPOINT=1 it internally
+                        // dispatcher Ã¢â‚¬â€ when DCENT_AM2_HB_RESET_REPOINT=1 it internally
                         // re-points to the bosminer-faithful plain-kernel-sysfs
                         // LOW->hold->HIGH pulse (the cold-capture-proven mechanism)
                         // instead of the devmem RMW. So this faithful re-pulse picks up
@@ -13886,7 +15030,7 @@ impl S19jHybridMiner {
                         .await;
 
                         // PWR_CONTROL gate auto-deasserts when the surviving
-                        // `psu_arc` reference is dropped on return — owned by
+                        // `psu_arc` reference is dropped on return Ã¢â‚¬â€ owned by
                         // `Apw121215a::Drop`.
 
                         return Err(e).context("Phase 4-7 ASIC init failed");
@@ -13985,11 +15129,11 @@ impl S19jHybridMiner {
                 );
             }
 
-            // 2026-05-31 — AM2 `a lab unit` open-core ramp-DOWN (Variant A second
+            // 2026-05-31 Ã¢â‚¬â€ AM2 `a lab unit` open-core ramp-DOWN (Variant A second
             // half). The chip string enumerated AT the elevated open-core
             // voltage (set at the Phase-3 `cold_boot_init` call site above).
             // Now that enum SUCCEEDED (enum > 0) and BEFORE work dispatch, ramp
-            // the chip rail back DOWN to the steady operating voltage — exactly
+            // the chip rail back DOWN to the steady operating voltage Ã¢â‚¬â€ exactly
             // what the AM3-BB `a lab unit` reference does (`am3_bb_mining.rs`
             // open-core-mv -> hold -> steady-mv) on the same BM1362.
             //
@@ -13997,7 +15141,7 @@ impl S19jHybridMiner {
             // If enum == 0 we never reach here: Phase 4-7 takes the full
             // safe-off path. Elevated mode admits only one init attempt because
             // no evidence-backed dwell/retry budget exists. Default-OFF /
-            // non-`a lab unit` ⇒ this block is a no-op.
+            // non-`a lab unit` Ã¢â€¡â€™ this block is a no-op.
             if open_core_rail_plan.requires_demotion() {
                 if init_unique_count == 0 {
                     pic_i2c.latch_terminal_safe_off();
@@ -14046,7 +15190,7 @@ impl S19jHybridMiner {
                     open_core_mv = open_core_rail_plan.energization_mv,
                     steady_mv,
                     unique_chip_replies = init_unique_count,
-                    "[T+{}] AM2 .25 open-core ramp-DOWN: enum succeeded ({} chips) — ramping chip \
+                    "[T+{}] AM2 .25 open-core ramp-DOWN: enum succeeded ({} chips) Ã¢â‚¬â€ ramping chip \
                      rail from open-core back to steady {} mV before work dispatch (matches AM3-BB .79)",
                     t(),
                     init_unique_count,
@@ -14055,7 +15199,18 @@ impl S19jHybridMiner {
                 // Sanctioned cold-boot init transition: enumeration has just
                 // proven the elevated open-core rail usable, and work remains
                 // fenced until this one-shot demotion reaches steady voltage.
-                if let Err(e) = pic.set_voltage(steady_mv) {
+                // P1-2: demotion + fail-closed safe-off through VoltageRail facet.
+                let demote_result = {
+                    // `pic` is already `&mut Pic0x89Service`; reborrow for the
+                    // scoped rail facet so the binding stays live for the later
+                    // fail-closed disable_voltage() paths.
+                    let mut rail = Pic0x89VoltageRail::new(
+                        &mut *pic,
+                        dspic_fw86_trust_degraded_override_enabled(),
+                    );
+                    rail.set_mv(steady_mv)
+                };
+                if let Err(e) = demote_result {
                     error!(
                         t_ms = t(),
                         steady_mv,
@@ -14071,11 +15226,19 @@ impl S19jHybridMiner {
                     // admission/start/execution deadline; there is no retry
                     // whose late completion could re-energize the rail.
                     pic_i2c.latch_terminal_safe_off();
-                    if let Err(disable_err) = pic.disable_voltage() {
+                    let disable_err = {
+                        // Same scoped reborrow as the demotion facet above.
+                        let mut rail = Pic0x89VoltageRail::new(
+                            &mut *pic,
+                            dspic_fw86_trust_degraded_override_enabled(),
+                        );
+                        safe_off_voltage_rail(&mut rail)
+                    };
+                    if let Err(disable_err) = disable_err {
                         warn!(
                             error = %disable_err,
                             addr = format_args!("0x{:02X}", selected_pic_addr),
-                            "Selected dsPIC voltage-disable failed after demotion failure; PWR_CONTROL hard-stop remains authoritative"
+                            "Selected dsPIC VoltageRail safe_off failed after demotion failure; PWR_CONTROL hard-stop remains authoritative"
                         );
                     }
                     force_am2_home_hard_stop(&self.config, "open-core-demotion-failed");
@@ -14125,7 +15288,10 @@ impl S19jHybridMiner {
 
             if let Some(gate_pwm) = fan_gate_pwm {
                 let configured_max = self.config.thermal.fan_max_pwm;
-                match open_am2_fan_controller("phase-2c-steady-cap") {
+                match open_am2_fan_controller(
+                    "phase-2c-steady-cap",
+                    dcentrald_hal::fan::Am2FanModePolicy::EnableC52,
+                ) {
                     Some((discovery, fan)) => {
                         let steady_pwm = configured_max
                             .min(dcentrald_hal::fan::PWM_MAX)
@@ -14279,13 +15445,13 @@ impl S19jHybridMiner {
             let wt = calculate_work_time_bm1362(target_freq);
             fpga.set_work_time(wt);
             info!(
-                "FPGA WORK_TIME = 0x{:08X} (for {} MHz) — informational only on am2",
+                "FPGA WORK_TIME = 0x{:08X} (for {} MHz) Ã¢â‚¬â€ informational only on am2",
                 wt, target_freq
             );
         } else {
             if ctrl == 0 {
                 warn!(
-                    "FPGA CTRL=0 (chain disabled) — writing am2 authoritative 0x{:08X}",
+                    "FPGA CTRL=0 (chain disabled) Ã¢â‚¬â€ writing am2 authoritative 0x{:08X}",
                     AM2_CTRL_BM1362
                 );
                 fpga.write_ctrl(AM2_CTRL_BM1362);
@@ -14319,7 +15485,7 @@ impl S19jHybridMiner {
         if skip_reset {
             warn!(
                 chain_id = fpga_chain_id,
-                "DIAGNOSTIC: skip_fifo_reset armed — preserving WORK_TX/WORK_RX state (passthrough only)"
+                "DIAGNOSTIC: skip_fifo_reset armed Ã¢â‚¬â€ preserving WORK_TX/WORK_RX state (passthrough only)"
             );
         } else {
             fpga.reset_work_fifos();
@@ -14330,7 +15496,7 @@ impl S19jHybridMiner {
         // Phase 9: diagnostic-only Braiins glitch monitor mirror, Braiins-am2 only.
         //
         // W13.B1 (2026-05-10) RECLASSIFIED: 0x43D00030/0x43D00034 are
-        // read-only Braiins-am2 status mirrors of BM1362 ASIC reg 0x2C —
+        // read-only Braiins-am2 status mirrors of BM1362 ASIC reg 0x2C Ã¢â‚¬â€
         // NOT a control surface. Phase 9A proved 7 devmem writes are
         // silent NO-OPs at the FPGA fabric. BM1362 0x2C/0x34 candidate
         // relay broadcasts are lab-gated by
@@ -14367,7 +15533,7 @@ impl S19jHybridMiner {
                                         offset = format_args!("0x{:02X}", offset),
                                         wrote = format_args!("0x{:08X}", target_value),
                                         post_read = format_args!("0x{:08X}", post_read),
-                                        "Phase 9 glitch mirror readback != write (expected — Phase 9A NO-OP)"
+                                        "Phase 9 glitch mirror readback != write (expected Ã¢â‚¬â€ Phase 9A NO-OP)"
                                     );
                                 }
                             }
@@ -14418,28 +15584,26 @@ impl S19jHybridMiner {
             info!(
                 "Phase 9b: passthrough mode skips DCENT_OS PIC heartbeat; inherited firmware owns voltage watchdog"
             );
-        } else if runtime_threads.contains("s19j-pic-heartbeat") {
+        } else if runtime_threads.slot_is_registered(HybridThreadSlot::PicHeartbeat) {
             info!("Phase 9b: PIC heartbeat already running from Phase 3d");
         } else {
             anyhow::bail!("PIC heartbeat was not started before ASIC init");
         }
 
-        // ---- Arm the hardware watchdog (AFTER chain bring-up completes) ----
-        // `--s19j-hybrid` bypasses `Daemon::run()`, so historically this path armed
-        // NO `/dev/watchdog` — a CPU/runtime hang here left the boards energized &
-        // unsupervised. Arm it now (chains enumerated, FPGA open, PIC heartbeat
-        // live) using the shared, config-gated helper — NOT earlier, so the
-        // DTB-10s window can never trip during the slow cold-boot. Gated on
-        // `watchdog.enabled`: the `a lab unit`/XIL bring-up configs set it `false`, so
-        // this is INERT on `a lab unit` and the proven recipe stays byte-unchanged.
-        // SAF-5: gate kicks on this path's runtime thermal/housekeeping loop so a
-        // live-locked hybrid miner stops feeding `/dev/watchdog` after the
-        // counter has started advancing.
-        let watchdog_liveness = Arc::new(AtomicU64::new(0));
-        crate::daemon::spawn_watchdog_kicker(
-            &self.config.watchdog,
-            self.shutdown.clone(),
-            Some(watchdog_liveness.clone()),
+        // Transfer the already-armed fail-closed owner from Bringup to Mining
+        // only after enumeration, FPGA ownership, and PIC heartbeat readiness
+        // are established. API mutation admission remains Pending until this
+        // same boundary and can be opened only by the retained owner.
+        watchdog
+            .enter_mining()
+            .await
+            .context("s19j-hybrid: watchdog refused Mining admission")?;
+        let api_admission = hardware_mutation_owner
+            .open()
+            .context("s19j-hybrid: API mutation admission could not open at mining readiness")?;
+        info!(
+            opened_at = ?api_admission.opened_at(),
+            "s19j-hybrid: mining readiness admitted watchdog liveness and API mutation generation"
         );
 
         // ================================================================
@@ -14452,11 +15616,15 @@ impl S19jHybridMiner {
             mpsc::channel::<dcentrald_stratum::types::StratumStatus>(64);
         let serial_work_dispatch = am2_serial_work_dispatch_enabled();
 
-        let stratum_config = crate::config::build_stratum_config(
+        // P2-9: prefer live unique enum; fall back to configured chip_count.
+        let hybrid_enum_chips =
+            live_enumerated_chips.or_else(|| (chip_count > 0).then_some(u32::from(chip_count)));
+        let stratum_config = crate::config::build_stratum_config_with_enumerated_chips(
             &self.config,
             crate::config::stratum_donation_config(&self.config.donation),
             serial_work_dispatch && self.config.mining.version_rolling,
             false,
+            hybrid_enum_chips,
         );
         let stratum_router = dcentrald_stratum::StratumRouter::new(stratum_config);
         tokio::spawn(async move {
@@ -14528,14 +15696,14 @@ impl S19jHybridMiner {
         ) {
             warn!(
                     env = ENV_AM2_SKIP_THERMAL_SUPERVISOR,
-                    "AM2 thermal supervisor disabled by lab override — never set this for an unattended home soak"
+                    "AM2 thermal supervisor disabled by lab override Ã¢â‚¬â€ never set this for an unattended home soak"
                 );
             None
         } else {
             // R-13: die-temp calibration is DEFAULT-OFF. It activates only when
             // the `[thermal.die_temp_calibration].enabled` config flag OR the
             // `DCENT_AM2_DIE_TEMP_CALIBRATION` env override is set. Even then it
-            // is fail-safe (bad/missing/not-cold baseline → raw; safety reading
+            // is fail-safe (bad/missing/not-cold baseline Ã¢â€ â€™ raw; safety reading
             // never below raw), so this can never delay or suppress a trip.
             let mut die_cal_cfg = self.config.thermal.die_temp_calibration.clone();
             if am2_env_flag(ENV_AM2_DIE_TEMP_CALIBRATION) {
@@ -14587,10 +15755,10 @@ impl S19jHybridMiner {
             );
             // Capture the cold die-calibration baseline (no-op unless enabled)
             // at this pre-stratum stage, BEFORE the hard thermal proof, while
-            // the unit is still cold and board ≈ die ≈ ambient.
+            // the unit is still cold and board Ã¢â€°Ë† die Ã¢â€°Ë† ambient.
             sup.maybe_capture_die_baseline();
-            if let Err(e) = sup.poll_and_check("pre-stratum") {
-                error!(error = %e, "AM2 pre-stratum thermal proof FAILED — forcing home hard-stop");
+            if let Err(e) = sup.poll_and_check(Am2ThermalPollStage::PreStratum("pre-stratum")) {
+                error!(error = %e, "AM2 pre-stratum thermal proof FAILED Ã¢â‚¬â€ forcing home hard-stop");
                 force_am2_thermal_hard_stop(&self.config, "pre-stratum-thermal-proof-failed");
                 return Err(e);
             }
@@ -14598,763 +15766,956 @@ impl S19jHybridMiner {
         };
         let thermal_poll_ms = ((self.config.thermal.pid_interval_s.max(1.0) * 1000.0) as u64)
             .max(AM2_THERMAL_MIN_POLL_MS);
+        let mut no_nonce_stall_reason: Option<String> = None;
+        let mut additional_terminal_pic_addrs: Vec<u8> = Vec::new();
 
-        // ---- Route: serial-work-dispatch alternative (DCENT_AM2_SERIAL_WORK_DISPATCH=1) ----
-        if serial_work_dispatch {
-            let serial = post_init_serial.take().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DCENT_AM2_SERIAL_WORK_DISPATCH=1 but the post-init serial backend is unavailable"
-                )
-            })?;
-
-            // ---- GROUP B / W8: DUAL-CHAIN capability (DCENT_AM2_DUAL_CHAIN_TTYS3=1) ----
-            //
-            // DEFAULT-OFF. When set, bring up a SECOND chain on the configured
-            // second UART (`/dev/ttyS3` on `a lab unit`, dsPIC 0x22) using the SAME
-            // proven `init_asic_chain` bring-up as the primary chain, then run
-            // the dual-chain dispatch loop so BOTH hashboards mine (~2× hashrate
-            // vs chain-1-only). The exact 2nd-chain cold bring-up order/timing is
-            // RE-ASK-XIL-6 (unconfirmed vs a live bosminer dual-chain strace), so
-            // this is a CAPABILITY flagged for operator live-validation. If the
-            // second chain fails to enumerate, FALL BACK to the proven
-            // single-chain path (never regress the chain-1 milestone).
-            if am2_dual_chain_ttys3_enabled() {
-                let second_uart = am2_dual_chain_second_uart();
-                let pll_ramp = self.config.mining.am2_pll_ramp;
-                if second_uart == chain_uart_device {
-                    warn!(
-                        second_uart = %second_uart,
-                        primary_chain_uart = %chain_uart_device,
-                        "DCENT_AM2_DUAL_CHAIN_TTYS3=1 but the configured second UART equals the primary chain UART — refusing to bring up a duplicate chain; running single-chain"
-                    );
-                } else {
-                    let pic_addr_b = am2_pic_addr_from_serial_device(&second_uart);
-                    info!(
-                        second_uart = %second_uart,
-                        primary_chain_uart = %chain_uart_device,
-                        pic_addr_b = ?pic_addr_b.map(|a| format!("0x{:02X}", a)),
-                        "DCENT_AM2_DUAL_CHAIN_TTYS3=1 — attempting second BM1362 chain bring-up (RE-ASK-XIL-6: order/timing pending operator live-validation)"
-                    );
-                    match Self::init_asic_chain(&second_uart, chip_count, target_freq, pll_ramp) {
-                        Ok((serial_b, unique_b)) => {
-                            info!(
-                                second_uart = %second_uart,
-                                unique_chip_replies = unique_b,
-                                "DUAL-CHAIN: second chain enumerated — routing work to BOTH chains"
-                            );
-                            // pic_addr_b is best-effort for teardown; on the `a lab unit`
-                            // topology slot-2/ttyS3 → 0x22 (already enabled by the
-                            // all-active-PICs Phase 1-3 path). Fall back to the
-                            // primary's dsPIC addr if the path is unrecognized so
-                            // teardown still disables a real controller.
-                            let pic_addr_b = pic_addr_b.unwrap_or(selected_pic_addr);
-                            let dispatch_result = self
-                                .run_am2_dual_chain_serial_dispatch_loop(
-                                    serial,
-                                    serial_b,
-                                    job_rx,
-                                    share_tx,
-                                    chip_count,
-                                    i2c0_service.clone(),
-                                    selected_pic_addr,
-                                    pic_addr_b,
-                                    heartbeat_pic_fw,
-                                    thermal_supervisor,
-                                    thermal_poll_ms,
-                                    watchdog_liveness.clone(),
-                                    share_accounting.clone(),
-                                    pool_quality.clone(),
-                                )
-                                .await;
-                            let feeders_quiesced = stop_am2_runtime_feeders_bounded(
-                                &self.config,
-                                &mut runtime_threads,
-                                "dual-chain-dispatch-stop",
-                            )
-                            .await;
-                            let shutdown_evidence = if feeders_quiesced {
-                                let mut teardown_addrs = vec![selected_pic_addr, pic_addr_b];
-                                teardown_addrs.sort_unstable();
-                                teardown_addrs.dedup();
-                                if let Some(service) = i2c0_service.as_ref() {
-                                    disable_dspic_addrs_best_effort(
-                                        service,
-                                        &teardown_addrs,
-                                        selected_pic_addr,
-                                        heartbeat_pic_fw,
-                                        "dual-chain-clean-stop",
-                                    );
-                                }
-                                shutdown_am2_psu_after_feeders_quiesced(
-                                    &psu_arc,
-                                    "dual-chain-dispatch-stop",
-                                )
-                            } else {
-                                Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
-                            };
-                            return finalize_am2_dispatch_shutdown(
-                                dispatch_result,
-                                shutdown_evidence,
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                second_uart = %second_uart,
-                                error = %e,
-                                "DUAL-CHAIN: second chain bring-up FAILED — falling back to the proven single-chain path (no regression to the chain-1 milestone)"
-                            );
-                        }
-                    }
-                }
-            } else if am2_xil_25_fingerprint_matches() {
-                // D6-2 (2026-06-13): on the `a lab unit` 2-board topology (hashboards on
-                // PL UART 0 + 2 = ttyS1 + ttyS3), with DCENT_AM2_DUAL_CHAIN_TTYS3
-                // unset DCENT drives ONLY the primary chain. Record it loudly so an
-                // enum=0 / low-hashrate result is NOT misread as a whole-unit
-                // failure — the second board on /dev/ttyS3 is intentionally idle.
-                // Fires once per run() (this is dispatch setup, before the loop).
-                warn!(
-                    primary_chain_uart = %chain_uart_device,
-                    idle_second_uart = AM2_DUAL_CHAIN_SECOND_UART_DEFAULT,
-                    "DUAL-CHAIN GATE OFF on a .25-fingerprint unit: only the primary chain is driven; /dev/ttyS3 (slot-2 board) is IDLE. An enum=0 here is a SINGLE-chain result, NOT whole-unit. Set DCENT_AM2_DUAL_CHAIN_TTYS3=1 for a 2-board run."
+        // ---- Phase 10-pre: shared work-dispatch safety admission ----
+        // One lifecycle for this mining run. FPGA WORK_TX and serial-work
+        // dispatch both refuse to energize standard work until the pure matrix
+        // is green; terminal revoke blocks re-admit without full teardown.
+        let mut dispatch_life = WorkDispatchLifecycle::new();
+        let lab_thermal_skip = am2_env_flag(ENV_AM2_SKIP_THERMAL_SUPERVISOR);
+        let thermal_state =
+            hybrid_thermal_safety_state(thermal_supervisor.is_some(), lab_thermal_skip);
+        let wd_state = hybrid_watchdog_safety_state(
+            self.config.watchdog.enabled,
+            true, // enter_mining() succeeded above
+        );
+        let (hb_req, hb_obs) = hybrid_heartbeat_inputs(
+            passthrough,
+            selected_pic_addr,
+            true, // Phase 3d started and still running (no terminal latch yet)
+            &[],
+            1,
+        );
+        let dispatch_inputs = hybrid_work_dispatch_inputs(wd_state, hb_req, &hb_obs, thermal_state);
+        match hybrid_admit_standard_work_dispatch(&mut dispatch_life, &dispatch_inputs) {
+            Ok(receipt) => {
+                info!(
+                    watchdog = ?receipt.watchdog,
+                    thermal = ?receipt.thermal,
+                    controller_count = receipt.controller_count,
+                    heartbeat_cycle_id = ?receipt.heartbeat_cycle_id,
+                    "s19j-hybrid work-dispatch admission OK Ã¢â‚¬â€ standard work allowed"
                 );
             }
-
-            info!(
-                "DCENT_AM2_SERIAL_WORK_DISPATCH=1 — routing work via the proven BM1362 88-byte serial frame over the chain UART (FPGA WORK_TX FIFO bypassed)"
-            );
-            let mut dispatch_result = self
-                .run_am2_serial_dispatch_loop(
-                    serial,
-                    job_rx,
-                    share_tx,
-                    chip_count,
-                    i2c0_service.clone(),
-                    selected_pic_addr,
-                    heartbeat_pic_fw,
-                    thermal_supervisor,
-                    thermal_poll_ms,
-                    watchdog_liveness.clone(),
-                    share_accounting.clone(),
-                    pool_quality.clone(),
-                )
-                .await;
-            let feeders_quiesced = stop_am2_runtime_feeders_bounded(
-                &self.config,
-                &mut runtime_threads,
-                "single-chain-dispatch-stop",
-            )
-            .await;
-            let shutdown_evidence = if feeders_quiesced {
-                // Phase 3A (CE-010): preserve the rail walk/reset/decay plan,
-                // but only after PIC and PSU feeders are both joined.
-                if am2_safe_teardown_enabled() {
-                    if let Err(error) = am2_safe_teardown_sequence(
-                        selected_pic_endpoint_session.as_mut(),
-                        selected_pic_endpoint_required,
-                        i2c0_service.as_ref(),
-                        selected_pic_addr,
-                        heartbeat_pic_fw,
-                        "serial-dispatch-clean-stop",
-                    ) {
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "s19j-hybrid work-dispatch admission REFUSED Ã¢â‚¬â€ no work frames"
+                );
+                force_am2_home_hard_stop(&self.config, "work-dispatch-admission-refused");
+                return Err(anyhow::anyhow!(
+                    "s19j-hybrid work-dispatch admission refused: {err}"
+                ));
+            }
+        }
+        // P1-5 post-admit re-authorization: when multi-PIC rail enable ran under
+        // PowerUpOnly (Phase 3 precedes enter_mining + thermal proof), re-plan the
+        // remaining-active PIC set with full green dispatch pillars. Fail-closed
+        // if production stagger refuses; expect Composed authority now that pillars
+        // exist (evaluator residual: compose where dispatch pillars exist).
+        if all_active_voltage_enable {
+            let other_pics: Vec<u8> = active_dspic_addrs(active_chains)
+                .into_iter()
+                .filter(|&a| a != selected_pic_addr)
+                .collect();
+            if !other_pics.is_empty() {
+                match dcentrald_common::plan_production_multi_chain_enable(
+                    &other_pics,
+                    StaggerConfig::default(),
+                    Some(&dispatch_inputs),
+                ) {
+                    Ok(plan) => match plan.authority {
+                        MultiChainEnableAuthority::Composed { admission } => {
+                            info!(
+                                controller_count = admission.controller_count,
+                                remaining_pics = other_pics.len(),
+                                steps = plan.sequence.len(),
+                                "P1-5: post-admit multi-PIC schedule re-authorized as Composed"
+                            );
+                        }
+                        MultiChainEnableAuthority::PowerUpOnly => {
+                            // Green admit + default stagger should never land here.
+                            warn!(
+                                remaining_pics = other_pics.len(),
+                                "P1-5: post-admit multi-PIC plan unexpectedly PowerUpOnly after green dispatch admit"
+                            );
+                        }
+                    },
+                    Err(e) => {
                         error!(
-                            error = %error,
-                            "AM2 safe teardown lost exact endpoint authority; forcing hard stop"
+                            error = %e,
+                            remaining_pics = other_pics.len(),
+                            "P1-5: post-admit multi-PIC production stagger refused — fail-closed before work"
                         );
                         force_am2_home_hard_stop(
                             &self.config,
-                            "safe-teardown-missing-exact-pic-endpoint",
+                            "p1-5-post-admit-multi-pic-stagger-refused",
                         );
-                        dispatch_result = Err(error);
-                    }
-                } else {
-                    match pic0x89_clean_stop_owner_policy(
-                        selected_pic_endpoint_required,
-                        selected_pic_endpoint_session.is_some(),
-                    ) {
-                        Pic0x89CleanStopOwnerPolicy::Endpoint => {
-                            let pic = selected_pic_endpoint_session
-                                .as_mut()
-                                .expect("endpoint policy requires retained session")
-                                .controller_mut();
-                            if let Err(e) = pic.disable_voltage() {
-                                warn!(
-                                    error = %e,
-                                    addr = format_args!("0x{:02X}", selected_pic_addr),
-                                    "AM2 serial-dispatch PIC voltage disable failed after feeders quiesced"
-                                );
-                            }
-                        }
-                        Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => {
-                            error!(
-                                addr = format_args!("0x{:02X}", selected_pic_addr),
-                                "exact AM2 endpoint session missing at serial-dispatch clean stop; refusing raw address/firmware reconstruction"
-                            );
-                            force_am2_home_hard_stop(
-                                &self.config,
-                                "serial-dispatch-missing-exact-pic-endpoint",
-                            );
-                            dispatch_result = Err(anyhow::anyhow!(
-                                "exact AM2 endpoint session missing at serial-dispatch clean stop"
-                            ));
-                        }
-                        Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
-                            if let (Some(service), Some(fw)) =
-                                (i2c0_service.as_ref(), heartbeat_pic_fw)
-                            {
-                                let mut pic = Pic0x89Service::new_with_fw(
-                                    service.clone(),
-                                    selected_pic_addr,
-                                    Some(fw),
-                                );
-                                if let Err(e) = pic.disable_voltage() {
-                                    warn!(
-                                        error = %e,
-                                        addr = format_args!("0x{:02X}", selected_pic_addr),
-                                        "AM2 legacy-compatible serial-dispatch PIC voltage disable failed after feeders quiesced"
-                                    );
-                                }
-                            }
-                        }
+                        return Err(anyhow::anyhow!(
+                            "P1-5 post-admit multi-PIC power-up policy refused: {e}"
+                        ));
                     }
                 }
-                shutdown_am2_psu_after_feeders_quiesced(&psu_arc, "single-chain-dispatch-stop")
-            } else {
-                Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
-            };
-            return finalize_am2_dispatch_shutdown(dispatch_result, shutdown_evidence);
+            }
         }
+        let home_profile_pwm = self
+            .config
+            .thermal
+            .fan_max_pwm
+            .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
+        // Mid-run revoke with stop_feed must suppress further SoC WDT kicks
+        // immediately (stock parity) — not only during graceful teardown.
+        let watchdog_feed_stop = watchdog.feed_stop_signal();
 
-        // ---- Phase 10b: Mining loop (FPGA work dispatch + nonce collection) ----
-        info!(
-            "=== MINING ACTIVE — {} BM1362 chips, FPGA chain {} at 0x{:08X} (phys idx {}) ===",
-            chip_count, fpga_chain_id, fpga_base, relay_phys_idx,
-        );
+        // ---- Route: serial-work-dispatch alternative (DCENT_AM2_SERIAL_WORK_DISPATCH=1) ----
+        let mining_route_result: Result<()> = 'mining_route: {
+            if serial_work_dispatch {
+                let Some(serial) = post_init_serial.take() else {
+                    break 'mining_route Err(anyhow::anyhow!(
+                        "DCENT_AM2_SERIAL_WORK_DISPATCH=1 but the post-init serial backend is unavailable"
+                    ));
+                };
 
-        log_bm1362_voltage_topology(fpga_chain_id, chip_count);
+                // ---- GROUP B / W8: DUAL-CHAIN capability (DCENT_AM2_DUAL_CHAIN_TTYS3=1) ----
+                //
+                // DEFAULT-OFF. When set, bring up a SECOND chain on the configured
+                // second UART (`/dev/ttyS3` on `a lab unit`, dsPIC 0x22) using the SAME
+                // proven `init_asic_chain` bring-up as the primary chain, then run
+                // the dual-chain dispatch loop so BOTH hashboards mine (~2Ãƒâ€” hashrate
+                // vs chain-1-only). The exact 2nd-chain cold bring-up order/timing is
+                // RE-ASK-XIL-6 (unconfirmed vs a live bosminer dual-chain strace), so
+                // this is a CAPABILITY flagged for operator live-validation. If the
+                // second chain fails to enumerate, FALL BACK to the proven
+                // single-chain path (never regress the chain-1 milestone).
+                if am2_dual_chain_ttys3_enabled() {
+                    let second_uart = am2_dual_chain_second_uart();
+                    let pll_ramp = self.config.mining.am2_pll_ramp;
+                    if second_uart == chain_uart_device {
+                        warn!(
+                            second_uart = %second_uart,
+                            primary_chain_uart = %chain_uart_device,
+                            "DCENT_AM2_DUAL_CHAIN_TTYS3=1 but the configured second UART equals the primary chain UART Ã¢â‚¬â€ refusing to bring up a duplicate chain; running single-chain"
+                        );
+                    } else {
+                        let pic_addr_b = am2_pic_addr_from_serial_device(&second_uart);
+                        info!(
+                            second_uart = %second_uart,
+                            primary_chain_uart = %chain_uart_device,
+                            pic_addr_b = ?pic_addr_b.map(|a| format!("0x{:02X}", a)),
+                            "DCENT_AM2_DUAL_CHAIN_TTYS3=1 Ã¢â‚¬â€ attempting second BM1362 chain bring-up (RE-ASK-XIL-6: order/timing pending operator live-validation)"
+                        );
+                        match Self::init_asic_chain(&second_uart, chip_count, target_freq, pll_ramp)
+                        {
+                            Ok((serial_b, unique_b)) => {
+                                info!(
+                                    second_uart = %second_uart,
+                                    unique_chip_replies = unique_b,
+                                    "DUAL-CHAIN: second chain enumerated Ã¢â‚¬â€ routing work to BOTH chains"
+                                );
+                                // pic_addr_b is best-effort for teardown; on the `a lab unit`
+                                // topology slot-2/ttyS3 Ã¢â€ â€™ 0x22 (already enabled by the
+                                // all-active-PICs Phase 1-3 path). Fall back to the
+                                // primary's dsPIC addr if the path is unrecognized so
+                                // teardown still disables a real controller.
+                                let pic_addr_b = pic_addr_b.unwrap_or(selected_pic_addr);
+                                if pic_addr_b != selected_pic_addr {
+                                    additional_terminal_pic_addrs.push(pic_addr_b);
+                                }
+                                let dispatch_result = self
+                                    .run_am2_dual_chain_serial_dispatch_loop(
+                                        serial,
+                                        serial_b,
+                                        job_rx,
+                                        share_tx,
+                                        chip_count,
+                                        i2c0_service.clone(),
+                                        selected_pic_addr,
+                                        pic_addr_b,
+                                        heartbeat_pic_fw,
+                                        thermal_supervisor,
+                                        thermal_poll_ms,
+                                        watchdog_liveness.clone(),
+                                        share_accounting.clone(),
+                                        pool_quality.clone(),
+                                        &mut dispatch_life,
+                                        home_profile_pwm,
+                                        pic_heartbeat_terminal_failed.clone(),
+                                        &watchdog_feed_stop,
+                                    )
+                                    .await;
+                                break 'mining_route dispatch_result;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    second_uart = %second_uart,
+                                    error = %e,
+                                    "DUAL-CHAIN: second chain bring-up FAILED Ã¢â‚¬â€ falling back to the proven single-chain path (no regression to the chain-1 milestone)"
+                                );
+                            }
+                        }
+                    }
+                } else if am2_xil_25_fingerprint_matches() {
+                    // D6-2 (2026-06-13): on the `a lab unit` 2-board topology (hashboards on
+                    // PL UART 0 + 2 = ttyS1 + ttyS3), with DCENT_AM2_DUAL_CHAIN_TTYS3
+                    // unset DCENT drives ONLY the primary chain. Record it loudly so an
+                    // enum=0 / low-hashrate result is NOT misread as a whole-unit
+                    // failure Ã¢â‚¬â€ the second board on /dev/ttyS3 is intentionally idle.
+                    // Fires once per run() (this is dispatch setup, before the loop).
+                    warn!(
+                        primary_chain_uart = %chain_uart_device,
+                        idle_second_uart = AM2_DUAL_CHAIN_SECOND_UART_DEFAULT,
+                        "DUAL-CHAIN GATE OFF on a .25-fingerprint unit: only the primary chain is driven; /dev/ttyS3 (slot-2 board) is IDLE. An enum=0 here is a SINGLE-chain result, NOT whole-unit. Set DCENT_AM2_DUAL_CHAIN_TTYS3=1 for a 2-board run."
+                    );
+                }
 
-        let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
-        let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
-        let mut asic_job_id: u8 = 0;
-        let mut work_history: Vec<VecDeque<WorkEntry>> = (0..128)
-            .map(|_| VecDeque::with_capacity(WORK_HISTORY_PER_ID))
-            .collect();
+                info!(
+                    "DCENT_AM2_SERIAL_WORK_DISPATCH=1 Ã¢â‚¬â€ routing work via the proven BM1362 88-byte serial frame over the chain UART (FPGA WORK_TX FIFO bypassed)"
+                );
+                let dispatch_result = self
+                    .run_am2_serial_dispatch_loop(
+                        serial,
+                        job_rx,
+                        share_tx,
+                        chip_count,
+                        i2c0_service.clone(),
+                        selected_pic_addr,
+                        heartbeat_pic_fw,
+                        thermal_supervisor,
+                        thermal_poll_ms,
+                        watchdog_liveness.clone(),
+                        share_accounting.clone(),
+                        pool_quality.clone(),
+                        &mut dispatch_life,
+                        home_profile_pwm,
+                        pic_heartbeat_terminal_failed.clone(),
+                        &watchdog_feed_stop,
+                    )
+                    .await;
+                break 'mining_route dispatch_result;
+            }
 
-        let mut total_work: u64 = 0;
-        let mut total_nonces: u64 = 0;
-        let mut shares_submitted: u64 = 0;
-        // Dedup the FPGA RX FIFO: the same nonce surfaces multiple times (both
-        // midstate slots carry identical work, and the FIFO can re-present a
-        // nonce), so without this every duplicate is re-submitted → pool reject
-        // code 22. Mirrors the serial-dispatch loop + work_dispatcher.rs. Keyed
-        // (work_id, nonce): the two identical-midstate slots reconstruct the same
-        // header, so collapsing them on (work_id, nonce) is correct here
-        // (am2 configs are version_rolling=false; add solution_id if ever enabled).
-        let mut seen_shares: std::collections::BTreeSet<(u8, u32)> =
-            std::collections::BTreeSet::new();
-        let mut unsupported_share_submit_logged = false;
-        let mut unsupported_job_logged = false;
-        let start_time = Instant::now();
-        let mut last_hr_time = Instant::now();
-        let mut hr_nonces: u64 = 0;
-        let mut first_dispatch_diag_done = false;
-        let mut first_gate_bypass_done = false;
-        let mut chain4_hidden_state_diag_done = false;
-        let no_nonce_timeout = if self.config.mining.am2_no_nonce_timeout_s == 0 {
-            None
-        } else {
-            Some(Duration::from_secs(
-                self.config.mining.am2_no_nonce_timeout_s,
-            ))
-        };
-        let mut first_work_at: Option<Instant> = None;
-        let mut no_nonce_stall_reason: Option<String> = None;
-        let chain4_timeline_enabled = self.config.mining.am2_first_work_timeline
-            && passthrough
-            && self.config.mining.skip_fifo_reset
-            && fpga_chain_id == 4;
-        if let Some(timeout) = no_nonce_timeout {
+            // ---- Phase 10b: Mining loop (FPGA work dispatch + nonce collection) ----
             info!(
-                timeout_s = timeout.as_secs(),
-                "AM2 no-nonce fail-closed guard armed"
+                "=== MINING ACTIVE Ã¢â‚¬â€ {} BM1362 chips, FPGA chain {} at 0x{:08X} (phys idx {}) ===",
+                chip_count, fpga_chain_id, fpga_base, relay_phys_idx,
             );
-        } else {
-            warn!("AM2 no-nonce fail-closed guard disabled by config");
-        }
-        if self.config.mining.am2_first_work_timeline && !chain4_timeline_enabled {
-            warn!(
+
+            log_bm1362_voltage_topology(fpga_chain_id, chip_count);
+
+            let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
+            let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
+            // P1-1 pure SerialWorkBookkeeping façade: FPGA path uses 7-bit work-id
+            // + step 2. Dedup keys (work_id, nonce) with version_bits=0: am2 FPGA
+            // configs are version_rolling=false (identical midstate slots
+            // reconstruct the same header).
+            let mut bookkeeping: SerialWorkBookkeeping<WorkEntry> =
+                SerialWorkBookkeeping::hybrid_fpga();
+            let mut total_work: u64 = 0;
+            let mut total_nonces: u64 = 0;
+            let mut shares_submitted: u64 = 0;
+            let mut unsupported_share_submit_logged = false;
+            let mut unsupported_job_logged = false;
+            let start_time = Instant::now();
+            let mut last_hr_time = Instant::now();
+            let mut hr_nonces: u64 = 0;
+            let mut first_dispatch_diag_done = false;
+            let mut first_gate_bypass_done = false;
+            let mut chain4_hidden_state_diag_done = false;
+            let no_nonce_timeout = if self.config.mining.am2_no_nonce_timeout_s == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(
+                    self.config.mining.am2_no_nonce_timeout_s,
+                ))
+            };
+            let mut first_work_at: Option<Instant> = None;
+            let chain4_timeline_enabled = self.config.mining.am2_first_work_timeline
+                && passthrough
+                && self.config.mining.skip_fifo_reset
+                && fpga_chain_id == 4;
+            if let Some(timeout) = no_nonce_timeout {
+                info!(
+                    timeout_s = timeout.as_secs(),
+                    "AM2 no-nonce fail-closed guard armed"
+                );
+            } else {
+                warn!("AM2 no-nonce fail-closed guard disabled by config");
+            }
+            if self.config.mining.am2_first_work_timeline && !chain4_timeline_enabled {
+                warn!(
                 fpga_chain_id,
                 passthrough,
                 skip_fifo_reset = self.config.mining.skip_fifo_reset,
                 "AM2 first-work timeline requested but inactive; requires passthrough + skip_fifo_reset + chain4"
             );
-        }
+            }
 
-        let mut dispatch_timer = tokio::time::interval(Duration::from_millis(10));
-        let mut nonce_poll_timer = tokio::time::interval(Duration::from_millis(5));
-        let mut hashrate_timer = tokio::time::interval(Duration::from_secs(5));
-        let mut thermal_timer = tokio::time::interval(Duration::from_millis(
-            thermal_poll_ms.max(AM2_THERMAL_MIN_POLL_MS),
-        ));
+            let mut dispatch_timer = tokio::time::interval(Duration::from_millis(10));
+            let mut nonce_poll_timer = tokio::time::interval(Duration::from_millis(5));
+            let mut hashrate_timer = tokio::time::interval(Duration::from_secs(5));
+            let mut thermal_timer = tokio::time::interval(Duration::from_millis(
+                thermal_poll_ms.max(AM2_THERMAL_MIN_POLL_MS),
+            ));
 
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => { info!("Shutdown requested"); break; }
-
-                _ = thermal_timer.tick() => {
-                    watchdog_liveness.fetch_add(1, Ordering::Relaxed);
-                    if let Some(sup) = thermal_supervisor.as_mut() {
-                        if let Err(e) = sup.poll_and_check("runtime") {
-                            error!(error = %e, "AM2 runtime thermal supervisor tripped — forcing home hard-stop");
-                            force_am2_thermal_hard_stop(&self.config, "runtime-thermal-fail-closed");
-                            self.shutdown.cancel();
-                            break;
-                        }
-                    }
+            loop {
+                if pic_heartbeat_terminal_failed.load(Ordering::SeqCst)
+                    && dispatch_life.is_admitted()
+                {
+                    let action = hybrid_revoke_and_stop_watchdog_feed(
+                        &mut dispatch_life,
+                        DispatchRevocationCause::HeartbeatFailure,
+                        home_profile_pwm,
+                        &watchdog_feed_stop,
+                    );
+                    error!(
+                        steps = action.steps().len(),
+                        "s19j-hybrid FPGA work-dispatch TERMINALLY REVOKED after PIC heartbeat failure (watchdog feed stopped)"
+                    );
+                    self.shutdown.cancel();
+                    break;
                 }
 
-                Some(job) = job_rx.recv() => {
-                    if job.clean_jobs {
-                        info!(job_id = %job.job_id, "NEW BLOCK — flushing FPGA work queues");
-                        if !first_dispatch_diag_done {
-                            log_am2_dispatch_snapshot(&fpga, "clean_jobs_pre_flush");
-                            log_am2_glitch_window("clean_jobs_pre_flush");
-                        }
-                        work_history.iter_mut().for_each(VecDeque::clear);
-                        seen_shares.clear(); // new block: prior nonces are now stale
-                        work_builder.reset_extranonce2();
-                        fpga.flush_work_tx();
-                        apply_am2_work_tx_bosminer_idle_mode(&fpga, "clean_jobs_post_work_tx_flush");
-                        fpga.flush_work_rx();
-                        if !first_dispatch_diag_done {
-                            log_am2_dispatch_snapshot(&fpga, "clean_jobs_post_flush");
-                            log_am2_glitch_window("clean_jobs_post_flush");
-                        }
-                    }
-                    if job.is_flush_only() {
-                        info!(
-                            job_id = %job.job_id,
-                            "Pool switch flush complete; hybrid dispatch paused until the next pool notify"
-                        );
-                        current_job = None;
-                        unsupported_job_logged = false;
-                        continue;
-                    }
-                    if job.version_mask != 0 {
-                        if !unsupported_job_logged {
-                            unsupported_job_logged = true;
-                            warn!(
-                                version_mask = format_args!("0x{:08X}", job.version_mask),
-                                "Hybrid BM1362 path cannot safely submit rolled-version shares on the FPGA nonce path — refusing version-rolling jobs"
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => {
+                        info!("Shutdown requested");
+                        if dispatch_life.is_admitted() {
+                            let cause = if pic_heartbeat_terminal_failed.load(Ordering::SeqCst) {
+                                DispatchRevocationCause::HeartbeatFailure
+                            } else {
+                                DispatchRevocationCause::OperatorSafeOff
+                            };
+                            let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                &mut dispatch_life,
+                                cause,
+                                home_profile_pwm,
+                                &watchdog_feed_stop,
                             );
                         }
-                        current_job = None;
-                        continue;
+                        break;
                     }
-                    unsupported_job_logged = false;
-                    work_builder.set_version_mask(0);
-                    current_job = Some(job);
-                }
 
-                _ = dispatch_timer.tick() => {
-                    if let Some(ref job) = current_job {
-                        if !chain4_hidden_state_diag_done
-                            && passthrough
-                            && self.config.mining.skip_fifo_reset
-                            && fpga_chain_id == 4
-                            && total_work == 0
-                        {
-                            chain4_hidden_state_diag_done = true;
-                            if let Some(serial) = post_init_serial.as_ref() {
-                                info!("chain4_hidden_state_diag_begin");
-                                let summary = probe_bm1362_get_address_summary(serial, 250);
-                                info!(summary = %summary, "chain4_hidden_state_serial_probe");
-                                info!("chain4_hidden_state_diag_end");
-                            } else {
-                                warn!("chain4_hidden_state_diag_serial_unavailable");
+                    _ = thermal_timer.tick() => {
+                        watchdog_liveness.mark_progress();
+                        if let Some(sup) = thermal_supervisor.as_mut() {
+                            if let Err(e) =
+                                sup.poll_and_check(Am2ThermalPollStage::Runtime("runtime"))
+                            {
+                                error!(error = %e, "AM2 runtime thermal supervisor tripped Ã¢â‚¬â€ forcing home hard-stop");
+                                if dispatch_life.is_admitted() {
+                                    let _ = hybrid_revoke_and_stop_watchdog_feed(
+                                        &mut dispatch_life,
+                                        DispatchRevocationCause::ThermalCutoff,
+                                        home_profile_pwm,
+                                        &watchdog_feed_stop,
+                                    );
+                                }
+                                force_am2_thermal_hard_stop(&self.config, "runtime-thermal-fail-closed");
+                                self.shutdown.cancel();
+                                break;
                             }
                         }
+                    }
 
-                        let tx_stat_now = fpga.read_work_tx_status();
-                        let allow_first_job_despite_full = !first_gate_bypass_done
-                            && passthrough
-                            && self.config.mining.skip_fifo_reset
-                            && total_work == 0
-                            && ((tx_stat_now & fpga_chain::STAT_IRQ != 0)
-                                || (fpga_chain_id == 4 && chain4_hidden_state_diag_done));
-
-                        if fpga.work_tx_full() && !allow_first_job_despite_full {
+                    Some(job) = job_rx.recv() => {
+                        if job.clean_jobs {
+                            info!(job_id = %job.job_id, "NEW BLOCK Ã¢â‚¬â€ flushing FPGA work queues");
                             if !first_dispatch_diag_done {
-                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_blocked_pre");
-                                log_am2_glitch_window("first_dispatch_blocked_pre");
+                                log_am2_dispatch_snapshot(&fpga, "clean_jobs_pre_flush");
+                                log_am2_glitch_window("clean_jobs_pre_flush");
+                            }
+                            bookkeeping.on_clean_jobs(); // history + dedup; prior nonces stale
+                            work_builder.reset_extranonce2();
+                            fpga.flush_work_tx();
+                            apply_am2_work_tx_bosminer_idle_mode(&fpga, "clean_jobs_post_work_tx_flush");
+                            fpga.flush_work_rx();
+                            if !first_dispatch_diag_done {
+                                log_am2_dispatch_snapshot(&fpga, "clean_jobs_post_flush");
+                                log_am2_glitch_window("clean_jobs_post_flush");
+                            }
+                        }
+                        if job.is_flush_only() {
+                            info!(
+                                job_id = %job.job_id,
+                                "Pool switch flush complete; hybrid dispatch paused until the next pool notify"
+                            );
+                            current_job = None;
+                            unsupported_job_logged = false;
+                            continue;
+                        }
+                        if job.version_mask != 0 {
+                            if !unsupported_job_logged {
+                                unsupported_job_logged = true;
+                                warn!(
+                                    version_mask = format_args!("0x{:08X}", job.version_mask),
+                                    "Hybrid BM1362 path cannot safely submit rolled-version shares on the FPGA nonce path Ã¢â‚¬â€ refusing version-rolling jobs"
+                                );
+                            }
+                            current_job = None;
+                            continue;
+                        }
+                        unsupported_job_logged = false;
+                        work_builder.set_version_mask(0);
+                        current_job = Some(job);
+                    }
 
-                                if passthrough && self.config.mining.skip_fifo_reset {
-                                    fpga.write_work_tx_ctrl(0x0000_0000);
-                                    std::thread::sleep(Duration::from_millis(1));
-                                    log_am2_dispatch_snapshot(&fpga, "first_dispatch_txctrl_zero");
+                    _ = dispatch_timer.tick() => {
+                        // Fail-closed: never push FPGA work without live admission.
+                        if !dispatch_life.is_admitted() {
+                            continue;
+                        }
+                        if let Some(ref job) = current_job {
+                            if !chain4_hidden_state_diag_done
+                                && passthrough
+                                && self.config.mining.skip_fifo_reset
+                                && fpga_chain_id == 4
+                                && total_work == 0
+                            {
+                                chain4_hidden_state_diag_done = true;
+                                if let Some(serial) = post_init_serial.as_ref() {
+                                    info!("chain4_hidden_state_diag_begin");
+                                    let summary = probe_bm1362_get_address_summary(serial, 250);
+                                    info!(summary = %summary, "chain4_hidden_state_serial_probe");
+                                    info!("chain4_hidden_state_diag_end");
+                                } else {
+                                    warn!("chain4_hidden_state_diag_serial_unavailable");
+                                }
+                            }
 
-                                    fpga.write_work_tx_ctrl(fpga_chain::CMD_CTRL_IRQ_EN);
-                                    std::thread::sleep(Duration::from_millis(1));
-                                    log_am2_dispatch_snapshot(&fpga, "first_dispatch_txctrl_irqen");
+                            let tx_stat_now = fpga.read_work_tx_status();
+                            let allow_first_job_despite_full = !first_gate_bypass_done
+                                && passthrough
+                                && self.config.mining.skip_fifo_reset
+                                && total_work == 0
+                                && ((tx_stat_now & fpga_chain::STAT_IRQ != 0)
+                                    || (fpga_chain_id == 4 && chain4_hidden_state_diag_done));
+
+                            if fpga.work_tx_full() && !allow_first_job_despite_full {
+                                if !first_dispatch_diag_done {
+                                    log_am2_dispatch_snapshot(&fpga, "first_dispatch_blocked_pre");
+                                    log_am2_glitch_window("first_dispatch_blocked_pre");
+
+                                    if passthrough && self.config.mining.skip_fifo_reset {
+                                        fpga.write_work_tx_ctrl(0x0000_0000);
+                                        std::thread::sleep(Duration::from_millis(1));
+                                        log_am2_dispatch_snapshot(&fpga, "first_dispatch_txctrl_zero");
+
+                                        fpga.write_work_tx_ctrl(fpga_chain::CMD_CTRL_IRQ_EN);
+                                        std::thread::sleep(Duration::from_millis(1));
+                                        log_am2_dispatch_snapshot(&fpga, "first_dispatch_txctrl_irqen");
+                                    }
+
+                                    if let Some(serial) = post_init_serial.as_ref() {
+                                        let blocked_drain = read_bm1362_serial_drain_summary(serial, 50);
+                                        info!(summary = %blocked_drain, "first_dispatch_blocked_serial_drain");
+                                        let serial_probe = probe_bm1362_get_address_summary(serial, 250);
+                                        info!(summary = %serial_probe, "first_dispatch_blocked_serial_probe");
+                                    } else {
+                                        info!("first_dispatch_blocked_serial_probe: unavailable");
+                                    }
+
+                                    post_init_serial = None;
+                                    first_dispatch_diag_done = true;
+                                }
+                                continue;
+                            }
+
+                            if allow_first_job_despite_full {
+                                first_gate_bypass_done = true;
+                                warn!(
+                                    tx_stat = format_args!("0x{:08X}", tx_stat_now),
+                                    "DIAGNOSTIC: allowing one first work write despite TX_FULL because am2 hidden-state gate suggests a valid discriminator write"
+                                );
+                                if !first_dispatch_diag_done {
+                                    log_am2_dispatch_snapshot(&fpga, "first_dispatch_gate_bypass");
+                                }
+                            }
+
+                            let work = match work_builder.next_work(job) {
+                                Ok(work) => work,
+                                Err(error) => {
+                                    warn!(%error, "AM2 FPGA V1 work domain unavailable; pausing dispatch until a fresh generation arrives");
+                                    current_job = None;
+                                    continue;
+                                }
+                            };
+                            let asic_job_id = bookkeeping.job_ids.current();
+                            let mut words = [0u32; WORK_WORDS];
+
+                            // Word 0: Extended work_id.
+                            words[0] = (asic_job_id as u32) << MIDSTATE_CNT_LOG2;
+                            // Word 1: nbits
+                            words[1] = work.nbits;
+                            // Word 2: ntime
+                            words[2] = work.ntime;
+                            // Word 3: merkle_tail
+                            words[3] = u32::from_le_bytes(work.merkle4);
+
+                            // Words 4-19: 2 midstate slots (8 words each).
+                            for slot in 0..(1usize << MIDSTATE_CNT_LOG2) {
+                                let midstate = &work.midstates[0];
+                                let base = 4 + slot * 8;
+                                for i in 0..8 {
+                                    let word_idx = 7 - i;
+                                    words[base + i] = u32::from_be_bytes([
+                                        midstate[word_idx * 4],
+                                        midstate[word_idx * 4 + 1],
+                                        midstate[word_idx * 4 + 2],
+                                        midstate[word_idx * 4 + 3],
+                                    ]);
+                                }
+                            }
+
+                            let version_bits_per_ms: Vec<Option<String>> =
+                                vec![None; work.midstates.len()];
+                            bookkeeping.history.push(
+                                asic_job_id,
+                                WorkEntry {
+                                    work_generation: work.work_generation,
+                                    job_id: work.job_id.clone(),
+                                    extranonce2: work.extranonce2.clone(),
+                                    ntime: work.ntime,
+                                    nbits: work.nbits,
+                                    version: work.version,
+                                    share_target: work.share_target,
+                                    prev_block_hash: work.prev_block_hash,
+                                    merkle_root: work.merkle_root,
+                                    version_bits_per_midstate: version_bits_per_ms,
+                                    version_rolling_enabled: work.version_mask != 0,
+                                },
+                            );
+
+                            if !first_dispatch_diag_done {
+                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_pre");
+                                log_am2_glitch_window("first_dispatch_pre");
+                            }
+
+                            fpga.write_work(&words);
+
+                            if chain4_timeline_enabled && total_work > 0 && total_work < 3 {
+                                let phase = format!("chain4_dispatch_timeline_job{}", total_work + 1);
+                                run_am2_dispatch_timeline(&fpga, &phase);
+                            }
+
+                            if !first_dispatch_diag_done {
+                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_post");
+                                log_am2_glitch_window("first_dispatch_post");
+
+                                if chain4_timeline_enabled {
+                                    run_am2_dispatch_timeline(&fpga, "chain4_dispatch_timeline_job1");
+                                } else {
+                                    std::thread::sleep(Duration::from_millis(300));
+
+                                    log_am2_dispatch_snapshot(&fpga, "first_dispatch_300ms");
+                                    log_am2_glitch_window("first_dispatch_300ms");
                                 }
 
+                                run_am2_rx_oracle_window(&fpga, Duration::from_secs(2));
+                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_rx_oracle_end");
+
                                 if let Some(serial) = post_init_serial.as_ref() {
-                                    let blocked_drain = read_bm1362_serial_drain_summary(serial, 50);
-                                    info!(summary = %blocked_drain, "first_dispatch_blocked_serial_drain");
+                                    let dispatch_drain = read_bm1362_serial_drain_summary(serial, 50);
+                                    info!(summary = %dispatch_drain, "first_dispatch_serial_drain");
                                     let serial_probe = probe_bm1362_get_address_summary(serial, 250);
-                                    info!(summary = %serial_probe, "first_dispatch_blocked_serial_probe");
+                                    info!(summary = %serial_probe, "first_dispatch_serial_probe");
                                 } else {
-                                    info!("first_dispatch_blocked_serial_probe: unavailable");
+                                    info!("first_dispatch_serial_probe: unavailable");
                                 }
 
                                 post_init_serial = None;
                                 first_dispatch_diag_done = true;
                             }
-                            continue;
-                        }
 
-                        if allow_first_job_despite_full {
-                            first_gate_bypass_done = true;
-                            warn!(
-                                tx_stat = format_args!("0x{:08X}", tx_stat_now),
-                                "DIAGNOSTIC: allowing one first work write despite TX_FULL because am2 hidden-state gate suggests a valid discriminator write"
-                            );
-                            if !first_dispatch_diag_done {
-                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_gate_bypass");
-                            }
-                        }
-
-                        let work = work_builder.next_work(job);
-                        let mut words = [0u32; WORK_WORDS];
-
-                        // Word 0: Extended work_id.
-                        words[0] = (asic_job_id as u32) << MIDSTATE_CNT_LOG2;
-                        // Word 1: nbits
-                        words[1] = work.nbits;
-                        // Word 2: ntime
-                        words[2] = work.ntime;
-                        // Word 3: merkle_tail
-                        words[3] = u32::from_le_bytes(work.merkle4);
-
-                        // Words 4-19: 2 midstate slots (8 words each).
-                        for slot in 0..(1usize << MIDSTATE_CNT_LOG2) {
-                            let midstate = &work.midstates[0];
-                            let base = 4 + slot * 8;
-                            for i in 0..8 {
-                                let word_idx = 7 - i;
-                                words[base + i] = u32::from_be_bytes([
-                                    midstate[word_idx * 4],
-                                    midstate[word_idx * 4 + 1],
-                                    midstate[word_idx * 4 + 2],
-                                    midstate[word_idx * 4 + 3],
-                                ]);
-                            }
-                        }
-
-                        let version_bits_per_ms: Vec<Option<String>> = vec![None; work.midstates.len()];
-
-                        let history = &mut work_history[asic_job_id as usize];
-                        if history.len() >= WORK_HISTORY_PER_ID {
-                            history.pop_front();
-                        }
-                        history.push_back(WorkEntry {
-                            job_id: work.job_id.clone(),
-                            extranonce2: work.extranonce2.clone(),
-                            ntime: work.ntime,
-                            nbits: work.nbits,
-                            version: work.version,
-                            share_target: work.share_target,
-                            prev_block_hash: work.prev_block_hash,
-                            merkle_root: work.merkle_root,
-                            version_bits_per_midstate: version_bits_per_ms,
-                            version_rolling_enabled: work.version_mask != 0,
-                        });
-
-                        if !first_dispatch_diag_done {
-                            log_am2_dispatch_snapshot(&fpga, "first_dispatch_pre");
-                            log_am2_glitch_window("first_dispatch_pre");
-                        }
-
-                        fpga.write_work(&words);
-
-                        if chain4_timeline_enabled && total_work > 0 && total_work < 3 {
-                            let phase = format!("chain4_dispatch_timeline_job{}", total_work + 1);
-                            run_am2_dispatch_timeline(&fpga, &phase);
-                        }
-
-                        if !first_dispatch_diag_done {
-                            log_am2_dispatch_snapshot(&fpga, "first_dispatch_post");
-                            log_am2_glitch_window("first_dispatch_post");
-
-                            if chain4_timeline_enabled {
-                                run_am2_dispatch_timeline(&fpga, "chain4_dispatch_timeline_job1");
-                            } else {
-                                std::thread::sleep(Duration::from_millis(300));
-
-                                log_am2_dispatch_snapshot(&fpga, "first_dispatch_300ms");
-                                log_am2_glitch_window("first_dispatch_300ms");
+                            let logged_work_id = asic_job_id;
+                            let _ = bookkeeping.job_ids.take_and_advance();
+                            total_work += 1;
+                            if first_work_at.is_none() {
+                                first_work_at = Some(Instant::now());
                             }
 
-                            run_am2_rx_oracle_window(&fpga, Duration::from_secs(2));
-                            log_am2_dispatch_snapshot(&fpga, "first_dispatch_rx_oracle_end");
-
-                            if let Some(serial) = post_init_serial.as_ref() {
-                                let dispatch_drain = read_bm1362_serial_drain_summary(serial, 50);
-                                info!(summary = %dispatch_drain, "first_dispatch_serial_drain");
-                                let serial_probe = probe_bm1362_get_address_summary(serial, 250);
-                                info!(summary = %serial_probe, "first_dispatch_serial_probe");
-                            } else {
-                                info!("first_dispatch_serial_probe: unavailable");
-                            }
-
-                            post_init_serial = None;
-                            first_dispatch_diag_done = true;
-                        }
-
-                        asic_job_id = (asic_job_id.wrapping_add(JOB_ID_INCREMENT)) & JOB_ID_MASK;
-                        total_work += 1;
-                        if first_work_at.is_none() {
-                            first_work_at = Some(Instant::now());
-                        }
-
-                        if total_work <= 3 {
-                            info!(
-                                work_id = asic_job_id.wrapping_sub(JOB_ID_INCREMENT) & JOB_ID_MASK,
-                                pool_job = %work.job_id,
-                                words = WORK_WORDS,
-                                "WORK #{} sent ({} words to FPGA WORK_TX)",
-                                total_work, WORK_WORDS,
-                            );
-                        }
-                    }
-                }
-
-                _ = nonce_poll_timer.tick() => {
-                    let mut nonces_this_poll = 0;
-                    while let Some((w0, w1)) = fpga.read_nonce() {
-                        nonces_this_poll += 1;
-                        total_nonces += 1;
-                        hr_nonces += 1;
-
-                        let nonce = w0;
-                        let ext_work_id = ((w1 >> 8) & 0xFFFF) as u16;
-                        let work_id = ((ext_work_id >> MIDSTATE_CNT_LOG2) & 0x7F) as u8;
-                        let solution_id = (w1 & 0xFF) as u8;
-
-                        if total_nonces <= 1000 {
-                            info!(
-                                nonce = format_args!("0x{:08X}", nonce),
-                                work_id,
-                                solution_id,
-                                w1 = format_args!("0x{:08X}", w1),
-                                "Nonce #{}", total_nonces,
-                            );
-                        }
-
-                        let history = &work_history[work_id as usize];
-                        if history.is_empty() {
-                            warn!(work_id, "Stale nonce (no work history)");
-                            continue;
-                        }
-                        if !seen_shares.insert((work_id, nonce)) {
-                            continue; // duplicate (FPGA RX FIFO re-surfaced this nonce)
-                        }
-                        if dcentrald_common::should_clear_seen_shares(
-                            seen_shares.len(),
-                            dcentrald_common::DEFAULT_SEEN_SHARES_CAP,
-                        ) {
-                            seen_shares.clear();
-                        }
-
-                        let latest_entry = history
-                            .back()
-                            .expect("history checked non-empty")
-                            .clone();
-
-                        let ms_idx = (solution_id as usize)
-                            .min(latest_entry.version_bits_per_midstate.len().saturating_sub(1));
-                        let share_version_bits = latest_entry.version_bits_per_midstate
-                            .get(ms_idx)
-                            .cloned()
-                            .flatten();
-                        let _rolled_version_guess = match &share_version_bits {
-                            Some(vb) => latest_entry.version ^ u32::from_str_radix(vb, 16).unwrap_or(0),
-                            None => latest_entry.version,
-                        };
-
-                        let missing_version_reconstruction = latest_entry.version_rolling_enabled
-                            && latest_entry.version_bits_per_midstate.iter().all(|vb| vb.is_none());
-                        if missing_version_reconstruction {
-                            if !unsupported_share_submit_logged {
-                                unsupported_share_submit_logged = true;
-                                warn!(
-                                    "S19j hybrid path cannot yet reconstruct BM1362 rolled version bits from FPGA nonce metadata — dropping share submissions to avoid malformed pool submits"
+                            if total_work <= 3 {
+                                info!(
+                                    work_id = logged_work_id,
+                                    pool_job = %work.job_id,
+                                    words = WORK_WORDS,
+                                    "WORK #{} sent ({} words to FPGA WORK_TX)",
+                                    total_work, WORK_WORDS,
                                 );
                             }
-                            continue;
                         }
+                    }
 
-                        if let Some((entry, rolled_version, share_version_bits)) = history.iter().rev().find_map(|candidate| {
+                    _ = nonce_poll_timer.tick() => {
+                        let mut nonces_this_poll = 0;
+                        while let Some((w0, w1)) = fpga.read_nonce() {
+                            nonces_this_poll += 1;
+                            total_nonces += 1;
+                            hr_nonces += 1;
+
+                            let nonce = w0;
+                            let ext_work_id = ((w1 >> 8) & 0xFFFF) as u16;
+                            let work_id = ((ext_work_id >> MIDSTATE_CNT_LOG2) & 0x7F) as u8;
+                            let solution_id = (w1 & 0xFF) as u8;
+
+                            if total_nonces <= 1000 {
+                                info!(
+                                    nonce = format_args!("0x{:08X}", nonce),
+                                    work_id,
+                                    solution_id,
+                                    w1 = format_args!("0x{:08X}", w1),
+                                    "Nonce #{}", total_nonces,
+                                );
+                            }
+
+                            if bookkeeping.history.is_empty_slot(work_id) {
+                                warn!(work_id, "Stale nonce (no work history)");
+                                continue;
+                            }
+                            // FPGA non-rolling path: version_bits fixed at 0.
+                            if !bookkeeping.seen.insert(work_id, nonce, 0) {
+                                continue; // duplicate (FPGA RX FIFO re-surfaced this nonce)
+                            }
+
+                            let latest_entry = bookkeeping
+                                .history
+                                .latest(work_id)
+                                .expect("history checked non-empty")
+                                .clone();
+
                             let ms_idx = (solution_id as usize)
-                                .min(candidate.version_bits_per_midstate.len().saturating_sub(1));
-                            let share_version_bits = candidate
-                                .version_bits_per_midstate
+                                .min(latest_entry.version_bits_per_midstate.len().saturating_sub(1));
+                            let share_version_bits = latest_entry.version_bits_per_midstate
                                 .get(ms_idx)
                                 .cloned()
                                 .flatten();
-                            let rolled_version = match &share_version_bits {
-                                Some(vb) => candidate.version ^ u32::from_str_radix(vb, 16).unwrap_or(0),
-                                None => candidate.version,
+                            let _rolled_version_guess = match &share_version_bits {
+                                Some(vb) => latest_entry.version ^ u32::from_str_radix(vb, 16).unwrap_or(0),
+                                None => latest_entry.version,
                             };
-                            let header = hybrid_build_header(candidate, rolled_version, nonce);
-                            if dcentrald_stratum::share_pipeline::validate_full_header(&header, &candidate.share_target) {
-                                Some((candidate.clone(), rolled_version, share_version_bits))
-                            } else {
-                                None
+
+                            let missing_version_reconstruction = latest_entry.version_rolling_enabled
+                                && latest_entry.version_bits_per_midstate.iter().all(|vb| vb.is_none());
+                            if missing_version_reconstruction {
+                                if !unsupported_share_submit_logged {
+                                    unsupported_share_submit_logged = true;
+                                    warn!(
+                                        "S19j hybrid path cannot yet reconstruct BM1362 rolled version bits from FPGA nonce metadata Ã¢â‚¬â€ dropping share submissions to avoid malformed pool submits"
+                                    );
+                                }
+                                continue;
                             }
-                        }) {
-                            shares_submitted += 1;
-                            let vdelta = rolled_version ^ entry.version;
-                            let share = dcentrald_stratum::types::ValidShare {
-                                worker_name: self.config.pool.worker.clone(),
-                                job_id: entry.job_id.clone(),
-                                extranonce2: entry.extranonce2.clone(),
-                                ntime: format!("{:08x}", entry.ntime),
-                                nonce: format!("{:08x}", nonce),
-                                version_bits: share_version_bits.or_else(|| {
-                                    if vdelta != 0 {
-                                        Some(format!("{:08x}", vdelta))
-                                    } else {
-                                        None
+
+                            if let Some((entry, rolled_version, share_version_bits)) =
+                                bookkeeping.history.iter_newest_first(work_id).find_map(|candidate| {
+                                let ms_idx = (solution_id as usize)
+                                    .min(candidate.version_bits_per_midstate.len().saturating_sub(1));
+                                let share_version_bits = candidate
+                                    .version_bits_per_midstate
+                                    .get(ms_idx)
+                                    .cloned()
+                                    .flatten();
+                                let rolled_version = match &share_version_bits {
+                                    Some(vb) => candidate.version ^ u32::from_str_radix(vb, 16).unwrap_or(0),
+                                    None => candidate.version,
+                                };
+                                let header = hybrid_build_header(candidate, rolled_version, nonce);
+                                if dcentrald_stratum::share_pipeline::validate_full_header(&header, &candidate.share_target) {
+                                    Some((candidate.clone(), rolled_version, share_version_bits))
+                                } else {
+                                    None
+                                }
+                            }) {
+                                shares_submitted += 1;
+                                let vdelta = rolled_version ^ entry.version;
+                                let share = dcentrald_stratum::types::ValidShare {
+                                    work_generation: entry.work_generation,
+                                    worker_name: self.config.pool.worker.clone(),
+                                    job_id: entry.job_id.clone(),
+                                    extranonce2: entry.extranonce2.clone(),
+                                    ntime: format!("{:08x}", entry.ntime),
+                                    nonce: format!("{:08x}", nonce),
+                                    version_bits: share_version_bits.or_else(|| {
+                                        if vdelta != 0 {
+                                            Some(format!("{:08x}", vdelta))
+                                        } else {
+                                            None
+                                        }
+                                    }),
+                                    version: rolled_version,
+                                    achieved_difficulty: None,
+                                };
+                                match share_tx.send(share).await {
+                                    Ok(()) => {
+                                        info!(nonce = format_args!("0x{:08X}", nonce), "SHARE #{}", shares_submitted);
                                     }
-                                }),
-                                version: rolled_version,
-                                achieved_difficulty: None,
-                            };
-                            match share_tx.send(share).await {
-                                Ok(()) => {
-                                    info!(nonce = format_args!("0x{:08X}", nonce), "SHARE #{}", shares_submitted);
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Share channel closed");
-                                    break;
+                                    Err(e) => {
+                                        error!(error = %e, "Share channel closed");
+                                        break;
+                                    }
                                 }
                             }
-                        }
 
-                        if nonces_this_poll > 100 { break; }
-                    }
-                }
-
-                _ = hashrate_timer.tick() => {
-                    // Per-5s FPGA status snapshot — always emitted.
-                    let ctrl_now = fpga.read_ctrl();
-                    let errs = fpga.read_error_count();
-                    let tx_full = fpga.work_tx_full();
-                    let rx_has = fpga.work_rx_has_data();
-                    let tx_last = fpga.read_work_tx_last();
-                    info!(
-                        chain = fpga_chain_id,
-                        ctrl = format_args!("0x{:08X}", ctrl_now),
-                        err_cnt = errs,
-                        tx_last = format_args!("0x{:08X}", tx_last),
-                        tx_full,
-                        rx_empty = !rx_has,
-                        nonces_5s = hr_nonces,
-                        "fpga_status"
-                    );
-
-                    if let (Some(timeout), Some(first_work)) = (no_nonce_timeout, first_work_at) {
-                        if total_nonces == 0 && first_work.elapsed() >= timeout {
-                            let tx_stat = fpga.read_work_tx_status();
-                            let rx_stat = fpga.read_work_rx_status();
-                            let reason = format!(
-                                "AM2 no-nonce stall after {}s: work_sent={} shares={} tx_stat=0x{:08X} tx_last=0x{:08X} rx_stat=0x{:08X}",
-                                first_work.elapsed().as_secs(),
-                                total_work,
-                                shares_submitted,
-                                tx_stat,
-                                tx_last,
-                                rx_stat
-                            );
-                            error!(
-                                work_sent = total_work,
-                                shares = shares_submitted,
-                                timeout_s = timeout.as_secs(),
-                                tx_stat = format_args!("0x{:08X}", tx_stat),
-                                tx_last = format_args!("0x{:08X}", tx_last),
-                                rx_stat = format_args!("0x{:08X}", rx_stat),
-                                "AM2 no-nonce stall detected - forcing home hard-stop"
-                            );
-                            force_am2_home_hard_stop(&self.config, "no-nonce-stall");
-                            no_nonce_stall_reason = Some(reason);
-                            self.shutdown.cancel();
-                            break;
+                            if nonces_this_poll > 100 { break; }
                         }
                     }
 
-                    // Per-5s PSU status snapshot (Phase 5B instrumentation).
-                    if let Some(ref psu_mutex) = psu_arc {
-                        let psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                        let ticks = psu_guard.heartbeat_ticks();
-                        let gate_ok = psu_guard.is_voltage_set_allowed();
-                        let model = psu_guard.model().name();
-                        let fw = psu_guard.fw_byte().unwrap_or(0);
+                    _ = hashrate_timer.tick() => {
+                        // Per-5s FPGA status snapshot Ã¢â‚¬â€ always emitted.
+                        let ctrl_now = fpga.read_ctrl();
+                        let errs = fpga.read_error_count();
+                        let tx_full = fpga.work_tx_full();
+                        let rx_has = fpga.work_rx_has_data();
+                        let tx_last = fpga.read_work_tx_last();
                         info!(
                             chain = fpga_chain_id,
-                            model,
-                            fw = format_args!("0x{:02X}", fw),
-                            hb_ticks = ticks,
-                            voltage_gate_ok = gate_ok,
-                            "psu_status"
+                            ctrl = format_args!("0x{:08X}", ctrl_now),
+                            err_cnt = errs,
+                            tx_last = format_args!("0x{:08X}", tx_last),
+                            tx_full,
+                            rx_empty = !rx_has,
+                            nonces_5s = hr_nonces,
+                            "fpga_status"
                         );
-                    }
 
-                    let elapsed = last_hr_time.elapsed().as_secs_f64();
-                    if elapsed > 0.0 && hr_nonces > 0 {
-                        let ths = hr_nonces as f64 * HW_DIFFICULTY as f64 * 4_294_967_296.0 / elapsed / 1e12;
-                        info!("{:.2} TH/s — {} nonces, {} shares, {} CRC errs, {}s uptime",
-                            ths, total_nonces, shares_submitted, errs, start_time.elapsed().as_secs());
+                        if let (Some(timeout), Some(first_work)) = (no_nonce_timeout, first_work_at) {
+                            if total_nonces == 0 && first_work.elapsed() >= timeout {
+                                let tx_stat = fpga.read_work_tx_status();
+                                let rx_stat = fpga.read_work_rx_status();
+                                let reason = format!(
+                                    "AM2 no-nonce stall after {}s: work_sent={} shares={} tx_stat=0x{:08X} tx_last=0x{:08X} rx_stat=0x{:08X}",
+                                    first_work.elapsed().as_secs(),
+                                    total_work,
+                                    shares_submitted,
+                                    tx_stat,
+                                    tx_last,
+                                    rx_stat
+                                );
+                                error!(
+                                    work_sent = total_work,
+                                    shares = shares_submitted,
+                                    timeout_s = timeout.as_secs(),
+                                    tx_stat = format_args!("0x{:08X}", tx_stat),
+                                    tx_last = format_args!("0x{:08X}", tx_last),
+                                    rx_stat = format_args!("0x{:08X}", rx_stat),
+                                    "AM2 no-nonce stall detected - forcing home hard-stop"
+                                );
+                                let _ = force_am2_home_hard_stop_blocking(
+                                    &self.config,
+                                    "no-nonce-stall",
+                                )
+                                .await;
+                                no_nonce_stall_reason = Some(reason);
+                                self.shutdown.cancel();
+                                break;
+                            }
+                        }
+
+                        // Per-5s PSU status snapshot (Phase 5B instrumentation).
+                        if let Some(ref psu_mutex) = psu_arc {
+                            let psu_guard = psu_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            let ticks = psu_guard.heartbeat_ticks();
+                            let gate_ok = psu_guard.is_voltage_set_allowed();
+                            let model = psu_guard.model().name();
+                            let fw = psu_guard.fw_byte().unwrap_or(0);
+                            info!(
+                                chain = fpga_chain_id,
+                                model,
+                                fw = format_args!("0x{:02X}", fw),
+                                hb_ticks = ticks,
+                                voltage_gate_ok = gate_ok,
+                                "psu_status"
+                            );
+                        }
+
+                        let elapsed = last_hr_time.elapsed().as_secs_f64();
+                        if elapsed > 0.0 && hr_nonces > 0 {
+                            let ths = hr_nonces as f64 * HW_DIFFICULTY as f64 * 4_294_967_296.0 / elapsed / 1e12;
+                            info!("{:.2} TH/s Ã¢â‚¬â€ {} nonces, {} shares, {} CRC errs, {}s uptime",
+                                ths, total_nonces, shares_submitted, errs, start_time.elapsed().as_secs());
+                        }
+                        hr_nonces = 0;
+                        last_hr_time = Instant::now();
                     }
-                    hr_nonces = 0;
-                    last_hr_time = Instant::now();
                 }
             }
-        }
+            Ok(())
+        };
 
         // ================================================================
-        // Graceful shutdown — stop all heartbeat ownership, command the bulk
+        // Graceful shutdown Ã¢â‚¬â€ stop all heartbeat ownership, command the bulk
         // rail toward minimum, then disarm its watchdog. If the minimum-ramp
         // fails, the armed watchdog becomes the independent backstop after any
         // already in-flight heartbeat transfer drains.
         // ================================================================
+        let revoked_api_commit_fence = hardware_mutation_owner.revoke_commit_fence();
         info!("=== SHUTDOWN: graceful PSU teardown ===");
-        let feeders_quiesced =
-            stop_am2_runtime_feeders_bounded(&self.config, &mut runtime_threads, "normal-shutdown")
-                .await;
+        let teardown_request = watchdog
+            .request_teardown_budget()
+            .context("s19j-hybrid: watchdog could not issue its one-shot teardown budget")?;
+        let (teardown_budget, watchdog_teardown_admission) = teardown_request.into_parts();
+        let teardown_view = teardown_budget.view();
+
+        // Publish the shared deadline before cancellation, then immediately
+        // stop every PIC/PSU feeder from beginning another intentional feed.
+        // Bounded joins and their typed evidence stay later in teardown so the
+        // transport-independent cutoff is never delayed by a wedged actor.
+        runtime_threads.request_stop();
+
+        // PWR_CONTROL is the transport-independent, load-bearing cutoff. API
+        // commits were synchronously revoked above; perform the checked OFF
+        // write/readback before spending the shared cleanup interval on actor
+        // joins, PIC/APW traffic, owner retirement, or fan coast-down.
+        let early_cut_spec = self.config.psu.pwr_control_gpio.clone();
+        let early_cut_budget = teardown_view.clone();
+        let early_power_cut_result = match tokio::task::spawn_blocking(move || {
+            cut_am2_power_control_early_checked(early_cut_spec.as_deref(), early_cut_budget)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "s19j-hybrid: early PWR_CONTROL cutoff worker failed: {error}"
+            )),
+        };
+        if let Err(error) = &early_power_cut_result {
+            error!(
+                %error,
+                "s19j-hybrid: early checked PWR_CONTROL cutoff lacked positive evidence; all later safe-off work continues with watchdog Disarm forbidden"
+            );
+        }
+        let watchdog_teardown_admission_result = watchdog
+            .observe_teardown_admission(watchdog_teardown_admission, &teardown_view)
+            .await;
+        if let Err(error) = &watchdog_teardown_admission_result {
+            warn!(
+                %error,
+                "s19j-hybrid: watchdog Teardown acknowledgement failed after local deadline publication and immediate PWR_CONTROL cutoff; defense-in-depth teardown will continue with Disarm forbidden"
+            );
+        }
+
+        let api_mutation_gate = hardware_mutation_owner.gate();
+        let api_drain_timeout = teardown_view
+            .remaining_capped_at(
+                TeardownStage::CleanupComplete,
+                S19J_HYBRID_API_MUTATION_DRAIN_TIMEOUT,
+                Instant::now(),
+            )
+            .unwrap_or(Duration::ZERO);
+        let api_barrier = match tokio::task::spawn_blocking(move || {
+            api_mutation_gate.close_and_drain(api_drain_timeout)
+        })
+        .await
+        {
+            Ok(Ok(receipt)) => Some(receipt),
+            Ok(Err(error)) => {
+                warn!(
+                    error = %error,
+                    "s19j-hybrid: API mutation ownership did not drain; safe-off will continue but watchdog disarm remains forbidden"
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "s19j-hybrid: API mutation drain worker failed; safe-off will continue but watchdog disarm remains forbidden"
+                );
+                None
+            }
+        };
+        let api_commit_started = tokio::time::Instant::now();
+        let api_commit_deadline =
+            tokio::time::Instant::from_std(teardown_view.deadline(TeardownStage::CleanupComplete));
+        let api_commit_fence_result = wait_revoked_hardware_mutation_commit_fence(
+            revoked_api_commit_fence,
+            api_commit_started,
+            api_commit_deadline,
+            "s19j-hybrid API shutdown",
+        )
+        .await;
+        match &api_commit_fence_result {
+            Ok(receipt) => info!(
+                closed_generation = receipt.closed_generation(),
+                fence_poisoned = receipt.fence_poisoned(),
+                "s19j-hybrid: fenced every entered API hardware commit before controller and PSU safe-off"
+            ),
+            Err(error) => error!(
+                %error,
+                "s19j-hybrid: API final-commit fence lacked timely evidence; safe-off continues with watchdog disarm forbidden"
+            ),
+        }
+
+        let feeder_stop_timeout = teardown_view
+            .remaining_capped_at(
+                TeardownStage::CleanupComplete,
+                AM2_FEEDER_STOP_TIMEOUT,
+                Instant::now(),
+            )
+            .unwrap_or(Duration::ZERO);
+        let feeder_stop = stop_am2_runtime_feeders_with_evidence(
+            &self.config,
+            &mut runtime_threads,
+            "normal-shutdown",
+            feeder_stop_timeout,
+        )
+        .await;
+        let feeders_quiesced = feeder_stop.all_started_threads_quiesced();
         let mut endpoint_authority_error: Option<anyhow::Error> = None;
+        let mut controller_shutdown = if passthrough {
+            Am2ShutdownLegOutcome::NotApplicable
+        } else {
+            Am2ShutdownLegOutcome::Failed
+        };
         let shutdown_evidence = if feeders_quiesced {
             // No heartbeat can race after this disable: both feeder handles
             // have been observed finished and joined before controller traffic.
+            // The retained endpoint is moved to the blocking pool and returned
+            // before any later owner decision; synchronous I2C waits must never
+            // park this Tokio worker.
             match pic0x89_clean_stop_owner_policy(
                 selected_pic_endpoint_required,
                 selected_pic_endpoint_session.is_some(),
             ) {
                 Pic0x89CleanStopOwnerPolicy::Endpoint => {
-                    let pic = selected_pic_endpoint_session
-                        .as_mut()
-                        .expect("endpoint policy requires retained session")
-                        .controller_mut();
-                    match pic.disable_voltage() {
-                        Ok(()) => info!(
-                            addr = format_args!("0x{:02X}", selected_pic_addr),
-                            "PIC voltage disabled after heartbeat feeders quiesced"
-                        ),
-                        Err(e) => warn!(
-                            error = %e,
-                            addr = format_args!("0x{:02X}", selected_pic_addr),
-                            "PIC voltage disable failed during shutdown"
-                        ),
+                    let mut endpoint = selected_pic_endpoint_session
+                        .take()
+                        .expect("endpoint policy requires retained session");
+                    match tokio::task::spawn_blocking(move || {
+                        let disable_result = endpoint.controller_mut().disable_voltage();
+                        drop(endpoint);
+                        disable_result
+                    })
+                    .await
+                    {
+                        Ok(disable_result) => {
+                            controller_shutdown = if disable_result.is_ok() {
+                                Am2ShutdownLegOutcome::Succeeded
+                            } else {
+                                Am2ShutdownLegOutcome::Failed
+                            };
+                            match disable_result {
+                                Ok(()) => info!(
+                                    addr = format_args!("0x{:02X}", selected_pic_addr),
+                                    "PIC voltage disabled after heartbeat feeders quiesced"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    addr = format_args!("0x{:02X}", selected_pic_addr),
+                                    "PIC voltage disable failed during shutdown"
+                                ),
+                            }
+                        }
+                        Err(error) => {
+                            controller_shutdown = Am2ShutdownLegOutcome::Failed;
+                            endpoint_authority_error = Some(anyhow::anyhow!(
+                                "exact AM2 endpoint shutdown worker failed: {error}"
+                            ));
+                            error!(
+                                %error,
+                                addr = format_args!("0x{:02X}", selected_pic_addr),
+                                "PIC voltage-disable worker failed; safe-off continues with watchdog disarm forbidden"
+                            );
+                        }
                     }
                 }
                 Pic0x89CleanStopOwnerPolicy::RefuseMissingExactEndpoint => {
@@ -15362,47 +16723,214 @@ impl S19jHybridMiner {
                         addr = format_args!("0x{:02X}", selected_pic_addr),
                         "exact AM2 endpoint session missing at normal shutdown; refusing raw address/firmware reconstruction"
                     );
-                    force_am2_home_hard_stop(
-                        &self.config,
-                        "normal-shutdown-missing-exact-pic-endpoint",
-                    );
+                    let hard_stop_config = self.config.clone();
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        force_am2_home_hard_stop(
+                            &hard_stop_config,
+                            "normal-shutdown-missing-exact-pic-endpoint",
+                        );
+                    })
+                    .await
+                    {
+                        error!(%error, "missing-endpoint hard-stop worker failed");
+                    }
                     endpoint_authority_error = Some(anyhow::anyhow!(
                         "exact AM2 endpoint session missing at normal shutdown"
                     ));
+                    controller_shutdown = Am2ShutdownLegOutcome::Failed;
                 }
                 Pic0x89CleanStopOwnerPolicy::LegacyCompatibility => {
                     if let (Some(service), Some(fw)) = (i2c0_service.as_ref(), heartbeat_pic_fw) {
-                        let mut pic = Pic0x89Service::new_with_fw(
-                            service.clone(),
-                            selected_pic_addr,
-                            Some(fw),
-                        );
-                        match pic.disable_voltage() {
-                            Ok(()) => info!(
-                                addr = format_args!("0x{:02X}", selected_pic_addr),
-                                "legacy-compatible PIC voltage disabled after heartbeat feeders quiesced"
-                            ),
-                            Err(e) => warn!(
-                                error = %e,
-                                addr = format_args!("0x{:02X}", selected_pic_addr),
-                                "legacy-compatible PIC voltage disable failed during shutdown"
-                            ),
+                        let service = service.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            let mut pic =
+                                Pic0x89Service::new_with_fw(service, selected_pic_addr, Some(fw));
+                            pic.disable_voltage()
+                        })
+                        .await
+                        {
+                            Ok(disable_result) => {
+                                controller_shutdown = if disable_result.is_ok() {
+                                    Am2ShutdownLegOutcome::Succeeded
+                                } else {
+                                    Am2ShutdownLegOutcome::Failed
+                                };
+                                match disable_result {
+                                    Ok(()) => info!(
+                                        addr = format_args!("0x{:02X}", selected_pic_addr),
+                                        "legacy-compatible PIC voltage disabled after heartbeat feeders quiesced"
+                                    ),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        addr = format_args!("0x{:02X}", selected_pic_addr),
+                                        "legacy-compatible PIC voltage disable failed during shutdown"
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                controller_shutdown = Am2ShutdownLegOutcome::Failed;
+                                endpoint_authority_error = Some(anyhow::anyhow!(
+                                    "legacy-compatible PIC shutdown worker failed: {error}"
+                                ));
+                                error!(%error, "legacy-compatible PIC voltage-disable worker failed");
+                            }
                         }
+                    } else if !passthrough {
+                        controller_shutdown = Am2ShutdownLegOutcome::Failed;
                     }
                 }
             }
-            shutdown_am2_psu_after_feeders_quiesced(&psu_arc, "normal-shutdown")
+            if !additional_terminal_pic_addrs.is_empty() {
+                if let Some(service) = i2c0_service.as_ref() {
+                    let service = service.clone();
+                    let additional_addrs = additional_terminal_pic_addrs.clone();
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        disable_dspic_addrs_best_effort(
+                            &service,
+                            &additional_addrs,
+                            selected_pic_addr,
+                            heartbeat_pic_fw,
+                            "unified-dual-chain-normal-shutdown",
+                        );
+                    })
+                    .await
+                    {
+                        warn!(
+                            %error,
+                            "additional dual-chain PIC disable worker failed; terminal PWR_CONTROL safe-off continues"
+                        );
+                    }
+                } else {
+                    warn!(
+                        ?additional_terminal_pic_addrs,
+                        "additional dual-chain PIC addresses cannot receive defense-in-depth disable without the retained I2C service"
+                    );
+                }
+            }
+            let shutdown_psu = psu_arc.clone();
+            match tokio::task::spawn_blocking(move || {
+                shutdown_am2_psu_after_feeders_quiesced(&shutdown_psu, "normal-shutdown")
+            })
+            .await
+            {
+                Ok(evidence) => evidence.with_controller_shutdown(controller_shutdown),
+                Err(error) => {
+                    error!(%error, "AM2 PSU safe-direction worker failed; forcing independent hard stop");
+                    let hard_stop_config = self.config.clone();
+                    if let Err(hard_stop_error) = tokio::task::spawn_blocking(move || {
+                        force_am2_home_hard_stop(
+                            &hard_stop_config,
+                            "normal-shutdown-psu-worker-failed",
+                        );
+                    })
+                    .await
+                    {
+                        error!(%hard_stop_error, "PSU-worker fallback hard-stop worker failed");
+                    }
+                    Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
+                        .with_controller_shutdown(controller_shutdown)
+                }
+            }
         } else {
             // The bounded stop already asserted PWR_CONTROL independently.
             // Do not touch PIC/I2C or the PSU mutex while a detached worker may
             // still own either transport.
             Am2PowerShutdownEvidence::hard_stop_after_timeout(psu_arc.is_some())
         };
-        // PWR_CONTROL gate auto-deasserts via `Apw121215a::Drop` when the
-        // last `Arc<Mutex<Apw121215a>>` reference (held in `psu_arc`)
-        // is dropped at the end of this function scope — after the
-        // heartbeat thread has joined and released its clone above.
-        // No explicit deassert here.
+        if !feeders_quiesced {
+            if let Some(guard) = _home_hard_stop_guard.as_mut() {
+                guard.retain_transport_independent_hard_stop_only();
+            }
+            let hard_stop_guard = _home_hard_stop_guard.take();
+            let bypass_gate = _psu_bypass_gate.take();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                retire_am2_home_hard_stop_blocking(
+                    hard_stop_guard,
+                    "runtime-feeder-timeout-retirement",
+                );
+                drop(bypass_gate);
+            })
+            .await
+            {
+                error!(%error, "AM2 timeout owner-retirement worker failed");
+            }
+        }
+        if passthrough {
+            let hard_stop_guard = _home_hard_stop_guard.take();
+            let bypass_gate = _psu_bypass_gate.take();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                retire_am2_home_hard_stop_blocking(hard_stop_guard, "passthrough-owner-retirement");
+                drop(bypass_gate);
+            })
+            .await
+            {
+                error!(%error, "AM2 passthrough owner-retirement worker failed");
+            }
+            anyhow::bail!(
+                "AM2 passthrough stopped without daemon-owned PIC/PSU/PWR_CONTROL safe-off; leaving the SoC watchdog armed"
+            );
+        }
+        let power_control_closeout = if feeders_quiesced {
+            // Retire the run-scope fallback while the watchdog is still armed.
+            // Execute the final duplicate dsPIC disable, hard OFF, and
+            // quiet-fan command directly on this awaited blocking worker;
+            // doing that here guarantees no RAII hardware mutation remains
+            // deferred until after watchdog closeout.
+            let hard_stop_guard = _home_hard_stop_guard.take();
+            let hard_stop_retired = match tokio::task::spawn_blocking(move || {
+                retire_am2_home_hard_stop_blocking(
+                    hard_stop_guard,
+                    "normal-shutdown-run-scope-retirement",
+                );
+            })
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    error!(%error, "AM2 run-scope hard-stop retirement worker failed");
+                    false
+                }
+            };
+            let closeout_psu = psu_arc.clone();
+            let mut bypass_gate = _psu_bypass_gate.take();
+            let closeout_result = match tokio::task::spawn_blocking(move || {
+                let result =
+                    close_am2_power_control_after_safe_off(&closeout_psu, &mut bypass_gate, false);
+                drop(bypass_gate);
+                result
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "AM2 PWR_CONTROL closeout worker failed: {error}"
+                )),
+            };
+            match closeout_result {
+                Ok(closeout) if hard_stop_retired => Some(closeout),
+                Ok(_) => None,
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        "AM2 PWR_CONTROL terminal OFF/readback failed; watchdog disarm remains forbidden"
+                    );
+                    let hard_stop_config = self.config.clone();
+                    if let Err(hard_stop_error) = tokio::task::spawn_blocking(move || {
+                        force_am2_home_hard_stop(
+                            &hard_stop_config,
+                            "normal-shutdown-power-control-closeout-failed",
+                        );
+                    })
+                    .await
+                    {
+                        error!(%hard_stop_error, "power-control fallback hard-stop worker failed");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         if !shutdown_evidence.completed_gracefully() {
             error!(
@@ -15414,26 +16942,71 @@ impl S19jHybridMiner {
                 shutdown_evidence
             );
         }
-        info!(?shutdown_evidence, "=== SHUTDOWN COMPLETE ===");
-        if let Some(error) = endpoint_authority_error {
-            return Err(error);
+        let power_control_closeout = power_control_closeout.context(
+            "s19j-hybrid: terminal PWR_CONTROL OFF/readback evidence is unavailable after safe-off",
+        )?;
+        let early_power_cut = early_power_cut_result.context(
+            "s19j-hybrid: early PWR_CONTROL cutoff evidence is unavailable after safe-off",
+        )?;
+        let panic_teardown_barrier = close_am2_panic_teardown_authority()
+            .context("s19j-hybrid: failed to fence and retire panic-hook hardware authority")?;
+        let terminal_safe_off = Am2TerminalSafeOffEvidence::from_completed_shutdown(
+            shutdown_evidence,
+            power_control_closeout,
+            panic_teardown_barrier,
+            early_power_cut,
+        )?;
+        watchdog_teardown_admission_result.map_err(anyhow::Error::msg)?;
+        let api_barrier = api_barrier
+            .context("s19j-hybrid: API mutation barrier evidence is unavailable after safe-off")?;
+        let api_commit_fence = api_commit_fence_result.context(
+            "s19j-hybrid: API final-commit fence evidence is unavailable after safe-off",
+        )?;
+        let actor_receipt = feeder_stop.into_receipt().context(
+            "s19j-hybrid: exact PSU/PIC actor roster did not close cleanly after safe-off",
+        )?;
+        info!(
+            ?terminal_safe_off,
+            "AM2 terminal safe-off evidence admitted"
+        );
+        let teardown_disarm = teardown_budget.begin_disarm_at(Instant::now())?;
+        let manifest = HybridWatchdogShutdownManifest::new(
+            watchdog_route_scope,
+            api_barrier,
+            api_commit_fence,
+            actor_receipt,
+            terminal_safe_off,
+            teardown_disarm,
+        );
+        let permit = WatchdogDisarmPermit::from_hybrid_manifest(manifest)?;
+        let closeout = watchdog
+            .disarm_and_join(permit, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+            .await?;
+        info!("=== SHUTDOWN COMPLETE ===");
+        let terminal_error = if let Some(error) = endpoint_authority_error {
+            Some(error)
+        } else if let Some(reason) = no_nonce_stall_reason {
+            Some(anyhow::anyhow!(reason))
+        } else {
+            finalize_am2_dispatch_shutdown(mining_route_result, shutdown_evidence).err()
+        };
+        match terminal_error {
+            Some(error) => Err(terminal_safe_off_error(error, closeout)),
+            None => Ok(()),
         }
-        if let Some(reason) = no_nonce_stall_reason {
-            anyhow::bail!("{}", reason);
-        }
-        Ok(())
     }
 }
 
+/// G22: thin-wrap stratum pure SSOT (engines keep distinct WorkEntry types).
 fn hybrid_build_header(entry: &WorkEntry, rolled_version: u32, nonce: u32) -> [u8; 80] {
-    let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&rolled_version.to_le_bytes());
-    header[4..36].copy_from_slice(&entry.prev_block_hash);
-    header[36..68].copy_from_slice(&entry.merkle_root);
-    header[68..72].copy_from_slice(&entry.ntime.to_le_bytes());
-    header[72..76].copy_from_slice(&entry.nbits.to_le_bytes());
-    header[76..80].copy_from_slice(&nonce.to_le_bytes());
-    header
+    dcentrald_stratum::v1::job::build_block_header(
+        rolled_version,
+        &entry.prev_block_hash,
+        &entry.merkle_root,
+        entry.ntime,
+        entry.nbits,
+        nonce,
+    )
 }
 
 fn am2_hybrid_reconstruct_rolled_version(base_version: u32, version_bits_raw: u16) -> (u32, u32) {
@@ -15460,14 +17033,14 @@ fn log_am2_planned_chain_contexts(plan: &[Am2ChainContext]) {
     }
 }
 
-/// Locally-proven achieved difficulty for an AM2 serial-dispatch share —
+/// Locally-proven achieved difficulty for an AM2 serial-dispatch share Ã¢â‚¬â€
 /// computed by SHA256d-ing the rebuilt header (with rolled version + nonce
 /// applied) and converting the big-endian hash to a difficulty value.
 ///
 /// Mirrors `am3_bb_achieved_difficulty_from_header` in `am3_bb_mining.rs`.
 /// Populates `ValidShare.achieved_difficulty` so  9F achieved-vs-
 /// pool-target reporting works correctly on AM2 serial-dispatch shares
-/// (previously hard-coded to `None` — see
+/// (previously hard-coded to `None` Ã¢â‚¬â€ see
 ///  F9).
 fn am2_hybrid_achieved_difficulty_from_header(header: &[u8; 80]) -> Option<f64> {
     let hash = dcentrald_stratum::work::double_sha256(header);
@@ -15540,11 +17113,17 @@ mod tests {
         proc_comm_matches_target,
         psu_override_active,
         s19j_hybrid_chip_rail_target_mv,
+        select_am2_thermal_sample,
         Am2SerialChainState,
         Am2SerialChainStats,
         Am2ShareAccounting,
+        Am2ThermalSource,
+        HardwareMutationGateOwner,
         OpenCoreRailAdmissionError,
         S19jHybridMiner,
+        S19jHybridSafetyAdmission,
+        SafetyLiveness,
+        SafetyWatchdogOwner,
         WorkEntry,
         AM2_DUAL_CHAIN_SECOND_UART_DEFAULT,
         AM2_FAN_FAULT_STRIKES,
@@ -15587,12 +17166,181 @@ mod tests {
         S19_DSPIC_ADDRS,
         TICKET_MASK_256,
     };
+
+    #[test]
+    fn hybrid_terminal_safe_off_marker_consumes_watchdog_closeout_receipt() {
+        let source = include_str!("s19j_hybrid_mining.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production hybrid mining source");
+        let owner_closeout = source
+            .find("let closeout = watchdog")
+            .expect("watchdog owner closeout receipt");
+        let terminal_marker = source[owner_closeout..]
+            .find("Some(error) => Err(terminal_safe_off_error(error, closeout))")
+            .map(|offset| owner_closeout + offset)
+            .expect("receipt-backed hybrid terminal marker");
+        assert!(owner_closeout < terminal_marker);
+        assert!(source.contains("_closeout: closeout"));
+        assert!(!source.contains(concat!("WatchdogCloseoutReceipt", "::")));
+    }
+
+    #[test]
+    fn smart_apw_lenience_excludes_typed_controller_and_safety_failures() {
+        let ordinary_wire = dcentrald_hal::HalError::I2c {
+            bus: 0,
+            addr: 0x10,
+            detail: "silent optional peer".to_string(),
+        };
+        assert!(super::smart_apw_lenient_peer_failure(&ordinary_wire));
+        assert!(super::smart_apw_heartbeat_retryable(&ordinary_wire));
+        assert!(super::optional_apw_device_type_failure(&ordinary_wire));
+        assert!(super::smart_apw_lenient_peer_failure(
+            &dcentrald_hal::HalError::I2cEndpointNotReady {
+                bus: 0,
+                addr: 0x10,
+                detail: "optional endpoint is still binding".to_string(),
+            }
+        ));
+        let protocol_reply = dcentrald_hal::HalError::PsuProtocol("PSU NAK (0xF5)");
+        assert!(super::smart_apw_lenient_peer_failure(&protocol_reply));
+        assert!(!super::smart_apw_heartbeat_retryable(&protocol_reply));
+        assert!(super::optional_apw_device_type_failure(&protocol_reply));
+
+        let excluded = vec![
+            dcentrald_hal::HalError::I2cEndpointRefused {
+                bus: 0,
+                addr: 0x10,
+                detail: "endpoint policy refusal".to_string(),
+            },
+            dcentrald_hal::HalError::I2cAdmissionBusy {
+                bus: 0,
+                addr: 0x10,
+                detail: "exclusive controller job".to_string(),
+            },
+            dcentrald_hal::HalError::I2cSafetySuperseded {
+                bus: 0,
+                addr: 0x10,
+                detail: "terminal safe-off generation".to_string(),
+            },
+            dcentrald_hal::HalError::I2cSafeOffOutcomeUnknown {
+                bus: 0,
+                addr: 0x10,
+                detail: "accepted safe-off completion was not observed".to_string(),
+            },
+            dcentrald_hal::HalError::PsuOverCurrent,
+            dcentrald_hal::HalError::PsuUnsupported("foreign dialect".to_string()),
+            dcentrald_hal::HalError::PsuProtocolOwned(
+                "runtime protocol policy failure".to_string(),
+            ),
+        ];
+        for error in &excluded {
+            assert!(
+                !super::smart_apw_lenient_peer_failure(error),
+                "typed failure was incorrectly treated as optional peer absence: {error}"
+            );
+            assert!(
+                !super::smart_apw_heartbeat_retryable(error),
+                "typed failure was incorrectly treated as heartbeat wire exhaustion: {error}"
+            );
+            assert!(
+                !super::optional_apw_device_type_failure(error),
+                "typed failure was incorrectly ignored by optional device-type observation: {error}"
+            );
+        }
+
+        let heartbeat_exhausted = dcentrald_hal::HalError::PsuHeartbeatExhausted {
+            primary: "0x84 ordinary wire failure".to_string(),
+            fallback: "0x81/[0x02] ordinary wire failure".to_string(),
+        };
+        assert!(super::smart_apw_heartbeat_retryable(&heartbeat_exhausted));
+        assert!(!super::smart_apw_lenient_peer_failure(&heartbeat_exhausted));
+        assert!(!super::optional_apw_device_type_failure(
+            &heartbeat_exhausted
+        ));
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn smart_apw_lenient_service_terminal_refusal_returns_error_without_heartbeat() {
+        use dcentrald_hal::platform::sim::{SimModel, SimPlatform};
+
+        let platform = SimPlatform::new(SimModel::S19jPro);
+        let service = platform.open_i2c_service(232).unwrap();
+        let transition = service.latch_terminal_safe_off();
+        assert!(transition.no_controller_mutation_stage_in_flight());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut watchdog =
+            crate::runtime::safety_watchdog::SafetyWatchdogOwner::inert_for_pre_hardware_test();
+        let mut route_scope = watchdog.claim_hybrid_route_scope().unwrap();
+        let actor_owner = route_scope.take_actor_owner().unwrap();
+        let mut runtime_threads = actor_owner.activate(shutdown.clone());
+
+        let result = super::bring_up_apw121215a_smart_lenient(
+            &service,
+            0x10,
+            13.7,
+            std::time::Duration::from_millis(1),
+            shutdown,
+            "i2c_service",
+            &mut runtime_threads,
+        );
+        let error = result.err().expect("typed terminal refusal must escape");
+        assert!(matches!(
+            error.downcast_ref::<dcentrald_hal::HalError>(),
+            Some(dcentrald_hal::HalError::I2cSafetySuperseded { .. })
+        ));
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn smart_apw_heartbeat_typed_refusal_cancels_hybrid_run() {
+        use dcentrald_hal::platform::sim::{SimModel, SimPlatform};
+
+        let platform = SimPlatform::new(SimModel::S19jPro);
+        let service = platform.open_i2c_service(233).unwrap();
+        let mut psu =
+            dcentrald_hal::psu::Apw121215a::open_service_at(service.clone(), 233, 0x10).unwrap();
+        psu.assume_fw_byte(0x71);
+        let transition = service.latch_terminal_safe_off();
+        assert!(transition.no_controller_mutation_stage_in_flight());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        super::psu_heartbeat_loop(
+            std::sync::Arc::new(std::sync::Mutex::new(psu)),
+            shutdown.clone(),
+            std::time::Duration::from_millis(1),
+        );
+
+        assert!(shutdown.is_cancelled());
+    }
     use crate::config::DcentraldConfig;
     use crate::config::PsuOverride;
     use dcentrald_hal::i2c::I2cTransactionStep;
     use proptest::prelude::*;
 
     const S19J_SOURCE: &str = include_str!("s19j_hybrid_mining.rs");
+
+    #[test]
+    fn am2_thermal_selection_preserves_effective_source_provenance() {
+        assert_eq!(
+            select_am2_thermal_sample(Some(72.0), Some(61.0)),
+            Some((72.0, Am2ThermalSource::DspicBoardSensor))
+        );
+        assert_eq!(
+            select_am2_thermal_sample(Some(55.0), Some(68.0)),
+            Some((68.0, Am2ThermalSource::XadcSocDie))
+        );
+        assert_eq!(
+            select_am2_thermal_sample(None, Some(64.0)),
+            Some((64.0, Am2ThermalSource::XadcSocDie))
+        );
+        assert_eq!(
+            select_am2_thermal_sample(Some(64.0), None),
+            Some((64.0, Am2ThermalSource::DspicBoardSensor))
+        );
+        assert_eq!(select_am2_thermal_sample(None, None), None);
+    }
 
     #[test]
     fn open_core_rail_plan_is_atomic_and_fail_closed() {
@@ -15629,6 +17377,44 @@ mod tests {
         assert_eq!(am2_hb_reset_attempt_budget(true, 0, false), 1);
         assert_eq!(am2_hb_reset_attempt_budget(true, 6, false), 6);
         assert_eq!(am2_hb_reset_attempt_budget(true, u8::MAX, false), 20);
+    }
+
+    #[test]
+    fn am2_run_scope_drop_transfers_io_but_clean_retirement_is_awaited() {
+        let drop_body = S19J_SOURCE
+            .split("impl Drop for Am2HomeHardStopGuard")
+            .nth(1)
+            .expect("AM2 home hard-stop Drop")
+            .split("fn retire_am2_home_hard_stop_blocking")
+            .next()
+            .expect("bounded AM2 home hard-stop Drop");
+        let dispatch = drop_body
+            .find("crate::terminal_io_owner::dispatch(")
+            .expect("AM2 async Drop must transfer terminal I/O");
+        assert!(
+            dispatch
+                < drop_body
+                    .find("disable_dspic_addrs_best_effort(")
+                    .expect("queued Drop must disable dsPIC rails")
+        );
+        assert!(
+            dispatch
+                < drop_body
+                    .find("force_pwr_control_low(")
+                    .expect("queued Drop must cut PWR_CONTROL")
+        );
+
+        let normal_shutdown = S19J_SOURCE
+            .split("let power_control_closeout = if feeders_quiesced")
+            .nth(1)
+            .expect("AM2 normal shutdown closeout")
+            .split("if !shutdown_evidence.completed_gracefully()")
+            .next()
+            .expect("bounded AM2 normal shutdown closeout");
+        assert!(normal_shutdown.contains("tokio::task::spawn_blocking(move ||"));
+        assert!(normal_shutdown.contains("retire_am2_home_hard_stop_blocking("));
+        assert!(normal_shutdown.contains("normal-shutdown-run-scope-retirement"));
+        assert!(!normal_shutdown.contains("drop(hard_stop_guard)"));
     }
 
     #[test]
@@ -15681,7 +17467,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_pic0x89_endpoint_session_is_retained_through_clean_stop() {
+    fn serial_dispatch_rejoins_normal_shutdown_with_retained_pic0x89_session() {
         let run = S19J_SOURCE
             .split("pub async fn run(&mut self)")
             .nth(1)
@@ -15691,20 +17477,35 @@ mod tests {
         assert!(run.contains("selected_pic_endpoint_session = Some("));
         assert!(run.contains(".controller_mut()"));
 
-        let clean_stop_start = run
-            .rfind(".run_am2_serial_dispatch_loop(")
-            .expect("single-chain dispatch clean-stop boundary");
-        let clean_stop = &run[clean_stop_start..];
-        let clean_stop = clean_stop
+        let dispatch = run
+            .split("let mining_route_result: Result<()> = 'mining_route:")
+            .nth(1)
+            .expect("shared mining-route outcome")
             .split("// ---- Phase 10b: Mining loop")
             .next()
-            .expect("bounded single-chain clean stop");
-        assert!(clean_stop.contains("selected_pic_endpoint_session.as_mut()"));
-        assert!(clean_stop.contains("selected_pic_endpoint_required"));
-        assert!(clean_stop.contains("RefuseMissingExactEndpoint"));
-        assert!(clean_stop.contains("refusing raw address/firmware reconstruction"));
+            .expect("bounded serial-dispatch route");
+        assert_eq!(
+            dispatch
+                .matches("break 'mining_route dispatch_result;")
+                .count(),
+            2
+        );
+        assert!(!dispatch.contains("selected_pic_endpoint_session.take()"));
+        assert!(!dispatch.contains("stop_am2_runtime_feeders_bounded("));
+        assert!(!dispatch.contains("finalize_am2_dispatch_shutdown("));
+        assert!(dispatch.contains("additional_terminal_pic_addrs.push(pic_addr_b)"));
 
-        let exact_branch = clean_stop
+        let shutdown = run
+            .split("// Graceful shutdown")
+            .nth(1)
+            .expect("unified normal shutdown");
+        assert!(shutdown.contains("let mut endpoint = selected_pic_endpoint_session"));
+        assert!(shutdown.contains(".take()"));
+        assert!(shutdown.contains("selected_pic_endpoint_required"));
+        assert!(shutdown.contains("RefuseMissingExactEndpoint"));
+        assert!(shutdown.contains("refusing raw address/firmware reconstruction"));
+        assert!(shutdown.contains("unified-dual-chain-normal-shutdown"));
+        let exact_branch = shutdown
             .split("Pic0x89CleanStopOwnerPolicy::Endpoint =>")
             .nth(1)
             .expect("exact endpoint clean-stop branch");
@@ -15713,7 +17514,10 @@ mod tests {
             .next()
             .expect("bounded exact endpoint clean-stop branch");
         assert!(exact_branch.contains(".controller_mut()"));
+        assert!(exact_branch.contains("tokio::task::spawn_blocking"));
         assert!(!exact_branch.contains("Pic0x89Service::new_with_fw"));
+        assert!(shutdown
+            .contains("finalize_am2_dispatch_shutdown(mining_route_result, shutdown_evidence)"));
     }
 
     #[test]
@@ -15745,6 +17549,9 @@ mod tests {
             .next()
             .expect("bounded normal-shutdown exact endpoint branch");
         assert!(exact_branch.contains(".controller_mut()"));
+        assert!(exact_branch.contains("tokio::task::spawn_blocking"));
+        assert!(exact_branch.contains("let mut endpoint = selected_pic_endpoint_session"));
+        assert!(exact_branch.contains(".take()"));
         assert!(!exact_branch.contains("Pic0x89Service::new_with_fw"));
 
         let legacy_branch = shutdown
@@ -15752,6 +17559,215 @@ mod tests {
             .nth(1)
             .expect("normal-shutdown non-target compatibility branch");
         assert!(legacy_branch.contains("Pic0x89Service::new_with_fw"));
+        assert!(legacy_branch.contains("tokio::task::spawn_blocking"));
+    }
+
+    #[test]
+    fn early_cutoff_start_is_recorded_at_the_physical_value_write_boundary() {
+        let function = S19J_SOURCE
+            .split("fn cut_am2_power_control_early_checked(")
+            .nth(1)
+            .expect("hybrid early cutoff function")
+            .split("impl Am2TerminalSafeOffEvidence")
+            .next()
+            .expect("bounded hybrid early cutoff function");
+        let prepare = function
+            .find("let prepared = prepare_pwr_control_cut(")
+            .expect("GPIO parse/export/direction preparation");
+        let started = function
+            .find("let started_at = Instant::now();")
+            .expect("physical cutoff start timestamp");
+        let write = function
+            .find("let cutoff = prepared.write_checked(")
+            .expect("physical OFF value write");
+        assert!(prepare < started && started < write);
+        assert!(!function.contains("force_pwr_control_low_checked("));
+    }
+
+    #[test]
+    fn normal_shutdown_retires_every_hardware_owner_before_watchdog_disarm() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let shutdown = run
+            .split("// Graceful shutdown")
+            .nth(1)
+            .expect("normal shutdown boundary")
+            .split("fn hybrid_build_header")
+            .next()
+            .expect("bounded normal shutdown");
+
+        let position = |needle: &str| {
+            shutdown
+                .find(needle)
+                .unwrap_or_else(|| panic!("normal shutdown source contract missing `{needle}`"))
+        };
+        let teardown_request = position("watchdog\n            .request_teardown_budget(");
+        let teardown_budget_publication = position("let teardown_view = teardown_budget.view();");
+        let feeder_stop_request = position("runtime_threads.request_stop();");
+        let early_power_cut = position("cut_am2_power_control_early_checked(");
+        let teardown_observe =
+            position(".observe_teardown_admission(watchdog_teardown_admission, &teardown_view)");
+        let api_close = position("api_mutation_gate.close_and_drain(");
+        let commit_fence = position("wait_revoked_hardware_mutation_commit_fence(");
+        let feeders = position("stop_am2_runtime_feeders_with_evidence(");
+        let controller_safe_off = position("pic0x89_clean_stop_owner_policy(");
+        let fallback_drop = position("let hard_stop_guard = _home_hard_stop_guard.take();");
+        let power_control = position("close_am2_power_control_after_safe_off(");
+        let panic_barrier = position("close_am2_panic_teardown_authority()");
+        let terminal_evidence = position("Am2TerminalSafeOffEvidence::from_completed_shutdown(");
+        let teardown_ack_gate =
+            position("watchdog_teardown_admission_result.map_err(anyhow::Error::msg)?;");
+        let disarm_authority = position("teardown_budget.begin_disarm_at(Instant::now())");
+        let manifest = position("HybridWatchdogShutdownManifest::new(");
+        let permit = position("WatchdogDisarmPermit::from_hybrid_manifest(");
+        let disarm = position("watchdog\n            .disarm_and_join(");
+
+        assert!(
+            teardown_request < teardown_budget_publication
+                && teardown_budget_publication < feeder_stop_request
+                && feeder_stop_request < early_power_cut
+                && early_power_cut < teardown_observe
+                && teardown_observe < api_close
+                && api_close < commit_fence
+                && commit_fence < feeders
+                && feeders < controller_safe_off
+                && controller_safe_off < fallback_drop
+                && fallback_drop < power_control
+                && power_control < panic_barrier
+                && panic_barrier < terminal_evidence
+                && terminal_evidence < teardown_ack_gate
+                && teardown_ack_gate < disarm_authority
+                && disarm_authority < manifest
+                && manifest < permit
+                && permit < disarm,
+            "normal hybrid teardown must cut PWR_CONTROL before bounded cleanup, quiesce actors, retire every owner and panic-hook mutation, mint run-bound terminal evidence, and only then disarm the watchdog"
+        );
+        assert!(shutdown.contains("terminal_safe_off,"));
+        assert!(S19J_SOURCE.contains("watchdog.claim_hybrid_route_scope()?"));
+        assert!(shutdown.contains("watchdog_route_scope,"));
+        assert!(shutdown.contains("retain_transport_independent_hard_stop_only()"));
+        assert!(shutdown.matches("tokio::task::spawn_blocking").count() >= 8);
+        assert!(shutdown
+            .contains("AM2 passthrough stopped without daemon-owned PIC/PSU/PWR_CONTROL safe-off"));
+        assert!(!shutdown.contains("from_evidence_set"));
+    }
+
+    #[test]
+    fn normal_shutdown_requests_feeder_stop_before_cutoff_ack_and_later_join() {
+        let run = S19J_SOURCE
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("S19j run body");
+        let shutdown = run
+            .split("// Graceful shutdown")
+            .nth(1)
+            .expect("normal shutdown boundary")
+            .split("fn hybrid_build_header")
+            .next()
+            .expect("bounded normal shutdown");
+
+        let position = |needle: &str| {
+            shutdown
+                .find(needle)
+                .unwrap_or_else(|| panic!("normal shutdown source contract missing `{needle}`"))
+        };
+        let budget_publication = position("let teardown_view = teardown_budget.view();");
+        let feeder_stop_request = position("runtime_threads.request_stop();");
+        let physical_cutoff = position("cut_am2_power_control_early_checked(");
+        let watchdog_ack =
+            position(".observe_teardown_admission(watchdog_teardown_admission, &teardown_view)");
+        let bounded_join = position("stop_am2_runtime_feeders_with_evidence(");
+
+        assert_eq!(
+            shutdown.matches("runtime_threads.request_stop();").count(),
+            1,
+            "normal teardown must issue one explicit early feeder cancellation request"
+        );
+        assert!(
+            budget_publication < feeder_stop_request
+                && feeder_stop_request < physical_cutoff
+                && physical_cutoff < watchdog_ack
+                && watchdog_ack < bounded_join,
+            "hybrid teardown must publish the budget, request feeder cancellation, cut power, observe the watchdog acknowledgement, and only later join actors"
+        );
+    }
+
+    #[test]
+    fn heartbeat_roster_is_watchdog_issued_reserved_before_spawn_and_manifest_typed() {
+        let source = S19J_SOURCE;
+        let imports = source
+            .split("fn bring_up_apw121215a_smart_lenient(")
+            .next()
+            .expect("hybrid imports and declarations");
+        assert!(!imports.contains("use crate::runtime::thread_guard::{RuntimeThreadGuard"));
+
+        let lenient = source
+            .split("fn bring_up_apw121215a_smart_lenient(")
+            .nth(1)
+            .expect("lenient smart-PSU owner")
+            .split("// ====================================================================")
+            .next()
+            .expect("bounded lenient smart-PSU owner");
+        for worker_name in ["s19j-psu-hb-lenient-bitbang", "s19j-psu-hb-lenient"] {
+            let spawn = lenient
+                .find(&format!(".name(\"{worker_name}\".into())"))
+                .unwrap_or_else(|| panic!("missing {worker_name} spawn"));
+            let reserve = lenient[..spawn]
+                .rfind(".reserve(HybridThreadSlot::PsuHeartbeat)")
+                .unwrap_or_else(|| panic!("missing typed reservation before {worker_name}"));
+            let attach = lenient[spawn..]
+                .find("heartbeat_slot.attach(heartbeat)")
+                .map(|offset| spawn + offset)
+                .unwrap_or_else(|| panic!("missing typed attachment after {worker_name}"));
+            assert!(reserve < spawn && spawn < attach);
+        }
+
+        let run = source
+            .split("pub async fn run(&mut self)")
+            .nth(1)
+            .expect("hybrid run body");
+        let actor_owner = run
+            .find(".take_actor_owner()")
+            .expect("watchdog-issued hybrid actor owner");
+        let activate = run
+            .find("actor_owner.activate(self.shutdown.clone())")
+            .expect("hybrid actor-roster activation");
+        let psu_reserve = run
+            .find(".reserve(HybridThreadSlot::PsuHeartbeat)")
+            .expect("default smart-PSU typed reservation");
+        let topology = run
+            .find(".resolve_conditional(")
+            .expect("smart-PSU topology resolution");
+        let pic_reserve = run
+            .find(".reserve(HybridThreadSlot::PicHeartbeat)")
+            .expect("PIC typed reservation");
+        let pic_spawn = run
+            .find("spawn_pic_heartbeat_thread(")
+            .expect("PIC heartbeat spawn");
+        let pic_attach = run[pic_spawn..]
+            .find("heartbeat_slot.attach(heartbeat)")
+            .map(|offset| pic_spawn + offset)
+            .expect("PIC typed attachment");
+        let actor_receipt = run
+            .find("let actor_receipt = feeder_stop.into_receipt()")
+            .expect("typed hybrid actor receipt");
+        let manifest = run
+            .find("HybridWatchdogShutdownManifest::new(")
+            .expect("typed hybrid shutdown manifest");
+        assert!(
+            actor_owner < activate
+                && activate < psu_reserve
+                && psu_reserve < topology
+                && topology < pic_reserve
+                && pic_reserve < pic_spawn
+                && pic_spawn < pic_attach
+                && pic_attach < actor_receipt
+                && actor_receipt < manifest
+        );
+        assert!(run.contains("actor_receipt,"));
+        assert!(!run.contains("feeder_summary,"));
     }
 
     #[test]
@@ -15915,8 +17931,8 @@ worker = "test"
         ));
 
         // The canonical live-FALSIFIED value 0x50D2_0164 (VCO 5250 IN band, but a
-        // ÷35 postdiv -> 150 MHz, off the proven low-VCO regime) is REFUSED on the
-        // operating-frequency check — this is the exact fat-fingered shape the
+        // ÃƒÂ·35 postdiv -> 150 MHz, off the proven low-VCO regime) is REFUSED on the
+        // operating-frequency check Ã¢â‚¬â€ this is the exact fat-fingered shape the
         // clamp must catch.
         assert!(!am2_re018_pll_hex_within_envelope(0x50D2_0164));
         // The ~50 MHz low-VCO eco default (VCO 2100 < 2400, 50 MHz) is below the
@@ -15937,7 +17953,7 @@ worker = "test"
         assert_eq!(am2_chain_id_for_pic_addr(0x21), Some(1));
         assert_eq!(am2_chain_id_for_pic_addr(0x22), Some(2));
         assert_eq!(am2_chain_id_for_pic_addr(0x23), Some(3));
-        // Unrecognized address → None (AT-3 publishes nothing, never a
+        // Unrecognized address Ã¢â€ â€™ None (AT-3 publishes nothing, never a
         // wrong-keyed reading).
         assert_eq!(am2_chain_id_for_pic_addr(0x55), None);
         assert_eq!(am2_chain_id_for_pic_addr(0x00), None);
@@ -15945,7 +17961,7 @@ worker = "test"
 
     #[test]
     fn at3_rail_read_gate_defaults_off_and_opts_in_via_config() {
-        // Default-OFF is load-bearing — with the gate closed the AT-3 select!
+        // Default-OFF is load-bearing Ã¢â‚¬â€ with the gate closed the AT-3 select!
         // arm is never polled and the loop is byte-identical to the proven path.
         // (Guard the default-false assertion on the opt-in env being unset so a
         // CI runner that happens to export it can't make this flaky.)
@@ -15979,7 +17995,7 @@ worker = "test"
         //  B05: assert the ACTUAL runtime order, not a source string.
         // With selected=0x20 (the real /p config, serial_device=ttyS1),
         // the non-selected PICs 0x21/0x22 are primed FIRST and 0x20 is warmed
-        // LAST — there is NO "0x20 first" guarantee.
+        // LAST Ã¢â‚¬â€ there is NO "0x20 first" guarantee.
         assert_eq!(
             am2_bus_prime_order(&[0x20, 0x21, 0x22], 0x20),
             vec![0x21, 0x22]
@@ -15995,9 +18011,9 @@ worker = "test"
             am2_bus_prime_order(&[0x22, 0x20, 0x21], 0x20),
             vec![0x21, 0x22]
         );
-        // selected not present → all returned ascending.
+        // selected not present Ã¢â€ â€™ all returned ascending.
         assert_eq!(am2_bus_prime_order(&[0x22, 0x20], 0x23), vec![0x20, 0x22]);
-        // single PIC == selected → empty.
+        // single PIC == selected Ã¢â€ â€™ empty.
         assert_eq!(am2_bus_prime_order(&[0x20], 0x20), Vec::<u8>::new());
     }
 
@@ -16023,6 +18039,7 @@ worker = "test"
         );
 
         let entry = WorkEntry {
+            work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
             job_id: "job".to_string(),
             extranonce2: "00000000".to_string(),
             ntime: 0x6655_4433,
@@ -16035,6 +18052,19 @@ worker = "test"
             version_rolling_enabled: false,
         };
         let header = hybrid_build_header(&entry, rolled_version, nonce);
+        // G22: engine builder is byte-identical to stratum pure SSOT.
+        assert_eq!(
+            header,
+            dcentrald_stratum::v1::job::build_block_header(
+                rolled_version,
+                &entry.prev_block_hash,
+                &entry.merkle_root,
+                entry.ntime,
+                entry.nbits,
+                nonce,
+            ),
+            "hybrid_build_header must equal stratum build_block_header SSOT"
+        );
         assert_eq!(
             u32::from_le_bytes(header[0..4].try_into().expect("version bytes")),
             rolled_version,
@@ -16087,7 +18117,7 @@ worker = "test"
     }
 
     // ====================================================================
-    // GROUP B / W8 — DUAL-CHAIN `a lab unit` ttyS3 dispatch capability
+    // GROUP B / W8 Ã¢â‚¬â€ DUAL-CHAIN `a lab unit` ttyS3 dispatch capability
     // ====================================================================
 
     /// Build an 11-byte BM1362 serial nonce RX frame for the dual-chain
@@ -16107,38 +18137,42 @@ worker = "test"
             n[2],
             n[3],
             0x00,                      // midstate_idx
-            (sent_job_id << 1) & 0xF0, // result byte → echoed job_id slot
+            (sent_job_id << 1) & 0xF0, // result byte Ã¢â€ â€™ echoed job_id slot
             v[0],
             v[1],
-            0x80, // flags: bit7 set ⇒ job response
+            0x80, // flags: bit7 set Ã¢â€¡â€™ job response
         ]
     }
 
     /// Seed a chain's work-history slot with a permissive `WorkEntry` (all-FF
-    /// share target ⇒ any nonce validates) so `ingest_rx` deterministically
+    /// share target Ã¢â€¡â€™ any nonce validates) so `ingest_rx` deterministically
     /// produces a share without needing a real pool job / mined nonce.
     fn seed_permissive_work_entry(
         chain: &mut Am2SerialChainState,
         sent_job_id: u8,
         job_label: &str,
     ) {
-        let slot = am2_serial_echoed_job_id(sent_job_id) as usize;
-        chain.work_history[slot].push_back(WorkEntry {
-            job_id: job_label.to_string(),
-            extranonce2: "00000000".to_string(),
-            ntime: 0x6655_4433,
-            nbits: 0x1d00_ffff,
-            version: 0x2000_0000,
-            share_target: [0xff; 32], // permissive: any header validates
-            prev_block_hash: [0x11; 32],
-            merkle_root: [0x22; 32],
-            version_bits_per_midstate: vec![None],
-            version_rolling_enabled: false,
-        });
+        let slot = am2_serial_echoed_job_id(sent_job_id);
+        chain.bookkeeping.history.push(
+            slot,
+            WorkEntry {
+                work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
+                job_id: job_label.to_string(),
+                extranonce2: "00000000".to_string(),
+                ntime: 0x6655_4433,
+                nbits: 0x1d00_ffff,
+                version: 0x2000_0000,
+                share_target: [0xff; 32], // permissive: any header validates
+                prev_block_hash: [0x11; 32],
+                merkle_root: [0x22; 32],
+                version_bits_per_midstate: vec![None],
+                version_rolling_enabled: false,
+            },
+        );
     }
 
     /// LOAD-BEARING: the dual-chain capability is DEFAULT-OFF. With the env
-    /// unset, the gate returns false → `run()` never opens the second UART and
+    /// unset, the gate returns false Ã¢â€ â€™ `run()` never opens the second UART and
     /// runs the proven single-chain `run_am2_serial_dispatch_loop` (the chain-1
     /// `a lab unit`/.109 milestone path) byte-for-byte. This pins that contract.
     #[test]
@@ -16147,7 +18181,7 @@ worker = "test"
         std::env::remove_var(ENV);
         assert!(
             !am2_dual_chain_ttys3_enabled(),
-            "dual-chain MUST be OFF when the env is unset — gate-off is the proven single-chain path"
+            "dual-chain MUST be OFF when the env is unset Ã¢â‚¬â€ gate-off is the proven single-chain path"
         );
         // Explicit truthy turns it on; falsey/garbage keep it off.
         for on in ["1", "true", "yes", "on", "ON"] {
@@ -16201,7 +18235,7 @@ worker = "test"
     #[test]
     fn am2_serial_chain_state_attributes_and_dedups() {
         let mut chain = Am2SerialChainState::new(0);
-        let sent_job_id = AM2_SERIAL_JOB_ID_STEP; // 8 → echoed slot 8
+        let sent_job_id = AM2_SERIAL_JOB_ID_STEP; // 8 Ã¢â€ â€™ echoed slot 8
         seed_permissive_work_entry(&mut chain, sent_job_id, "jobA");
 
         let frame = make_dual_chain_nonce_frame(sent_job_id, 0xDEAD_BEEF, 0x0000);
@@ -16236,16 +18270,16 @@ worker = "test"
     /// The dual-chain core: two independent `Am2SerialChainState`s attribute
     /// nonces to THEIR OWN chain only. A nonce produced on chain A's wire is
     /// never credited to chain B (and vice-versa), and each chain keeps its own
-    /// counters — the property that makes per-chain attribution correct.
+    /// counters Ã¢â‚¬â€ the property that makes per-chain attribution correct.
     #[test]
     fn am2_dual_chain_attributes_nonces_to_the_producing_chain_only() {
         let mut chain_a = Am2SerialChainState::new(0);
         let mut chain_b = Am2SerialChainState::new(1);
 
         // Same echoed job-id slot on both chains, but each chain seeds a
-        // DIFFERENT pool job into that slot — so a nonce can only validate
+        // DIFFERENT pool job into that slot Ã¢â‚¬â€ so a nonce can only validate
         // against its own chain's history and is labelled with that chain's job.
-        let sent = AM2_SERIAL_JOB_ID_STEP * 2; // 16 → echoed slot 16
+        let sent = AM2_SERIAL_JOB_ID_STEP * 2; // 16 Ã¢â€ â€™ echoed slot 16
         seed_permissive_work_entry(&mut chain_a, sent, "jobA");
         seed_permissive_work_entry(&mut chain_b, sent, "jobB");
 
@@ -16278,7 +18312,7 @@ worker = "test"
         assert_eq!(chain_b.shares_submitted, 1);
 
         // Crucially: chain A never saw chain B's nonce (different chain UARTs)
-        // — feeding A's frame to B yields NO share because B's slot holds jobB
+        // Ã¢â‚¬â€ feeding A's frame to B yields NO share because B's slot holds jobB
         // but A's nonce is genuinely B's only if B mined it; B did not ingest
         // A's bytes, so A's nonce is unknown to B. Prove the isolation directly:
         // a fresh chain that never ingested a frame has zero shares.
@@ -16294,7 +18328,7 @@ worker = "test"
     #[test]
     fn am2_dual_chain_bip320_reconstruction_is_per_chain_correct() {
         let mut chain = Am2SerialChainState::new(0);
-        let sent = AM2_SERIAL_JOB_ID_STEP * 3; // 24 → echoed slot 24
+        let sent = AM2_SERIAL_JOB_ID_STEP * 3; // 24 Ã¢â€ â€™ echoed slot 24
         seed_permissive_work_entry(&mut chain, sent, "jobV");
 
         let vbits_raw: u16 = 0x0014;
@@ -16320,10 +18354,10 @@ worker = "test"
     }
 
     /// W24-CRASH-1 (w24-thermal-safety F-1): the process-global panic-hook
-    /// teardown params set→read round-trip.
+    /// teardown params setÃ¢â€ â€™read round-trip.
     ///
     /// `AM2_TEARDOWN_PARAMS` is a process-wide `OnceLock` (set-once), so this
-    /// is the ONLY test allowed to arm it — a second arming test in the same
+    /// is the ONLY test allowed to arm it Ã¢â‚¬â€ a second arming test in the same
     /// process would see the first test's value (set is idempotent). We arm it
     /// from a config carrying non-default values (`pwr_control_gpio` set, a
     /// non-default `fan_idle_pwm`/`fan_max_pwm`) and confirm the hook would read
@@ -16336,7 +18370,7 @@ worker = "test"
     fn am2_teardown_params_global_set_then_read_round_trip() {
         // Unset before arming proves the no-op-on-unset branch of the hook.
         // (OnceLock can't be reset, so we only get to observe this when this
-        // test runs first — assert the round-trip regardless of ordering.)
+        // test runs first Ã¢â‚¬â€ assert the round-trip regardless of ordering.)
         let config: DcentraldConfig = toml::from_str(
             r#"
 [pool]
@@ -16358,7 +18392,7 @@ fan_max_pwm = 28
         assert_eq!(config.thermal.fan_idle_pwm, 12);
         assert_eq!(config.thermal.fan_max_pwm, 28);
 
-        arm_am2_teardown_params(&config);
+        arm_am2_teardown_params(&config).expect("panic teardown authority should arm once");
 
         let params = am2_teardown_params().expect("params must be armed after arm_*");
         assert_eq!(
@@ -16387,9 +18421,9 @@ fan_max_pwm = 28
     }
 
     /// R11-7 FastUART settle-delay env knob (`DCENT_AM2_FASTUART_SETTLE_MS`).
-    /// Single test (no shared guard needed — this is the ONLY test that
+    /// Single test (no shared guard needed Ã¢â‚¬â€ this is the ONLY test that
     /// touches this env var) walking the three contracts in sequence:
-    ///   1. absent env ⇒ the hardcoded default (byte-identical behaviour),
+    ///   1. absent env Ã¢â€¡â€™ the hardcoded default (byte-identical behaviour),
     ///   2. valid override is parsed + applied,
     ///   3. out-of-range overrides clamp to [MIN, MAX].
     #[test]
@@ -16405,7 +18439,7 @@ fan_max_pwm = 28
         assert_eq!(AM2_FASTUART_SETTLE_MS_MIN, 100);
         assert_eq!(AM2_FASTUART_SETTLE_MS_MAX, 3000);
 
-        // 1. Absent env ⇒ default (byte-identical to the prior hardcoded sleep).
+        // 1. Absent env Ã¢â€¡â€™ default (byte-identical to the prior hardcoded sleep).
         std::env::remove_var(ENV);
         assert_eq!(
             am2_fast_uart_settle_ms(),
@@ -16437,7 +18471,7 @@ fan_max_pwm = 28
             "above-ceiling MUST clamp DOWN to MAX"
         );
 
-        // Unparseable ⇒ falls back to default (never silently changes timing).
+        // Unparseable Ã¢â€¡â€™ falls back to default (never silently changes timing).
         std::env::set_var(ENV, "not-a-number");
         assert_eq!(am2_fast_uart_settle_ms(), AM2_FASTUART_SETTLE_MS_DEFAULT);
 
@@ -16476,7 +18510,7 @@ fan_max_pwm = 28
     fn am2_safe_teardown_default_on_opt_out() {
         const ENV: &str = "DCENT_AM2_SAFE_TEARDOWN";
 
-        // Unset ⇒ ON (the promoted default — no operator AC-cycle needed).
+        // Unset Ã¢â€¡â€™ ON (the promoted default Ã¢â‚¬â€ no operator AC-cycle needed).
         std::env::remove_var(ENV);
         assert!(
             am2_safe_teardown_enabled(),
@@ -16527,7 +18561,7 @@ fan_max_pwm = 28
     }
 
     /// CE-012: teardown de-energizes EVERY S19 dsPIC controller (0x20/0x21/0x22)
-    /// — the unconditional superset, not just the active-mask subset. Pin the
+    /// Ã¢â‚¬â€ the unconditional superset, not just the active-mask subset. Pin the
     /// canonical address set so a future edit cannot silently shrink it.
     #[test]
     fn s19_dspic_addrs_cover_all_three_controllers() {
@@ -16644,7 +18678,7 @@ fan_max_pwm = 28
         assert_eq!(
             steps.len(),
             4,
-            "no zero-flush + read_len=1 → exactly 4 steps"
+            "no zero-flush + read_len=1 Ã¢â€ â€™ exactly 4 steps"
         );
         assert!(matches!(steps[0], I2cTransactionStep::SetTimeout(10)));
         match &steps[1] {
@@ -16665,7 +18699,7 @@ fan_max_pwm = 28
 
     #[test]
     fn pic_get_version_retry_budget_is_bosminer_faithful() {
-        // R5: clean whole-frame retry up to 15× @100 ms (bosminer cadence),
+        // R5: clean whole-frame retry up to 15Ãƒâ€” @100 ms (bosminer cadence),
         // NOT a 3-attempt-then-flush loop.
         assert_eq!(PIC_GET_VERSION_CLEAN_RETRIES, 15);
         assert_eq!(PIC_GET_VERSION_RETRY_DELAY_MS, 100);
@@ -16715,7 +18749,7 @@ fan_max_pwm = 28
     #[test]
     fn parse_ablation_fields_captures_126_to_28_collapse_signature() {
         // The R11-2 failure mode: many frames, few unique ids, big collision
-        // count — exactly what PR-019 instrumentation must surface per phase.
+        // count Ã¢â‚¬â€ exactly what PR-019 instrumentation must surface per phase.
         let summary = "count=90 chipid_like=90 unique_chip_addrs=28 duplicate_chipid=62 \
                        nonce_like=0 other=0 malformed=0 chip_preview=00,02,04,06,08,0A,0C,0E \
                        first=[13, 62, 03, 00, 00, 00, 00, 00, 00]";
@@ -16730,7 +18764,7 @@ fan_max_pwm = 28
     }
 
     // =======================================================================
-    //  — bosminer-faithful Phase 0d skip-heartbeats env-gate pin
+    //  Ã¢â‚¬â€ bosminer-faithful Phase 0d skip-heartbeats env-gate pin
     // =======================================================================
 
     #[test]
@@ -16740,25 +18774,25 @@ fan_max_pwm = 28
         // whole bosminer-faithful Phase 0d shape (timing + protocol) with
         // ONE flag. If a future refactor splits these into separate gates,
         // it must update this test + the run_wave42_25.sh launcher
-        // together — the operator-facing contract is "one env, the entire
+        // together Ã¢â‚¬â€ the operator-facing contract is "one env, the entire
         // bosminer-faithful behaviour".
         std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL");
         assert!(
             !super::am2_dspic_bosminer_faithful_enabled(),
             "default-off: unset env must leave Wave-42 disabled (byte-identical \
-             to today's 5×1Hz heartbeat path for .109/.79/.139)"
+             to today's 5Ãƒâ€”1Hz heartbeat path for .109/.79/.139)"
         );
         std::env::set_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL", "1");
         assert!(
             super::am2_dspic_bosminer_faithful_enabled(),
-            "operator opt-in via '1' must enable Wave-42 (skip 5×1Hz heartbeats; \
-             emit single 500-ms settle instead — matches bosminer i2c-0 strace)"
+            "operator opt-in via '1' must enable Wave-42 (skip 5Ãƒâ€”1Hz heartbeats; \
+             emit single 500-ms settle instead Ã¢â‚¬â€ matches bosminer i2c-0 strace)"
         );
         std::env::remove_var("DCENT_AM2_DSPIC_BOSMINER_FAITHFUL");
     }
 
     // =======================================================================
-    //  — strace-derived 4-byte GET_VERSION response parser pins
+    //  Ã¢â‚¬â€ strace-derived 4-byte GET_VERSION response parser pins
     // =======================================================================
 
     #[test]
@@ -16804,9 +18838,9 @@ fan_max_pwm = 28
     fn wave28b_parse_does_not_false_positive_on_older_3byte_shape() {
         // Older bare-firmware response `[0x17, 0x00, FW]` puts fw at
         // INDEX 2 with status 0x00 at index 1. The new 4-byte branch
-        // must NOT consume this — it requires buf[1] to be a known fw
+        // must NOT consume this Ã¢â‚¬â€ it requires buf[1] to be a known fw
         // byte (not 0x00). With buf[1] == 0x00, `is_known_pic_fw(0x00)`
-        // is false → new branch skipped → fall through to existing
+        // is false Ã¢â€ â€™ new branch skipped Ã¢â€ â€™ fall through to existing
         // 3-byte branch that returns Some(fw) from buf[2].
         let older_reply = [0x17u8, 0x00, 0x89, 0xFF, 0xFF];
         assert_eq!(parse_hybrid_pic_fw_reply(&older_reply), Some(0x89));
@@ -16819,7 +18853,7 @@ fan_max_pwm = 28
     fn wave28b_parse_does_not_false_positive_on_vnish_5byte_shape() {
         // VNish-RE'd `[0x05, 0x17, FW, ?, checksum]` (LEN=5, opcode echo,
         // fw at index 2). The new 4-byte branch requires buf[0] == 0x17;
-        // VNish has buf[0] == 0x05 → new branch skipped → fall through to
+        // VNish has buf[0] == 0x05 Ã¢â€ â€™ new branch skipped Ã¢â€ â€™ fall through to
         // existing VNish branch that returns Some(fw) from buf[2].
         let vnish_reply = [0x05u8, 0x17, 0x89, 0x00, 0xA5];
         assert_eq!(parse_hybrid_pic_fw_reply(&vnish_reply), Some(0x89));
@@ -16835,9 +18869,9 @@ fan_max_pwm = 28
         // patterns that aren't actually the strace shape.
         let bad_status_reply = [0x17u8, 0x89, 0xFF, 0xA5];
         // Falls through to older patterns: `[0x17, 0xFF, ...]`:
-        //   - 3-byte branch needs buf[1]==0x00 → fails
-        //   - 3-byte fallback needs is_known_pic_fw(buf[2]==0xFF) → fails
-        // Then `is_known_pic_fw(buf[0]==0x17)` → fails. Returns None.
+        //   - 3-byte branch needs buf[1]==0x00 Ã¢â€ â€™ fails
+        //   - 3-byte fallback needs is_known_pic_fw(buf[2]==0xFF) Ã¢â€ â€™ fails
+        // Then `is_known_pic_fw(buf[0]==0x17)` Ã¢â€ â€™ fails. Returns None.
         assert_eq!(parse_hybrid_pic_fw_reply(&bad_status_reply), None);
     }
 
@@ -16846,16 +18880,16 @@ fan_max_pwm = 28
         // buf[1] must be a known fw byte; otherwise reject.
         let bad_fw_reply = [0x17u8, 0x77, 0x00, 0xFF];
         // Falls through to older patterns; `is_known_pic_fw(0x00)` is
-        // false at index 2 → None.
+        // false at index 2 Ã¢â€ â€™ None.
         assert_eq!(parse_hybrid_pic_fw_reply(&bad_fw_reply), None);
     }
 
     #[test]
     fn wave28b_parse_handles_1_byte_read_without_false_4byte_match() {
         // When the env gate is OFF (default), the read is still 1 byte
-        // → buf = [0x17]. The new 4-byte branch requires buf.len() >= 4
-        // → skipped. The 3-byte branches also skip. Then
-        // `is_known_pic_fw(0x17)` → false. Returns None — exactly the
+        // Ã¢â€ â€™ buf = [0x17]. The new 4-byte branch requires buf.len() >= 4
+        // Ã¢â€ â€™ skipped. The 3-byte branches also skip. Then
+        // `is_known_pic_fw(0x17)` Ã¢â€ â€™ false. Returns None Ã¢â‚¬â€ exactly the
         // pre- behaviour. Default-off byte-identical guarantee.
         let one_byte_opcode_echo = [0x17u8];
         assert_eq!(parse_hybrid_pic_fw_reply(&one_byte_opcode_echo), None);
@@ -16864,7 +18898,7 @@ fan_max_pwm = 28
     #[test]
     fn parse_ablation_fields_tolerates_missing_or_error_summaries() {
         // read_error / send_error strings and empty input must not panic and
-        // must degrade to zeros + "none" — instrumentation never bails.
+        // must degrade to zeros + "none" Ã¢â‚¬â€ instrumentation never bails.
         let (t, u, d, p) = parse_ablation_fields("read_error=timeout");
         assert_eq!((t, u, d), (0, 0, 0));
         assert_eq!(p, "none");
@@ -16882,19 +18916,19 @@ fan_max_pwm = 28
     }
 
     // ================================================================
-    //  am2/BM1362 FREQUENCY-ONLY autotuner — host-safe unit tests.
+    //  am2/BM1362 FREQUENCY-ONLY autotuner Ã¢â‚¬â€ host-safe unit tests.
     //
     // Pure-logic coverage of the load-bearing invariants. (No HAL /
-    // hardware — these run wherever the rest of the dcentrald suite
+    // hardware Ã¢â‚¬â€ these run wherever the rest of the dcentrald suite
     // runs.)
     // ================================================================
 
     #[test]
     fn freq_only_default_off_is_byte_identical_gate() {
         // DEFAULT-OFF is THE load-bearing invariant: with neither the
-        // TOML key nor the env var set, the gate is closed → the
+        // TOML key nor the env var set, the gate is closed Ã¢â€ â€™ the
         // serial-dispatch loop never builds the rig (no freq_cmd_rx, no
-        // chain_stats, no tuner spawn) → byte-identical to the proven
+        // chain_stats, no tuner spawn) Ã¢â€ â€™ byte-identical to the proven
         // `a lab unit`/.109 path. We assert the resolver returns false on a
         // clean minimal config (env not set in the test process).
         std::env::remove_var(dcentrald_autotuner::config::AM2_FREQUENCY_AUTOTUNE_ENV);
@@ -16905,7 +18939,7 @@ fan_max_pwm = 28
         );
         assert!(
             !am2_frequency_autotune_opted_in(&cfg),
-            "gate MUST be closed by default — zero `a lab unit` behavior change unless opted in"
+            "gate MUST be closed by default Ã¢â‚¬â€ zero `a lab unit` behavior change unless opted in"
         );
     }
 
@@ -16930,7 +18964,7 @@ fan_max_pwm = 28
         // [400,545].
         assert_eq!(AM2_FREQ_ONLY_APPLIED_FLOOR_MHZ, 400);
         assert_eq!(AM2_FREQ_ONLY_APPLIED_CEIL_MHZ, 545);
-        // Below proven floor → clamps UP to 400 (never an unproven
+        // Below proven floor Ã¢â€ â€™ clamps UP to 400 (never an unproven
         // sub-400 PLL word).
         assert_eq!(am2_freq_only_clamp_applied_mhz(245), 400);
         assert_eq!(am2_freq_only_clamp_applied_mhz(320), 400);
@@ -16939,7 +18973,7 @@ fan_max_pwm = 28
         assert_eq!(am2_freq_only_clamp_applied_mhz(400), 400);
         assert_eq!(am2_freq_only_clamp_applied_mhz(500), 500);
         assert_eq!(am2_freq_only_clamp_applied_mhz(545), 545);
-        // Above nameplate → clamps DOWN to 545 (no home overclock).
+        // Above nameplate Ã¢â€ â€™ clamps DOWN to 545 (no home overclock).
         assert_eq!(am2_freq_only_clamp_applied_mhz(546), 545);
         assert_eq!(am2_freq_only_clamp_applied_mhz(597), 545);
         assert_eq!(am2_freq_only_clamp_applied_mhz(900), 545);
@@ -16975,7 +19009,7 @@ fan_max_pwm = 28
         );
         assert_eq!(
             built.max_freq_mhz, 545,
-            "config band ceiling clamps DOWN to 545 — no above-nameplate exploration"
+            "config band ceiling clamps DOWN to 545 Ã¢â‚¬â€ no above-nameplate exploration"
         );
         assert!(built.enabled, "opt-in IS the enable for this path");
         assert!(
@@ -16987,7 +19021,7 @@ fan_max_pwm = 28
     #[test]
     fn quiet_home_efficiency_is_the_default_objective_for_dot25() {
         // `a lab unit` is a home unit ("aim for a home friendly profile").
-        // The QUIET profile (`Efficiency` — walk frequency DOWN toward
+        // The QUIET profile (`Efficiency` Ã¢â‚¬â€ walk frequency DOWN toward
         // the J/TH minimum) is the DEFAULT objective when autotune is
         // opted in. Standard/home/heater all resolve to Efficiency;
         // Performance/Hashrate is never the default on a home unit.
@@ -17009,7 +19043,7 @@ fan_max_pwm = 28
     #[test]
     fn explicit_operator_hashrate_target_is_preserved_not_silently_quieted() {
         // Opting OUT of the quiet default is the operator's explicit
-        // call and must never be silently overridden — mirrors the
+        // call and must never be silently overridden Ã¢â‚¬â€ mirrors the
         // daemon W1.3 behavior. An explicit non-Efficiency target_mode
         // survives the builder.
         std::env::remove_var(dcentrald_autotuner::config::AM2_FREQUENCY_AUTOTUNE_ENV);
@@ -17042,17 +19076,17 @@ fan_max_pwm = 28
         );
         assert!(
             !built.voltage_optimization && !built.dvfs_enabled,
-            "voltage/DVFS HARD-off regardless of objective — no live am2 voltage this wave"
+            "voltage/DVFS HARD-off regardless of objective Ã¢â‚¬â€ no live am2 voltage this wave"
         );
     }
 
     #[test]
     fn chain_stats_snapshot_is_chip_count_aware_and_resets_window() {
-        // The autotuner's expected-NPS math is per-chip × chip_count
+        // The autotuner's expected-NPS math is per-chip Ãƒâ€” chip_count
         // (894 nonce-attribution slots per BM1362 chip, W6.8). The
         // serial path's chain-level snapshot must carry the LIVE
         // enumerated chip count (28..110 on XIL) so the prediction
-        // scales with the real chain — chip_temps_c length proves the
+        // scales with the real chain Ã¢â‚¬â€ chip_temps_c length proves the
         // count is propagated; aggregate nonce/error counts feed the
         // single synthetic chain; the window resets after each
         // snapshot.
@@ -17093,7 +19127,7 @@ fan_max_pwm = 28
         );
 
         // Expected-NPS scales linearly with the enumerated chip count
-        // (894 slots/chip, the W6.8 BM1362 geometry) — proves the
+        // (894 slots/chip, the W6.8 BM1362 geometry) Ã¢â‚¬â€ proves the
         // chain estimate is chip-count-aware, not fixed-126.
         let per_chip = dcentrald_autotuner::chip_geometry::expected_nps_for_chip(0x1362, 500, 256);
         assert!(per_chip > 0.0);
@@ -17106,7 +19140,7 @@ fan_max_pwm = 28
     }
 
     // -----------------------------------------------------------------------
-    // R1 — am2 low-idle PWM command clamp (compute_quiet_idle_pwm)
+    // R1 Ã¢â‚¬â€ am2 low-idle PWM command clamp (compute_quiet_idle_pwm)
     //
     // -----------------------------------------------------------------------
 
@@ -17123,7 +19157,7 @@ fan_max_pwm = 28
     }
 
     /// PWM is only ever driven DOWN: if the configured idle exceeds the fan
-    /// ceiling, it clamps to the ceiling — never up.
+    /// ceiling, it clamps to the ceiling Ã¢â‚¬â€ never up.
     #[test]
     fn quiet_idle_pwm_clamps_down_to_fan_max() {
         assert_eq!(
@@ -17134,7 +19168,7 @@ fan_max_pwm = 28
         assert_eq!(compute_quiet_idle_pwm(100, 15), 15);
     }
 
-    /// `PWM_SAFETY_MAX` (30) is an enforced upper bound on EVERY path — even
+    /// `PWM_SAFETY_MAX` (30) is an enforced upper bound on EVERY path Ã¢â‚¬â€ even
     /// if both the idle and the ceiling somehow exceeded it.
     #[test]
     fn quiet_idle_pwm_never_exceeds_safety_max() {
@@ -17149,7 +19183,7 @@ fan_max_pwm = 28
         assert!(compute_quiet_idle_pwm(255, 255) <= dcentrald_hal::fan::PWM_MAX);
     }
 
-    /// A 0 setpoint is honored (off) — the clamp only bounds the TOP, never
+    /// A 0 setpoint is honored (off) Ã¢â‚¬â€ the clamp only bounds the TOP, never
     /// raises a low value.
     #[test]
     fn quiet_idle_pwm_zero_is_preserved() {
@@ -17202,13 +19236,13 @@ fan_max_pwm = 28
     // -----------------------------------------------------------------------
     // Regression pins for the 2026-06-14 `a lab unit` hashrate fixes (perf audit).
     // If any drift, the gentle-bump (A8 core-enable) or the ticket-mask cleanup
-    // silently changes — these were live-diagnosed and must not regress.
+    // silently changes Ã¢â‚¬â€ these were live-diagnosed and must not regress.
     // -----------------------------------------------------------------------
     #[test]
     fn re018_hashrate_fix_constants_are_byte_exact() {
         // TICKET_MASK (0x14) + HASH_COUNTING (0x10): the bosminer-strace-omitted
         // diff-256 hardware filter + 126-chip nonce range. Live-proven (flood
-        // collapse 270x: 709/s -> 2.6/s) — a cleanup, NOT the hashrate root cause.
+        // collapse 270x: 709/s -> 2.6/s) Ã¢â‚¬â€ a cleanup, NOT the hashrate root cause.
         assert_eq!(TICKET_MASK_256, 0x0000_00FF, "ticket mask 0x14 (diff-256)");
         assert_eq!(
             NONCE_RANGE_126, 0x0000_1381,
@@ -17233,9 +19267,9 @@ fan_max_pwm = 28
             "full-core per-chip A8"
         );
         // option-B (2026-06-14): the freq-override DEFAULT is now the PROVEN 320 MHz sweet spot
-        // (table ÷10 byte order, 0x50800141), NOT the live-rejected off-table 150 MHz 0x50D2_0164.
+        // (table ÃƒÂ·10 byte order, 0x50800141), NOT the live-rejected off-table 150 MHz 0x50D2_0164.
         // It must (a) be that proven value, (b) match bm1362::pll_lookup_extended(320), and (c) stay
-        // DISTINCT from the ~50 MHz eco default RE018_PLL_08 (de-couple sentinel — never the off-table value).
+        // DISTINCT from the ~50 MHz eco default RE018_PLL_08 (de-couple sentinel Ã¢â‚¬â€ never the off-table value).
         assert_eq!(
             RE018_LOW_FREQ_PLL_08, 0x5080_0141,
             "freq-override default = proven 320 MHz"
@@ -17308,8 +19342,8 @@ fan_max_pwm = 28
         // Pin the conservative floor so a future edit can't make it un-generous.
         assert_eq!(AM2_MID_RUN_STALL_MIN_DEFAULT_S, 300);
 
-        // Default derived from the 90 s no-nonce default ⇒ max(2×90, 300) = 300 s,
-        // i.e. ALWAYS ≥ the startup no-nonce timeout and ≥ the 5-minute floor.
+        // Default derived from the 90 s no-nonce default Ã¢â€¡â€™ max(2Ãƒâ€”90, 300) = 300 s,
+        // i.e. ALWAYS Ã¢â€°Â¥ the startup no-nonce timeout and Ã¢â€°Â¥ the 5-minute floor.
         let derived = am2_mid_run_nonce_stall_timeout(90).expect("armed for a non-zero base");
         assert_eq!(derived, dur(300));
         assert!(
@@ -17317,10 +19351,10 @@ fan_max_pwm = 28
             "mid-run timeout must never be shorter than the startup no-nonce timeout"
         );
 
-        // A large base scales (2×) above the floor.
+        // A large base scales (2Ãƒâ€”) above the floor.
         assert_eq!(am2_mid_run_nonce_stall_timeout(200), Some(dur(400)));
 
-        // Base 0 (startup guard disabled for deep lab capture) ⇒ guard off.
+        // Base 0 (startup guard disabled for deep lab capture) Ã¢â€¡â€™ guard off.
         assert_eq!(am2_mid_run_nonce_stall_timeout(0), None);
 
         // Explicit env override wins (still generous in practice; the operator owns it).
@@ -17339,19 +19373,19 @@ fan_max_pwm = 28
     fn am2_mid_run_stall_fires_only_after_generous_timeout() {
         let timeout = Some(dur(300));
 
-        // No nonce ever ⇒ NOT a mid-run stall (the startup no-nonce guard owns it).
+        // No nonce ever Ã¢â€¡â€™ NOT a mid-run stall (the startup no-nonce guard owns it).
         assert!(!am2_mid_run_nonce_stalled(timeout, None));
 
-        // Healthy cadence: last nonce a few seconds ago ⇒ never trips.
+        // Healthy cadence: last nonce a few seconds ago Ã¢â€¡â€™ never trips.
         assert!(!am2_mid_run_nonce_stalled(timeout, Some(dur(5))));
         // Even a sparse-but-alive eco unit well under the window stays healthy.
         assert!(!am2_mid_run_nonce_stalled(timeout, Some(dur(299))));
 
-        // At/after the generous timeout ⇒ fail closed.
+        // At/after the generous timeout Ã¢â€¡â€™ fail closed.
         assert!(am2_mid_run_nonce_stalled(timeout, Some(dur(300))));
         assert!(am2_mid_run_nonce_stalled(timeout, Some(dur(900))));
 
-        // Guard disabled ⇒ never trips regardless of elapsed.
+        // Guard disabled Ã¢â€¡â€™ never trips regardless of elapsed.
         assert!(!am2_mid_run_nonce_stalled(None, Some(dur(99999))));
     }
 
@@ -17362,28 +19396,28 @@ fan_max_pwm = 28
         let timeout = Some(dur(300));
         assert!(am2_nonce_recently_active(timeout, Some(dur(5))));
         assert!(!am2_nonce_recently_active(timeout, Some(dur(300))));
-        // No nonce yet, or guard disabled ⇒ never falsely "stalled" (returns true).
+        // No nonce yet, or guard disabled Ã¢â€¡â€™ never falsely "stalled" (returns true).
         assert!(am2_nonce_recently_active(timeout, None));
         assert!(am2_nonce_recently_active(None, Some(dur(99999))));
     }
 
     /// MINE-LIFE-2: the recent-window "current" hashrate differs from the
-    /// cumulative latch — it drops to 0 once activity stops, instead of keeping a
+    /// cumulative latch Ã¢â‚¬â€ it drops to 0 once activity stops, instead of keeping a
     /// healthy lifetime average.
     #[test]
     fn am2_recent_window_hashrate_drops_when_activity_stops() {
         let acct = Am2ShareAccounting::default();
         acct.record_accepted(256.0, 256.0); // achieved-difficulty sum = 256
 
-        // Window that captured the share (prev sum 0 → delta 256) reads > 0.
+        // Window that captured the share (prev sum 0 Ã¢â€ â€™ delta 256) reads > 0.
         let active = acct.hashrate_ghs_window(0.0, 5.0);
         assert!(
             active > 0.0,
             "an active window must read a positive hashrate"
         );
 
-        // Next window with NO new shares (prev sum == current sum) reads 0 — the
-        // honest "current" value — even though the cumulative achieved sum (256)
+        // Next window with NO new shares (prev sum == current sum) reads 0 Ã¢â‚¬â€ the
+        // honest "current" value Ã¢â‚¬â€ even though the cumulative achieved sum (256)
         // would still yield a positive lifetime average.
         let stalled = acct.hashrate_ghs_window(256.0, 5.0);
         assert_eq!(stalled, 0.0, "a window with no new shares must read 0 GH/s");
@@ -17401,7 +19435,7 @@ fan_max_pwm = 28
     /// FIX 2 / MINE-LIFE-2 (eco-stable): the rolling-window "current" hashrate
     /// stays a STABLE non-zero value across a realistic sparse-share eco cadence
     /// (a healthy ~1 TH/s @ ~50 MHz unit lands a share only every ~30 s) instead
-    /// of flickering to 0 on the empty 5 s ticks BETWEEN shares — and still
+    /// of flickering to 0 on the empty 5 s ticks BETWEEN shares Ã¢â‚¬â€ and still
     /// decays to ~0 only after a genuine SUSTAINED stall (no new share for the
     /// whole horizon). The baseline selection + the existing
     /// `hashrate_ghs_window` delta math together remain a REAL measured value,
@@ -17446,7 +19480,7 @@ fan_max_pwm = 28
             "sparse-but-alive eco cadence must read non-zero, got {hr}"
         );
 
-        // One empty 5 s tick later (ages +5, NO new share) must NOT flicker to 0 —
+        // One empty 5 s tick later (ages +5, NO new share) must NOT flicker to 0 Ã¢â‚¬â€
         // the wide window still contains the recent shares.
         let next: Vec<(f64, f64)> = history.iter().map(|&(a, s)| (a + 5.0, s)).collect();
         let (span_n, base_n) = am2_rolling_window_baseline(&next, horizon).unwrap();
@@ -17456,7 +19490,7 @@ fan_max_pwm = 28
         );
 
         // Genuine SUSTAINED stall: no new share for longer than the whole horizon
-        // ⇒ every in-window baseline already sits at the current sum ⇒ delta 0.
+        // Ã¢â€¡â€™ every in-window baseline already sits at the current sum Ã¢â€¡â€™ delta 0.
         let stalled: Vec<(f64, f64)> = (1..=12).rev().map(|k| ((k * 5) as f64, 512.0)).collect();
         let (span_s, base_s) = am2_rolling_window_baseline(&stalled, horizon).unwrap();
         assert_eq!(
@@ -17465,12 +19499,12 @@ fan_max_pwm = 28
             "a sustained stall must decay the current tile to 0"
         );
 
-        // First tick (no prior history) ⇒ None, so the caller shows the
+        // First tick (no prior history) Ã¢â€¡â€™ None, so the caller shows the
         // cumulative figure exactly once.
         assert_eq!(am2_rolling_window_baseline(&[], horizon), None);
 
         // Before a full horizon of history accrues, the baseline is the OLDEST
-        // retained snapshot (a real, non-zero span — not a flicker-0 zero-span):
+        // retained snapshot (a real, non-zero span Ã¢â‚¬â€ not a flicker-0 zero-span):
         // e.g. with only 15 s of history.
         let young: Vec<(f64, f64)> = vec![(15.0, 0.0), (10.0, 0.0), (5.0, 256.0)];
         assert_eq!(
@@ -17491,14 +19525,14 @@ fan_max_pwm = 28
         let cool = 49.3_f32; // the .25 eco steady-state die temp (proven path)
         let warm = 70.0_f32; // above hot (a genuinely overheating unit)
 
-        // Healthy: airflow present ⇒ never strikes (the .25 eco PWM10/~2880 RPM
+        // Healthy: airflow present Ã¢â€¡â€™ never strikes (the .25 eco PWM10/~2880 RPM
         // case), even at a warm temperature that would otherwise be eligible.
         let (s, f) = am2_fan_fault_step(0, Some((2880, 10)), warm, hot);
         assert_eq!((s, f), (0, false));
 
         // FIX 1 (false-cut guard): commanded but 0 RPM while COOL is NOT a fault.
         // A confirmed-cool unit is cooling adequately regardless of the tach, so
-        // it never strikes — this is the healthy sister am2-zynq / unverified-tach
+        // it never strikes Ã¢â‚¬â€ this is the healthy sister am2-zynq / unverified-tach
         // case the fix protects.
         let (s, f) = am2_fan_fault_step(0, Some((0, 10)), cool, hot);
         assert_eq!((s, f), (0, false));
@@ -17521,15 +19555,15 @@ fan_max_pwm = 28
         let (s, f) = am2_fan_fault_step(0, Some((0, 10)), hot, hot);
         assert_eq!((s, f), (1, false));
 
-        // Zero command (fans not driven) is NOT a fault — resets even while hot.
+        // Zero command (fans not driven) is NOT a fault Ã¢â‚¬â€ resets even while hot.
         let (s, f) = am2_fan_fault_step(2, Some((0, 0)), warm, hot);
         assert_eq!((s, f), (0, false));
 
-        // Inconclusive read (fan UIO unreadable) is NOT a fault — resets, never cuts.
+        // Inconclusive read (fan UIO unreadable) is NOT a fault Ã¢â‚¬â€ resets, never cuts.
         let (s, f) = am2_fan_fault_step(2, None, warm, hot);
         assert_eq!((s, f), (0, false));
 
-        // Non-finite temperature is inconclusive corroboration — resets, never cuts.
+        // Non-finite temperature is inconclusive corroboration Ã¢â‚¬â€ resets, never cuts.
         let (s, f) = am2_fan_fault_step(2, Some((0, 10)), f32::NAN, hot);
         assert_eq!((s, f), (0, false));
 
@@ -17546,7 +19580,7 @@ fan_max_pwm = 28
         let step = AM2_THERMAL_THROTTLE_STEP_MHZ; // 25
         let hot = 65.0_f32;
 
-        // Below hot ⇒ no change (the proven path stays full-frequency).
+        // Below hot Ã¢â€¡â€™ no change (the proven path stays full-frequency).
         assert_eq!(
             am2_graded_throttle_target_mhz(525, 60.0, hot, floor, step),
             None
@@ -17556,7 +19590,7 @@ fan_max_pwm = 28
             None
         );
 
-        // At/above hot on a high-frequency unit ⇒ one small step DOWN, never up.
+        // At/above hot on a high-frequency unit Ã¢â€¡â€™ one small step DOWN, never up.
         let t = am2_graded_throttle_target_mhz(525, 65.0, hot, floor, step).unwrap();
         assert_eq!(t, 500);
         assert!(t < 525, "throttle must only ever reduce frequency");
@@ -17571,7 +19605,7 @@ fan_max_pwm = 28
             Some(400)
         );
 
-        // At/below the PLL floor ⇒ no PLL throttle. This is the .25 eco ~50 MHz
+        // At/below the PLL floor Ã¢â€¡â€™ no PLL throttle. This is the .25 eco ~50 MHz
         // guard: a sub-floor chip is NEVER clocked UP toward the floor.
         assert_eq!(
             am2_graded_throttle_target_mhz(50, 90.0, hot, floor, step),
@@ -17582,7 +19616,7 @@ fan_max_pwm = 28
             None
         );
 
-        // Non-finite temp ⇒ no change (never throttle on a bad reading).
+        // Non-finite temp Ã¢â€¡â€™ no change (never throttle on a bad reading).
         assert_eq!(
             am2_graded_throttle_target_mhz(525, f32::NAN, hot, floor, step),
             None
@@ -17603,11 +19637,13 @@ worker = "test"
     fn admitted_hybrid_route() -> crate::s19j_hybrid_admission::S19jHybridRouteAdmission {
         let identity = crate::daemon_lifecycle::PlatformIdentitySnapshot {
             declared_board_target: Some("am2-s19j".to_string()),
+            observed_board_target: None,
             board_desc: dcentrald_common::BoardDesc::lookup("am2-s19j"),
             declared_platform_marker: Some("zynq-bm3-am2".to_string()),
             declared_subtype: None,
             declared_psu_hardware_variant: None,
-            observed_control_board: "Zynq am2-s17".to_string(),
+            observed_control_board: crate::runtime::hardware_info::OBSERVED_CONTROL_BOARD_ZYNQ_AM2
+                .to_string(),
         };
         crate::s19j_hybrid_admission::admit_s19j_hybrid_route(
             &identity,
@@ -17617,17 +19653,33 @@ worker = "test"
         .expect("canonical test composition must admit the hybrid route")
     }
 
+    fn admitted_hybrid_safety_for_pre_hardware_test() -> S19jHybridSafetyAdmission {
+        let mut watchdog = SafetyWatchdogOwner::inert_for_pre_hardware_test();
+        let watchdog_route_scope = watchdog.claim_hybrid_route_scope().unwrap();
+        S19jHybridSafetyAdmission {
+            route_admission: admitted_hybrid_route(),
+            watchdog,
+            watchdog_route_scope,
+            liveness: SafetyLiveness::default(),
+            hardware_mutation_owner: HardwareMutationGateOwner::new_pending(),
+        }
+    }
+
     #[tokio::test]
     async fn hybrid_route_admission_is_consumed_at_first_run_entry() {
         let shutdown = tokio_util::sync::CancellationToken::new();
         shutdown.cancel();
-        let mut miner =
-            S19jHybridMiner::new(min_hybrid_config(), shutdown, admitted_hybrid_route()).unwrap();
+        let mut miner = S19jHybridMiner::new(
+            min_hybrid_config(),
+            shutdown,
+            admitted_hybrid_safety_for_pre_hardware_test(),
+        )
+        .unwrap();
 
         let first = miner.run().await.unwrap_err().to_string();
         assert!(first.contains("cancelled before hardware admission"));
         let second = miner.run().await.unwrap_err().to_string();
-        assert!(second.contains("route admission was already consumed"));
+        assert!(second.contains("safety admission was already consumed"));
     }
 
     /// MINE-LIFE-2: the per-chain `ChainState.status` reverts to "stalled" when a
@@ -17639,26 +19691,26 @@ worker = "test"
         let miner = S19jHybridMiner::new(
             min_hybrid_config(),
             tokio_util::sync::CancellationToken::new(),
-            admitted_hybrid_route(),
+            admitted_hybrid_safety_for_pre_hardware_test(),
         )
         .unwrap();
 
-        // Produced nonces + recently active ⇒ "mining" (unchanged healthy path).
+        // Produced nonces + recently active Ã¢â€¡â€™ "mining" (unchanged healthy path).
         let active = miner.build_am2_chain_state(0x20, 126, 1000.0, 5, 0, true);
         assert_eq!(active.status, "mining");
 
-        // Produced nonces but no recent activity ⇒ "stalled", NOT a reassuring
+        // Produced nonces but no recent activity Ã¢â€¡â€™ "stalled", NOT a reassuring
         // "mining" off the cumulative unique-nonce latch.
         let stalled = miner.build_am2_chain_state(0x20, 126, 1000.0, 5, 0, false);
         assert_eq!(stalled.status, "stalled");
 
-        // Never produced a nonce ⇒ "active" (pre-first-nonce), regardless of flag.
+        // Never produced a nonce Ã¢â€¡â€™ "active" (pre-first-nonce), regardless of flag.
         let pre = miner.build_am2_chain_state(0x20, 126, 0.0, 0, 0, false);
         assert_eq!(pre.status, "active");
     }
 
     /// MINE-LIFE-2: the published pool `status` downgrades from "mining" to
-    /// "stalled" when the unit has gone quiet, and stays "mining" while active —
+    /// "stalled" when the unit has gone quiet, and stays "mining" while active Ã¢â‚¬â€
     /// so the dashboard stops latching "mining" at a healthy hashrate on a stall.
     #[test]
     fn am2_publish_status_downgrades_to_stalled_on_inactivity() {
@@ -17668,21 +19720,223 @@ worker = "test"
         let miner = S19jHybridMiner::new(
             min_hybrid_config(),
             tokio_util::sync::CancellationToken::new(),
-            admitted_hybrid_route(),
+            admitted_hybrid_safety_for_pre_hardware_test(),
         )
         .unwrap()
         .with_state_tx(tx);
 
         let acct = Am2ShareAccounting::default();
-        acct.record_accepted(256.0, 256.0); // accepted()>0 ⇒ base status "mining"
+        acct.record_accepted(256.0, 256.0); // accepted()>0 Ã¢â€¡â€™ base status "mining"
         let quality = dcentrald_stratum::pool_quality::PoolQualitySnapshot::default();
 
-        // Recently active ⇒ "mining" (healthy path unchanged).
+        // Recently active Ã¢â€¡â€™ "mining" (healthy path unchanged).
         miner.publish_miner_state(&acct, &quality, 1000.0, 1000.0, vec![], 10, true);
         assert_eq!(rx.borrow().pool.status, "mining");
 
-        // Gone quiet ⇒ downgraded to "stalled" (no more reassuring "mining").
+        // Gone quiet Ã¢â€¡â€™ downgraded to "stalled" (no more reassuring "mining").
         miner.publish_miner_state(&acct, &quality, 1000.0, 0.0, vec![], 10, false);
         assert_eq!(rx.borrow().pool.status, "stalled");
+    }
+}
+
+#[cfg(test)]
+mod work_dispatch_admission_tests {
+    //! Drive the shipped hybrid admission adapters through the real
+    //! `WorkDispatchLifecycle` path - not a reimplementation.
+
+    use super::*;
+    use dcentrald_common::{power_precedes_fan_raise, SafetyStep, HOME_FAN_PWM_SAFETY_MAX};
+
+    #[test]
+    fn hybrid_watchdog_state_maps_config_and_mining_enter() {
+        assert_eq!(
+            hybrid_watchdog_safety_state(false, true),
+            WatchdogSafetyState::DisabledByConfiguration
+        );
+        assert_eq!(
+            hybrid_watchdog_safety_state(true, true),
+            WatchdogSafetyState::Armed
+        );
+        assert_eq!(
+            hybrid_watchdog_safety_state(true, false),
+            WatchdogSafetyState::NotPositivelyAdmitted
+        );
+    }
+
+    #[test]
+    fn hybrid_heartbeat_passthrough_requires_none() {
+        let (req, obs) = hybrid_heartbeat_inputs(true, 0x20, true, &[], 1);
+        assert_eq!(req, HeartbeatRequirement::NoneRequired);
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn hybrid_admit_green_succeeds() {
+        let mut life = WorkDispatchLifecycle::new();
+        let (req, obs) = hybrid_heartbeat_inputs(false, 0x20, true, &[], 1);
+        let inputs = hybrid_work_dispatch_inputs(
+            hybrid_watchdog_safety_state(true, true),
+            req,
+            &obs,
+            ThermalSafetyState::Ready,
+        );
+        let receipt = hybrid_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+        assert_eq!(receipt.controller_count, 1);
+        assert_eq!(receipt.heartbeat_cycle_id, Some(1));
+        assert!(life.is_admitted());
+    }
+
+    #[test]
+    fn hybrid_admit_refuses_failed_pic_heartbeat() {
+        let mut life = WorkDispatchLifecycle::new();
+        let (req, obs) = hybrid_heartbeat_inputs(false, 0x22, false, &[], 1);
+        let inputs = hybrid_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            req,
+            &obs,
+            ThermalSafetyState::Ready,
+        );
+        let err = hybrid_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::HeartbeatFailed {
+                controller_id: 0x22,
+                ..
+            }
+        ));
+        assert!(!life.is_admitted());
+    }
+
+    #[test]
+    fn hybrid_admit_refuses_thermal_not_ready() {
+        let mut life = WorkDispatchLifecycle::new();
+        let (req, obs) = hybrid_heartbeat_inputs(false, 0x20, true, &[], 1);
+        let inputs = hybrid_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            req,
+            &obs,
+            hybrid_thermal_safety_state(false, false),
+        );
+        let err = hybrid_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::ThermalNotReady {
+                state: ThermalSafetyState::NotReady
+            }
+        ));
+    }
+
+    #[test]
+    fn hybrid_terminal_revoke_blocks_re_admit_until_teardown() {
+        let mut life = WorkDispatchLifecycle::new();
+        let (req, obs) = hybrid_heartbeat_inputs(false, 0x20, true, &[], 1);
+        let inputs = hybrid_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            req,
+            &obs,
+            ThermalSafetyState::Ready,
+        );
+        hybrid_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+        let (action, stop_feed) =
+            hybrid_revoke_work_dispatch(&mut life, DispatchRevocationCause::HeartbeatFailure, 100);
+        assert!(stop_feed);
+        assert!(power_precedes_fan_raise(&action.steps()));
+        match &action.steps()[1] {
+            SafetyStep::CommandFans(fan) => {
+                assert!(fan.effective_pwm() <= HOME_FAN_PWM_SAFETY_MAX);
+            }
+            other => panic!("expected fan park second, got {other:?}"),
+        }
+        let err = hybrid_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert_eq!(err, WorkDispatchSafetyError::TerminallyRevoked);
+        life.reset_after_full_teardown();
+        hybrid_admit_standard_work_dispatch(&mut life, &inputs).expect("re-admit after teardown");
+    }
+
+    #[test]
+    fn hybrid_run_owns_lifecycle_and_calls_shipped_adapters() {
+        let src = include_str!("s19j_hybrid_mining.rs");
+        assert!(
+            src.contains("WorkDispatchLifecycle::new()"),
+            "hybrid run must own a WorkDispatchLifecycle"
+        );
+        assert!(
+            src.contains("hybrid_admit_standard_work_dispatch"),
+            "run must call the shipped hybrid admit adapter"
+        );
+        assert!(
+            src.contains("hybrid_revoke_and_stop_watchdog_feed"),
+            "run must call the shipped hybrid revoke+stop_feed adapter"
+        );
+        assert!(
+            src.contains("close_terminal_lock_free()"),
+            "hybrid mid-run revoke must stop SoC WDT feed"
+        );
+        assert!(
+            src.contains("DispatchRevocationCause::HeartbeatFailure"),
+            "PIC HB failure must terminal-revoke via HeartbeatFailure"
+        );
+        assert!(
+            src.contains("DispatchRevocationCause::ThermalCutoff"),
+            "thermal trip must revoke via ThermalCutoff"
+        );
+        assert!(
+            src.contains("DispatchRevocationCause::OperatorSafeOff"),
+            "operator shutdown must revoke via OperatorSafeOff"
+        );
+        assert!(
+            src.contains("if !dispatch_life.is_admitted()"),
+            "dispatch loops must gate work on live admission"
+        );
+        assert!(
+            src.contains("terminal_failure.store(true, Ordering::SeqCst)"),
+            "PIC HB thread must latch terminal failure for HeartbeatFailure revoke"
+        );
+    }
+
+    /// Decade backlog P1-5: multi-PIC voltage enable must call the pure
+    /// multi-chain enable planner (prefer compose, fail-closed on burst).
+    #[test]
+    fn multi_pic_voltage_enable_uses_production_powerup_planner() {
+        let src = include_str!("s19j_hybrid_mining.rs");
+        assert!(
+            src.contains("plan_production_multi_chain_enable"),
+            "multi-PIC enable must call dcentrald_common::plan_production_multi_chain_enable"
+        );
+        assert!(
+            src.contains("StaggerConfig::default()"),
+            "multi-PIC enable must use production StaggerConfig (bosminer 250 ms cadence)"
+        );
+        assert!(
+            src.contains("all_active_voltage_enable"),
+            "multi-PIC path remains gated (default-OFF experimental)"
+        );
+        assert!(
+            src.contains("MultiChainEnableAuthority::Composed")
+                || src.contains("MultiChainEnableAuthority::PowerUpOnly"),
+            "multi-PIC path must distinguish Composed vs PowerUpOnly authority"
+        );
+        // Fail-closed: policy refuse must not fall through to simultaneous enable.
+        assert!(
+            src.contains("refusing multi-PIC voltage enable under production power-up policy")
+                || src.contains("P1-5: refusing multi-PIC voltage enable"),
+            "multi-PIC path must log/refuse on production power-up policy error"
+        );
+        // Post-admit re-authorize where dispatch pillars exist.
+        assert!(
+            src.contains("post-admit multi-PIC schedule re-authorized as Composed")
+                || src.contains("P1-5: post-admit multi-PIC"),
+            "after work-dispatch admit, multi-PIC schedule must be re-authorized under green pillars"
+        );
+        let plan_idx = src
+            .find("plan_production_multi_chain_enable")
+            .expect("plan_production_multi_chain_enable present");
+        let multi_gate_idx = src
+            .find("all_active_voltage_enable")
+            .expect("all_active_voltage_enable present");
+        assert!(
+            plan_idx > multi_gate_idx,
+            "plan_production_multi_chain_enable must appear after all_active_voltage_enable gate in source order"
+        );
     }
 }

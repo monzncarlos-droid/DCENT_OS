@@ -53,7 +53,6 @@
 //! **SKELETON ONLY (2026-04-20).** This file compiles and enforces the
 //! preconditions; the Stratum + WORK_TX loop is a TODO for Phase 6 Agent B.
 
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -61,6 +60,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use dcentrald_common::SerialWorkBookkeeping;
 use dcentrald_hal::fpga_chain::DevmemFpgaChain;
 // W13.B1 (2026-05-10): renamed from `uart_relay::{UartRelay, RELAY_ENABLE_VALUE}`.
 // This is the Braiins-am2 diagnostic mirror, not a control surface.
@@ -78,21 +78,6 @@ use crate::config::DcentraldConfig;
 /// Hardware difficulty floor on the BM1362 FPGA nonce path.
 const HW_DIFFICULTY: u64 = 256;
 
-/// Work-history ring depth per FPGA work_id slot.
-const WORK_HISTORY_PER_ID: usize = 32;
-
-/// am2 MIDSTATE_CNT=1 → 2 midstate slots → ExtWorkId stride 2.
-const JOB_ID_INCREMENT: u8 = 2;
-
-/// FPGA work_id is 8 bits. We wrap at 0xFF
-/// naturally via `u8::wrapping_add`, but keep the legacy 0x7F mask used by
-/// hybrid mode to keep nonce→slot indexing identical between the two paths.
-const JOB_ID_MASK: u8 = 0x7F;
-
-/// Per-chain work_history slots. Matches hybrid exactly (128, one per
-/// wrapping-masked 7-bit job id).
-const WORK_HISTORY_SLOTS: usize = 128;
-
 /// BM1362 work payload on am2: 4 header words + 2 midstate slots × 8 words.
 const WORK_WORDS: usize = 20;
 
@@ -102,13 +87,15 @@ const MIDSTATE_CNT_LOG2: u32 = 1;
 // ---------------------------------------------------------------------------
 // Work entry for nonce → share lookup.
 //
-// Copied from `s19j_hybrid_mining::WorkEntry`. We keep this as a private copy
-// inside the tap module rather than promoting it to a shared location — the
-// smaller edit, and it keeps hybrid/tap coupling to exactly zero.
+// Private rich entry (share_target / midstate vbits) stored in pure
+// `WorkHistoryRing<WorkEntry>`. Job-id step/mask is pure
+// `AsicJobIdCursor::hybrid_fpga` (step 2, 0x7F) — same spine as hybrid FPGA.
+// Local type avoids coupling tap to hybrid's PSU/PIC/serial side effects.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct WorkEntry {
+    work_generation: dcentrald_stratum::WorkGeneration,
     job_id: String,
     extranonce2: String,
     ntime: u32,
@@ -122,15 +109,16 @@ struct WorkEntry {
 }
 
 /// Rebuild the 80-byte block header for share validation.
+/// G22: thin-wrap stratum pure SSOT (engines keep distinct WorkEntry types).
 fn tap_build_header(entry: &WorkEntry, rolled_version: u32, nonce: u32) -> [u8; 80] {
-    let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&rolled_version.to_le_bytes());
-    header[4..36].copy_from_slice(&entry.prev_block_hash);
-    header[36..68].copy_from_slice(&entry.merkle_root);
-    header[68..72].copy_from_slice(&entry.ntime.to_le_bytes());
-    header[72..76].copy_from_slice(&entry.nbits.to_le_bytes());
-    header[76..80].copy_from_slice(&nonce.to_le_bytes());
-    header
+    dcentrald_stratum::v1::job::build_block_header(
+        rolled_version,
+        &entry.prev_block_hash,
+        &entry.merkle_root,
+        entry.ntime,
+        entry.nbits,
+        nonce,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -385,13 +373,9 @@ impl S19jTapMiner {
 
         let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
-        // FPGA work_id is 8 bits. `u8` wraps
-        // naturally at 0xFF via `wrapping_add`. We still AND with JOB_ID_MASK
-        // so the slot index stays bounded by WORK_HISTORY_SLOTS.
-        let mut asic_job_id: u8 = 0;
-        let mut work_history: Vec<VecDeque<WorkEntry>> = (0..WORK_HISTORY_SLOTS)
-            .map(|_| VecDeque::with_capacity(WORK_HISTORY_PER_ID))
-            .collect();
+        // Pure bookkeeping SSOT (G3 gauntlet R2): full hybrid_fpga façade —
+        // history ring + job cursor + SeenShareSet (matches hybrid FPGA dedup).
+        let mut bookkeeping = SerialWorkBookkeeping::<WorkEntry>::hybrid_fpga();
 
         let mut total_work: u64 = 0;
         let mut total_nonces: u64 = 0;
@@ -424,7 +408,7 @@ impl S19jTapMiner {
                     if job.clean_jobs {
                         info!(job_id = %job.job_id, "NEW BLOCK — clearing work history + flushing WORK_RX (TX untouched, bosminer's in-flight work survives)");
                         current_job = None;
-                        work_history.iter_mut().for_each(VecDeque::clear);
+                        bookkeeping.on_clean_jobs();
                         work_builder.reset_extranonce2();
                         // INVARIANT: never flush_work_tx in tap mode — it
                         // would eat bosminer's in-flight work. Only RX.
@@ -465,7 +449,17 @@ impl S19jTapMiner {
                             continue;
                         }
 
-                        let work = work_builder.next_work(job);
+                        let work = match work_builder.next_work(job) {
+                            Ok(work) => work,
+                            Err(error) => {
+                                warn!(%error, "V1 work domain unavailable; pausing tap dispatch until a fresh generation arrives");
+                                current_job = None;
+                                continue;
+                            }
+                        };
+                        // Pure façade: peek current, push history, write, then advance
+                        // (matches hybrid FPGA order: id stable until after WORK_TX).
+                        let asic_job_id = bookkeeping.job_ids.current();
                         let mut words = [0u32; WORK_WORDS];
 
                         // Word 0: Extended work_id.
@@ -495,35 +489,33 @@ impl S19jTapMiner {
                         let version_bits_per_ms: Vec<Option<String>> =
                             vec![None; work.midstates.len()];
 
-                        let slot_idx = (asic_job_id & JOB_ID_MASK) as usize;
-                        let history = &mut work_history[slot_idx];
-                        if history.len() >= WORK_HISTORY_PER_ID {
-                            history.pop_front();
-                        }
-                        history.push_back(WorkEntry {
-                            job_id: work.job_id.clone(),
-                            extranonce2: work.extranonce2.clone(),
-                            ntime: work.ntime,
-                            nbits: work.nbits,
-                            version: work.version,
-                            share_target: work.share_target,
-                            prev_block_hash: work.prev_block_hash,
-                            merkle_root: work.merkle_root,
-                            version_bits_per_midstate: version_bits_per_ms,
-                            version_rolling_enabled: work.version_mask != 0,
-                        });
+                        // Pure ring push: depth-capped eviction SSOT.
+                        bookkeeping.history.push(
+                            asic_job_id,
+                            WorkEntry {
+                                work_generation: work.work_generation,
+                                job_id: work.job_id.clone(),
+                                extranonce2: work.extranonce2.clone(),
+                                ntime: work.ntime,
+                                nbits: work.nbits,
+                                version: work.version,
+                                share_target: work.share_target,
+                                prev_block_hash: work.prev_block_hash,
+                                merkle_root: work.merkle_root,
+                                version_bits_per_midstate: version_bits_per_ms,
+                                version_rolling_enabled: work.version_mask != 0,
+                            },
+                        );
 
                         fpga.write_work(&words);
 
-                        // 8-bit wrap — FPGA only sees 8 bits of work_id; mask
-                        // to JOB_ID_MASK (0x7F) so steady-state range matches
-                        // hybrid and slot index stays bounded by WORK_HISTORY_SLOTS.
-                        asic_job_id = asic_job_id.wrapping_add(JOB_ID_INCREMENT) & JOB_ID_MASK;
+                        let logged_work_id = asic_job_id;
+                        let _ = bookkeeping.job_ids.take_and_advance();
                         total_work += 1;
 
                         if total_work <= 3 {
                             info!(
-                                work_id = asic_job_id.wrapping_sub(JOB_ID_INCREMENT),
+                                work_id = logged_work_id,
                                 pool_job = %work.job_id,
                                 words = WORK_WORDS,
                                 "WORK #{} sent ({} words to FPGA WORK_TX)",
@@ -563,16 +555,22 @@ impl S19jTapMiner {
                             );
                         }
 
-                        let history = &work_history[(work_id & JOB_ID_MASK) as usize];
-                        if history.is_empty() {
+                        // work_id already masked to 0x7F at decode; pure ring indexes u8.
+                        if bookkeeping.history.is_empty_slot(work_id) {
                             if total_nonces <= 50 {
                                 warn!(work_id, "Stale nonce (no work history — likely bosminer's)");
                             }
                             continue;
                         }
 
-                        let latest_entry = history
-                            .back()
+                        // Hybrid FPGA parity: drop duplicate work_id+nonce (vbits=0 on tap).
+                        if !bookkeeping.seen.insert(work_id, nonce, 0) {
+                            continue;
+                        }
+
+                        let latest_entry = bookkeeping
+                            .history
+                            .latest(work_id)
                             .expect("history checked non-empty")
                             .clone();
 
@@ -592,7 +590,7 @@ impl S19jTapMiner {
                         }
 
                         if let Some((entry, rolled_version, share_version_bits)) =
-                            history.iter().rev().find_map(|candidate| {
+                            bookkeeping.history.iter_newest_first(work_id).find_map(|candidate| {
                                 let ms_idx = (solution_id as usize).min(
                                     candidate.version_bits_per_midstate.len().saturating_sub(1),
                                 );
@@ -622,6 +620,7 @@ impl S19jTapMiner {
                             shares_submitted += 1;
                             let vdelta = rolled_version ^ entry.version;
                             let share = dcentrald_stratum::types::ValidShare {
+                                work_generation: entry.work_generation,
                                 worker_name: self.config.pool.worker.clone(),
                                 job_id: entry.job_id.clone(),
                                 extranonce2: entry.extranonce2.clone(),

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use dcentrald_asic::drivers::ChipRegistry;
+use dcentrald_asic::drivers::{ChipDriverMaturity, ChipRegistry};
 use dcentrald_hal::chain_backend::Bm1397PlusChainBackend;
 use dcentrald_hal::fpga_chain::FpgaChain;
 use dcentrald_hal::i2c::I2cPicFirmware;
@@ -41,6 +41,54 @@ fn parse_vector(contents: &str) -> (Value, Vec<TraceEvent>) {
     (header, events)
 }
 
+/// The driver maturity each golden model is registered at.
+///
+/// Pinned here deliberately. `registry_admitting_catalogued_driver` used to ask
+/// the registry what maturity a chip had and then build whichever registry that
+/// answer required — so a chip moving between Production and Experimental
+/// changed nothing observable and no test failed. Maturity is not cosmetic: it
+/// decides whether a driver may run against energized hardware without an exact
+/// per-chip opt-in. Moving a chip across that line must be a deliberate edit
+/// here, reviewed on its own, not a silent consequence of editing the registry.
+fn pinned_maturity(slug: &str) -> ChipDriverMaturity {
+    match slug {
+        // BM1387 / BM1362 / BM1366 / BM1368 — Production.
+        "s9" | "s19jpro" | "s19xp" | "s19kpro" | "s21" => ChipDriverMaturity::Production,
+        // BM1397 / BM1398 / BM1370 — implemented, and admitted only behind an
+        // exact per-chip experimental opt-in.
+        "s17" | "s17pro" | "t17" | "s19pro" | "s21pro" => ChipDriverMaturity::Experimental,
+        other => panic!(
+            "golden model {other:?} has no pinned driver maturity. Add it to \
+             pinned_maturity deliberately; do not let the registry decide, which \
+             is exactly the drift this pin exists to catch."
+        ),
+    }
+}
+
+fn registry_admitting_catalogued_driver(slug: &str, chip_id: u16) -> ChipRegistry {
+    let production = ChipRegistry::production();
+    let recognition = production
+        .recognize(chip_id)
+        .expect("golden model chip identity must be catalogued");
+    let pinned = pinned_maturity(slug);
+    assert_eq!(
+        recognition.maturity(),
+        pinned,
+        "chip {chip_id:#06x} ({slug}) is registered as {:?} but this golden test pins \
+         {pinned:?}. If the change is intended, update pinned_maturity in the same \
+         commit and say why — a Production promotion means the driver may execute \
+         against energized hardware with no per-chip opt-in.",
+        recognition.maturity()
+    );
+    match pinned {
+        ChipDriverMaturity::Production => production,
+        ChipDriverMaturity::Experimental => ChipRegistry::with_experimental_driver(chip_id),
+        ChipDriverMaturity::Scaffold => {
+            panic!("golden hardware evidence must not authorize a Scaffold driver")
+        }
+    }
+}
+
 fn assert_init_vector_with_strictness(
     vector: &str,
     slug: &str,
@@ -65,10 +113,10 @@ fn assert_init_vector_with_strictness(
     }
 
     let evidence = dcentrald_re_catalog::model_evidence(slug).expect("model catalog row");
-    let registry = ChipRegistry::production();
+    let registry = registry_admitting_catalogued_driver(slug, evidence.chip_id);
     let driver = registry
         .detect(evidence.chip_id)
-        .expect("production driver");
+        .expect("driver admitted at its catalogued maturity");
     let mut chain = FpgaChain::open_sim_for_model(0, model).expect("sim chain");
     let chip_count =
         u8::try_from(evidence.chips_per_chain.expect("known chip count")).expect("u8 chip count");
@@ -78,7 +126,7 @@ fn assert_init_vector_with_strictness(
             chip_count,
             evidence.default_frequency_mhz.expect("known frequency"),
         )
-        .expect("production init");
+        .expect("maturity-admitted init");
     if let Some(expected) = expected_open_core_writes {
         assert_eq!(
             driver
@@ -255,14 +303,14 @@ fn assert_structural_init_vector(
     assert_eq!(header["model"], slug);
     assert_eq!(header["strictness"], "structural");
     let evidence = dcentrald_re_catalog::model_evidence(slug).expect("model catalog row");
-    let registry = ChipRegistry::production();
+    let registry = registry_admitting_catalogued_driver(slug, evidence.chip_id);
     let driver = registry
         .detect(evidence.chip_id)
-        .expect("production driver");
+        .expect("driver admitted at its catalogued maturity");
     let mut chain = FpgaChain::open_sim_for_model(0, model).expect("sim chain");
     driver
         .init_chain(&mut chain, chip_count, frequency_mhz)
-        .expect("production init");
+        .expect("maturity-admitted init");
     let actual = chain.drain_sim_trace().expect("sim trace");
 
     let mut cursor = 0;

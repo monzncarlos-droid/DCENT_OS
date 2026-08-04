@@ -265,7 +265,29 @@ pub fn resolve_global_gpio(gpio: u32) -> Result<Option<(PathBuf, u32)>> {
 ///
 /// Useful when the gpio number isn't known but the DT label is, e.g.
 /// `HB0_RESET` on the `0x41210000` PL GPIO bank.
+///
+/// Returns the FIRST matching offset. Callers that must fail closed on
+/// duplicate names should use [`crate::gpio_name_resolver`] instead, which
+/// scans every chip and refuses ambiguous names.
 pub fn line_offset_by_name(chip_path: &Path, label: &str) -> Result<Option<u32>> {
+    let names = list_line_names(chip_path)?;
+    for (offset, name) in names.iter().enumerate() {
+        if name.as_deref() == Some(label) {
+            return Ok(Some(offset as u32));
+        }
+    }
+    Ok(None)
+}
+
+/// Enumerate every line's kernel-published (DT `gpio-line-names`) name on a
+/// chardev chip via the v1 `GPIO_GET_LINEINFO` ioctl.
+///
+/// Index `i` of the returned vec is line offset `i`. Lines with no
+/// DT-assigned name (or whose line-info ioctl failed) are `None`.
+///
+/// This is the chardev half of the UB-23 by-name resolution capability
+/// (`crate::gpio_name_resolver`); the sysfs/DT half lives there.
+pub fn list_line_names(chip_path: &Path) -> Result<Vec<Option<String>>> {
     let chip_fd = open_chip(chip_path)?;
 
     let mut info = GpiochipInfo {
@@ -289,7 +311,7 @@ pub fn line_offset_by_name(chip_path: &Path, label: &str) -> Result<Option<u32>>
         )));
     }
 
-    let label_bytes = label.as_bytes();
+    let mut names: Vec<Option<String>> = Vec::with_capacity(info.lines as usize);
     for offset in 0..info.lines {
         let mut line_info = GpiolineInfo {
             line_offset: offset,
@@ -305,6 +327,7 @@ pub fn line_offset_by_name(chip_path: &Path, label: &str) -> Result<Option<u32>>
             )
         };
         if rc < 0 {
+            names.push(None);
             continue;
         }
         let len = line_info
@@ -312,11 +335,15 @@ pub fn line_offset_by_name(chip_path: &Path, label: &str) -> Result<Option<u32>>
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(line_info.name.len());
-        if &line_info.name[..len] == label_bytes {
-            return Ok(Some(offset));
+        if len == 0 {
+            names.push(None);
+        } else {
+            names.push(Some(
+                String::from_utf8_lossy(&line_info.name[..len]).into_owned(),
+            ));
         }
     }
-    Ok(None)
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------

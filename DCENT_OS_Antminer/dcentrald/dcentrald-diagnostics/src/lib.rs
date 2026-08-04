@@ -5,9 +5,9 @@
 //! subprocess-based tests (wrapping existing Python tools).
 //!
 //! Modules:
-//! - `hashreport`   - HashReport 15-minute test drive
+//! - `hashreport`   - HashReport schema and current completion-snapshot grading
 //! - `chip_health`  - Per-chip health scoring and ChipMap
-//! - `board_health` - Per-board health test
+//! - `board_health` - Per-board snapshot schema and canonical health grading
 //! - `troubleshoot` - Instant troubleshooting tools
 //! - `report`       - HTML/PDF report generation (askama templates)
 //! - `progress`     - Progress tracking and WebSocket push
@@ -23,22 +23,38 @@
 //! is not treated as EEPROM presence or validation. Consequently snapshots are
 //! useful triage records, but cannot claim a measured pass.
 //!
-//! Dedicated hardware-test producers should migrate each observation to
-//! `DiagnosticEvidence::measured` or `measured_validated`, name the concrete
-//! sensor/protocol/checksum source, attach an observation time when available,
-//! and keep the evidence value identical to the field being graded. Residual
-//! producer gap: `SnapshotChain` has no voltage-readback, bounded CRC-window,
-//! or EEPROM read/checksum provenance, so snapshot reports remain capped until
-//! those data paths expose direct observations.
+//! Production builds intentionally expose no constructor that can mint
+//! measured-verdict authority from caller-supplied values. Dedicated hardware
+//! producers must first add the run-bound, parser-issued receipt path described
+//! by the v3 contract; source text and a timestamp alone are insufficient.
+//! Residual producer gap: `SnapshotChain` has no bounded chip-enumeration, typed
+//! temperature-sensor, voltage-readback, bounded CRC-window, or EEPROM
+//! read/checksum provenance, so snapshot reports remain capped until those
+//! data paths expose direct observations.
+//! Serialized v2 evidence is offline-unattested and cannot recreate the private,
+//! test-only construction witness used to exercise A/B grading rules. Run/capture binding,
+//! explicit verification status, and portable attestation belong to the v3
+//! envelope described in `docs/architecture/DIAGNOSTIC_EVIDENCE.md`.
 
 pub mod board_health;
 pub mod builders;
 /// Pure chip anomaly math bridge (`dcentrald-chip-analysis`).
 pub mod chip_analysis_bridge;
 pub mod chip_health;
+/// Honest snapshot vs active-stim labels (P2-5).
+pub mod diagnostic_mode;
 pub mod evidence;
 pub mod hashreport;
+/// Offline factory pattern-test parser/grader (default-OFF `pattern-selftest`).
+///
+/// Pure only: parses held AMTC pattern blobs and grades per-core nonce maps.
+/// Does **not** dispatch work or open hardware. The live self-test arm remains
+/// a separate, gated item that must consume `admit_work_dispatch`.
+#[cfg(feature = "pattern-selftest")]
+pub mod pattern_test;
 pub mod progress;
+/// Physical fault localization from a ChipMap (pure, Inferred-grade diagnoses).
+pub mod repair_advisor;
 pub mod report;
 pub mod snapshot;
 pub mod subprocess;
@@ -47,7 +63,14 @@ pub mod troubleshoot;
 pub use chip_analysis_bridge::{
     analyze_chip, enrich_cell_anomalies, ChipAnalysis, ChipAnomalyScores,
 };
+pub use diagnostic_mode::{
+    admit_report_kind, evidence_kind_from_measurement_provenance, parse_report_kind,
+    DiagnosticModeError, DiagnosticRunMode,
+};
 pub use evidence::{DiagnosticEvidence, EvidenceKind, EvidenceQuality};
+pub use repair_advisor::{
+    analyze_chipmap, RepairConfidence, RepairContext, RepairRecommendation, SuspectedComponent,
+};
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;

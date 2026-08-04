@@ -414,11 +414,20 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
             pic_addrs_hint: Some(X17_PIC_ADDRS),
             support_tier: SupportTier::Experimental,
         },
+        // S17+/T17+ are BM1397 -- operator-confirmed twice and corroborated by four
+        // independent sources. Promoted from the unregistered 0x1396 to the
+        // RECOGNIZED BM1397 identity (the same one S17 / S17 Pro / T17 already
+        // use) by operator decision 2026-08-03, at SupportTier::Experimental.
+        // BM1397 is registered at Experimental maturity, so production dispatch
+        // still requires an explicit per-chip opt-in -- this ends "points at a
+        // chip that can never resolve", it does not open the boards up. No
+        // S17+/T17+ exists on the fleet. Chip COUNTS differ from S17 (65 and 44
+        // per chain, not 48) and are unchanged.
         "s17+" | "s17plus" => ModelSpec {
             model_key: "s17+",
-            family_key: "bm1396",
-            chip_label: "BM1396",
-            chip_id: Some(0x1396),
+            family_key: "bm1397",
+            chip_label: "BM1397",
+            chip_id: Some(0x1397),
             chips_per_chain_hint: Some(65),
             pic_type_hint: Some(ModelPicTypeHint::Pic16),
             pic_addrs_hint: Some(X17_PIC_ADDRS),
@@ -426,9 +435,9 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
         },
         "t17+" | "t17plus" => ModelSpec {
             model_key: "t17+",
-            family_key: "bm1396",
-            chip_label: "BM1396",
-            chip_id: Some(0x1396),
+            family_key: "bm1397",
+            chip_label: "BM1397",
+            chip_id: Some(0x1397),
             chips_per_chain_hint: Some(44),
             pic_type_hint: Some(ModelPicTypeHint::Pic16),
             pic_addrs_hint: Some(X17_PIC_ADDRS),
@@ -661,8 +670,15 @@ pub fn board_target_chip_label(board_target: &str) -> Option<&'static str> {
         "am2s19j" | "am2s19jpro" | "am2s19jprozynq" | "am2s19jproxil25" | "am2xil25" => "BM1362",
         "am2s19xp" => "BM1366",
         "am2s17" | "am2s17p" | "am2s17pro" | "am2t17" => "BM1397",
-        "am2s17plus" | "am2t17plus" => "BM1396",
-        "x17s17edspicplanned" | "x17t17epic16planned" => "BM1397",
+        // Operator-confirmed 2026-08-03 and corrected repo-wide in `1eae28615`:
+        // the '+' variants are BM1397; only the 'e' variants are BM1396. These two
+        // rows were reversed, and `skus.conf` was corrected without them, which is
+        // what `live_skus_conf_agrees_with_board_target_chip_label_for_every_target`
+        // caught. This is the IDENTITY label only — see the ModelSpec `chip_id`
+        // note in `model_spec_chip_ids_match_skus_conf_for_all_20_target_skus`
+        // for why the DISPATCH id is deliberately still 0x1396.
+        "am2s17plus" | "am2t17plus" => "BM1397",
+        "x17s17edspicplanned" | "x17t17epic16planned" => "BM1396",
         // am3-aml — Amlogic A113D. Disambiguated by the model suffix.
         "am3s21" | "am3t21" => "BM1368",
         "am3s21pro" | "am3s21xp" => "BM1370",
@@ -761,19 +777,23 @@ mod tests {
         assert_eq!(board_target_chip_label("am2-s19pro"), Some("BM1398"));
         assert_eq!(board_target_chip_label("am2-s19j"), Some("BM1362"));
         assert_eq!(board_target_chip_label("am2-s19jpro-zynq"), Some("BM1362"));
-        assert_eq!(board_target_chip_label("am2-s19jpro-xil"), Some("BM1362"));
+        assert_eq!(
+            board_target_chip_label("am2-s19jpro-xil"),
+            Some("BM1362")
+        );
         assert_eq!(board_target_chip_label("am1-t15"), Some("BM1391"));
         assert_eq!(board_target_chip_label("am2-s17p"), Some("BM1397"));
-        assert_eq!(board_target_chip_label("am2-s17plus"), Some("BM1396"));
+        // '+' = BM1397, 'e' = BM1396 (operator-confirmed; see the match arm).
+        assert_eq!(board_target_chip_label("am2-s17plus"), Some("BM1397"));
         assert_eq!(board_target_chip_label("am2-t17"), Some("BM1397"));
-        assert_eq!(board_target_chip_label("am2-t17plus"), Some("BM1396"));
+        assert_eq!(board_target_chip_label("am2-t17plus"), Some("BM1397"));
         assert_eq!(
             board_target_chip_label("x17-s17e-dspic-planned"),
-            Some("BM1397")
+            Some("BM1396")
         );
         assert_eq!(
             board_target_chip_label("x17-t17e-pic16-planned"),
-            Some("BM1397")
+            Some("BM1396")
         );
         assert_eq!(board_target_chip_label("am3-s21"), Some("BM1368"));
         assert_eq!(board_target_chip_label("am3-t21"), Some("BM1368"));
@@ -851,11 +871,14 @@ mod tests {
         assert_eq!(id("t15"), None); // skus.conf am1-t15 scaffold
         assert_eq!(id("s17"), Some(0x1397)); // am2-s17p
         assert_eq!(id("s17pro"), Some(0x1397)); // am2-s17p
-        assert_eq!(id("s17+"), Some(0x1396)); // am2-s17plus fail-closed BM1396
+                                                // RECONCILED 2026-08-03 by operator decision: skus.conf,
+                                                // `board_target_chip_label`, `asic_protocol` and this `chip_id` all now
+                                                // say S17+/T17+ = BM1397. There is no remaining carve-out on this axis.
+        assert_eq!(id("s17+"), Some(0x1397)); // am2-s17plus, Experimental
         assert_eq!(id("t17"), Some(0x1397)); // am2-t17
-        assert_eq!(id("t17+"), Some(0x1396)); // am2-t17plus fail-closed BM1396
-        assert_eq!(id("s17e"), None); // planned BM1397 scaffold
-        assert_eq!(id("t17e"), None); // planned BM1397 scaffold
+        assert_eq!(id("t17+"), Some(0x1397)); // am2-t17plus, Experimental
+        assert_eq!(id("s17e"), None); // planned BM1396 scaffold
+        assert_eq!(id("t17e"), None); // planned BM1396 scaffold
         assert_eq!(id("s19"), Some(0x1398)); // am2-s19
         assert_eq!(id("s19pro"), Some(0x1398)); // am2-s19pro
         assert_eq!(id("s19jpro"), Some(0x1362)); // am2-s19jpro-zynq
@@ -881,30 +904,57 @@ mod tests {
     }
 
     #[test]
-    fn bm1396_s17plus_t17plus_are_identified_but_not_driver_promoted() {
-        use dcentrald_asic::drivers::ChipRegistry;
+    fn bm1397_s17plus_t17plus_dispatch_experimental_and_keep_their_own_geometry() {
+        use dcentrald_asic::drivers::{ChipDriverMaturity, ChipRegistry};
 
         for model in ["s17+", "s17plus", "t17+", "t17plus"] {
-            let spec = lookup_model(model).expect("BM1396 plus-family model");
-            assert_eq!(spec.chip_label, "BM1396");
-            assert_eq!(spec.chip_id, Some(0x1396));
+            let spec = lookup_model(model).expect("BM1397 plus-family model");
+            assert_eq!(spec.chip_label, "BM1397");
+            assert_eq!(spec.chip_id, Some(0x1397));
             assert_eq!(spec.support_tier, SupportTier::Experimental);
         }
 
+        // Same silicon as S17/S17 Pro/T17, DIFFERENT geometry. Promoting the chip
+        // family must never drag S17's 48 chips/chain onto the '+' variants --
+        // that is exactly the confusion the vendor catalog header caused.
         assert_eq!(model_chip_count_hint("s17+"), Some(65));
         assert_eq!(model_chip_count_hint("t17+"), Some(44));
+        assert_ne!(model_chip_count_hint("s17+"), model_chip_count_hint("s17"));
         assert_eq!(model_pic_type_hint("s17+"), Some(ModelPicTypeHint::Pic16));
         assert_eq!(model_pic_type_hint("t17+"), Some(ModelPicTypeHint::Pic16));
+
+        // 0x1397 is a RECOGNIZED identity, so an S17+/T17+ can reach a driver at
+        // all. It is deliberately NOT production-dispatchable on sight: BM1397 is
+        // registered at Experimental maturity, so `production()` still refuses it
+        // until the operator opts that exact chip in. Identical posture to S17 /
+        // S17 Pro / T17; the '+' variants simply join it instead of pointing at an
+        // unregistered 0x1396 that could never resolve.
+        let production = ChipRegistry::production();
+        let recognition = production
+            .recognize(0x1397)
+            .expect("S17+/T17+ must reach the recognized BM1397 identity");
+        assert_eq!(recognition.chip_name(), "BM1397");
+        assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
         assert!(
-            ChipRegistry::production().detect(0x1396).is_none(),
-            "BM1396 is identified for S17+/T17+, but remains fail-closed until a live enumerate bench gate"
+            production.detect(0x1397).is_none(),
+            "Experimental maturity must still gate production dispatch"
+        );
+        assert!(
+            ChipRegistry::with_experimental_driver(0x1397)
+                .detect(0x1397)
+                .is_some(),
+            "explicit Experimental opt-in must reach the BM1397 driver"
+        );
+        assert!(
+            production.recognize(0x1396).is_none(),
+            "BM1396 (S17e/T17e) remains entirely unregistered"
         );
     }
 
     #[test]
     fn live_skus_conf_agrees_with_board_target_chip_label_for_every_target() {
         // Authoritative cross-source gate: read the LIVE skus.conf (the
-        // acceptance-harness 20-SKU source of truth) and verify the daemon's
+        // acceptance-harness 21-SKU source of truth) and verify the daemon's
         // board_target_chip_label resolves each board_target to the SAME chip.
         // Unlike the hardcoded pins above, this catches a divergence introduced on
         // EITHER side (a skus.conf edit OR a model.rs edit) — the exact class of the
@@ -929,8 +979,8 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 20,
-            "skus.conf must list exactly the 20 target SKUs; cross-checked {checked}"
+            checked, 21,
+            "skus.conf must list exactly the 21 target SKUs; cross-checked {checked}"
         );
     }
 

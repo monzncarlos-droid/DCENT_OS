@@ -147,10 +147,12 @@ pub const BM1397_CHIP_ID_REPLY: [u8; 2] = [0x13, 0x97];
 pub const BM1397_MISC_CONTROL_DEFAULT: u32 = 0x0000_3A01;
 
 /// BM1397 fast-UART (BHB07601 jig path) = a TWO-register write: reg 0x68 then
-/// reg 0x28. Source `set_baud_ext@269A4.c`. UNVERIFIED on-wire — do NOT wire
-/// into a live path without a scope capture (RE-ASK-CHIP-BM1397).
-pub const BM1397_FAST_UART_REG68: u32 = 0xC070_0111;
-pub const BM1397_FAST_UART_REG28: u32 = 0x0600_000F;
+/// reg 0x28. Source `set_baud_ext@269A4.c`. G43 pure SSOT in `dcentrald_common`
+/// (`BM1397_FAST_UART_PLL3_VALUE` / `BM1397_FAST_UART_CONFIG_VALUE` +
+/// `plan_bm1397_fast_uart_pll3_then_config`). Live host reclock still
+/// EXPERIMENTAL / scope-gated.
+pub const BM1397_FAST_UART_REG68: u32 = dcentrald_common::BM1397_FAST_UART_PLL3_VALUE;
+pub const BM1397_FAST_UART_REG28: u32 = dcentrald_common::BM1397_FAST_UART_CONFIG_VALUE;
 
 #[cfg(test)]
 mod tests {

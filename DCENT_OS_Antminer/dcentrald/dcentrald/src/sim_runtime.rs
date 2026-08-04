@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use dcentrald_asic::chain::Chain as HashChain;
+use dcentrald_asic::chain::{Chain as HashChain, EnumerationCommandDialect};
 use dcentrald_asic::drivers::ChipRegistry;
 use dcentrald_hal::chain_backend::Bm1397PlusChainBackend;
 use dcentrald_hal::fpga_chain::FpgaChain;
@@ -83,7 +83,7 @@ async fn accepted_loopback_share(chain: &FpgaChain, worker: &str) -> Result<Mock
         .context("loopback job timeout")?
         .ok_or_else(|| anyhow!("loopback pool closed before job"))?;
     job.share_target = [0xff; 32];
-    let work = WorkBuilder::new().next_work(&job);
+    let work = WorkBuilder::new().next_work(&job)?;
     let expected_nonce = 0x1357_2468;
     let header = header_for(&work, expected_nonce);
     if !validate_full_header(&header, &work.share_target) {
@@ -101,6 +101,7 @@ async fn accepted_loopback_share(chain: &FpgaChain, worker: &str) -> Result<Mock
         .ok_or_else(|| anyhow!("simulated chain produced no nonce"))?;
     share_tx
         .send(ValidShare {
+            work_generation: work.work_generation,
             worker_name: worker.to_string(),
             job_id: work.job_id,
             extranonce2: work.extranonce2,
@@ -160,7 +161,7 @@ pub async fn run(config: DcentraldConfig, shutdown: CancellationToken) -> Result
     let mut chain = FpgaChain::open_sim_for_model(0, model)?;
     if model == SimModel::S9 {
         let mut legacy = HashChain::new(chain, 6);
-        let enumerated = legacy.enumerate_chips()?;
+        let enumerated = legacy.enumerate_chips(EnumerationCommandDialect::Bm1387)?;
         if (enumerated.chip_count(), enumerated.chip_id()) != (chip_count, profile.chip_id) {
             return Err(anyhow!("legacy enumeration mismatch: {enumerated:?}"));
         }

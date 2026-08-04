@@ -1,0 +1,16 @@
+# DEPRECATED ALIAS of `sdkconfig.defaults.16mb`.
+#
+# The 16 MB (N16R8) flash geometry stopped being Hammer-specific when the Lucky
+# Miner LVxx family (also N16R8) landed, so the canonical overlay was renamed to
+# `sdkconfig.defaults.16mb` and the partition table to `partitions-16mb.csv`.
+# This file is kept ONLY so an existing command line, script, or doc that still
+# names `sdkconfig.defaults.hammer-16mb` keeps producing the identical layout.
+#
+# Prefer `sdkconfig.defaults.16mb` in anything new. The partition TABLE is
+# single-sourced (`partitions-16mb.csv`); only these four flash-mode keys are
+# repeated here, and they must stay byte-identical to the canonical overlay.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16mb.csv"

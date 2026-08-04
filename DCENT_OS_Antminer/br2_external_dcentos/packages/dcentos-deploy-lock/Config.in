@@ -1,0 +1,8 @@
+config BR2_PACKAGE_DCENTOS_DEPLOY_LOCK
+	bool "dcentos-deploy-lock"
+	help
+	  Kernel-backed command serializer for dcentrald boot admission,
+	  development deployment, recovery, and recovery-administration
+	  operations. The lock is nonblocking and is released by the kernel
+	  if the owner dies; no pathname lease is treated as liveness.
+

@@ -35,6 +35,8 @@ pub const STRATUM_DEFAULT_VERSION_MASK: u32 = 0x1FFFE000;
 // ── Register types ──────────────────────────────────────────────────────────
 
 /// Register type identifiers matching the C enum
+/// (`Invalid`..=`PllParam` are the faithful ESP-Miner port; the telemetry
+/// variants below them are DCENT extensions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RegisterType {
@@ -47,6 +49,18 @@ pub enum RegisterType {
     Domain3Count,
     ErrorCount,
     PllParam,
+    // ── DCENT extensions (not in the ESP-Miner C enum) ──────────────────────
+    // Appended at the END so the existing #[repr(u8)] discriminants
+    // (Invalid=0 .. PllParam=8) never move. Added for the Avalon shim
+    // drivers' STATUS_ASIC Temp/Volt telemetry, which previously had no
+    // honest variant and was mislabelled as `Hashrate` — a raw temperature
+    // ADC word must never be typed as hashrate.
+    /// Raw temperature telemetry word (e.g. Avalon STATUS_ASIC subtype Temp).
+    /// Units/scaling are chip-specific and NOT normalised here.
+    Temperature,
+    /// Raw voltage telemetry word (e.g. Avalon STATUS_ASIC subtype Volt).
+    /// Units/scaling are chip-specific and NOT normalised here.
+    Voltage,
 }
 
 // ── ASIC model ──────────────────────────────────────────────────────────────
@@ -58,6 +72,22 @@ pub enum AsicModel {
     BM1370,
     BM1373, // S23 chip — SCAFFOLD (pre-hardware, 2026-04-14)
     BM1397,
+    /// MSBT0501 (vendor driver name `LT0051`) — the **Scrypt** ASIC in the
+    /// Hammer/Volc DC0x line. `PowAlgorithm::Scrypt1024`, not SHA-256d.
+    ///
+    /// The variant is deliberately **NOT** feature-gated even though the
+    /// `lt0051` driver module is (`asic-lt0051`, default OFF). Reason: the
+    /// NVS `asicmodel` string "MSBT0501" must resolve to THIS variant on every
+    /// build. A cfg-gated variant would leave the string falling through
+    /// `config.rs::asic_model()`'s catch-all to the **BM1366** fallback — the
+    /// exact latent trap that was found and fixed for BM1373 in the BC0x lane,
+    /// and which here would mean running a Bitmain SHA-256 init sequence
+    /// against live Scrypt silicon.
+    ///
+    /// With the feature off, `create_driver` returns an `UnsupportedAsicDriver`
+    /// that refuses every operation — same fail-closed outcome as the real
+    /// scaffold, no wrong-chip init.
+    Lt0051,
     // KF1950 (WhatsMiner K-series, M30/M30S/M31S/M32 era).
     // UNTESTED RESEARCH DRIVER — gated by `asic-kf1950` feature, default OFF.
     #[cfg(feature = "asic-kf1950")]
@@ -80,11 +110,324 @@ impl fmt::Display for AsicModel {
             AsicModel::BM1370 => write!(f, "BM1370"),
             AsicModel::BM1373 => write!(f, "BM1373"),
             AsicModel::BM1397 => write!(f, "BM1397"),
+            AsicModel::Lt0051 => write!(f, "MSBT0501"),
             #[cfg(feature = "asic-kf1950")]
             AsicModel::KF1950 => write!(f, "KF1950"),
             #[cfg(feature = "asic-avalon")]
             AsicModel::Avalon => write!(f, "Avalon"),
         }
+    }
+}
+
+// ── Proof-of-work algorithm (P1 Scrypt seam / P2 Scrypt target math) ────────
+
+/// Bitcoin pool-difficulty-1 share target, `2^224 - 1`, 32 bytes big-endian.
+///
+/// Single source shared with `dcentaxe_stratum::types::PDIFF1_TARGET` (a
+/// compile-linked parity test pins the two byte-identical).
+pub const SHA256D_PDIFF1_TARGET: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
+
+/// **THE SCRYPT DIFF-1 CONVENTION (P2 decision, `SCRYPT_STACK_DESIGN.md`
+/// §2.3 R4).**
+///
+/// Litecoin/scrypt pools conventionally define "difficulty 1" as a target
+/// `65536 x` LARGER (easier) than Bitcoin's — i.e. a diff-1 scrypt share costs
+/// `2^16` hashes where a diff-1 SHA-256 share costs `2^32`. This is the
+/// "ltc-scale" convention; the alternative "btc-scale" convention reuses
+/// Bitcoin's constant and compensates by sending FRACTIONAL difficulties.
+///
+/// The scale is expressed here as ONE named constant rather than a magic
+/// number baked into a target literal, because getting it wrong is a
+/// `x65536` error in BOTH directions at once:
+/// - too loose  -> we submit ~65536x too many shares -> "low difficulty share"
+///   flood -> pool ban;
+/// - too tight  -> we submit ~nothing and report a hashrate 65536x low.
+///
+/// Neither failure is visible from the wire format, so the runtime
+/// [`pool agreement monitor`](../../dcentaxe-stratum/src/pool_agreement.rs)
+/// is the live cross-check that catches a convention mismatch from the pool's
+/// own accept/reject responses.
+pub const SCRYPT_DIFF1_SCALE_VS_BITCOIN: u64 = 65536;
+
+/// Scrypt pool-difficulty-1 share target =
+/// [`SHA256D_PDIFF1_TARGET`] x [`SCRYPT_DIFF1_SCALE_VS_BITCOIN`]
+/// = `(2^224 - 1) * 2^16` = `2^240 - 2^16`, 32 bytes big-endian.
+///
+/// Byte form: two `0x00`, twenty-eight `0xFF`, two `0x00`. Derived (not
+/// transcribed) by `scrypt_pdiff1_is_exactly_bitcoin_pdiff1_times_the_scale`.
+pub const SCRYPT_PDIFF1_TARGET: [u8; 32] = [
+    0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+];
+
+/// `log2` of the diff-1 target used by the fractional-difficulty target
+/// solver: Bitcoin's `2^224`, Scrypt's `2^240`.
+pub const SHA256D_PDIFF1_LOG2: i32 = 224;
+/// See [`SHA256D_PDIFF1_LOG2`].
+pub const SCRYPT_PDIFF1_LOG2: i32 = 240;
+
+/// Lowest `mining.set_difficulty` value the Scrypt path will honour without
+/// flooring (STRATUM-2, made algorithm-conditional in P2).
+///
+/// `1 / 65536` is chosen for one specific reason, not as a round number: under
+/// [`SCRYPT_PDIFF1_TARGET`] it produces EXACTLY the target that a **btc-scale**
+/// pool means by "difficulty 1". It is therefore the widest sub-1 value that a
+/// diff-1 *convention mismatch* can possibly explain. Anything below it is not
+/// a scale disagreement — it is garbage — and is floored, exactly as the
+/// SHA-256 path floors at `1.0`.
+///
+/// ⚠ Honest residual: honouring a sub-1 difficulty under the ltc-scale
+/// constant still yields a very loose target. The floor bounds the blast
+/// radius; the real defence against a convention mismatch is the pool
+/// agreement monitor, and bring-up must run on a test account first.
+pub const SCRYPT_MIN_POOL_DIFFICULTY: f64 = 1.0 / SCRYPT_DIFF1_SCALE_VS_BITCOIN as f64;
+
+/// Hashrate display unit for an algorithm (design §4.6). Scrypt ASICs are
+/// SRAM-dominated and hash in MH/s, not GH/s — using the SHA-256 unit would
+/// misreport a DC06 by `1000x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashrateUnit {
+    /// Gigahashes per second (SHA-256 boards).
+    GigaHashPerSecond,
+    /// Megahashes per second (Scrypt boards).
+    MegaHashPerSecond,
+}
+
+impl HashrateUnit {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HashrateUnit::GigaHashPerSecond => "GH/s",
+            HashrateUnit::MegaHashPerSecond => "MH/s",
+        }
+    }
+
+    /// Hashes per one unit (`1e9` for GH/s, `1e6` for MH/s).
+    pub const fn hashes_per_unit(self) -> f64 {
+        match self {
+            HashrateUnit::GigaHashPerSecond => 1.0e9,
+            HashrateUnit::MegaHashPerSecond => 1.0e6,
+        }
+    }
+}
+
+/// Which proof-of-work function a chip / work unit / board mines.
+///
+/// Design: `docs/SCRYPT_STACK_DESIGN.md` §4.2 — deliberately an **enum, not a
+/// trait object** (no `dyn` on the hot path; `match` exhaustiveness gives the
+/// same compiler-enforced coverage the board tables rely on).
+///
+/// P2 status: BOTH algorithms now have real target math and real host-side
+/// share validation. Product-level fail-closed posture for Scrypt is enforced
+/// where it belongs instead — the `LT0051` driver is a refusing scaffold and
+/// every Hammer DC0x board row declares `fan/temp/power = None` so
+/// `BoardConfig::validate()` refuses mining.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum PowAlgorithm {
+    /// Bitcoin SHA-256d — all existing chips (BM13xx, KF1950, Avalon).
+    #[default]
+    Sha256d,
+    /// Litecoin `scrypt(N=1024, r=1, p=1)` — MSBT0501/LT0051, future
+    /// BM1485/BM1489.
+    Scrypt1024,
+}
+
+impl PowAlgorithm {
+    /// The pool-difficulty-1 share target for this algorithm (32 bytes,
+    /// big-endian). See [`SCRYPT_DIFF1_SCALE_VS_BITCOIN`] for the Scrypt
+    /// convention decision.
+    pub const fn pdiff1_target(self) -> [u8; 32] {
+        match self {
+            PowAlgorithm::Sha256d => SHA256D_PDIFF1_TARGET,
+            PowAlgorithm::Scrypt1024 => SCRYPT_PDIFF1_TARGET,
+        }
+    }
+
+    /// `log2` of the diff-1 target, for the fractional-difficulty solver.
+    pub const fn pdiff1_log2(self) -> i32 {
+        match self {
+            PowAlgorithm::Sha256d => SHA256D_PDIFF1_LOG2,
+            PowAlgorithm::Scrypt1024 => SCRYPT_PDIFF1_LOG2,
+        }
+    }
+
+    /// Lowest pool difficulty honoured before flooring (STRATUM-2, now
+    /// algorithm-conditional).
+    ///
+    /// `Sha256d` keeps the historical `1.0` floor byte-for-byte: SHA-256 ASIC
+    /// pools never set diff<1 for a BitAxe, and both the dispatcher's
+    /// `mining.set_difficulty` handler and `difficulty_to_target` collapse
+    /// `0 < d < 1` to the diff-1 target. `Scrypt1024` lowers it to
+    /// [`SCRYPT_MIN_POOL_DIFFICULTY`] so a legitimate btc-scale Scrypt pool's
+    /// fractional difficulty is honoured instead of silently over-tightened.
+    ///
+    /// ⚠ BOTH consumers must move together (the STRATUM-2 note): the
+    /// dispatcher floor and the target math. They do — each calls this.
+    pub const fn min_pool_difficulty(self) -> f64 {
+        match self {
+            PowAlgorithm::Sha256d => 1.0,
+            PowAlgorithm::Scrypt1024 => SCRYPT_MIN_POOL_DIFFICULTY,
+        }
+    }
+
+    /// Whether BIP310/BIP320 version rolling (ASICBoost) applies.
+    ///
+    /// Scrypt has no AsicBoost equivalent; the Stratum client must skip
+    /// `mining.configure` version-rolling negotiation entirely for Scrypt
+    /// pools (design §2.3) and the dispatcher must never reconstruct a rolled
+    /// version, program a hardware version mask, or drop a share for rolling
+    /// "outside the negotiated mask" on a Scrypt work unit.
+    pub const fn supports_version_rolling(self) -> bool {
+        match self {
+            PowAlgorithm::Sha256d => true,
+            PowAlgorithm::Scrypt1024 => false,
+        }
+    }
+
+    /// Display unit for hashrate surfaces (design §4.6).
+    pub const fn hashrate_unit(self) -> HashrateUnit {
+        match self {
+            PowAlgorithm::Sha256d => HashrateUnit::GigaHashPerSecond,
+            PowAlgorithm::Scrypt1024 => HashrateUnit::MegaHashPerSecond,
+        }
+    }
+
+    /// True when the full host-side stack (target math, share validation) is
+    /// implemented for this algorithm. Both are implemented as of P2 — this
+    /// is NOT a claim that a Scrypt BOARD can mine (it cannot: the LT0051
+    /// driver refuses and the DC0x board rows refuse).
+    pub const fn is_implemented(self) -> bool {
+        matches!(self, PowAlgorithm::Sha256d | PowAlgorithm::Scrypt1024)
+    }
+}
+
+impl fmt::Display for PowAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PowAlgorithm::Sha256d => write!(f, "SHA-256d"),
+            PowAlgorithm::Scrypt1024 => write!(f, "Scrypt-1024"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pow_algorithm_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_sha256d() {
+        // The entire P1 seam relies on this: every site that does not
+        // explicitly choose an algorithm gets Sha256d.
+        assert_eq!(PowAlgorithm::default(), PowAlgorithm::Sha256d);
+    }
+
+    #[test]
+    fn sha256d_pdiff1_target_is_2_pow_224_minus_1() {
+        let t = PowAlgorithm::Sha256d.pdiff1_target();
+        assert_eq!(&t[0..4], &[0, 0, 0, 0]);
+        assert!(t[4..].iter().all(|&b| b == 0xFF));
+        assert!(PowAlgorithm::Sha256d.is_implemented());
+    }
+
+    // ── P2: the diff-1 convention landmine, pinned by DERIVATION ────────────
+    //
+    // The Scrypt constant is not transcribed by hand; this test multiplies the
+    // Bitcoin constant by the named scale factor with 256-bit long
+    // multiplication and asserts the literal matches. A typo in either the
+    // scale or the byte literal fails here, which is the whole point: a
+    // x65536 error is invisible on the wire and shows up only as a pool ban
+    // or a 65536x hashrate lie.
+    #[test]
+    fn scrypt_pdiff1_is_exactly_bitcoin_pdiff1_times_the_scale() {
+        assert_eq!(SCRYPT_DIFF1_SCALE_VS_BITCOIN, 65536);
+
+        // 256-bit big-endian multiply-by-u64 with carry.
+        let mut product = [0u8; 32];
+        let mut carry: u128 = 0;
+        for i in (0..32).rev() {
+            let v =
+                SHA256D_PDIFF1_TARGET[i] as u128 * SCRYPT_DIFF1_SCALE_VS_BITCOIN as u128 + carry;
+            product[i] = (v & 0xFF) as u8;
+            carry = v >> 8;
+        }
+        assert_eq!(carry, 0, "scaled diff-1 target must fit in 256 bits");
+        assert_eq!(
+            product, SCRYPT_PDIFF1_TARGET,
+            "SCRYPT_PDIFF1_TARGET must equal Bitcoin pdiff1 x SCRYPT_DIFF1_SCALE_VS_BITCOIN"
+        );
+        assert_eq!(
+            PowAlgorithm::Scrypt1024.pdiff1_target(),
+            SCRYPT_PDIFF1_TARGET
+        );
+
+        // Shape sanity: 2^240 - 2^16 == 00 00 | FF x28 | 00 00.
+        assert_eq!(&SCRYPT_PDIFF1_TARGET[0..2], &[0x00, 0x00]);
+        assert!(SCRYPT_PDIFF1_TARGET[2..30].iter().all(|&b| b == 0xFF));
+        assert_eq!(&SCRYPT_PDIFF1_TARGET[30..32], &[0x00, 0x00]);
+
+        // It is EASIER (numerically larger) than Bitcoin's — a regression that
+        // made it harder would silently zero the share rate.
+        assert!(SCRYPT_PDIFF1_TARGET.as_slice() > SHA256D_PDIFF1_TARGET.as_slice());
+    }
+
+    #[test]
+    fn pdiff1_log2_matches_the_target_magnitude() {
+        // The fractional-difficulty solver approximates diff1 as 2^log2, so the
+        // exponent must be the bit index just above the target's top set bit.
+        for (algo, log2) in [
+            (PowAlgorithm::Sha256d, 224),
+            (PowAlgorithm::Scrypt1024, 240),
+        ] {
+            assert_eq!(algo.pdiff1_log2(), log2);
+            let t = algo.pdiff1_target();
+            let leading_zero_bytes = t.iter().take_while(|&&b| b == 0).count();
+            // top set bit index = 8 * (32 - leading_zero_bytes) - 1
+            let top_bit = 8 * (32 - leading_zero_bytes) - 1;
+            assert_eq!(top_bit as i32 + 1, log2, "{algo:?}");
+        }
+    }
+
+    #[test]
+    fn min_pool_difficulty_is_algorithm_conditional() {
+        // STRATUM-2: SHA-256 keeps the historical 1.0 floor byte-for-byte.
+        assert_eq!(PowAlgorithm::Sha256d.min_pool_difficulty(), 1.0);
+        // Scrypt honours sub-1 down to the btc-scale diff-1 equivalent.
+        assert_eq!(
+            PowAlgorithm::Scrypt1024.min_pool_difficulty(),
+            1.0 / 65536.0
+        );
+        assert!(PowAlgorithm::Scrypt1024.min_pool_difficulty() < 1.0);
+        assert!(PowAlgorithm::Scrypt1024.min_pool_difficulty() > 0.0);
+    }
+
+    #[test]
+    fn version_rolling_is_sha256d_only() {
+        assert!(PowAlgorithm::Sha256d.supports_version_rolling());
+        assert!(!PowAlgorithm::Scrypt1024.supports_version_rolling());
+    }
+
+    #[test]
+    fn hashrate_unit_is_mh_for_scrypt_and_gh_for_sha256d() {
+        assert_eq!(
+            PowAlgorithm::Sha256d.hashrate_unit(),
+            HashrateUnit::GigaHashPerSecond
+        );
+        assert_eq!(PowAlgorithm::Sha256d.hashrate_unit().as_str(), "GH/s");
+        assert_eq!(
+            PowAlgorithm::Scrypt1024.hashrate_unit(),
+            HashrateUnit::MegaHashPerSecond
+        );
+        assert_eq!(PowAlgorithm::Scrypt1024.hashrate_unit().as_str(), "MH/s");
+        assert_eq!(
+            PowAlgorithm::Sha256d.hashrate_unit().hashes_per_unit()
+                / PowAlgorithm::Scrypt1024.hashrate_unit().hashes_per_unit(),
+            1000.0
+        );
     }
 }
 

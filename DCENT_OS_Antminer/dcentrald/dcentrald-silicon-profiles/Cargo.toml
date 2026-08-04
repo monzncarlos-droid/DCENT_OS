@@ -16,6 +16,9 @@ thiserror = { workspace = true }
 #  W5-A: registry references `ChipFamily` and `MinerModel` for the
 # `ProfileBundle` schema (§A of the import-infra spec).
 dcentrald-api-types = { path = "../dcentrald-api-types" }
+# P1-5 SSOT: staggered power-up schedule math + production refuse live in
+# dcentrald-common; this crate keeps serde PowerUpStep as a thin façade.
+dcentrald-common = { path = "../dcentrald-common" }
 
 [features]
 default = []
@@ -55,8 +58,6 @@ serde_json = { workspace = true }
 # status: .
 # cargo 1.95+: per-crate overrides cannot coexist with `[lints] workspace = true`.
 [lints.clippy]
-doc_lazy_continuation = "allow"
-doc_overindented_list_items = "allow"
 unwrap_used = "allow"
 expect_used = "allow"
 panic = "allow"

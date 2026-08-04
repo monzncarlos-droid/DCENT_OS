@@ -33,6 +33,27 @@ pub use crate::work::{
     validate_share, MiningWork, WorkBuilder,
 };
 
+/// Serial-path share dedup key (ASIC job id + nonce + version bits).
+///
+/// Re-exported from `dcentrald_common::serial_work_policy` so mining engines
+/// have **one** import surface for share math (validate + dedup policy) without
+/// inventing parallel key tuples.
+pub use dcentrald_common::{
+    generation_share_dedup_key, serial_share_dedup_key, should_clear_seen_shares,
+    DEFAULT_SEEN_SHARES_CAP, GENERATION_SEEN_RETAIN_WINDOW, GENERATION_SEEN_SOFT_CAP_DISPATCHER,
+    GENERATION_SEEN_SOFT_CAP_SERIAL,
+};
+
+/// FPGA / multi-midstate share dedup key (generation + nonce + midstate index).
+///
+/// Thin alias of [`generation_share_dedup_key`] for WorkDispatcher-class paths.
+/// When midstates are not distinct, pass `midstate_idx = 0` for all nonces so
+/// the key collapses to generation+nonce uniqueness.
+#[inline]
+pub fn dispatcher_share_dedup_key(generation: u64, nonce: u32, midstate_idx: u8) -> (u64, u32, u8) {
+    generation_share_dedup_key(generation, nonce, midstate_idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +71,19 @@ mod tests {
         let iv = [0u32; 8];
         let block = [0u8; 64];
         let _ = sha256_compress(&iv, &block);
+    }
+
+    #[test]
+    fn serial_and_dispatcher_dedup_keys_are_stable() {
+        assert_eq!(
+            serial_share_dedup_key(8, 0xdead_beef, 0x1ff),
+            (8, 0xdead_beef, 0x1ff)
+        );
+        assert_eq!(dispatcher_share_dedup_key(42, 0x11, 3), (42, 0x11, 3));
+        // Distinct midstate indices must not collide under the same generation.
+        assert_ne!(
+            dispatcher_share_dedup_key(1, 0xaa, 0),
+            dispatcher_share_dedup_key(1, 0xaa, 1)
+        );
     }
 }

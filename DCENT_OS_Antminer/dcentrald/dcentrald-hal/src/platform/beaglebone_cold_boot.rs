@@ -16,31 +16,27 @@
 //! bmminer_init_trace_am335x.md` (Round-4 RE deliverable) + W4 handoff
 //! Critical Action #1 (`am335x_*.{c,h,md}`). This module ports the
 //! trace's six observable phases into a single Rust entry point so a
-//! future bench-AM335x BB operator can reproduce the sequence under
+//! future bench operator on the legacy BBCtrl/S70-class carrier can reproduce the sequence under
 //! DCENT_OS without touching `bmminer`.
 //!
 //! ## Hardware-acquisition note
 //!
-//! **Bench AM335x BB unit is STILL NOT on the fleet** as of 2026-05-10
-//! — this is one of the R4 hardware acquisition asks that has been
-//! escalated for R6 (
-//! and ). The
-//! handoff §7 ship-confidence table lists am3-bb at HIGH confidence,
-//! but every execution path in this module remains unreachable from
-//! default code paths until live hardware verification closes the loop.
-//! Tests + a future bench-unit operator harness are the only callers
-//! today. The constructor
-//! [`crate::platform::beaglebone::BeagleBonePlatform::new`] does NOT
-//! call this — opt-in by design.
+//! **Bench validation of that legacy BBCtrl/S70 trace remains outstanding.**
+//! This was one of the R4 hardware-acquisition asks escalated for R6 (see
+//!  and
+//! ). The  handoff §7
+//! ship-confidence table lists am3-bb at HIGH confidence, but no claim in this
+//! module upgrades evidence-backed offline behavior into physical validation.
+//! The sequence is reachable only through the explicit experimental
+//! `--am3-bb-mining` route after exact platform admission; it is never invoked
+//! by [`crate::platform::beaglebone::BeagleBonePlatform::new`].
 //!
 //! ## Status
 //!
-//! **Code-only, hardware-gated.** No bench-AM335x BB unit on the production
-//! fleet (2026-05-10 — R4 hardware acquisition ask is still outstanding),
-//! so this routine is unreachable from any default code path. Tests + a
-//! future bench-unit operator harness are the only callers. The
-//! constructor [`crate::platform::beaglebone::BeagleBonePlatform::new`]
-//! does NOT call this — opt-in by design.
+//! **EXPERIMENTAL: implemented from strong local evidence, not bench
+//! validated.** The route is opt-in, instrumented, and fail-closed. Promotion
+//! requires a physical AM335x BB run; the platform constructor does not
+//! energize hardware or invoke this sequence.
 //!
 //! ## Phase map (matches R4 §1 timeline; W14.A1 phase-5 default-off)
 //!
@@ -66,13 +62,11 @@
 //!   reached the dispatch boundary. R4 confirms `/dev/axi_fpga_dev` on BB
 //!   is for hash-board telemetry / fan PWM / temp sensors only, NOT chain
 //!   work.
-//! - **GPIO chardev (libgpiod) is the target API.** AM335x kernel 4.6+
-//!   ships `gpio-cdev`. The existing platform code in `beaglebone.rs`
-//!   still uses sysfs (`/sys/class/gpio/gpioN/value`) for runtime
-//!   compatibility with stock Bitmain's 3.8 kernel. **TODO(W14): migrate
-//!   to libgpiod chardev once `dcentrald-hal::libgpiod` lands a stable
-//!   chip-handle API.** Until then we route through the same
-//!   `write_sysfs_gpio_value` helper as CV1835.
+//! - **Sysfs GPIO is the shared captured-kernel API.** Stock Bitmain Linux
+//!   3.8 predates `gpio-cdev`; live LuxOS Linux 5.4 retains sysfs. The current
+//!   S19J_IO_BOARD_V2_0 route therefore uses pre-opened sysfs descriptors.
+//!   A future character-device backend is additive only after its target
+//!   images and raw-level semantics are independently validated.
 //! - **No devmem pinmux replay.** CV1835 has 24× devmem writes in
 //!   `S37bitmainer_setup`. AM335x relies entirely on the DTS for pinmux;
 //!   no runtime replay is needed.
@@ -678,8 +672,9 @@ fn write_sysfs_gpio_direction(gpio: u32, dir: &str) -> Result<()> {
 // implements the v1 board-side init for `S19J_IO_BOARD_V2_0` from
 //  §3-4:
 //
-//   1. export gpio59 (board enable) + the ASIC RST gpios {49,60,27,22}
-//   2. assert gpio59 to the configured polarity → settle (~3 s)
+//   1. consume the caller's pre-opened gpio59 owner and export/configure only
+//      the ASIC RST gpios {49,60,27,22}
+//   2. use that sole owner to assert gpio59 HIGH → settle (~3 s)
 //   3. APW121215f init on the bit-banged i2c-gpio bus (bus 1) via the
 //      7-byte UART-tunnel framing: probe HW=0x76/FW=0x17, calibration
 //      read `0x06/[0x40,0x20]`, watchdog-disable `0x81/[0x00,0x00]` —
@@ -808,13 +803,20 @@ impl Default for ColdBootOptsV2 {
     }
 }
 
-/// Optional env-gate (Phase D safety): when this is `=1`, the cold-boot
-/// routine is allowed to run live. Mirrors the cvitek env-gate pattern.
-/// Since the routine is only reachable via the explicit `--am3-bb-mining`
-/// daemon mode (Phase C), the gate is **advisory** — Phase C decides
-/// whether to also require it. The constant is exported so Phase C / Phase D
-/// can find the canonical string. Default-off until live `a lab unit` verification.
-pub const ACCEPT_BEST_GUESS_COLD_BOOT_ENV: &str = "DCENT_AM3_BB_COLD_BOOT";
+/// Caller-owned authority for the sole board-enable ON transition.
+///
+/// Implementations must acquire and retain the sole ON writer plus independent
+/// physical-LOW cutoff handles before cold boot. The sequence validates that
+/// the capability is bound to the same GPIO and polarity as the immutable
+/// board target, then uses it for the ON write without re-exporting or
+/// reconfiguring the line. `assert_checked` must be one-shot, must return only
+/// after exact topology/level readback, and must reject assertion after any
+/// terminal cutoff has been published.
+pub trait PreparedBoardEnable {
+    fn gpio(&self) -> u32;
+    fn board_enable_active_high(&self) -> bool;
+    fn assert_checked(&mut self) -> Result<()>;
+}
 
 /// Run the `a lab unit`-class (`S19J_IO_BOARD_V2_0`) cold-boot sequence.
 ///
@@ -856,11 +858,12 @@ pub const ACCEPT_BEST_GUESS_COLD_BOOT_ENV: &str = "DCENT_AM3_BB_COLD_BOOT";
 ///   continues. Calibration read and watchdog-disable are Ghidra-confirmed but
 ///   still treated as non-fatal by this `a lab unit` bring-up wrapper. The hard errors
 ///   are the GPIO writes and shape checks.
-pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
+pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus, G: PreparedBoardEnable>(
     _platform: &BeagleBonePlatform,
     psu: &mut ApwUartTunnel<B>,
     uarts: &mut [DevmemUart],
     opts: ColdBootOptsV2,
+    board_enable: &mut G,
 ) -> Result<()> {
     // ── Sanity checks ─────────────────────────────────────────────────────
     let n = opts.chain_count as usize;
@@ -895,6 +898,17 @@ pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
                 .into(),
         ));
     }
+    if board_enable.gpio() != opts.board_enable_gpio
+        || board_enable.board_enable_active_high() != opts.board_enable_active_high
+    {
+        return Err(HalError::Platform(format!(
+            "prepared board-enable capability does not match cold-boot target: capability gpio{} active_high={}, target gpio{} active_high={}",
+            board_enable.gpio(),
+            board_enable.board_enable_active_high(),
+            opts.board_enable_gpio,
+            opts.board_enable_active_high
+        )));
+    }
 
     let t0 = Instant::now();
     tracing::info!(
@@ -907,16 +921,13 @@ pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
     );
 
     // ── Step 1 — export GPIOs + hold all chains in reset ──────────────────
-    // gpio59 (board enable, OUT, active_low=0 = direct level — luxminer does
-    // `set_active_low(false)` on the PSU enable pin per analysis/C §3.3) +
-    // the per-chain ASIC RST gpios (OUT, active_low=1 — luxminer does
+    // GPIO59 was already configured glitch-free OFF by the retained
+    // `PreparedBoardEnable` owner before cold boot. Configure only the per-chain
+    // ASIC RST gpios here (OUT, active_low=1 — luxminer does
     // `set_active_low(true)` on the chain-reset pins; the 2026-05-12 ftrace
     // on `a lab unit` confirms the reset pins are driven *electrically LOW* when
     // held, so logical-1 = electrical-0 = reset asserted). Order matters:
     // direction → active_low → value.
-    export_sysfs_gpio(opts.board_enable_gpio)?;
-    write_sysfs_gpio_direction(opts.board_enable_gpio, "out")?;
-    write_sysfs_gpio_active_low(opts.board_enable_gpio, false)?;
     for &g in opts.asic_rst_gpios.iter().take(4) {
         export_sysfs_gpio(g)?;
         write_sysfs_gpio_direction(g, "out")?;
@@ -925,7 +936,7 @@ pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
                                                // (The de-assert in step 5 writes logical-0 → electrical-1 = running.)
         write_sysfs_gpio_value(g, true)?;
     }
-    tracing::info!("AM335x BB S19J_IO_V2_0 cold-boot step 1 done — GPIOs exported + all chains held in reset (active-low, ftrace-confirmed)");
+    tracing::info!("AM335x BB S19J_IO_V2_0 cold-boot step 1 done — retained board-enable owner present + all chains held in reset (active-low, ftrace-confirmed)");
 
     // ── Step 2 — assert board enable, settle ──────────────────────────────
     // gpio59 polarity: active-HIGH (1 = ON). The 2026-05-12 ftrace on `a lab unit`
@@ -933,9 +944,11 @@ pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
     // "already enabled, active-HIGH, leave it alone"; analysis/C §3.3 +
     // S70cgminer also use direct-level (active_low=0). A true-cold trace would
     // show the 0→1 here; until then this is "consistent-with-confirmed", not
-    // byte-confirmed. Flip via the board-target TOML's
-    // `[gpio].board_enable_active = "low"` if a cold trace ever contradicts.
-    write_sysfs_gpio_value(opts.board_enable_gpio, opts.board_enable_active_high)?;
+    // byte-confirmed. The experimental daemon currently refuses a non-active-
+    // HIGH topology before any GPIO mutation. If a true-cold trace contradicts
+    // this polarity, implement and validate a separately safe inverse path;
+    // changing board-target TOML alone must not bypass that refusal.
+    board_enable.assert_checked()?;
     tracing::info!(
         gpio = opts.board_enable_gpio,
         level = if opts.board_enable_active_high { 1 } else { 0 },
@@ -1151,7 +1164,50 @@ pub fn cold_boot_sequence_s19j_io_v2<B: ApwUartTunnelBus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::config::PlatformConfig;
     use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct NoIoApwBus;
+
+    impl ApwUartTunnelBus for NoIoApwBus {
+        fn write_frame(&mut self, _addr: u8, _frame: &[u8]) -> Result<()> {
+            Err(HalError::Platform(
+                "test APW bus must not be touched before capability validation".into(),
+            ))
+        }
+
+        fn read_reply(&mut self, _addr: u8, _read_len: usize) -> Result<Vec<u8>> {
+            Err(HalError::Platform(
+                "test APW bus must not be touched before capability validation".into(),
+            ))
+        }
+
+        fn delay(&mut self, _dur: Duration) {
+            panic!("test APW bus delay must not run before capability validation");
+        }
+    }
+
+    struct MockPreparedBoardEnable {
+        gpio: u32,
+        active_high: bool,
+        assertions: usize,
+    }
+
+    impl PreparedBoardEnable for MockPreparedBoardEnable {
+        fn gpio(&self) -> u32 {
+            self.gpio
+        }
+
+        fn board_enable_active_high(&self) -> bool {
+            self.active_high
+        }
+
+        fn assert_checked(&mut self) -> Result<()> {
+            self.assertions += 1;
+            Ok(())
+        }
+    }
 
     // --- Mock Pic1704ColdBoot impl ----------------------------------------
 
@@ -1536,12 +1592,11 @@ mod tests {
             "chip-side BM1362 on this carrier"
         );
         assert!(!o.apw_drop_to_steady, "caller flips this after open-core");
-        // The env-gate constant is the canonical Phase-D string.
-        assert_eq!(ACCEPT_BEST_GUESS_COLD_BOOT_ENV, "DCENT_AM3_BB_COLD_BOOT");
     }
 
-    /// A board-target TOML can flip the gpio59 polarity to active-LOW —
-    /// the opts must carry that through (Phase D may need it).
+    /// The parser preserves an active-LOW board-target assertion so the
+    /// mismatch remains observable. The experimental daemon separately
+    /// refuses that unsupported topology before any GPIO mutation.
     #[test]
     fn cold_boot_opts_v2_honors_active_low_polarity() {
         use super::super::beaglebone::parse_board_target_toml; // platform::beaglebone
@@ -1592,6 +1647,37 @@ mod tests {
         let rst = vec![49u32, 60];
         let n = 3usize;
         assert!(rst.len() < n, "2 RST GPIOs for 3 chains is a shape error");
+    }
+
+    #[test]
+    fn cold_boot_v2_refuses_mismatched_prepared_board_enable_before_io() {
+        let platform = BeagleBonePlatform::with_config(PlatformConfig::s19j_beaglebone());
+        let opts = ColdBootOptsV2::default();
+
+        for (gpio, active_high) in [(58, true), (59, false)] {
+            let mut psu = ApwUartTunnel::new(NoIoApwBus);
+            let mut board_enable = MockPreparedBoardEnable {
+                gpio,
+                active_high,
+                assertions: 0,
+            };
+            let error = cold_boot_sequence_s19j_io_v2(
+                &platform,
+                &mut psu,
+                &mut [],
+                opts.clone(),
+                &mut board_enable,
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match cold-boot target"),
+                "{error}"
+            );
+            assert_eq!(board_enable.assertions, 0);
+        }
     }
 
     /// The new entry point's BEST-GUESS markers must stay in source for the

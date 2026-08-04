@@ -27,8 +27,14 @@ impl SimSiliconState {
         let table = match board.model {
             S9 => &BM1387_TABLE,
             S11 | S15 | T15 => &BM1391_TABLE,
-            S17 | S17Pro | T17 | S17e => &BM1397_TABLE,
-            S17Plus | T17Plus => &BM1396_TABLE,
+            // 2026-08-03 mapping correction (W8-G): S17+/T17+ are BM1397 and
+            // S17e is BM1396 (PR-056's reversed attribution is retracted).
+            // NOTE the BM1396 table's five rows were harvested as *plus-family*
+            // vendor anchors under the old attribution, so they now describe the
+            // wrong models; re-homing that vendor curve to BM1397 is tracked as
+            // follow-up. Table selection here follows the CHIP, as it must.
+            S17 | S17Pro | T17 | S17Plus | T17Plus => &BM1397_TABLE,
+            S17e => &BM1396_TABLE,
             S19 | S19Pro => &BM1398_TABLE,
             S19jPro => &BM1362_TABLE,
             S19Xp | S19kPro => &BM1366_TABLE,

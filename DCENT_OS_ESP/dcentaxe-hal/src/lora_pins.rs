@@ -288,4 +288,122 @@ mod tests {
             "SX1262 SPI ceiling is 16 MHz (doc 08)"
         );
     }
+
+    /// No board's GPIO-binder pins may collide with the LoRa map unless the
+    /// pairing is refused at build time.
+    ///
+    /// # The defect this exists to catch
+    ///
+    /// `main.rs` binds a board's `(asic_reset, buck_enable, led)` pins with a
+    /// `match` on RUNTIME values, so **every arm is compiled into every image**.
+    /// A runtime match cannot make two `peripherals.pins.gpioN` moves mutually
+    /// exclusive — only `#[cfg]` can. The LoRa bus takes its nine pins earlier in
+    /// `main`, so the moment any board row names a GPIO that the LoRa map also
+    /// claims, `--features lora` stops compiling **for every board**, not just
+    /// the one that introduced the collision.
+    ///
+    /// That is exactly what happened when the BitForge Nano landed with
+    /// `led_pin: 9`: GPIO9 is `LORA_RXEN`, and every LoRa image broke. Nothing
+    /// caught it, because the host gate never compiles `main.rs` (it is
+    /// `target_os = "espidf"` only) and the board-side guard
+    /// (`board_gpio_tuple_is_bindable_for_every_model`) only checks that the
+    /// tuple HAS an arm — not what else already owns those pins.
+    ///
+    /// So this is the host-observable half: it cannot see `#[cfg]`, but it can
+    /// see the collision, and it forces anyone who creates one to come here and
+    /// declare the guard that makes it safe.
+    #[test]
+    fn no_board_binder_pin_collides_with_lora_unless_the_pairing_is_refused() {
+        use crate::board::{BoardConfig, BoardVersionProfile};
+
+        // The ONLY tolerated collisions. Each entry is a promise that
+        // `dcentaxe/src/main.rs` carries a `compile_error!` forbidding that
+        // board together with `lora`, AND that the binder arm which moves the
+        // pin is `#[cfg(not(feature = "lora"))]`. Adding a row here without
+        // adding both is how a board gets a boot loop instead of a build error.
+        const GUARDED: [(&str, i32); 1] = [
+            // BitForge Nano status LED. GPIO4 is unavailable on that board (it
+            // is the ASIC-2 NTC divider node), so the LED genuinely has to live
+            // on GPIO9 — the collision is real hardware, not a naming accident.
+            ("BitForgeNano", LORA_RXEN_GPIO),
+        ];
+
+        let m = lora_pin_map();
+        let mut lora_pins = vec![m.sclk, m.mosi, m.miso, m.nss, m.busy, m.dio1, m.nreset];
+        lora_pins.extend(m.txen);
+        lora_pins.extend(m.rxen);
+
+        for profile in BoardVersionProfile::ALL.iter() {
+            let cfg = BoardConfig::for_model(profile.model);
+            let model = format!("{:?}", profile.model);
+            for (label, pin) in [
+                ("asic_reset", cfg.asic_reset_pin),
+                ("buck_enable", cfg.buck_enable_pin),
+                ("led", cfg.led_pin),
+            ] {
+                // -1 is the "not wired" sentinel; it is never a real GPIO.
+                if pin < 0 || !lora_pins.contains(&pin) {
+                    continue;
+                }
+                assert!(
+                    GUARDED.contains(&(model.as_str(), pin)),
+                    "{model}: {label}_pin = GPIO{pin} collides with the LoRa map, \
+                     so `--features lora` will FAIL TO COMPILE for every board \
+                     (the binder `match` is on runtime values, so its arms are \
+                     all compiled). Either move the pin, or gate the binder arm \
+                     with `#[cfg(not(feature = \"lora\"))]`, add a \
+                     `compile_error!` refusing this board + lora in main.rs, and \
+                     record it in GUARDED here."
+                );
+            }
+        }
+    }
+
+    /// The same trap, one step ahead of the code that will spring it.
+    ///
+    /// The TMP451 diode mux declares `A0 = GPIO2` on both muxed Nerd boards —
+    /// and GPIO2 is `LORA_TXEN`. Nothing binds those pins yet, so there is no
+    /// collision today; the moment `main.rs` moves them, `--features lora`
+    /// breaks on every board exactly the way the BitForge Nano's GPIO9 did.
+    ///
+    /// This test does NOT forbid that. It records the overlap so the person
+    /// wiring the mux meets it here, with the fix already spelled out, instead
+    /// of meeting it as an E0382 in a build they did not think they had
+    /// touched. Kept separate from the binder test above because that one
+    /// asserts a live invariant, while this one is a warning shot: if the mux
+    /// select ever stops colliding, delete it rather than "fixing" it.
+    #[test]
+    fn tmp451_mux_select_lines_overlap_lora_and_will_need_the_same_treatment() {
+        use crate::board::{BitAxeModel, Tmp451SelectLines};
+
+        let m = lora_pin_map();
+        let mut overlapping = vec![];
+        for model in [
+            BitAxeModel::NerdOctaxeGamma,
+            BitAxeModel::NerdQX,
+            BitAxeModel::Q1370,
+            BitAxeModel::Q1373,
+        ] {
+            let Some(mux) = model.tmp451_diode_mux() else {
+                continue;
+            };
+            // Expander pins are not ESP GPIOs and cannot collide.
+            let Tmp451SelectLines::Gpio { a0, a1 } = mux.select else {
+                continue;
+            };
+            for pin in [a0, a1] {
+                if Some(pin) == m.txen || Some(pin) == m.rxen {
+                    overlapping.push((model, pin));
+                }
+            }
+        }
+
+        assert!(
+            overlapping
+                .iter()
+                .any(|(m, p)| matches!(m, BitAxeModel::NerdOctaxeGamma) && *p == LORA_TXEN_GPIO),
+            "expected NerdOCTAXE-γ's mux A0 to still be GPIO2 = LORA_TXEN. If the \
+             wiring genuinely changed, delete this test — it exists only to warn."
+        );
+    }
 }

@@ -43,18 +43,57 @@ pub(crate) fn default_model_for_build() -> BitAxeModel {
         BitAxeModel::HexSupra
     } else if cfg!(feature = "nerdnos") {
         BitAxeModel::NerdNOS
+    } else if cfg!(feature = "nerdaxe-gamma") {
+        BitAxeModel::NerdAxeGamma
     } else if cfg!(feature = "nerdaxe") {
         BitAxeModel::NerdAxe
     } else if cfg!(feature = "nerdqaxe-plus") {
         BitAxeModel::NerdQaxePlus
     } else if cfg!(feature = "nerdqaxe-pp") {
         BitAxeModel::NerdQaxePP
+    } else if cfg!(feature = "nerdoctaxe-plus") {
+        BitAxeModel::NerdOctaxePlus
+    } else if cfg!(feature = "nerdoctaxe-gamma") {
+        BitAxeModel::NerdOctaxeGamma
     } else if cfg!(feature = "dcent-axe-bm1397") {
         BitAxeModel::DcentAxeBm1397
     } else if cfg!(feature = "dcent-axe-quad-bm1397") {
         BitAxeModel::DcentAxeQuadBm1397
     } else if cfg!(feature = "dcent-axe-hex-bm1397") {
         BitAxeModel::DcentAxeHexBm1397
+    } else if cfg!(feature = "hammer-bc01") {
+        BitAxeModel::HammerBc01
+    } else if cfg!(feature = "hammer-bc01-pro") {
+        BitAxeModel::HammerBc01Pro
+    } else if cfg!(feature = "hammer-bc02") {
+        BitAxeModel::HammerBc02
+    } else if cfg!(feature = "hammer-bc04") {
+        BitAxeModel::HammerBc04
+    } else if cfg!(feature = "hammer-dc02") {
+        BitAxeModel::HammerDc02
+    } else if cfg!(feature = "hammer-dc04") {
+        BitAxeModel::HammerDc04
+    } else if cfg!(feature = "hammer-dc06") {
+        BitAxeModel::HammerDc06
+    } else if cfg!(feature = "lucky-lv06") {
+        BitAxeModel::LuckyLv06
+    } else if cfg!(feature = "lucky-lv07") {
+        BitAxeModel::LuckyLv07
+    } else if cfg!(feature = "lucky-lv08") {
+        // A missing arm here makes a lucky-lv08 image silently build as the
+        // final `Gamma` fallback (wrong chip, wrong count, wrong envelope) —
+        // the exact defect R2 flagged for every new SKU family.
+        BitAxeModel::LuckyLv08
+    } else if cfg!(feature = "bitforge-nano") {
+        // Same reason as the Lucky arm above: without this, a bitforge-nano
+        // image builds as the `Gamma` fallback — one ASIC instead of two, and
+        // an envelope that is not this board's.
+        BitAxeModel::BitForgeNano
+    } else if cfg!(feature = "bitaxe-naja") {
+        // Same reason again, and the consequence is worse here: the `Gamma`
+        // fallback is BM1370 silicon at 1150 mV, and this board carries BM1373
+        // dies whose ceiling is 1200 mV with a 1010 mV default.
+        BitAxeModel::BitaxeNaja
     } else {
         BitAxeModel::Gamma
     }
@@ -92,6 +131,189 @@ pub const DEFAULT_FAN_TARGET_TEMP_C: u8 = 0;
 // magic string "BM1397" is preserved verbatim.
 pub fn chip_rolls_versions(asic_model: &str) -> bool {
     asic_model.trim() != "BM1397"
+}
+
+// ── Lucky-enablement SPEC §1.2 / §3 — inbound identity helpers ───────────────
+
+/// SPEC §1.2: true iff this raw inbound boardversion is one of the vendor
+/// `A`-suffixed spellings (`300A`/`301A`/`302A`, case-insensitive) that request
+/// an anonymous `mining.subscribe` (empty params, no user-agent). The suffix is
+/// NOT hardware — it maps onto the same board rows — so it is modeled as the
+/// `anonymous_subscribe` config flag, latched before canonicalization erases it.
+pub fn board_version_requests_anonymous_subscribe(board_version: &str) -> bool {
+    matches!(
+        board_version.trim().to_ascii_lowercase().as_str(),
+        "300a" | "301a" | "302a"
+    )
+}
+
+/// Outcome of the boot-time fail-closed identity gate (SPEC §3 steps 4–5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityGateOutcome {
+    /// The stored identity already resolves through the normal ladder exactly
+    /// as `resolve_identity` would — nothing to change, boot proceeds.
+    Proceed,
+    /// The tuple resolution CORRECTS the naive `board_version`-first lookup
+    /// (e.g. stored vendor identity `302`/`lv08` → Lucky LV08 `2008`, or the
+    /// probe proved the three-regulator LV08 signature). The caller must adopt
+    /// this canonical profile into the config and persist it.
+    AdoptProfile(&'static BoardVersionProfile),
+    /// SPEC §3 step 5: the identity is ambiguous and the probe could not
+    /// settle it. The device must still boot, identify, serve the dashboard
+    /// and report WHY — but mining stays disabled and the core rail is never
+    /// brought up (the caller routes this through the existing
+    /// `mining_permitted`/`mining_block_reason` refusal mechanism, the same
+    /// path the Hammer fail-closed rows use).
+    RefuseToEnergize { reason: String },
+}
+
+/// Outcome of the separate, post-resolution Hammer DC address-strap gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityStrapGateOutcome {
+    Proceed,
+    RefuseToEnergize { reason: String },
+}
+
+/// Verify an already-resolved Hammer DC row against its read-only TMP75
+/// address strap.
+///
+/// This is intentionally separate from [`resolve_identity_gate`]: that gate
+/// probes only its Ambiguous arm, while this one verifies a Resolved row. The
+/// model check precedes the closure call because 0x48 and 0x4C are unrelated
+/// peripherals on non-Hammer boards.
+pub fn verify_identity_strap_gate(
+    model: BitAxeModel,
+    expected_addr: Option<u8>,
+    probe: impl FnOnce(u8) -> Option<dcentaxe_hal::hammer_strap::HammerStrapProbeVerdict>,
+) -> IdentityStrapGateOutcome {
+    use dcentaxe_hal::hammer_strap::HammerStrapProbeVerdict;
+
+    if !model.is_hammer_dc() {
+        return IdentityStrapGateOutcome::Proceed;
+    }
+
+    let Some(expected_addr) = expected_addr else {
+        return IdentityStrapGateOutcome::RefuseToEnergize {
+            reason: format!(
+                "resolved Hammer DC model {model:?} has no registered identity strap; \
+                 refusing to energize"
+            ),
+        };
+    };
+
+    match probe(expected_addr) {
+        Some(HammerStrapProbeVerdict::Match) => IdentityStrapGateOutcome::Proceed,
+        Some(HammerStrapProbeVerdict::Absent) => IdentityStrapGateOutcome::RefuseToEnergize {
+            reason: format!(
+                "Hammer DC identity strap 0x{expected_addr:02X} did not ACK; \
+                 refusing to energize"
+            ),
+        },
+        Some(HammerStrapProbeVerdict::Mismatch { observed_mask }) => {
+            IdentityStrapGateOutcome::RefuseToEnergize {
+                reason: format!(
+                    "Hammer DC identity strap mismatch: expected 0x{expected_addr:02X}, \
+                     observed candidate mask 0x{observed_mask:02X}; refusing to energize"
+                ),
+            }
+        }
+        None => IdentityStrapGateOutcome::RefuseToEnergize {
+            reason: format!(
+                "Hammer DC identity strap 0x{expected_addr:02X} could not be probed; \
+                 refusing to energize"
+            ),
+        },
+    }
+}
+
+/// Boot-time fail-closed identity gate (SPEC §3).
+///
+/// Pure decision logic over `board::resolve_identity` plus an injected probe:
+/// * `Resolved` → [`IdentityGateOutcome::Proceed`] when the naive
+///   `BoardVersionProfile::find(board_version)` already lands on the same row;
+///   otherwise [`IdentityGateOutcome::AdoptProfile`] (the resolver corrected a
+///   colliding/vendor identity).
+/// * `Ambiguous { probe_lv08: true }` → run `probe` (the ONLY branch that may
+///   touch the read-only PMBus 0x7F/0x14 probe — `power.rs` documents that
+///   caller contract, and taking the probe as a closure enforces it
+///   structurally: no other branch can invoke it):
+///     - `TripleRegulatorLv08` ⇒ adopt the LV08 row (`2008`),
+///     - `NoSecondaryRegulators` ⇒ genuine BitAxe ⇒ keep the legacy profile,
+///     - `Inconclusive` (or probe unavailable, `None`) ⇒ REFUSE TO ENERGIZE.
+/// * `Ambiguous { probe_lv08: false }` → refuse (no disambiguation available).
+/// * `Unknown` → `Proceed`; the existing unrecognized-identity refusal in
+///   `validate_safety` already fails that closed.
+///
+/// Host-tested in `identity_gate_tests` below (compiled via `dcentaxe-core`).
+pub fn resolve_identity_gate(
+    board_version: &str,
+    device_model: &str,
+    miner_model: &str,
+    probe: impl FnOnce() -> Option<dcentaxe_hal::tps546_guard::LuckyProbeVerdict>,
+) -> IdentityGateOutcome {
+    use dcentaxe_hal::board::{resolve_identity, IdentityVerdict};
+    use dcentaxe_hal::tps546_guard::LuckyProbeVerdict;
+
+    match resolve_identity(board_version, device_model, miner_model) {
+        IdentityVerdict::Resolved(profile) => {
+            let naive = BoardVersionProfile::find(board_version);
+            if naive.map(|row| row.board_version) == Some(profile.board_version) {
+                IdentityGateOutcome::Proceed
+            } else {
+                // The tuple resolution disagrees with (or supplements) the
+                // naive board_version lookup — re-anchor to the &'static row.
+                match BoardVersionProfile::find(profile.board_version) {
+                    Some(row) => IdentityGateOutcome::AdoptProfile(row),
+                    // Unreachable for any row resolve_identity can return, but
+                    // never fall back to the naive (possibly colliding) row.
+                    None => IdentityGateOutcome::RefuseToEnergize {
+                        reason: format!(
+                            "board identity resolved to unregistered board_version '{}' — \
+                             refusing to energize (fail-closed)",
+                            profile.board_version
+                        ),
+                    },
+                }
+            }
+        }
+        IdentityVerdict::Ambiguous { reason, probe_lv08 } => {
+            if !probe_lv08 {
+                return IdentityGateOutcome::RefuseToEnergize {
+                    reason: format!(
+                        "board identity ambiguous ({reason}); no disambiguation probe \
+                         available — refusing to energize (SPEC §3 fail-closed)"
+                    ),
+                };
+            }
+            match probe() {
+                Some(LuckyProbeVerdict::TripleRegulatorLv08) => {
+                    match BoardVersionProfile::find("2008") {
+                        Some(row) => IdentityGateOutcome::AdoptProfile(row),
+                        None => IdentityGateOutcome::RefuseToEnergize {
+                            reason: "LV08 probe matched but board_version 2008 is not \
+                                     registered — refusing to energize"
+                                .to_string(),
+                        },
+                    }
+                }
+                Some(LuckyProbeVerdict::NoSecondaryRegulators) => {
+                    // Neither LV08-only address answered ⇒ genuine BitAxe ⇒
+                    // the legacy board_version resolution stands unchanged.
+                    IdentityGateOutcome::Proceed
+                }
+                Some(LuckyProbeVerdict::Inconclusive) | None => {
+                    IdentityGateOutcome::RefuseToEnergize {
+                        reason: format!(
+                            "board identity ambiguous ({reason}); LV08 secondary-regulator \
+                             probe inconclusive — refusing to energize (SPEC §3 step 5 \
+                             fail-closed; dashboard stays up, mining disabled)"
+                        ),
+                    }
+                }
+            }
+        }
+        IdentityVerdict::Unknown => IdentityGateOutcome::Proceed,
+    }
 }
 
 // ── CFG-2 — bounded body-accumulation decision helpers ───────────────────────
@@ -317,6 +539,40 @@ const BM1368_VOLTAGES: &[u16] = &[1100, 1150, 1166, 1200, 1250, 1300];
 const BM1370_FREQUENCIES: &[u16] = &[400, 490, 525, 550, 600, 625];
 const BM1370XP_FREQUENCIES: &[u16] = &[350, 375, 380, 400, 410];
 const BM1370_VOLTAGES: &[u16] = &[1000, 1060, 1100, 1150, 1200, 1250];
+// BM1373 (Hammer BC01 Pro): vendor ceiling is 500 MHz and 1.15 V per chip —
+// deliberately narrow, conservative option lists (driver is a fail-closed
+// scaffold; these only bound the UI until hardware bring-up).
+const BM1373_FREQUENCIES: &[u16] = &[300, 350, 400, 450, 500];
+const BM1373_VOLTAGES: &[u16] = &[1000, 1050, 1100, 1150];
+// MSBT0501 (Hammer DC0x, Scrypt). PER-ASIC millivolts — the rail is
+// per-ASIC x chip_count (DC02 x2, DC04 x4, DC06 x6). The vendor per-chip
+// window is identical on all three models: 500 / 635 (stock) / 750 mV.
+// Frequencies never exceed the vendor STOCK default of 2300 MHz; the firmware
+// clamp's 2600 MHz top and the web UI's 2400 are policy numbers, not proven
+// safe operating points, and the driver refuses to run either way.
+// Q1373 (BM1373 on the Q1370 board). Upstream's own tables, which are tighter
+// than the generic BM1373 lists: 250-550 MHz and 980-1080 mV, against an
+// absMax of 700 MHz / 1200 mV. The option list stops at the vendor table's top,
+// not at the absolute ceiling.
+const Q1373_FREQUENCIES: &[u16] = &[250, 300, 350, 400, 475, 550];
+const Q1373_VOLTAGES: &[u16] = &[980, 1000, 1010, 1030, 1050, 1080];
+// NerdQX (BM1370). Upstream's table starts at 495 MHz / 1085 mV (its eco point)
+// and reaches 1000 MHz / 1350 mV — but ONLY on a board whose TMP451 mux
+// answered. With no mux probe wired yet, the options stop at the clamped
+// 495 MHz / 1150 mV that upstream itself falls back to. Widening this list is
+// gated on the probe, not on a config edit.
+const NERDQX_FREQUENCIES: &[u16] = &[495];
+const NERDQX_VOLTAGES: &[u16] = &[1085, 1120, 1130, 1140, 1150];
+// NerdAxe-γ carries its own tables rather than the shared BM1370 pair.
+// `m_asicVoltages` is 1120..=1200 in 10 mV steps, so the shared
+// BM1370_VOLTAGES would offer this board both 1000 mV (below its
+// characterized floor — the under-volt direction the multiphase floor test
+// exists to prevent) and 1250 mV (above its ceiling). Upstream
+// `nerdaxegamma.cpp`, verbatim.
+const NERDAXE_GAMMA_FREQUENCIES: &[u16] = &[500, 515, 525, 550, 575];
+const NERDAXE_GAMMA_VOLTAGES: &[u16] = &[1120, 1130, 1140, 1150, 1160, 1170, 1180, 1190, 1200];
+const MSBT0501_FREQUENCIES: &[u16] = &[700, 1200, 1600, 2000, 2300];
+const MSBT0501_VOLTAGES: &[u16] = &[500, 550, 600, 635, 700, 750];
 
 pub fn stock_asic_settings(model: BitAxeModel) -> StockAsicSettings {
     match model {
@@ -329,13 +585,24 @@ pub fn stock_asic_settings(model: BitAxeModel) -> StockAsicSettings {
             default_voltage_mv: 1400,
             voltage_options: BM1397_VOLTAGES,
         },
-        BitAxeModel::Ultra | BitAxeModel::HexUltra => StockAsicSettings {
+        // NerdAxe needs NO tables of its own: upstream `nerdaxe.cpp` declares
+        // `m_asicFrequencies = {400,425,450,475,485,500,525,550,575}` and
+        // `m_asicVoltages = {1100,1150,1200,1250,1300}` — byte-identical to
+        // BM1366_FREQUENCIES / BM1366_VOLTAGES — with `m_defaultAsicFrequency
+        // = 485` and `m_defaultAsicVoltageMillis = 1200`, which is this arm
+        // exactly. It only looked like a special case while it was mislabelled
+        // BM1370.
+        BitAxeModel::Ultra | BitAxeModel::HexUltra | BitAxeModel::NerdAxe => StockAsicSettings {
             default_frequency: 485,
             frequency_options: BM1366_FREQUENCIES,
             default_voltage_mv: 1200,
             voltage_options: BM1366_VOLTAGES,
         },
-        BitAxeModel::Supra | BitAxeModel::HexSupra | BitAxeModel::NerdQaxePlus => {
+        BitAxeModel::Supra
+        | BitAxeModel::HexSupra
+        | BitAxeModel::NerdQaxePlus
+        // NerdOCTAXE+ is 8x BM1368 and inherits the NerdQAxe+ tables upstream.
+        | BitAxeModel::NerdOctaxePlus => {
             StockAsicSettings {
                 default_frequency: 490,
                 frequency_options: BM1368_FREQUENCIES,
@@ -347,14 +614,27 @@ pub fn stock_asic_settings(model: BitAxeModel) -> StockAsicSettings {
         | BitAxeModel::GammaTurbo
         | BitAxeModel::Touch
         | BitAxeModel::GtTouch
-        | BitAxeModel::NerdAxe
-        | BitAxeModel::NerdQaxePP => StockAsicSettings {
+        | BitAxeModel::NerdQaxePP
+        // NerdOCTAXE-γ is 8x BM1370 and inherits the NerdQAxe++ tables, as do
+        // NerdHaxe-γ (6x), NerdEKO (12x) and the Q1370 (4x). NerdQX is BM1370
+        // too but is NOT here: it carries its own frequency/voltage tables
+        // starting at 1085 mV, and its unproven-board ceiling is 495 MHz /
+        // 1150 mV — see the arm below.
+        | BitAxeModel::NerdOctaxeGamma
+        | BitAxeModel::NerdHaxeGamma
+        | BitAxeModel::NerdEko
+        | BitAxeModel::Q1370 => StockAsicSettings {
             default_frequency: 525,
             frequency_options: BM1370_FREQUENCIES,
             default_voltage_mv: 1150,
             voltage_options: BM1370_VOLTAGES,
         },
-        BitAxeModel::GammaDuo => StockAsicSettings {
+        // BitForge Nano needs NO tables of its own: 2x BM1370 in parallel on
+        // one rail is the same shape as the Gamma Duo, and the shared BM1370
+        // options already top out at 1250 mV — below this board's 1350 mV
+        // ceiling and far below the 1400 mV its vendor Kconfig defaults to
+        // (see `BoardConfig::for_model`). Zero new constants.
+        BitAxeModel::GammaDuo | BitAxeModel::BitForgeNano => StockAsicSettings {
             default_frequency: 400,
             frequency_options: BM1370XP_FREQUENCIES,
             default_voltage_mv: 1150,
@@ -366,6 +646,84 @@ pub fn stock_asic_settings(model: BitAxeModel) -> StockAsicSettings {
             default_voltage_mv: 1200,
             voltage_options: &[1200],
         },
+        // ── Hammer BC0x (EXPERIMENTAL): per-chip values — the series rail is
+        // derived via BoardConfig.voltage_domains, never encoded here. ──
+        BitAxeModel::HammerBc01 | BitAxeModel::HammerBc04 => StockAsicSettings {
+            default_frequency: 525,
+            frequency_options: BM1370_FREQUENCIES,
+            default_voltage_mv: 1200,
+            voltage_options: BM1370_VOLTAGES,
+        },
+        BitAxeModel::HammerBc02 => StockAsicSettings {
+            default_frequency: 525,
+            frequency_options: BM1370_FREQUENCIES,
+            default_voltage_mv: 1225,
+            voltage_options: BM1370_VOLTAGES,
+        },
+        BitAxeModel::HammerBc01Pro => StockAsicSettings {
+            default_frequency: 400,
+            frequency_options: BM1373_FREQUENCIES,
+            default_voltage_mv: 1000,
+            voltage_options: BM1373_VOLTAGES,
+        },
+        // Q1373 — BM1373 on the Q1370 board. Its own upstream tables run
+        // 250-550 MHz / 980-1080 mV, tighter than the generic BM1373 lists, so
+        // it gets its own options rather than borrowing the Hammer ones.
+        // BitAxe Naja is the same BM1373 silicon on a 2-die board, so it takes
+        // the same vendor tables and the same defaults — the ASIC sets these,
+        // not the board. Zero new constants: a Naja-specific table here would
+        // be an invented number, since bitaxeorg ships no firmware at all.
+        BitAxeModel::Q1373 | BitAxeModel::BitaxeNaja => StockAsicSettings {
+            default_frequency: 350,
+            frequency_options: Q1373_FREQUENCIES,
+            default_voltage_mv: 1010,
+            voltage_options: Q1373_VOLTAGES,
+        },
+        // NerdQX — BM1370, but its own tables and, until its TMP451 mux proves
+        // the board is really a QX, upstream's clamped 495 MHz / 1150 mV
+        // ceiling. Defaults are the clamped values, not the nominal 777/1200.
+        BitAxeModel::NerdQX => StockAsicSettings {
+            default_frequency: 495,
+            frequency_options: NERDQX_FREQUENCIES,
+            default_voltage_mv: 1150,
+            voltage_options: NERDQX_VOLTAGES,
+        },
+        // NerdAxe-γ — BM1370 on a narrower window than the shared BM1370
+        // tables. `m_defaultAsicFrequency = 515`, `m_defaultAsicVoltageMillis
+        // = 1150` (upstream `nerdaxegamma.cpp`).
+        BitAxeModel::NerdAxeGamma => StockAsicSettings {
+            default_frequency: 515,
+            frequency_options: NERDAXE_GAMMA_FREQUENCIES,
+            default_voltage_mv: 1150,
+            voltage_options: NERDAXE_GAMMA_VOLTAGES,
+        },
+        // ── Hammer DC0x (MSBT0501, Scrypt) ──
+        // 🔴 `default_voltage_mv` / `voltage_options` here are PER-ASIC, like
+        // every other row. The RAIL is derived as per-ASIC x voltage_domains
+        // (2/4/6), so 635 mV means 1.27 V on a DC02 and 3.81 V on a DC06.
+        // Never substitute a rail figure into this table.
+        // Frequency options stop AT the vendor stock default (2300 MHz): the
+        // firmware clamp reaches 2600 and the web UI shows 2400, but neither is
+        // bench-proven, so the list only ever goes DOWN from stock.
+        BitAxeModel::HammerDc02 | BitAxeModel::HammerDc04 | BitAxeModel::HammerDc06 => {
+            StockAsicSettings {
+                default_frequency: 2300,
+                frequency_options: MSBT0501_FREQUENCIES,
+                default_voltage_mv: 635,
+                voltage_options: MSBT0501_VOLTAGES,
+            }
+        }
+        // ── Lucky Miner LVxx (BM1366) ──
+        // Envelope mirrored from the already-registered board rows
+        // (485 MHz / 1200 mV, options 1100-1300) — see board.rs.
+        BitAxeModel::LuckyLv06 | BitAxeModel::LuckyLv07 | BitAxeModel::LuckyLv08 => {
+            StockAsicSettings {
+                default_frequency: 485,
+                frequency_options: BM1366_FREQUENCIES,
+                default_voltage_mv: 1200,
+                voltage_options: BM1366_VOLTAGES,
+            }
+        }
     }
 }
 
@@ -447,6 +805,43 @@ pub struct DcentAxeConfig {
     /// Runtime ASIC model read from AxeOS/ESP-Miner NVS when available.
     #[serde(default)]
     pub asic_model: String,
+    /// Vendor `minermodel` NVS key (Lucky-enablement SPEC §3). Only Lucky
+    /// factory firmware writes this key ("LV06"/"LV07"/"LV08"); a genuine
+    /// BitAxe never does, which makes it the most reliable inbound identity
+    /// signal. Persisted verbatim so `board::resolve_identity` can re-run the
+    /// fail-closed disambiguation on every boot. `#[serde(default)]` ⇒ legacy
+    /// NVS blobs round-trip as "" (absent).
+    #[serde(default)]
+    pub miner_model: String,
+    /// SPEC §1.2: vendor boardversions `300A`/`301A`/`302A` are electrically
+    /// identical to `300`/`301`/`302`; the sole difference is that they send
+    /// `mining.subscribe` with EMPTY params (no `bitaxe/BM1366/<ver>`-style
+    /// user-agent). Modeled as this config flag — never as separate board
+    /// rows. Latched (never auto-cleared) by `canonicalize_identity` when a
+    /// raw A-suffixed boardversion is seen, BEFORE the canonical rewrite
+    /// erases the suffix. `#[serde(default)]` ⇒ legacy NVS blobs round-trip
+    /// as `false` (identified subscribe, today's behavior).
+    ///
+    /// HONESTY/HOOKUP NOTE: the actual `mining.subscribe` request is built in
+    /// `dcentaxe-stratum` (`client.rs` `send_subscribe`/`build_subscribe_params`
+    /// with the crate-level `USER_AGENT`); `StratumConfig` carries no such
+    /// flag yet, so this field is plumbed as far as this crate owns and the
+    /// stratum-side hookup is a documented remaining step.
+    #[serde(default)]
+    pub anonymous_subscribe: bool,
+    /// RUNTIME-ONLY fail-closed identity refusal (Lucky-enablement SPEC §3
+    /// step 5). Set by the boot identity gate in `main.rs` when the inbound
+    /// identity is ambiguous and the read-only LV08 regulator probe could not
+    /// settle it; checked FIRST by [`Self::validate_safety`], which is the
+    /// existing master mining-permission gate — so the refusal rides the same
+    /// `mining_permitted`/`mining_block_reason` path as every other refusal
+    /// (Hammer precedent) and the rail is never brought up.
+    ///
+    /// `#[serde(skip)]`: never serialized, never deserialized — recomputed
+    /// every boot, so a stale NVS blob can never suppress (or fabricate) a
+    /// refusal.
+    #[serde(skip)]
+    pub identity_refusal: Option<String>,
     /// User-configurable hostname (persisted to NVS)
     #[serde(default)]
     pub hostname: String,
@@ -1008,9 +1403,7 @@ impl DcentAxeConfig {
         if self.asic_count > 0 {
             board.asic_count = self.asic_count;
         }
-        if let Some(hw) = &self.hardware {
-            board.apply_hardware_config(hw);
-        }
+        self.apply_hardware_override_if_unrecognized(&mut board, "board_profile_resolution");
         let board_safe = board.validate().is_ok()
             && board
                 .validate_accessory_mode(board.accessory_mode())
@@ -1092,11 +1485,36 @@ impl DcentAxeConfig {
         if self.asic_count > 0 {
             board.asic_count = self.asic_count;
         }
-        if let Some(hw) = &self.hardware {
-            board.apply_hardware_config(hw);
-        }
+        self.apply_hardware_override_if_unrecognized(&mut board, "board_config");
 
         board
+    }
+
+    /// Apply NVS hardware metadata only on the explicit custom-board path.
+    ///
+    /// Registered rows are the firmware's safety authority. A successfully
+    /// deserialized legacy blob may still carry `hardware`, but it must never
+    /// replace a recognized row's fan, thermal, or power-controller topology.
+    /// Keeping deserialization permissive avoids bricking existing units while
+    /// this resolution-time guard refuses the unsafe interpretation.
+    fn apply_hardware_override_if_unrecognized(
+        &self,
+        board: &mut BoardConfig,
+        resolution_path: &str,
+    ) {
+        let Some(hw) = &self.hardware else {
+            return;
+        };
+        if self.board_identity_recognized() {
+            log::error!(
+                "REFUSING persisted hardware override in {resolution_path}: recognized board \
+                 identity board_version='{}' board_model='{}' must use its registered topology",
+                self.board_version.trim(),
+                self.board_model.trim(),
+            );
+            return;
+        }
+        board.apply_hardware_config(hw);
     }
 
     /// W5500 LAN activation gate — PLAN-E Phase 1 (host-pure, unit-tested).
@@ -1125,6 +1543,22 @@ impl DcentAxeConfig {
     }
 
     pub fn validate_safety(&self, unsafe_lab_bypass: bool) -> Result<(), String> {
+        // SPEC §3 step 5 — the fail-closed identity refusal is checked FIRST,
+        // before any board-shape validation: a misidentified board makes every
+        // downstream conclusion (voltage domains, chip count, controllers)
+        // untrustworthy. Set only at runtime by the boot identity gate
+        // (`#[serde(skip)]` — a persisted blob can never carry it).
+        if let Some(reason) = &self.identity_refusal {
+            if !unsafe_lab_bypass {
+                return Err(format!("board identity gate: {reason}"));
+            }
+            log::warn!(
+                "UNSAFE LAB BYPASS is overriding a FAIL-CLOSED BOARD-IDENTITY REFUSAL: \
+                 {reason}. The board may be MISIDENTIFIED — a wrong voltage-domain \
+                 profile can drive a multiple of the per-die voltage onto the core \
+                 rail (the 3.6 V Lucky LV08 trap). Lab hardware only."
+            );
+        }
         let board = self.board_config();
         board.validate().map_err(|e| e.to_string())?;
         board
@@ -1195,6 +1629,13 @@ impl DcentAxeConfig {
     }
 
     pub fn canonicalize_identity(&mut self) {
+        // SPEC §1.2: latch the anonymous-subscribe request from a raw
+        // A-suffixed vendor boardversion BEFORE any canonical rewrite (below,
+        // or the boot identity gate) erases the suffix. Latch-only: a later
+        // canonical "2008" never clears an already-set flag.
+        if board_version_requests_anonymous_subscribe(&self.board_version) {
+            self.anonymous_subscribe = true;
+        }
         if !self.board_version.trim().is_empty()
             && BoardVersionProfile::find(&self.board_version).is_none()
         {
@@ -1208,6 +1649,60 @@ impl DcentAxeConfig {
         self.asic_model = profile.asic_model.to_string();
     }
 
+    /// The exact argument tuple the boot identity gate feeds to
+    /// [`resolve_identity_gate`]: `(board_version, device_model, miner_model)`.
+    ///
+    /// Extracted as a pure function so the WIRING (not just the resolver) is
+    /// host-testable — the failure mode this guards against is a correct
+    /// resolver that production never calls, or calls with the wrong fields
+    /// (e.g. dropping `miner_model`, the vendor's most reliable signal).
+    pub fn identity_gate_inputs(&self) -> (&str, &str, &str) {
+        (&self.board_version, &self.board_model, &self.miner_model)
+    }
+
+    /// Run the SPEC §3 boot identity gate over THIS config's stored identity.
+    /// `probe` is invoked only from the AMBIGUOUS branch (see
+    /// [`resolve_identity_gate`]); `main.rs` passes the real read-only
+    /// PMBus 0x7F/0x14 probe, tests inject verdicts.
+    pub fn run_identity_gate(
+        &self,
+        probe: impl FnOnce() -> Option<dcentaxe_hal::tps546_guard::LuckyProbeVerdict>,
+    ) -> IdentityGateOutcome {
+        let (board_version, device_model, miner_model) = self.identity_gate_inputs();
+        resolve_identity_gate(board_version, device_model, miner_model, probe)
+    }
+
+    /// Run the post-resolution Hammer DC identity-strap verification. The
+    /// injected probe is structurally unreachable for every non-Hammer model.
+    pub fn run_identity_strap_gate(
+        &self,
+        probe: impl FnOnce(u8) -> Option<dcentaxe_hal::hammer_strap::HammerStrapProbeVerdict>,
+    ) -> IdentityStrapGateOutcome {
+        let board = self.board_config();
+        verify_identity_strap_gate(board.model, board.identity_strap_addr, probe)
+    }
+
+    /// Adopt a gate-resolved canonical profile ([`IdentityGateOutcome::AdoptProfile`])
+    /// into this config: canonical board_version/board_model/asic_model plus the
+    /// row's chip count, clearing any prior runtime refusal and stale custom
+    /// hardware metadata. Latches the SPEC §1.2 anonymous-subscribe request
+    /// from the raw pre-rewrite boardversion before the canonical rewrite
+    /// erases the `A` suffix.
+    pub fn apply_identity_profile(&mut self, row: &'static BoardVersionProfile) {
+        if board_version_requests_anonymous_subscribe(&self.board_version) {
+            self.anonymous_subscribe = true;
+        }
+        self.board_version = row.board_version.to_string();
+        self.board_model = row.model.canonical_key().to_string();
+        self.asic_model = row.asic_model.to_string();
+        self.asic_count = BoardConfig::for_profile(row).asic_count;
+        // An ambiguous AxeOS identity can arrive with a custom hardware blob.
+        // Once the gate adopts a registered row, that blob is no longer
+        // authoritative and must not survive the identity rewrite/persist.
+        self.hardware = None;
+        self.identity_refusal = None;
+    }
+
     pub fn board_target(&self) -> &'static str {
         self.board_config().model.board_target()
     }
@@ -1218,6 +1713,20 @@ impl DcentAxeConfig {
             "BM1397" => dcentaxe_asic::AsicModel::BM1397,
             "BM1368" => dcentaxe_asic::AsicModel::BM1368,
             "BM1370" => dcentaxe_asic::AsicModel::BM1370,
+            // BM1373 (Hammer BC01 Pro) MUST resolve to its own fail-closed
+            // scaffold driver — falling through to the BM1366 fallback would
+            // run a WRONG chip's init sequence against live BM1373 silicon.
+            "BM1373" => dcentaxe_asic::AsicModel::BM1373,
+            // MSBT0501 (Hammer DC0x, Scrypt) MUST resolve to its own driver.
+            // Falling through to the BM1366 fallback would run a Bitmain
+            // SHA-256 init sequence — 0x55AA framing, CRC-5 command frames, a
+            // TicketMask write with the LOW-bits convention — against live
+            // Scrypt silicon that speaks 0xCDAB/CRC-16-CMS and uses a HIGH-bits
+            // ticket mask. This is the same latent trap that was found and
+            // fixed for "BM1373" in the BC0x lane. `LT0051` is accepted too
+            // because that is the vendor's DRIVER name and may appear in a
+            // hand-set NVS field.
+            "MSBT0501" | "LT0051" => dcentaxe_asic::AsicModel::Lt0051,
             _ => dcentaxe_asic::AsicModel::BM1366,
         }
     }
@@ -1241,7 +1750,7 @@ impl DcentAxeConfig {
         &self,
         frequency_mhz: f32,
         voltage_mv: u16,
-        _surface: ControlSurface,
+        surface: ControlSurface,
     ) -> QualifiedOperatingPoint {
         let board = self.board_config();
         let stock = stock_asic_settings(board.model);
@@ -1304,10 +1813,20 @@ impl DcentAxeConfig {
         if max_voltage_mv < min_voltage_mv {
             min_voltage_mv = max_voltage_mv;
         }
+        // A boot-restored vendor/NVS value outside the board driver's absolute
+        // voltage window is evidence of a foreign or corrupt profile. Preserve
+        // that evidence and refuse mining instead of silently replacing it
+        // with a boundary value and persisting the replacement. Runtime control
+        // surfaces retain their load-bearing clamp behavior. Voltage zero is
+        // the HAL's explicit "disable output" command and is not rejected here.
+        let refused = surface == ControlSurface::BootRestore
+            && voltage_mv != 0
+            && (voltage_mv < board.min_voltage_mv || voltage_mv > board.max_voltage_mv);
         let qualified_voltage = voltage_mv.clamp(min_voltage_mv, max_voltage_mv);
         QualifiedOperatingPoint {
             frequency_mhz: qualified_frequency,
             voltage_mv: qualified_voltage,
+            refused,
             clamped: frequency_was_invalid
                 || (qualified_frequency - frequency_mhz).abs() > f32::EPSILON
                 || qualified_voltage != voltage_mv,
@@ -1356,7 +1875,7 @@ impl DcentAxeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlSurface {
     Provisioning,
     RestPatch,
@@ -1371,6 +1890,9 @@ pub enum ControlSurface {
 pub struct QualifiedOperatingPoint {
     pub frequency_mhz: f32,
     pub voltage_mv: u16,
+    /// BootRestore only: the stored voltage is outside the HAL's absolute
+    /// board envelope and must not be applied or persisted.
+    pub refused: bool,
     pub clamped: bool,
 }
 
@@ -1387,6 +1909,9 @@ impl Default for DcentAxeConfig {
             board_model: default_model_for_build().canonical_key().into(),
             board_version: profile.board_version.into(),
             asic_model: profile.asic_model.into(),
+            miner_model: String::new(),
+            anonymous_subscribe: false,
+            identity_refusal: None,
             hostname: String::new(),
             target_frequency: board.default_frequency,
             target_voltage_mv: board.default_voltage_mv,
@@ -1504,11 +2029,25 @@ impl PowerLimits {
                 default_frequency: 400.0,
                 max_voltage_mv: 1200,
             },
+            // NerdAxe: 1x BM1366 off USB-C 5 V. `max_current_a` is upstream's
+            // `m_maxCurrentA = 5.0`, not the 5.5 the mislabelled BM1370 row
+            // guessed; `max_power_w` is its `m_maxPin = 15.0`.
             BitAxeModel::NerdAxe => Self {
-                max_power_w: 25.0,
-                max_current_a: 5.5,
+                max_power_w: 15.0,
+                max_current_a: 5.0,
                 max_frequency: 475.0,
                 default_frequency: 400.0,
+                max_voltage_mv: 1200,
+            },
+            // NerdAxe-γ: 1x BM1370, `m_maxPin = 25.0`, `m_maxCurrentA = 6.0`.
+            // Ceiling is the top of `m_asicVoltages` (1200), which is also the
+            // board row's `max_voltage_mv` — this board has no headroom above
+            // its characterized window, so `overclock` returns `safe`.
+            BitAxeModel::NerdAxeGamma => Self {
+                max_power_w: 25.0,
+                max_current_a: 6.0,
+                max_frequency: 575.0,
+                default_frequency: 515.0,
                 max_voltage_mv: 1200,
             },
             BitAxeModel::NerdQaxePlus => Self {
@@ -1524,6 +2063,88 @@ impl PowerLimits {
                 max_frequency: 475.0,
                 default_frequency: 400.0,
                 max_voltage_mv: 1200,
+            },
+            // ── NerdOCTAXE pair: 8 ASICs on a 12 V multi-phase rail ──
+            // Envelopes derived from the upstream board constructors' own
+            // m_maxPin ceilings, kept BELOW them: OCTAXE+ m_maxPin 130 W,
+            // OCTAXE-γ m_maxPin 250 W on the 4-phase part (300 W only on the
+            // 6-phase TPS53667, which this row does not assume). These are
+            // "safe" limits, so they sit under the vendor ceiling deliberately.
+            BitAxeModel::NerdOctaxePlus => Self {
+                max_power_w: 110.0,
+                max_current_a: 10.0,
+                max_frequency: 450.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1250,
+            },
+            BitAxeModel::NerdOctaxeGamma => Self {
+                max_power_w: 200.0,
+                max_current_a: 18.0,
+                max_frequency: 475.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1200,
+            },
+            // ── The rest of the Nerd multi-ASIC line + the Q-series ──
+            // Same derivation as the OCTAXE pair: sit UNDER the upstream
+            // constructor's own m_maxPin, and under the vendor current ceiling
+            // (m_maxCurrentA) rather than at it.
+            // NerdHaxe-γ: 6x BM1370, m_maxPin 250 W, m_maxCurrentA 15 A.
+            BitAxeModel::NerdHaxeGamma => Self {
+                max_power_w: 200.0,
+                max_current_a: 13.0,
+                max_frequency: 475.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1200,
+            },
+            // NerdEKO: 12x BM1370, m_maxPin 350 W, m_maxCurrentA 25 A. The
+            // largest envelope in the registry, and still held below vendor.
+            BitAxeModel::NerdEko => Self {
+                max_power_w: 300.0,
+                max_current_a: 22.0,
+                max_frequency: 475.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1200,
+            },
+            // NerdQX: 4x BM1370, m_maxPin 240 W. The frequency/voltage ceiling
+            // is the CLAMPED one (495 MHz / 1150 mV) — see `stock_asic_settings`.
+            // Its own over-current trip is refused as unreachable, so nothing
+            // here may lean on the regulator catching an overload.
+            BitAxeModel::NerdQX => Self {
+                max_power_w: 200.0,
+                max_current_a: 17.0,
+                max_frequency: 495.0,
+                default_frequency: 495.0,
+                max_voltage_mv: 1150,
+            },
+            // Q1370: 4x BM1370, m_maxPin 150 W, m_maxCurrentA 20 A.
+            BitAxeModel::Q1370 => Self {
+                max_power_w: 130.0,
+                max_current_a: 12.0,
+                max_frequency: 475.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1200,
+            },
+            // Q1373: 4x BM1373, m_maxPin 180 W, m_maxCurrentA 15 A. The BM1373
+            // envelope is much lower than the BM1370's — 550 MHz vendor table
+            // top and a 1080 mV ceiling — so this row is not a scaled Q1370.
+            BitAxeModel::Q1373 => Self {
+                max_power_w: 150.0,
+                max_current_a: 13.0,
+                max_frequency: 400.0,
+                default_frequency: 350.0,
+                max_voltage_mv: 1050,
+            },
+            // BitAxe Naja: the same BM1373 dies, two of them instead of four.
+            // Frequency and voltage are per-die properties and so are IDENTICAL
+            // to the Q1373 row above; only the power and current envelopes
+            // halve with the die count. Its 2-phase TPS546D24A rail and 90 W
+            // row target both agree with that.
+            BitAxeModel::BitaxeNaja => Self {
+                max_power_w: 75.0,
+                max_current_a: 6.5,
+                max_frequency: 400.0,
+                default_frequency: 350.0,
+                max_voltage_mv: 1050,
             },
             // Touch variants share limits with their mining-board base.
             BitAxeModel::Touch => Self::safe(BitAxeModel::Gamma),
@@ -1545,6 +2166,115 @@ impl PowerLimits {
                 max_frequency: 400.0,
                 default_frequency: 425.0,
                 max_voltage_mv: 1400,
+            },
+            // ── Hammer BC0x (EXPERIMENTAL) — vendor wall-power maxima; all
+            // voltages are PER-CHIP (the series rail is derived elsewhere).
+            // Mining is refused on these boards until peripheral drivers
+            // exist; these envelopes only bound config plumbing/UI. ──
+            BitAxeModel::HammerBc01 => Self {
+                max_power_w: 45.0,
+                max_current_a: 9.0,
+                max_frequency: 600.0,
+                default_frequency: 525.0,
+                max_voltage_mv: 1300,
+            },
+            // BC01 Pro: 1.15 V per-chip HARD cap and 500 MHz vendor ceiling
+            // (lower-confidence web-UI data — keep conservative).
+            BitAxeModel::HammerBc01Pro => Self {
+                max_power_w: 45.0,
+                max_current_a: 9.0,
+                max_frequency: 500.0,
+                default_frequency: 400.0,
+                max_voltage_mv: 1150,
+            },
+            BitAxeModel::HammerBc02 => Self {
+                max_power_w: 60.0,
+                max_current_a: 12.0,
+                max_frequency: 600.0,
+                default_frequency: 525.0,
+                max_voltage_mv: 1300,
+            },
+            BitAxeModel::HammerBc04 => Self {
+                max_power_w: 120.0,
+                max_current_a: 10.0,
+                max_frequency: 600.0,
+                default_frequency: 525.0,
+                max_voltage_mv: 1250,
+            },
+            // ── Hammer DC0x (EXPERIMENTAL, Scrypt) — vendor wall-power
+            // maxima. `max_voltage_mv` is PER-CHIP (750 mV); the series rail is
+            // derived as per-chip x 2/4/6 by the regulator layer, so this
+            // number must NEVER be read as a rail. `max_frequency` is pinned to
+            // the vendor STOCK default, i.e. zero headroom.
+            // Mining is refused on these boards (no trusted thermal source);
+            // these envelopes only bound config plumbing/UI. ──
+            BitAxeModel::HammerDc02 => Self {
+                max_power_w: 50.0,
+                max_current_a: 5.0,
+                max_frequency: 2300.0,
+                default_frequency: 2300.0,
+                max_voltage_mv: 750,
+            },
+            BitAxeModel::HammerDc04 => Self {
+                max_power_w: 100.0,
+                max_current_a: 9.0,
+                max_frequency: 2300.0,
+                default_frequency: 2300.0,
+                max_voltage_mv: 750,
+            },
+            BitAxeModel::HammerDc06 => Self {
+                max_power_w: 100.0,
+                max_current_a: 9.0,
+                max_frequency: 2300.0,
+                default_frequency: 2300.0,
+                max_voltage_mv: 750,
+            },
+            // ── Lucky Miner LVxx — 12 V input, one parallel domain (SPEC §1).
+            // Safe envelopes sit AT (LV06/LV07, 40 W vendor rating) or just
+            // UNDER (LV08: 135 W vs the 140 W rating) the vendor maxima —
+            // no Lucky hardware is on any bench (SPEC §8), so no headroom is
+            // granted anywhere. 485 MHz / 1200 mV stock, 1300 mV option cap. ──
+            BitAxeModel::LuckyLv06 => Self {
+                max_power_w: 40.0,
+                max_current_a: 4.0,
+                max_frequency: 500.0,
+                default_frequency: 485.0,
+                max_voltage_mv: 1300,
+            },
+            BitAxeModel::LuckyLv07 => Self {
+                // Same 40 W family rating as LV06 (SPEC §1 table) — the second
+                // die does not raise the vendor ceiling.
+                max_power_w: 40.0,
+                max_current_a: 4.0,
+                max_frequency: 500.0,
+                default_frequency: 485.0,
+                max_voltage_mv: 1300,
+            },
+            BitAxeModel::LuckyLv08 => Self {
+                // 135 W safe envelope under the 140 W vendor rating; ~11.5 A
+                // at the 12 V input.
+                max_power_w: 135.0,
+                max_current_a: 11.5,
+                max_frequency: 500.0,
+                default_frequency: 485.0,
+                max_voltage_mv: 1300,
+            },
+            BitAxeModel::BitForgeNano => Self {
+                // `BITFORGE_NANO_MAX_POWER 60` (forge-os `power.c:15`) is the
+                // vendor's own ceiling; the README asks for a >=70 W supply, so
+                // 60 W sits inside the recommended headroom. 5 A at the 12 V
+                // barrel jack.
+                max_power_w: 60.0,
+                max_current_a: 5.0,
+                // 2x BM1370 in parallel — the Gamma Duo's frequency envelope.
+                max_frequency: 410.0,
+                default_frequency: 400.0,
+                // Refuses the vendor's 1400 mV Kconfig default outright. See
+                // the `BoardConfig::for_model` note: nothing upstream clamps it
+                // (`VCORE_set_voltage` passes the float straight through, and
+                // `TPS546_INIT_VOUT_MAX = 2` is a 2.0 V ceiling on a 1.2 V
+                // rail).
+                max_voltage_mv: 1250,
             },
         }
     }
@@ -1610,6 +2340,29 @@ impl PowerLimits {
             },
             // Nerd boards: overclock = same as safe (USB-powered, limited headroom)
             BitAxeModel::NerdNOS => Self::safe(model),
+            // The OCTAXE pair is 12 V-fed and already sized near its vendor
+            // ceiling at "safe"; there is no separate USB-C overclock envelope
+            // to grant, so they reuse their safe limits like NerdNOS does.
+            // Same for the rest of the 12 V multi-phase line and the Q-series:
+            // all are wall-fed and already sized near their vendor ceiling at
+            // "safe". NerdQX especially — its regulator's own over-current trip
+            // is unreachable (see `check_iout_fault_limit`), so granting it
+            // extra headroom would be leaning on a protection that is not there.
+            BitAxeModel::NerdOctaxePlus
+            | BitAxeModel::NerdOctaxeGamma
+            | BitAxeModel::NerdHaxeGamma
+            | BitAxeModel::NerdEko
+            | BitAxeModel::NerdQX
+            | BitAxeModel::Q1370
+            | BitAxeModel::Q1373
+            // BitAxe Naja: no characterized headroom exists to grant. No unit
+            // has ever run, and the BM1373 numbers it uses are the vendor's for
+            // a different board — there is nothing to overclock ON TOP of.
+            | BitAxeModel::BitaxeNaja
+            // NerdAxe-γ: `max_voltage_mv` already IS the top of
+            // `m_asicVoltages`, and upstream's `m_absMaxAsicVoltageMillis` is
+            // commented out — there is no characterized headroom to grant.
+            | BitAxeModel::NerdAxeGamma => Self::safe(model),
             BitAxeModel::NerdAxe | BitAxeModel::NerdQaxePlus | BitAxeModel::NerdQaxePP => Self {
                 max_power_w: Self::safe(model).max_power_w * 1.5,
                 max_current_a: Self::safe(model).max_current_a * 1.5,
@@ -1631,6 +2384,29 @@ impl PowerLimits {
                 default_frequency: Self::safe(model).default_frequency,
                 max_voltage_mv: Self::safe(model).max_voltage_mv + 100,
             },
+            // ── Hammer BC0x: NO overclock headroom is granted — we hold no
+            // evidence for anything beyond the vendor envelope (BC01 Pro's
+            // 1.15 V cap in particular must never be raised this way). ──
+            // Hammer DC0x: same posture, and doubly so — the vendor's own
+            // 700-2600 MHz clamp is explicitly NOT a proven-safe envelope, and
+            // a per-chip over-volt is multiplied by 2/4/6 across the series
+            // stack. No headroom without a witnessed wattmeter+thermal soak.
+            // Lucky LVxx: no hardware on any bench, so no headroom either.
+            BitAxeModel::HammerBc01
+            | BitAxeModel::HammerBc01Pro
+            | BitAxeModel::HammerBc02
+            | BitAxeModel::HammerBc04
+            | BitAxeModel::HammerDc02
+            | BitAxeModel::HammerDc04
+            | BitAxeModel::HammerDc06
+            | BitAxeModel::LuckyLv06
+            | BitAxeModel::LuckyLv07
+            | BitAxeModel::LuckyLv08
+            // BitForge Nano: no hardware on any bench, and its vendor firmware
+            // ships no characterized headroom at all — its only voltage
+            // "ceiling" is a 2.0 V TPS546 limit on a 1.2 V rail, which is not a
+            // ceiling. Nothing to grant.
+            | BitAxeModel::BitForgeNano => Self::safe(model),
         }
     }
 
@@ -2092,8 +2868,12 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 requires_overclock: false,
             },
         ],
-        // NerdAxe: BM1370, same as Gamma but Nerd hardware
-        BitAxeModel::NerdAxe => mining_presets(BitAxeModel::Gamma),
+        // NerdAxe: 1x BM1366 — the BitAxe Ultra's ASIC and, per
+        // `stock_asic_settings`, its exact frequency/voltage tables. This
+        // borrowed the Gamma presets while the row claimed BM1370.
+        BitAxeModel::NerdAxe => mining_presets(BitAxeModel::Ultra),
+        // NerdAxe-γ: 1x BM1370, electrically the BitAxe Gamma shape.
+        BitAxeModel::NerdAxeGamma => mining_presets(BitAxeModel::Gamma),
         // NerdQaxe+: 4x BM1368
         BitAxeModel::NerdQaxePlus => vec![
             MiningPreset {
@@ -2132,6 +2912,166 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 requires_overclock: true,
             },
         ],
+        // NerdOCTAXE+: 8x BM1368. Upstream README documents ~5 TH/s at ~100 W
+        // for the whole board; these presets stay under that.
+        BitAxeModel::NerdOctaxePlus => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 4000.0,
+                expected_power_w: 70.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 450.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 4800.0,
+                expected_power_w: 100.0,
+                requires_overclock: false,
+            },
+        ],
+        // NerdOCTAXE-γ: 8x BM1370. Figures are the 4-phase (rev ≤3.3) envelope
+        // — the 6-phase rev 3.4 runs higher, but only once its TPS53667 has
+        // been positively identified, which is not something a static preset
+        // table can assert.
+        BitAxeModel::NerdOctaxeGamma => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 6400.0,
+                expected_power_w: 100.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 9600.0,
+                expected_power_w: 150.0,
+                requires_overclock: true,
+            },
+        ],
+        // NerdHaxe-γ: 6x BM1370, m_maxPin 250 W. Per-chip figures are the
+        // NerdOCTAXE-γ's, scaled 6/8.
+        BitAxeModel::NerdHaxeGamma => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 4800.0,
+                expected_power_w: 75.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 7200.0,
+                expected_power_w: 115.0,
+                requires_overclock: true,
+            },
+        ],
+        // NerdEKO: 12x BM1370 on a 6-phase TPS53667, m_maxPin 350 W. Same
+        // per-chip figures scaled 12/8.
+        BitAxeModel::NerdEko => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 9600.0,
+                expected_power_w: 150.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 14400.0,
+                expected_power_w: 225.0,
+                requires_overclock: true,
+            },
+        ],
+        // NerdQX: 4x BM1370. ONE preset, because until the TMP451 mux proves
+        // the board, 495 MHz / 1150 mV is the only operating point it is
+        // allowed. A "Default" above the ceiling would be a preset that cannot
+        // be applied.
+        BitAxeModel::NerdQX => vec![MiningPreset {
+            name: "Default",
+            frequency: 495.0,
+            voltage_mv: 1150,
+            expected_hashrate_ghs: 3000.0,
+            expected_power_w: 55.0,
+            requires_overclock: false,
+        }],
+        // Q1370: 4x BM1370, m_maxPin 150 W — the NerdQAxe++ per-chip figures.
+        BitAxeModel::Q1370 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 3200.0,
+                expected_power_w: 50.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 4800.0,
+                expected_power_w: 75.0,
+                requires_overclock: true,
+            },
+        ],
+        // Q1373: 4x BM1373. Hashrate per chip is UNMEASURED — no BM1373 board
+        // has ever run here, and the Hammer BC01 Pro row is the only other
+        // BM1373 figure we hold (vendor web-UI table, not a measurement).
+        // Frequencies are the vendor's own table; the hashrate numbers are
+        // scaled from that vendor claim and should be treated as such.
+        BitAxeModel::Q1373 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 300.0,
+                voltage_mv: 1000,
+                expected_hashrate_ghs: 12000.0,
+                expected_power_w: 100.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 350.0,
+                voltage_mv: 1010,
+                expected_hashrate_ghs: 14000.0,
+                expected_power_w: 130.0,
+                requires_overclock: false,
+            },
+        ],
+        // BitAxe Naja: 2x BM1373. These are the Q1373 figures above halved for
+        // the die count, which makes them DOUBLY derived — that row is already
+        // scaled from a vendor web-UI claim rather than a measurement, and no
+        // BM1373 board of any kind has run on a bench here. Treat the hashrate
+        // and power columns as order-of-magnitude only. The frequency and
+        // voltage columns are the vendor's own table and are not derived.
+        BitAxeModel::BitaxeNaja => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 300.0,
+                voltage_mv: 1000,
+                expected_hashrate_ghs: 6000.0,
+                expected_power_w: 50.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 350.0,
+                voltage_mv: 1010,
+                expected_hashrate_ghs: 7000.0,
+                expected_power_w: 65.0,
+                requires_overclock: false,
+            },
+        ],
         // Touch variants reuse the presets of their mining-board base.
         BitAxeModel::Touch => mining_presets(BitAxeModel::Gamma),
         BitAxeModel::GtTouch => mining_presets(BitAxeModel::GammaTurbo),
@@ -2154,6 +3094,147 @@ pub fn mining_presets(model: BitAxeModel) -> Vec<MiningPreset> {
                 voltage_mv: 1400,
                 expected_hashrate_ghs: 1700.0,
                 expected_power_w: 56.0,
+                requires_overclock: false,
+            },
+        ],
+        // ── Hammer BC0x (EXPERIMENTAL — mining refused until drivers exist;
+        // presets are per-chip values bounding future UI, hashrate figures are
+        // conservative 525 MHz extrapolations, not vendor 820 MHz claims). ──
+        BitAxeModel::HammerBc01 => mining_presets(BitAxeModel::Gamma),
+        BitAxeModel::HammerBc01Pro => vec![MiningPreset {
+            name: "Default",
+            frequency: 400.0,
+            voltage_mv: 1000,
+            expected_hashrate_ghs: 3200.0,
+            expected_power_w: 36.0,
+            requires_overclock: false,
+        }],
+        BitAxeModel::HammerBc02 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 1600.0,
+                expected_power_w: 25.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1225,
+                expected_hashrate_ghs: 2100.0,
+                expected_power_w: 40.0,
+                requires_overclock: false,
+            },
+        ],
+        BitAxeModel::HammerBc04 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 3200.0,
+                expected_power_w: 55.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 525.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 4200.0,
+                expected_power_w: 80.0,
+                requires_overclock: false,
+            },
+        ],
+        // ── Hammer DC0x (Scrypt) ──
+        // ⚠ `expected_hashrate_ghs` is a SHA-256-era field name. Scrypt boards
+        // hash in MH/s (`PowAlgorithm::hashrate_unit()`), and 150/300/450 MH/s
+        // is 0.00015/0.0003/0.00045 GH/s — a number no UI should ever show as
+        // "GH/s". Rather than store a misleading unit, these presets report
+        // 0.0 and the DC0x rows are excluded from hashrate-bearing preset
+        // surfaces until the display layer is unit-aware (design §4.6).
+        // `voltage_mv` is PER-CHIP; the rail is derived x2/x4/x6.
+        BitAxeModel::HammerDc02 | BitAxeModel::HammerDc04 | BitAxeModel::HammerDc06 => {
+            vec![
+                MiningPreset {
+                    name: "Low Power",
+                    frequency: 1600.0,
+                    voltage_mv: 600,
+                    expected_hashrate_ghs: 0.0,
+                    expected_power_w: 0.0,
+                    requires_overclock: false,
+                },
+                MiningPreset {
+                    name: "Default",
+                    frequency: 2300.0,
+                    voltage_mv: 635,
+                    expected_hashrate_ghs: 0.0,
+                    expected_power_w: 0.0,
+                    requires_overclock: false,
+                },
+            ]
+        }
+        // ── Lucky Miner LVxx — stock BM1366 envelope (485 MHz / 1200 mV).
+        // ⚠ Expected hashrate/power are PROJECTIONS (per-chip BM1366 figures ×
+        // chip count + the 18 W family input offset) — NO Lucky hardware has
+        // ever been bench-proven (SPEC §8), nothing here is measured. The
+        // earlier Ultra-preset delegate was wrong by 2×/9× on LV07/LV08.
+        // No preset requires overclock: `PowerLimits::overclock` grants Lucky
+        // zero headroom, so an overclock-gated preset would be unreachable.
+        BitAxeModel::LuckyLv06 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 400.0,
+                expected_power_w: 14.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 485.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 500.0,
+                expected_power_w: 18.0,
+                requires_overclock: false,
+            },
+        ],
+        BitAxeModel::LuckyLv07 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 800.0,
+                expected_power_w: 26.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 485.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 1000.0,
+                expected_power_w: 34.0,
+                requires_overclock: false,
+            },
+        ],
+        // 2x BM1370 in parallel — the same silicon, count and topology as the
+        // Gamma Duo, so it borrows that board's preset ladder rather than
+        // inventing hashrate/power figures no bench has measured.
+        BitAxeModel::BitForgeNano => mining_presets(BitAxeModel::GammaDuo),
+        BitAxeModel::LuckyLv08 => vec![
+            MiningPreset {
+                name: "Low Power",
+                frequency: 400.0,
+                voltage_mv: 1150,
+                expected_hashrate_ghs: 3600.0,
+                expected_power_w: 100.0,
+                requires_overclock: false,
+            },
+            MiningPreset {
+                name: "Default",
+                frequency: 485.0,
+                voltage_mv: 1200,
+                expected_hashrate_ghs: 4500.0,
+                expected_power_w: 135.0,
                 requires_overclock: false,
             },
         ],
@@ -2393,6 +3474,85 @@ mod tests {
         );
     }
 
+    // ── Hammer BC0x/DC0x (EXPERIMENTAL): recognized identity, refused mining. ──
+    // Production-path pin: the full NVS→resolution ladder must (a) recognize
+    // the provisional Hammer rows so the boards never fall into the
+    // custom-board lab-bypass lane, and (b) still refuse mining because no
+    // Hammer peripheral driver exists (board_safe=false — no trusted thermal
+    // source). This drives `board_profile_resolution()` exactly as boot does.
+    #[test]
+    fn hammer_rows_are_recognized_but_mining_stays_refused() {
+        for (ver, model_key, asic) in [
+            ("hammer-bc01", "hammer_bc01", "BM1370"),
+            ("hammer-bc01-pro", "hammer_bc01_pro", "BM1373"),
+            ("hammer-bc02", "hammer_bc02", "BM1370"),
+            ("hammer-bc04", "hammer_bc04", "BM1370"),
+            ("3102", "hammer_dc02", "MSBT0501"),
+            ("3104", "hammer_dc04", "MSBT0501"),
+            ("3106", "hammer_dc06", "MSBT0501"),
+        ] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_version = ver.to_string();
+            cfg.board_model = model_key.to_string();
+            cfg.asic_model.clear();
+            cfg.canonicalize_identity();
+            let resolved = cfg.board_profile_resolution();
+            assert_eq!(resolved.source, BoardProfileSource::BoardVersion, "{ver}");
+            assert!(resolved.identity_recognized, "{ver}: identity must resolve");
+            assert!(resolved.family_consistent, "{ver}");
+            assert!(
+                !resolved.mining_allowed_without_lab_bypass,
+                "{ver}: mining must stay refused until Hammer peripheral drivers exist"
+            );
+            assert_eq!(cfg.support_status(), "experimental", "{ver}");
+            assert_eq!(cfg.asic_model_name(), asic, "{ver}");
+
+            // Regression for the live porosity: a recognized row must ignore
+            // deserialized hardware metadata rather than accepting Tps546 as
+            // a synthetic thermal source (with no fan and no temp sensor).
+            cfg.hardware = Some(custom_hw(
+                FanControllerKind::None,
+                TempSensorKind::None,
+                PowerControllerKind::Tps546,
+            ));
+            assert!(cfg.hardware.is_some(), "{ver}: blob still deserializes");
+            let board = cfg.board_config();
+            assert_eq!(
+                board.power_controller,
+                PowerControllerKind::None,
+                "{ver}: registered topology must beat NVS hardware"
+            );
+            assert_eq!(board.temp_sensor, TempSensorKind::None, "{ver}");
+            assert!(
+                cfg.validate_safety(false).is_err(),
+                "{ver}: production safety path must refuse the porous hardware blob"
+            );
+        }
+    }
+
+    // ── BM1373 must resolve to its own fail-closed scaffold driver. ──
+    // Production-path pin for `asic_model()`: before this arm existed, the
+    // string "BM1373" fell through to the BM1366 FALLBACK — which would run a
+    // wrong chip's full init sequence against live BM1373 silicon on a
+    // BC01 Pro. The scaffold driver refuses init instead (fail-closed).
+    #[test]
+    fn bm1373_resolves_to_its_own_driver_not_the_bm1366_fallback() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "hammer-bc01-pro".to_string();
+        cfg.board_model = "hammer_bc01_pro".to_string();
+        cfg.asic_model.clear();
+        cfg.canonicalize_identity();
+        assert_eq!(cfg.asic_model_name(), "BM1373");
+        assert_eq!(
+            cfg.asic_model(),
+            dcentaxe_asic::AsicModel::BM1373,
+            "BM1373 must select the fail-closed BM1373 scaffold, never the BM1366 fallback"
+        );
+        // The metadata now reports the PROVEN silicon id (0x1372, not the
+        // 0x1373 part number — BM1373_DOSSIER.md).
+        assert_eq!(cfg.asic_model().expected_chip_id(), 0x1372);
+    }
+
     #[test]
     fn unknown_board_version_is_mining_gated_without_lab_bypass() {
         let mut cfg = DcentAxeConfig::default();
@@ -2476,11 +3636,70 @@ mod tests {
         assert!(touch.board_identity_family_consistent());
         assert!(touch.validate_safety(false).is_ok());
 
+        // NerdQAxe++ USED to borrow "601" and so used to validate against it.
+        // Queue rank 41 gave it canonical row "4007", and the pairing is now
+        // correctly REFUSED — the same correction, for the same reason, as the
+        // NerdAxe case immediately below: "601" is a BM1370 board on a single
+        // TPS546 with a one-fan EMC2101, while a NerdQAxe++ is a BM1370 board
+        // on a 3-phase TPS53647 at 0x71 with a two-fan EMC2302 and a 100 W
+        // envelope. Accepting the pair hands it the wrong regulator driver.
+        let mut stale_borrow = DcentAxeConfig::default();
+        stale_borrow.board_version = "601".to_string(); // Gamma-family profile
+        stale_borrow.board_model = "nerdqaxe++".to_string();
+        assert!(
+            !stale_borrow.board_identity_family_consistent(),
+            "a Gamma profile must not validate against the TPS53647 NerdQAxe++"
+        );
+
+        // Its own row pairs, and mines.
         let mut nerd = DcentAxeConfig::default();
-        nerd.board_version = "601".to_string(); // Gamma-family profile
-        nerd.board_model = "nerdaxe".to_string();
+        nerd.board_version = "4007".to_string();
+        nerd.board_model = "nerdqaxe++".to_string();
         assert!(nerd.board_identity_family_consistent());
         assert!(nerd.validate_safety(false).is_ok());
+
+        // Same for the other three rank-41 rows, so a later edit cannot quietly
+        // point one of them back at a BitAxe row.
+        for (ver, model) in [
+            ("4006", "nerdqaxe+"),
+            ("4008", "nerdoctaxe+"),
+            ("4009", "nerdoctaxe-gamma"),
+        ] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_version = ver.to_string();
+            cfg.board_model = model.to_string();
+            assert!(
+                cfg.board_identity_family_consistent(),
+                "{model} must pair with its canonical row {ver}"
+            );
+        }
+
+        // NerdAxe no longer borrows one, and this pairing is now correctly
+        // REFUSED. It used to pass — which was the mislabelling in miniature:
+        // "601" is a BM1370 board on a TPS546, and NerdAxe is BM1366 on a
+        // DS4432U whose enable GPIO is inverted relative to it. Accepting the
+        // pair would hand a real NerdAxe the wrong regulator driver and the
+        // wrong panic-hook polarity.
+        let mut mismatched = DcentAxeConfig::default();
+        mismatched.board_version = "601".to_string();
+        mismatched.board_model = "nerdaxe".to_string();
+        assert!(
+            !mismatched.board_identity_family_consistent(),
+            "a Gamma profile must not validate against the BM1366 NerdAxe"
+        );
+
+        // Its own row does pair, and so does the γ's.
+        let mut axe = DcentAxeConfig::default();
+        axe.board_version = "4004".to_string();
+        axe.board_model = "nerdaxe".to_string();
+        assert!(axe.board_identity_family_consistent());
+        assert!(axe.validate_safety(false).is_ok());
+
+        let mut gamma = DcentAxeConfig::default();
+        gamma.board_version = "4005".to_string();
+        gamma.board_model = "nerdaxegamma".to_string();
+        assert!(gamma.board_identity_family_consistent());
+        assert!(gamma.validate_safety(false).is_ok());
     }
 
     #[test]
@@ -2539,6 +3758,35 @@ mod tests {
         // Invariant: the overclock envelope is never below the safe envelope.
         assert!(oc_gamma.max_frequency >= safe_gamma.max_frequency);
         assert!(oc_gamma.max_voltage_mv >= safe_gamma.max_voltage_mv);
+    }
+
+    #[test]
+    fn boot_restore_refuses_out_of_range_voltage_while_runtime_surfaces_clamp() {
+        let cfg = DcentAxeConfig::default(); // Gamma: absolute max 1400mV
+        let requested = u16::MAX;
+
+        let boot = cfg.qualify_operating_point(450.0, requested, ControlSurface::BootRestore);
+        assert!(boot.refused, "foreign boot voltage must be refused");
+        assert!(
+            boot.clamped,
+            "qualified diagnostic value still records the boundary"
+        );
+
+        for surface in [
+            ControlSurface::Provisioning,
+            ControlSurface::RestPatch,
+            ControlSurface::LegacyRest,
+            ControlSurface::Mcp,
+            ControlSurface::Autotuner,
+            ControlSurface::Schedule,
+        ] {
+            let runtime = cfg.qualify_operating_point(450.0, requested, surface);
+            assert!(
+                !runtime.refused,
+                "{surface:?}: runtime clamp behavior is load-bearing"
+            );
+            assert!(runtime.clamped, "{surface:?}");
+        }
     }
 
     #[test]
@@ -3502,5 +4750,518 @@ mod w5500_lan_network_config_guards {
 
         cfg.board_model = "touch".into();
         assert!(cfg.eth_lan_activation().is_err());
+    }
+}
+
+// ── Lucky-enablement SPEC §3 / §1.2 — host tests for the fail-closed identity
+// gate and the anonymous-subscribe latch (compiled on the host gate via the
+// dcentaxe-core `#[path]` re-include of this file).
+#[cfg(test)]
+mod identity_gate_tests {
+    use super::*;
+    use dcentaxe_hal::hammer_strap::HammerStrapProbeVerdict;
+    use dcentaxe_hal::tps546_guard::LuckyProbeVerdict;
+
+    fn no_probe_expected() -> Option<LuckyProbeVerdict> {
+        panic!(
+            "the probe closure must ONLY run from the AMBIGUOUS branch \
+             (power.rs caller contract — 0x7F is an I2C spec-reserved address)"
+        );
+    }
+
+    fn no_strap_probe_expected(_: u8) -> Option<HammerStrapProbeVerdict> {
+        panic!("identity strap probe must be model-gated to Hammer DC rows")
+    }
+
+    fn adopted_version(outcome: IdentityGateOutcome) -> &'static str {
+        match outcome {
+            IdentityGateOutcome::AdoptProfile(row) => row.board_version,
+            other => panic!("expected AdoptProfile, got {other:?}"),
+        }
+    }
+
+    // ── The 3.6 V trap itself: an unlocked LV08 (302/lv08) must NEVER stand
+    // as a Hex Ultra. Resolution happens on strings alone — no probe runs. ──
+    #[test]
+    fn unlocked_lv08_resolves_to_lucky_2008_without_probing() {
+        let outcome = resolve_identity_gate("302", "lv08", "", no_probe_expected);
+        assert_eq!(adopted_version(outcome), "2008");
+    }
+
+    // Stock Lucky factory identity (402/supra/LV08): minermodel is
+    // authoritative, again with no probe.
+    #[test]
+    fn stock_lucky_lv08_resolves_via_minermodel_without_probing() {
+        let outcome = resolve_identity_gate("402", "supra", "LV08", no_probe_expected);
+        assert_eq!(adopted_version(outcome), "2008");
+        let outcome = resolve_identity_gate("402", "supra", "LV06", no_probe_expected);
+        assert_eq!(adopted_version(outcome), "2006");
+    }
+
+    // A-suffixed vendor boardversions resolve directly (SPEC §1.2).
+    #[test]
+    fn a_suffixed_boardversions_adopt_lucky_rows() {
+        assert_eq!(
+            adopted_version(resolve_identity_gate("302A", "", "", no_probe_expected)),
+            "2008"
+        );
+        assert_eq!(
+            adopted_version(resolve_identity_gate("300A", "", "", no_probe_expected)),
+            "2006"
+        );
+        assert_eq!(
+            adopted_version(resolve_identity_gate("301A", "", "", no_probe_expected)),
+            "2007"
+        );
+    }
+
+    // A consistent genuine BitAxe never probes and never changes.
+    #[test]
+    fn canonical_identities_proceed_without_probe() {
+        for (bv, dm) in [
+            ("302", "hex"),
+            ("402", "supra"),
+            ("601", "gamma"),
+            ("2008", "lucky_lv08"),
+            ("2006", "lv06"),
+        ] {
+            assert_eq!(
+                resolve_identity_gate(bv, dm, "", no_probe_expected),
+                IdentityGateOutcome::Proceed,
+                "({bv},{dm}) must proceed unchanged"
+            );
+        }
+    }
+
+    // ── SPEC §3 step 4: the ambiguous collision runs the probe. ──
+    #[test]
+    fn ambiguous_302_probe_decides_lv08_vs_genuine_hex() {
+        // Both LV08-only addresses answered ⇒ adopt the LV08 row.
+        let outcome = resolve_identity_gate("302", "", "", || {
+            Some(LuckyProbeVerdict::TripleRegulatorLv08)
+        });
+        assert_eq!(adopted_version(outcome), "2008");
+
+        // Neither answered ⇒ genuine BitAxe ⇒ legacy resolution stands.
+        let outcome = resolve_identity_gate("302", "", "", || {
+            Some(LuckyProbeVerdict::NoSecondaryRegulators)
+        });
+        assert_eq!(outcome, IdentityGateOutcome::Proceed);
+    }
+
+    // ── SPEC §3 step 5: inconclusive (or unavailable) probe ⇒ REFUSE. ──
+    #[test]
+    fn inconclusive_probe_refuses_to_energize() {
+        for probe_result in [Some(LuckyProbeVerdict::Inconclusive), None] {
+            let outcome = resolve_identity_gate("302", "", "", || probe_result);
+            match outcome {
+                IdentityGateOutcome::RefuseToEnergize { reason } => {
+                    assert!(
+                        reason.to_ascii_lowercase().contains("refusing to energize"),
+                        "refusal must say why: {reason}"
+                    );
+                }
+                other => panic!("probe={probe_result:?} must refuse, got {other:?}"),
+            }
+        }
+        // 402-with-minermodel collision (unrecognized minermodel) also refuses
+        // when the probe cannot settle it.
+        let outcome = resolve_identity_gate("402", "supra", "LV99", || {
+            Some(LuckyProbeVerdict::Inconclusive)
+        });
+        assert!(matches!(
+            outcome,
+            IdentityGateOutcome::RefuseToEnergize { .. }
+        ));
+    }
+
+    // Unknown tuples proceed — validate_safety's unrecognized-identity refusal
+    // already fails them closed (no probe runs).
+    #[test]
+    fn unknown_identity_proceeds_to_existing_refusal_path() {
+        assert_eq!(
+            resolve_identity_gate("999x", "", "", no_probe_expected),
+            IdentityGateOutcome::Proceed
+        );
+    }
+
+    // ── SPEC §1.2 — anonymous-subscribe latch. ──
+    #[test]
+    fn a_suffix_latches_anonymous_subscribe_before_canonical_rewrite() {
+        for raw in ["300A", "301a", "302A", " 302a "] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_version = raw.to_string();
+            cfg.canonicalize_identity();
+            assert!(
+                cfg.anonymous_subscribe,
+                "raw boardversion '{raw}' must latch anonymous_subscribe"
+            );
+        }
+        // Plain versions do NOT set it…
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "302".to_string();
+        cfg.canonicalize_identity();
+        assert!(!cfg.anonymous_subscribe);
+        // …and canonicalization never CLEARS an already-latched flag.
+        let mut cfg = DcentAxeConfig::default();
+        cfg.anonymous_subscribe = true;
+        cfg.board_version = "2008".to_string();
+        cfg.board_model = "lucky_lv08".to_string();
+        cfg.canonicalize_identity();
+        assert!(cfg.anonymous_subscribe, "latch must never be auto-cleared");
+    }
+
+    #[test]
+    fn board_version_anonymous_classifier_table() {
+        for yes in ["300A", "301A", "302A", "300a", " 302a "] {
+            assert!(board_version_requests_anonymous_subscribe(yes), "{yes}");
+        }
+        for no in ["300", "302", "2008", "402", "", "303A", "hammer-bc01"] {
+            assert!(!board_version_requests_anonymous_subscribe(no), "{no}");
+        }
+    }
+
+    // Legacy NVS blobs (no miner_model / anonymous_subscribe keys) round-trip
+    // with the safe defaults and no schema bump.
+    #[test]
+    fn legacy_blob_defaults_new_identity_fields() {
+        let full = DcentAxeConfig::default();
+        let mut value = serde_json::to_value(&full).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("miner_model");
+        obj.remove("anonymous_subscribe");
+        let loaded: DcentAxeConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.miner_model, "");
+        assert!(!loaded.anonymous_subscribe);
+        assert_eq!(loaded.schema_version, full.schema_version);
+    }
+
+    // The Lucky build-default arms exist (a missing cfg! arm silently builds
+    // the final Gamma fallback — R2). Host builds compile with no board
+    // feature, so pin the production fn's SOURCE REGION (sliced to the fn
+    // body, per the include_str! self-match trap rule) instead of runtime cfg!.
+    #[test]
+    fn default_model_for_build_has_lucky_arms() {
+        let src = include_str!("config.rs");
+        let fn_start = src
+            .find("pub(crate) fn default_model_for_build()")
+            .expect("default_model_for_build must exist");
+        let fn_end = src[fn_start..]
+            .find("\n}\n")
+            .map(|off| fn_start + off)
+            .expect("fn body end");
+        let body = &src[fn_start..fn_end];
+        for (feature, model) in [
+            ("lucky-lv06", "LuckyLv06"),
+            ("lucky-lv07", "LuckyLv07"),
+            ("lucky-lv08", "LuckyLv08"),
+        ] {
+            assert!(
+                body.contains(&format!("cfg!(feature = \"{feature}\")")),
+                "default_model_for_build must branch on {feature}"
+            );
+            assert!(
+                body.contains(&format!("BitAxeModel::{model}")),
+                "default_model_for_build must map {feature} to {model}"
+            );
+        }
+    }
+
+    // Lucky safe envelopes stay at/under the SPEC §1 vendor ratings and get
+    // zero overclock headroom (SPEC §8: no hardware, no proof).
+    #[test]
+    fn lucky_power_envelopes_match_spec_ratings() {
+        assert_eq!(PowerLimits::safe(BitAxeModel::LuckyLv06).max_power_w, 40.0);
+        assert_eq!(PowerLimits::safe(BitAxeModel::LuckyLv07).max_power_w, 40.0);
+        assert_eq!(PowerLimits::safe(BitAxeModel::LuckyLv08).max_power_w, 135.0);
+        for model in [
+            BitAxeModel::LuckyLv06,
+            BitAxeModel::LuckyLv07,
+            BitAxeModel::LuckyLv08,
+        ] {
+            let safe = PowerLimits::safe(model);
+            let oc = PowerLimits::overclock(model);
+            assert_eq!(oc.max_power_w, safe.max_power_w, "{model:?}: no headroom");
+            assert_eq!(oc.max_voltage_mv, safe.max_voltage_mv, "{model:?}");
+            assert_eq!(oc.max_frequency, safe.max_frequency, "{model:?}");
+            // Presets stay inside the safe envelope and never gate on the
+            // (headroom-less) overclock flag.
+            for preset in mining_presets(model) {
+                assert!(!preset.requires_overclock, "{model:?} '{}'", preset.name);
+                assert!(preset.frequency <= safe.max_frequency);
+                assert!(preset.voltage_mv <= safe.max_voltage_mv);
+                assert!(preset.expected_power_w <= safe.max_power_w);
+            }
+        }
+    }
+
+    // ════ WIRING tests — the resolver being correct is not enough; production
+    // must actually CALL it with the right stored fields (the "green tests,
+    // broken product" failure mode). ════
+
+    // The caller's argument choice, as a pure function: all three stored
+    // fields flow through, in order. Mutation-checked: dropping `miner_model`
+    // turns the stock-Lucky case into Proceed (Supra!) and this test fails;
+    // dropping `board_model` makes the unlocked-Lucky case hit the
+    // panicking probe closure and this test fails.
+    #[test]
+    fn run_identity_gate_wires_all_three_stored_identity_fields() {
+        // miner_model is load-bearing: stock Lucky (402/supra/LV08).
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "402".into();
+        cfg.board_model = "supra".into();
+        cfg.miner_model = "LV08".into();
+        assert_eq!(
+            cfg.identity_gate_inputs(),
+            ("402", "supra", "LV08"),
+            "gate inputs must be (board_version, board_model, miner_model) verbatim"
+        );
+        match cfg.run_identity_gate(no_probe_expected) {
+            IdentityGateOutcome::AdoptProfile(row) => assert_eq!(row.board_version, "2008"),
+            other => panic!("stock Lucky LV08 must adopt 2008 via minermodel, got {other:?}"),
+        }
+
+        // board_model (device_model) is load-bearing: unlocked Lucky (302/lv08)
+        // must resolve on strings alone — the panicking probe closure proves
+        // the devicemodel actually reached the resolver.
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "302".into();
+        cfg.board_model = "lv08".into();
+        cfg.miner_model = String::new();
+        match cfg.run_identity_gate(no_probe_expected) {
+            IdentityGateOutcome::AdoptProfile(row) => assert_eq!(row.board_version, "2008"),
+            other => panic!("unlocked Lucky LV08 must adopt 2008 via devicemodel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_identity_profile_adopts_canonical_row() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "302A".into();
+        cfg.board_model = "lv08".into();
+        cfg.asic_count = 6; // stale Hex count from a naive prior resolution
+        cfg.hardware = Some(BoardHardwareConfig {
+            plug_sense: false,
+            asic_enable: true,
+            fan_controller: FanControllerKind::Emc2101,
+            temp_sensor: TempSensorKind::Emc2101,
+            power_controller: PowerControllerKind::Ds4432u,
+            has_ina260: false,
+            emc_internal_temp: false,
+            emc_ideality_factor: 0x24,
+            emc_beta_compensation: 0,
+            temp_offset_c: 0,
+            power_consumption_target_w: 19,
+        });
+        cfg.identity_refusal = Some("stale".into());
+        let row = BoardVersionProfile::find("2008").unwrap();
+        cfg.apply_identity_profile(row);
+        assert_eq!(cfg.board_version, "2008");
+        // The adopted board_model is the model's canonical key ("lv08" — the
+        // vendor's own devicemodel spelling) and MUST round-trip through
+        // from_device_model so every later resolution lands on the same model.
+        assert_eq!(cfg.board_model, row.model.canonical_key());
+        assert_eq!(
+            dcentaxe_hal::board::BitAxeModel::from_device_model(&cfg.board_model),
+            Some(row.model),
+            "adopted board_model must round-trip to the adopted model"
+        );
+        assert_eq!(cfg.asic_model, "BM1366");
+        assert_eq!(cfg.asic_count, 9, "LV08 is nine chips, one parallel domain");
+        assert!(
+            cfg.hardware.is_none(),
+            "adopting a registered row must clear stale custom hardware"
+        );
+        assert!(cfg.identity_refusal.is_none());
+        assert!(
+            cfg.anonymous_subscribe,
+            "raw 302A must latch anonymous_subscribe before the rewrite erases the suffix"
+        );
+        // And the adopted identity is stable: the gate now proceeds.
+        assert_eq!(
+            cfg.run_identity_gate(no_probe_expected),
+            IdentityGateOutcome::Proceed
+        );
+        // SPEC §1.1: the adopted board is ONE parallel domain — never Hex's 3.
+        assert_eq!(cfg.board_config().voltage_domains, 1);
+    }
+
+    #[test]
+    fn hammer_strap_gate_is_model_gated_and_all_registered_rows_match() {
+        let cfg = DcentAxeConfig::default();
+        assert_eq!(
+            cfg.run_identity_strap_gate(no_strap_probe_expected),
+            IdentityStrapGateOutcome::Proceed,
+            "non-Hammer models must never touch strap candidate addresses"
+        );
+
+        for (version, model, expected) in [
+            ("3102", "hammer_dc02", 0x48),
+            ("3104", "hammer_dc04", 0x4C),
+            ("3106", "hammer_dc06", 0x4F),
+        ] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_version = version.into();
+            cfg.board_model = model.into();
+            assert_eq!(
+                cfg.run_identity_strap_gate(|address| {
+                    assert_eq!(address, expected, "{version}");
+                    Some(HammerStrapProbeVerdict::Match)
+                }),
+                IdentityStrapGateOutcome::Proceed,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn hammer_strap_absent_mismatch_and_unreadable_reach_master_refusal() {
+        for verdict in [
+            Some(HammerStrapProbeVerdict::Absent),
+            Some(HammerStrapProbeVerdict::Mismatch {
+                observed_mask: dcentaxe_hal::hammer_strap::hammer_strap_addr_bit(0x4A)
+                    | dcentaxe_hal::hammer_strap::hammer_strap_addr_bit(0x4E),
+            }),
+            None,
+        ] {
+            let mut cfg = DcentAxeConfig::default();
+            cfg.board_version = "3104".into();
+            cfg.board_model = "hammer_dc04".into();
+            let reason = match cfg.run_identity_strap_gate(|expected| {
+                assert_eq!(expected, 0x4C);
+                verdict
+            }) {
+                IdentityStrapGateOutcome::RefuseToEnergize { reason } => reason,
+                other => panic!("bad strap evidence must refuse, got {other:?}"),
+            };
+            cfg.identity_refusal = Some(reason);
+            let err = cfg.validate_safety(false).unwrap_err();
+            assert!(
+                err.contains("identity gate") && err.contains("identity strap"),
+                "strap refusal must win at the production master gate: {err}"
+            );
+        }
+    }
+
+    // The refusal is enforced through the EXISTING master gate
+    // (validate_safety), checked before every other check, and only the
+    // explicit unsafe-lab bypass can override it.
+    #[test]
+    fn validate_safety_checks_identity_refusal_first_and_only_lab_bypass_overrides() {
+        let mut cfg = DcentAxeConfig::default();
+        assert!(cfg.validate_safety(false).is_ok(), "test premise");
+        cfg.identity_refusal = Some("probe inconclusive".into());
+        let err = cfg.validate_safety(false).unwrap_err();
+        assert!(
+            err.contains("identity gate") && err.contains("probe inconclusive"),
+            "refusal must surface the gate reason: {err}"
+        );
+        assert!(cfg.validate_safety(true).is_ok(), "lab bypass overrides");
+
+        // Checked FIRST: even on a config that would also fail a later check
+        // (unrecognized identity), the identity-gate reason wins.
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "999x".into();
+        cfg.board_model = "nonsense".into();
+        cfg.identity_refusal = Some("probe inconclusive".into());
+        let err = cfg.validate_safety(false).unwrap_err();
+        assert!(
+            err.contains("identity gate"),
+            "identity refusal must be the FIRST check: {err}"
+        );
+    }
+
+    // identity_refusal is runtime-only: never serialized, never accepted from
+    // a stored blob (a stale blob must not be able to suppress OR fabricate a
+    // refusal — it is recomputed every boot).
+    #[test]
+    fn identity_refusal_is_never_persisted() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.identity_refusal = Some("probe inconclusive".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("identity_refusal"),
+            "identity_refusal must be #[serde(skip)]"
+        );
+        let injected: DcentAxeConfig = serde_json::from_str(&json.replace(
+            "\"miner_model\":\"\"",
+            "\"miner_model\":\"\",\"identity_refusal\":\"fabricated\"",
+        ))
+        .unwrap();
+        assert!(injected.identity_refusal.is_none());
+    }
+
+    // ── Source-pin the two production call sites (the files are esp-idf-only
+    // and cannot host-compile, so pin their source text — same pattern as the
+    // PROVISIONING_RS / nvs_config pins elsewhere in this test suite). ──
+    #[test]
+    fn nvs_migration_reads_minermodel_and_stores_it() {
+        let src = include_str!("nvs_config.rs");
+        assert!(
+            src.contains("read_str(\"minermodel\")"),
+            "migrate_axeos_config must read the vendor `minermodel` NVS key (SPEC §3 step 1)"
+        );
+        assert!(
+            src.contains("miner_model:"),
+            "migrate_axeos_config must persist miner_model into DcentAxeConfig"
+        );
+        assert!(
+            src.contains("resolve_identity("),
+            "migrate_axeos_config must route identity through board::resolve_identity, \
+             never BoardVersionProfile::find(board_version) alone"
+        );
+    }
+
+    #[test]
+    fn main_boot_path_runs_the_identity_gate_before_energizing() {
+        let src = include_str!("main.rs");
+        let gate_idx = src
+            .find(".run_identity_gate(")
+            .expect("main.rs must invoke config.run_identity_gate on the boot path");
+        let strap_idx = src
+            .find(".run_identity_strap_gate(")
+            .expect("main.rs must invoke the post-resolution Hammer strap gate");
+        assert!(
+            src.contains("probe_lucky_lv08_secondary_regulators"),
+            "the gate's AMBIGUOUS branch must wire the real read-only LV08 probe"
+        );
+        assert!(
+            src.contains(".apply_identity_profile("),
+            "AdoptProfile must re-anchor the config via apply_identity_profile"
+        );
+        assert!(
+            src.contains("probe_hammer_identity_strap"),
+            "the Hammer gate must wire the real read-only address-only probe"
+        );
+        assert!(
+            src.contains("identity_refusal = Some("),
+            "RefuseToEnergize must set config.identity_refusal for validate_safety"
+        );
+        // Ordering: the gate must run BEFORE the master safety gate is
+        // evaluated and long before any rail bring-up.
+        let validate_idx = src
+            .find("config.validate_safety(")
+            .expect("main.rs evaluates validate_safety");
+        assert!(
+            gate_idx < strap_idx && strap_idx < validate_idx,
+            "gate order must be identity ({gate_idx}) < strap ({strap_idx}) < \
+             validate_safety ({validate_idx})"
+        );
+        let power_idx = src
+            .find("PowerManager::new(")
+            .expect("main.rs constructs PowerManager");
+        assert!(
+            strap_idx < power_idx,
+            "strap gate (byte {strap_idx}) must run before PowerManager::new (byte {power_idx})"
+        );
+        // Match the real call STATEMENT, not prose — several comments (and the
+        // gate's own placement rationale) quote `enable_buck(true)`.
+        let buck_idx = src
+            .find("if let Err(e) = gpio_ctrl.enable_buck(true)")
+            .expect("main.rs enables the buck");
+        assert!(
+            strap_idx < buck_idx,
+            "strap gate (byte {strap_idx}) must run before the buck is enabled (byte {buck_idx})"
+        );
     }
 }

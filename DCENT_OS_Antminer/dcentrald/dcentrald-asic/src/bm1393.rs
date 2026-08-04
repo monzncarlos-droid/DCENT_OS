@@ -169,8 +169,19 @@ pub const BM1393_CRC8_POLY_TBD: u8 = 0x00;
 ///
 /// Documented for completeness; not yet used as a registry key. The
 /// BM139x family chip IDs are:
-/// `0x1391` (T15/S11), `0x1393` (S9k), `0x1396` (S17+/T17+),
-/// `0x1397` (S17/T17), `0x1398` (S19/S19+/S21).
+/// `0x1391` (T15/S11), `0x1393` (S9k), `0x1396` (S17e/T17e),
+/// `0x1397` (S17/S17+/T17/T17+), `0x1398` (S19/S19+/S21).
+///
+/// 2026-08-03 mapping correction (W8-G): this line previously read
+/// `0x1396` (S17+/T17+) / `0x1397` (S17/T17). That pairing was backwards
+/// and — together with `dcentrald-silicon-profiles/src/asics.rs` — was the
+/// sole evidence PR-056 traced its model attribution to, making the claim
+/// circular. Operator-confirmed correct pairing: the "+" variants are
+/// BM1397, the "e" variants are BM1396. See the correction banner in
+/// .
+/// Corroborated by :16,18`
+/// and :31`
+/// (Bitmain AMTC maintenance guide: T17e = 78 chips, 13 domains x 6, 1.35 V).
 pub const CHIP_ID: u16 = 0x1393;
 
 #[cfg(test)]

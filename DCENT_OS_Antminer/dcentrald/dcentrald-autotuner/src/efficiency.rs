@@ -96,6 +96,7 @@ impl EfficiencyOptimizer {
                 .min(1.0)
         };
 
+        // P1-4: empty table for unknown chip_id — snap_pll_floor never panics.
         let pll = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(chip_id);
 
         let per_chip_freqs: Vec<u16> = chip_profiles
@@ -109,11 +110,7 @@ impl EfficiencyOptimizer {
                     profile.measured_max_stable_at_or_below_voltage(optimal_voltage_mv)
                 {
                     let target = measured_freq.max(min_freq_mhz);
-                    return pll
-                        .iter()
-                        .rev()
-                        .find(|&&f| f <= target)
-                        .copied()
+                    return dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, target)
                         .unwrap_or(min_freq_mhz);
                 }
 
@@ -121,11 +118,7 @@ impl EfficiencyOptimizer {
                 let derated_freq = (profile.max_stable_mhz as f64 * derating) as u16;
                 let target = derated_freq.max(min_freq_mhz);
 
-                // Snap to nearest PLL entry <= target
-                pll.iter()
-                    .rev()
-                    .find(|&&f| f <= target)
-                    .copied()
+                dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, target)
                     .unwrap_or(min_freq_mhz)
             })
             .collect();

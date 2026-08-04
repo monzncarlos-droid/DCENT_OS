@@ -31,6 +31,62 @@ EXPECTFILE="/var/run/dcentrald.expected_exit.pid"
 API_PORT=8080
 SCRIPT="$0"
 SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
+PROCESS_IDENTITY_HELPER="/usr/libexec/dcentos/dcentrald-process-identity.sh"
+CRASH_LATCH_FILE="/data/dcent/dcentrald-hardware-session.crash-latched"
+PIDOF_COMMAND=pidof
+
+# Production always uses the kernel sysfs trees. Offline behavioral tests may
+# opt into isolated fixture roots explicitly; the test switch is never shipped
+# enabled and avoids touching a developer host's GPIO/PWM devices.
+GPIO_SYSFS_ROOT="/sys/class/gpio"
+PWM_SYSFS_ROOT="/sys/class/pwm"
+GPIO_TEST_SYSFS_EMULATION=0
+SAFETY_WRITE_JOURNAL=
+SAFETY_FAIL_WRITE_PATH=
+SAFETY_FAULT_INJECTED=0
+AM3_BB_SAFE_FAN_DUTY=30000
+if [ "${DCENT_TEST_ONLY_SYSFS_ROOTS:-0}" = "1" ]; then
+    GPIO_SYSFS_ROOT=${DCENT_TEST_GPIO_SYSFS_ROOT:-}
+    PWM_SYSFS_ROOT=${DCENT_TEST_PWM_SYSFS_ROOT:-}
+    LOGFILE=${DCENT_TEST_LOGFILE:-$LOGFILE}
+    GPIO_TEST_SYSFS_EMULATION=1
+    DAEMON=${DCENT_TEST_DAEMON:-$DAEMON}
+    CONFIG=${DCENT_TEST_CONFIG:-$CONFIG}
+    PIDFILE=${DCENT_TEST_PIDFILE:-$PIDFILE}
+    CHILD_PIDFILE=${DCENT_TEST_CHILD_PIDFILE:-$CHILD_PIDFILE}
+    EXPECTFILE=${DCENT_TEST_EXPECTFILE:-$EXPECTFILE}
+    CRASH_LATCH_FILE=${DCENT_TEST_CRASH_LATCH_FILE:-$CRASH_LATCH_FILE}
+    PROCESS_IDENTITY_HELPER=${DCENT_TEST_PROCESS_IDENTITY_HELPER:-$PROCESS_IDENTITY_HELPER}
+    if [ -n "${DCENT_TEST_PIDOF_COMMAND:-}" ]; then
+        case "$DCENT_TEST_PIDOF_COMMAND" in
+            /*) PIDOF_COMMAND=$DCENT_TEST_PIDOF_COMMAND ;;
+            *)
+                echo "  [SAFETY-FAIL] test-only pidof command must be an absolute path" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    SAFETY_WRITE_JOURNAL=${DCENT_TEST_WRITE_JOURNAL:-}
+    SAFETY_FAIL_WRITE_PATH=${DCENT_TEST_FAIL_WRITE_PATH:-}
+    case "$GPIO_SYSFS_ROOT:$PWM_SYSFS_ROOT" in
+        /*:/*) ;;
+        *)
+            echo "  [SAFETY-FAIL] test-only sysfs roots must be absolute" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=0
+if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ] \
+    && [ "$DAEMON" != /usr/local/bin/dcentrald ]; then
+    DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=1
+fi
+readonly DCENT_PROCESS_IDENTITY_TEST_AUTHORITY
+PROCESS_IDENTITY_AVAILABLE=0
+if [ -r "$PROCESS_IDENTITY_HELPER" ] && . "$PROCESS_IDENTITY_HELPER"; then
+    PROCESS_IDENTITY_AVAILABLE=1
+fi
 
 # Production-readiness matrix §7 #4 (AM3-BB cold-boot management-only gate).
 #
@@ -51,8 +107,16 @@ SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
 # the cold-boot proof) => the full mining profile + --am3-bb-mining.
 AM3_BB_COLDBOOT_PROOF_MARKER="/data/dcentos/am3-bb-coldboot-proven"
 AM3_BB_MGMT_ONLY_CONFIG="/etc/dcentrald.management-only.toml"
+if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ]; then
+    AM3_BB_COLDBOOT_PROOF_MARKER=${DCENT_TEST_COLDBOOT_PROOF_MARKER:-$AM3_BB_COLDBOOT_PROOF_MARKER}
+    AM3_BB_MGMT_ONLY_CONFIG=${DCENT_TEST_MGMT_ONLY_CONFIG:-$AM3_BB_MGMT_ONLY_CONFIG}
+fi
 
 detect_platform() {
+    if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ] && [ -n "${DCENT_TEST_PLATFORM:-}" ]; then
+        echo "$DCENT_TEST_PLATFORM"
+        return 0
+    fi
     if [ -e /dev/uio0 ]; then
         echo "zynq"
     elif grep -qiE 'AM33XX|AM335x|TI AM335' /proc/cpuinfo 2>/dev/null || [ -e /dev/ttyO1 ]; then
@@ -62,6 +126,43 @@ detect_platform() {
     else
         echo "unknown"
     fi
+}
+
+am3_bb_identity_verified() {
+    if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ]; then
+        [ "${DCENT_TEST_BOARD_TARGET:-}" = am3-bb-s19jpro ]
+        return
+    fi
+    [ "$(cat /etc/dcentos/board_target 2>/dev/null)" = am3-bb-s19jpro ]
+}
+
+child_identity_matches() {
+    IDENTITY_PID=$1
+    IDENTITY_START_TICKS=$2
+    [ -n "$IDENTITY_PID" ] && [ -n "$IDENTITY_START_TICKS" ] || return 1
+    case "$IDENTITY_PID:$IDENTITY_START_TICKS" in
+        *[!0-9:]*|:*) return 1 ;;
+    esac
+    [ "$(awk '{print $22}' "/proc/$IDENTITY_PID/stat" 2>/dev/null)" = "$IDENTITY_START_TICKS" ] \
+        || return 1
+    [ "$(readlink -f "/proc/$IDENTITY_PID/exe" 2>/dev/null)" = "$DAEMON" ] || return 1
+}
+
+child_identity_is_live() {
+    child_identity_matches "$1" "$2" || return 1
+    IDENTITY_STATE=$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null) || return 1
+    [ "$IDENTITY_STATE" != Z ]
+}
+
+dcentrald_may_execute() {
+    for IDENTITY_PID in $("$PIDOF_COMMAND" dcentrald 2>/dev/null || true); do
+        case "$IDENTITY_PID" in
+            ''|*[!0-9]*) return 0 ;;
+        esac
+        IDENTITY_STATE=$(awk '{print $3}' "/proc/$IDENTITY_PID/stat" 2>/dev/null) || return 0
+        [ "$IDENTITY_STATE" = Z ] || return 0
+    done
+    return 1
 }
 
 migrate_legacy_api_port() {
@@ -94,53 +195,426 @@ migrate_legacy_api_port() {
     fi
 }
 
+safety_failure() {
+    echo "$(date): SAFETY-FAIL: $*" >> "$LOGFILE" 2>/dev/null || true
+    echo "  [SAFETY-FAIL] $*" >&2
+}
+
+write_and_verify() {
+    SAFETY_PATH="$1"
+    SAFETY_EXPECTED="$2"
+    SAFETY_LABEL="$3"
+
+    if [ ! -e "$SAFETY_PATH" ]; then
+        safety_failure "$SAFETY_LABEL is absent ($SAFETY_PATH)"
+        return 1
+    fi
+    # Deterministic one-shot write failure for the isolated behavioral test.
+    # Production cannot enable this because the path is accepted only inside
+    # the explicit test-only sysfs-root branch above.
+    if [ -n "$SAFETY_FAIL_WRITE_PATH" ] \
+        && [ "$SAFETY_PATH" = "$SAFETY_FAIL_WRITE_PATH" ] \
+        && [ "$SAFETY_FAULT_INJECTED" -eq 0 ]; then
+        SAFETY_FAULT_INJECTED=1
+        safety_failure "$SAFETY_LABEL injected write failure ($SAFETY_PATH)"
+        return 1
+    fi
+    if [ -n "$SAFETY_WRITE_JOURNAL" ]; then
+        printf '%s=%s\n' "$SAFETY_PATH" "$SAFETY_EXPECTED" >> "$SAFETY_WRITE_JOURNAL"
+    fi
+    if ! (printf '%s\n' "$SAFETY_EXPECTED" > "$SAFETY_PATH") 2>/dev/null; then
+        safety_failure "$SAFETY_LABEL write failed ($SAFETY_PATH)"
+        return 1
+    fi
+    SAFETY_ACTUAL=$(cat "$SAFETY_PATH" 2>/dev/null) || {
+        safety_failure "$SAFETY_LABEL readback failed ($SAFETY_PATH)"
+        return 1
+    }
+    if [ "$SAFETY_ACTUAL" != "$SAFETY_EXPECTED" ]; then
+        safety_failure "$SAFETY_LABEL readback mismatch: expected $SAFETY_EXPECTED, got ${SAFETY_ACTUAL:-<empty>}"
+        return 1
+    fi
+    return 0
+}
+
+read_and_verify() {
+    SAFETY_PATH="$1"
+    SAFETY_EXPECTED="$2"
+    SAFETY_LABEL="$3"
+
+    SAFETY_ACTUAL=$(cat "$SAFETY_PATH" 2>/dev/null) || {
+        safety_failure "$SAFETY_LABEL readback failed ($SAFETY_PATH)"
+        return 1
+    }
+    if [ "$SAFETY_ACTUAL" != "$SAFETY_EXPECTED" ]; then
+        safety_failure "$SAFETY_LABEL readback mismatch: expected $SAFETY_EXPECTED, got ${SAFETY_ACTUAL:-<empty>}"
+        return 1
+    fi
+    return 0
+}
+
+gpio_set_direction_atomic() {
+    GPIO_DIR_PATH="$1"
+    GPIO_DIRECTION_COMMAND="$2"
+    GPIO_EXPECTED_VALUE="$3"
+    GPIO_LABEL="$4"
+
+    if ! (printf '%s\n' "$GPIO_DIRECTION_COMMAND" > "$GPIO_DIR_PATH/direction") 2>/dev/null; then
+        safety_failure "$GPIO_LABEL atomic direction=$GPIO_DIRECTION_COMMAND write failed"
+        return 1
+    fi
+    if [ -n "$SAFETY_WRITE_JOURNAL" ]; then
+        printf '%s=%s\n' "$GPIO_DIR_PATH/direction" "$GPIO_DIRECTION_COMMAND" \
+            >> "$SAFETY_WRITE_JOURNAL"
+    fi
+
+    # Regular-file fixtures do not implement the GPIO sysfs ABI side effect:
+    # direction=high/low atomically selects output mode and the RAW electrical
+    # level; active_low affects the logical value readback. Reproduce the
+    # resulting logical readback after exercising the production write above.
+    if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ]; then
+        printf '%s\n' "$GPIO_DIRECTION_COMMAND" > "$GPIO_DIR_PATH/direction_command"
+        printf 'out\n' > "$GPIO_DIR_PATH/direction"
+        printf '%s\n' "$GPIO_EXPECTED_VALUE" > "$GPIO_DIR_PATH/value"
+    fi
+
+    read_and_verify "$GPIO_DIR_PATH/direction" out "$GPIO_LABEL direction" || return 1
+    read_and_verify "$GPIO_DIR_PATH/value" "$GPIO_EXPECTED_VALUE" "$GPIO_LABEL value" || return 1
+    return 0
+}
+
 gpio_set_out() {
     GPIO_NUM="$1"
     GPIO_VALUE="$2"
     GPIO_ACTIVE_LOW="$3"
-    GPIO_DIR="/sys/class/gpio/gpio${GPIO_NUM}"
+    GPIO_DIR="$GPIO_SYSFS_ROOT/gpio${GPIO_NUM}"
+    if [ ! -d "$GPIO_DIR" ]; then
+        if ! (printf '%s\n' "$GPIO_NUM" > "$GPIO_SYSFS_ROOT/export") 2>/dev/null; then
+            safety_failure "GPIO $GPIO_NUM export failed"
+            return 1
+        fi
+    fi
+    if [ ! -d "$GPIO_DIR" ]; then
+        safety_failure "GPIO $GPIO_NUM did not appear after export"
+        return 1
+    fi
 
-    [ -d "$GPIO_DIR" ] || echo "$GPIO_NUM" > /sys/class/gpio/export 2>/dev/null || true
-    [ -d "$GPIO_DIR" ] || return 0
-    echo "$GPIO_ACTIVE_LOW" > "$GPIO_DIR/active_low" 2>/dev/null || true
-    echo out > "$GPIO_DIR/direction" 2>/dev/null || true
-    echo "$GPIO_VALUE" > "$GPIO_DIR/value" 2>/dev/null || true
+    # Polarity determines the electrical meaning of every later logical write.
+    # Never continue when it is absent, unwritable, or contradictory.
+    write_and_verify "$GPIO_DIR/active_low" "$GPIO_ACTIVE_LOW" "GPIO $GPIO_NUM active_low" \
+        || return 1
+
+    # Linux sysfs direction=high/low is a RAW electrical initial level even
+    # after active_low is configured. Convert the desired logical value to raw
+    # before issuing the glitch-free atomic direction command.
+    if [ "$GPIO_VALUE" != "$GPIO_ACTIVE_LOW" ]; then
+        GPIO_DIRECTION_COMMAND=high
+    else
+        GPIO_DIRECTION_COMMAND=low
+    fi
+    gpio_set_direction_atomic "$GPIO_DIR" "$GPIO_DIRECTION_COMMAND" "$GPIO_VALUE" "GPIO $GPIO_NUM"
 }
 
 am3_bb_hashboard_safety_override() {
     # S19J_IO_BOARD_V2_0 / .79-class: ASIC reset GPIOs are active-low,
     # represented through sysfs active_low=1 with value=1 meaning asserted.
+    AM3_BB_GPIO_RESULT=0
+    AM3_BB_LOAD_CUT_VERIFIED=0
+    AM3_BB_BOARD_ENABLE=failed
+    AM3_BB_RESETS=not-commanded
+    # Cut the active-high board-enable first. Reset assertion and fan coast-down
+    # are secondary containment and must never delay the monotonic load cut.
+    if ! gpio_set_out 59 0 0; then
+        # Do not reduce cooling or touch secondary outputs while the energized
+        # state is unknown. The terminal receipt remains failed.
+        return 1
+    fi
+    AM3_BB_LOAD_CUT_VERIFIED=1
+    AM3_BB_BOARD_ENABLE=verified
+    AM3_BB_RESETS=verified
     for g in 49 60 27 22; do
-        gpio_set_out "$g" 1 1
+        if ! gpio_set_out "$g" 1 1; then
+            AM3_BB_GPIO_RESULT=1
+            AM3_BB_RESETS=failed
+        fi
     done
-    # gpio59 board-enable is active-high; value=0 turns the board off.
-    gpio_set_out 59 0 0
+    return "$AM3_BB_GPIO_RESULT"
+}
+
+am3_bb_unsigned_decimal() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+am3_bb_modern_topology_complete() {
+    for p in "$PWM_SYSFS_ROOT/pwmchip0/pwm1/period" \
+             "$PWM_SYSFS_ROOT/pwmchip0/pwm1/duty_cycle" \
+             "$PWM_SYSFS_ROOT/pwmchip0/pwm1/enable" \
+             "$PWM_SYSFS_ROOT/pwmchip2/pwm0/period" \
+             "$PWM_SYSFS_ROOT/pwmchip2/pwm0/duty_cycle" \
+             "$PWM_SYSFS_ROOT/pwmchip2/pwm0/enable"; do
+        [ -e "$p" ] || return 1
+    done
+    return 0
+}
+
+am3_bb_legacy_topology_complete() {
+    for p in "$PWM_SYSFS_ROOT/pwm1/period_ns" \
+             "$PWM_SYSFS_ROOT/pwm1/duty_ns" \
+             "$PWM_SYSFS_ROOT/pwm1/run" \
+             "$PWM_SYSFS_ROOT/pwm2/period_ns" \
+             "$PWM_SYSFS_ROOT/pwm2/duty_ns" \
+             "$PWM_SYSFS_ROOT/pwm2/run"; do
+        [ -e "$p" ] || return 1
+    done
+    return 0
+}
+
+am3_bb_pwm_tuple_valid() {
+    AM3_BB_TUPLE_PERIOD="$1"
+    AM3_BB_TUPLE_DUTY="$2"
+    AM3_BB_TUPLE_STATE="$3"
+    am3_bb_unsigned_decimal "$AM3_BB_TUPLE_PERIOD" || return 1
+    am3_bb_unsigned_decimal "$AM3_BB_TUPLE_DUTY" || return 1
+    case "$AM3_BB_TUPLE_STATE" in 0|1) ;; *) return 1 ;; esac
+    if [ "$AM3_BB_TUPLE_PERIOD" -eq 0 ]; then
+        [ "$AM3_BB_TUPLE_DUTY" -eq 0 ] || return 1
+    else
+        [ "$AM3_BB_TUPLE_DUTY" -le "$AM3_BB_TUPLE_PERIOD" ] || return 1
+    fi
+    return 0
+}
+
+am3_bb_preflight_modern_pwm() {
+    AM3_BB_MODERN1_PERIOD=$(cat "$PWM_SYSFS_ROOT/pwmchip0/pwm1/period" 2>/dev/null) || return 1
+    AM3_BB_MODERN1_DUTY=$(cat "$PWM_SYSFS_ROOT/pwmchip0/pwm1/duty_cycle" 2>/dev/null) || return 1
+    AM3_BB_MODERN1_STATE=$(cat "$PWM_SYSFS_ROOT/pwmchip0/pwm1/enable" 2>/dev/null) || return 1
+    AM3_BB_MODERN2_PERIOD=$(cat "$PWM_SYSFS_ROOT/pwmchip2/pwm0/period" 2>/dev/null) || return 1
+    AM3_BB_MODERN2_DUTY=$(cat "$PWM_SYSFS_ROOT/pwmchip2/pwm0/duty_cycle" 2>/dev/null) || return 1
+    AM3_BB_MODERN2_STATE=$(cat "$PWM_SYSFS_ROOT/pwmchip2/pwm0/enable" 2>/dev/null) || return 1
+    am3_bb_pwm_tuple_valid "$AM3_BB_MODERN1_PERIOD" "$AM3_BB_MODERN1_DUTY" "$AM3_BB_MODERN1_STATE" \
+        || return 1
+    am3_bb_pwm_tuple_valid "$AM3_BB_MODERN2_PERIOD" "$AM3_BB_MODERN2_DUTY" "$AM3_BB_MODERN2_STATE" \
+        || return 1
+    return 0
+}
+
+am3_bb_preflight_legacy_pwm() {
+    AM3_BB_LEGACY1_PERIOD=$(cat "$PWM_SYSFS_ROOT/pwm1/period_ns" 2>/dev/null) || return 1
+    AM3_BB_LEGACY1_DUTY=$(cat "$PWM_SYSFS_ROOT/pwm1/duty_ns" 2>/dev/null) || return 1
+    AM3_BB_LEGACY1_STATE=$(cat "$PWM_SYSFS_ROOT/pwm1/run" 2>/dev/null) || return 1
+    AM3_BB_LEGACY2_PERIOD=$(cat "$PWM_SYSFS_ROOT/pwm2/period_ns" 2>/dev/null) || return 1
+    AM3_BB_LEGACY2_DUTY=$(cat "$PWM_SYSFS_ROOT/pwm2/duty_ns" 2>/dev/null) || return 1
+    AM3_BB_LEGACY2_STATE=$(cat "$PWM_SYSFS_ROOT/pwm2/run" 2>/dev/null) || return 1
+    am3_bb_pwm_tuple_valid "$AM3_BB_LEGACY1_PERIOD" "$AM3_BB_LEGACY1_DUTY" "$AM3_BB_LEGACY1_STATE" \
+        || return 1
+    am3_bb_pwm_tuple_valid "$AM3_BB_LEGACY2_PERIOD" "$AM3_BB_LEGACY2_DUTY" "$AM3_BB_LEGACY2_STATE" \
+        || return 1
+    return 0
+}
+
+am3_bb_restore_modern_pwm_channel() {
+    AM3_BB_PWM_BASE="$1"
+    AM3_BB_PWM_LABEL="$2"
+    AM3_BB_PWM_RESTORE_RESULT=0
+    write_and_verify "$AM3_BB_PWM_BASE/enable" 0 "$AM3_BB_PWM_LABEL rollback disable" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/duty_cycle" 0 "$AM3_BB_PWM_LABEL rollback zero duty" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/period" "$3" "$AM3_BB_PWM_LABEL rollback period" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/duty_cycle" "$4" "$AM3_BB_PWM_LABEL rollback duty" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/enable" "$5" "$AM3_BB_PWM_LABEL rollback enable" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    if [ "$AM3_BB_PWM_RESTORE_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: restored prior $AM3_BB_PWM_LABEL tuple after transition failure" >> "$LOGFILE"
+    else
+        safety_failure "$AM3_BB_PWM_LABEL prior tuple could not be completely restored"
+    fi
+    return "$AM3_BB_PWM_RESTORE_RESULT"
+}
+
+am3_bb_restore_legacy_pwm_channel() {
+    AM3_BB_PWM_BASE="$1"
+    AM3_BB_PWM_LABEL="$2"
+    AM3_BB_PWM_RESTORE_RESULT=0
+    write_and_verify "$AM3_BB_PWM_BASE/run" 0 "$AM3_BB_PWM_LABEL rollback stop" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/duty_ns" 0 "$AM3_BB_PWM_LABEL rollback zero duty" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/period_ns" "$3" "$AM3_BB_PWM_LABEL rollback period" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/duty_ns" "$4" "$AM3_BB_PWM_LABEL rollback duty" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    write_and_verify "$AM3_BB_PWM_BASE/run" "$5" "$AM3_BB_PWM_LABEL rollback run" \
+        || AM3_BB_PWM_RESTORE_RESULT=1
+    if [ "$AM3_BB_PWM_RESTORE_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: restored prior $AM3_BB_PWM_LABEL tuple after transition failure" >> "$LOGFILE"
+    else
+        safety_failure "$AM3_BB_PWM_LABEL prior tuple could not be completely restored"
+    fi
+    return "$AM3_BB_PWM_RESTORE_RESULT"
+}
+
+am3_bb_set_modern_pwm_channel() {
+    AM3_BB_PWM_BASE="$1"
+    AM3_BB_PWM_LABEL="$2"
+    AM3_BB_PWM_OLD_PERIOD="$3"
+    AM3_BB_PWM_OLD_DUTY="$4"
+    AM3_BB_PWM_OLD_STATE="$5"
+
+    # Preserve airflow and minimize sysfs churn when the period is already the
+    # proven 100us value. An enabled channel needs only a duty adjustment.
+    if [ "$AM3_BB_PWM_OLD_PERIOD" -eq 100000 ]; then
+        if [ "$AM3_BB_PWM_OLD_DUTY" -ne "$AM3_BB_SAFE_FAN_DUTY" ]; then
+            write_and_verify "$AM3_BB_PWM_BASE/duty_cycle" "$AM3_BB_SAFE_FAN_DUTY" "$AM3_BB_PWM_LABEL duty" || {
+                am3_bb_restore_modern_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+                    "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+                return 1
+            }
+        fi
+        if [ "$AM3_BB_PWM_OLD_STATE" -eq 0 ]; then
+            write_and_verify "$AM3_BB_PWM_BASE/enable" 1 "$AM3_BB_PWM_LABEL enable" || {
+                am3_bb_restore_modern_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+                    "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+                return 1
+            }
+        fi
+        return 0
+    fi
+
+    # A period transition requires a disabled, zero-duty channel. Every failed
+    # step attempts to restore the fully preflighted prior tuple.
+    write_and_verify "$AM3_BB_PWM_BASE/enable" 0 "$AM3_BB_PWM_LABEL disable" \
+        && write_and_verify "$AM3_BB_PWM_BASE/duty_cycle" 0 "$AM3_BB_PWM_LABEL zero duty" \
+        && write_and_verify "$AM3_BB_PWM_BASE/period" 100000 "$AM3_BB_PWM_LABEL period" \
+        && write_and_verify "$AM3_BB_PWM_BASE/duty_cycle" "$AM3_BB_SAFE_FAN_DUTY" "$AM3_BB_PWM_LABEL duty" \
+        && write_and_verify "$AM3_BB_PWM_BASE/enable" 1 "$AM3_BB_PWM_LABEL enable" \
+        && return 0
+    am3_bb_restore_modern_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+        "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+    return 1
+}
+
+am3_bb_set_legacy_pwm_channel() {
+    AM3_BB_PWM_BASE="$1"
+    AM3_BB_PWM_LABEL="$2"
+    AM3_BB_PWM_OLD_PERIOD="$3"
+    AM3_BB_PWM_OLD_DUTY="$4"
+    AM3_BB_PWM_OLD_STATE="$5"
+    if [ "$AM3_BB_PWM_OLD_PERIOD" -eq 100000 ]; then
+        if [ "$AM3_BB_PWM_OLD_DUTY" -ne "$AM3_BB_SAFE_FAN_DUTY" ]; then
+            write_and_verify "$AM3_BB_PWM_BASE/duty_ns" "$AM3_BB_SAFE_FAN_DUTY" "$AM3_BB_PWM_LABEL duty" || {
+                am3_bb_restore_legacy_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+                    "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+                return 1
+            }
+        fi
+        if [ "$AM3_BB_PWM_OLD_STATE" -eq 0 ]; then
+            write_and_verify "$AM3_BB_PWM_BASE/run" 1 "$AM3_BB_PWM_LABEL run" || {
+                am3_bb_restore_legacy_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+                    "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+                return 1
+            }
+        fi
+        return 0
+    fi
+    write_and_verify "$AM3_BB_PWM_BASE/run" 0 "$AM3_BB_PWM_LABEL stop" \
+        && write_and_verify "$AM3_BB_PWM_BASE/duty_ns" 0 "$AM3_BB_PWM_LABEL zero duty" \
+        && write_and_verify "$AM3_BB_PWM_BASE/period_ns" 100000 "$AM3_BB_PWM_LABEL period" \
+        && write_and_verify "$AM3_BB_PWM_BASE/duty_ns" "$AM3_BB_SAFE_FAN_DUTY" "$AM3_BB_PWM_LABEL duty" \
+        && write_and_verify "$AM3_BB_PWM_BASE/run" 1 "$AM3_BB_PWM_LABEL run" \
+        && return 0
+    am3_bb_restore_legacy_pwm_channel "$AM3_BB_PWM_BASE" "$AM3_BB_PWM_LABEL" \
+        "$AM3_BB_PWM_OLD_PERIOD" "$AM3_BB_PWM_OLD_DUTY" "$AM3_BB_PWM_OLD_STATE" || true
+    return 1
+}
+
+am3_bb_fan_safety_override() {
+    AM3_BB_PWM_RESULT=0
+
+    # Select only a complete, readable two-channel backend. A stray modern
+    # attribute must not mask a complete stock legacy topology, and neither
+    # backend may mutate channel one before channel two has been preflighted.
+    if am3_bb_modern_topology_complete && am3_bb_preflight_modern_pwm; then
+        am3_bb_set_modern_pwm_channel "$PWM_SYSFS_ROOT/pwmchip0/pwm1" front-pwm1 \
+            "$AM3_BB_MODERN1_PERIOD" "$AM3_BB_MODERN1_DUTY" "$AM3_BB_MODERN1_STATE" \
+            || AM3_BB_PWM_RESULT=1
+        am3_bb_set_modern_pwm_channel "$PWM_SYSFS_ROOT/pwmchip2/pwm0" rear-pwm0 \
+            "$AM3_BB_MODERN2_PERIOD" "$AM3_BB_MODERN2_DUTY" "$AM3_BB_MODERN2_STATE" \
+            || AM3_BB_PWM_RESULT=1
+        return "$AM3_BB_PWM_RESULT"
+    fi
+
+    if am3_bb_legacy_topology_complete && am3_bb_preflight_legacy_pwm; then
+        am3_bb_set_legacy_pwm_channel "$PWM_SYSFS_ROOT/pwm1" "legacy front fan PWM" \
+            "$AM3_BB_LEGACY1_PERIOD" "$AM3_BB_LEGACY1_DUTY" "$AM3_BB_LEGACY1_STATE" \
+            || AM3_BB_PWM_RESULT=1
+        am3_bb_set_legacy_pwm_channel "$PWM_SYSFS_ROOT/pwm2" "legacy rear fan PWM" \
+            "$AM3_BB_LEGACY2_PERIOD" "$AM3_BB_LEGACY2_DUTY" "$AM3_BB_LEGACY2_STATE" \
+            || AM3_BB_PWM_RESULT=1
+        return "$AM3_BB_PWM_RESULT"
+    fi
+
+    safety_failure "no complete and valid AM3-BB fan PWM topology is available"
+    return 1
 }
 
 fan_safety_override() {
     FAN_PLATFORM=${PLATFORM:-$(detect_platform)}
-    fan_detail="fans commanded to safe PWM; AM3 BB resets asserted and board-enable off where available"
+    FAN_SAFETY_RESULT=0
+    SAFETY_GPIO_CUT=not-applicable
+    SAFETY_FAN=failed
+    AM3_BB_BOARD_ENABLE=not-applicable
+    AM3_BB_RESETS=not-applicable
+    if [ "$FAN_PLATFORM" != beaglebone ] || ! am3_bb_identity_verified; then
+        safety_failure "exact am3-bb-s19jpro platform identity is absent; refusing fixed safety mutation"
+        echo "$(date): SAFETY: safeoff-failed gpio_cut=failed fan=preserved board_enable=not-commanded resets=not-commanded" >> "$LOGFILE"
+        return 1
+    fi
     case "$FAN_PLATFORM" in
         amlogic)
-            if [ -d /sys/class/pwm/pwmchip0/pwm0 ]; then
-                echo 30000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
-                echo 30000 > /sys/class/pwm/pwmchip0/pwm1/duty_cycle 2>/dev/null
+            AMLOGIC_PWM_FOUND=0
+            for p in "$PWM_SYSFS_ROOT/pwmchip0/pwm0/duty_cycle" \
+                     "$PWM_SYSFS_ROOT/pwmchip0/pwm1/duty_cycle"; do
+                if [ -e "$p" ]; then
+                    AMLOGIC_PWM_FOUND=$((AMLOGIC_PWM_FOUND + 1))
+                    write_and_verify "$p" 30000 "fan PWM" || FAN_SAFETY_RESULT=1
+                fi
+            done
+            if [ "$AMLOGIC_PWM_FOUND" -eq 0 ]; then
+                safety_failure "no amlogic fan PWM channel is available"
+                FAN_SAFETY_RESULT=1
             fi
+            [ "$FAN_SAFETY_RESULT" -eq 0 ] && SAFETY_FAN=verified
             ;;
         beaglebone)
             # AM335x BB carrier (S19j Pro 3-board variant) -- 4 fans on
             # sysfs PWM. PWM=30 cap (30000ns / 100000ns period) across every
             # exported channel. Both LuxOS/DCENT_OS pwmchip0+pwmchip2
             # paths and Bitmain stock legacy pwm1/pwm2 are tolerated.
-            for p in /sys/class/pwm/pwmchip0/pwm0/duty_cycle \
-                     /sys/class/pwm/pwmchip0/pwm1/duty_cycle \
-                     /sys/class/pwm/pwmchip2/pwm0/duty_cycle; do
-                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
-            done
-            for p in /sys/class/pwm/pwm1/duty_ns /sys/class/pwm/pwm2/duty_ns; do
-                [ -e "$p" ] && echo 30000 > "$p" 2>/dev/null
-            done
-            am3_bb_hashboard_safety_override
+            if am3_bb_hashboard_safety_override; then
+                SAFETY_GPIO_CUT=verified
+                echo "$(date): SAFETY: gpio_cut=verified" >> "$LOGFILE"
+            else
+                SAFETY_GPIO_CUT=failed
+                FAN_SAFETY_RESULT=1
+                safety_failure "AM3-BB GPIO load-cut/reset command-readback is incomplete"
+            fi
+            if [ "${AM3_BB_LOAD_CUT_VERIFIED:-0}" -ne 1 ]; then
+                SAFETY_FAN=preserved
+                safety_failure "AM3-BB fan command suppressed because the primary load cut is unverified"
+            elif am3_bb_fan_safety_override; then
+                SAFETY_FAN=verified
+                echo "$(date): SAFETY: fan=verified" >> "$LOGFILE"
+            else
+                SAFETY_FAN=failed
+                FAN_SAFETY_RESULT=1
+                safety_failure "AM3-BB fan coast-down command-readback is incomplete"
+            fi
             ;;
         zynq)
             # AM2/XIL fan-control is UIO-bound; devmem writes are stale/no-op.
@@ -155,22 +629,63 @@ fan_safety_override() {
             # is unreachable on this overlay; do not duplicate the custodian here.
             if [ -x "$DAEMON" ]; then
                 if "$DAEMON" --set-fan 30 >/tmp/s82dcentrald-fan-safety.log 2>&1; then
-                    fan_detail="AM2 fans commanded to PWM 30 via dcentrald UIO (one-shot; AM2 hold lives in board/zynq/*)"
+                    SAFETY_FAN=verified
                 else
-                    fan_detail="WARN: AM2 fan safety command failed; see /tmp/s82dcentrald-fan-safety.log"
+                    FAN_SAFETY_RESULT=1
                 fi
             else
-                fan_detail="WARN: AM2 fan safety command skipped; $DAEMON missing"
+                FAN_SAFETY_RESULT=1
             fi
             ;;
+        *)
+            safety_failure "platform is unknown; no emergency safe-off backend is available"
+            FAN_SAFETY_RESULT=1
+            ;;
     esac
-    echo "$(date): SAFETY: $fan_detail" >> "$LOGFILE"
+    if [ "$FAN_SAFETY_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: safeoff-verified gpio_cut=$SAFETY_GPIO_CUT fan=$SAFETY_FAN board_enable=$AM3_BB_BOARD_ENABLE resets=$AM3_BB_RESETS" >> "$LOGFILE"
+    else
+        echo "$(date): SAFETY: safeoff-failed gpio_cut=$SAFETY_GPIO_CUT fan=$SAFETY_FAN board_enable=$AM3_BB_BOARD_ENABLE resets=$AM3_BB_RESETS" >> "$LOGFILE"
+    fi
+    return "$FAN_SAFETY_RESULT"
 }
 
 case "$1" in
     start)
-        [ -x "$DAEMON" ] || { echo "  [SKIP] $DAEMON not found"; exit 0; }
-        [ -f "$CONFIG" ] || { echo "  [SKIP] $CONFIG not found"; exit 0; }
+        PLATFORM=$(detect_platform)
+        RUNNING_PIDS=$("$PIDOF_COMMAND" dcentrald 2>/dev/null || true)
+        if [ -n "$RUNNING_PIDS" ]; then
+            echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
+            exit 1
+        fi
+
+        # Snapshot posture once. A marker appearing later must never upgrade a
+        # degraded management-only admission into mining in this invocation.
+        AM3_BB_MINING_REQUESTED=0
+        [ -e "$AM3_BB_COLDBOOT_PROOF_MARKER" ] && AM3_BB_MINING_REQUESTED=1
+
+        # Once absence of a live owner is established, perform the monotonic
+        # emergency cut before trusting any daemon/configuration artifact.
+        if ! fan_safety_override; then
+            if [ "$PLATFORM" = beaglebone ] \
+                && [ "$AM3_BB_MINING_REQUESTED" -eq 0 ] \
+                && [ "${AM3_BB_LOAD_CUT_VERIFIED:-0}" -eq 1 ]; then
+                # Management-only cold boot cannot energize mining hardware.
+                # Preserve diagnostics when the load-bearing board-enable cut
+                # is verified even if fan/reset evidence is incomplete.
+                echo "  [WARN] Load cut verified; continuing toward management-only admission with degraded auxiliary safety evidence"
+                echo "$(date): SAFETY: management-only-prestart load_cut=verified auxiliary=degraded" >> "$LOGFILE"
+            else
+                echo "  [FAIL] Pre-start emergency safe-off could not be verified"
+                exit 1
+            fi
+        fi
+        if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ] \
+            && [ "${DCENT_TEST_CREATE_PROOF_AFTER_SAFEOFF:-0}" = 1 ]; then
+            : > "$AM3_BB_COLDBOOT_PROOF_MARKER"
+        fi
+        [ -x "$DAEMON" ] || { echo "  [FAIL] $DAEMON not found or not executable"; exit 1; }
+        [ -f "$CONFIG" ] || { echo "  [FAIL] $CONFIG not found"; exit 1; }
 
         if [ -d /data/dcent ]; then
             chmod 0700 /data/dcent 2>/dev/null
@@ -179,7 +694,6 @@ case "$1" in
             chmod 0600 /data/dcent/auth.json 2>/dev/null
         fi
 
-        PLATFORM=$(detect_platform)
         ARGS="--config $CONFIG"
         case "$PLATFORM" in
             amlogic) ARGS="--serial-mining $ARGS" ;;
@@ -193,7 +707,7 @@ case "$1" in
                 # de-energized and the ASIC chains untouched while SSH/MCP/
                 # dashboard/API stay reachable. The mining profile at $CONFIG
                 # is preserved verbatim and used unchanged once proven.
-                if [ -f "$AM3_BB_COLDBOOT_PROOF_MARKER" ]; then
+                if [ "$AM3_BB_MINING_REQUESTED" -eq 1 ]; then
                     echo "  [AM3-BB] cold-boot proof marker present ($AM3_BB_COLDBOOT_PROOF_MARKER) — starting mining"
                     echo "$(date): AM3-BB cold-boot proof present; starting --am3-bb-mining with $CONFIG" >> "$LOGFILE"
                     ARGS="--am3-bb-mining $ARGS"
@@ -229,7 +743,7 @@ case "$1" in
                         echo "  [AM3-BB]   ERROR: $AM3_BB_MGMT_ONLY_CONFIG missing — refusing to start dcentrald to avoid cold-boot energize."
                         echo "  [AM3-BB]   SSH (S50dropbear) + MCP (S81mcp) remain up. Restore the config or drop the proof marker, then: $SCRIPT restart"
                         echo "$(date): ERROR AM3-BB management-only config missing; refusing to start mining daemon (fail-closed, no energize)" >> "$LOGFILE"
-                        exit 0
+                        exit 1
                     fi
                 fi
                 ;;
@@ -237,23 +751,17 @@ case "$1" in
 
         migrate_legacy_api_port
 
-        RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
-        if [ -n "$RUNNING_PIDS" ]; then
-            echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
-            exit 1
-        fi
-        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
-            echo "  [FAIL] Persistent hardware-session latch helper is missing"
-            fan_safety_override
+        if [ ! -r "$SESSION_LATCH_HELPER" ] \
+            || [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Persistent session or exact-process identity helper is missing"
+            fan_safety_override || true
             exit 1
         fi
         SESSION_TOKEN=$(/bin/sh "$SESSION_LATCH_HELPER" prepare 2>> "$LOGFILE") || {
             echo "  [FAIL] Hardware-session admission is blocked; see $LOGFILE"
-            fan_safety_override
+            fan_safety_override || true
             exit 1
         }
-        fan_safety_override
-
         echo "  Starting dcentrald (platform=$PLATFORM)..."
         echo "  Config: $CONFIG"
         echo "  API: REST/WebSocket :$API_PORT"
@@ -265,53 +773,40 @@ case "$1" in
             "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" "$@"; then
             /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
                 >> "$LOGFILE" 2>&1 || true
-            fan_safety_override
+            fan_safety_override || true
             echo "  [FAIL] dcentrald supervisor did not start"
             exit 1
         fi
 
         sleep 3
-        if pidof dcentrald > /dev/null 2>&1; then
-            echo "  [OK] dcentrald running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        if "$PIDOF_COMMAND" dcentrald > /dev/null 2>&1; then
+            echo "  [OK] dcentrald running (PID $("$PIDOF_COMMAND" dcentrald), REST/WebSocket :$API_PORT)"
         else
             echo "  [FAIL] dcentrald not started"
-            fan_safety_override
+            fan_safety_override || true
             exit 1
         fi
         ;;
 
     stop)
         echo "  Stopping dcentrald..."
-        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
-        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
-        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
-        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
-
-        for i in $(seq 1 30); do
-            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-
-        TIMED_OUT=0
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-            echo "  [WARN] dcentrald did not exit in 30s - force killing"
-            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
-            rm -f "$EXPECTFILE"
-            TIMED_OUT=1
-            kill -9 "$CHILD_PID" 2>/dev/null
+        if [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Exact-process identity helper is unavailable; refusing stop mutations"
+            exit 1
         fi
-
-        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
-            kill -TERM "$WRAPPER_PID" 2>/dev/null
-            sleep 1
-            kill -9 "$WRAPPER_PID" 2>/dev/null
+        if [ "$GPIO_TEST_SYSFS_EMULATION" -eq 1 ]; then
+            STOP_GRACE=2
+            STOP_REAP=1
+            STOP_RECEIPT=0
+        else
+            STOP_GRACE=30
+            STOP_REAP=5
+            STOP_RECEIPT=30
         fi
-
-        rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        fan_safety_override
-        echo "  [OK] dcentrald stopped; hardware disposition remains unresolved"
+        dcent_stop_managed_session "$CHILD_PIDFILE" "$EXPECTFILE" "$DAEMON" \
+            "$PIDFILE" "$CRASH_LATCH_FILE" "$SCRIPT" "$LOGFILE" \
+            "$STOP_GRACE" "$STOP_REAP" "$STOP_RECEIPT" || exit $?
+        echo "  [OK] dcentrald stopped after exact owner-death and terminal-custody evidence"
         ;;
 
     restart)
@@ -321,19 +816,27 @@ case "$1" in
         ;;
 
     safety)
+        AM3_BB_SAFE_FAN_DUTY=30000
         fan_safety_override
+        exit $?
+        ;;
+
+    boot-safety)
+        AM3_BB_SAFE_FAN_DUTY=10000
+        fan_safety_override
+        exit $?
         ;;
 
     status)
-        if pidof dcentrald > /dev/null 2>&1; then
-            echo "dcentrald: running (PID $(pidof dcentrald), REST/WebSocket :$API_PORT)"
+        if "$PIDOF_COMMAND" dcentrald > /dev/null 2>&1; then
+            echo "dcentrald: running (PID $("$PIDOF_COMMAND" dcentrald), REST/WebSocket :$API_PORT)"
         else
             echo "dcentrald: stopped"
         fi
         ;;
 
     *)
-        echo "Usage: $0 {start|stop|restart|status|safety}"
+        echo "Usage: $0 {start|stop|restart|status|safety|boot-safety}"
         exit 1
         ;;
 esac

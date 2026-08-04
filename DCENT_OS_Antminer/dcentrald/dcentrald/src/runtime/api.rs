@@ -17,6 +17,15 @@ use dcentrald_hal::platform::HardwareMutationGate;
 
 use crate::config::DcentraldConfig;
 
+/// Route-admitted API identity. Construction belongs to the hardware route;
+/// the API cannot mint this from a presentation string or mutable config.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedApiHardwareIdentity {
+    pub control_board_label: String,
+    pub chip_type_label: String,
+    pub identification: dcentrald_api::HardwareIdentification,
+}
+
 /// Build a minimal AppState and spawn the dashboard / CGMiner API servers.
 ///
 /// Used by `--stratum-proxy`, `--s19j-hybrid`, `--tap-mode`,
@@ -103,6 +112,98 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
     hardware_mutation_gate: HardwareMutationGate,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    spawn_proxy_mode_api_with_identity(
+        config,
+        runtime_mode,
+        runtime_health_rx,
+        external_state_rx,
+        hardware_mutation_gate,
+        false,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// Fully owned proxy-mode API with an explicit, route-admitted control-board
+/// identity. Standalone hardware runtimes use this when `RuntimeHealthMode`
+/// alone is too coarse to identify the SoC (for example AM3-BB is Native but
+/// physically AM335x, not Zynq).
+pub async fn spawn_proxy_mode_api_with_state_gate_and_identity(
+    config: DcentraldConfig,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
+    external_state_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::MinerState>>,
+    hardware_mutation_gate: HardwareMutationGate,
+    identity: AdmittedApiHardwareIdentity,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    spawn_proxy_mode_api_with_identity(
+        config,
+        runtime_mode,
+        runtime_health_rx,
+        external_state_rx,
+        hardware_mutation_gate,
+        true,
+        Some(identity),
+        shutdown,
+    )
+    .await
+}
+
+/// Observation-only API without asserted hardware identity. Used when an AM3
+/// CLI request is disabled or exact route admission fails: management remains
+/// reachable, but neither persistent API mutation nor a fabricated board label
+/// is allowed.
+pub async fn spawn_observer_only_api_with_state_and_hardware_mutation_gate(
+    config: DcentraldConfig,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
+    external_state_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::MinerState>>,
+    hardware_mutation_gate: HardwareMutationGate,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    spawn_proxy_mode_api_with_identity(
+        config,
+        runtime_mode,
+        runtime_health_rx,
+        external_state_rx,
+        hardware_mutation_gate,
+        true,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+fn fallback_hardware_labels(
+    observer_only: bool,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    serial_chip_type: Option<&str>,
+    configured_model: Option<&str>,
+) -> (String, String) {
+    if observer_only {
+        return ("Unknown".to_string(), "Unknown".to_string());
+    }
+    (
+        format!("DCENT_OS ({} mode)", runtime_mode.as_str()),
+        serial_chip_type
+            .or(configured_model)
+            .unwrap_or("Proxied")
+            .to_string(),
+    )
+}
+
+async fn spawn_proxy_mode_api_with_identity(
+    config: DcentraldConfig,
+    runtime_mode: dcentrald_api::RuntimeHealthMode,
+    runtime_health_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::RuntimeHealthSnapshot>>,
+    external_state_rx: Option<tokio::sync::watch::Receiver<dcentrald_api::MinerState>>,
+    hardware_mutation_gate: HardwareMutationGate,
+    observer_only: bool,
+    admitted_identity: Option<AdmittedApiHardwareIdentity>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
     let api_config = dcentrald_api::ApiConfig {
         cgminer_port: config.api.cgminer_port,
         http_port: config.api.http_port,
@@ -114,6 +215,7 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
         metrics_require_auth: config.api.metrics_require_auth,
         // W13.D1: dev-mode boot-timeline gate. See ApiConfig docs.
         expose_boot_timeline: config.api.expose_boot_timeline,
+        observer_only,
     };
     let mode = dcentrald_api::OperatingMode::from_config_str(&config.mode.active);
     let firmware_version = std::fs::read_to_string("/etc/dcentos-version")
@@ -125,6 +227,12 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
         .protocol
         .clone()
         .unwrap_or_else(|| "sv1".to_string());
+    let fallback_labels = fallback_hardware_labels(
+        observer_only,
+        runtime_mode,
+        config.mining.serial_chip_type.as_deref(),
+        config.mining.model.as_deref(),
+    );
     let inputs = dcentrald_api::MinimalAppStateInputs {
         api_config,
         pool_url: config.pool.url.clone(),
@@ -136,12 +244,14 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
         fan_pwm: 0,
         network_block: config.network_block.clone(),
         profile_path: config.autotuner.profile_path.clone(),
-        control_board_label: format!("DCENT_OS ({} mode)", runtime_mode.as_str()),
-        chip_type_label: config
-            .mining
-            .model
-            .clone()
-            .unwrap_or_else(|| "Proxied".to_string()),
+        control_board_label: admitted_identity
+            .as_ref()
+            .map(|identity| identity.control_board_label.clone())
+            .unwrap_or_else(|| fallback_labels.0.clone()),
+        chip_type_label: admitted_identity
+            .as_ref()
+            .map(|identity| identity.chip_type_label.clone())
+            .unwrap_or_else(|| fallback_labels.1.clone()),
         external_state_rx,
     };
     if let Some(rx) = runtime_health_rx {
@@ -156,6 +266,13 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
         inputs,
         hardware_mutation_gate,
     );
+    if let Some(identity) = admitted_identity {
+        let mut hardware = app_state
+            .hardware_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hardware.identification = identity.identification;
+    }
 
     // P1-4 (Omega): bring up the shared notification stack (MQTT publisher +
     // event-bus webhook dispatcher + mining-sync bridge) for EVERY non-`Daemon`
@@ -182,9 +299,13 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
             // P2-7 (Omega): the proxy/hybrid AppState exposes the same clamped
             // fan setter + autotuner command channel, so HA command setpoints
             // route through the same caps here as on the S9 Daemon path.
-            Some(dcentrald_api::rest::app_state_mqtt_command_sink(
-                app_state.clone(),
-            )),
+            if observer_only {
+                None
+            } else {
+                Some(dcentrald_api::rest::app_state_mqtt_command_sink(
+                    app_state.clone(),
+                ))
+            },
         );
     }
 
@@ -211,5 +332,29 @@ pub async fn spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
             );
             Err(e.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_hardware_labels;
+
+    #[test]
+    fn observer_fallback_never_asserts_configured_hardware_identity() {
+        let labels = fallback_hardware_labels(
+            true,
+            dcentrald_api::RuntimeHealthMode::Native,
+            Some("BM1362"),
+            Some("S19j Pro"),
+        );
+        assert_eq!(labels, ("Unknown".to_string(), "Unknown".to_string()));
+
+        let labels = fallback_hardware_labels(
+            false,
+            dcentrald_api::RuntimeHealthMode::Native,
+            Some("BM1362"),
+            Some("S19j Pro"),
+        );
+        assert_eq!(labels.1, "BM1362");
     }
 }

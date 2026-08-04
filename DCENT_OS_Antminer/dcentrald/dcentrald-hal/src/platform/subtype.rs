@@ -11,7 +11,7 @@
 //! | `CVCtrl_BHB42XXX`    | CV1835/CV183x| BHB42XXX (S19j Pro / S19 / S19i / S19 XP / **T19**) | PIC1704 |
 //! | `BBCtrl_BHB42XXX`    | AM335x BB    | BHB42XXX (S19j Pro) | PIC1704 (this wave) |
 //! | `AMLCtrl_BHB42XXX`   | Amlogic A113D| BHB42XXX (S19j Pro AML) | PIC1704 (this wave) |
-//! | `AMLCtrl_BHB56xxx`   | Amlogic A113D| BHB569xx (S19k Pro / S21) | dsPIC33EP (existing) |
+//! | `AMLCtrl_BHB56xxx`   | Amlogic A113D| BHB569xx (live BHB56902 / S19k Pro evidence) | NoPic |
 //! | `AMLCtrl_BHB68xxx`   | Amlogic A113D| BHB68xxx (S21 NoPic) | NoPic |
 //!
 //! W11.3 marker expansion (2026-05-09): RE2 hardware catalog §6.1 confirms
@@ -368,10 +368,7 @@ fn subtype_expectation(subtype: Option<&str>) -> SubtypeExpectation {
     ) {
         return SubtypeExpectation::ControllerAt0x20(VoltageControllerKind::Pic1704);
     }
-    if upper.starts_with("AMLCTRL_BHB56") {
-        return SubtypeExpectation::ControllerAt0x20(VoltageControllerKind::Dspic33Ep);
-    }
-    if upper.starts_with("AMLCTRL_BHB68") {
+    if upper.starts_with("AMLCTRL_BHB56") || upper.starts_with("AMLCTRL_BHB68") {
         return SubtypeExpectation::NoController;
     }
     if matches!(upper.as_str(), "S9" | "S9J" | "S9K" | "S9_BHB09001") {
@@ -440,8 +437,8 @@ fn discover_from_observations(
 ///
 /// Decision table:
 /// - `*Ctrl_BHB42XXX` (CV / BB / AML) → `Pic1704`
-/// - `AMLCtrl_BHB56xxx` (S19k Pro / S21 with framed dsPIC) → `Dspic33Ep`
-/// - other `AML*` strings (catch-all for S21 NoPic variants) → `NoPic`
+/// - `AMLCtrl_BHB56xxx` (live BHB56902 / S19k Pro evidence) → `NoPic`
+/// - other `AML*` strings (catch-all for unproven Amlogic variants) → `NoPic`
 /// - `S9` / Bitmain stock S9 → `Pic16f1704`
 /// - missing → `NoPic` compatibility result (identity unknown; non-energizing)
 /// - present but unknown → `NoPic` (fail closed: issue no PIC/dsPIC voltage commands)
@@ -470,11 +467,12 @@ pub(crate) fn classify_voltage_controller(subtype: Option<&str>) -> VoltageContr
         return VoltageControllerKind::Pic1704;
     }
 
-    // BHB56xxx hashboard family on Amlogic — framed dsPIC33EP path
-    // (S19k Pro at .78, S21 framed-dsPIC variants).
+    // BHB56xxx hashboard family on Amlogic — live BHB56902 EEPROM
+    // evidence and the canonical model catalog agree that this is NoPic.
+    // A family-looking subtype must not resurrect the retired dsPIC guess.
     if upper.starts_with("AMLCTRL_") && upper.contains("BHB56") {
-        tracing::debug!(subtype = %s, "subtype: AMLCtrl_BHB56xxx → Dspic33Ep");
-        return VoltageControllerKind::Dspic33Ep;
+        tracing::debug!(subtype = %s, "subtype: AMLCtrl_BHB56xxx → NoPic");
+        return VoltageControllerKind::NoPic;
     }
 
     // Catch-all for other Amlogic carrier strings — treat as S21-class
@@ -964,14 +962,15 @@ mod tests {
             VoltageControllerKind::Pic1704,
         );
 
-        // Existing dsPIC33EP path (S19k Pro / S21 framed-dsPIC).
+        // Live BHB56902 evidence is NoPic; unknown BHB56 suffixes inherit no
+        // controller authority.
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56902")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56999")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
 
         // Other Amlogic strings → NoPic catch-all.
@@ -1046,13 +1045,13 @@ mod tests {
             (
                 Some("AMLCtrl_BHB56902"),
                 true,
-                VoltageControllerDiscoveryStatus::Confirmed(VoltageControllerKind::Dspic33Ep),
-                true,
+                VoltageControllerDiscoveryStatus::Contradictory,
+                false,
             ),
             (
                 Some("AMLCtrl_BHB56902"),
                 false,
-                VoltageControllerDiscoveryStatus::Contradictory,
+                VoltageControllerDiscoveryStatus::NoController,
                 false,
             ),
             (
@@ -1121,6 +1120,7 @@ mod tests {
             Some(""),
             Some("unknown"),
             Some("S9"),
+            Some("AMLCtrl_BHB56902"),
             Some("AMLCtrl_BHB68900"),
             Some("AMLCtrl_S21Pro"),
         ] {
@@ -1132,7 +1132,7 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0, "subtype={subtype:?}");
         }
 
-        for subtype in ["CVCtrl_BHB42XXX", "AMLCtrl_BHB56902"] {
+        for subtype in ["CVCtrl_BHB42XXX"] {
             let calls = AtomicUsize::new(0);
             let _ = discover_voltage_controller_with_probe(Some(subtype), || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1177,18 +1177,19 @@ mod tests {
         assert_eq!(pic.bus(), 0);
         assert_eq!(pic.address(), 0x20);
 
-        let confirmed_dspic =
-            discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
-        let dspic = bind_presence_validated_endpoint(
-            Some("AMLCtrl_BHB56902"),
-            confirmed_dspic,
-            0,
-            0x22,
-            || true,
-        )
-        .expect("confirmed dsPIC identity plus exact-address ACK should bind");
-        assert_eq!(dspic.kind(), VoltageControllerKind::Dspic33Ep);
-        assert_eq!(dspic.address(), 0x22);
+        let nopic_bhb56 = discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        assert_eq!(
+            bind_presence_validated_endpoint(
+                Some("AMLCtrl_BHB56902"),
+                nopic_bhb56,
+                0,
+                0x22,
+                || true,
+            ),
+            Err(VoltageControllerEndpointError::DiscoveryNotConfirmed(
+                VoltageControllerDiscoveryStatus::NoController
+            ))
+        );
     }
 
     #[test]
@@ -1269,11 +1270,7 @@ mod tests {
 
     #[test]
     fn endpoint_binding_rejects_addresses_outside_exact_family_topology() {
-        for (subtype, address) in [
-            ("CVCtrl_BHB42XXX", 0x21),
-            ("AMLCtrl_BHB56902", 0x1F),
-            ("AMLCtrl_BHB56902", 0x23),
-        ] {
+        for (subtype, address) in [("CVCtrl_BHB42XXX", 0x21)] {
             let discovery = discover_voltage_controller_with_probe(Some(subtype), || true);
             assert!(matches!(
                 bind_presence_validated_endpoint(Some(subtype), discovery, 0, address, || true),
@@ -1287,9 +1284,9 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let exact_probe_calls = AtomicUsize::new(0);
-        let discovery = discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        let discovery = discover_voltage_controller_with_probe(Some("CVCtrl_BHB42XXX"), || true);
         let result =
-            bind_presence_validated_endpoint(Some("AMLCtrl_BHB56902"), discovery, 0, 0x22, || {
+            bind_presence_validated_endpoint(Some("CVCtrl_BHB42XXX"), discovery, 0, 0x20, || {
                 exact_probe_calls.fetch_add(1, Ordering::SeqCst);
                 false
             });
@@ -1299,15 +1296,15 @@ mod tests {
             Err(
                 VoltageControllerEndpointError::EndpointPresenceNotObserved {
                     bus: 0,
-                    address: 0x22,
+                    address: 0x20,
                 }
             )
         );
 
         let invalid_probe_calls = AtomicUsize::new(0);
-        let discovery = discover_voltage_controller_with_probe(Some("AMLCtrl_BHB56902"), || true);
+        let discovery = discover_voltage_controller_with_probe(Some("CVCtrl_BHB42XXX"), || true);
         let _ =
-            bind_presence_validated_endpoint(Some("AMLCtrl_BHB56902"), discovery, 0, 0x23, || {
+            bind_presence_validated_endpoint(Some("CVCtrl_BHB42XXX"), discovery, 0, 0x21, || {
                 invalid_probe_calls.fetch_add(1, Ordering::SeqCst);
                 true
             });
@@ -1509,15 +1506,12 @@ mod tests {
     }
 
     #[test]
-    fn t19_bhb56_subtype_returns_dspic() {
-        // Defense-in-depth: if a T19 SKU were ever discovered with a
-        // BHB56-family hashboard (RE3 does NOT document this — purely
-        // hypothetical), the classifier MUST route it to the existing
-        // dsPIC path, not Pic1704. Mirrors the S19k Pro / S21 framed
-        // dsPIC contract enforced by the BHB56xxx → Dspic33Ep arm.
+    fn unproven_bhb56_suffix_cannot_authorize_a_controller() {
+        // Only BHB56902 has live evidence, and it is NoPic. A family-looking
+        // suffix cannot manufacture dsPIC authority for a hypothetical SKU.
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56999")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
     }
 
@@ -1558,8 +1552,8 @@ mod tests {
 
     #[test]
     fn classify_with_probe_requires_presence_for_address_0x20_families() {
-        // BHB56 is exact dsPIC identity evidence, but still requires presence
-        // at its documented 0x20 endpoint before compatibility can energize.
+        // BHB56 is exact NoController identity evidence. A device ACK cannot
+        // turn it into an energizing protocol family.
         assert_eq!(
             classify_with_probe(Some("AMLCtrl_BHB56902"), 0),
             VoltageControllerKind::NoPic,
@@ -1634,7 +1628,7 @@ mod tests {
         );
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56902")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB68xxx")),

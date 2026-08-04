@@ -428,6 +428,170 @@ pub fn pll_compute(target_mhz: u32, ref_mhz: u32) -> Option<crate::bm1362::PllPa
     crate::bm1362::pll_compute(target_mhz, ref_mhz)
 }
 
+// ----------------------------------------------------------------------------
+// NoPic voltage: TI DAC53401 board-rail DAC (BHB56902 / S19k Pro)
+// ----------------------------------------------------------------------------
+//
+// # Provenance
+//
+// Recovered 2026-07-24 from Bitmain's own factory jig
+//  (ARM32 LE) via
+// GhidraMCP. This replaces the vague "Voltage is set by LDO/op-amp" note above with
+// the exact device and transfer function the fixture uses:
+//
+// * `set_dac53401_voltage` (`FUN_0003c138`): writes DAC-DATA register `0x21` on the
+//   I2C device at 7-bit address `0x48`, as a **big-endian** 2-byte value `N << 2`.
+// * `init_dac53401_NBT2006_36` (`FUN_0003bd90`): read register `0xD1` (2B), set its
+//   low byte to `(x & 0xE0) | 0x05`, wait 200 ms, write it back.
+// * mV→code solver (`FUN_0003be80`): requires model string `"NBT2006-36"`; refuses
+//   `V > 15.32` ("voltage can't bigger than 15.32v"); otherwise
+//   `N = floor(((15.32 - V) / 4.69) * 1024)`, clamped to `N >= 0`. Constants read
+//   from the binary: `15.32` (`DAT_0003bfb8`), `4.69` (`DAT_0003bfc0`),
+//   `1024.0` (`DAT_0003bfc8`).
+// * `set_dac_voltage_step_by_step` (`FUN_0003c3cc`): ramps `pre_N → target_N` over
+//   `step_num` steps with a 300 ms wait per step. It also proves the `Config.ini`
+//   `Voltage` fields are **centivolts** — it divides by `100.0` (`DAT_0003c700`)
+//   before calling the solver, so `Config.ini "1300"` = 13.00 V (NOT 1300 mV).
+//
+// # Status
+//
+// **Experimental — pure transfer function only.** No HAL, no I2C, no write path here.
+// The 15.32 V ceiling is a load-bearing safety clamp: [`dac53401_code`] refuses any
+// request above it. A caller that owns the HAL still must (a) confirm I2C `0x48` does
+// not collide with a live sensor before writing, and (b) treat the rail as unproven
+// until a bench DMM validates it. This module never commands hardware.
+
+/// TI DAC53401 I2C address on the BHB56902 board rail (7-bit).
+pub const DAC53401_I2C_ADDR: u8 = 0x48;
+
+/// DAC-DATA register that receives the `N << 2` code (big-endian u16).
+pub const DAC53401_DATA_REG: u8 = 0x21;
+
+/// Config/init register poked during `init_dac53401_NBT2006_36`.
+pub const DAC53401_INIT_REG: u8 = 0xD1;
+
+/// Low-nibble value ORed into the init register (`(old & 0xE0) | 0x05`).
+pub const DAC53401_INIT_LOW_NIBBLE: u8 = 0x05;
+
+/// Absolute maximum board-rail voltage the jig will command. Requests above this
+/// are refused by construction — the DAC's linear model is only defined at/below it.
+pub const DAC53401_MAX_VOLTAGE_V: f32 = 15.32;
+
+/// DAC transfer denominator (`4.69`) and full-scale (`1024`), from the jig constants.
+const DAC53401_SLOPE_DIVISOR_V: f32 = 4.69;
+const DAC53401_FULL_SCALE: f32 = 1024.0;
+
+/// The DAC53401 is a **10-bit** DAC: the DATA field is bits `[11:2]` of register
+/// `0x21`, so valid solver codes are `0..=1023`. A code above this would alias in the
+/// device's 10-bit field, and because the transfer function is *inverse*, that
+/// truncation raises the actual rail — so an out-of-range code is refused, never
+/// masked.
+pub const DAC53401_MAX_CODE: u16 = 0x3FF;
+
+/// Why a DAC53401 voltage request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dac53401Error {
+    /// Above the 15.32 V absolute ceiling (fail-closed, high side).
+    AboveCeiling,
+    /// Below the modeled floor: the solver code would exceed the DAC's 10-bit range
+    /// (`> DAC53401_MAX_CODE`), which — because the transfer is inverse — would alias
+    /// to a HIGHER rail. Refused fail-closed rather than truncated. Corresponds to
+    /// `board_v < 15.32 - 4.69*1023/1024 ≈ 10.6346 V`.
+    BelowModeledFloor,
+    /// Not a finite, non-negative voltage.
+    NotFinite,
+}
+
+/// Resolve a board-rail voltage (volts) to the DAC53401 solver code `N`.
+///
+/// This is the pre-`<< 2` value; the register write is `code << 2` big-endian, see
+/// [`dac53401_data_register_bytes`]. Fail-closed: any request above
+/// [`DAC53401_MAX_VOLTAGE_V`], or a non-finite/negative input, is refused rather than
+/// silently clamped — a higher-than-modeled rail is a hardware-damage risk, not a
+/// value to saturate. Matches the jig's `FUN_0003be80` exactly.
+pub fn dac53401_code(board_v: f32) -> Result<u16, Dac53401Error> {
+    if !board_v.is_finite() || board_v < 0.0 {
+        return Err(Dac53401Error::NotFinite);
+    }
+    if board_v > DAC53401_MAX_VOLTAGE_V {
+        return Err(Dac53401Error::AboveCeiling);
+    }
+    let n = (((DAC53401_MAX_VOLTAGE_V - board_v) / DAC53401_SLOPE_DIVISOR_V) * DAC53401_FULL_SCALE)
+        .floor();
+    // For board_v in [0, 15.32] the raw solver code ranges up to ~3344, which exceeds
+    // the DAC's 10-bit DATA field. Fail CLOSED on the low side: a code above 1023 must
+    // never be truncated, because the inverse transfer means truncation raises the
+    // rail (e.g. board_v=10.0 -> n=1161, device sees 137 ~= 14.69 V). The jig's own
+    // callers stay in [13.00, 15.00] V so it never hit this; a public solver must.
+    let n = n.max(0.0);
+    if n > DAC53401_MAX_CODE as f32 {
+        return Err(Dac53401Error::BelowModeledFloor);
+    }
+    // Now guaranteed in [0, 1023], so (code << 2) fits the device's 10-bit field.
+    Ok(n as u16)
+}
+
+/// The two bytes written to [`DAC53401_DATA_REG`] for a resolved `code`, big-endian
+/// (`code << 2`, MSB first) — exactly what `set_dac53401_voltage` emits. `code` must be
+/// a valid 10-bit DAC code (`<= DAC53401_MAX_CODE`), as produced by [`dac53401_code`];
+/// a larger value would overflow the shift.
+pub fn dac53401_data_register_bytes(code: u16) -> [u8; 2] {
+    debug_assert!(
+        code <= DAC53401_MAX_CODE,
+        "DAC53401 code {code} exceeds 10-bit range; only dac53401_code output is valid"
+    );
+    ((code & DAC53401_MAX_CODE) << 2).to_be_bytes()
+}
+
+/// Convert a Bitmain `Config.ini` `Voltage`/`Pre_Open_Core_Voltage` centivolt field
+/// to volts. The jig divides the raw integer by 100 before the DAC solver, so
+/// `1300` → `13.00`. Provided so an importer cannot re-make the "1300 mV" mistake.
+pub fn centivolts_to_volts(centivolts: u16) -> f32 {
+    centivolts as f32 / 100.0
+}
+
+// ----------------------------------------------------------------------------
+// BM1366 core-control register (0x3C) encoders — DIFFER from BM1398
+// ----------------------------------------------------------------------------
+//
+// # Provenance
+//
+// Recovered 2026-07-24 from `single_board_test_bm1366` (jig). These are NOT the same
+// as the BM1398 encoders in `dcentrald_api_types::bm1398_protocol`: on BM1366 the
+// HASH_CLOCK write ignores `Pulse_Mode` entirely and carries only `Clk_Sel` bit 0, and
+// the CLOCK_DELAY write packs the fields at different bit positions. Capturing both
+// families as named encoders makes the per-chip divergence explicit instead of a
+// silent copy-paste hazard.
+
+/// Core-control register id (shared across BM136x): `0x3C`.
+pub const BM1366_CORE_REG: u8 = 0x3C;
+/// Analog-mux register id: `0x54`.
+pub const BM1366_ANALOG_MUX_REG: u8 = 0x54;
+
+/// BM1366 HASH_CLOCK write to reg `0x3C`: base `0x8000_8540`, only `Clk_Sel` bit 0 is
+/// carried — `Pulse_Mode` is DISCARDED on BM1366 (unlike BM1398). For the S19k Pro
+/// config (`Clk_Sel = 0`) this is `0x8000_8540`.
+pub const fn bm1366_core_reg_hash_clock(clk_sel: u8) -> u32 {
+    0x8000_8540 | ((clk_sel as u32) & 0x1)
+}
+
+/// BM1366 CLOCK_DELAY write to reg `0x3C`: base `0x8000_8000`,
+/// `(CCdly_Sel & 3) << 6 | (Pwth_Sel & 7) << 3 | (Swpf_Mode != 0)`. For the S19k Pro
+/// config (`CCdly = 0, Pwth = 4, Swpf = 0`) this is `0x8000_8020`. Note `Pwth` is 3
+/// bits here (vs 2 on BM1398) and `CCdly`/`Pwth` bit positions differ from BM1398.
+pub const fn bm1366_core_reg_clock_delay(ccdly_sel: u8, pwth_sel: u8, swpf_mode: u8) -> u32 {
+    0x8000_8000
+        | (((ccdly_sel as u32) & 0x3) << 6)
+        | (((pwth_sel as u32) & 0x7) << 3)
+        | if swpf_mode != 0 { 1 } else { 0 }
+}
+
+/// BM1366 analog-mux write to reg `0x54`: `Diode_Vdd_Mux_Sel & 0xF`. The jig's observed
+/// end-state for the S19k Pro config is `0x03`.
+pub const fn bm1366_analog_mux_value(diode_vdd_mux_sel: u8) -> u32 {
+    (diode_vdd_mux_sel as u32) & 0xF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +615,122 @@ mod tests {
             "S19k Pro nameplate efficiency {} W/TH outside [27, 30]",
             eff
         );
+    }
+
+    // --- NoPic DAC53401 voltage broker (jig-recovered, host-testable) ---
+
+    /// Both worked examples from the jig RE: V=13.00 → N=506 (reg 0x21 = 0x07E8),
+    /// V=15.00 → N=69. These pin the exact `FUN_0003be80` transfer function.
+    #[test]
+    fn dac53401_code_matches_jig_worked_examples() {
+        assert_eq!(dac53401_code(13.00).unwrap(), 506);
+        assert_eq!(dac53401_data_register_bytes(506), [0x07, 0xE8]);
+        assert_eq!(dac53401_code(15.00).unwrap(), 69);
+    }
+
+    /// The 15.32 V ceiling is a fail-CLOSED safety clamp: above it is refused, never
+    /// saturated. Exactly at the ceiling resolves to code 0.
+    #[test]
+    fn dac53401_ceiling_is_fail_closed() {
+        assert_eq!(dac53401_code(15.32).unwrap(), 0);
+        assert_eq!(dac53401_code(15.33), Err(Dac53401Error::AboveCeiling));
+        assert_eq!(dac53401_code(20.0), Err(Dac53401Error::AboveCeiling));
+        assert_eq!(dac53401_code(f32::NAN), Err(Dac53401Error::NotFinite));
+        assert_eq!(dac53401_code(f32::INFINITY), Err(Dac53401Error::NotFinite));
+        assert_eq!(dac53401_code(-1.0), Err(Dac53401Error::NotFinite));
+    }
+
+    /// The DAC is 10-bit; a request below the modeled floor (~10.63 V) would produce a
+    /// code above 1023 that, if truncated, raises the rail. It MUST be refused, not
+    /// masked — this closes the fail-open-from-below path the  review found.
+    #[test]
+    fn dac53401_low_side_is_fail_closed_not_aliased() {
+        // ~10.6346 V is the floor; just below must refuse.
+        assert_eq!(dac53401_code(10.60), Err(Dac53401Error::BelowModeledFloor));
+        assert_eq!(dac53401_code(10.00), Err(Dac53401Error::BelowModeledFloor));
+        // The reviewer's alias example: 1.25 V would mask to full-scale 15.32 V.
+        assert_eq!(dac53401_code(1.25), Err(Dac53401Error::BelowModeledFloor));
+        assert_eq!(dac53401_code(0.0), Err(Dac53401Error::BelowModeledFloor));
+        // Just above the floor resolves to a valid near-max code.
+        let n = dac53401_code(10.64).unwrap();
+        assert!(n <= DAC53401_MAX_CODE, "code {n} must fit 10 bits");
+    }
+
+    /// Every Ok code fits the DAC's 10-bit field, so `(code << 2)` never sets bits
+    /// outside the device's DATA field (`[11:2]`).
+    #[test]
+    fn every_ok_code_fits_ten_bits() {
+        for cv in 0u16..=1600 {
+            if let Ok(code) = dac53401_code(cv as f32 / 100.0) {
+                assert!(
+                    code <= DAC53401_MAX_CODE,
+                    "cv={cv} -> code {code} > 10 bits"
+                );
+                let bytes = dac53401_data_register_bytes(code);
+                // code<<2 must occupy only bits [11:2]; nothing above bit 11.
+                let word = u16::from_be_bytes(bytes);
+                assert_eq!(
+                    word & !0x0FFC,
+                    0,
+                    "cv={cv} word {word:#06x} spills device field"
+                );
+            }
+        }
+    }
+
+    /// Lower commanded voltage means a larger code (inverse-linear), and the register
+    /// bytes are big-endian `code << 2`.
+    #[test]
+    fn dac53401_code_is_monotonic_inverse_and_big_endian() {
+        let low = dac53401_code(13.0).unwrap();
+        let high = dac53401_code(14.0).unwrap();
+        assert!(low > high, "lower volts must yield a larger DAC code");
+        // code<<2 big-endian: MSB first.
+        assert_eq!(dac53401_data_register_bytes(0x0100), [0x04, 0x00]);
+    }
+
+    /// The centivolt helper prevents the "1300 mV" import bug: 1300 → 13.00 V, which
+    /// then resolves through the DAC to the worked-example code.
+    #[test]
+    fn config_ini_voltage_is_centivolts_not_millivolts() {
+        assert!((centivolts_to_volts(1300) - 13.00).abs() < 1e-6);
+        assert!((centivolts_to_volts(1500) - 15.00).abs() < 1e-6);
+        assert_eq!(
+            dac53401_code(centivolts_to_volts(1300)).unwrap(),
+            506,
+            "Config.ini 1300 = 13.00 V must resolve to the jig's N=506"
+        );
+    }
+
+    /// The named device facts are load-bearing RE constants; pin them so a refactor
+    /// cannot silently retarget the wrong I2C address or register.
+    #[test]
+    fn dac53401_device_constants_are_pinned() {
+        assert_eq!(DAC53401_I2C_ADDR, 0x48);
+        assert_eq!(DAC53401_DATA_REG, 0x21);
+        assert_eq!(DAC53401_INIT_REG, 0xD1);
+        assert_eq!(DAC53401_INIT_LOW_NIBBLE, 0x05);
+        assert!((DAC53401_MAX_VOLTAGE_V - 15.32).abs() < 1e-6);
+    }
+
+    /// BM1366 core encoders differ from BM1398 — pin the jig config outputs and the
+    /// key differences (Pulse discarded, 3-bit Pwth, different bit positions).
+    #[test]
+    fn bm1366_core_encoders_match_jig_config() {
+        // S19k Pro Config.ini: Clk_Sel=0, CCdly=0, Pwth=4, Swpf=0, Diode_Vdd_Mux=3.
+        assert_eq!(bm1366_core_reg_hash_clock(0), 0x8000_8540);
+        assert_eq!(bm1366_core_reg_clock_delay(0, 4, 0), 0x8000_8020);
+        assert_eq!(bm1366_analog_mux_value(3), 0x03);
+        // Pulse_Mode is DISCARDED on BM1366 (no field in HASH_CLOCK); only Clk_Sel
+        // bit 0 varies.
+        assert_eq!(bm1366_core_reg_hash_clock(1), 0x8000_8541);
+        assert_eq!(bm1366_core_reg_hash_clock(0xFF), 0x8000_8541);
+        // Pwth is 3 bits here (vs 2 on BM1398), at [5:3]; CCdly 2 bits at [7:6].
+        assert_eq!(bm1366_core_reg_clock_delay(0, 7, 0), 0x8000_8038);
+        assert_eq!(bm1366_core_reg_clock_delay(3, 0, 1), 0x8000_80C1);
+        assert_eq!(bm1366_analog_mux_value(0xFF), 0x0F);
+        assert_eq!(BM1366_CORE_REG, 0x3C);
+        assert_eq!(BM1366_ANALOG_MUX_REG, 0x54);
     }
 
     #[test]

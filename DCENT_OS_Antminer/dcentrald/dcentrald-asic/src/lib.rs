@@ -40,7 +40,10 @@ pub mod hw_err_tracker;
 pub mod pic;
 pub mod pic1704;
 pub mod protocol;
+pub mod serial_chip_address;
 pub mod uart_trans;
+/// Thin VoltageRail adapters over PIC16 / dsPIC (P1-2 I/O edge).
+pub mod voltage_rail_adapters;
 
 use thiserror::Error;
 

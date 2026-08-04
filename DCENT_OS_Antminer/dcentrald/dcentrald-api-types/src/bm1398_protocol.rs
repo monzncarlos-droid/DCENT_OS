@@ -63,19 +63,32 @@ pub const BM1398_PLL_SEARCH_SPEC: FourDividerPllSearchSpec = FourDividerPllSearc
 
 /// Encode a BM1398 PLL0 word. FBDIV occupies bits `[27:16]`; post-divider
 /// fields are raw values, not the minus-one encoding used by later families.
+///
+/// G19 pure SSOT: thin-wrap of `dcentrald_common::bm1398_pll_register_value`.
 pub const fn bm1398_pll_register_value(params: FourDividerPll) -> u32 {
-    (1u32 << 30)
-        | ((params.fbdiv as u32 & 0x0fff) << 16)
-        | ((params.refdiv as u32 & 0x3f) << 8)
-        | ((params.postdiv1 as u32 & 0x7) << 4)
-        | (params.postdiv2 as u32 & 0x7)
+    dcentrald_common::bm1398_pll_register_value(dcentrald_common::Bm1398PllDividers {
+        fb_div: params.fbdiv,
+        ref_div: params.refdiv,
+        post_div1: params.postdiv1,
+        post_div2: params.postdiv2,
+    })
 }
 
+/// Resolve BM1398 PLL0 (G19 pure SSOT in dcentrald-common).
+///
+/// Thin-wraps `dcentrald_common::resolve_bm1398_pll` so api-types and common
+/// share one vendor search. `BM1398_PLL_SEARCH_SPEC` remains the documented
+/// envelope pin (must stay byte-identical to common constants).
 pub fn resolve_bm1398_pll(target_mhz: u16) -> Option<Bm1398PllSolution> {
-    let dividers = BM1398_PLL_SEARCH_SPEC.resolve(target_mhz)?;
+    let (sol, div) = dcentrald_common::resolve_bm1398_pll(target_mhz)?;
     Some(Bm1398PllSolution {
-        dividers,
-        register_value: bm1398_pll_register_value(dividers),
+        dividers: FourDividerPll {
+            refdiv: div.ref_div,
+            fbdiv: div.fb_div,
+            postdiv1: div.post_div1,
+            postdiv2: div.post_div2,
+        },
+        register_value: sol.register_value,
     })
 }
 
@@ -362,9 +375,291 @@ pub const S19_PRO_NBP1901_BM1398_PROFILE: Bm1398ProtocolProfile = Bm1398Protocol
     fifo: BM1398_FPGA_FIFO_SPEC,
 };
 
+// ============================================================================
+// BM1398 native bring-up spec, as inert host-testable data (jig-recovered)
+// ============================================================================
+//
+// # Provenance
+//
+// Recovered 2026-07-24 from Bitmain's factory jig
+//  via GhidraMCP,
+// orchestrator `FUN_0001d124` and its callees. Documented in
+//  (ledger L3).
+//
+// This is a **spec expressed as data and pure arithmetic** — it commands no
+// silicon. Its purpose is (a) to make the two previously-opaque
+// [`BM1398_PROVEN_CORE_WRITES`] magic constants auditable by re-deriving them from
+// named `Asic_Register` fields, (b) to add the config writes the jig always issues
+// that DCENT was missing (Diode_Vdd_Mux reg 0x54; the ticket-mask reg 0x14 LUT), and
+// (c) to record the exact cold-boot step ORDER. Wiring any of this into a live serial
+// dispatch stays behind the `serial_mining.rs` native-BM1398 refusal + a two-source
+// `AsicProtocolAdmission` until bench proof; the jig's 15.0 V pre-open-core voltage is
+// a **fixture-only** value and must never enter a production cold boot (see the
+// `PRE_OPEN_CORE` note below).
+
+/// BM1398 core-control register (`0x3c`), first write: encodes `Pulse_Mode` (bits
+/// [5:4]) and `Clk_Sel` (bits [2:0]) over the fixed base `0x8000_8700`.
+/// From jig `FUN_0002a8ec`. For the AMTC config (Pulse=1, Clk=0) this is `0x8000_8710`
+/// — byte-identical to `BM1398_PROVEN_CORE_WRITES[0]`.
+pub const fn bm1398_core_reg_pulse_clk(pulse_mode: u8, clk_sel: u8) -> u32 {
+    0x8000_8700 | (((pulse_mode as u32) & 0x3) << 4) | ((clk_sel as u32) & 0x7)
+}
+
+/// BM1398 core-control register (`0x3c`), second write: encodes `Pwth_Sel` (bits
+/// [5:4]), `CCdly_Sel` (bits [7:6]) and `Swpf_Mode` (bit 0) over base `0x8000_8000`.
+/// From jig `FUN_000297c4`. For the AMTC config (Pwth=1, CCdly=1, Swpf=0) this is
+/// `0x8000_8050` — byte-identical to `BM1398_PROVEN_CORE_WRITES[1]`.
+pub const fn bm1398_core_reg_pwth_ccdly_swpf(pwth_sel: u8, ccdly_sel: u8, swpf_mode: u8) -> u32 {
+    0x8000_8000
+        | (((pwth_sel as u32) & 0x3) << 4)
+        | (((ccdly_sel as u32) & 0x3) << 6)
+        | if swpf_mode != 0 { 1 } else { 0 }
+}
+
+/// Diode-Vdd-mux register. The jig (`FUN_00029fa4`) writes this FIRST in the chain
+/// bring-up, broadcast, value `Diode_Vdd_Mux_Sel & 7`. DCENT was missing this write
+/// entirely.
+pub const BM1398_DIODE_VDD_MUX_REG: u8 = 0x54;
+
+/// Value for [`BM1398_DIODE_VDD_MUX_REG`] from the `Diode_Vdd_Mux_Sel` config field.
+pub const fn bm1398_diode_vdd_mux_value(sel: u8) -> u32 {
+    (sel as u32) & 0x7
+}
+
+/// Ticket-mask register (same id as BM1387/BM1397: `0x14`). The jig
+/// (`FUN_00029ad4`) writes the mask with **each byte bit-reversed** via the
+/// [`BM1398_BIT_SWAP_TABLE`], byte order preserved.
+pub const BM1398_TICKET_MASK_REG: u8 = 0x14;
+
+/// 256-byte 8-bit bit-reversal LUT read from jig `.rodata` at `ram:0x00035df0`.
+/// `BM1398_BIT_SWAP_TABLE[i] == (i as u8).reverse_bits()` for all `i` — the test
+/// below pins that equivalence for every entry, so the table is self-verifying.
+/// Twin of the documented BM1397 table at `0x00030b3c`.
+#[rustfmt::skip]
+pub const BM1398_BIT_SWAP_TABLE: [u8; 256] = [
+    0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0,
+    0x08, 0x88, 0x48, 0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8,
+    0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4, 0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4,
+    0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C, 0x9C, 0x5C, 0xDC, 0x3C, 0xBC, 0x7C, 0xFC,
+    0x02, 0x82, 0x42, 0xC2, 0x22, 0xA2, 0x62, 0xE2, 0x12, 0x92, 0x52, 0xD2, 0x32, 0xB2, 0x72, 0xF2,
+    0x0A, 0x8A, 0x4A, 0xCA, 0x2A, 0xAA, 0x6A, 0xEA, 0x1A, 0x9A, 0x5A, 0xDA, 0x3A, 0xBA, 0x7A, 0xFA,
+    0x06, 0x86, 0x46, 0xC6, 0x26, 0xA6, 0x66, 0xE6, 0x16, 0x96, 0x56, 0xD6, 0x36, 0xB6, 0x76, 0xF6,
+    0x0E, 0x8E, 0x4E, 0xCE, 0x2E, 0xAE, 0x6E, 0xEE, 0x1E, 0x9E, 0x5E, 0xDE, 0x3E, 0xBE, 0x7E, 0xFE,
+    0x01, 0x81, 0x41, 0xC1, 0x21, 0xA1, 0x61, 0xE1, 0x11, 0x91, 0x51, 0xD1, 0x31, 0xB1, 0x71, 0xF1,
+    0x09, 0x89, 0x49, 0xC9, 0x29, 0xA9, 0x69, 0xE9, 0x19, 0x99, 0x59, 0xD9, 0x39, 0xB9, 0x79, 0xF9,
+    0x05, 0x85, 0x45, 0xC5, 0x25, 0xA5, 0x65, 0xE5, 0x15, 0x95, 0x55, 0xD5, 0x35, 0xB5, 0x75, 0xF5,
+    0x0D, 0x8D, 0x4D, 0xCD, 0x2D, 0xAD, 0x6D, 0xED, 0x1D, 0x9D, 0x5D, 0xDD, 0x3D, 0xBD, 0x7D, 0xFD,
+    0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3, 0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
+    0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB, 0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB,
+    0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7,
+    0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF,
+];
+
+/// Encode a ticket mask for [`BM1398_TICKET_MASK_REG`]: bit-reverse each of the four
+/// bytes (byte order preserved). `0xFFFF_FFFF` (all-accept) maps to itself, matching
+/// the jig's `TM = 0xff` broadcast.
+///
+/// G24: pure SSOT is `reverse_bits().swap_bytes()` in `dcentrald_common` (equivalent
+/// to indexing [`BM1398_BIT_SWAP_TABLE`] per LE byte). Kept as `const fn` for
+/// static init paths; must stay byte-identical to the pure encode.
+pub const fn bm1398_ticket_mask_value(mask: u32) -> u32 {
+    // G24/G25: shared pure bit-swap transform (const twin of
+    // `dcentrald_common::bit_reverse_u32_bytewise`).
+    dcentrald_common::bit_reverse_u32_bytewise(mask)
+}
+
+/// One ordered step in the BM1398 chain bring-up, as recovered from `FUN_0001d124`.
+/// Command lengths: a register write is a 9-byte frame; chain-inactive and
+/// set-chip-address are 5-byte frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Bm1398ChainInitStep {
+    /// Broadcast register write (9-byte frame): diode-mux, core writes, PLL, baud,
+    /// ticket-mask.
+    RegisterWrite { register: u8 },
+    /// Chain-Inactive broadcast (5-byte frame).
+    ChainInactive,
+    /// Per-chip Set-Chip-Address sweep (5-byte frames), `hw_addr` stepping by the
+    /// address-plan interval.
+    SetChipAddress,
+}
+
+/// The recovered cold-boot step ORDER for BM1398 (jig `FUN_0001d124`). This is the
+/// sequence a native driver must follow; it is inert until wired behind the refusal
+/// gate. The jig's UART-relay step (its topology formula addresses nonexistent chip
+/// addresses) is intentionally excluded — production uses
+/// [`S19_PRO_NBP1901_PRODUCTION_UART_RELAY_WRITES`] instead.
+pub const BM1398_CHAIN_INIT_STEPS: [Bm1398ChainInitStep; 9] = [
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_DIODE_VDD_MUX_REG,
+    },
+    Bm1398ChainInitStep::ChainInactive,
+    Bm1398ChainInitStep::SetChipAddress,
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_CHIP_SPEC.core_register_control, // core write #1 (0x3c)
+    },
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_CHIP_SPEC.core_register_control, // core write #2 (0x3c)
+    },
+    // Both PLL0 writes are ADJACENT and PRECEDE baud (jig FUN_0001d124): the
+    // user-divider zero-write comes first, then the PLL-frequency write. The sequence
+    // ends on ticket-mask.
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_CHIP_SPEC.pll_register, // PLL0 user-divider zero-write (0x08)
+    },
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_CHIP_SPEC.pll_register, // PLL0 frequency write (0x08)
+    },
+    Bm1398ChainInitStep::RegisterWrite { register: 0x18 }, // baud
+    Bm1398ChainInitStep::RegisterWrite {
+        register: BM1398_TICKET_MASK_REG, // ticket-mask (0x14) — last wire op
+    },
+];
+
+/// **Fixture-only voltage — NOT for production.** The AMTC `Config.ini`
+/// `Pre_Open_Core_Voltage = 1500` (15.00 V, centivolts) is a pattern-test fixture
+/// voltage read by the jig's pattern checker, NOT part of the chain-init orchestrator.
+/// A native BM1398 cold boot must use the ~13.8 V nameplate rail; commanding 15.0 V
+/// would over-volt the chain. Recorded as a named constant purely so the value is
+/// documented as forbidden, never so it is used.
+pub const BM1398_JIG_PRE_OPEN_CORE_FIXTURE_MILLIVOLTS: u16 = 15_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two core-write encoders must reproduce the already-shipped, .129-cold-boot-
+    /// proven magic constants for the AMTC config. This ties the opaque constants to
+    /// their named-field derivation with zero behavioral change.
+    #[test]
+    fn core_reg_encoders_reproduce_proven_magic_constants() {
+        assert_eq!(bm1398_core_reg_pulse_clk(1, 0), 0x8000_8710);
+        assert_eq!(bm1398_core_reg_pwth_ccdly_swpf(1, 1, 0), 0x8000_8050);
+        assert_eq!(
+            BM1398_PROVEN_CORE_WRITES[0].value,
+            bm1398_core_reg_pulse_clk(1, 0)
+        );
+        assert_eq!(
+            BM1398_PROVEN_CORE_WRITES[1].value,
+            bm1398_core_reg_pwth_ccdly_swpf(1, 1, 0)
+        );
+    }
+
+    /// Field masking must not spill into the fixed base bits.
+    #[test]
+    fn core_reg_encoders_mask_fields() {
+        // pulse_mode is 2 bits, clk_sel 3 bits.
+        assert_eq!(bm1398_core_reg_pulse_clk(0xFF, 0xFF), 0x8000_8737);
+        // pwth 2 bits @4, ccdly 2 bits @6, swpf 1 bit @0.
+        assert_eq!(
+            bm1398_core_reg_pwth_ccdly_swpf(0xFF, 0xFF, 0xFF),
+            0x8000_80F1
+        );
+    }
+
+    #[test]
+    fn diode_vdd_mux_value_masks_to_three_bits() {
+        assert_eq!(bm1398_diode_vdd_mux_value(3), 0x0000_0003);
+        assert_eq!(bm1398_diode_vdd_mux_value(0xFF), 0x7);
+        assert_eq!(BM1398_DIODE_VDD_MUX_REG, 0x54);
+    }
+
+    /// Every LUT entry equals Rust's `reverse_bits`, proving the recovered 256 bytes.
+    #[test]
+    fn bit_swap_table_equals_reverse_bits() {
+        for i in 0..=255u16 {
+            let i = i as u8;
+            assert_eq!(
+                BM1398_BIT_SWAP_TABLE[i as usize],
+                i.reverse_bits(),
+                "LUT[{i:#04x}] mismatch"
+            );
+        }
+        assert_eq!(BM1398_BIT_SWAP_TABLE[1], 0x80);
+        assert_eq!(BM1398_BIT_SWAP_TABLE[0x80], 0x01);
+        assert_eq!(BM1398_BIT_SWAP_TABLE[0xFF], 0xFF);
+    }
+
+    #[test]
+    fn ticket_mask_encoding_matches_jig_vectors() {
+        // All-accept round-trips (jig broadcasts TM=0xff -> 0xFFFF_FFFF).
+        assert_eq!(bm1398_ticket_mask_value(0xFFFF_FFFF), 0xFFFF_FFFF);
+        // Low bit reverses to the top of its byte.
+        assert_eq!(bm1398_ticket_mask_value(0x0000_0001), 0x0000_0080);
+        assert_eq!(BM1398_TICKET_MASK_REG, 0x14);
+    }
+
+    /// The recovered order: diode-mux first, chain-inactive, address sweep, then the
+    /// two core writes, PLL, baud, ticket-mask.
+    #[test]
+    fn chain_init_step_order_is_jig_faithful() {
+        use Bm1398ChainInitStep::*;
+        assert!(matches!(
+            BM1398_CHAIN_INIT_STEPS[0],
+            RegisterWrite {
+                register: BM1398_DIODE_VDD_MUX_REG
+            }
+        ));
+        assert_eq!(BM1398_CHAIN_INIT_STEPS[1], ChainInactive);
+        assert_eq!(BM1398_CHAIN_INIT_STEPS[2], SetChipAddress);
+        // Diode-mux precedes chain-inactive (a safety-relevant ordering fact).
+        let diode = BM1398_CHAIN_INIT_STEPS
+            .iter()
+            .position(|s| matches!(s, RegisterWrite { register: 0x54 }))
+            .unwrap();
+        let inactive = BM1398_CHAIN_INIT_STEPS
+            .iter()
+            .position(|s| *s == ChainInactive)
+            .unwrap();
+        assert!(diode < inactive);
+
+        // Tail order ( review fix): both PLL0 writes (0x08) are adjacent at
+        // indices 5,6 and PRECEDE baud (0x18) at 7; the sequence ends on ticket-mask
+        // (0x14) at 8. This pins the exact misordering the review caught.
+        assert_eq!(
+            BM1398_CHAIN_INIT_STEPS[5],
+            RegisterWrite {
+                register: BM1398_CHIP_SPEC.pll_register
+            }
+        );
+        assert_eq!(
+            BM1398_CHAIN_INIT_STEPS[6],
+            RegisterWrite {
+                register: BM1398_CHIP_SPEC.pll_register
+            }
+        );
+        assert_eq!(BM1398_CHAIN_INIT_STEPS[7], RegisterWrite { register: 0x18 });
+        assert_eq!(
+            BM1398_CHAIN_INIT_STEPS[8],
+            RegisterWrite {
+                register: BM1398_TICKET_MASK_REG
+            }
+        );
+        // Both PLL writes precede baud.
+        let baud = BM1398_CHAIN_INIT_STEPS
+            .iter()
+            .position(|s| *s == (RegisterWrite { register: 0x18 }))
+            .unwrap();
+        let pll_positions: Vec<usize> = BM1398_CHAIN_INIT_STEPS
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                **s == (RegisterWrite {
+                    register: BM1398_CHIP_SPEC.pll_register,
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pll_positions, vec![5, 6]);
+        assert!(pll_positions.iter().all(|&p| p < baud));
+    }
+
+    /// The fixture pre-open-core voltage is documented ONLY as a forbidden value.
+    #[test]
+    fn fixture_pre_open_core_voltage_is_not_a_production_rail() {
+        assert_eq!(BM1398_JIG_PRE_OPEN_CORE_FIXTURE_MILLIVOLTS, 15_000);
+        // Well above the ~13.8 V nameplate — must never be a cold-boot target.
+        assert!(BM1398_JIG_PRE_OPEN_CORE_FIXTURE_MILLIVOLTS > 14_000);
+    }
 
     #[test]
     fn exact_vendor_pll_vectors_are_pinned() {

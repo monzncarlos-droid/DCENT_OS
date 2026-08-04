@@ -31,6 +31,7 @@
 use crate::i2c::I2cRawFabricLease;
 use crate::{HalError, Result};
 use dcentrald_fabric_lease::PhysicalI2cFabricId;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 ///  (2026-05-24): sum-mod-256 of NON-preamble bytes (LEN + CMD + payload + CRC).
 ///
@@ -295,6 +296,45 @@ fn loki_bosminer_bulk_mode() -> bool {
         .unwrap_or(false)
 }
 
+fn require_loki_bulk_frame_ack(addr: u8, frame_len: usize, nak_at: Option<usize>) -> Result<()> {
+    if let Some(index) = nak_at {
+        return Err(HalError::I2c {
+            bus: 1,
+            addr,
+            detail: format!(
+                "Wave-57 Loki BULK write: NAK on frame byte {}/{}",
+                index + 1,
+                frame_len
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn require_loki_reply_register_ack(
+    addr: u8,
+    reply_reg: u8,
+    addr_ack: bool,
+    reg_ack: bool,
+) -> Result<()> {
+    if !addr_ack || !reg_ack {
+        return Err(HalError::I2c {
+            bus: 1,
+            addr,
+            detail: format!(
+                "Wave-56b Loki reply-register select 0x{reply_reg:02X}: {}",
+                match (addr_ack, reg_ack) {
+                    (false, false) => "NAK on address and register",
+                    (false, true) => "NAK on address",
+                    (true, false) => "NAK on register",
+                    (true, true) => unreachable!("successful ACK pair was rejected"),
+                }
+            ),
+        });
+    }
+    Ok(())
+}
+
 ///  refinement (2026-05-29): post-write settle delay (ms) before the
 /// BULK read transaction issues, so the APW12/Loki spoof has time to STAGE the
 /// framed reply.
@@ -356,6 +396,14 @@ pub struct GpioBitBangI2c {
     /// and service transports. A bit-banged fallback is another bus master,
     /// not an escape from a lease conflict.
     _fabric_lease: I2cRawFabricLease,
+    /// Count of reply-register selects that were NAKed.
+    ///
+    /// The select is best-effort (see `select_loki_reply_register`), so a NAK is
+    /// logged rather than propagated. That is the correct behaviour, but it
+    /// means a permanently dead spoof would otherwise be invisible — this
+    /// counter is what keeps it observable. `AtomicU64` because the transport
+    /// methods take `&self`.
+    loki_reply_reg_select_naks: AtomicU64,
 }
 
 /// Resolve the runtime half-period: env override OR  default.
@@ -434,6 +482,7 @@ impl GpioBitBangI2c {
             backend: GpioBackend::Sysfs { sda_gpio, scl_gpio },
             half_period_us,
             _fabric_lease: fabric_lease,
+            loki_reply_reg_select_naks: AtomicU64::new(0),
         };
         // Start with both lines HIGH (input = released = pull-up)
         i2c.sda_high();
@@ -527,6 +576,7 @@ impl GpioBitBangI2c {
             backend: GpioBackend::Mmap { base_ptr },
             half_period_us,
             _fabric_lease: fabric_lease,
+            loki_reply_reg_select_naks: AtomicU64::new(0),
         };
         // Start with both lines HIGH (input = released = pull-up). The
         // first writes RMW the TRI register so any other bits in the bank
@@ -874,11 +924,10 @@ impl GpioBitBangI2c {
                     detail: "Wave-57 Loki BULK write: NAK on address".into(),
                 });
             }
-            // Write every frame byte MSB-first in the SAME transaction. Track
-            // NAKs for diagnostics but, like bosminer's write-N, do not abort
-            // mid-frame — the spoof's empty-calibration behaviour can NAK a
-            // trailing byte yet still latch the command; the parser/read side
-            // owns the verdict.
+            // Write every frame byte MSB-first in the SAME transaction. Finish
+            // clocking the frame for deterministic bus cleanup, but never
+            // report exact success when any byte was NAK'd: APW state changes
+            // are committed by the caller only after this returns `Ok`.
             let mut nak_at: Option<usize> = None;
             for (i, &b) in frame.iter().enumerate() {
                 if !self.write_byte_raw(b) && nak_at.is_none() {
@@ -893,7 +942,7 @@ impl GpioBitBangI2c {
                 nak_at = ?nak_at,
                 "Wave-57: bosminer-faithful BULK write (single txn, no 0x11 prefix, no reply-reg select)"
             );
-            return Ok(());
+            return require_loki_bulk_frame_ack(addr, frame.len(), nak_at);
         }
 
         // wave55c_crc_diagnostic — log computed-vs-provided CRC for byte-level
@@ -977,9 +1026,8 @@ impl GpioBitBangI2c {
         // (`DCENT_AM2_LOKI_REPLY_REG`, default 0x00) for runtime A/B testing.
         let reply_reg = loki_reply_register();
         self.start();
-        // Address+W (best-effort: log NAKs but don't abort — the command
-        // frame already went out OK; the reply-register select is the new,
-        // experimental staging step we're A/B-testing).
+        // Both ACKs are part of the documented reply-staging contract, but a NAK
+        // here is NOT fatal — see the closing block of this function.
         let addr_ack = self.write_byte_raw(addr << 1);
         let reg_ack = self.write_byte_raw(reply_reg);
         self.stop();
@@ -993,6 +1041,46 @@ impl GpioBitBangI2c {
             reply_reg
         );
 
+        // NON-FATAL by design, and this is the load-bearing difference from the
+        // bulk-frame site below.
+        //
+        // By the time we get here the command frame has already been fully
+        // clocked out and per-byte ACK-checked. A NAK on the reply-register
+        // select therefore says "the response staging is unproven", NOT "the
+        // command failed" — and the live-observed Loki behaviour on `a lab unit` is
+        // that the PSU latches the command despite NAKing. Returning `Err` here
+        // would abort a transaction the PSU has already accepted, on a
+        // live-proven mining path.
+        //
+        // This path IS reachable in a shipped image: the per-byte mode is
+        // force-enabled by `enable_loki_per_byte_mode_for_wave55b_standalone`,
+        // which deliberately bypasses the `DCENT_AM2_PSU_LOKI_REGISTER_POINTER`
+        // env gate and is reached via `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1` in
+        // the committed am2-s19jpro overlay env file. That reachability is
+        // exactly why it must not be fatal — and why the NAK still has to be
+        // counted rather than silently swallowed.
+        //
+        // `require_loki_reply_register_ack` is retained (not inlined) so its
+        // three rendered NAK diagnostics stay unit-testable.
+        if let Err(unstaged) = require_loki_reply_register_ack(addr, reply_reg, addr_ack, reg_ack) {
+            let naks = self
+                .loki_reply_reg_select_naks
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                target: "wave56b_loki_reply_reg_select",
+                addr = format_args!("0x{:02X}", addr),
+                reply_reg = format_args!("0x{:02X}", reply_reg),
+                addr_ack,
+                reg_ack,
+                nak_count = naks,
+                detail = %unstaged,
+                "Loki reply-register select NAKed; command frame was already \
+                 clocked, so response staging is unproven but the transaction is \
+                 NOT aborted (non-fatal). A rising count means the spoof is not \
+                 answering."
+            );
+        }
         Ok(())
     }
 
@@ -1372,6 +1460,78 @@ impl Drop for GpioBitBangI2c {
 #[cfg(test)]
 mod wave36_tests {
     use super::*;
+
+    #[test]
+    fn loki_bulk_and_reply_register_naks_never_prove_exact_success() {
+        require_loki_bulk_frame_ack(0x10, 6, None).unwrap();
+        for index in [0, 3, 5] {
+            let rendered = require_loki_bulk_frame_ack(0x10, 6, Some(index))
+                .unwrap_err()
+                .to_string();
+            assert!(rendered.contains(&format!("frame byte {}/6", index + 1)));
+        }
+
+        require_loki_reply_register_ack(0x10, 0x00, true, true).unwrap();
+        for (addr_ack, reg_ack, expected) in [
+            (false, false, "NAK on address and register"),
+            (false, true, "NAK on address"),
+            (true, false, "NAK on register"),
+        ] {
+            let rendered = require_loki_reply_register_ack(0x10, 0x00, addr_ack, reg_ack)
+                .unwrap_err()
+                .to_string();
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+
+        let source = include_str!("psu_gpio_i2c.rs");
+        let start = source
+            .find("    pub fn write_apw12_loki_frame(&self")
+            .expect("Loki framed write");
+        let end = source[start..]
+            .find("    pub fn read_apw12_loki_response")
+            .map(|offset| start + offset)
+            .expect("Loki framed read boundary");
+        let write = &source[start..end];
+
+        // The two sites must NOT converge. They are deliberately asymmetric:
+        //
+        //   bulk frame  -> FATAL. A NAK mid-frame leaves delivery genuinely
+        //                  ambiguous, and the path is unreachable by default
+        //                  (`DCENT_AM2_LOKI_BOSMINER_BULK` is set nowhere in
+        //                  the repo), so failing closed costs nothing.
+        //   reply select -> NON-FATAL. The command frame is already fully
+        //                  clocked and per-byte ACK-checked by then, the live
+        //                  `a lab unit` Loki latches despite NAKing, and this path IS
+        //                  reachable in a shipped image via the committed
+        //                  `DCENT_AM2_PSU_LOKI_COLD_BOOT_FULL=1` overlay.
+        //
+        // Asserting both shapes separately is what stops a future "consistency"
+        // cleanup from making the reply select fatal again.
+        assert!(
+            write.contains("return require_loki_bulk_frame_ack("),
+            "the bulk-frame NAK must stay fatal (an early `return`)"
+        );
+        assert!(
+            write.contains("if let Err(unstaged) = require_loki_reply_register_ack("),
+            "the reply-register NAK must stay NON-fatal: inspected via `if let Err`, \
+             counted, and warned about — never returned"
+        );
+        assert!(
+            !write.contains("return require_loki_reply_register_ack("),
+            "the reply-register select must not propagate its NAK — that aborts a \
+             transaction the PSU has already latched, on a live-proven mining path"
+        );
+        // Whitespace-stripped: `cargo fmt` breaks this counter across four lines
+        // (`self\n.loki_reply_reg_select_naks\n.fetch_add(1, ..)\n+ 1`), so the
+        // contiguous literal stopped matching even though the counter is intact.
+        // A method-chain contract must never be matched against raw source text.
+        let write_compact: String = write.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            write_compact.contains("loki_reply_reg_select_naks.fetch_add("),
+            "a non-fatal NAK must still be counted, or a permanently dead spoof is \
+             invisible"
+        );
+    }
 
     #[test]
     fn every_public_gpio_wire_entry_revalidates_process_ownership() {

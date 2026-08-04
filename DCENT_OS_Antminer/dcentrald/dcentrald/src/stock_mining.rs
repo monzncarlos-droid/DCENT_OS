@@ -1,9 +1,12 @@
 //! Stock Bitmain FPGA mining path.
 //!
-//! This module provides a complete mining pipeline for S9 miners running
-//! stock Bitmain firmware (kernel 3.14.0-xilinx with bitmain_axi.ko +
-//! fpga_mem_driver.ko). It replaces the BraiinsOS-specific UIO/FIFO
-//! approach with direct mmap access to the stock FPGA register block.
+//! This module provides the experimental S9 mining pipeline for stock Bitmain
+//! firmware (kernel 3.14.0-xilinx with bitmain_axi.ko +
+//! fpga_mem_driver.ko). It replaces the BraiinsOS-specific UIO/FIFO approach
+//! with direct mmap access to the stock FPGA register block. Because the
+//! autonomous FPGA nonce2/job-id correlation schema cannot be verified
+//! offline, runtime entry is fail-closed unless the explicit
+//! `DCENT_EXPERIMENTAL_STOCK_FPGA_NONCE2` beta gate is enabled.
 //!
 //! Architecture differences from the BraiinsOS path (daemon.rs):
 //!
@@ -23,7 +26,7 @@
 //! The ASIC init sequence (chain_inactive, set_address, set_freq, open_core)
 //! is the same — only the register access method changes.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +35,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use dcentrald_asic::voltage_rail_adapters::StockFpgaVoltageRail;
+use dcentrald_common::{
+    apply_safety_action, energize_voltage_rail, pic16_mv_to_dac, safe_off_voltage_rail,
+    stock_asicboost_admitted, stock_pic16_init_dac, stock_pic16_operating_dac,
+    ControllerHeartbeatObservation, DispatchRevocationCause, HeartbeatRequirement, PowerCut,
+    PowerCutReason, SafetyAction, ThermalSafetyState, VoltageRail, WatchdogSafetyState,
+    WorkDispatchAdmissionReceipt, WorkDispatchLifecycle, WorkDispatchSafetyError,
+    WorkDispatchSafetyInputs, WorkHistoryRing, STOCK_PIC16_INIT_MV, STOCK_PIC16_OPERATING_MV,
+};
 use dcentrald_hal::stock_fpga::*;
 use dcentrald_hal::stock_fpga_iic::StockFpgaI2c;
 use dcentrald_hal::stock_fpga_work::{StockFpgaDma, StockFpgaWorkEngine};
@@ -54,11 +66,12 @@ const STOCK_CHAIN_IDS: [u8; 4] = [5, 6, 7, 8];
 /// Number of BM1387 chips per S9 hash board.
 const CHIPS_PER_CHAIN: u8 = 63;
 
-/// Default PIC DAC value for ~9.10V operating voltage.
-/// pic_val = round(1608.42 - 170.42 * 9.1) = 57
-const DEFAULT_VOLTAGE_DAC: u8 = 57;
+/// Historical bmminer operating DAC (~9.10 V). Prefer
+/// [`stock_pic16_operating_dac`] / [`STOCK_PIC16_OPERATING_MV`] at call sites.
+#[allow(dead_code)]
+const DEFAULT_VOLTAGE_DAC_HISTORICAL: u8 = 57;
 
-/// Safe init voltage DAC (~9.4V). Used during chip enumeration.
+/// Historical init DAC (~9.4 V). Must equal [`stock_pic16_init_dac`].
 const INIT_VOLTAGE_DAC: u8 = 6;
 
 /// PIC heartbeat interval (ms). Well within the ~1 minute stock PIC timeout.
@@ -66,6 +79,87 @@ const HEARTBEAT_INTERVAL_MS: u64 = 5000;
 
 /// Hardware difficulty for BM1387 with TicketMask 0xFF = diff 256.
 const HW_DIFFICULTY: u64 = 256;
+
+/// Stock DHASH autonomously increments extranonce2 and returns only a work ID.
+/// The exact FPGA-written nonce2/job-id DMA schema is still hardware-beta
+/// evidence, so this path is fail-closed before opening any device unless the
+/// operator explicitly opts into correlation testing.
+const STOCK_FPGA_NONCE2_BETA_ENV: &str = "DCENT_EXPERIMENTAL_STOCK_FPGA_NONCE2";
+
+fn stock_fpga_nonce2_beta_enabled_value(raw: Option<&str>) -> bool {
+    raw.map(str::trim).is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn stock_fpga_nonce2_beta_enabled() -> bool {
+    stock_fpga_nonce2_beta_enabled_value(std::env::var(STOCK_FPGA_NONCE2_BETA_ENV).ok().as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Work-dispatch safety (shared pure policy → stock adapter)
+// ---------------------------------------------------------------------------
+
+/// Map stock-FPGA bring-up observations into the shared
+/// [`WorkDispatchSafetyInputs`] matrix.
+///
+/// Pure and host-testable: engines must not invent a second admission matrix.
+/// Heartbeat observations use chain IDs as `controller_id` (stock PIC is
+/// addressed per FPGA chain slot).
+pub(crate) fn stock_fpga_work_dispatch_inputs(
+    soc_watchdog: WatchdogSafetyState,
+    controller_heartbeats: &[ControllerHeartbeatObservation],
+    thermal: ThermalSafetyState,
+) -> WorkDispatchSafetyInputs {
+    WorkDispatchSafetyInputs {
+        watchdog: soc_watchdog,
+        heartbeat_requirement: HeartbeatRequirement::AllControllersSameCycle,
+        controllers: controller_heartbeats.to_vec(),
+        thermal,
+        // Lifecycle latch owns the terminal revoke bit; never smuggle clear here.
+        previously_revoked: false,
+    }
+}
+
+/// Stock-path SoC watchdog contribution from config + kicker spawn outcome.
+///
+/// - Config disabled → [`WatchdogSafetyState::DisabledByConfiguration`]
+/// - Config enabled and kicker owner present → [`WatchdogSafetyState::Armed`]
+/// - Config enabled but no owner → [`WatchdogSafetyState::Unavailable`]
+pub(crate) fn stock_fpga_watchdog_safety_state(
+    config_enabled: bool,
+    kicker_owner_present: bool,
+) -> WatchdogSafetyState {
+    match (config_enabled, kicker_owner_present) {
+        (false, _) => WatchdogSafetyState::DisabledByConfiguration,
+        (true, true) => WatchdogSafetyState::Armed,
+        (true, false) => WatchdogSafetyState::Unavailable,
+    }
+}
+
+/// Admit standard work dispatch on the stock-FPGA lifecycle latch.
+///
+/// Call **before** the first DHASH/DMA work commit. Returns the pure receipt
+/// so logs/forensics can pin which pillars were green.
+pub(crate) fn stock_fpga_admit_standard_work_dispatch<'a>(
+    life: &'a mut WorkDispatchLifecycle,
+    inputs: &WorkDispatchSafetyInputs,
+) -> Result<&'a WorkDispatchAdmissionReceipt, WorkDispatchSafetyError> {
+    life.admit(inputs)
+}
+
+/// Terminal revoke for the stock-FPGA lifecycle (heartbeat miss, operator stop,
+/// thermal/watchdog loss). Always cut-hash-before-noise via the shared policy.
+pub(crate) fn stock_fpga_revoke_work_dispatch(
+    life: &mut WorkDispatchLifecycle,
+    cause: DispatchRevocationCause,
+    profile_max_pwm: u8,
+) -> (SafetyAction, bool) {
+    life.revoke(cause, profile_max_pwm)
+}
 
 // ---------------------------------------------------------------------------
 // StockMiner — top-level stock FPGA mining orchestrator
@@ -98,11 +192,11 @@ fn clear_stock_chain_energized(mask: &AtomicU32, chain: u8) {
 }
 
 /// Best-effort cut-hash teardown for the `main()` crash panic hook on the
-/// stock-fpga (S9) path. No-op (allocation-free early return) unless a
-/// any energized bit exists. Re-opens the FPGA (the running handle may be held by
-/// the panicking thread — the Ok-path graceful shutdown re-opens the same way at
-/// `StockFpga::open()` below) and drives `enable_voltage(chain, false)` per
-/// energized chain to cut the rail. Swallows ALL errors — must NEVER re-panic
+/// stock-fpga (S9) path. No-op (allocation-free early return) unless any
+/// energized bit exists. Re-opens the FPGA (the running handle may be held by
+/// the panicking thread — the Ok-path graceful shutdown re-opens the same way)
+/// and cuts each energized chain via [`StockFpgaVoltageRail`] +
+/// [`safe_off_voltage_rail`] (P1-2). Swallows ALL errors — must NEVER re-panic
 /// from inside the panic hook.
 ///
 /// Why this matters: the release profile is `panic = "abort"`, so a panic runs
@@ -116,15 +210,31 @@ pub fn stock_fpga_panic_hook_best_effort_teardown() {
     if energized == 0 {
         return;
     }
-    if let Ok(fpga) = StockFpga::open() {
-        let i2c = StockFpgaI2c::new(&fpga);
-        for chain in 0u8..32 {
-            let bit = 1u32 << u32::from(chain);
-            if energized & bit != 0 && i2c.enable_voltage(chain, false).is_ok() {
-                clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain);
+    // P1-6: cut-hash-only SafetyAction (no fan blast from the panic hook).
+    let action = SafetyAction::PowerCutOnly(PowerCut {
+        reason: PowerCutReason::PanicTeardown,
+        cut_hash_before_noise: true,
+    });
+    let _ = apply_safety_action(
+        action,
+        |_cut| {
+            if let Ok(fpga) = StockFpga::open() {
+                let i2c = StockFpgaI2c::new(&fpga);
+                for chain in 0u8..32 {
+                    let bit = 1u32 << u32::from(chain);
+                    if energized & bit == 0 {
+                        continue;
+                    }
+                    let mut rail = StockFpgaVoltageRail::new(&i2c, chain);
+                    if safe_off_voltage_rail(&mut rail).is_ok() {
+                        clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain);
+                    }
+                }
             }
-        }
-    }
+            Ok::<(), ()>(())
+        },
+        |_pwm| Ok(()),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,33 +313,52 @@ impl StockRunSafetyGuard {
                 watchdog_fallback: true,
             }
         } else {
+            // P1-6: execute PowerCut-only SafetyAction for ordinary-return teardown.
+            let chains = self.chains.clone();
             let mut completed = 0usize;
-            if let Ok(shutdown_fpga) = StockFpga::open() {
-                let shutdown_i2c = StockFpgaI2c::new(&shutdown_fpga);
-                for &chain in &self.chains {
-                    match shutdown_i2c.enable_voltage(chain, false) {
-                        Ok(()) => {
-                            completed += 1;
-                            clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain);
-                            info!(
-                                chain,
-                                reason, "Stock FPGA voltage-disable command completed"
-                            );
+            let action = SafetyAction::PowerCutOnly(PowerCut {
+                reason: PowerCutReason::OperatorSafeOff,
+                cut_hash_before_noise: true,
+            });
+            let apply = apply_safety_action(
+                action,
+                |_cut| {
+                    if let Ok(shutdown_fpga) = StockFpga::open() {
+                        let shutdown_i2c = StockFpgaI2c::new(&shutdown_fpga);
+                        for &chain in &chains {
+                            let mut rail = StockFpgaVoltageRail::new(&shutdown_i2c, chain);
+                            match safe_off_voltage_rail(&mut rail) {
+                                Ok(()) => {
+                                    completed += 1;
+                                    clear_stock_chain_energized(
+                                        &STOCK_FPGA_ENERGIZED_CHAIN_MASK,
+                                        chain,
+                                    );
+                                    info!(
+                                        chain,
+                                        reason, "Stock FPGA VoltageRail safe_off completed"
+                                    );
+                                }
+                                Err(error) => warn!(
+                                    chain,
+                                    reason,
+                                    error = %error,
+                                    "Stock FPGA VoltageRail safe_off failed; PIC watchdog remains the safety net"
+                                ),
+                            }
                         }
-                        Err(error) => warn!(
-                            chain,
+                        Ok::<(), ()>(())
+                    } else {
+                        warn!(
                             reason,
-                            error = %error,
-                            "Stock FPGA voltage-disable command failed; PIC watchdog remains the safety net"
-                        ),
+                            "Stock FPGA could not be reopened for voltage teardown; PIC watchdog remains the safety net"
+                        );
+                        Err(())
                     }
-                }
-            } else {
-                warn!(
-                    reason,
-                    "Stock FPGA could not be reopened for voltage teardown; PIC watchdog remains the safety net"
-                );
-            }
+                },
+                |_pwm| Ok(()),
+            );
+            let _ = apply;
             let all_commands_completed = completed == self.chains.len();
             StockVoltageTeardownEvidence {
                 software_attempted: true,
@@ -285,6 +414,18 @@ impl StockMiner {
     /// 7. Nonce collection via shared RETURN_NONCE FIFO
     /// 8. Share validation and submission
     pub async fn run(&mut self) -> Result<()> {
+        if !stock_fpga_nonce2_beta_enabled() {
+            bail!(
+                "stock FPGA DHASH mining is hardware-beta and refused before device access: \
+                 the FPGA autonomously increments extranonce2, but its nonce2/job-id DMA return \
+                 schema and wrap boundary are not yet hardware-validated. Set \
+                 {STOCK_FPGA_NONCE2_BETA_ENV}=1 only during the documented instrumented beta."
+            );
+        }
+        warn!(
+            env = STOCK_FPGA_NONCE2_BETA_ENV,
+            "EXPERIMENTAL stock FPGA nonce2 correlation enabled; do not use for unattended production until DMA mapping and wrap-stop beta vectors pass"
+        );
         info!("=== STOCK FPGA MINING PATH ===");
         info!("Using stock Bitmain FPGA register interface (/dev/axi_fpga_dev)");
         info!("This path does NOT require BraiinsOS boot components or UIO devices");
@@ -366,6 +507,9 @@ impl StockMiner {
         let i2c = StockFpgaI2c::new(&fpga);
 
         let mut initialized_chains: Vec<u8> = Vec::new();
+        // Per-initialized-chain initial PIC heartbeat (same order as
+        // `initialized_chains`). Feeds work-dispatch admission.
+        let mut initial_pic_heartbeat_ok: Vec<bool> = Vec::new();
         let mut run_safety = StockRunSafetyGuard::new(Vec::new());
 
         for &chain_id in &detected_chains {
@@ -420,24 +564,23 @@ impl StockMiner {
                 }
             }
 
-            // Set safe init voltage (9.4V)
-            if let Err(e) = i2c.set_voltage(chain_id, INIT_VOLTAGE_DAC) {
-                warn!(
-                    chain_id,
-                    error = %e,
-                    "Failed to set init voltage on chain {} — may not mine",
-                    chain_id,
-                );
-                continue;
-            }
-
+            // P1-2: full VoltageRail facet energize (set_mv → enable) via stock FPGA PIC.
+            debug_assert_eq!(INIT_VOLTAGE_DAC, stock_pic16_init_dac());
             // A multi-write enable error cannot prove that no write reached the
-            // PIC. Mark possible energization BEFORE the first stage so panic
-            // and ordinary-return teardown remain conservative at every point.
+            // PIC. Mark possible energization BEFORE the first enable stage so
+            // panic and ordinary-return teardown remain conservative.
             mark_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain_id);
             run_safety.add_energized_chain(chain_id);
-            if let Err(enable_error) = i2c.enable_voltage(chain_id, true) {
-                match i2c.enable_voltage(chain_id, false) {
+            let energize_result = {
+                let mut rail = StockFpgaVoltageRail::new(&i2c, chain_id);
+                energize_voltage_rail(&mut rail, STOCK_PIC16_INIT_MV)
+            };
+            if let Err(enable_error) = energize_result {
+                let disable_result = {
+                    let mut rail = StockFpgaVoltageRail::new(&i2c, chain_id);
+                    safe_off_voltage_rail(&mut rail)
+                };
+                match disable_result {
                     Ok(()) => {
                         clear_stock_chain_energized(&STOCK_FPGA_ENERGIZED_CHAIN_MASK, chain_id);
                         run_safety.remove_deenergized_chain(chain_id);
@@ -445,7 +588,7 @@ impl StockMiner {
                             chain_id,
                             error = %enable_error,
                             cleanup_completed = true,
-                            "Stock PIC voltage-enable returned an uncertain outcome; compensating disable completed"
+                            "Stock PIC VoltageRail energize failed; compensating safe_off completed"
                         );
                     }
                     Err(disable_error) => warn!(
@@ -454,29 +597,42 @@ impl StockMiner {
                         cleanup_error = %disable_error,
                         possibly_energized = true,
                         watchdog_fallback = true,
-                        "Stock PIC voltage-enable returned an uncertain outcome and compensating disable failed; retaining teardown ownership"
+                        "Stock PIC VoltageRail energize failed and compensating safe_off failed; retaining teardown ownership"
                     ),
                 }
                 continue;
             }
 
-            // Send initial heartbeat
-            if let Err(e) = i2c.send_heartbeat(chain_id) {
-                warn!(
-                    chain_id,
-                    error = %e,
-                    "PIC heartbeat failed on chain {} — PIC watchdog may fire",
-                    chain_id,
-                );
-            }
+            // Send initial heartbeat — observation feeds the shared
+            // work-dispatch admission gate (same-cycle HB required for every
+            // energized PIC before DHASH work may start).
+            let heartbeat_ok = {
+                let mut rail = StockFpgaVoltageRail::new(&i2c, chain_id);
+                match rail.heartbeat() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            chain_id,
+                            error = %e,
+                            "PIC heartbeat failed on chain {} — PIC watchdog may fire; \
+                             work-dispatch admission will refuse until a green same-cycle sample exists",
+                            chain_id,
+                        );
+                        false
+                    }
+                }
+            };
 
             info!(
                 chain_id,
-                "PIC on chain {} initialized — voltage enabled at ~9.4V (DAC={})",
+                init_mv = STOCK_PIC16_INIT_MV,
+                dac = stock_pic16_init_dac(),
+                "PIC on chain {} initialized — VoltageRail energize ~9.4V (DAC={})",
                 chain_id,
-                INIT_VOLTAGE_DAC,
+                stock_pic16_init_dac(),
             );
             initialized_chains.push(chain_id);
+            initial_pic_heartbeat_ok.push(heartbeat_ok);
         }
 
         if initialized_chains.is_empty() {
@@ -495,9 +651,8 @@ impl StockMiner {
         // heartbeat path has been proven. SAF-5: gate kicks on the stock mining
         // loop's status heartbeat so a live-locked loop stops feeding the SoC WDT.
         let watchdog_liveness = Arc::new(AtomicU64::new(0));
-        crate::daemon::spawn_watchdog_kicker(
+        let mut legacy_watchdog_feed_owner = crate::daemon::spawn_watchdog_kicker(
             &self.config.watchdog,
-            self.shutdown.clone(),
             Some(watchdog_liveness.clone()),
         );
 
@@ -564,16 +719,17 @@ impl StockMiner {
         //   3. set_frequency (PLL configuration)
         //   4. open_core (114 dummy work items)
         //
-        // ASIC init via BC_WRITE_COMMAND is NOT yet implemented.
-        // Stock FPGA only works in passthrough mode: kill bmminer/bosminer first,
-        // then start dcentrald. ASICs retain their state (baud, freq, addresses)
-        // until power is cycled.
+        // G32–G41: pure+execute library available offline for set_freq, software_set_address,
+        // set_baud, ticket_mask/hcnt, timeout, open_core (EXPERIMENTAL). G41 adds a pure cold-boot
+        // inventory spine only (phase4b admission flag remains false). Full composition is still
+        // NOT auto-wired into this Phase 4b path (passthrough + counting gate).
         //
         // BUG FIX (2026-04-11): Hard-fail on cold boot instead of silently proceeding
         // with uninitialized ASICs (which produces 0 nonces and wastes time debugging).
         info!("--- Phase 4b: ASIC chain init ---");
-        warn!("Stock FPGA ASIC init via BC_WRITE_COMMAND not yet implemented. \
-               Passthrough mode only — bmminer/bosminer must have initialized ASICs before dcentrald.");
+        warn!("Stock FPGA full cold-boot auto-composition not yet admitted (G32–G41 pure library + \
+               G41 inventory plan-only; open_core/set_baud/ticket_mask EXPERIMENTAL). Passthrough mode only — bmminer/bosminer \
+               must have initialized ASICs before dcentrald.");
         // Read HASH_COUNTING_NUMBER to check if ASICs are alive.
         // REG_RETURN_NONCE (0x010) is destructive and can consume a real nonce.
         let counting = fpga.read_reg(REG_HASH_COUNTING_NUMBER);
@@ -597,13 +753,21 @@ impl StockMiner {
             counting
         );
 
-        // Set operating voltage (9.1V)
+        // Set operating voltage (~9.1V) via VoltageRail facet (P1-2).
+        let operating_dac = stock_pic16_operating_dac();
         info!(
-            "Setting operating voltage to ~9.1V (DAC={})",
-            DEFAULT_VOLTAGE_DAC
+            operating_mv = STOCK_PIC16_OPERATING_MV,
+            dac = operating_dac,
+            historical_dac = DEFAULT_VOLTAGE_DAC_HISTORICAL,
+            "Setting operating voltage via VoltageRail (SSOT DAC; historical pin was {})",
+            DEFAULT_VOLTAGE_DAC_HISTORICAL
         );
         for &chain in &initialized_chains {
-            if let Err(e) = i2c.set_voltage(chain, DEFAULT_VOLTAGE_DAC) {
+            let set_result = {
+                let mut rail = StockFpgaVoltageRail::new(&i2c, chain);
+                rail.set_mv(STOCK_PIC16_OPERATING_MV)
+            };
+            if let Err(e) = set_result {
                 warn!(
                     chain,
                     error = %e,
@@ -631,6 +795,10 @@ impl StockMiner {
         let hb_chains = initialized_chains.clone();
         let hb_shutdown = self.shutdown.clone();
         let mut runtime_threads = RuntimeThreadGuard::new(self.shutdown.clone());
+        // Shared flag: any mid-run PIC heartbeat failure terminal-revokes work
+        // dispatch on the next mining-loop tick (shared pure latch).
+        let pic_heartbeat_failed = Arc::new(AtomicBool::new(false));
+        let pic_heartbeat_failed_hb = pic_heartbeat_failed.clone();
 
         // The PIC heartbeat runs on a dedicated OS thread (not tokio) to guarantee
         // timing even when the async runtime is busy with work dispatch.
@@ -644,6 +812,7 @@ impl StockMiner {
                     Ok(f) => f,
                     Err(e) => {
                         error!(error = %e, "Heartbeat thread: failed to open stock FPGA");
+                        pic_heartbeat_failed_hb.store(true, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -668,9 +837,10 @@ impl StockMiner {
                             warn!(
                                 chain,
                                 error = %e,
-                                "PIC heartbeat failed on chain {}",
+                                "PIC heartbeat failed on chain {} — signalling work-dispatch terminal revoke",
                                 chain,
                             );
+                            pic_heartbeat_failed_hb.store(true, Ordering::SeqCst);
                         }
                     }
 
@@ -693,6 +863,62 @@ impl StockMiner {
         runtime_threads.push("stock-pic-heartbeat", heartbeat_handle);
         run_safety.heartbeat_started();
 
+        // ---- Phase 6b: Work-dispatch safety admission (shared pure latch) ----
+        // Refuse DHASH/DMA work until SoC watchdog + same-cycle PIC heartbeats
+        // + thermal pillar are green. Engine wire residual shrinks to owning
+        // one WorkDispatchLifecycle — not a second admission matrix.
+        let mut dispatch_life = WorkDispatchLifecycle::new();
+        let admission_cycle_id = 1u64;
+        let controller_heartbeats: Vec<ControllerHeartbeatObservation> = initialized_chains
+            .iter()
+            .zip(initial_pic_heartbeat_ok.iter())
+            .map(|(&chain, &ok)| ControllerHeartbeatObservation {
+                controller_id: chain,
+                heartbeat_ok: ok,
+                cycle_id: admission_cycle_id,
+            })
+            .collect();
+        let wd_state = stock_fpga_watchdog_safety_state(
+            self.config.watchdog.enabled,
+            legacy_watchdog_feed_owner.is_some(),
+        );
+        // Stock FPGA path does not yet run the full thermal supervisor loop;
+        // Ready here means "no thermal emergency latched before mining." Full
+        // ThermalController wire on stock remains a residual (engines share
+        // this same ThermalSafetyState enum when that lands).
+        let dispatch_inputs = stock_fpga_work_dispatch_inputs(
+            wd_state,
+            &controller_heartbeats,
+            ThermalSafetyState::Ready,
+        );
+        match stock_fpga_admit_standard_work_dispatch(&mut dispatch_life, &dispatch_inputs) {
+            Ok(receipt) => {
+                info!(
+                    watchdog = ?receipt.watchdog,
+                    thermal = ?receipt.thermal,
+                    controller_count = receipt.controller_count,
+                    heartbeat_cycle_id = ?receipt.heartbeat_cycle_id,
+                    "Stock FPGA work-dispatch admission OK — DHASH/DMA work allowed"
+                );
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "Stock FPGA work-dispatch admission REFUSED — cutting hash before any work commit"
+                );
+                if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+                    owner.close_terminal();
+                }
+                let heartbeat_stop = runtime_threads.stop_and_join(Duration::from_secs(3)).await;
+                run_safety.heartbeat_stop_observed(&heartbeat_stop);
+                let evidence = run_safety.teardown("work-dispatch-admission-refused");
+                warn!(?evidence, "Stock admission-refused teardown evidence");
+                return Err(anyhow::anyhow!(
+                    "stock FPGA work-dispatch admission refused: {err}"
+                ));
+            }
+        }
+
         // ---- Phase 7: Initialize work engine ----
         info!("--- Phase 7: Initializing DHASH accelerator + work engine ---");
         let mut work_engine = StockFpgaWorkEngine::new(&fpga, &dma);
@@ -702,7 +928,27 @@ impl StockMiner {
 
         if passthrough {
             // Passthrough: preserve bmminer's DHASH state (0x8100, not 0x8160)
-            work_engine.init_passthrough();
+            //
+            // This runs POST-ENERGIZE, so a bare `?` here would return with the
+            // chain still energized and no teardown. Every fallible exit past
+            // `run_safety` must cut hash explicitly first — pinned by
+            // `stock_and_legacy_psu_feeders_keep_explicit_bounded_ownership`.
+            if let Err(err) = work_engine.init_passthrough() {
+                error!(
+                    error = %err,
+                    "Inherited stock FPGA DMA registers do not match the admitted layout — cutting hash before any work commit"
+                );
+                if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+                    owner.close_terminal();
+                }
+                let heartbeat_stop = runtime_threads.stop_and_join(Duration::from_secs(3)).await;
+                run_safety.heartbeat_stop_observed(&heartbeat_stop);
+                let evidence = run_safety.teardown("passthrough-dma-layout-refused");
+                warn!(?evidence, "Stock passthrough-refused teardown evidence");
+                return Err(anyhow::anyhow!(
+                    "inherited stock FPGA DMA registers do not match the admitted layout: {err}"
+                ));
+            }
         } else {
             work_engine.init(total_chips);
         }
@@ -719,15 +965,22 @@ impl StockMiner {
         info!("--- Phase 8: Connecting to mining pool ---");
 
         let (job_tx, mut job_rx) = mpsc::channel::<dcentrald_stratum::types::JobTemplate>(32);
-        let (share_tx, share_rx) = mpsc::channel::<dcentrald_stratum::types::ValidShare>(256);
+        // Keep the receiver open for the Stratum task, but never feed it from
+        // this beta path until FPGA nonce2/job-id correlation is implemented.
+        // Dropping the only sender would make recv() immediately-ready forever
+        // in some session loops, so retain an explicitly named guard.
+        let (_uncorrelated_share_tx_guard, share_rx) =
+            mpsc::channel::<dcentrald_stratum::types::ValidShare>(256);
         let (status_tx, mut status_rx) =
             mpsc::channel::<dcentrald_stratum::types::StratumStatus>(64);
 
-        let stratum_config = crate::config::build_stratum_config(
+        // P2-9: stock path knows board×chip geometry before pool connect.
+        let stratum_config = crate::config::build_stratum_config_with_enumerated_chips(
             &self.config,
             crate::config::disabled_stratum_donation_config(),
             false,
             false,
+            (total_chips > 0).then_some(total_chips),
         );
 
         let stratum_router = dcentrald_stratum::StratumRouter::new(stratum_config);
@@ -786,16 +1039,18 @@ impl StockMiner {
 
         let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new();
         let mut current_job: Option<dcentrald_stratum::types::JobTemplate> = None;
-        let mut work_id_counter: u8 = 0;
-
-        // Work tracking table for nonce → share matching
-        let mut work_table: Vec<Option<StockWorkEntry>> = vec![None; 256];
+        // G14/G15: pure WorkHistoryRing depth=1.
+        // G15 correlation SSOT: history slots are the low byte of FPGA REG_JOB_ID
+        // returned by StockFpgaWorkEngine::dispatch_work (post-inc write). Nonce
+        // path maps RETURN_NONCE_EXT the same way — never a separate CPU cursor.
+        // No share-dedup on this path (intentionally; do not invent one).
+        let mut work_history: WorkHistoryRing<StockWorkEntry> = WorkHistoryRing::new(1);
 
         // Stats
         let mut total_work_dispatched: u64 = 0;
         let mut total_nonces: u64 = 0;
-        let mut shares_submitted: u64 = 0;
-        let mut shares_found: u64 = 0;
+        let shares_submitted: u64 = 0;
+        let mut uncorrelated_nonces_dropped: u64 = 0;
         let mut hw_errors: u64 = 0;
         let start_time = Instant::now();
         let mut last_hashrate_time = Instant::now();
@@ -807,6 +1062,60 @@ impl StockMiner {
         let mut hashrate_timer = tokio::time::interval(Duration::from_secs(5));
 
         loop {
+            // Terminal revoke on mid-run PIC heartbeat failure — cut hash
+            // before noise via the shared lifecycle latch (not fan blast).
+            if pic_heartbeat_failed.load(Ordering::SeqCst) && dispatch_life.is_admitted() {
+                let home_pwm = self
+                    .config
+                    .thermal
+                    .fan_max_pwm
+                    .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
+                let (action, stop_feed) = stock_fpga_revoke_work_dispatch(
+                    &mut dispatch_life,
+                    DispatchRevocationCause::HeartbeatFailure,
+                    home_pwm,
+                );
+                // P1-6: execute SafetyAction steps (cut-hash policy); I/O disable
+                // is owned by StockRunSafetyGuard drop after break.
+                let report = apply_safety_action(
+                    action,
+                    |cut| {
+                        error!(
+                            ?cut.reason,
+                            "Stock FPGA SafetyAction CutPower (PIC disable on guard drop)"
+                        );
+                        Ok::<(), ()>(())
+                    },
+                    |pwm| {
+                        // Home-capped intent only — stock fan path is FPGA register; guard drop owns rails.
+                        debug!(
+                            pwm,
+                            "Stock FPGA SafetyAction CommandFans (effective PWM recorded)"
+                        );
+                        Ok(())
+                    },
+                );
+                match report {
+                    Ok(r) => error!(
+                        stop_watchdog_feed = stop_feed,
+                        steps = r.steps_attempted,
+                        cut = r.cut_power_applied,
+                        "Stock FPGA work-dispatch TERMINALLY REVOKED after PIC heartbeat failure"
+                    ),
+                    Err((r, _)) => error!(
+                        stop_watchdog_feed = stop_feed,
+                        steps = r.steps_attempted,
+                        "Stock FPGA work-dispatch revoke SafetyAction callback failed"
+                    ),
+                }
+                if stop_feed {
+                    if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+                        owner.close_terminal();
+                    }
+                }
+                break;
+            }
+
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     info!("Stock mining stopping — shutdown requested");
@@ -820,22 +1129,36 @@ impl StockMiner {
                             job_id = %job.job_id,
                             "NEW BLOCK — flushing work and nonces",
                         );
-                        work_table.iter_mut().for_each(|e| *e = None);
+                        work_history.clear_all();
                         work_engine.signal_new_block();
                         work_builder.reset_extranonce2();
                     }
+                    // Propagate BIP-310 mask so WorkBuilder midstates + G17 AsicBoost
+                    // packing share the negotiated mask (0 = single-version path).
+                    work_builder.set_version_mask(job.version_mask);
                     current_job = Some(job);
                 }
 
                 // Dispatch work to FPGA via DMA
                 _ = dispatch_timer.tick() => {
+                    // Fail-closed: never commit DHASH work without a live admission.
+                    if !dispatch_life.is_admitted() {
+                        continue;
+                    }
                     if let Some(ref job) = current_job {
                         // NOTE: BUFFER_SPACE register reads 0 during normal mining
                         // (bmminer also shows 0). It does NOT gate work dispatch.
                         // The FPGA picks up work via JOB_DATA_READY regardless.
 
                         // Generate new work
-                        let stratum_work = work_builder.next_work(job);
+                        let stratum_work = match work_builder.next_work(job) {
+                            Ok(work) => work,
+                            Err(error) => {
+                                warn!(%error, "V1 work domain unavailable; pausing stock dispatch until a fresh generation arrives");
+                                current_job = None;
+                                continue;
+                            }
+                        };
 
                         // Convert prev_block_hash from pool byte order to 8 x u32 words.
                         // The FPGA uses this to construct block headers internally.
@@ -892,34 +1215,71 @@ impl StockMiner {
                         header_tail[4..8].copy_from_slice(&stratum_work.ntime.to_le_bytes());
                         header_tail[8..12].copy_from_slice(&stratum_work.nbits.to_le_bytes());
 
-                        // Track work for nonce matching
-                        work_table[work_id_counter as usize] = Some(StockWorkEntry {
-                            job_id: stratum_work.job_id.clone(),
-                            extranonce2: stratum_work.extranonce2.clone(),
-                            ntime: stratum_work.ntime,
-                            version: stratum_work.version,
-                            share_target: stratum_work.share_target,
-                            midstate: stratum_work.midstates[0],
-                            header_tail,
-                        });
-
                         // Dispatch via DMA + DHASH accelerator.
                         // In VIL mode, FPGA computes midstate internally from:
                         //   prev_hash (registers) + coinbase (DMA) + merkle (DMA)
-                        let _fpga_job_id = work_engine.dispatch_work(
-                            &job_data,
-                            &prev_hash_words,
-                            stratum_work.version,
-                            stratum_work.ntime,
-                            stratum_work.nbits,
+                        // G15: REG_JOB_ID (return value) is the correlation spine —
+                        // push history AFTER dispatch using the low byte nonces echo.
+                        // G17: when BIP-310 mask is non-zero, use pure 4-way AsicBoost
+                        // packing + multi-midstate DHASH (stock/bmminer path).
+                        let use_asicboost =
+                            stock_asicboost_admitted(stratum_work.version_mask);
+                        let fpga_job_id = if use_asicboost {
+                            work_engine.dispatch_work_asicboost(
+                                &job_data,
+                                &prev_hash_words,
+                                stratum_work.version,
+                                stratum_work.version_mask,
+                                stratum_work.ntime,
+                                stratum_work.nbits,
+                            )
+                        } else {
+                            work_engine.dispatch_work(
+                                &job_data,
+                                &prev_hash_words,
+                                stratum_work.version,
+                                stratum_work.ntime,
+                                stratum_work.nbits,
+                            )
+                        };
+                        let work_id = (fpga_job_id & 0xFF) as u8;
+                        // Up to 4 midstates for AsicBoost solution_idx validation;
+                        // single-version path fills slot 0 only.
+                        let mut midstates = [[0u8; 32]; 4];
+                        let n_ms = stratum_work.midstates.len().min(4);
+                        for (i, ms) in stratum_work.midstates.iter().take(n_ms).enumerate() {
+                            midstates[i] = *ms;
+                        }
+                        if n_ms == 0 {
+                            // Defensive: WorkBuilder always provides ≥1 midstate.
+                            midstates[0] = [0u8; 32];
+                        } else if n_ms == 1 {
+                            // Replicate midstate0 so solution_idx never reads empty.
+                            for i in 1..4 {
+                                midstates[i] = midstates[0];
+                            }
+                        }
+                        work_history.push(
+                            work_id,
+                            StockWorkEntry {
+                                work_generation: stratum_work.work_generation,
+                                job_id: stratum_work.job_id.clone(),
+                                extranonce2: stratum_work.extranonce2.clone(),
+                                ntime: stratum_work.ntime,
+                                version: stratum_work.version,
+                                version_mask: stratum_work.version_mask,
+                                share_target: stratum_work.share_target,
+                                midstates,
+                                header_tail,
+                            },
                         );
 
-                        work_id_counter = work_id_counter.wrapping_add(1);
                         total_work_dispatched += 1;
 
                         if total_work_dispatched <= 3 {
                             info!(
-                                work_id = work_id_counter.wrapping_sub(1),
+                                work_id,
+                                fpga_job_id,
                                 job_id = %stratum_work.job_id,
                                 version = format_args!("0x{:08X}", stratum_work.version),
                                 ntime = format_args!("0x{:08X}", stratum_work.ntime),
@@ -944,12 +1304,10 @@ impl StockMiner {
                         //   Bits [23:8]  = extended_work_id
                         //   Bits [7:0]   = solution_index
                         //
-                        // The job_id field in the ext word maps back to the FPGA's
-                        // internal job counter (set by REG_JOB_ID). We use our work_table
-                        // indexed by the low byte of the job_id for simplicity.
+                        // G15: extended work_id low byte is the same spine as
+                        // REG_JOB_ID written at dispatch — history keys match.
                         let ext_work_id = ((ext >> 8) & 0xFFFF) as u16;
                         let solution_idx = (ext & 0xFF) as u8;
-                        // Map back to our work_id counter (modulo 256)
                         let work_id = (ext_work_id & 0xFF) as u8;
 
                         if total_nonces <= 3 {
@@ -963,8 +1321,8 @@ impl StockMiner {
                             );
                         }
 
-                        // Look up work entry
-                        let entry = match &work_table[work_id as usize] {
+                        // Look up work entry (depth-1 ring: latest or empty/stale).
+                        let entry = match work_history.latest(work_id) {
                             Some(e) => e.clone(),
                             None => {
                                 debug!(work_id, "Nonce for unknown work_id — stale");
@@ -972,7 +1330,50 @@ impl StockMiner {
                             }
                         };
 
-                        shares_found += 1;
+                        // The stock DHASH engine advances nonce2 autonomously and
+                        // writes the actual (work_id, nonce2, midstate) mapping
+                        // into the separate 2 MiB FPGA store. Until hardware
+                        // replay proves that correlation, using the CPU seed can
+                        // validate and submit the wrong header.
+                        uncorrelated_nonces_dropped += 1;
+                        static WARNED_UNCORRELATED_NONCE2: AtomicBool = AtomicBool::new(false);
+                        if !WARNED_UNCORRELATED_NONCE2.swap(true, Ordering::Relaxed) {
+                            warn!(
+                                "Stock FPGA nonce2/job-id mapping is not hardware-validated; \
+                                 pool submission is suppressed for this experimental session"
+                            );
+                        }
+                        debug!(
+                            nonce = format_args!("0x{:08X}", nonce),
+                            ext = format_args!("0x{:08X}", ext),
+                            work_id,
+                            solution_idx,
+                            cpu_job_id = %entry.job_id,
+                            cpu_seed_extranonce2 = %entry.extranonce2,
+                            uncorrelated_nonces_dropped,
+                            "Dropped uncorrelated stock FPGA nonce before local share validation"
+                        );
+                        continue;
+
+                        #[cfg(any())]
+                        {
+                        // G17: AsicBoost solution_idx selects version slot + midstate.
+                        // Single-version path uses slot 0 / midstates[0].
+                        let slot = if stock_asicboost_admitted(entry.version_mask) {
+                            stock_asicboost_slot_from_solution_idx(solution_idx)
+                        } else {
+                            0
+                        };
+                        let midstate = entry.midstates[slot as usize];
+                        let submit_version = if stock_asicboost_admitted(entry.version_mask) {
+                            stock_asicboost_version_for_solution(
+                                entry.version,
+                                entry.version_mask,
+                                solution_idx,
+                            )
+                        } else {
+                            entry.version
+                        };
 
                         // BUG FIX (2026-04-11): Enable share validation. Was bypassed and
                         // submitting ALL nonces, spamming pools with invalid shares.
@@ -980,7 +1381,7 @@ impl StockMiner {
                         // If CPU midstate doesn't match, shares are correctly rejected here
                         // rather than wasting pool bandwidth.
                         let meets_target = dcentrald_stratum::share_pipeline::validate_share(
-                            &entry.midstate,
+                            &midstate,
                             &entry.header_tail,
                             nonce,
                             &entry.share_target,
@@ -992,13 +1393,14 @@ impl StockMiner {
 
                         shares_submitted += 1;
                         let share = dcentrald_stratum::types::ValidShare {
+                            work_generation: entry.work_generation,
                             worker_name: self.config.pool.worker.clone(),
                             job_id: entry.job_id.clone(),
                             extranonce2: entry.extranonce2.clone(),
                             ntime: format!("{:08x}", entry.ntime),
                             nonce: format!("{:08x}", nonce),
                             version_bits: None,
-                            version: entry.version,
+                            version: submit_version,
                             achieved_difficulty: None,
                         };
 
@@ -1016,6 +1418,7 @@ impl StockMiner {
                                 error!(error = %e, "Share channel closed");
                                 break;
                             }
+                        }
                         }
                     }
                 }
@@ -1036,7 +1439,7 @@ impl StockMiner {
                             total_nonces,
                             total_work = total_work_dispatched,
                             shares_submitted,
-                            shares_found,
+                            uncorrelated_nonces_dropped,
                             uptime_s = start_time.elapsed().as_secs(),
                             crc_errors = fpga.read_crc_errors(),
                             "Hashrate: {:.2} TH/s ({:.0} GH/s) — {} nonces, {} shares submitted",
@@ -1052,6 +1455,35 @@ impl StockMiner {
 
         // ---- Shutdown ----
         info!("=== STOCK FPGA MINING SHUTDOWN ===");
+
+        // Operator/normal stop: terminal revoke if still admitted (heartbeat
+        // failure already revoked above). Shared policy cuts hash before noise
+        // and reports whether the SoC WDT feed must stop.
+        if dispatch_life.is_admitted() {
+            let home_pwm = self
+                .config
+                .thermal
+                .fan_max_pwm
+                .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
+            let (action, stop_feed) = stock_fpga_revoke_work_dispatch(
+                &mut dispatch_life,
+                DispatchRevocationCause::OperatorSafeOff,
+                home_pwm,
+            );
+            info!(
+                stop_watchdog_feed = stop_feed,
+                steps = action.steps().len(),
+                "Stock FPGA work-dispatch revoked on operator shutdown"
+            );
+            if stop_feed {
+                if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+                    owner.close_terminal();
+                }
+            }
+        } else if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+            // Already revoked (e.g. heartbeat) — still close the feed owner.
+            owner.close_terminal();
+        }
 
         // Stop DHASH accelerator
         work_engine.stop();
@@ -1071,18 +1503,19 @@ impl StockMiner {
         // the PWM-30 home cap is
         // load-bearing (; cut-hash-before-noise) and
         // every sibling teardown (daemon.rs Step 7, NoPicPsuGuard, Am3BbRunSafetyGuard)
-        // already honors it. fan_max_pwm is 0-100; REG_FAN_CONTROL duty (bits [23:16])
-        // is 0-255, so scale. PWM_SAFETY_MAX (30) is never exceeded.
+        // already honors it. G44: FAN_CONTROL pack = pure T9+ set_PWM SSOT (not
+        // invent 0–255 scale); PWM_SAFETY_MAX (30) is still applied before pack.
         let cooldown_pct = self
             .config
             .thermal
             .fan_max_pwm
             .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
-        let duty_raw = (cooldown_pct as u32) * 255 / 100;
-        fpga.write_reg(REG_FAN_CONTROL, (duty_raw << 16) | 0x14);
+        let fan_word = dcentrald_common::stock_fan_control_value(cooldown_pct);
+        fpga.write_reg(REG_FAN_CONTROL, fan_word);
         info!(
             cooldown_pct,
-            "Fan set to PWM {}% (home cap) via FPGA FAN_CONTROL for post-mining cooldown",
+            fan_word = format_args!("0x{:08X}", fan_word),
+            "Fan set to PWM {}% (home cap) via FPGA FAN_CONTROL (T9+ pure pack) for post-mining cooldown",
             cooldown_pct
         );
 
@@ -1106,14 +1539,23 @@ impl StockMiner {
 // ---------------------------------------------------------------------------
 
 /// Work entry for matching nonces back to pool jobs (stock FPGA path).
+///
+/// Engine-local rich payload stored in pure [`WorkHistoryRing`] depth=1 (G14/G15/G17).
+/// Slot key = FPGA REG_JOB_ID low byte from dispatch_work (not a separate cursor).
+/// Do not unify with hybrid/serial WorkEntry — midstate/header_tail are stock-specific.
 #[derive(Clone)]
 struct StockWorkEntry {
+    work_generation: dcentrald_stratum::WorkGeneration,
     job_id: String,
     extranonce2: String,
     ntime: u32,
+    /// Base stratum version (pre-slot packing).
     version: u32,
+    /// Negotiated BIP-310 mask; 0 = single-version path.
+    version_mask: u32,
     share_target: [u8; 32],
-    midstate: [u8; 32],
+    /// Up to 4 midstates for AsicBoost solution_idx; slot 0 is single-version.
+    midstates: [[u8; 32]; 4],
     header_tail: [u8; 12],
 }
 
@@ -1133,6 +1575,258 @@ fn decode_hex_bytes(hex: &str) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod work_dispatch_admission_tests {
+    //! Drive the **shipped** stock-FPGA admission adapters
+    //! (`stock_fpga_work_dispatch_inputs`, `stock_fpga_watchdog_safety_state`,
+    //! `stock_fpga_admit_standard_work_dispatch`, `stock_fpga_revoke_work_dispatch`)
+    //! through the real `WorkDispatchLifecycle` path — not a reimplementation.
+
+    use super::*;
+    use dcentrald_common::{power_precedes_fan_raise, SafetyStep, HOME_FAN_PWM_SAFETY_MAX};
+
+    fn green_heartbeats(chains: &[u8]) -> Vec<ControllerHeartbeatObservation> {
+        chains
+            .iter()
+            .map(|&id| ControllerHeartbeatObservation {
+                controller_id: id,
+                heartbeat_ok: true,
+                cycle_id: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stock_nonce2_beta_gate_is_explicit_and_fail_closed() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!stock_fpga_nonce2_beta_enabled_value(disabled));
+        }
+        for enabled in [Some("1"), Some("true"), Some("YES"), Some(" on ")] {
+            assert!(stock_fpga_nonce2_beta_enabled_value(enabled));
+        }
+    }
+
+    #[test]
+    fn stock_nonce2_beta_refusal_precedes_all_device_access() {
+        let src = include_str!("stock_mining.rs");
+        let run = &src[src.find("pub async fn run").expect("StockMiner::run")..];
+        let gate = run
+            .find("if !stock_fpga_nonce2_beta_enabled()")
+            .expect("stock beta gate");
+        let fpga_open = run.find("StockFpga::open()").expect("stock FPGA open");
+        assert!(
+            gate < fpga_open,
+            "unvalidated stock nonce2 correlation must be refused before opening hardware"
+        );
+    }
+
+    #[test]
+    fn stock_nonce2_beta_suppresses_every_uncorrelated_pool_submission() {
+        let src = include_str!("stock_mining.rs");
+        let nonce_path = &src[src
+            .find("let entry = match work_history.latest(work_id)")
+            .expect("stock nonce correlation path")..];
+        let suppression = nonce_path
+            .find("pool submission is suppressed for this experimental session")
+            .expect("explicit uncorrelated-share suppression");
+        let fail_closed_continue = nonce_path[suppression..]
+            .find("continue;")
+            .map(|offset| suppression + offset)
+            .expect("fail-closed continuation");
+        let compile_excluded_reference = nonce_path
+            .find("#[cfg(any())]")
+            .expect("compile-excluded future correlation reference");
+        let historical_send = nonce_path
+            .find("share_tx.send(share)")
+            .expect("future correlated submission reference");
+
+        assert!(
+            suppression < fail_closed_continue
+                && fail_closed_continue < compile_excluded_reference
+                && compile_excluded_reference < historical_send,
+            "every observed stock nonce must stop before the compile-excluded submission reference"
+        );
+    }
+
+    #[test]
+    fn stock_watchdog_state_maps_config_and_kicker_presence() {
+        assert_eq!(
+            stock_fpga_watchdog_safety_state(false, false),
+            WatchdogSafetyState::DisabledByConfiguration
+        );
+        assert_eq!(
+            stock_fpga_watchdog_safety_state(false, true),
+            WatchdogSafetyState::DisabledByConfiguration
+        );
+        assert_eq!(
+            stock_fpga_watchdog_safety_state(true, true),
+            WatchdogSafetyState::Armed
+        );
+        assert_eq!(
+            stock_fpga_watchdog_safety_state(true, false),
+            WatchdogSafetyState::Unavailable
+        );
+    }
+
+    #[test]
+    fn admit_before_work_dispatch_succeeds_when_pillars_green() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[5, 6, 7]);
+        let inputs = stock_fpga_work_dispatch_inputs(
+            stock_fpga_watchdog_safety_state(true, true),
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let (controller_count, cycle) = {
+            let receipt =
+                stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+            (receipt.controller_count, receipt.heartbeat_cycle_id)
+        };
+        assert!(life.is_admitted());
+        assert_eq!(controller_count, 3);
+        assert_eq!(cycle, Some(1));
+    }
+
+    #[test]
+    fn admit_refuses_failed_initial_pic_heartbeat() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = vec![
+            ControllerHeartbeatObservation {
+                controller_id: 6,
+                heartbeat_ok: true,
+                cycle_id: 1,
+            },
+            ControllerHeartbeatObservation {
+                controller_id: 7,
+                heartbeat_ok: false, // failed initial send_heartbeat
+                cycle_id: 1,
+            },
+        ];
+        let inputs = stock_fpga_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let err = stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::HeartbeatFailed {
+                controller_id: 7,
+                ..
+            }
+        ));
+        assert!(!life.is_admitted());
+    }
+
+    #[test]
+    fn admit_refuses_when_soc_watchdog_enabled_but_kicker_missing() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[6]);
+        let inputs = stock_fpga_work_dispatch_inputs(
+            stock_fpga_watchdog_safety_state(true, false),
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let err = stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::WatchdogNotAdmitted {
+                state: WatchdogSafetyState::Unavailable
+            }
+        ));
+    }
+
+    /// Mid-run PIC heartbeat failure must terminally revoke: cut hash before
+    /// noise, stop WDT feed, and block re-admit without full teardown.
+    #[test]
+    fn terminal_revoke_on_heartbeat_failure_blocks_re_admit_and_cuts_hash_first() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[6, 7]);
+        let inputs = stock_fpga_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+
+        let (action, stop_feed) = stock_fpga_revoke_work_dispatch(
+            &mut life,
+            DispatchRevocationCause::HeartbeatFailure,
+            100, // profile max — home cap must still bind
+        );
+        assert!(stop_feed, "heartbeat revoke must stop SoC WDT feed");
+        assert!(!life.is_admitted());
+        assert!(life.is_terminally_revoked());
+
+        let steps = action.steps();
+        assert!(
+            power_precedes_fan_raise(&steps),
+            "cut-hash-before-noise must hold on stock revoke"
+        );
+        match &steps[1] {
+            SafetyStep::CommandFans(fan) => {
+                assert!(fan.effective_pwm() <= HOME_FAN_PWM_SAFETY_MAX);
+            }
+            other => panic!("expected fan park second, got {other:?}"),
+        }
+
+        // Green sample after revoke must not re-admit the old generation.
+        let err = stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert_eq!(err, WorkDispatchSafetyError::TerminallyRevoked);
+    }
+
+    #[test]
+    fn operator_shutdown_revoke_also_stops_feed_and_parks_fans() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[5]);
+        let inputs = stock_fpga_work_dispatch_inputs(
+            WatchdogSafetyState::DisabledByConfiguration,
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        stock_fpga_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+        let (action, stop_feed) = stock_fpga_revoke_work_dispatch(
+            &mut life,
+            DispatchRevocationCause::OperatorSafeOff,
+            30,
+        );
+        assert!(stop_feed);
+        assert!(power_precedes_fan_raise(&action.steps()));
+        assert!(!life.is_admitted());
+    }
+
+    /// Structural pin: `StockMiner::run` must own the lifecycle and call the
+    /// shipped admit/revoke adapters — not reimplement the matrix inline.
+    #[test]
+    fn stock_run_owns_lifecycle_and_calls_shipped_admit_revoke_adapters() {
+        let src = include_str!("stock_mining.rs");
+        assert!(
+            src.contains("WorkDispatchLifecycle::new()"),
+            "StockMiner::run must own a WorkDispatchLifecycle"
+        );
+        assert!(
+            src.contains("stock_fpga_admit_standard_work_dispatch"),
+            "run must call the shipped admit adapter before DHASH work"
+        );
+        assert!(
+            src.contains("stock_fpga_revoke_work_dispatch"),
+            "run must call the shipped revoke adapter"
+        );
+        assert!(
+            src.contains("DispatchRevocationCause::HeartbeatFailure"),
+            "mid-run PIC HB failure must terminal-revoke via HeartbeatFailure"
+        );
+        assert!(
+            src.contains("DispatchRevocationCause::OperatorSafeOff"),
+            "operator shutdown must revoke via OperatorSafeOff"
+        );
+        assert!(
+            src.contains("if !dispatch_life.is_admitted()"),
+            "DMA dispatch tick must fail-closed when not admitted"
+        );
+    }
 }
 
 #[cfg(test)]

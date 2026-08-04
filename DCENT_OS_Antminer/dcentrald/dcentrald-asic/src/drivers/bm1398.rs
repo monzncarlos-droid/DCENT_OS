@@ -131,41 +131,34 @@ pub mod regs {
 
 /// Calculate BM1398 PLL0 register value for a target frequency.
 ///
-/// Identical to BM1397 PLL calculation:
-///   Bit 31:       LOCKED (read-only)
+/// **G19 pure SSOT** (`dcentrald_common::resolve_bm1398_pll`) — vendor four-divider
+/// search (NBP1901 + jig). **Not** BM1397-identical:
 ///   Bit 30:       PLLEN (must be 1)
-///   Bits [26:16]: FBDIV (11 bits)
-///   Bits [13:8]:  REFDIV (6 bits)
-///   Bits [6:4]:   POSTDIV1 (3 bits, raw, NOT -1)
-///   Bits [2:0]:   POSTDIV2 (3 bits, raw, NOT -1)
+///   Bits [27:16]: FBDIV (**12 bits**, not BM1397 11-bit)
+///   Bits [13:8]:  REFDIV
+///   Bits [6:4]/[2:0]: POSTDIV1/2 raw (no −1)
+/// Envelope: FBDIV 16..=250, refdiv order 2→1, VCO 2000..=3200 (refdiv1 max 3125).
 ///
 /// Returns (reg_value, actual_freq_mhz, fb_div, ref_div, postdiv1, postdiv2).
 fn bm1398_pll_calc(target_mhz: u16) -> (u32, u16, u16, u8, u8, u8) {
-    let target_mhz = target_mhz.clamp(50, 900);
-    let solution = dcentrald_api_types::bm1398_protocol::resolve_bm1398_pll(target_mhz)
-        .expect("built-in BM1398 PLL search envelope must resolve mining frequencies");
-    let dividers = solution.dividers;
-    let actual_millimhz = dividers
-        .output_millimhz(dcentrald_api_types::bm1398_protocol::BM1398_PLL_SEARCH_SPEC.reference_mhz)
-        .expect("resolved BM1398 dividers are non-zero");
+    // G19 R2: nearest pure-admitted discrete only (no invent-525 outside envelope).
+    let (sol, div) = dcentrald_common::resolve_bm1398_pll_nearest_admitted(target_mhz)
+        .expect("BM1398 discrete list always contains admitted mining freqs");
     (
-        solution.register_value,
-        ((actual_millimhz + 500) / 1_000) as u16,
-        dividers.fbdiv,
-        dividers.refdiv,
-        dividers.postdiv1,
-        dividers.postdiv2,
+        sol.register_value,
+        sol.actual_freq_mhz,
+        div.fb_div,
+        div.ref_div,
+        div.post_div1,
+        div.post_div2,
     )
 }
 
 /// Get the sorted list of discrete PLL frequencies the BM1398 can generate (MHz).
 ///
-/// Extended range compared to BM1397: S19 operates at 675 MHz default (vs ~500 on S17).
+/// Pure SSOT: `dcentrald_common::bm1398_pll_frequencies` (G19).
 pub fn pll_frequencies() -> &'static [u16] {
-    &[
-        50, 100, 150, 200, 250, 300, 350, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650,
-        675, 700, 750, 800,
-    ]
+    dcentrald_common::bm1398_pll_frequencies()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +196,78 @@ fn fifo_bm1398_set_address(addr: u8) -> u32 {
 /// Encode a single-chip Read Register command for BM1398 CMD_TX_FIFO.
 fn fifo_bm1398_read_reg_single(chip_addr: u8, reg: u8) -> u32 {
     bm139x::fifo_read_reg_single(chip_addr, reg)
+}
+
+/// Execute pure BM139x frequency program (broadcast) — G11 twin of G5 BM1397.
+///
+/// Cadence: `plan_bm1397_frequency_program_ops` — Divider 0x70 prelude ×2 then
+/// PLL0 Parameter ×2 with 10 ms spacing. BM1398 open-coded Step 9 matched this
+/// byte-for-byte; pure SSOT owns the sequence (no local PLL0_DIV_PRECONFIG).
+fn execute_bm1398_frequency_program_broadcast(chain: &mut FpgaChain, pll_reg: u32) {
+    use dcentrald_common::{plan_bm1397_frequency_program_ops, TransportOp};
+    for op in plan_bm1397_frequency_program_ops(pll_reg) {
+        match op {
+            TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                let (w0, w1) = fifo_bm1398_write_reg_bcast(reg, value);
+                chain.write_cmd(w0);
+                chain.write_cmd(w1);
+            }
+            TransportOp::DelayMs { ms } => {
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Execute pure BM139x frequency program (single chip) — G11 twin of G5.
+fn execute_bm1398_frequency_program_chip(chain: &mut FpgaChain, chip_addr: u8, pll_reg: u32) {
+    use dcentrald_common::{plan_bm1397_frequency_program_ops_chip, TransportOp};
+    for op in plan_bm1397_frequency_program_ops_chip(chip_addr, pll_reg) {
+        match op {
+            TransportOp::SendWriteRegBm1397Plus {
+                chip_addr: addr,
+                reg,
+                value,
+            } => {
+                let (w0, w1) = fifo_bm1398_write_reg_single(addr, reg, value);
+                chain.write_cmd(w0);
+                chain.write_cmd(w1);
+            }
+            TransportOp::DelayMs { ms } => {
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Execute pure PLL0-only verify-retry rewrite (G10 twin of G9 BM1397 policy).
+///
+/// Reuses `plan_bm1397_pll0_verify_retry_rewrite` — BM1398 shares PLL0 Parameter
+/// @0x08 layout and the same shipped init rewrite cadence (single bcast + 20 ms,
+/// not full 0x70 program). Name retains G9 pure SSOT identity intentionally.
+fn execute_bm1398_pll0_verify_retry_rewrite(chain: &mut FpgaChain, pll_reg: u32) {
+    use dcentrald_common::{plan_bm1397_pll0_verify_retry_rewrite, TransportOp};
+    for op in plan_bm1397_pll0_verify_retry_rewrite(pll_reg) {
+        match op {
+            TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                let (w0, w1) = fifo_bm1398_write_reg_bcast(reg, value);
+                chain.write_cmd(w0);
+                chain.write_cmd(w1);
+            }
+            TransportOp::DelayMs { ms } => {
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// BM1398 driver implementation.
@@ -257,8 +322,8 @@ impl Bm1398Driver {
     }
 
     fn pll_register_to_freq(raw_reg: u32) -> Option<u16> {
-        const PLL_LOCK_BIT: u32 = 0x8000_0000;
-        let masked = raw_reg & !PLL_LOCK_BIT;
+        // Lock bit is status-only; pure G9 SSOT owns the mask (G10 BM1398 twin).
+        let masked = raw_reg & !dcentrald_common::BM1397_PLL0_LOCK_BIT;
         MinerProfile::pll_frequencies_for_chip(CHIP_ID)
             .iter()
             .copied()
@@ -476,60 +541,56 @@ impl ChipDriver for Bm1398Driver {
         chain.write_cmd(w1);
         tracing::debug!("MiscControl = 0x00007A31 (BT8D=26, 115740 baud)");
 
-        // --- Step 9: Frequency ramp via PLL0 ---
-        // BM1398 requires PLL0 Divider pre-configuration before PLL0 Parameter change.
-        // PLL0 Divider (0x70) = 0x0F0F0F00 sets all PLLDIV to max to prevent glitches.
-        // Both PLL0 Divider and PLL0 Parameter are sent TWICE with 10ms delays.
-
-        // Step 9a: Pre-configure PLL0 Divider (send twice).
-        const PLL0_DIV_PRECONFIG: u32 = 0x0F0F_0F00;
-        for attempt in 0..2u8 {
-            let (w0, w1) = fifo_bm1398_write_reg_bcast(regs::PLL0_DIVIDER, PLL0_DIV_PRECONFIG);
-            chain.write_cmd(w0);
-            chain.write_cmd(w1);
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if attempt == 0 {
-                tracing::debug!("PLL0 Divider pre-config = 0x0F0F0F00 (glitch protection, 1/2)");
-            }
-        }
-
-        // Step 9b: Set PLL0 Parameter (send twice).
+        // --- Step 9: Frequency via pure BM139x program plan (G11 twin of G5) ---
+        // Pure SSOT: Divider 0x70 prelude ×2 + PLL0 Parameter ×2 (10 ms spacing).
+        // Matches prior open-coded BM1398 Step 9a/9b; no local PLL0_DIV_PRECONFIG.
         let pll = self.pll_params(freq_mhz);
-        for attempt in 0..2u8 {
-            let (w0, w1) = fifo_bm1398_write_reg_bcast(regs::PLL0_PARAMETER, pll.reg_value);
-            chain.write_cmd(w0);
-            chain.write_cmd(w1);
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if attempt == 0 {
-                tracing::info!(
-                    pll_reg = format_args!("0x{:08X}", pll.reg_value),
-                    freq_mhz = freq_mhz,
-                    fb_div = pll.fb_div,
-                    ref_div = pll.ref_div,
-                    post_div1 = pll.post_div1,
-                    post_div2 = pll.post_div2,
-                    "PLL0 write (1/2) -- all chips switching to {} MHz",
-                    freq_mhz,
-                );
-            }
-        }
+        tracing::info!(
+            pll_reg = format_args!("0x{:08X}", pll.reg_value),
+            freq_mhz = freq_mhz,
+            fb_div = pll.fb_div,
+            ref_div = pll.ref_div,
+            post_div1 = pll.post_div1,
+            post_div2 = pll.post_div2,
+            "PLL0 pure program plan -- all chips switching to {} MHz",
+            freq_mhz,
+        );
+        execute_bm1398_frequency_program_broadcast(chain, pll.reg_value);
 
         // Wait for PLL to lock (~10ms typical, 20ms to be safe).
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        // PLL readback verification: read PLL0 from chip 0 to confirm lock.
-        const PLL_LOCK_BIT: u32 = 0x8000_0000;
-        for pll_retry in 0..3u8 {
+        // PLL readback verification (G10 twin of G9 pure SSOT): same lock-mask
+        // match, ≤3 attempts, PLL0-only rewrite+20ms as BM1397 init. BM1398
+        // shares PLL0 Parameter @0x08 layout — reuse G9 helpers (no invented
+        // BM1398-only cadence).
+        use dcentrald_common::{
+            bm1397_pll0_lock_bit_set, bm1397_pll0_readback_matches,
+            bm1397_pll0_verify_rewrite_admitted, plan_bm1397_pll0_verify_read, TransportOp,
+            BM1397_PLL0_VERIFY_MAX_ATTEMPTS,
+        };
+        for pll_retry in 0..BM1397_PLL0_VERIFY_MAX_ATTEMPTS {
+            // Drain stale CMD RX (engine residual — not pure plan).
             while chain.cmd_rx_has_data() {
                 let _ = chain.read_cmd_response();
             }
-            let pll_read_cmd = fifo_bm1398_read_reg_single(0x00, regs::PLL0_PARAMETER);
-            chain.write_cmd(pll_read_cmd);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            for op in plan_bm1397_pll0_verify_read(0x00) {
+                match op {
+                    TransportOp::SendReadRegBm1397Plus { chip_addr, reg } => {
+                        let pll_read_cmd = fifo_bm1398_read_reg_single(chip_addr, reg);
+                        chain.write_cmd(pll_read_cmd);
+                    }
+                    TransportOp::DelayMs { ms } => {
+                        if ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             let pll_readback = if chain.cmd_rx_has_data() {
-                // Use the transport-aware accessor: on hardware this reads the
-                // same UIO FIFO; sim-hal drains its virtual response queue.
+                // Transport-aware accessor: hardware UIO FIFO; sim-hal virtual queue.
                 let r0 = chain.read_cmd_response().unwrap_or_default();
                 let _r1 = chain.read_cmd_response();
                 let bytes = unpack_lsb_first(r0);
@@ -539,8 +600,8 @@ impl ChipDriver for Bm1398Driver {
             };
 
             match pll_readback {
-                Some(val) if (val & !PLL_LOCK_BIT) == pll.reg_value => {
-                    let locked = val & PLL_LOCK_BIT != 0;
+                Some(val) if bm1397_pll0_readback_matches(pll.reg_value, val) => {
+                    let locked = bm1397_pll0_lock_bit_set(val);
                     tracing::info!(
                         chain_id = chain.chain_id,
                         readback = format_args!("0x{:08X}", val),
@@ -557,29 +618,23 @@ impl ChipDriver for Bm1398Driver {
                         chain_id = chain.chain_id,
                         expected = format_args!("0x{:08X}", pll.reg_value),
                         got = format_args!("0x{:08X}", val),
-                        "PLL0 readback MISMATCH (attempt {}/3)",
+                        "PLL0 readback MISMATCH (attempt {}/{})",
                         pll_retry + 1,
+                        BM1397_PLL0_VERIFY_MAX_ATTEMPTS,
                     );
-                    if pll_retry < 2 {
-                        let (w0, w1) =
-                            fifo_bm1398_write_reg_bcast(regs::PLL0_PARAMETER, pll.reg_value);
-                        chain.write_cmd(w0);
-                        chain.write_cmd(w1);
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    if bm1397_pll0_verify_rewrite_admitted(pll_retry) {
+                        execute_bm1398_pll0_verify_retry_rewrite(chain, pll.reg_value);
                     }
                 }
                 None => {
                     tracing::warn!(
                         chain_id = chain.chain_id,
-                        "PLL0 readback TIMEOUT -- chip 0 did not respond (attempt {}/3)",
+                        "PLL0 readback TIMEOUT -- chip 0 did not respond (attempt {}/{})",
                         pll_retry + 1,
+                        BM1397_PLL0_VERIFY_MAX_ATTEMPTS,
                     );
-                    if pll_retry < 2 {
-                        let (w0, w1) =
-                            fifo_bm1398_write_reg_bcast(regs::PLL0_PARAMETER, pll.reg_value);
-                        chain.write_cmd(w0);
-                        chain.write_cmd(w1);
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    if bm1397_pll0_verify_rewrite_admitted(pll_retry) {
+                        execute_bm1398_pll0_verify_retry_rewrite(chain, pll.reg_value);
                     }
                 }
             }
@@ -715,39 +770,11 @@ impl ChipDriver for Bm1398Driver {
             "BM1398: Setting frequency"
         );
 
-        // BM1398 requires PLL0 Divider pre-configuration before PLL0 change.
-        const PLL0_DIV_PRECONFIG: u32 = 0x0F0F_0F00;
-
+        // Pure cadence SSOT (G11): Divider 0x70 ×2 then PLL0 Parameter ×2 (10 ms).
         if chip_addr == 0xFF {
-            // Broadcast
-            for _ in 0..2 {
-                let (w0, w1) = fifo_bm1398_write_reg_bcast(regs::PLL0_DIVIDER, PLL0_DIV_PRECONFIG);
-                chain.write_cmd(w0);
-                chain.write_cmd(w1);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            for _ in 0..2 {
-                let (w0, w1) = fifo_bm1398_write_reg_bcast(regs::PLL0_PARAMETER, pll.reg_value);
-                chain.write_cmd(w0);
-                chain.write_cmd(w1);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            execute_bm1398_frequency_program_broadcast(chain, pll.reg_value);
         } else {
-            // Single chip
-            for _ in 0..2 {
-                let (w0, w1) =
-                    fifo_bm1398_write_reg_single(chip_addr, regs::PLL0_DIVIDER, PLL0_DIV_PRECONFIG);
-                chain.write_cmd(w0);
-                chain.write_cmd(w1);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            for _ in 0..2 {
-                let (w0, w1) =
-                    fifo_bm1398_write_reg_single(chip_addr, regs::PLL0_PARAMETER, pll.reg_value);
-                chain.write_cmd(w0);
-                chain.write_cmd(w1);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            execute_bm1398_frequency_program_chip(chain, chip_addr, pll.reg_value);
         }
 
         // Wait for PLL to lock (~20ms).
@@ -811,9 +838,14 @@ impl ChipDriver for Bm1398Driver {
     }
 
     fn set_voltage(&self, pic: &mut PicController, voltage_mv: u16) -> Result<()> {
-        let pic_value = PicController::voltage_to_pic(voltage_mv as f64 / 1000.0);
-        pic.set_voltage(pic_value)?;
-        Ok(())
+        // P1-2: BM1398 ownership is HashboardDspic — ChipDriver path refused.
+        let addr = pic.address();
+        crate::voltage_rail_adapters::chip_driver_set_voltage_via_pic16_rail(
+            dcentrald_common::AsicProtocolIdentity::Bm1398,
+            pic,
+            voltage_mv,
+        )
+        .map_err(|e| crate::voltage_rail_adapters::voltage_rail_error_as_asic(e, addr))
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -983,8 +1015,12 @@ impl ChipDriver for Bm1398Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BM1398 uses simple (difficulty - 1) as ticket mask (same as BM1397).
-        difficulty.saturating_sub(1)
+        // G24 pure SSOT: BM1398 protocol bit-swap table ≡ BitReversed
+        // (diff 256 still 0xFF — invariant). Matches api-types bm1398_ticket_mask_value.
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::BitReversed,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

@@ -32,7 +32,7 @@ use dcentrald_asic::drivers::bm1387::Bm1387Driver;
 use dcentrald_asic::drivers::bm1397::Bm1397Driver;
 use dcentrald_asic::drivers::bm1398::Bm1398Driver;
 use dcentrald_asic::drivers::{
-    ChipDriverExecutionPolicy, ChipRegistry, FpgaNonceDecodeContext, MinerProfile,
+    ChipDriverAdmission, ChipRegistry, FpgaNonceDecodeContext, MinerProfile,
     MiningWork as AsicWork, PicType,
 };
 use dcentrald_autotuner::chip_stats::{
@@ -43,12 +43,16 @@ use dcentrald_autotuner::power_budget::PowerModel;
 use dcentrald_autotuner::power_budget::RuntimeWattCapState;
 use dcentrald_autotuner::power_budget::{efficiency_jth_from, EfficiencyHashrateEma};
 use dcentrald_autotuner::{FreqCommand, FrequencyLimitSource, LivePowerEstimate, PowerCalibration};
+use dcentrald_common::{bm1397plus_addr_interval, SerialMiningEngineBookkeeping};
 use dcentrald_hal::led::LedCommand;
 use dcentrald_stratum::share_pipeline::WorkBuilder;
 use dcentrald_stratum::types::{JobTemplate, ValidShare};
 
-use crate::asic_identity_publication::{ActiveCompositionSession, AsicIdentityPublicationPort};
+use crate::asic_identity_publication::{
+    ActiveCompositionSession, MeasuredDispatcherExecutionAdmission,
+};
 use crate::runtime::task_guard::RuntimeTaskGuard;
+use crate::runtime_execution::RuntimeExecutionCommitPort;
 use crate::voltage_mailbox::{VoltageCommandSender, VoltageTrySendError};
 use crate::work_ledger::{ChainWorkLedger, LedgerLookup};
 
@@ -86,7 +90,7 @@ impl DispatchWriteChip {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatchWriteIdentityError {
+pub(crate) enum DispatchWriteIdentityError {
     Missing,
     Unsupported(u16),
     Mixed {
@@ -113,6 +117,8 @@ impl std::fmt::Display for DispatchWriteIdentityError {
     }
 }
 
+impl std::error::Error for DispatchWriteIdentityError {}
+
 impl TryFrom<u16> for DispatchWriteChip {
     type Error = DispatchWriteIdentityError;
 
@@ -134,6 +140,8 @@ impl TryFrom<u16> for DispatchWriteChip {
 /// Work tracking entry for matching nonces back to jobs.
 #[derive(Clone)]
 struct WorkEntry {
+    /// Exact V1 subscription/job generation that allocated this work.
+    work_generation: dcentrald_stratum::WorkGeneration,
     /// Job ID from the pool (for share submission).
     job_id: String,
     /// Extranonce2 used for this work unit (hex string).
@@ -168,7 +176,12 @@ struct WorkEntry {
 pub enum VoltageCommandReply {
     Applied(u16),
     Verified(Option<u16>),
-    Disabled,
+    /// Physical controller command timing captured by the worker that executes
+    /// the I/O, rather than by the async caller that merely queues it.
+    Disabled {
+        operation_started_at: std::time::Instant,
+        operation_completed_at: std::time::Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -470,9 +483,13 @@ pub struct WorkDispatcher {
     chains: Vec<Chain>,
     /// Detected chip ID (e.g., 0x1387 for BM1387).
     chip_id: u16,
-    /// Immutable executable-driver authority inherited from the sealed startup
-    /// composition. The dispatcher must not reconstruct a broader policy.
-    driver_execution_policy: ChipDriverExecutionPolicy,
+    /// Shared work-dispatch admission publication (daemon lifecycle / PIC HB /
+    /// thermal revoke → this hot loop). Fail-closed: no work commit without
+    /// a live green publication for this generation.
+    work_dispatch_admission: std::sync::Arc<dcentrald_common::WorkDispatchAdmissionPublication>,
+    /// Move-only executable-driver authority inherited from the measured
+    /// composition. `run()` consumes it into one exact non-reminting registry.
+    driver_admission: Option<ChipDriverAdmission>,
     /// Hardware difficulty (TicketMask + 1). Default 256 for BM1387.
     hw_difficulty: u64,
     /// Channel to send per-chip stats snapshots to the autotuner.
@@ -540,9 +557,11 @@ pub struct WorkDispatcher {
     /// stale up-front, fewer wasted hash recomputes against aliased
     /// midstates). Set to 1 to revert to legacy behavior.
     stale_age_divisor: u32,
-    /// One-shot, generation-bound authority to publish measured ASIC identity
-    /// after dispatcher/all-chain consensus is proven.
-    asic_identity_publication: Option<AsicIdentityPublicationPort>,
+    /// Already-published generation lease fused to the move-only driver
+    /// admission before this dispatcher can be constructed.
+    identity_composition_session: ActiveCompositionSession,
+    /// Exact measured-generation port for final mining hardware commits.
+    runtime_execution_commit_port: RuntimeExecutionCommitPort,
 }
 
 impl WorkDispatcher {
@@ -577,7 +596,7 @@ impl WorkDispatcher {
     ///
     /// `hw_difficulty` must match the TicketMask written during init.
     /// BM1387 default is 256 (TicketMask = 0xFF).
-    pub fn new(
+    pub(crate) fn new(
         job_rx: mpsc::Receiver<JobTemplate>,
         share_tx: mpsc::Sender<ValidShare>,
         state_tx: watch::Sender<dcentrald_api::MinerState>,
@@ -585,8 +604,8 @@ impl WorkDispatcher {
         shutdown: CancellationToken,
         worker_name: String,
         chains: Vec<Chain>,
-        chip_id: u16,
-        driver_execution_policy: ChipDriverExecutionPolicy,
+        execution_admission: MeasuredDispatcherExecutionAdmission,
+        work_dispatch_admission: std::sync::Arc<dcentrald_common::WorkDispatchAdmissionPublication>,
         hw_difficulty: u64,
         autotune_stats_tx: Option<mpsc::Sender<ChipStatsSnapshot>>,
         freq_cmd_rx: Option<mpsc::Receiver<FreqCommand>>,
@@ -603,7 +622,18 @@ impl WorkDispatcher {
         power_calibration: Arc<std::sync::RwLock<PowerCalibration>>,
         curtailment_sleeping: Arc<AtomicBool>,
         skip_board_temp: bool,
-    ) -> Self {
+    ) -> std::result::Result<Self, DispatchWriteIdentityError> {
+        let chip_id = execution_admission.chip_id();
+        Self::normalize_dispatch_write_identity(
+            chip_id,
+            chains
+                .iter()
+                .filter(|chain| chain.mining)
+                .map(|chain| chain.chip_id),
+        )?;
+        let (driver_admission, identity_composition_session, runtime_execution_commit_port) =
+            execution_admission.into_parts();
+
         // Initialize per-chip frequency tracking from chain config values.
         // Each chain's chips start at the configured frequency_mhz.
         let chip_frequencies: Vec<Vec<u16>> = chains
@@ -618,7 +648,7 @@ impl WorkDispatcher {
             .collect();
 
         let worker_name: Arc<str> = worker_name.into();
-        Self {
+        Ok(Self {
             job_rx,
             share_tx,
             state_tx,
@@ -627,7 +657,8 @@ impl WorkDispatcher {
             worker_name,
             chains,
             chip_id,
-            driver_execution_policy,
+            work_dispatch_admission,
+            driver_admission: Some(driver_admission),
             hw_difficulty,
             autotune_stats_tx,
             freq_cmd_rx,
@@ -656,15 +687,9 @@ impl WorkDispatcher {
             // from `MiningConfig::stale_age_divisor` (default 4 from
             // `default_stale_age_divisor()`).
             stale_age_divisor: 1,
-            asic_identity_publication: None,
-        }
-    }
-
-    pub(crate) fn set_asic_identity_publication_port(
-        &mut self,
-        port: Option<AsicIdentityPublicationPort>,
-    ) {
-        self.asic_identity_publication = port;
+            identity_composition_session,
+            runtime_execution_commit_port,
+        })
     }
 
     ///  W1 — install the stale-age divisor (from `MiningConfig`).
@@ -744,14 +769,9 @@ impl WorkDispatcher {
         &mut self,
         work_ledgers: &mut [ChainWorkLedger<Arc<WorkEntry>>],
         hashrate: &mut HashrateTracker,
-    ) {
+    ) -> std::result::Result<(), String> {
         work_ledgers.iter_mut().for_each(ChainWorkLedger::clear);
-        for chain in &mut self.chains {
-            if chain.mining {
-                chain.fpga.flush_work_tx();
-                chain.fpga.flush_work_rx();
-            }
-        }
+        let flush_result = self.flush_mining_fifos(true, "curtailment-sleep FPGA work FIFO flush");
         for temp in &self.board_temps {
             temp.store(0, Ordering::Release);
         }
@@ -759,16 +779,39 @@ impl WorkDispatcher {
             seen_at.store(0, Ordering::Release);
         }
         *hashrate = HashrateTracker::new(hashrate.chain_hashrate.len());
+        flush_result
     }
 
-    fn exit_curtailment_sleep(&mut self, hashrate: &mut HashrateTracker) {
-        for chain in &mut self.chains {
-            if chain.mining {
-                chain.fpga.flush_work_tx();
-                chain.fpga.flush_work_rx();
-            }
-        }
+    fn exit_curtailment_sleep(
+        &mut self,
+        hashrate: &mut HashrateTracker,
+    ) -> std::result::Result<(), String> {
+        let flush_result = self.flush_mining_fifos(true, "curtailment-wake FPGA work FIFO flush");
         *hashrate = HashrateTracker::new(hashrate.chain_hashrate.len());
+        flush_result
+    }
+
+    fn flush_mining_fifos(
+        &mut self,
+        flush_rx: bool,
+        operation: &'static str,
+    ) -> std::result::Result<(), String> {
+        let commit_port = self.runtime_execution_commit_port.clone();
+        for chain in &mut self.chains {
+            if !chain.mining {
+                continue;
+            }
+            commit_port
+                .commit(operation, || -> std::result::Result<(), String> {
+                    chain.fpga.flush_work_tx();
+                    if flush_rx {
+                        chain.fpga.flush_work_rx();
+                    }
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn publish_curtailment_sleep_snapshot(&self) {
@@ -1085,20 +1128,29 @@ impl WorkDispatcher {
     }
 
     fn recalc_work_time_for_chain(
+        commit_port: &RuntimeExecutionCommitPort,
         chain: &mut Chain,
         min_freq_mhz: u16,
-    ) -> std::result::Result<(), DispatchWriteIdentityError> {
-        let chip = DispatchWriteChip::try_from(chain.chip_id)?;
+    ) -> std::result::Result<(), String> {
+        let chip = DispatchWriteChip::try_from(chain.chip_id).map_err(|error| error.to_string())?;
         let work_time = Self::calculate_work_time_for_chip(
             chip,
             chain.chip_count,
             min_freq_mhz,
             chain.fpga_midstate_cnt,
         );
-        chain
-            .fpga
-            .common
-            .write_reg(dcentrald_hal::fpga_chain::REG_WORK_TIME, work_time);
+        commit_port
+            .commit(
+                "FPGA WORK_TIME register write",
+                || -> std::result::Result<(), String> {
+                    chain
+                        .fpga
+                        .common
+                        .write_reg(dcentrald_hal::fpga_chain::REG_WORK_TIME, work_time);
+                    Ok(())
+                },
+            )
+            .map_err(|error| error.to_string())?;
         info!(
             chain_id = chain.chain_id,
             min_freq_mhz,
@@ -1177,27 +1229,39 @@ impl WorkDispatcher {
 
         if all_same {
             let target = target_freqs[0];
-            if let Err(e) = drv.set_frequency(&mut self.chains[chain_idx].fpga, 0xFF, target) {
-                warn!(
-                    chain_id,
-                    target,
-                    reason,
-                    error = %e,
-                    "Failed to reapply broadcast frequency after ceiling update",
-                );
-                return Err(format!(
-                    "chain {} broadcast frequency apply failed during {}: {}",
-                    chain_id, reason, e
-                ));
-            }
-            let (verified_freq, issue) =
-                Self::verify_applied_frequency(drv, &mut self.chains[chain_idx], 0x00, target);
+            let frequency_commit_port = self.runtime_execution_commit_port.clone();
+            let (verified_freq, issue) = frequency_commit_port
+                .commit("broadcast ASIC PLL/frequency write", || {
+                    drv.set_frequency(&mut self.chains[chain_idx].fpga, 0xFF, target)
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>(Self::verify_applied_frequency(
+                        drv,
+                        &mut self.chains[chain_idx],
+                        0x00,
+                        target,
+                    ))
+                })
+                .map_err(|error| {
+                    warn!(
+                        chain_id,
+                        target,
+                        reason,
+                        error = %error,
+                        "Failed to reapply broadcast frequency after ceiling update",
+                    );
+                    format!(
+                        "chain {} broadcast frequency apply failed during {}: {}",
+                        chain_id, reason, error
+                    )
+                })?;
             applied_freqs.fill(verified_freq);
             verification_issue = issue;
             any_applied = true;
         } else {
+            // Pure full-population stride SSOT when count known (P1-3).
+            // Historical fallback 4 when chip count is still unknown.
             let addr_interval = if chain_chip_count > 0 {
-                256u16 / chain_chip_count as u16
+                u16::from(bm1397plus_addr_interval(chain_chip_count))
             } else {
                 4
             };
@@ -1208,27 +1272,33 @@ impl WorkDispatcher {
                     continue;
                 }
                 let chip_addr = (chip_idx as u16 * addr_interval) as u8;
-                if let Err(e) =
-                    drv.set_frequency(&mut self.chains[chain_idx].fpga, chip_addr, new_freq)
-                {
-                    warn!(
-                        chain_id,
-                        chip_index = chip_idx as u8,
-                        old_freq,
-                        new_freq,
-                        reason,
-                        error = %e,
-                        "Failed to reapply per-chip frequency after ceiling update",
-                    );
-                    partial_failure = true;
-                    break;
-                }
-                let (verified_freq, issue) = Self::verify_applied_frequency(
-                    drv,
-                    &mut self.chains[chain_idx],
-                    chip_addr,
-                    new_freq,
-                );
+                let frequency_commit_port = self.runtime_execution_commit_port.clone();
+                let (verified_freq, issue) =
+                    match frequency_commit_port.commit("per-chip ASIC PLL/frequency write", || {
+                        drv.set_frequency(&mut self.chains[chain_idx].fpga, chip_addr, new_freq)
+                            .map_err(|error| error.to_string())?;
+                        Ok::<_, String>(Self::verify_applied_frequency(
+                            drv,
+                            &mut self.chains[chain_idx],
+                            chip_addr,
+                            new_freq,
+                        ))
+                    }) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            warn!(
+                                chain_id,
+                                chip_index = chip_idx as u8,
+                                old_freq,
+                                new_freq,
+                                reason,
+                                error = %error,
+                                "Failed to reapply per-chip frequency after ceiling update",
+                            );
+                            partial_failure = true;
+                            break;
+                        }
+                    };
                 applied_freqs[chip_idx] = verified_freq;
                 if verification_issue.is_none() {
                     verification_issue = issue;
@@ -1254,9 +1324,10 @@ impl WorkDispatcher {
             .copied()
             .min()
             .unwrap_or(current_chain_freq);
+        let work_time_commit_port = self.runtime_execution_commit_port.clone();
         let chain = &mut self.chains[chain_idx];
         chain.frequency_mhz = new_chain_freq;
-        Self::recalc_work_time_for_chain(chain, min_freq)
+        Self::recalc_work_time_for_chain(&work_time_commit_port, chain, min_freq)
             .map_err(|error| format!("refusing {} work-time update: {}", reason, error))?;
         if partial_failure {
             warn!(
@@ -1347,12 +1418,7 @@ impl WorkDispatcher {
     }
 
     fn prepare_i2c_quiet_window(&mut self) -> std::result::Result<(), String> {
-        for chain in &mut self.chains {
-            if chain.mining {
-                chain.fpga.flush_work_tx();
-            }
-        }
-        Ok(())
+        self.flush_mining_fifos(false, "I2C quiet-window FPGA work TX flush")
     }
 
     fn verify_applied_frequency(
@@ -1431,46 +1497,25 @@ impl WorkDispatcher {
                     error = %error,
                     "ASIC dispatch identity is not authoritative; work and frequency writes remain disabled"
                 );
-                None
+                return;
             }
         };
 
-        // Look up the chip driver only after the typed write boundary accepts
-        // the identity. Unknown/missing/mixed identities stay monitoring-only.
-        let registry = ChipRegistry::with_execution_policy(self.driver_execution_policy);
+        // The constructor can be reached only after measured publication has
+        // succeeded for this exact generation. Consume the fused driver proof
+        // only now, immediately before resolving the executable driver.
+        let Some(driver_admission) = self.driver_admission.take() else {
+            error!("Move-only dispatcher driver admission is missing; refusing all ASIC execution");
+            return;
+        };
+        let registry = ChipRegistry::from_admission(driver_admission);
         let driver = dispatch_chip.and_then(|chip| registry.detect(chip.chip_id()));
-
-        let mut identity_composition_session: Option<ActiveCompositionSession> = None;
-        if let Some(publication) = self.asic_identity_publication.take() {
-            if dispatch_chip.is_some() && driver.is_some() {
-                match publication.publish(self.chip_id) {
-                    Ok(session) => identity_composition_session = Some(session),
-                    Err(error) => {
-                        error!(
-                            error = %error,
-                            "Dispatcher ASIC consensus did not publish measured hardware identity"
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    "Dispatcher identity is missing, mixed, or unsupported; measured hardware identity remains unpublished"
-                );
-            }
-        }
-
         if driver.is_none() {
-            if self.chip_id != 0 {
-                error!(
-                    chip_id = format_args!("0x{:04X}", self.chip_id),
-                    "No chip driver found for ChipID 0x{:04X} — cannot generate ASIC work for unknown chip type",
-                    self.chip_id,
-                );
-            }
-            info!(
-                "No ASIC chips active — work dispatcher will accept pool jobs but won't dispatch to hardware. \
-                 Pool connection stays alive for monitoring and API. Plug in hash boards + PSU to start mining."
+            error!(
+                chip_id = format_args!("0x{:04X}", self.chip_id),
+                "Measured dispatcher admission did not resolve its exact driver; refusing all ASIC execution"
             );
+            return;
         }
 
         let num_chains = self.chains.iter().filter(|c| c.mining).count();
@@ -1509,13 +1554,13 @@ impl WorkDispatcher {
                     .expect("admitted work ID domain must be a nonzero power of two")
             })
             .collect::<Vec<ChainWorkLedger<Arc<WorkEntry>>>>();
-        let mut next_dispatch_serial: u64 = 0;
         let mut hashrate = HashrateTracker::new(num_chains);
 
-        // Nonce dedup set — local variable (dispatcher is single-threaded, no Mutex needed).
+        // P1-1 pure SerialMiningEngineBookkeeping façade (generation-keyed path).
         // Key: (generation, nonce, midstate_idx). Generation-based eviction avoids
-        // wholesale clear() which could allow duplicate submissions.
-        let mut seen: std::collections::HashSet<(u64, u32, u8)> = std::collections::HashSet::new();
+        // wholesale clear() which could allow duplicate submissions. Work IDs stay
+        // ledger-owned; only take_generation / admit_share / dispatch_generation.
+        let mut bookkeeping = SerialMiningEngineBookkeeping::work_dispatcher();
 
         // Round-robin index for board temp reads — only read ONE chain per 5s tick
         // to reduce I2C bus time from ~300-600ms to ~100-200ms per tick.
@@ -1705,11 +1750,11 @@ impl WorkDispatcher {
                         // clean_jobs means the previous block is dead; leaving stale work
                         // queued in TX keeps ASICs hashing the old block for extra seconds,
                         // and leaving stale nonces in RX can misattribute submissions.
-                        for chain in &mut self.chains {
-                            if chain.mining {
-                                chain.fpga.flush_work_tx();
-                                chain.fpga.flush_work_rx();
-                            }
+                        if let Err(error) = self.flush_mining_fifos(
+                            true,
+                            "clean-job FPGA work FIFO flush",
+                        ) {
+                            warn!(error = %error, "Clean-job FIFO flush refused");
                         }
                         // Flash both LEDs on new block from pool — visual "new block!" indicator
                         if let Some(ref led) = self.led_tx {
@@ -1801,11 +1846,11 @@ impl WorkDispatcher {
                         }
                         current_job = None;
                         work_ledgers.iter_mut().for_each(ChainWorkLedger::clear);
-                        for chain in &mut self.chains {
-                            if chain.mining {
-                                chain.fpga.flush_work_tx();
-                                chain.fpga.flush_work_rx();
-                            }
+                        if let Err(error) = self.flush_mining_fifos(
+                            true,
+                            "BM1387 incompatible-job FPGA work FIFO flush",
+                        ) {
+                            warn!(error = %error, "BM1387 incompatible-job FIFO flush refused");
                         }
                         self.emit_sync_event(
                             dcentrald_api::websocket::WsMiningSyncEventKind::CleanJob,
@@ -1896,17 +1941,31 @@ impl WorkDispatcher {
                 // Critical insight: at 100ms dispatch (old code), the FPGA was idle
                 // 96% of the time — the #1 cause of ~100x low hashrate.
                 _ = dispatch_timer.tick() => {
+                    // Fail-closed mid-run gate (Runtime NO-SHIP residual): never
+                    // commit FPGA WORK_TX without a live shared admission for
+                    // this generation. Stock/serial/hybrid use local
+                    // `if !dispatch_life.is_admitted()`; daemon WorkDispatcher
+                    // is a separate task, so it consumes the shared publication.
+                    if !self.work_dispatch_admission.allow_work_commit() {
+                        continue;
+                    }
                     let sleeping_now = self.curtailment_sleeping.load(Ordering::Acquire);
                     if sleeping_now {
                         if !dispatcher_sleeping {
                             info!("Curtailment sleep active — pausing work dispatch and flushing FPGA FIFOs");
-                            self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate);
+                            if let Err(error) =
+                                self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate)
+                            {
+                                warn!(error = %error, "Curtailment-sleep FIFO flush refused");
+                            }
                             dispatcher_sleeping = true;
                         }
                         continue;
                     } else if dispatcher_sleeping {
                         info!("Curtailment wake complete — resuming work dispatch");
-                        self.exit_curtailment_sleep(&mut hashrate);
+                        if let Err(error) = self.exit_curtailment_sleep(&mut hashrate) {
+                            warn!(error = %error, "Curtailment-wake FIFO flush refused");
+                        }
                         dispatcher_sleeping = false;
                     }
 
@@ -1949,7 +2008,9 @@ impl WorkDispatcher {
                         };
                         let first_chain = &self.chains[first_chain_idx];
                         let first_dispatch_at = Instant::now();
-                        let pending_first_serial = next_dispatch_serial;
+                        // Peek generation for the ledger row; advance only after
+                        // reserve succeeds so a full-slots stall does not burn serials.
+                        let pending_first_serial = bookkeeping.dispatch_generation();
                         let Some(pending_first_reservation) = work_ledgers[first_chain_idx].reserve(
                             pending_first_serial,
                             first_dispatch_at,
@@ -1962,13 +2023,21 @@ impl WorkDispatcher {
                             );
                             continue;
                         };
-                        next_dispatch_serial = next_dispatch_serial.wrapping_add(1);
+                        let advanced = bookkeeping.take_generation();
+                        debug_assert_eq!(advanced, pending_first_serial);
                         let pending_first_wid = pending_first_reservation.work_id();
                         let mut pending_first_reservation = Some(pending_first_reservation);
                         let first_chain_ms_cnt = first_chain.fpga_midstate_cnt;
                         let first_chain_chip_id = first_chain.chip_id;
                         work_builder.set_version_mask(Self::effective_version_mask(first_chain_chip_id, job.version_mask));
-                        let stratum_work = work_builder.next_work(job);
+                        let stratum_work = match work_builder.next_work(job) {
+                            Ok(work) => work,
+                            Err(error) => {
+                                warn!(%error, "V1 work domain unavailable; pausing dispatch until the Stratum client installs a fresh generation");
+                                current_job = None;
+                                continue;
+                            }
+                        };
                         let asic_work = AsicWork {
                             work_id: pending_first_wid,
                             fpga_midstate_cnt: first_chain_ms_cnt,
@@ -2006,11 +2075,9 @@ impl WorkDispatcher {
                             );
 
                             // Reconstruct the full 80-byte block header for verification.
-                            let mut full_header = [0u8; 80];
-                            full_header[0..4].copy_from_slice(&stratum_work.version.to_le_bytes());
+                            // G22: field packing via stratum pure SSOT (nonce=0 for 76-byte diag log).
                             let mut diag_prev_hash = job.prev_block_hash;
                             dcentrald_stratum::work::reverse_endianness_per_word_pub(&mut diag_prev_hash);
-                            full_header[4..36].copy_from_slice(&diag_prev_hash);
                             // Reconstruct coinbase and merkle root
                             let diag_en2_bytes = decode_hex_bytes(&stratum_work.extranonce2);
                             let mut diag_coinbase = Vec::new();
@@ -2026,9 +2093,14 @@ impl WorkDispatcher {
                                 combined[32..64].copy_from_slice(branch);
                                 diag_merkle = dcentrald_stratum::work::double_sha256(&combined);
                             }
-                            full_header[36..68].copy_from_slice(&diag_merkle);
-                            full_header[68..72].copy_from_slice(&stratum_work.ntime.to_le_bytes());
-                            full_header[72..76].copy_from_slice(&stratum_work.nbits.to_le_bytes());
+                            let full_header = dcentrald_stratum::v1::job::build_block_header(
+                                stratum_work.version,
+                                &diag_prev_hash,
+                                &diag_merkle,
+                                stratum_work.ntime,
+                                stratum_work.nbits,
+                                0,
+                            );
 
                             info!(
                                 coinbase_len = diag_coinbase.len(),
@@ -2060,6 +2132,7 @@ impl WorkDispatcher {
                         // Commit only after send_work() succeeds. If send_work fails, the
                         // slot would point to work that never reached hardware.
                         let pending_first_entry = Arc::new(WorkEntry {
+                            work_generation: stratum_work.work_generation,
                             job_id: stratum_work.job_id.clone(),
                             extranonce2: stratum_work.extranonce2.clone(),
                             ntime: stratum_work.ntime,
@@ -2080,6 +2153,7 @@ impl WorkDispatcher {
                         // wasting 2/3 of hashrate on duplicate nonce searching (66% reject rate).
                         // First chain uses work generated above. Subsequent chains get fresh work.
                         let mut first_chain_done = false;
+                        let work_commit_port = self.runtime_execution_commit_port.clone();
                         for (chain_idx, chain) in self.chains.iter_mut().enumerate() {
                             if !chain.mining {
                                 continue;
@@ -2097,7 +2171,7 @@ impl WorkDispatcher {
                             // Generate unique work for chains after the first
                             if first_chain_done {
                                 let dispatch_at = Instant::now();
-                                let pending_serial = next_dispatch_serial;
+                                let pending_serial = bookkeeping.dispatch_generation();
                                 let Some(pending_reservation) = work_ledgers[chain_idx].reserve(
                                     pending_serial,
                                     dispatch_at,
@@ -2111,10 +2185,18 @@ impl WorkDispatcher {
                                     );
                                     continue;
                                 };
-                                next_dispatch_serial = next_dispatch_serial.wrapping_add(1);
+                                let advanced = bookkeeping.take_generation();
+                                debug_assert_eq!(advanced, pending_serial);
                                 let pending_wid = pending_reservation.work_id();
                                 work_builder.set_version_mask(Self::effective_version_mask(chain.chip_id, job.version_mask));
-                                let sw = work_builder.next_work(job);
+                                let sw = match work_builder.next_work(job) {
+                                    Ok(work) => work,
+                                    Err(error) => {
+                                        warn!(%error, "V1 work domain unavailable while feeding sibling chain; pausing this job generation");
+                                        current_job = None;
+                                        break;
+                                    }
+                                };
                                 let aw = AsicWork {
                                     work_id: pending_wid,
                                     fpga_midstate_cnt: chain.fpga_midstate_cnt,
@@ -2142,6 +2224,7 @@ impl WorkDispatcher {
                                 // succeeds. If send_work fails, the slot would point to work
                                 // that never reached hardware — stale nonces could match it.
                                 let pending_entry = Arc::new(WorkEntry {
+                                    work_generation: sw.work_generation,
                                     job_id: sw.job_id.clone(),
                                     extranonce2: sw.extranonce2.clone(),
                                     ntime: sw.ntime,
@@ -2154,7 +2237,10 @@ impl WorkDispatcher {
                                     prev_block_hash: sw.prev_block_hash,
                                     header_tail: ht,
                                 });
-                                match drv.send_work(&mut chain.fpga, &aw) {
+                                match work_commit_port.commit(
+                                    "FPGA/ASIC work send",
+                                    || drv.send_work(&mut chain.fpga, &aw),
+                                ) {
                                     Ok(_) => {
                                         work_ledgers[chain_idx]
                                             .commit(pending_reservation, pending_entry)
@@ -2173,7 +2259,10 @@ impl WorkDispatcher {
                             first_chain_done = true;
 
                             // Write first chain's work (generated above)
-                            match drv.send_work(&mut chain.fpga, &asic_work) {
+                            match work_commit_port.commit(
+                                "FPGA/ASIC work send",
+                                || drv.send_work(&mut chain.fpga, &asic_work),
+                            ) {
                                 Ok(wid) => {
                                     work_ledgers[chain_idx]
                                         .commit(
@@ -2502,7 +2591,8 @@ impl WorkDispatcher {
                                 .map(|ledger| ledger.lookup(nonce_result.work_id))
                             {
                                 Some(LedgerLookup::Found(record)) => {
-                                    let age = next_dispatch_serial
+                                    let age = bookkeeping
+                                        .dispatch_generation()
                                         .saturating_sub(record.dispatch_serial);
                                     //  W1: tighten the stale-age
                                     // eviction threshold from
@@ -2589,9 +2679,12 @@ impl WorkDispatcher {
                                 // Combine generation + work_id for a unique job-scoped key.
                                 // Generation is monotonic, so even after work_id wraps, the
                                 // combination is unique for the lifetime of the daemon.
-                                let gen_key = work_dispatch_serial;
-                                let key = (gen_key, nonce_result.nonce, dedup_ms_idx);
-                                if !seen.insert(key) {
+                                // P1-1 pure SerialMiningEngineBookkeeping: generation-keyed admit.
+                                if !bookkeeping.admit_share(
+                                    work_dispatch_serial,
+                                    nonce_result.nonce,
+                                    dedup_ms_idx,
+                                ) {
                                     dedup_discarded += 1;
                                     // Report duplicate to autotuner for error rate tracking.
                                     if let Some(ref mut tracker) = chip_tracker {
@@ -2602,13 +2695,6 @@ impl WorkDispatcher {
                                         }
                                     }
                                     continue;
-                                }
-                                // FIX (2026-04-11): Generation-based eviction instead of wholesale clear().
-                                // clear() could allow duplicate submissions for nonces still in the FIFO pipeline.
-                                // retain() keeps recent entries (last 2048 generations) and prunes old ones.
-                                if seen.len() > 4000 {
-                                    let cutoff = next_dispatch_serial.saturating_sub(2048);
-                                    seen.retain(|&(gen, _, _)| gen >= cutoff);
                                 }
                             }
 
@@ -2674,7 +2760,7 @@ impl WorkDispatcher {
                                                 work_id = nonce_result.work_id,
                                                 hw_work_id = format_args!("0x{:04X}", hw_work_id),
                                                 work_generation = work_dispatch_serial,
-                                                dispatch_generation = next_dispatch_serial,
+                                                dispatch_generation = bookkeeping.dispatch_generation(),
                                                 midstate_idx = nonce_result.midstate_idx,
                                                 nonce = format_args!("0x{:08x}", nonce_result.nonce),
                                                 version_bits = ?share_version_bits,
@@ -2789,7 +2875,8 @@ impl WorkDispatcher {
                                             .map(|d| d.as_millis() as u64)
                                             .unwrap_or(0);
                                         let hw_work_id_raw = ((w1 >> 8) & 0xFFFF) as u16;
-                                        let gen_age = next_dispatch_serial
+                                        let gen_age = bookkeeping
+                                            .dispatch_generation()
                                             .saturating_sub(work_dispatch_serial);
                                         let diag = dcentrald_api_types::share_validation::LocalRejectDiagnostic {
                                             seq: local_share_rejects_legacy + 1,
@@ -2864,6 +2951,7 @@ impl WorkDispatcher {
                             // on every share. Shares are rare (~1/min at pool diff 8192),
                             // so this is low priority but a clean optimization.
                             let share = ValidShare {
+                                work_generation: work_entry.work_generation,
                                 worker_name: self.worker_name.to_string(),
                                 job_id: work_entry.job_id.clone(),
                                 extranonce2: work_entry.extranonce2.clone(),
@@ -3238,29 +3326,47 @@ impl WorkDispatcher {
                                         continue;
                                     }
 
-                                    let addr_interval = if chain_chip_count > 0 { 256u16 / chain_chip_count as u16 } else { 4 };
-                                    let chip_addr = (chip_index as u16 * addr_interval) as u8;
-                                    let chain = &mut self.chains[idx];
-                                    if let Err(e) = drv.set_frequency(&mut chain.fpga, chip_addr, applied_freq) {
-                                        warn!(
-                                            chain_id,
-                                            chip_index,
-                                            requested_mhz = freq_mhz,
-                                            applied_mhz = applied_freq,
-                                            error = %e,
-                                            "Autotuner: failed to set chip frequency"
-                                        );
-                                        apply_result = Err(format!(
-                                            "failed to set chain {} chip {} to {} MHz: {}",
-                                            chain_id, chip_index, applied_freq, e
-                                        ));
+                                    let addr_interval = if chain_chip_count > 0 {
+                                        u16::from(bm1397plus_addr_interval(chain_chip_count))
                                     } else {
-                                        let (verified_freq, verification_issue) = Self::verify_applied_frequency(
-                                            *drv,
-                                            chain,
-                                            chip_addr,
-                                            applied_freq,
-                                        );
+                                        4
+                                    };
+                                    let chip_addr = (chip_index as u16 * addr_interval) as u8;
+                                    let frequency_commit_port =
+                                        self.runtime_execution_commit_port.clone();
+                                    let chain = &mut self.chains[idx];
+                                    match frequency_commit_port.commit(
+                                        "autotuner per-chip ASIC PLL/frequency write",
+                                        || {
+                                            drv.set_frequency(
+                                                &mut chain.fpga,
+                                                chip_addr,
+                                                applied_freq,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                            Ok::<_, String>(Self::verify_applied_frequency(
+                                                *drv,
+                                                chain,
+                                                chip_addr,
+                                                applied_freq,
+                                            ))
+                                        },
+                                    ) {
+                                        Err(error) => {
+                                            warn!(
+                                                chain_id,
+                                                chip_index,
+                                                requested_mhz = freq_mhz,
+                                                applied_mhz = applied_freq,
+                                                error = %error,
+                                                "Autotuner: failed to set chip frequency"
+                                            );
+                                            apply_result = Err(format!(
+                                                "failed to set chain {} chip {} to {} MHz: {}",
+                                                chain_id, chip_index, applied_freq, error
+                                            ));
+                                        }
+                                        Ok((verified_freq, verification_issue)) => {
                                         if idx < self.chip_frequencies.len() && ci < self.chip_frequencies[idx].len() {
                                             self.chip_frequencies[idx][ci] = verified_freq;
                                         }
@@ -3275,6 +3381,7 @@ impl WorkDispatcher {
                                         } else {
                                             Ok(verified_freq)
                                         };
+                                        }
                                     }
                                 }
                                 if let Some(ack_tx) = ack_tx {
@@ -3408,6 +3515,8 @@ impl WorkDispatcher {
                                 if let Some(idx) = self.chains.iter().position(|c| c.chain_id == chain_id) {
                                     let actual_min = self.current_chain_min_freq(idx);
                                     let effective_min = actual_min.min(min_freq_mhz);
+                                    let work_time_commit_port =
+                                        self.runtime_execution_commit_port.clone();
                                     let chain = &mut self.chains[idx];
                                     if let Err(identity_error) = Self::normalize_chain_write_identity(
                                         self.chip_id,
@@ -3420,8 +3529,11 @@ impl WorkDispatcher {
                                         );
                                         continue;
                                     }
-                                    if let Err(identity_error) =
-                                        Self::recalc_work_time_for_chain(chain, effective_min)
+                                    if let Err(identity_error) = Self::recalc_work_time_for_chain(
+                                        &work_time_commit_port,
+                                        chain,
+                                        effective_min,
+                                    )
                                     {
                                         warn!(
                                             chain_id,
@@ -3835,14 +3947,20 @@ impl WorkDispatcher {
                     if self.curtailment_sleeping.load(Ordering::Acquire) {
                         if !dispatcher_sleeping {
                             info!("Curtailment sleep active — publishing low-power dispatcher snapshot");
-                            self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate);
+                            if let Err(error) =
+                                self.enter_curtailment_sleep(&mut work_ledgers, &mut hashrate)
+                            {
+                                warn!(error = %error, "Curtailment-sleep FIFO flush refused");
+                            }
                             dispatcher_sleeping = true;
                         }
                         self.publish_curtailment_sleep_snapshot();
                         continue;
                     } else if dispatcher_sleeping {
                         info!("Curtailment wake detected — resetting hashrate tracker for clean resume");
-                        self.exit_curtailment_sleep(&mut hashrate);
+                        if let Err(error) = self.exit_curtailment_sleep(&mut hashrate) {
+                            warn!(error = %error, "Curtailment-wake FIFO flush refused");
+                        }
                         dispatcher_sleeping = false;
                     }
 
@@ -4226,13 +4344,11 @@ impl WorkDispatcher {
                 );
             }
         }
-        if let Some(session) = identity_composition_session {
-            if let Err(error) = session.revoke() {
-                warn!(
-                    error = %error,
-                    "Dispatcher composition session could not revoke measured hardware identity during shutdown"
-                );
-            }
+        if let Err(error) = self.identity_composition_session.revoke() {
+            warn!(
+                error = %error,
+                "Dispatcher composition session could not revoke measured hardware identity during shutdown"
+            );
         }
     }
 }
@@ -4266,15 +4382,21 @@ fn ntime_to_hex(ntime: u32) -> String {
     format!("{:08x}", ntime)
 }
 
+/// G22: thin-wrap stratum pure SSOT; nbits lives in header_tail[8..12] on this path.
 fn dispatcher_build_header(entry: &WorkEntry, rolled_version: u32, nonce: u32) -> [u8; 80] {
-    let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&rolled_version.to_le_bytes());
-    header[4..36].copy_from_slice(&entry.prev_block_hash);
-    header[36..68].copy_from_slice(&entry.merkle_root);
-    header[68..72].copy_from_slice(&entry.ntime.to_le_bytes());
-    header[72..76].copy_from_slice(&entry.header_tail[8..12]);
-    header[76..80].copy_from_slice(&nonce.to_le_bytes());
-    header
+    let nbits = u32::from_le_bytes(
+        entry.header_tail[8..12]
+            .try_into()
+            .expect("header_tail nbits is 4 bytes"),
+    );
+    dcentrald_stratum::v1::job::build_block_header(
+        rolled_version,
+        &entry.prev_block_hash,
+        &entry.merkle_root,
+        entry.ntime,
+        nbits,
+        nonce,
+    )
 }
 
 fn full_header_hash_be(header: &[u8; 80]) -> [u8; 32] {
@@ -4338,6 +4460,7 @@ mod tests {
         header_tail[8..12].copy_from_slice(&0x5566_7788u32.to_le_bytes());
 
         WorkEntry {
+            work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
             job_id: "job-1".to_string(),
             extranonce2: "abcd1234".to_string(),
             ntime: 0x1122_3344,
@@ -5154,6 +5277,35 @@ mod tests {
                 0,
                 "chip 0x{chip_id:04X}: effective_version_mask must be 0 (chip rolls internally)"
             );
+        }
+    }
+
+    #[test]
+    fn every_dispatcher_hardware_write_uses_the_measured_execution_commit_port() {
+        let source = include_str!("work_dispatcher.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("work-dispatcher test boundary missing")];
+
+        for needle in [
+            ".flush_work_tx()",
+            ".flush_work_rx()",
+            "drv.send_work(",
+            "drv.set_frequency(",
+            ".write_reg(dcentrald_hal::fpga_chain::REG_WORK_TIME",
+        ] {
+            let positions: Vec<_> = production.match_indices(needle).collect();
+            assert!(
+                !positions.is_empty(),
+                "expected dispatcher write surface {needle}"
+            );
+            for (position, _) in positions {
+                let prefix = &production[position.saturating_sub(700)..position];
+                assert!(
+                    prefix.contains(".commit("),
+                    "dispatcher write {needle} at byte {position} is outside the measured execution commit port"
+                );
+            }
         }
     }
 }

@@ -113,8 +113,8 @@ pub mod regs {
 /// BM1366 register init values from ESP-Miner (Section 7.2 and 15.1).
 mod init_values {
     /// Version rolling register: EN=1, bit28=1, MASK=0xFFFF.
-    /// Written as 0x9000FFFF (for version_mask 0x1FFFE000 >> 13 = 0xFFFF).
-    pub const VERSION_ROLLING: u32 = 0x9000_FFFF;
+    /// G28 pure SSOT: BIP-320 mask → reg 0xA4 (`version_rolling_reg_value`).
+    pub const VERSION_ROLLING: u32 = dcentrald_common::VERSION_ROLLING_REG_BIP320_DEFAULT;
 
     /// Reg_A8 broadcast init value.
     pub const REG_A8_BCAST: u32 = 0x0007_0000;
@@ -209,72 +209,11 @@ pub fn resolve_hash_counting(stock: u32, override_raw: Option<&str>) -> u32 {
 
 /// BM1366 PLL frequency computation.
 ///
-/// PLL formula: freq = 25 MHz * FB_DIV / (REF_DIV * POSTDIV1 * POSTDIV2)
-///
-/// Register 0x08 format (BM1366):
-///   Byte 0: VDO_SCALE (0x40 if VCO < 2400 MHz, 0x50 if >= 2400 MHz)
-///   Byte 1: FB_DIV (feedback divider, range 144-235)
-///   Byte 2: REF_DIV (reference divider, typically 1 or 2)
-///   Byte 3: POSTDIV encoded as ((POSTDIV1-1) << 4) | (POSTDIV2-1)
-///
-/// The search algorithm finds optimal PLL parameters by brute-force,
-/// matching ESP-Miner's pll_get_parameters() logic.
+/// G28: thin-wrap pure `dcentrald_common::bm1366_pll_reg_and_actual` (ESP-Miner
+/// crystal-25 search with full tie-break). Do not re-open a forked float search.
+#[inline]
 fn bm1366_pll_calc(target_mhz: u16) -> (u32, u16) {
-    const FREQ_MULT: f64 = 25.0;
-    const FB_DIV_MIN: u16 = 144;
-    const FB_DIV_MAX: u16 = 235;
-
-    let target = target_mhz as f64;
-    let mut best_freq = 0.0f64;
-    let mut best_fb = FB_DIV_MIN;
-    let mut best_ref = 1u8;
-    let mut best_pd1 = 1u8;
-    let mut best_pd2 = 1u8;
-    let mut best_vco = f64::MAX;
-
-    for refdiv in [1u8, 2] {
-        for postdiv1 in 1..=7u8 {
-            for postdiv2 in 1..=postdiv1 {
-                for fb_div in FB_DIV_MIN..=FB_DIV_MAX {
-                    let freq = FREQ_MULT * fb_div as f64
-                        / (refdiv as f64 * postdiv1 as f64 * postdiv2 as f64);
-                    let diff = (freq - target).abs();
-                    let best_diff = (best_freq - target).abs();
-                    let vco = FREQ_MULT * fb_div as f64 / refdiv as f64;
-
-                    if diff < best_diff
-                        || (diff == best_diff && vco < best_vco)
-                        || (diff == best_diff
-                            && vco == best_vco
-                            && (postdiv1 as u16 * postdiv2 as u16)
-                                < (best_pd1 as u16 * best_pd2 as u16))
-                    {
-                        best_freq = freq;
-                        best_fb = fb_div;
-                        best_ref = refdiv;
-                        best_pd1 = postdiv1;
-                        best_pd2 = postdiv2;
-                        best_vco = vco;
-                    }
-                }
-            }
-        }
-    }
-
-    // VCO scale byte
-    let vdo_scale: u8 = if best_vco >= 2400.0 { 0x50 } else { 0x40 };
-
-    // POSTDIV encoding: BM1366 uses (POSTDIV1-1) << 4 | (POSTDIV2-1)
-    let postdiv_byte = ((best_pd1 - 1) << 4) | (best_pd2 - 1);
-
-    // Register value: [VDO_SCALE, FB_DIV, REF_DIV, POSTDIV]
-    let reg_value = (vdo_scale as u32) << 24
-        | (best_fb as u32) << 16
-        | (best_ref as u32) << 8
-        | (postdiv_byte as u32);
-
-    let actual_mhz = best_freq.round() as u16;
-    (reg_value, actual_mhz)
+    dcentrald_common::bm1366_pll_reg_and_actual(target_mhz)
 }
 
 /// BM1366 driver implementation.
@@ -329,6 +268,40 @@ impl Bm1366Driver {
         let (w0, w1) = crate::protocol::fifo_cmd_write_reg_full(chip_addr, reg, value);
         chain.write_cmd(w0);
         chain.write_cmd(w1);
+    }
+
+    /// G20: ESP-Miner-faithful MiscCtrl **single** broadcast (pure SSOT).
+    /// Do not force BM1362 triple reliability cadence onto BM1366.
+    fn misc_ctrl_single_write_broadcast(chain: &mut FpgaChain, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_broadcast(value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
+    }
+
+    /// G20: ESP-Miner-faithful MiscCtrl **single** per-chip (pure SSOT).
+    fn misc_ctrl_single_write_chip(chain: &mut FpgaChain, chip_addr: u8, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_chip(chip_addr, value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBm1397Plus {
+                chip_addr: addr,
+                reg,
+                value,
+            } = op
+            {
+                Self::write_reg_single(chain, addr, reg, value);
+            }
+        }
     }
 }
 
@@ -392,8 +365,8 @@ impl ChipDriver for Bm1366Driver {
         // Step 0: Reset ASIC baud to default if hot start (same pattern as BM1387).
         let current_baud_div = chain.common.read_reg(fpga_chain::REG_BAUD);
         if current_baud_div != fpga_chain::BAUD_REG_115200 {
-            // Send MiscCtrl at current baud to reset ASICs to 115200.
-            Self::write_reg_broadcast(chain, regs::MISC_CONTROL, init_values::MISC_CTRL_BCAST);
+            // Send MiscCtrl at current baud to reset ASICs to 115200 (G20 pure single).
+            Self::misc_ctrl_single_write_broadcast(chain, init_values::MISC_CTRL_BCAST);
             std::thread::sleep(std::time::Duration::from_millis(10));
             tracing::info!(
                 chain_id = chain.chain_id,
@@ -406,11 +379,26 @@ impl ChipDriver for Bm1366Driver {
         chain.set_baud(fpga_chain::BAUD_REG_115200);
         tracing::debug!("FPGA baud set to 115200 (BAUD_REG=0x6C)");
 
-        // Step 2: Set version mask (3 times, per ESP-Miner).
+        // Step 2: Set version mask (3 times, per ESP-Miner). G21 pure SSOT.
         // Register 0xA4 = 0x9000FFFF: EN=1, bit28=1, MASK=0xFFFF.
-        for _ in 0..3 {
-            Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, init_values::VERSION_ROLLING);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        debug_assert_eq!(
+            regs::VERSION_ROLLING,
+            dcentrald_common::VERSION_ROLLING_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_version_rolling_triple_write_broadcast(
+            init_values::VERSION_ROLLING,
+        ) {
+            match op {
+                dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                    Self::write_reg_broadcast(chain, reg, value);
+                }
+                dcentrald_common::TransportOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                    }
+                }
+                _ => {}
+            }
         }
         tracing::info!("Version rolling enabled (0xA4 = 0x9000FFFF, sent 3x)");
 
@@ -418,8 +406,8 @@ impl ChipDriver for Bm1366Driver {
         Self::write_reg_broadcast(chain, regs::REG_A8, init_values::REG_A8_BCAST);
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        // Step 4: Misc Control broadcast = 0xFF0FC100.
-        Self::write_reg_broadcast(chain, regs::MISC_CONTROL, init_values::MISC_CTRL_BCAST);
+        // Step 4: Misc Control broadcast = 0xFF0FC100 (G20 pure single-write).
+        Self::misc_ctrl_single_write_broadcast(chain, init_values::MISC_CTRL_BCAST);
         std::thread::sleep(std::time::Duration::from_millis(5));
         tracing::info!("MiscCtrl broadcast = 0xFF0FC100");
 
@@ -461,24 +449,14 @@ impl ChipDriver for Bm1366Driver {
 
         // Step 11: Per-chip register configuration.
         // Each chip gets: Reg_A8, MiscCtrl, CoreReg x3.
-        let addr_interval = if chip_count > 0 {
-            256u16 / chip_count as u16
-        } else {
-            256
-        };
-        for i in 0..chip_count {
-            let addr = (i as u16 * addr_interval) as u8;
-
+        // P1-3: full-population stride SSOT (not open-coded 256/N).
+        let addr_interval = dcentrald_common::bm1397plus_addr_interval(chip_count);
+        for addr in dcentrald_common::linear_chip_addresses(chip_count, addr_interval) {
             // Reg_A8 per-chip = 0x000701F0
             Self::write_reg_single(chain, addr, regs::REG_A8, init_values::REG_A8_PER_CHIP);
 
-            // MiscCtrl per-chip = 0xF000C100
-            Self::write_reg_single(
-                chain,
-                addr,
-                regs::MISC_CONTROL,
-                init_values::MISC_CTRL_PER_CHIP,
-            );
+            // MiscCtrl per-chip = 0xF000C100 (G20 pure single-write)
+            Self::misc_ctrl_single_write_chip(chain, addr, init_values::MISC_CTRL_PER_CHIP);
 
             // Core Register: Hash Clock Ctrl
             Self::write_reg_single(
@@ -579,8 +557,16 @@ impl ChipDriver for Bm1366Driver {
             chip_count,
         );
 
-        // Step 15: Final version mask write.
-        Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, init_values::VERSION_ROLLING);
+        // Step 15: Final version mask write (G23 pure single — ESP-Miner init795).
+        for op in dcentrald_common::plan_version_rolling_single_write_broadcast(
+            init_values::VERSION_ROLLING,
+        ) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         // Step 16: Baud upgrade to 1 Mbps via Fast UART (register 0x28).
@@ -672,14 +658,16 @@ impl ChipDriver for Bm1366Driver {
     }
 
     fn set_voltage(&self, pic: &mut PicController, voltage_mv: u16) -> Result<()> {
-        // NOTE: This voltage formula is for PIC16F1704 (S9) only.
-        // dsPIC33EP (S17/S19) uses DspicController::set_voltage(mv) with direct millivolt values.
-        // NoPic (S21) uses kernel DTB-managed TAS5782M DACs.
-        // The daemon routes voltage commands based on MinerProfile.pic_type, so this
-        // function is only called for Pic16F1704 boards.
-        let pic_value = PicController::voltage_to_pic(voltage_mv as f64 / 1000.0);
-        pic.set_voltage(pic_value)?;
-        Ok(())
+        // P1-2: industrial BM1366 ChipDriverPic path → Pic16 VoltageRail.
+        // dsPIC / NoPic boards must not reach here (daemon routes by pic_type;
+        // ownership SSOT refuses non-ChipDriverPic identities).
+        let addr = pic.address();
+        crate::voltage_rail_adapters::chip_driver_set_voltage_via_pic16_rail(
+            dcentrald_common::AsicProtocolIdentity::Bm1366,
+            pic,
+            voltage_mv,
+        )
+        .map_err(|e| crate::voltage_rail_adapters::voltage_rail_error_as_asic(e, addr))
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -822,11 +810,13 @@ impl ChipDriver for Bm1366Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BM1366 uses simple (difficulty - 1) as ticket mask, same as BM1397/BM1368/BM1370.
-        // ESP-Miner BM1366 driver writes the mask value directly without bit reversal.
-        // Only BM1387 uses .reverse_bits().swap_bytes() encoding.
-        // For difficulty 256: mask = 255 = 0x000000FF.
-        difficulty.saturating_sub(1)
+        // G24 pure SSOT: industrial plain (diff-1). Fixture/path evidence for
+        // BM136x; ESP-Miner bit-reverse is a separate named pure
+        // (`ticket_mask_esp_miner_pow2_floor`) — not silently applied here.
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

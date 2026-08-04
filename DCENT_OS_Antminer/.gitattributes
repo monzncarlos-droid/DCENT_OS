@@ -28,3 +28,25 @@
 # tests and should not change line endings across Windows/WSL checkouts.
 /dcentrald/dcentrald-stratum/tests/v1_parser_corpus.rs text eol=lf
 /dcentrald/dcentrald-stratum/tests/v1_parser_corpus/** text eol=lf
+# Source-contract tests in these files `include_str!` their own source and split
+# it on the literal "\n#[cfg(test)]\nmod tests {" to isolate the production slice.
+# Under a CRLF checkout that split stops matching, the "production" slice silently
+# becomes the WHOLE file (test text included), so negative asserts can self-satisfy
+# and positive ones can self-fail with a misleading diagnostic. This class has
+# already cost this repo real time (the wave55 Windows-CRLF source-pin failures).
+#
+# CORRECTION (2026-07-27, ): the five per-file lines below were annotated
+# "the complete set as of 2026-07-26 — verified by fixed-string search". They were
+# not. A search for files that `include_str!` their OWN basename AND contain the
+# split marker finds 30 such files in this workspace; these five cover 5 of 30.
+# Per-file enrolment has now silently missed 25 files while asserting completeness,
+# so the blanket rule below supersedes it. Do NOT go back to hand-maintaining a
+# list — a missed entry is invisible until a Windows checkout fails confusingly.
+# Rust is LF-canonical, so pinning the whole workspace costs nothing.
+/dcentrald/**/*.rs text eol=lf
+# Retained for explicitness; each is already covered by the blanket rule above.
+/dcentrald/dcentrald/src/serial_mining.rs text eol=lf
+/dcentrald/dcentrald/src/s19j_hybrid_mining.rs text eol=lf
+/dcentrald/dcentrald/src/am3_bb_mining.rs text eol=lf
+/dcentrald/dcentrald/src/asic_identity_publication.rs text eol=lf
+/dcentrald/dcentrald/src/runtime/safety_watchdog.rs text eol=lf

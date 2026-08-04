@@ -87,11 +87,71 @@ fn non_s9_i2c_construction_sites_register_eeprom_write_denylist() {
             constructor: "spawn_i2c_service_no_register_touch_with_denylist",
             denylist_marker: "AMLOGIC_EEPROM_DENYLIST.to_vec()",
         },
+        // The site this array was missing, and the reason it stayed missing:
+        // every prior revision enumerated only the bus-0 helper above, so the
+        // gate went green while the service that actually reaches the Amlogic
+        // hashboard EEPROMs registered no denylist at all. The EEPROMs are on
+        // bus 1 (see `shipped_amlogic_hashboard_artifact_puts_eeproms_on_the_management_bus`
+        // below), which is this service.
+        //
+        // The entry marker resolves at the `AmlogicPowerThermalService::spawn`
+        // definition, which sits well after the bus-0 helper — so the helper's
+        // forward-only `find` cannot satisfy this row from the bus-0 site's
+        // occurrence of the same denylist marker.
+        ConstructionSite {
+            label: "am3_aml_management_power_thermal_service",
+            source: AMLOGIC_RS,
+            entry_marker: "fn spawn(admission: &AmlogicNoPicAdmission)",
+            constructor:
+                "spawn_owned_i2c_service_no_register_touch_with_denylist_and_reserved_preparation",
+            denylist_marker: "AMLOGIC_EEPROM_DENYLIST.to_vec()",
+        },
     ];
 
     for site in &sites {
         assert_denylisted_construction(site)
             .unwrap_or_else(|err| panic!("EEPROM denylist construction drift: {err}"));
+    }
+}
+
+/// Pin the evidence, not just the code shape.
+///
+/// The breadth row above asserts that the Amlogic *management* service carries
+/// the EEPROM write-denylist. This asserts WHY that is the right service: the
+/// hashboard EEPROMs are on I2C bus 1, per the artifact we ourselves ship into
+/// the rootfs. Without this, a future reader could "simplify" the breadth array
+/// back onto bus 0 and the suite would still pass.
+///
+/// Deliberately parsed with a plain substring scan rather than a JSON
+/// dependency — this is a test-only contract over a file whose shape we own.
+#[test]
+fn shipped_amlogic_hashboard_artifact_puts_eeproms_on_the_management_bus() {
+    const DECODED: &str = include_str!(
+        "../../../br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos/hashboard_decoded.json"
+    );
+
+    let declarations: Vec<&str> = DECODED
+        .split("\"i2c_bus\"")
+        .skip(1)
+        .map(|rest| rest.trim_start_matches([':', ' ']))
+        .collect();
+
+    assert!(
+        !declarations.is_empty(),
+        "shipped hashboard_decoded.json declares no i2c_bus at all — the artifact \
+         changed shape and this contract needs rewriting, not deleting"
+    );
+
+    for (index, decl) in declarations.iter().enumerate() {
+        assert!(
+            decl.starts_with('1'),
+            "board {index} in the shipped Amlogic hashboard artifact declares an \
+             i2c_bus that is not 1. The EEPROM write-denylist is registered on the \
+             service that owns the management bus; if the boards really moved, move \
+             the denylist with them rather than relaxing this assertion. \
+             (Corroborated by the live .78 probe: bus 0 scans empty and every bus-0 \
+             read fails, while bus 1 answers at 0x50/0x51/0x52.)"
+        );
     }
 }
 

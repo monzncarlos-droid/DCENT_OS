@@ -565,15 +565,26 @@ impl<'a> PicController<'a> {
 
     /// Convert voltage in volts to PIC register value.
     ///
-    /// Uses rounding (not truncation) to minimize voltage error.
-    /// Formula: pic_val = round(1608.420446 - 170.423497 * voltage_V)
+    /// SSOT: [`dcentrald_common::pic16_mv_to_dac`] (P1-2) — includes the
+    /// min-safe DAC floor so overvolt encodes never emit pic_value=0.
+    /// Formula: pic_val = round(1608.420446 - 170.423497 * voltage_V), floored.
     pub fn voltage_to_pic(voltage_v: f64) -> u8 {
-        (VOLTAGE_OFFSET - (voltage_v * VOLTAGE_DIVISOR)).round() as u8
+        let mv = (voltage_v * 1000.0).round();
+        let mv = if mv < 0.0 {
+            0u16
+        } else if mv > f64::from(u16::MAX) {
+            u16::MAX
+        } else {
+            mv as u16
+        };
+        dcentrald_common::pic16_mv_to_dac(mv)
     }
 
     /// Convert PIC register value to voltage in volts.
+    ///
+    /// SSOT: [`dcentrald_common::pic16_dac_to_mv`].
     pub fn pic_to_voltage(pic_value: u8) -> f64 {
-        (VOLTAGE_OFFSET - pic_value as f64) / VOLTAGE_DIVISOR
+        f64::from(dcentrald_common::pic16_dac_to_mv(pic_value)) / 1000.0
     }
 
     // -- private helpers --

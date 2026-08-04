@@ -65,6 +65,7 @@ async fn v1_client_serializes_submits_and_records_pool_acceptance() {
 
     share_tx
         .send(ValidShare {
+            work_generation: job.work_generation,
             worker_name: "dcent.sim.worker".to_string(),
             job_id: job.job_id,
             extranonce2: "00000000".to_string(),

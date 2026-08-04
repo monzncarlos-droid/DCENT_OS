@@ -296,6 +296,21 @@ pub mod chip {
 
     /// Number of mining chains on a stock S19j Pro hashing unit.
     pub const CHAINS: u8 = 4;
+
+    /// Non-hashing "dummy" core indices that the BM1362 reports but that produce no
+    /// real nonces. Recovered 2026-07-24 from Bitmain's factory jig
+    /// `single_board_test_bm1362` `FUN_000176b8` (the nonce-rate result printer):
+    /// `strcmp(type,"BM1362")==0 && (core - 0x25) < 3` skips cores `0x25/0x26/0x27`
+    /// when tallying received nonces, and the per-type core-count carries a `+3`
+    /// offset for BM1362 (vs `+0` for BM1398/BM1360, `+1` for BM1399).
+    ///
+    /// Metadata only — a per-core health/nonce-deficit scorer MUST exclude these to
+    /// avoid flagging three healthy chips as degraded. No register write is implied.
+    pub const DUMMY_CORE_INDICES: [u8; 3] = [0x25, 0x26, 0x27];
+
+    /// Core-count offset added for BM1362 in the jig's per-type accounting (`+3`,
+    /// i.e. the three [`DUMMY_CORE_INDICES`]).
+    pub const CORE_COUNT_TYPE_OFFSET: u8 = 3;
 }
 
 /// BM1362 wire-format work-layout constants (RE2 §4.2 lines 424-430).
@@ -1208,6 +1223,22 @@ pub fn pll_compute(target_mhz: u32, ref_mhz: u32) -> Option<PllParams> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dummy_cores_are_the_jig_recovered_triplet() {
+        assert_eq!(chip::DUMMY_CORE_INDICES, [0x25, 0x26, 0x27]);
+        assert_eq!(
+            chip::CORE_COUNT_TYPE_OFFSET as usize,
+            chip::DUMMY_CORE_INDICES.len(),
+            "the +3 type offset must equal the count of dummy cores"
+        );
+        // A per-core scorer built on these must skip exactly the dummy triplet.
+        let real: Vec<u8> = (0x20u8..0x2A)
+            .filter(|c| !chip::DUMMY_CORE_INDICES.contains(c))
+            .collect();
+        assert!(!real.contains(&0x25) && !real.contains(&0x26) && !real.contains(&0x27));
+        assert!(real.contains(&0x24) && real.contains(&0x28));
+    }
 
     #[test]
     fn table_has_21_rows() {

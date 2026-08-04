@@ -23,6 +23,13 @@ use tracing::error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlatformIdentitySnapshot {
     pub(crate) declared_board_target: Option<String>,
+    /// Exact control-board target inferred from immutable, live-captured
+    /// platform evidence when no image-owned board-target marker exists.
+    ///
+    /// This is currently populated only for the exact AM335x BeagleBone /
+    /// `S19J_IO_BOARD_V2_0` device-tree tuple. It is control-board composition
+    /// evidence, not measured ASIC or hashboard identity.
+    pub(crate) observed_board_target: Option<String>,
     /// Exact registry row for the declared control-board target, when known.
     /// This remains control-board composition metadata; it does not identify
     /// measured ASIC silicon, hashboard SKU, PSU, cooling, storage, or network.
@@ -35,7 +42,20 @@ pub(crate) struct PlatformIdentitySnapshot {
 
 impl PlatformIdentitySnapshot {
     pub(crate) fn board_target(&self) -> &str {
-        self.declared_board_target.as_deref().unwrap_or_default()
+        self.declared_board_target
+            .as_deref()
+            .or(self.observed_board_target.as_deref())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn board_target_source(&self) -> &'static str {
+        if self.declared_board_target.is_some() {
+            "declared_board_target"
+        } else if self.observed_board_target.is_some() {
+            "exact_device_tree"
+        } else {
+            "unresolved"
+        }
     }
 
     pub(crate) fn platform_marker(&self) -> &str {
@@ -110,7 +130,8 @@ pub(crate) trait PlatformLifecycle {
     /// Stop initialization-only keepalives before attempting safe-off.
     fn stop_initialization_keepalives(&mut self);
 
-    /// Best-effort safe-off for any partially initialized platform state.
+    /// Establish positive terminal safe-off for any partially initialized
+    /// platform state. An error forbids the management-only handoff.
     async fn safe_off_partial_platform(&mut self) -> Result<()>;
 
     /// Run the management plane until its normal shutdown condition.
@@ -143,9 +164,11 @@ pub(crate) enum BringupDisposition {
 /// Initialize a platform under a deadline and execute the complete recovery
 /// handoff on failure.
 ///
-/// Safe-off errors are logged but never suppress the management plane: a
-/// controller watchdog may be the remaining hardware safety net, while keeping
-/// the API reachable is still preferable to exiting the daemon. Failure of the
+/// Management-only is reachable only after positive safe-off completion. A
+/// controller watchdog is a final containment mechanism, not evidence that the
+/// rail is off; on safe-off failure the daemon exits so its external session
+/// supervisor can execute the independent emergency-safety path. Recovery-state
+/// publication remains advisory after safe-off succeeds. Failure of the
 /// management plane itself remains an error.
 pub(crate) async fn initialize_or_recover<P, R, C>(
     platform: &mut P,
@@ -167,7 +190,8 @@ where
         DeadlineResult::TimedOut => Err(anyhow!(
             "hardware bring-up (init) did not complete within {}s — the cold-boot \
              path is wedged (PIC/AXI-IIC/chip-UART timeout, PSU fault, or no \
-             hash boards). Aborting bring-up so the management plane recovers.",
+             hash boards). Aborting bring-up so terminal safe-off and conditional \
+             management-plane admission can run.",
             init_timeout.as_secs()
         )),
     };
@@ -179,10 +203,10 @@ where
     error!(
         error = %error,
         timeout_s = init_timeout.as_secs(),
-        "HARDWARE BRING-UP FAILED — running graceful hardware-safe-off \
-         teardown, then falling back to MANAGEMENT-ONLY (API/dashboard \
-         stay reachable; mining disabled until the operator acts). The \
-         daemon will NOT hang and will NOT crash on a failed bring-up."
+        "HARDWARE BRING-UP FAILED — attempting terminal hardware safe-off \
+         before management-only admission. API/dashboard become reachable only \
+         if safe-off succeeds; otherwise the daemon exits so the external session \
+         supervisor can run its independent emergency-safety path."
     );
 
     // Ordering is load-bearing: never keep a rail alive while waiting for a
@@ -192,9 +216,14 @@ where
         error!(
             error = %error,
             teardown_error = %teardown_error,
-            "graceful teardown after bring-up failure also errored — the PIC/dsPIC \
-             heartbeat watchdog (~5-64s) remains the hardware safety net"
+            "graceful teardown after bring-up failure also errored — refusing \
+             management-only so the external session supervisor performs its \
+             independent emergency-safety path"
         );
+        return Err(anyhow!(
+            "hardware bring-up failed ({error:#}) and terminal safe-off was not proven \
+             ({teardown_error:#}); management-only is forbidden"
+        ));
     }
 
     if let Err(publication_error) = recovery_publisher.publish_management_recovery() {
@@ -215,6 +244,7 @@ mod tests {
     fn test_identity() -> PlatformIdentitySnapshot {
         PlatformIdentitySnapshot {
             declared_board_target: Some("am1-s9".to_string()),
+            observed_board_target: None,
             board_desc: dcentrald_common::BoardDesc::lookup("am1-s9"),
             declared_platform_marker: Some("zynq-bm1-s9".to_string()),
             declared_subtype: None,
@@ -419,11 +449,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_off_error_does_not_make_the_management_plane_unreachable() {
+    async fn safe_off_error_forbids_the_management_plane() {
         let mut platform = RecordingPlatform::new(InitBehavior::Fail);
         platform.safe_off_fails = true;
         let mut publisher = RecordingRecoveryPublisher::for_platform(&platform);
-        let disposition = initialize_or_recover(
+        let error = initialize_or_recover(
             &mut platform,
             &test_identity(),
             &mut publisher,
@@ -431,10 +461,15 @@ mod tests {
             Duration::from_secs(90),
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(disposition, BringupDisposition::ManagementOnlyStopped);
-        assert_eq!(platform.snapshot().last(), Some(&"management-only"));
+        assert!(error
+            .to_string()
+            .contains("terminal safe-off was not proven"));
+        assert_eq!(
+            platform.snapshot(),
+            ["initialize", "stop-keepalives", "safe-off"]
+        );
     }
 
     #[tokio::test]
@@ -499,6 +534,7 @@ mod tests {
                 // This is declared simulator/package metadata, not a claim
                 // that the simulated BM1398 was measured from real silicon.
                 declared_board_target: Some("am2-s19pro".to_string()),
+                observed_board_target: None,
                 board_desc: dcentrald_common::BoardDesc::lookup("am2-s19pro"),
                 declared_platform_marker: Some("zynq-bm3-am2".to_string()),
                 declared_subtype: None,

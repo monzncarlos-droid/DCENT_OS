@@ -620,32 +620,15 @@ fn rpc_type_name(model: &str) -> String {
     format!("BITAXE {}", model)
 }
 
+/// Stock-AxeOS device-model name for the running board.
+///
+/// The map itself lives on [`dcentaxe_hal::board::BitAxeModel::stock_model_name`]
+/// — deliberately, and exactly once. This function used to hold its own copy of
+/// an exhaustive `match` on `BitAxeModel`, byte-identical to a second copy in
+/// `api.rs`; adding a board variant meant editing both, and commit `13e44591`
+/// proved what happens when only the HAL is rebuilt.
 fn stock_device_model_name(board: &dcentaxe_hal::board::BoardConfig) -> &'static str {
-    match board.board_version.as_str() {
-        "302" | "303" => "Hex",
-        "650" => "GammaDuo",
-        "701" | "702" => "SupraHex",
-        "801" => "GammaTurbo",
-        _ => match board.model {
-            dcentaxe_hal::board::BitAxeModel::Max => "Max",
-            dcentaxe_hal::board::BitAxeModel::Ultra => "Ultra",
-            dcentaxe_hal::board::BitAxeModel::Supra => "Supra",
-            dcentaxe_hal::board::BitAxeModel::Gamma => "Gamma",
-            dcentaxe_hal::board::BitAxeModel::HexUltra => "Hex",
-            dcentaxe_hal::board::BitAxeModel::HexSupra => "SupraHex",
-            dcentaxe_hal::board::BitAxeModel::GammaDuo => "GammaDuo",
-            dcentaxe_hal::board::BitAxeModel::GammaTurbo => "GammaTurbo",
-            dcentaxe_hal::board::BitAxeModel::NerdNOS => "Max",
-            dcentaxe_hal::board::BitAxeModel::NerdAxe => "Gamma",
-            dcentaxe_hal::board::BitAxeModel::NerdQaxePlus => "Supra",
-            dcentaxe_hal::board::BitAxeModel::NerdQaxePP => "Gamma",
-            dcentaxe_hal::board::BitAxeModel::Touch => "Touch",
-            dcentaxe_hal::board::BitAxeModel::GtTouch => "GtTouch",
-            dcentaxe_hal::board::BitAxeModel::DcentAxeBm1397 => "DCENT_axe BM1397",
-            dcentaxe_hal::board::BitAxeModel::DcentAxeQuadBm1397 => "DCENT_axe Quad BM1397",
-            dcentaxe_hal::board::BitAxeModel::DcentAxeHexBm1397 => "DCENT_axe Hex BM1397",
-        },
-    }
+    board.model.stock_model_name(board.board_version.as_str())
 }
 
 fn small_core_count(asic_model: &str) -> u32 {
@@ -653,7 +636,9 @@ fn small_core_count(asic_model: &str) -> u32 {
         "BM1397" => 672,
         "BM1366" => 894,
         "BM1368" => 1276,
-        "BM1370" => 2040,
+        // BM1373 grouped with BM1370 (2040) — matches main.rs:460 / api.rs
+        // small-core arms. PROJECTED for BM1373 until hardware verification.
+        "BM1370" | "BM1373" => 2040,
         _ => 0,
     }
 }

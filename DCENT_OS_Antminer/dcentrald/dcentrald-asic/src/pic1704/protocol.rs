@@ -247,6 +247,71 @@ pub fn enable_dc_dc_steps(enable: bool) -> Vec<I2cTransactionStep> {
 }
 
 // ===========================================================================
+//  Register access class (set_mv evidence — SOURCE_HAL pic1704.h map)
+// ===========================================================================
+
+/// Access class for short-form PIC1704 registers (host-pure).
+///
+/// Source: `SOURCE_HAL/pic1704.h` register map as mirrored in this module's
+/// constants. Used to fail-closed VoltageRail `set_mv` without inventing a
+/// write path that does not exist on the held short-form protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pic1704RegisterAccess {
+    /// Measure / status — reads only in application firmware.
+    ReadOnly,
+    /// Control / bootloader unlock path — writes (and version read for probe).
+    WriteOrProbe,
+    /// Not part of the held short-form map.
+    Unknown,
+}
+
+/// Classify a register address by access role on the short-form protocol.
+///
+/// **Voltage set-point:** there is **no** writable millivolt/DAC register in
+/// the held map. `REG_VOLTAGE_L/H` (0x02/0x03) are **read-only feedback**.
+/// Rail energize is `REG_CONTROL` DC-DC on/off only. PSU (or board topology)
+/// sets the absolute rail; PIC1704 gates it.
+pub fn register_access(reg: u8) -> Pic1704RegisterAccess {
+    match reg {
+        REG_TEMP | REG_VOLTAGE_L | REG_VOLTAGE_H | REG_CURRENT_L | REG_CURRENT_H | REG_TEMP_ALT
+        | REG_STATUS => Pic1704RegisterAccess::ReadOnly,
+        // REG_VERSION is read for probe and written only with BL_MAGIC for start_app.
+        // REG_CONTROL is write-only control (enable/HB/jump/reset research).
+        REG_VERSION | REG_CONTROL => Pic1704RegisterAccess::WriteOrProbe,
+        _ => Pic1704RegisterAccess::Unknown,
+    }
+}
+
+/// True if any short-form register is a writable voltage set-point (mV/DAC).
+///
+/// Always false on the held SOURCE_HAL map — evidence for VoltageRail set_mv
+/// **NOT IMPLEMENTED** (not "missing because live hardware unvalidated").
+pub const fn short_form_has_writable_voltage_setpoint() -> bool {
+    dcentrald_common::pic1704_short_form_has_writable_voltage_setpoint()
+}
+
+/// Pure admission for Pic1704 VoltageRail `set_mv`.
+///
+/// Thin-wraps host-safe [`dcentrald_common::admit_pic1704_short_form_set_mv`]
+/// and pins local register_access R-only invariants for REG_VOLTAGE_*.
+pub fn admit_short_form_set_mv(mv: u16) -> Result<(), dcentrald_common::VoltageRailError> {
+    debug_assert!(!short_form_has_writable_voltage_setpoint());
+    debug_assert_eq!(
+        register_access(REG_VOLTAGE_L),
+        Pic1704RegisterAccess::ReadOnly
+    );
+    debug_assert_eq!(
+        register_access(REG_VOLTAGE_H),
+        Pic1704RegisterAccess::ReadOnly
+    );
+    // Register address constants must stay aligned with common SSOT pins.
+    debug_assert_eq!(REG_VOLTAGE_L, dcentrald_common::PIC1704_REG_VOLTAGE_L);
+    debug_assert_eq!(REG_VOLTAGE_H, dcentrald_common::PIC1704_REG_VOLTAGE_H);
+    debug_assert_eq!(REG_CONTROL, dcentrald_common::PIC1704_REG_CONTROL);
+    dcentrald_common::admit_pic1704_short_form_set_mv(mv)
+}
+
+// ===========================================================================
 //  Tests (host-safe, no I2C bus required)
 // ===========================================================================
 
@@ -300,6 +365,62 @@ mod tests {
         assert!(is_application_version(0x8A));
         assert!(!is_application_version(0x00));
         assert!(!is_application_version(0xFF));
+    }
+
+    #[test]
+    fn voltage_feedback_registers_are_read_only_on_short_form_map() {
+        assert_eq!(
+            register_access(REG_VOLTAGE_L),
+            Pic1704RegisterAccess::ReadOnly
+        );
+        assert_eq!(
+            register_access(REG_VOLTAGE_H),
+            Pic1704RegisterAccess::ReadOnly
+        );
+        assert_eq!(register_access(REG_TEMP), Pic1704RegisterAccess::ReadOnly);
+        assert_eq!(register_access(REG_STATUS), Pic1704RegisterAccess::ReadOnly);
+        // Control is the only rail-gate write (DC-DC / HB), not an mV setpoint.
+        assert_eq!(
+            register_access(REG_CONTROL),
+            Pic1704RegisterAccess::WriteOrProbe
+        );
+        assert!(!short_form_has_writable_voltage_setpoint());
+    }
+
+    #[test]
+    fn admit_short_form_set_mv_is_evidence_exhausted_unsupported() {
+        let err = admit_short_form_set_mv(13_700).unwrap_err();
+        assert!(matches!(
+            err,
+            dcentrald_common::VoltageRailError::Unsupported { .. }
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("REG_VOLTAGE") || msg.contains("read-only"),
+            "error must cite read-only voltage feedback: {msg}"
+        );
+        assert!(
+            msg.contains("evidence-exhausted") || msg.contains("Evidence-exhausted"),
+            "error must mark evidence-exhausted not live-gated: {msg}"
+        );
+        // Must not be Ok(()) — historical silent-success class.
+        assert_ne!(format!("{err}"), "");
+    }
+
+    #[test]
+    fn enable_dc_dc_writes_control_not_voltage_regs() {
+        let on = enable_dc_dc_steps(true);
+        let off = enable_dc_dc_steps(false);
+        for steps in [&on, &off] {
+            match &steps[0] {
+                I2cTransactionStep::Write(buf) => {
+                    assert_eq!(buf[0], REG_CONTROL);
+                    assert_ne!(buf[0], REG_VOLTAGE_L);
+                    assert_ne!(buf[0], REG_VOLTAGE_H);
+                }
+                other => panic!("expected Write, got {other:?}"),
+            }
+        }
     }
 
     #[test]

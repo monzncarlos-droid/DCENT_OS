@@ -34,8 +34,13 @@ export interface VerdictBreakdown {
   reason: string;
 }
 
-// Roughly 5 sats / day / TH/s at current ~80T network difficulty.
-// Same constant the rest of the dashboard uses (estimateDailySats).
+// WARNING (do not wire this module into a UI as-is): this is a stale rough stub,
+// NOT the model the rest of the dashboard uses. The canonical revenue estimator is
+// the difficulty-anchored `estimateDailySats` in utils/thermal.ts, which yields on
+// the order of tens of sats / day / TH/s — this fixed `5` understates real revenue
+// by ~12-15x and cannot track difficulty. This module currently has zero importers;
+// before any consumer uses it, rebase `dailyRevenueUsd` on `estimateDailySats`
+// (threading networkDifficulty) rather than this constant.
 const SATS_PER_TH_PER_DAY = 5;
 
 // Threshold above which a result is considered "actually profitable"

@@ -305,36 +305,18 @@ fn partition_labels() -> (String, String) {
     (running_label, next_label)
 }
 
+/// Stock-AxeOS device-model name for the running board.
+///
+/// The map itself lives on [`dcentaxe_hal::board::BitAxeModel::stock_model_name`]
+/// — deliberately, and exactly once. This function used to hold its own copy of
+/// an exhaustive `match` on `BitAxeModel`, byte-identical to a second copy in
+/// `cgminer_tcp.rs`; adding a board variant meant editing both, and commit
+/// `13e44591` proved what happens when only the HAL is rebuilt.
 fn stock_device_model(config: &crate::config::DcentAxeConfig) -> &'static str {
     let board_cfg = config.board_config();
-    match board_cfg.board_version.as_str() {
-        "302" | "303" => "Hex",
-        "650" => "GammaDuo",
-        "701" | "702" => "SupraHex",
-        "801" => "GammaTurbo",
-        _ => match board_cfg.model {
-            dcentaxe_hal::board::BitAxeModel::Max => "Max",
-            dcentaxe_hal::board::BitAxeModel::Ultra => "Ultra",
-            dcentaxe_hal::board::BitAxeModel::Supra => "Supra",
-            dcentaxe_hal::board::BitAxeModel::Gamma => "Gamma",
-            dcentaxe_hal::board::BitAxeModel::GammaDuo => "GammaDuo",
-            dcentaxe_hal::board::BitAxeModel::GammaTurbo => "GammaTurbo",
-            dcentaxe_hal::board::BitAxeModel::HexUltra => "Hex",
-            dcentaxe_hal::board::BitAxeModel::HexSupra => "SupraHex",
-            dcentaxe_hal::board::BitAxeModel::NerdNOS => "Max",
-            dcentaxe_hal::board::BitAxeModel::NerdAxe => "Gamma",
-            dcentaxe_hal::board::BitAxeModel::NerdQaxePlus => "Supra",
-            dcentaxe_hal::board::BitAxeModel::NerdQaxePP => "Gamma",
-            // Surface Touch variants with their own marketing names so the
-            // dashboard / swarm / cgminer stock protocol identify them correctly.
-            dcentaxe_hal::board::BitAxeModel::Touch => "Touch",
-            dcentaxe_hal::board::BitAxeModel::GtTouch => "GtTouch",
-            // DCENT_axe BM1397 SKUs.
-            dcentaxe_hal::board::BitAxeModel::DcentAxeBm1397 => "DCENT_axe BM1397",
-            dcentaxe_hal::board::BitAxeModel::DcentAxeQuadBm1397 => "DCENT_axe Quad BM1397",
-            dcentaxe_hal::board::BitAxeModel::DcentAxeHexBm1397 => "DCENT_axe Hex BM1397",
-        },
-    }
+    board_cfg
+        .model
+        .stock_model_name(board_cfg.board_version.as_str())
 }
 
 fn stock_swarm_color(device_model: &str) -> &'static str {
@@ -354,7 +336,9 @@ fn stock_swarm_color(device_model: &str) -> &'static str {
 fn stock_hash_domains(asic_model: &str) -> u8 {
     match asic_model {
         "BM1397" => 1,
-        "BM1366" | "BM1368" | "BM1370" => 4,
+        // BM1373 grouped with the BM1370 family, matching the small-core /
+        // version-mask grouping used elsewhere in this file (api.rs:1008/1014).
+        "BM1366" | "BM1368" | "BM1370" | "BM1373" => 4,
         _ => 1,
     }
 }
@@ -1006,12 +990,18 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             dcentaxe_asic::AsicModel::BM1366 => 894,
             dcentaxe_asic::AsicModel::BM1368 => 1276,
             dcentaxe_asic::AsicModel::BM1370 | dcentaxe_asic::AsicModel::BM1373 => 2040,
+            // MSBT0501 (Scrypt) publishes no core-count contract in the RE'd
+            // protocol, and a SHA-256 "small core" figure would be meaningless
+            // for a 128 KiB-ROMix core anyway. 0 = "not applicable / unknown",
+            // never a fabricated number.
+            dcentaxe_asic::AsicModel::Lt0051 => 0,
         };
         let cores_per_chip: u32 = match config.asic_model() {
             dcentaxe_asic::AsicModel::BM1397 => 168,
             dcentaxe_asic::AsicModel::BM1366 => 112,
             dcentaxe_asic::AsicModel::BM1368 => 80,
             dcentaxe_asic::AsicModel::BM1370 | dcentaxe_asic::AsicModel::BM1373 => 128,
+            dcentaxe_asic::AsicModel::Lt0051 => 0,
         };
         let asic_count_val = if config.asic_count > 0 { config.asic_count as u32 } else { config.expected_asic_count() as u32 };
         // M-dash-1: expected hashrate is the host-pure, unit-tested derivation
@@ -1109,30 +1099,42 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             })
             .unwrap_or_default();
 
-        // Pre-compute voltage domains and chip health for the json! macro
+        // Pre-compute voltage domains and chip health for the json! macro.
+        //
+        // GENERIC derivation (Lucky-enablement wave): chips are partitioned
+        // sequentially into `board.voltage_domains` equal groups. The previous
+        // hand-written per-model match needed a new arm for EVERY new board and
+        // its `_` fallback silently reported 1 domain / `chips:[0]` for any
+        // multi-chip board without an arm — exactly how a 9-chip LV08 would
+        // have been misreported. The board registry is the single source of
+        // truth (`voltage_domains` is per-row and safety-pinned there — Lucky
+        // rows are pinned to 1 parallel domain, SPEC §1.1, NEVER Hex's 3-way
+        // series shape), and every legacy arm reproduces byte-identically:
+        //   Hex Ultra/Supra, DCENT_axe Hex: 6 chips / 3 domains → [0,1][2,3][4,5]
+        //   DCENT_axe Quad: 4 / 1 → [0,1,2,3]     GammaDuo/GT: 2 / 1 → [0,1]
+        //   Hammer BC02/BC04, DC02/04/06 series stacks: 1 chip per domain
+        //   single-chip default: 1 / 1 → [0]
+        //   Lucky LV06 → [0]; LV07 → [0,1]; LV08 → ONE domain [0..=8].
+        // `mv` stays the PER-DOMAIN (per-chip on series stacks) measured value,
+        // so no surface can present a per-chip voltage as a rail or vice versa.
         let voltage_domains_json = {
-            let model = config.bitaxe_model();
+            let board = config.board_config();
             let voltage = telem.voltage_mv as u32;
-            match model {
-                dcentaxe_hal::board::BitAxeModel::HexUltra |
-                dcentaxe_hal::board::BitAxeModel::HexSupra |
-                dcentaxe_hal::board::BitAxeModel::DcentAxeHexBm1397 => serde_json::json!([
-                    {"mv": voltage, "chips": [0, 1]},
-                    {"mv": voltage, "chips": [2, 3]},
-                    {"mv": voltage, "chips": [4, 5]}
-                ]),
-                // Quad: 4 BM1397 on one parallel voltage domain.
-                dcentaxe_hal::board::BitAxeModel::DcentAxeQuadBm1397 => serde_json::json!([
-                    {"mv": voltage, "chips": [0, 1, 2, 3]}
-                ]),
-                dcentaxe_hal::board::BitAxeModel::GammaDuo |
-                dcentaxe_hal::board::BitAxeModel::GammaTurbo => serde_json::json!([
-                    {"mv": voltage, "chips": [0, 1]}
-                ]),
-                _ => serde_json::json!([
-                    {"mv": voltage, "chips": [0]}
-                ]),
-            }
+            let domains = (board.voltage_domains as usize).max(1);
+            let chip_count = (board.asic_count as usize).max(1);
+            // Ceil-divide so a count that doesn't divide evenly (only possible
+            // via an inconsistent manual asic_count override) still lists every
+            // chip exactly once instead of panicking or dropping chips.
+            let per_domain = chip_count.div_ceil(domains);
+            let entries: Vec<serde_json::Value> = (0..domains)
+                .map(|d| {
+                    let start = d * per_domain;
+                    let end = ((d + 1) * per_domain).min(chip_count);
+                    let chips: Vec<usize> = (start..end).collect();
+                    serde_json::json!({"mv": voltage, "chips": chips})
+                })
+                .collect();
+            serde_json::Value::Array(entries)
         };
         let chip_health_json = {
             let chips = &telem.chip_data;
@@ -1544,6 +1546,11 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
                 creature_stage: creature_stage_clone.as_str(),
                 creature_mood: telem.creature_mood,
                 mining_enabled: telem.mining_enabled,
+                // SPEC §3 step 5: surface the boot identity gate's
+                // refuse-to-energize reason (set runtime-only by main.rs;
+                // never persisted) so the operator can diagnose the ambiguous
+                // identity from the API/dashboard. None ⇒ key omitted.
+                identity_refusal: config.identity_refusal.as_deref(),
                 // Per-chip data for multi-chip boards (GT, Hex). Phase R
                 // streaming serializer (`ChipsView`) borrows directly from
                 // telem.chip_data — no Vec<Value> allocation.
@@ -2201,12 +2208,16 @@ fn register_system_config(server: &mut EspHttpServer, state: SharedState) {
                 dcentaxe_asic::AsicModel::BM1366 => 112,
                 dcentaxe_asic::AsicModel::BM1368 => 80,
                 dcentaxe_asic::AsicModel::BM1370 | dcentaxe_asic::AsicModel::BM1373 => 128,
+                // MSBT0501 (Scrypt): no core-count contract exists — 0, not a
+                // fabricated SHA-256-shaped number.
+                dcentaxe_asic::AsicModel::Lt0051 => 0,
             },
             "smallCoreCount": match config.asic_model() {
                 dcentaxe_asic::AsicModel::BM1397 => 672,
                 dcentaxe_asic::AsicModel::BM1366 => 894,
                 dcentaxe_asic::AsicModel::BM1368 => 1276,
                 dcentaxe_asic::AsicModel::BM1370 | dcentaxe_asic::AsicModel::BM1373 => 2040,
+                dcentaxe_asic::AsicModel::Lt0051 => 0,
             },
             "versionRolling": config.stratum.version_rolling,
 

@@ -8,18 +8,44 @@
 //! the lighter cross-chip catalog used by the registry / install
 //! preflight.
 //!
-//! ## EEPROM preamble — load-bearing identifier
+//! ## EEPROM preamble — a FAMILY HINT, never an exact SKU
 //!
 //! The first two bytes of an AT24C02D chain EEPROM (i2c address 0x50)
-//! are a hashboard family preamble:
-//! - `0x04 0x11` — BHB42xxx family (S19j Pro / S19 Pro+ — BM1362 +
-//!   APW121215a).,
-//!   `dcent install` BLOCKS unless the EEPROM header matches the
-//!   product family.
-//! - `0x05 0x11` — BHB56902 family (S19k Pro — BM1366 + BHB56902 + APW
-//!   fw=0x76). this
-//!   is the canonical preamble; **routing code MUST distinguish from
-//!   BHB42xxx**.
+//! are a hashboard family preamble. Two bytes cannot encode an ASIC
+//! generation, and on this corpus they demonstrably do not:
+//! - `0x04 0x11` — BHB42xxx family (S19 / S19j Pro / T19 — BM1398 and
+//!   BM1362 both live behind these two bytes). Per
+//!   , `dcent install`
+//!   BLOCKS unless the EEPROM header matches the product family.
+//! - `0x05 0x11` — the `edf_v5_xxtea` (format-5) family. This spans
+//!   **BHB56xxx and BHB68xxx — BM1366 AND BM1368**, i.e. still multiple
+//!   ASIC generations. A live Antminer S21 (BM1368) hashboard page held at
+//!    begins
+//!   `05 11` and decodes to board name `BHB68606`.
+//!   CORRECTED 2026-08-02: an earlier revision of this doc claimed
+//!   `A3HB7xxxx` (BM1370) also lives behind `0x05 0x11`. That is FALSE —
+//!   every held decoded A3HB page is **format 1** and begins
+//!   **`0x01 0x41`** (the `0x41` is simply `'A'`, the first board-name
+//!   character, not a key selector). Evidence:
+//!   .
+//! - `0x01 0x41` — the A3HB (BM1370, format-1) family. Recognized but has
+//!   NO canonical `Hashboard` enum stand-in (no BM1370 variant exists), so
+//!   [`classify_by_eeprom_preamble`] deliberately returns `None` for it —
+//!   fail-closed at the enum level. Callers that need A3HB awareness use
+//!   `crate::hashboard_topology::classify_preamble_family`, which covers
+//!   all three families with the same hint-only semantics. Note also that
+//!   a SKU never maps to a format: BHB56801 was held as BOTH format 4 and
+//!   format 5 pages.
+//!
+//! So [`classify_by_eeprom_preamble`] returns a **canonical stand-in for
+//! the family**, exactly as the `0x04 0x11` arm has always documented
+//! itself. It is correct for populated / unpopulated / garbled triage
+//! and for choosing a decoder. It is NOT identity, and nothing that
+//! selects a voltage table, a PLL table, or a work codec may consume it
+//! as identity — take the exact SKU from
+//! `dcentrald_api_types::deployed_eeprom::decode_deployed_eeprom`, which
+//! decodes the whole 256-byte page to a board *name*, and fail closed
+//! when that is unavailable.
 //!
 //! Other hashboard families (S9 / S11 / S17 BHB-class) ship pre-AT24C02D
 //! EEPROMs with vendor-specific header layouts; RE2 doesn't pin
@@ -384,14 +410,25 @@ impl Hashboard {
     }
 }
 
-/// Look up a hashboard entry by EEPROM preamble. Used by `dcent install`
-/// preflight to decide which platform/chip family to route through.
-/// Returns the first match; preambles are intentionally non-overlapping
-/// across the BHB42xxx and BHB56902 families.
+/// Resolve an EEPROM preamble to a **family hint**, not an exact SKU.
+///
+/// Used by `dcent install` preflight and the energize gate to decide
+/// which platform/chip family to route through, and to tell a populated
+/// board from an unpopulated or garbled one. The returned [`Hashboard`]
+/// is a canonical stand-in for the family behind those two bytes; the
+/// real board may be a different SKU on different silicon.
+///
+/// Do not read the result as identity. `[0x05, 0x11]` alone is consistent
+/// with BM1366, BM1368 and BM1370 boards (see the module doc); a caller
+/// that needs the exact SKU must decode the full page via
+/// `dcentrald_api_types::deployed_eeprom::decode_deployed_eeprom` and
+/// fail closed if it cannot.
 pub fn classify_by_eeprom_preamble(preamble: [u8; 2]) -> Option<Hashboard> {
     // We can't iterate enum variants in a const fn, so spell out the
-    // preamble→variant mapping. Order matters for readability only —
-    // the preambles don't collide.
+    // preamble→family mapping. Order matters for readability only — the
+    // two preambles are distinct from each other. That is the ONLY
+    // non-overlap claim this function can make: within a preamble, the
+    // family spans multiple SKUs and multiple ASIC generations.
     if preamble == [0x04, 0x11] {
         // The BHB42xxx family shares a preamble; we return the
         // canonical S19j Pro standard SKU and let the caller (which
@@ -400,8 +437,23 @@ pub fn classify_by_eeprom_preamble(preamble: [u8; 2]) -> Option<Hashboard> {
         return Some(Hashboard::Bhb42601);
     }
     if preamble == [0x05, 0x11] {
+        // Family hint only. This preamble is the `edf_v5_xxtea` (format-5)
+        // class and covers BHB56xxx (BM1366) and BHB68xxx (BM1368).
+        // CORRECTED 2026-08-02: A3HB7xxxx (BM1370) does NOT live here —
+        // every held decoded A3HB page is format 1 and begins [0x01, 0x41]
+        // (see `epic-eeprom-matched-samples-20.json`). BHB56902 is the
+        // canonical stand-in because it is the live-decoded `a lab unit` S19k Pro
+        // board; an S21 page carries the same two bytes and is BM1368.
         return Some(Hashboard::Bhb56902);
     }
+    // [0x01, 0x41] — the A3HB (BM1370, format-1) family — is a KNOWN
+    // preamble, but there is no BM1370 `Hashboard` enum variant to stand in
+    // for it, so the enum-level classifier stays fail-closed (None) here.
+    // This is deliberate, regression-pinned behavior, not an omission:
+    // callers needing A3HB awareness use
+    // `crate::hashboard_topology::classify_preamble_family`, which returns
+    // `PreambleFamily::A3hbFormat1` with the same hint-only (never
+    // identity) semantics.
     None
 }
 
@@ -500,7 +552,9 @@ mod tests {
             classify_by_eeprom_preamble([0x04, 0x11]),
             Some(Hashboard::Bhb42601)
         );
-        // BHB56902 → unique route.
+        // edf_v5_xxtea family → return the BHB56902 canonical stand-in;
+        // caller refines. NOT a unique route: see
+        // `the_0x05_preamble_spans_asic_generations_so_it_cannot_be_an_exact_sku`.
         assert_eq!(
             classify_by_eeprom_preamble([0x05, 0x11]),
             Some(Hashboard::Bhb56902)
@@ -508,6 +562,55 @@ mod tests {
         // Unknown preambles → None (caller must error out).
         assert_eq!(classify_by_eeprom_preamble([0x00, 0x00]), None);
         assert_eq!(classify_by_eeprom_preamble([0xFF, 0xFF]), None);
+        // [0x01, 0x41] (A3HB / BM1370 format-1 family) is a KNOWN family
+        // that DELIBERATELY returns None at the enum level — no BM1370
+        // enum stand-in exists. A3HB-aware callers use
+        // `hashboard_topology::classify_preamble_family` instead. Pinned
+        // so nobody "handles" it by returning a wrong-family stand-in.
+        assert_eq!(classify_by_eeprom_preamble([0x01, 0x41]), None);
+    }
+
+    /// Pin the divergence itself, so the preamble can never be silently
+    /// re-asserted as an exact SKU.
+    ///
+    /// Asserting only that `[0x05,0x11]` maps to `Bhb56902` — which the test
+    /// above already does — merely restates the table and can never fail. The
+    /// load-bearing assertion here is the LAST one: a board carrying that same
+    /// preamble resolves, in this workspace's own deployed-page SKU catalog, to
+    /// different silicon than the stand-in's catalog row names.
+    ///
+    /// Honest note on its mutation: this test guards the FACT, not the prose.
+    /// Reverting the doc-comment corrections in this module would not turn it
+    /// red. It goes red if someone edits the preamble table to claim exactness,
+    /// or edits either catalog so the two stop disagreeing — which is the thing
+    /// that would actually be wrong.
+    #[test]
+    fn the_0x05_preamble_spans_asic_generations_so_it_cannot_be_an_exact_sku() {
+        use dcentrald_api_types::eeprom_record::chip_family_for_sku;
+
+        // What the preamble lookup can offer: a family stand-in, whose catalog
+        // row necessarily names exactly one chip.
+        assert_eq!(
+            classify_by_eeprom_preamble([0x05, 0x11]),
+            Some(Hashboard::Bhb56902)
+        );
+        let stand_in_chip = Hashboard::Bhb56902.catalog().chip_name;
+        assert_eq!(stand_in_chip, "BM1366");
+
+        // What boards behind that same preamble actually are. Both of these
+        // ship `edf_v5_xxtea_key1` pages, i.e. both begin `05 11`. BHB68606 is
+        // the board name the held live Antminer S21 page at
+        //  decodes to.
+        assert_eq!(chip_family_for_sku("BHB56902"), Some("BM1366"));
+        assert_eq!(chip_family_for_sku("BHB68606"), Some("BM1368"));
+
+        assert_ne!(
+            chip_family_for_sku("BHB68606"),
+            Some(stand_in_chip),
+            "a board sharing the 05 11 preamble resolves to different silicon \
+             than the preamble stand-in claims — the preamble is a family hint, \
+             and no caller may consume it as exact identity"
+        );
     }
 
     #[test]

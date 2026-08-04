@@ -1826,7 +1826,7 @@ async fn build_timed_hashreport_result(
     context.report_id = test_id;
     let mut report = build_hashreport_snapshot(&context, chain);
     report.report_id = test_id;
-    report.report_version = "timed-v1".to_string();
+    report.report_version = "timed-v2".to_string();
     report.report_kind = "timed_background_job".to_string();
     report.duration_seconds = elapsed_s.min(u32::MAX as u64) as u32;
     report.source = if context.history.is_empty() {
@@ -1835,7 +1835,7 @@ async fn build_timed_hashreport_result(
         "timed_runtime_plus_history_at_completion".to_string()
     };
     report.unit_grade_explanation = format!(
-        "Timed HashReport background job observed live runtime for {}s and generated the final report from completion-time miner state.",
+        "HashReport waited for {}s and generated its report from completion-time miner state. Passing grade remains withheld because this step does not capture bounded chip enumeration, typed temperature provenance, voltage readback, or a bounded CRC window.",
         report.duration_seconds
     );
     report.warnings.push(

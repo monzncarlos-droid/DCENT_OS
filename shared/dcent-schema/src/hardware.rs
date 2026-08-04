@@ -224,6 +224,156 @@ impl ArtifactMaturity {
     }
 }
 
+/// Named specialised mining lifecycle (routing lane).
+///
+/// A lane names *how* a target mines when it does not run through the generic
+/// `Platform` trait. It is a routing fact, not a maturity tier: a target can be
+/// `Experimental` on the maturity axis while being correctly routed here.
+/// Consumed by [`RuntimeStatus::SpecialisedLifecycle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LifecycleLane {
+    /// Native Amlogic serial-mining lifecycle with retained bus-1 power/thermal
+    /// ownership (the NoPic management fabric). Generic `Platform` construction
+    /// is deliberately refused on this carrier.
+    #[serde(rename = "amlogic_native_serial")]
+    AmlogicNativeSerial,
+    /// Exact AM2/Zynq BM1362 direct-serial lifecycle.
+    #[serde(rename = "am2_bm1362_serial")]
+    Am2Bm1362Serial,
+    /// AM3 BeagleBone serial lifecycle (`--am3-bb-mining`).
+    #[serde(rename = "am3_bb_serial")]
+    Am3BbSerial,
+    /// AM2 S19j hybrid lifecycle (`--s19j-hybrid`).
+    #[serde(rename = "s19j_hybrid")]
+    S19jHybrid,
+}
+
+impl LifecycleLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AmlogicNativeSerial => "amlogic_native_serial",
+            Self::Am2Bm1362Serial => "am2_bm1362_serial",
+            Self::Am3BbSerial => "am3_bb_serial",
+            Self::S19jHybrid => "s19j_hybrid",
+        }
+    }
+}
+
+/// What generic `Platform` construction does on a specialised-lifecycle target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GenericConstruction {
+    /// Generic construction returns `Err` by design (Amlogic: the board
+    /// requires the native serial-mining lifecycle with retained power/thermal
+    /// ownership, so generic `Platform` construction is refused).
+    #[serde(rename = "refused")]
+    Refused,
+    /// Generic construction succeeds but owns management surfaces only; mining
+    /// requires the named lane (Zynq hybrid, BeagleBone serial).
+    #[serde(rename = "management_only")]
+    ManagementOnly,
+}
+
+impl GenericConstruction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::ManagementOnly => "management_only",
+        }
+    }
+}
+
+/// Why a registered board target does or does not run — first-class, not an
+/// error string.
+///
+/// Two platform constructors return `Err` unconditionally today for
+/// structurally different reasons, and a status model that flattens them lies:
+///
+/// - Amlogic (`dcentrald-hal/src/platform/amlogic/mod.rs`,
+///   `AmlogicPlatform::new`) is an **architectural routing refusal** — the
+///   board mines via the native serial lifecycle; generic construction is
+///   refused. Amlogic routes elsewhere; it is not broken.
+/// - CVitek (`dcentrald-hal/src/platform/cvitek.rs`, `CViTekPlatform::new`) is
+///   a **genuine not-implemented fail-closed** — reverse-engineered register
+///   evidence is retained, but no runtime mutation lane is admitted.
+///
+/// Collapsing both to "unsupported" would either falsely condemn Amlogic or
+/// falsely promise CVitek. This axis is orthogonal to maturity and install
+/// authorization.
+///
+/// Deliberately `Serialize`-only: statuses are declared in code next to the
+/// registry row they describe and are never parsed from data. Accepting a
+/// deserialized status would let external input inject a "this target runs"
+/// claim, so the absence of `Deserialize` is the fail-closed choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "status")]
+pub enum RuntimeStatus {
+    /// Runs through the generic `Platform` trait.
+    #[serde(rename = "generic_platform")]
+    GenericPlatform,
+    /// Runs, but ONLY through a named specialised lifecycle. This is a routing
+    /// fact, not a capability gap.
+    #[serde(rename = "specialised_lifecycle")]
+    SpecialisedLifecycle {
+        lane: LifecycleLane,
+        generic_construction: GenericConstruction,
+    },
+    /// Evidence is retained; no runtime mutation lane is admitted. Not a bug,
+    /// not a routing detail — an explicit product decision. The `evidence`
+    /// list must be non-empty (enforced by [`Self::is_well_formed`] and by the
+    /// registry test) and such a row must never be a public-beta install
+    /// target.
+    #[serde(rename = "evidence_retained_not_implemented")]
+    EvidenceRetainedNotImplemented { evidence: &'static [&'static str] },
+    /// Management-only by policy, even though a lane could exist. `gate` names
+    /// the policy or missing admission that keeps mining off.
+    #[serde(rename = "management_only_by_policy")]
+    ManagementOnlyByPolicy { gate: &'static str },
+    /// No control-board datums captured yet; capture-first. `unconfirmed`
+    /// names the datums that must be captured before any lane can exist.
+    #[serde(rename = "capture_first")]
+    CaptureFirst {
+        unconfirmed: &'static [&'static str],
+    },
+}
+
+impl RuntimeStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::GenericPlatform => "generic_platform",
+            Self::SpecialisedLifecycle { .. } => "specialised_lifecycle",
+            Self::EvidenceRetainedNotImplemented { .. } => "evidence_retained_not_implemented",
+            Self::ManagementOnlyByPolicy { .. } => "management_only_by_policy",
+            Self::CaptureFirst { .. } => "capture_first",
+        }
+    }
+
+    /// Whether this status names an admissible mining lane at all.
+    ///
+    /// `SpecialisedLifecycle` counts: routing elsewhere is not a capability
+    /// gap. The three refusal statuses do not.
+    pub const fn permits_mining_lane(&self) -> bool {
+        matches!(
+            self,
+            Self::GenericPlatform | Self::SpecialisedLifecycle { .. }
+        )
+    }
+
+    /// Fail-closed structural validity: every explanatory payload must be
+    /// non-empty and contain no blank entries. A refusal that cannot say why
+    /// it refuses is not well-formed.
+    pub fn is_well_formed(&self) -> bool {
+        fn all_non_blank(entries: &[&str]) -> bool {
+            !entries.is_empty() && entries.iter().all(|entry| !entry.trim().is_empty())
+        }
+        match self {
+            Self::GenericPlatform | Self::SpecialisedLifecycle { .. } => true,
+            Self::EvidenceRetainedNotImplemented { evidence } => all_non_blank(evidence),
+            Self::ManagementOnlyByPolicy { gate } => !gate.trim().is_empty(),
+            Self::CaptureFirst { unconfirmed } => all_non_blank(unconfirmed),
+        }
+    }
+}
+
 /// Independent enablement facets for one packaged board target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HardwareEnablementPolicy {
@@ -328,6 +478,58 @@ mod tests {
             );
         }
         assert_eq!(ArtifactKind::parse("firmware-ish"), None);
+    }
+
+    #[test]
+    fn runtime_status_distinguishes_routing_refusal_from_not_implemented() {
+        let amlogic_shaped = RuntimeStatus::SpecialisedLifecycle {
+            lane: LifecycleLane::AmlogicNativeSerial,
+            generic_construction: GenericConstruction::Refused,
+        };
+        let cvitek_shaped = RuntimeStatus::EvidenceRetainedNotImplemented {
+            evidence: &["dcentrald-hal/src/platform/cvitek.rs"],
+        };
+        assert_ne!(amlogic_shaped, cvitek_shaped);
+        // Routing elsewhere still names a mining lane; retained-evidence
+        // not-implemented does not.
+        assert!(amlogic_shaped.permits_mining_lane());
+        assert!(!cvitek_shaped.permits_mining_lane());
+        assert_eq!(amlogic_shaped.as_str(), "specialised_lifecycle");
+        assert_eq!(cvitek_shaped.as_str(), "evidence_retained_not_implemented");
+    }
+
+    #[test]
+    fn runtime_status_fails_closed_on_absent_or_blank_evidence() {
+        assert!(!RuntimeStatus::EvidenceRetainedNotImplemented { evidence: &[] }.is_well_formed());
+        assert!(
+            !RuntimeStatus::EvidenceRetainedNotImplemented { evidence: &["  "] }.is_well_formed()
+        );
+        assert!(!RuntimeStatus::ManagementOnlyByPolicy { gate: "" }.is_well_formed());
+        assert!(!RuntimeStatus::CaptureFirst { unconfirmed: &[] }.is_well_formed());
+        assert!(RuntimeStatus::EvidenceRetainedNotImplemented {
+            evidence: &["dcentrald-hal/src/platform/cvitek.rs"]
+        }
+        .is_well_formed());
+        assert!(RuntimeStatus::GenericPlatform.is_well_formed());
+    }
+
+    #[test]
+    fn runtime_status_serializes_with_stable_wire_labels() {
+        let value = serde_json::to_value(RuntimeStatus::SpecialisedLifecycle {
+            lane: LifecycleLane::AmlogicNativeSerial,
+            generic_construction: GenericConstruction::Refused,
+        })
+        .unwrap();
+        assert_eq!(value["status"], "specialised_lifecycle");
+        assert_eq!(value["lane"], "amlogic_native_serial");
+        assert_eq!(value["generic_construction"], "refused");
+
+        let value = serde_json::to_value(RuntimeStatus::EvidenceRetainedNotImplemented {
+            evidence: &["dcentrald-hal/src/platform/cvitek.rs"],
+        })
+        .unwrap();
+        assert_eq!(value["status"], "evidence_retained_not_implemented");
+        assert_eq!(value["evidence"][0], "dcentrald-hal/src/platform/cvitek.rs");
     }
 
     #[test]

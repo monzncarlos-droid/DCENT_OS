@@ -67,6 +67,12 @@ PROC_CMDLINE_PATH="/proc/cmdline"
 ARCHIVE_ADMISSION_HELPER="/usr/libexec/dcentos/sysupgrade-archive-admission.sh"
 MANIFEST_JSON_HELPER="/usr/libexec/dcentos/sysupgrade-manifest-json.py"
 ZYNQ_GEOMETRY_HELPER="/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh"
+DEPLOY_LOCK_HELPER="/usr/libexec/dcentos/dcentos-deploy-lock"
+DEPLOY_UPGRADE_GUARD="/usr/libexec/dcentos/dcentrald-deploy-upgrade-guard.sh"
+SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
+SYSUPGRADE_UPDATE_LOCK="/run/dcentos-sysupgrade.lock"
+SYSUPGRADE_UPDATE_LOCK_OWNED=0
+SYSUPGRADE_MUTATION_STARTED=0
 WRONG_BOARD_EXIT=78
 if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     SCRIPT_REALPATH=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
@@ -91,6 +97,20 @@ if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     ARCHIVE_ADMISSION_HELPER="${DCENT_SYSUPGRADE_ARCHIVE_ADMISSION_HELPER:-$ARCHIVE_ADMISSION_HELPER}"
     MANIFEST_JSON_HELPER="${DCENT_SYSUPGRADE_MANIFEST_JSON_HELPER:-$MANIFEST_JSON_HELPER}"
     ZYNQ_GEOMETRY_HELPER="${DCENT_SYSUPGRADE_ZYNQ_GEOMETRY_HELPER:-$ZYNQ_GEOMETRY_HELPER}"
+fi
+
+if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
+    if [ "${DCENT_SYSUPGRADE_DEPLOY_LOCK_HELD:-0}" != "1" ]; then
+        [ -x "$DEPLOY_LOCK_HELPER" ] || {
+            echo "Error: deploy exclusion helper is missing: $DEPLOY_LOCK_HELPER"
+            exit 1
+        }
+        exec "$DEPLOY_LOCK_HELPER" -- env DCENT_SYSUPGRADE_DEPLOY_LOCK_HELD=1 "$0" "$@"
+    fi
+    [ "$(readlink "/proc/$PPID/exe" 2>/dev/null)" = "$DEPLOY_LOCK_HELPER" ] || {
+        echo "Error: sysupgrade deploy-lock provenance is invalid"
+        exit 1
+    }
 fi
 
 # --- am2-s17p expected UBI volume layout ---
@@ -125,10 +145,28 @@ if [ ! -r "$MANIFEST_JSON_HELPER" ] || ! command -v python3 >/dev/null 2>&1; the
     exit 1
 fi
 
+release_pre_mutation_update_lock() {
+    if [ "$SYSUPGRADE_UPDATE_LOCK_OWNED" = "1" ] \
+       && [ "$SYSUPGRADE_MUTATION_STARTED" = "0" ]; then
+        [ -d "$SYSUPGRADE_UPDATE_LOCK" ] \
+            && [ ! -L "$SYSUPGRADE_UPDATE_LOCK" ] \
+            && rmdir "$SYSUPGRADE_UPDATE_LOCK" 2>/dev/null || true
+        SYSUPGRADE_UPDATE_LOCK_OWNED=0
+    fi
+}
+
 cleanup_package() {
+    release_pre_mutation_update_lock
     if [ -n "$PACKAGE_DIR" ] && [ -d "$PACKAGE_DIR" ]; then
         rm -rf "$PACKAGE_DIR"
     fi
+}
+
+terminate_sysupgrade() {
+    signal_exit=$1
+    trap - EXIT INT TERM
+    cleanup_package
+    exit "$signal_exit"
 }
 
 manifest_field() {
@@ -508,7 +546,9 @@ payload_fits_ubi_volume() {
     return 0
 }
 
-trap cleanup_package EXIT INT TERM
+trap cleanup_package EXIT
+trap 'terminate_sysupgrade 130' INT
+trap 'terminate_sysupgrade 143' TERM
 
 # Parse arguments
 for arg in "$@"; do
@@ -941,6 +981,16 @@ if [ "$TEST_ONLY" = "1" ]; then
     exit 0
 fi
 
+if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
+    [ -r "$DEPLOY_UPGRADE_GUARD" ] || {
+        echo "Error: deploy upgrade guard is missing: $DEPLOY_UPGRADE_GUARD"
+        exit 1
+    }
+    . "$DEPLOY_UPGRADE_GUARD"
+    command -v dcent_deploy_upgrade_guard >/dev/null 2>&1 \
+        && dcent_deploy_upgrade_guard || exit 1
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
     echo "  DRY-RUN: NAND writes and U-Boot env flip will be SKIPPED."
     echo ""
@@ -955,6 +1005,34 @@ if [ "$FORCE" -eq 0 ] && [ "$DRY_RUN" = "0" ]; then
     esac
 elif [ "$FORCE" -eq 1 ]; then
     echo "  Force mode (-f): skipping confirmation"
+fi
+
+if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
+    [ -x "$SESSION_LATCH_HELPER" ] || {
+        echo "Error: hardware-session admission helper is missing: $SESSION_LATCH_HELPER"
+        exit 1
+    }
+    if [ -e "$SYSUPGRADE_UPDATE_LOCK" ] || [ -L "$SYSUPGRADE_UPDATE_LOCK" ]; then
+        echo "Error: hardware-session update transaction is already active: $SYSUPGRADE_UPDATE_LOCK"
+        exit 1
+    fi
+    if ! (umask 077; mkdir "$SYSUPGRADE_UPDATE_LOCK"); then
+        echo "Error: cannot acquire hardware-session update transaction: $SYSUPGRADE_UPDATE_LOCK"
+        exit 1
+    fi
+    SYSUPGRADE_UPDATE_LOCK_OWNED=1
+    if ! chmod 700 "$SYSUPGRADE_UPDATE_LOCK" \
+       || [ "$(stat -c '%u:%a' "$SYSUPGRADE_UPDATE_LOCK" 2>/dev/null)" != "0:700" ]; then
+        echo "Error: hardware-session update transaction metadata is unsafe"
+        release_pre_mutation_update_lock
+        exit 1
+    fi
+    if ! "$SESSION_LATCH_HELPER" admit-update \
+        /data "$SYSUPGRADE_UPDATE_LOCK" "$CURRENT_MTD"; then
+        echo "Error: firmware transition blocked by hardware-session disposition"
+        release_pre_mutation_update_lock
+        exit 1
+    fi
 fi
 
 echo ""
@@ -1046,6 +1124,7 @@ if [ ! -e /dev/ubi1_0 ] || [ ! -e /dev/ubi1_1 ]; then
             exit 0
         else
             echo "  Factory-blank inactive slot detected ($AVAIL_LEBS LEBs available). Creating volumes..."
+            SYSUPGRADE_MUTATION_STARTED=1
             if ! ubimkvol /dev/ubi1 -N kernel      -s $((EXPECTED_KERNEL_LEBS * UBI_LEB_SIZE)) -t dynamic; then
                 echo "Error: ubimkvol kernel failed"; ubidetach -d 1 2>/dev/null || true; exit 1
             fi
@@ -1179,6 +1258,7 @@ if ! payload_fits_ubi_volume "kernel" "$KERNEL_SIZE" "$KERNEL_LEBS" "$UBI_LEB_SI
     exit 1
 fi
 
+SYSUPGRADE_MUTATION_STARTED=1
 if ! ubiupdatevol /dev/ubi1_0 "$KERNEL_SOURCE"; then
     echo "Error: Failed to write kernel to ubi1_0"
     rm -f /tmp/kernel.bin

@@ -216,6 +216,16 @@ pub enum Am3BbIdentityEvidence {
     ExactDeviceTree,
 }
 
+impl Am3BbIdentityEvidence {
+    /// Stable receipt vocabulary; presentation strings are not route authority.
+    pub const fn receipt_label(self) -> &'static str {
+        match self {
+            Self::BoardTargetMarker => "board_target_marker",
+            Self::ExactDeviceTree => "exact_device_tree",
+        }
+    }
+}
+
 /// Where the per-board-target TOML lives on a DCENT_OS rootfs.
 pub const BOARD_TARGET_DIR: &str = "/etc/dcentos/board_targets";
 
@@ -233,7 +243,7 @@ fn dt_compatible_has_exact_token(raw: &[u8], expected: &str) -> bool {
         .any(|value| value == expected.as_bytes())
 }
 
-/// Authorize the one production AM3-BeagleBone mining topology.
+/// Authorize the one executable Experimental AM3-BeagleBone mining topology.
 ///
 /// An explicit marker is authoritative: it must match exactly and cannot be
 /// rescued by unrelated device-tree evidence. With no marker, the exact
@@ -319,8 +329,11 @@ fn bind_am3_bb_dspic_endpoint_from_observations(
     // The exact `a lab unit` S19J_IO_BOARD_V2_0 trace proves fw=0x89 on all three
     // hashboard controllers. Accept only reply shapes already admitted by the
     // legacy direct-serial parser; this issuer must not broaden wire grammar.
-    // Several distinct BHB56 firmware-reply framings all attest fw 0x89; keeping
-    // them as separate arms documents each recognized shape.
+    // clippy::if_same_then_else: the arms are identical ON PURPOSE. Each CONDITION
+    // admits a different GET_VERSION reply shape already accepted by the legacy
+    // direct-serial parser; they all resolve to fw=0x89. Collapsing them with `||`
+    // would hide which wire shapes are admitted, and this issuer must not broaden
+    // wire grammar.
     #[allow(clippy::if_same_then_else)]
     let firmware = if firmware_reply.len() >= 3
         && firmware_reply[0] == 0x05
@@ -500,13 +513,15 @@ pub struct BoardTargetUartSection {
 }
 
 fn default_uart_chains_v2() -> Vec<BoardTargetUartChain> {
+    const BASE_ADDRS: [u64; 3] = [0x4802_2000, 0x4802_4000, 0x481A_8000];
     CHAIN_UARTS_V2_0
         .iter()
+        .zip(BASE_ADDRS)
         .enumerate()
-        .map(|(i, &dev)| BoardTargetUartChain {
+        .map(|(i, (&dev, base_addr))| BoardTargetUartChain {
             index: i as u8,
             device: dev.to_string(),
-            base_addr: None,
+            base_addr: Some(base_addr),
             base_baud: 3_000_000,
         })
         .collect()
@@ -849,25 +864,86 @@ fn validate_supported_board_target(name: &str, target: &BeagleBoneBoardTarget) -
             )));
         }
     }
+    let exact_uarts = [
+        (0u8, "/dev/ttyS1", 0x4802_2000u64),
+        (1u8, "/dev/ttyS2", 0x4802_4000u64),
+        (2u8, "/dev/ttyS4", 0x481A_8000u64),
+    ];
     if target.uart.chain_count != 3
-        || target.uart.chains.len() != 3
+        || target.uart.chains.len() != exact_uarts.len()
         || !target
             .uart
             .chains
             .iter()
-            .enumerate()
-            .all(|(index, chain)| usize::from(chain.index) == index)
+            .zip(exact_uarts)
+            .all(|(chain, (index, device, base_addr))| {
+                chain.index == index
+                    && chain.device == device
+                    && chain.base_addr == Some(base_addr)
+                    && chain.base_baud == 3_000_000
+            })
+        || target.uart.mining_baud != 3_000_000
     {
         return Err(HalError::Platform(format!(
-            "BeagleBone: {} UART geometry must declare exactly chains 0,1,2; got chain_count={} entries={:?}",
+            "BeagleBone: {} UART topology must exactly match the admitted tty/base/baud tuple; got chain_count={} entries={:?} mining_baud={}",
             DEFAULT_BOARD_TARGET_V2_0,
             target.uart.chain_count,
             target
                 .uart
                 .chains
                 .iter()
-                .map(|chain| chain.index)
+                .map(|chain| (&chain.index, &chain.device, &chain.base_addr, &chain.base_baud))
                 .collect::<Vec<_>>()
+            ,
+            target.uart.mining_baud
+        )));
+    }
+
+    let gpio_exact = target.gpio.board_enable == GPIO_BOARD_ENABLE_V2_0
+        && target.gpio.asic_rst == GPIO_ASIC_RST_V2_0
+        && target.gpio.plug_detect == GPIO_PLUG_DETECT_V2_0
+        && target.gpio.fan_tach == GPIO_FAN_TACH_V2_0
+        && target.gpio.led == [GPIO_LED_V2_0.0, GPIO_LED_V2_0.1];
+    if !gpio_exact {
+        return Err(HalError::Platform(format!(
+            "BeagleBone: {} GPIO topology is not the exact S19J_IO_BOARD_V2_0 tuple",
+            DEFAULT_BOARD_TARGET_V2_0
+        )));
+    }
+
+    let i2c_exact = target.i2c.eeprom_bus == I2C_BUS_EEPROM_V2_0
+        && target.i2c.eeprom_addrs == [0x50, 0x51, 0x52]
+        && target.i2c.eeprom_write_deny
+        && target.i2c.psu_bus == I2C_BUS_PSU_V2_0
+        && target.i2c.psu_addr == I2C_ADDR_PSU_V2_0
+        && target.i2c.psu_kind == "apw12-uart-tunnel";
+    if !i2c_exact {
+        return Err(HalError::Platform(format!(
+            "BeagleBone: {} I2C topology/policy is not the exact admitted EEPROM/dsPIC/PSU tuple",
+            DEFAULT_BOARD_TARGET_V2_0
+        )));
+    }
+
+    let cold = &target.cold_boot;
+    let cold_boot_exact = !cold.enable_pic1704_dc_dc
+        && !cold.run_pic_heartbeat
+        && cold.run_miscctrl_triple_write
+        && cold.apw12_rail_open_core_mv == 15_000
+        && cold.apw12_rail_steady_mv == 13_800
+        && cold.gpio59_settle_ms == 3_000
+        && cold.asic_rst_stagger_ms == 10
+        && cold.asic_rst_settle_ms == 1_100
+        && cold.asic_rst_retry_chain == Some(1)
+        && cold.asic_rst_retry_pulses == 2
+        && cold.asic_rst_retry_assert_ms == 200
+        && cold.asic_rst_retry_release_ms == 100
+        && cold.initial_freq_mhz == 400
+        && cold.fan_boot_pwm == 10
+        && cold.fan_max_pwm == 30;
+    if !cold_boot_exact {
+        return Err(HalError::Platform(format!(
+            "BeagleBone: {} cold-boot voltage/reset/timing/cooling policy is not the exact admitted tuple",
+            DEFAULT_BOARD_TARGET_V2_0
         )));
     }
     Ok(())
@@ -879,10 +955,11 @@ fn validate_supported_board_target(name: &str, target: &BeagleBoneBoardTarget) -
 // fan code synthesized RPM from PWM (`900 + (pwm * 40)`), which masked any
 // real fan failure on am3-bb. W3.3 replaces that with a real edge counter.
 //
-// Stock Bitmain BB ships kernel 3.8.13 (.79 capture). The `/dev/gpiochip*`
-// chardev v1 ABI is present in 3.8 but the AM335x DTB Bitmain ships does
-// NOT enable interrupts on the tach lines. We therefore implement a polling
-// sysfs sampler that counts 1→0 transitions over a sliding 1-second window.
+// Stock Bitmain BB ships kernel 3.8.13 (.79 capture), which predates the GPIO
+// character-device ABI. LuxOS evidence includes 5.4, but one backend must work
+// on both deployed lineages and the AM335x DTB does not provide a validated
+// edge-event path for these tach lines. We therefore implement a polling sysfs
+// sampler that counts 1→0 transitions over a sliding 1-second window.
 
 /// Sampler tick interval (2 ms = 500 Hz polling).
 const FAN_TACH_SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
@@ -912,6 +989,8 @@ pub struct BeagleBonePlatform {
     /// Authorized board-target name. Runtime construction requires an exact
     /// marker or exact live-captured device-tree identity.
     board_target_name: String,
+    /// Immutable provenance that authorized this exact topology.
+    identity_evidence: Am3BbIdentityEvidence,
     /// Parsed target, or built-in `a lab unit` topology only for exact LuxOS DT evidence.
     board_target: BeagleBoneBoardTarget,
 }
@@ -1015,6 +1094,7 @@ impl BeagleBonePlatform {
         Ok(Self {
             config,
             board_target_name,
+            identity_evidence: identity,
             board_target,
         })
     }
@@ -1025,6 +1105,7 @@ impl BeagleBonePlatform {
         Self {
             config,
             board_target_name: DEFAULT_BOARD_TARGET_V2_0.to_string(),
+            identity_evidence: Am3BbIdentityEvidence::BoardTargetMarker,
             board_target: BeagleBoneBoardTarget::hardcoded_v2_0_defaults(),
         }
     }
@@ -1038,6 +1119,7 @@ impl BeagleBonePlatform {
         Self {
             config,
             board_target_name: board_target_name.into(),
+            identity_evidence: Am3BbIdentityEvidence::BoardTargetMarker,
             board_target,
         }
     }
@@ -1045,6 +1127,11 @@ impl BeagleBonePlatform {
     /// The active board-target name (`am3-bb-s19jpro` by default).
     pub fn board_target_name(&self) -> &str {
         &self.board_target_name
+    }
+
+    /// Immutable identity provenance captured before any hardware owner opens.
+    pub fn identity_evidence(&self) -> Am3BbIdentityEvidence {
+        self.identity_evidence
     }
 
     /// The loaded board-target config (or the hardcoded `a lab unit` defaults).
@@ -1180,14 +1267,24 @@ impl BeagleBonePlatform {
     /// The `pic`/`uarts` arguments are passed through to the cold-boot
     /// function — the daemon constructs the APW UART-tunnel PSU controller
     /// and per-chain UARTs (Phase C). See the cold-boot module docs.
-    pub fn run_cold_boot<B: crate::psu_apw_uart_tunnel::ApwUartTunnelBus>(
+    pub fn run_cold_boot<
+        B: crate::psu_apw_uart_tunnel::ApwUartTunnelBus,
+        G: super::beaglebone_cold_boot::PreparedBoardEnable,
+    >(
         &self,
         psu: &mut crate::psu_apw_uart_tunnel::ApwUartTunnel<B>,
         uarts: &mut [crate::serial::DevmemUart],
+        board_enable: &mut G,
     ) -> Result<()> {
         let opts =
             super::beaglebone_cold_boot::ColdBootOptsV2::from_board_target(&self.board_target);
-        super::beaglebone_cold_boot::cold_boot_sequence_s19j_io_v2(self, psu, uarts, opts)
+        super::beaglebone_cold_boot::cold_boot_sequence_s19j_io_v2(
+            self,
+            psu,
+            uarts,
+            opts,
+            board_enable,
+        )
     }
 }
 
@@ -2737,6 +2834,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"]
         );
+        assert_eq!(
+            bt.uart
+                .chains
+                .iter()
+                .map(|c| c.base_addr)
+                .collect::<Vec<_>>(),
+            vec![Some(0x4802_2000), Some(0x4802_4000), Some(0x481A_8000)]
+        );
         assert_eq!(bt.i2c.eeprom_bus, 0);
         assert_eq!(bt.i2c.psu_bus, 1);
         assert_eq!(bt.i2c.psu_addr, 0x10);
@@ -3046,6 +3151,32 @@ voltage_controller = "dspic33ep-fw89"
                 .expect_err("malformed board-enable polarity must fail closed")
                 .to_string();
         assert!(invalid_polarity_error.contains("must be exactly \"high\" or \"low\""));
+
+        let mut wrong_gpio = declared.clone();
+        wrong_gpio.gpio.board_enable = 65;
+        assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &wrong_gpio).is_err());
+        let mut wrong_uart = declared.clone();
+        wrong_uart.uart.chains[1].device = "/dev/ttyS3".into();
+        assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &wrong_uart).is_err());
+        let mut wrong_uart_base = declared.clone();
+        wrong_uart_base.uart.chains[2].base_addr = Some(0x481A_A000);
+        assert!(
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &wrong_uart_base).is_err()
+        );
+        let mut eeprom_writes_enabled = declared.clone();
+        eeprom_writes_enabled.i2c.eeprom_write_deny = false;
+        assert!(
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &eeprom_writes_enabled)
+                .is_err()
+        );
+        let mut wrong_voltage = declared.clone();
+        wrong_voltage.cold_boot.apw12_rail_steady_mv = 14_000;
+        assert!(
+            validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &wrong_voltage).is_err()
+        );
+        let mut wrong_timing = declared.clone();
+        wrong_timing.cold_boot.gpio59_settle_ms = 2_999;
+        assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &wrong_timing).is_err());
         declared.uart.chain_count = 4;
         assert!(validate_supported_board_target(DEFAULT_BOARD_TARGET_V2_0, &declared).is_err());
     }

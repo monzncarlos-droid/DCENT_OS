@@ -44,9 +44,6 @@ use dcentrald_hal::fpga_chain::FpgaChain;
 /// BM1391 chip ID. Read from the chip-address register (reg 0x00, bits 31:16).
 pub const CHIP_ID: u16 = 0x1391;
 
-/// Crystal oscillator reference (MHz) — standard 25 MHz, jig `set_BM1391_freq`.
-const FREQ_MULT: f64 = 25.0;
-
 /// Default chips per chain for the S11 hashboard (BHB91601/BHB91603).
 /// Sourced from the AMTC S11 (`V11-S`) Config.ini (AsicNum=60). Verify on a
 /// live S11 — the driver enumerates, this is the passthrough fallback only.
@@ -65,9 +62,8 @@ const CORES_PER_CHIP: u32 = 128;
 /// like BM1387. NEEDS-LIVE-VERIFY against `single_BM1391_check_nonce`.
 pub const RESPONSE_BYTES: usize = 9;
 
-/// 200 MHz fallback PLL value (jig `set_BM1391_freq` "using 200M pll"):
-/// `0xC0780111` (PLLEN, FBDIV=0x78=120, REFDIV=1, POSTDIV1=1, POSTDIV2=1).
-const PLL_FALLBACK_200M: u32 = 0xC078_0111;
+/// 200 MHz fallback PLL value — pure SSOT (`dcentrald_common::BM1391_PLL_FALLBACK_200M`).
+const PLL_FALLBACK_200M: u32 = dcentrald_common::BM1391_PLL_FALLBACK_200M;
 
 /// BM1391 register addresses — JIG-VERIFIED from `BM1391_set_config` call sites.
 pub mod regs {
@@ -188,26 +184,23 @@ impl ChipDriver for Bm1391Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BM1391 writes the ticket mask BIT-REVERSED (jig `BM1391_set_TM` via
-        // `bit_swap_table`). At difficulty 256 raw == reversed == 0xFF, so the
-        // common path is value `difficulty - 1`; non-256 difficulties need the
-        // per-byte bit-reversal applied at the wire-frame layer.
-        difficulty.max(1).saturating_sub(1)
+        // G25 pure SSOT: BM1391_set_TM bit-swap (was wrongly plain while comments
+        // claimed bit-reversed — fixed to BitReversed for non-256 difficulties).
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::BitReversed,
+            difficulty.max(1),
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {
-        // Standard BM13xx PLL encoding (jig `set_BM1391_freq`):
-        // reg_value = 0xC0000000 | fbdiv<<16 | refdiv<<8 | postdiv;
-        // f = 25 * fbdiv / (refdiv * postdiv1 * postdiv2).
-        // Defaults refdiv=1, postdiv1=postdiv2=1 → fbdiv = freq/25.
-        let fb_div = ((freq_mhz as f64) / FREQ_MULT).round().clamp(40.0, 240.0) as u16;
-        let reg_value = 0xC000_0000 | ((fb_div as u32) << 16) | (1u32 << 8) | 0x11;
+        // G42 pure SSOT: jig set_BM1391_freq pack + external div (not freq/25 invent).
+        let sol = dcentrald_common::resolve_bm1391_pll(freq_mhz);
         PllConfig {
-            fb_div,
-            ref_div: 1,
-            post_div1: 1,
-            post_div2: 1,
-            reg_value,
+            fb_div: sol.fb_div,
+            ref_div: sol.ref_div,
+            post_div1: sol.post_div1,
+            post_div2: sol.post_div2,
+            reg_value: sol.pll0_register,
         }
     }
 }
@@ -235,18 +228,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BM1391 = S11 chip, non-gating + init fail-closed (never runs live). \
-The pll_params() fbdiv floor clamp(40.0,..) forces 200 MHz -> fbdiv=40 (a ~1000 MHz VCO \
-at postdiv=1), and this expected encoding (fbdiv=8 / 0xC0080111) contradicts the same \
-file's PLL_FALLBACK_200M=0xC0780111 (fbdiv=120). The true BM1391 PLL encoding is \
-unverified against a live S11 + factory jig; do not 'fix' the math speculatively. \
-Re-enable once a live S11 jig capture pins the canonical encoding. \
- (BASELINE-RED-1)."]
     fn bm1391_pll_encoding_matches_jig_format() {
-        // 200 MHz → fbdiv = 8 → 0xC0080111 (standard BM13xx encoding).
+        // G42: jig 200 MHz fallback 0xC0780111 (fbdiv=120, external /15) — not fbdiv=8 invent.
         let pll = Bm1391Driver::new().pll_params(200);
-        assert_eq!(pll.fb_div, 8);
-        assert_eq!(pll.reg_value, 0xC008_0111);
+        assert_eq!(pll.fb_div, 120);
+        assert_eq!(pll.reg_value, 0xC078_0111);
+        assert_eq!(pll.reg_value, PLL_FALLBACK_200M);
+        let pure = dcentrald_common::resolve_bm1391_pll(200);
+        assert_eq!(pll.reg_value, pure.pll0_register);
+        assert_eq!(pure.external_div, 15);
     }
 
     #[test]

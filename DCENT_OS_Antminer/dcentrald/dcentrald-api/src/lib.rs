@@ -111,6 +111,8 @@ static THERMAL_SUPERVISOR_CONFIGURED_ENABLED: AtomicBool = AtomicBool::new(false
 pub const AUDIT_LOG_PATH_ENV: &str = "DCENTOS_AUDIT_LOG_PATH";
 pub const AUDIT_LOG_MAX_BYTES_ENV: &str = "DCENTOS_AUDIT_LOG_MAX_BYTES";
 pub const DEFAULT_AUDIT_LOG_PATH: &str = "/data/audit.log";
+pub const EPHEMERAL_RUNTIME_ENV: &str = "DCENTOS_EPHEMERAL_RUNTIME";
+pub const DEFAULT_EPHEMERAL_AUDIT_LOG_PATH: &str = "/tmp/dcent/audit.log";
 pub const DEFAULT_AUDIT_LOG_MAX_BYTES: u64 = 1_048_576;
 static AUDIT_LOG_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -219,9 +221,25 @@ pub fn push_audit_event(
 }
 
 pub fn audit_log_path() -> PathBuf {
-    std::env::var_os(AUDIT_LOG_PATH_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_LOG_PATH))
+    audit_log_path_for_policy(
+        std::env::var(EPHEMERAL_RUNTIME_ENV).ok().as_deref(),
+        std::env::var_os(AUDIT_LOG_PATH_ENV).map(PathBuf::from),
+    )
+}
+
+fn audit_log_path_for_policy(
+    ephemeral_value: Option<&str>,
+    configured: Option<PathBuf>,
+) -> PathBuf {
+    if matches!(ephemeral_value, Some("1")) {
+        // A persistent-valued inherited override must never defeat the
+        // process-wide ephemeral policy. Alternate launchers need only set the
+        // exact policy token; the audit sink then stays on tmpfs.
+        return configured
+            .filter(|path| path.starts_with("/tmp/dcent"))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_EPHEMERAL_AUDIT_LOG_PATH));
+    }
+    configured.unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_LOG_PATH))
 }
 
 pub fn audit_log_max_bytes() -> u64 {
@@ -879,6 +897,12 @@ pub struct ApiConfig {
     /// default would leak per-boot timing fingerprints to LAN scanners.
     #[serde(default)]
     pub expose_boot_timeline: bool,
+    /// Serve an observation-only API surface. Non-read HTTP methods are
+    /// refused before handlers, auth persistence is read without migration or
+    /// quarantine writes, and credential mutation is disabled. This is used by
+    /// reversible external-media hardware acceptance runs.
+    #[serde(default)]
+    pub observer_only: bool,
 }
 
 impl Default for ApiConfig {
@@ -893,6 +917,7 @@ impl Default for ApiConfig {
             cgminer_lan_writes: false,
             metrics_require_auth: true,
             expose_boot_timeline: false,
+            observer_only: false,
         }
     }
 }
@@ -1545,6 +1570,20 @@ impl HardwareIdentification {
             .collect();
     }
 
+    /// Return one unambiguous declared board target. Conflicting declarations
+    /// deliberately collapse to `None` instead of selecting an arbitrary one.
+    pub fn declared_board_target(&self) -> Option<&str> {
+        let mut targets = self.evidence.iter().filter_map(|evidence| {
+            matches!(
+                evidence.source,
+                HardwareIdentityEvidenceSource::Declared(DeclaredIdentitySource::BoardTarget)
+            )
+            .then_some(evidence.source_value.as_str())
+        });
+        let first = targets.next()?;
+        targets.all(|target| target == first).then_some(first)
+    }
+
     pub fn clear_measured_asic_evidence(&mut self) {
         self.evidence.retain(|evidence| {
             evidence.claim != HardwareIdentityClaim::AsicFamily
@@ -1655,10 +1694,24 @@ mod hardware_identity_evidence_tests {
                 "board_target:am2-s19j->BM1362",
             ]
         );
-        let wire = serde_json::to_value(identity).unwrap();
+        let wire = serde_json::to_value(&identity).unwrap();
         assert_eq!(wire["confidence"], "low");
         assert_eq!(wire["evidence"][0]["level"], "declared");
         assert_eq!(wire["evidence"][0]["source"], "config_model");
+        assert_eq!(identity.declared_board_target(), Some("am2-s19j"));
+    }
+
+    #[test]
+    fn conflicting_declared_board_targets_never_publish_one_arbitrarily() {
+        let identity = HardwareIdentification::from_evidence(
+            vec![
+                HardwareIdentityEvidence::declared_asic_board_target("am2-s19j", "BM1362"),
+                HardwareIdentityEvidence::declared_asic_board_target("am3-bb-s19jpro", "BM1362"),
+            ],
+            None,
+        );
+
+        assert_eq!(identity.declared_board_target(), None);
     }
 
     #[test]
@@ -2611,6 +2664,43 @@ mod minimal_app_state_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_policy_overrides_persistent_audit_sink_and_writes_only_tmpfs() {
+        let persistent_override = PathBuf::from("/data/inherited-audit.log");
+        assert_eq!(
+            audit_log_path_for_policy(Some("1"), Some(persistent_override)),
+            PathBuf::from(DEFAULT_EPHEMERAL_AUDIT_LOG_PATH)
+        );
+
+        let path = PathBuf::from(format!(
+            "/tmp/dcent/audit-policy-test-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let resolved = audit_log_path_for_policy(Some("1"), Some(path.clone()));
+        assert_eq!(resolved, path);
+        let record = dcentrald_api_types::audit_log::AuditRecord::new(
+            1,
+            "ephemeral-policy-test",
+            dcentrald_api_types::audit_log::AuditEvent::Free {
+                category: "unit".to_string(),
+                message: "tmpfs-only".to_string(),
+            },
+        );
+
+        append_audit_record_to_path(&resolved, &record).expect("write ephemeral audit row");
+
+        assert!(resolved.starts_with("/tmp/dcent"));
+        assert!(std::fs::read_to_string(&resolved)
+            .expect("read ephemeral audit row")
+            .contains("tmpfs-only"));
+        let _ = std::fs::remove_file(resolved);
+    }
+
     #[test]
     fn trim_audit_log_to_max_bytes_retains_recent_complete_rows() {
         let path = std::env::temp_dir().join(format!(
@@ -2738,6 +2828,7 @@ pub async fn start_api_servers(
     auth::init_auth_config(
         state.config.metrics_require_auth,
         state.config.websocket_tickets,
+        state.config.observer_only,
     );
 
     // SECURITY (W1.5, 2026-05-07): verify and auto-correct on-disk auth file

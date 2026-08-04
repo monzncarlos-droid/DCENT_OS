@@ -37,6 +37,14 @@
 //! must preserve that fail-closed result before enabling any dependent UART,
 //! fan, or GPIO operation.
 
+// clippy/dead_code: CV1835 (CViTek) is an EVIDENCE-RETAINED platform port. The
+// module is a complete RE'd bring-up path with no live fleet unit, so most of it
+// has no production caller yet and every item reads as dead code. It is retained
+// deliberately — the repo models exactly this state as
+// `RuntimeStatus::EvidenceRetainedNotImplemented`. Deleting it to satisfy the
+// lint would destroy real reverse-engineering work; wiring it to satisfy the lint
+// would promote an unproven platform. Allowed here until a bench unit lands.
+#![allow(dead_code)]
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 

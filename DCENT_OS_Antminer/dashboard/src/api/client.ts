@@ -344,10 +344,14 @@ function normalizeSystemInfo(info: RawSystemInfoResponse): SystemInfoResponse {
 }
 
 function normalizeHistory(response: HistoryResponse): HistoryResponse {
-  const stamped = (response.history ?? []).map((point: HistoryPoint) => ({
-    ...point,
-    timestamp: point.timestamp ?? point.timestamp_s ?? 0,
-  }));
+  const stamped = (response.history ?? [])
+    .map((point: HistoryPoint) => ({
+      ...point,
+      timestamp: point.timestamp ?? point.timestamp_s ?? 0,
+    }))
+    // Drop points with no usable timestamp instead of bucketing them at the 1970
+    // epoch — on a young install with few buckets that renders as a bogus leading day.
+    .filter((point) => Number.isFinite(point.timestamp) && point.timestamp > 0);
   return {
     ...response,
     // P3-35(a): trim the leading boot-zero placeholder rows (hashrate 0 + temp 0,
@@ -416,7 +420,10 @@ type RawRecentShareEvent = Partial<RecentShareEvent> & {
 function normalizeShareEvent(event: RawRecentShareEvent): RecentShareEvent {
   return {
     timestamp_ms: event.timestamp_ms ?? event.timestampMs ?? 0,
-    result: event.result ?? 'accepted',
+    // Truth contract ( 9D9/9F): a share whose result the daemon did not report
+    // must NOT be fabricated as pool-accepted. Default to 'unknown' (SharesPage renders
+    // it honestly in yellow), matching MiningWorkPostureCard's handling of the same field.
+    result: event.result ?? 'unknown',
     job_id: event.job_id ?? event.jobId ?? '',
     difficulty: event.difficulty ?? null,
     target_difficulty: event.target_difficulty ?? event.targetDifficulty ?? null,

@@ -1,30 +1,21 @@
 #!/bin/sh
 #
-# S82dcentrald - Start DCENTos mining daemon (am2-s19jpro variant)
+# S82dcentrald - Start DCENTos mining daemon (am2-s19pro variant)
 #
 # This init script overlays on top of the shared board/zynq init script
 # (via overlay-on-overlay in the defconfig). It adds am2-specific logic:
 #
-#   1. Reads /etc/dcentos/platform + /etc/dcentos/board_target to detect am2
-#      (zynq-bm3-am2 / am2-s19j) vs am1-s9.
-#   2. Injects --s19j-hybrid into dcentrald launch on am2 (belt-and-suspenders
-#      with Agent α's /etc/bos_platform auto-detection in main.rs).
-#   3. **MILESTONE-PATH ENV VARS (Phase 4A, 2026-05-15 .109 FIRST ACCEPTED
-#      SHARES)** — exports the three DCENT_AM2_* env vars that unlocked the
-#      first AM2 accepted-share proof on Public Pool (20/20 accepted in 5
-#      minutes). Without them, dcentrald falls through to the FPGA-FIFO path
-#      which has never produced an AM2 nonce, S99upgrade health gate fails,
-#      and U-Boot auto-reverts the firmware. See:
-#        -  (CE finding #4)
-#
-#
+#   1. Reads /etc/dcentos/platform + /etc/dcentos/board_target, keeping the
+#      broad AM2 carrier identity separate from the exact ASIC protocol.
+#   2. Leaves this BM1398 image management-only; only exact BM1362 S19j target
+#      stamps may inject --s19j-hybrid and its serial work recipe.
+#   3. Scrubs inherited BM1362/lab environment before the explicit persistent
+#      operator override in /data/dcentrald-env.
 #   4. Leaves I2C ownership to dcentrald. The production .139 path can use
 #      gpio_bitbang PSU transport and must not force-bind xiic-i2c from init.
 #
-# Variant scope: only zynq-bm3-am2 (AM2 S19j Pro / S19 Pro Zynq) gets the
-# milestone env-var + --s19j-hybrid injection. am1-s9 (the empty/unmatched
-# fallback in the case below) keeps the legacy launch shape so S9 cold-boot
-# mining is NOT regressed.
+# Variant scope: this overlay stamps am2-s19pro. Carrier-level AM2 fan safety is
+# retained, but ASIC-specific dispatch requires a separate exact-family match.
 #
 # SAFETY: unchanged from shared script — command fans to PWM 30 on crash/timeout.
 # NEVER PWM 127. Home mining.
@@ -40,11 +31,77 @@ LOGFILE="/tmp/dcentrald.log"
 FAN_BASE=0x42800000
 # AM2 persistent fan-custodian pidfile (see am2_start_fan_custodian below).
 FANHOLD_PIDFILE="/var/run/dcentrald-fanhold.pid"
+FANHOLD_READYFILE="/var/run/dcentrald-fanhold.ready"
 DEFAULT_COMPAT="/etc/default/dcentos-compat"
 PERSISTENT_COMPAT="/data/dcentos-compat"
 API_PORT=8080
 SCRIPT="$0"
 SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
+PROCESS_IDENTITY_HELPER="/usr/libexec/dcentos/dcentrald-process-identity.sh"
+FAN_CUSTODY_HELPER="/usr/libexec/dcentos/dcentrald-fan-custody.sh"
+CRASH_LATCH_FILE="/data/dcent/dcentrald-hardware-session.crash-latched"
+START_STOP_DAEMON=start-stop-daemon
+FAN_CUSTODIAN_DAEMON=$DAEMON
+FAN_CUSTODY_READY_WAIT=10
+ZYNQ_LAUNCHER_TEST_MODE=0
+if [ "${DCENT_TEST_ONLY_ZYNQ_LAUNCHER:-0}" = 1 ]; then
+    ZYNQ_LAUNCHER_TEST_MODE=1
+    DAEMON=${DCENT_TEST_DAEMON:-$DAEMON}
+    LOGFILE=${DCENT_TEST_LOGFILE:-$LOGFILE}
+    PIDFILE=${DCENT_TEST_PIDFILE:-$PIDFILE}
+    CHILD_PIDFILE=${DCENT_TEST_CHILD_PIDFILE:-$CHILD_PIDFILE}
+    EXPECTFILE=${DCENT_TEST_EXPECTFILE:-$EXPECTFILE}
+    FANHOLD_PIDFILE=${DCENT_TEST_FANHOLD_PIDFILE:-$FANHOLD_PIDFILE}
+    FANHOLD_READYFILE=${DCENT_TEST_FANHOLD_READYFILE:-$FANHOLD_READYFILE}
+    PROCESS_IDENTITY_HELPER=${DCENT_TEST_PROCESS_IDENTITY_HELPER:-$PROCESS_IDENTITY_HELPER}
+    FAN_CUSTODY_HELPER=${DCENT_TEST_FAN_CUSTODY_HELPER:-$FAN_CUSTODY_HELPER}
+    START_STOP_DAEMON=${DCENT_TEST_START_STOP_DAEMON:-$START_STOP_DAEMON}
+    FAN_CUSTODIAN_DAEMON=${DCENT_TEST_FAN_CUSTODIAN_DAEMON:-$DAEMON}
+    FAN_CUSTODY_READY_WAIT=${DCENT_TEST_FAN_READY_WAIT:-$FAN_CUSTODY_READY_WAIT}
+    case "$DAEMON:$LOGFILE:$PIDFILE:$CHILD_PIDFILE:$EXPECTFILE:$FANHOLD_PIDFILE" in
+        /*:/*:/*:/*:/*:/*) ;;
+        *) echo "  [FAIL] test-only Zynq launcher paths must be absolute" >&2; exit 1 ;;
+    esac
+    case "$START_STOP_DAEMON" in
+        /*) ;;
+        *) echo "  [FAIL] test-only start-stop-daemon path must be absolute" >&2; exit 1 ;;
+    esac
+    case "$FANHOLD_READYFILE:$FAN_CUSTODY_HELPER:$FAN_CUSTODIAN_DAEMON" in
+        /*:/*:/*) ;;
+        *) echo "  [FAIL] test-only fan-custody paths must be absolute" >&2; exit 1 ;;
+    esac
+fi
+DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=0
+if [ "$ZYNQ_LAUNCHER_TEST_MODE" -eq 1 ] \
+    && [ "$DAEMON" != /usr/local/bin/dcentrald ]; then
+    DCENT_PROCESS_IDENTITY_TEST_AUTHORITY=1
+fi
+readonly DCENT_PROCESS_IDENTITY_TEST_AUTHORITY
+PROCESS_IDENTITY_AVAILABLE=0
+if [ -r "$PROCESS_IDENTITY_HELPER" ] && . "$PROCESS_IDENTITY_HELPER"; then
+    PROCESS_IDENTITY_AVAILABLE=1
+fi
+FAN_CUSTODY_AVAILABLE=0
+if [ "$PROCESS_IDENTITY_AVAILABLE" -eq 1 ] \
+    && [ -r "$FAN_CUSTODY_HELPER" ] && . "$FAN_CUSTODY_HELPER"; then
+    FAN_CUSTODY_AVAILABLE=1
+fi
+FAN_TRANSITION_LOCK_HELD=0
+
+dcent_release_fan_transition_lock() {
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_lock_release "${FANHOLD_READYFILE}.lock" || true
+        FAN_TRANSITION_LOCK_HELD=0
+    fi
+}
+
+dcent_acquire_fan_transition_lock() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    dcent_fan_lock_acquire "${FANHOLD_READYFILE}.lock" 10 || return 1
+    FAN_TRANSITION_LOCK_HELD=1
+    trap 'dcent_release_fan_transition_lock' 0
+    trap 'exit 1' 1 2 15
+}
 
 # Use persistent config if available, otherwise default.
 #
@@ -102,6 +159,10 @@ PLATFORM=""
 [ -r /etc/dcentos/platform ] && PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null)
 BOARD_TARGET=""
 [ -r /etc/dcentos/board_target ] && BOARD_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null)
+if [ "$ZYNQ_LAUNCHER_TEST_MODE" -eq 1 ]; then
+    PLATFORM=${DCENT_TEST_PLATFORM:-$PLATFORM}
+    BOARD_TARGET=${DCENT_TEST_BOARD_TARGET:-$BOARD_TARGET}
+fi
 
 # Extra CLI args populated per platform below.
 EXTRA_ARGS=""
@@ -116,52 +177,33 @@ case "$BOARD_TARGET" in
     am2-s17|am2-s17p|am2-s17pro|am2-s17plus|am2-t17|am2-t17plus|am2-s19|am2-s19j|am2-s19jpro|am2-s19jpro-zynq|am2-s19pro|am2-t19) IS_AM2=1 ;;
 esac
 
-if [ "$IS_AM2" = "1" ]; then
-    # am2 S19j Pro Zynq — hybrid profile (s19-am2 FPGA + BM1362 chain).
-    # Belt-and-suspenders alongside Agent α's main.rs auto-detection: if
-    # Rust-side detection breaks, the CLI flag still forces the right
-    # profile. dcentrald treats the flag as idempotent.
-    EXTRA_ARGS="$EXTRA_ARGS --s19j-hybrid"
+# The AM2 carrier identity is not an ASIC protocol identity. Only the exact
+# BM1362 S19j targets may select the hybrid engine and its proven serial recipe;
+# S17/BM1397 and S19 Pro/BM1398 images must remain management-only until their
+# own engines are admitted.
+IS_BM1362_HYBRID_TARGET=0
+case "$BOARD_TARGET" in
+    am2-s19j|am2-s19jpro|am2-s19jpro-zynq) IS_BM1362_HYBRID_TARGET=1 ;;
+esac
 
-    # **MILESTONE-PATH ENV VARS** — `a lab unit` FIRST ACCEPTED SHARES (2026-05-15,
-    # 20/20 accepted on Public Pool). These three flags re-create the exact
-    # `dcentrald` runtime that proved AM2 native mining. They are exported
-    # here (not just prefixed on one launch line) so the wrapper's restart
-    # loop, the safety subcommand, and any child `sh -c` re-fork all inherit
-    # them. finding #4.
-    #
-    #   DCENT_AM2_SKIP_FAST_UART      — keep command/work path at 115200
-    #                                    (FastUART handoff never produced an
-    #                                    AM2 nonce in our 2026-05-12/14 runs)
-    #   DCENT_AM2_SERIAL_WORK_DISPATCH — route work through the proven BM1362
-    #                                    88-byte serial frame over the chain
-    #                                    UART (FPGA WORK_TX FIFO bypassed)
-    #   DCENT_AM2_SKIP_115200_PER_CHIP — leave BM1362 cores broadcast-only
-    #                                    activated (per-chip A8/MiscCtrl x3
-    #                                    sequence collapses chain addressing
-    #                                    on AM2 — proven on .79 only)
-    #
-    # NOT exported (operator-opt-in diagnostic only, default-OFF, additive):
-    #   DCENT_AM2_VERIFY_PRESENCE_AFTER_EACH_PHASE — PR-019 / R11-2 ablation.
-    #                                    Per-phase read-only GetAddress probe
-    #                                    + [AM2-ABLATION] / [AM2-ABLATION-PARAMS]
-    #                                    log lines to localize the 126->28
-    #                                    chain-collapse. Zero behaviour / wire
-    #                                    change when unset. Operators set it
-    #                                    explicitly per bring-up run.
+# Scrub inherited protocol/lab state before the explicit /data override below.
+# This makes an incomplete board stamp fail closed instead of inheriting a
+# BM1362 wire recipe merely because it uses the same AM2 carrier.
+unset DCENT_AM2_SKIP_FAST_UART
+unset DCENT_AM2_SERIAL_WORK_DISPATCH
+unset DCENT_AM2_SKIP_115200_PER_CHIP
+unset DCENT_AM2_TRUST_DEGRADED_FW
+unset DCENT_AM2_FORCE_FAST_UART
+unset DCENT_AM2_FAST_UART_VALUE
+unset DCENT_AM2_FAST_UART_BAUD
+unset DCENT_AM2_FASTUART_SWITCH_HOST_FIRST
+unset DCENT_AM2_WORK_TX_BOSMODE
+
+if [ "$IS_BM1362_HYBRID_TARGET" = "1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --s19j-hybrid"
     export DCENT_AM2_SKIP_FAST_UART=1
     export DCENT_AM2_SERIAL_WORK_DISPATCH=1
     export DCENT_AM2_SKIP_115200_PER_CHIP=1
-
-    # Clear lab-only overrides that could mask a manageability regression on
-    # a flashed image. Operators can re-export from /data/dcentrald-env if a
-    # bring-up override is ever needed.
-    unset DCENT_AM2_TRUST_DEGRADED_FW
-    unset DCENT_AM2_FORCE_FAST_UART
-    unset DCENT_AM2_FAST_UART_VALUE
-    unset DCENT_AM2_FAST_UART_BAUD
-    unset DCENT_AM2_FASTUART_SWITCH_HOST_FIRST
-    unset DCENT_AM2_WORK_TX_BOSMODE
 fi
 
 # Operator escape hatch for live debugging on a flashed unit — sourced AFTER
@@ -170,6 +212,50 @@ fi
 if [ -r /data/dcentrald-env ]; then
     . /data/dcentrald-env
 fi
+
+# gpio907/PWR_CONTROL polarity normalization for am2-s19|am2-s19pro|am2-t19.
+#
+# Scrub any inherited value, then pin exactly one marker. Both halves matter:
+#
+#   * The `unset` prevents a stale or hostile environment (e.g. an operator
+#     `/data/dcentrald-env`, sourced just above) from choosing the polarity the
+#     terminal safe-off path will use.
+#   * The `export` is REQUIRED for safe-off to run at all on this image. With
+#     neither marker set, `dcentrald --safe-off` refuses outright ("AM2
+#     PWR_CONTROL polarity unknown or conflicting", main.rs). As of 2026-07-27
+#     this script DOES define `am2_pwr_control_polarity_known()` and a fan-only
+#     fallback (see below), so an unset marker now degrades honestly instead of
+#     silently removing the power cut — but the marker is still exported,
+#     because fan-only is a degradation, not a power cut.
+#
+# HONEST RISK — polarity EVIDENCED BY FAMILY, declaration deliberately UNCHANGED
+# (2026-07-27). A six-lane investigation with per-lane adversarial
+# refutation concluded gpio907 is ACTIVE-LOW (0 = rail ON): 4 lanes CONFIRMED at
+# HIGH confidence, 0 refuted. Evidence:
+#   * S17 Pro factory jig (UNSTRIPPED, Bitmain's own symbols): power_on writes
+#     "0", power_off writes "1" on gpio907.
+#   * Same convention across the 7007 class (S17, T17/T17e/S17e, DR5, S11).
+#   * Live `a lab unit` register dump: gpio907 value=0 while bosminer held the rail up.
+#   * NOTHING anywhere writes the sysfs `active_low` attribute on this path.
+#
+# The S19 Pro leg is FAMILY-INFERRED, not model-exact: no decoded S19 Pro jig
+# artifact resolves the pin yet. A held candidate exists and is decodable at the
+# desk —  — which
+# would upgrade this to model-exact. Until then this image is the WEAKER of the
+# two evidence cases, and `a lab unit` is a live S19 Pro that would be affected.
+#
+# Under the CURRENT export a terminal safe-off writes 0 — the jig's power-ON
+# level — and the readback tautologically agrees, minting a FALSE safe-off proof.
+# The export is nonetheless kept, deliberately, per operator decision: flipping
+# it is a fleet-visible change to the only power-cut path on this image. The flip
+# is OPERATOR-GATED.
+#
+# Do NOT simply delete this block; that reintroduces the silent no-cut.
+unset DCENT_AM2_PWR_CONTROL_ACTIVE_LOW
+unset DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH
+case "$BOARD_TARGET" in
+    am2-s19|am2-s19pro|am2-t19) export DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH=1 ;;
+esac
 
 bosminer_pic_bootstrap_enabled() {
     BOSMINER_PIC_BOOTSTRAP=0
@@ -253,33 +339,91 @@ ensure_i2c0_kernel_bound() {
 # S9/am1 fan registers hold via devmem so that branch is unchanged. PWM is only
 # ever driven DOWN (<= 30).
 am2_start_fan_custodian() {
-    # $1 = PWM (0..30). Kill any existing custodian, then background a new one.
     _pwm="$1"
-    if [ -f "$FANHOLD_PIDFILE" ]; then
-        start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-        rm -f "$FANHOLD_PIDFILE"
+    FAN_CUSTODY_RESULT=1
+    if [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ]; then
+        if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+            dcent_fan_custodian_start_locked "$FAN_CUSTODIAN_DAEMON" "$_pwm" \
+                "$FANHOLD_PIDFILE" "$FANHOLD_READYFILE" "$START_STOP_DAEMON" \
+                "$LOGFILE" "$FAN_CUSTODY_READY_WAIT"
+        else
+            dcent_fan_custodian_start "$FAN_CUSTODIAN_DAEMON" "$_pwm" \
+            "$FANHOLD_PIDFILE" "$FANHOLD_READYFILE" "$START_STOP_DAEMON" \
+                "$LOGFILE" "$FAN_CUSTODY_READY_WAIT"
+        fi
+        FAN_CUSTODY_RESULT=$?
     fi
-    if start-stop-daemon -S -b -m -p "$FANHOLD_PIDFILE" -x "$DAEMON" -- --hold-fan "$_pwm" >> $LOGFILE 2>&1; then
-        echo "$(date): SAFETY: am2 persistent fan custodian started at PWM $_pwm ($DAEMON --hold-fan $_pwm, pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> $LOGFILE
+    if [ "$FAN_CUSTODY_RESULT" -eq 0 ]; then
+        echo "$(date): SAFETY: verified am2 fan custody at PWM $_pwm (pid $(cat "$FANHOLD_PIDFILE" 2>/dev/null))" >> "$LOGFILE"
         return 0
     fi
-    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed to start" >> $LOGFILE
+    echo "$(date): WARN: am2 fan custodian (--hold-fan $_pwm) failed readiness/custody validation" >> "$LOGFILE"
     return 1
+}
+
+am2_stop_fan_custodian() {
+    [ "$FAN_CUSTODY_AVAILABLE" -eq 1 ] || return 1
+    if [ "$FAN_TRANSITION_LOCK_HELD" -eq 1 ]; then
+        dcent_fan_custodian_stop_locked "$FAN_CUSTODIAN_DAEMON" "$FANHOLD_PIDFILE" \
+            "$FANHOLD_READYFILE" 5 2
+    else
+        dcent_fan_custodian_stop "$FAN_CUSTODIAN_DAEMON" "$FANHOLD_PIDFILE" \
+            "$FANHOLD_READYFILE" 5 2
+    fi
+}
+
+# PWR_CONTROL polarity helpers, ported from am2-s19jpro (2026-07-27, ).
+# These are the "CORRECT FIX" this script's own HONEST RISK block prescribed.
+#
+# am2_pwr_control_polarity_known(): true iff exactly one polarity marker is
+# exported. When NEITHER is set, the emergency path must degrade to fan-only
+# and say so, rather than calling `--safe-off` (which refuses outright with no
+# marker) and leaving the unit with no response at all.
+#
+# am2_power_cut_proven(): reads the raw gpio907 level and interprets it against
+# the DECLARED polarity. It is a *declaration-relative* check, not physical rail
+# proof — under a wrong declaration it returns a wrong answer, which is exactly
+# why the declaration matters and why the polarity question above is still open.
+am2_pwr_control_polarity_known() {
+    [ "${DCENT_AM2_PWR_CONTROL_ACTIVE_LOW:-0}" = "1" ] || [ "${DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH:-0}" = "1" ]
+}
+
+am2_power_cut_proven() {
+    [ -r /sys/class/gpio/gpio907/value ] || return 1
+    _v=$(cat /sys/class/gpio/gpio907/value 2>/dev/null)
+    if [ "${DCENT_AM2_PWR_CONTROL_ACTIVE_LOW:-0}" = "1" ]; then
+        [ "$_v" = "1" ]
+    elif [ "${DCENT_AM2_PWR_CONTROL_ACTIVE_HIGH:-0}" = "1" ]; then
+        [ "$_v" = "0" ]
+    else
+        return 1
+    fi
 }
 
 fan_safety_override() {
     if [ "$IS_AM2" = "1" ]; then
         if [ -x "$DAEMON" ]; then
+            # cut-hash-before-noise: only drop to the quiet floor once the power
+            # cut is evidenced. Unproven cut stays at 30 so a still-energized
+            # board keeps real airflow.
+            FAN_PWM=30
+            if am2_power_cut_proven; then
+                FAN_PWM=10
+            fi
             # Persistent custodian, NOT the exit-immediately --set-fan one-shot.
-            am2_start_fan_custodian 30
+            am2_start_fan_custodian "$FAN_PWM"
+            return $?
         else
             echo "$(date): WARN: am2 dcentrald binary absent at $DAEMON; fan cap not applied" >> $LOGFILE
+            return 1
         fi
     elif command -v devmem > /dev/null 2>&1; then
-        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null
-        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null
+        devmem $((FAN_BASE + 0x10)) 32 30 2>/dev/null || return 1
+        devmem $((FAN_BASE + 0x14)) 32 30 2>/dev/null || return 1
         echo "$(date): SAFETY: fans commanded to PWM 30 (dcentrald exited)" >> $LOGFILE
+        return 0
     fi
+    return 1
 }
 
 case "$1" in
@@ -288,14 +432,29 @@ case "$1" in
             echo "  [SKIP] dcentrald: binary not found at $DAEMON"
             exit 0
         fi
+        dcent_acquire_fan_transition_lock || {
+            echo "  [FAIL] Cannot serialize dcentrald owner admission"
+            exit 1
+        }
+
+        if [ "$IS_AM2" = "1" ] \
+            && { [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+                || [ -e "${FANHOLD_READYFILE}.pending" ]; }; then
+            am2_stop_fan_custodian || {
+                echo "  [FAIL] Prior fan custodian cannot be verified and stopped"
+                exit 1
+            }
+            echo "  [OK] exact prior am2 fan custodian stopped before owner admission"
+        fi
 
         RUNNING_PIDS=$(pidof dcentrald 2>/dev/null || true)
         if [ -n "$RUNNING_PIDS" ]; then
             echo "  [FAIL] Refusing a second dcentrald owner (PID(s): $RUNNING_PIDS)"
             exit 1
         fi
-        if [ ! -r "$SESSION_LATCH_HELPER" ]; then
-            echo "  [FAIL] Persistent hardware-session latch helper is missing"
+        if [ ! -r "$SESSION_LATCH_HELPER" ] \
+            || [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Persistent session or exact-process identity helper is missing"
             fan_safety_override
             exit 1
         fi
@@ -314,14 +473,6 @@ case "$1" in
         fi
         if [ -f /data/dcent/auth.json ]; then
             chmod 0600 /data/dcent/auth.json 2>/dev/null
-        fi
-
-        # Reap any persistent AM2 fan custodian left resident by a prior
-        # stop/safety so the main daemon can own the uio16 fan mmap (AM2 only).
-        if [ "$IS_AM2" = "1" ] && [ -f "$FANHOLD_PIDFILE" ]; then
-            start-stop-daemon -K -q -p "$FANHOLD_PIDFILE" -x "$DAEMON" 2>/dev/null
-            rm -f "$FANHOLD_PIDFILE"
-            echo "  [OK] reaped prior am2 fan custodian before daemon launch"
         fi
 
         # Do not force xiic-i2c from init. The Rust AM2 path binds kernel I2C
@@ -377,7 +528,7 @@ case "$1" in
 
         set -- $EXTRA_ARGS
         set -- "$DAEMON" --config "$CONFIG" "$@"
-        if ! start-stop-daemon -S -b -m -p "$PIDFILE" \
+        if ! "$START_STOP_DAEMON" -S -b -m -p "$PIDFILE" \
             -x /bin/sh -- "$SESSION_LATCH_HELPER" supervise "$SESSION_TOKEN" \
             "$SCRIPT" "$LOGFILE" "$CHILD_PIDFILE" "$EXPECTFILE" "$@"; then
             /bin/sh "$SESSION_LATCH_HELPER" abandon "$SESSION_TOKEN" supervisor-launch-failed \
@@ -398,34 +549,14 @@ case "$1" in
         #   + 5s fan cooldown = ~12s total
         # NEVER SIGKILL before voltage is off - kills heartbeat thread, PIC watchdog
         # fires, corrupts I2C bus, requires PSU power cycle.
-        CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null || pidof dcentrald 2>/dev/null | awk '{print $1}')
-        WRAPPER_PID=$(cat "$PIDFILE" 2>/dev/null || true)
-        [ -n "$CHILD_PID" ] && echo "$CHILD_PID" > "$EXPECTFILE"
-        [ -n "$CHILD_PID" ] && kill -TERM "$CHILD_PID" 2>/dev/null
-        # Wait up to 30 seconds for graceful shutdown.
-        # S9 shutdown can legitimately take ~18s when voltage-disable replies are slow.
-        for i in $(seq 1 30); do
-            if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-        TIMED_OUT=0
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-            echo "  [WARN] dcentrald did not exit in 30s - force killing (I2C bus may need PSU power cycle)"
-            rm -f "$EXPECTFILE"
-            TIMED_OUT=1
-            /bin/sh "$SESSION_LATCH_HELPER" latch forced-stop-timeout >> "$LOGFILE" 2>&1 || true
+        if [ "$PROCESS_IDENTITY_AVAILABLE" -ne 1 ]; then
+            echo "  [FAIL] Exact-process identity helper is unavailable; refusing stop mutations"
+            exit 1
         fi
-        [ "$TIMED_OUT" -eq 1 ] && kill -9 "$CHILD_PID" 2>/dev/null
-        if [ -n "$WRAPPER_PID" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
-            kill -TERM "$WRAPPER_PID" 2>/dev/null
-            sleep 1
-            kill -9 "$WRAPPER_PID" 2>/dev/null
-        fi
-        rm -f "$PIDFILE" "$CHILD_PIDFILE"
-        "$SCRIPT" safety
-        echo "  [OK] dcentrald stopped; any active hardware session remains unresolved"
+        dcent_stop_managed_session "$CHILD_PIDFILE" "$EXPECTFILE" "$DAEMON" \
+            "$PIDFILE" "$CRASH_LATCH_FILE" "$SCRIPT" "$LOGFILE" \
+            30 5 30 || exit $?
+        echo "  [OK] dcentrald stopped after exact owner-death and terminal-custody evidence"
         ;;
 
     restart)
@@ -435,26 +566,44 @@ case "$1" in
         ;;
 
     safety)
+        dcent_acquire_fan_transition_lock || exit 1
+        if [ -e "$FANHOLD_PIDFILE" ] || [ -e "$FANHOLD_READYFILE" ] \
+            || [ -e "${FANHOLD_READYFILE}.pending" ]; then
+            am2_stop_fan_custodian || exit 1
+        fi
+        if dcent_dcentrald_may_execute; then
+            echo "$(date): SAFETY-FAIL: refusing a competing safety writer while dcentrald may execute" >> "$LOGFILE"
+            exit 1
+        fi
         # G22 (no-brick safety, gap-swarm 2026-05-28): the emergency safety response
         # must CUT HASH POWER, not just cap fans. Delegate to the daemon's audited
         # per-platform one-shot `--safe-off` (cuts hash power, then quiets fans —
         # cut-hash-before-noise) instead of hardcoding GPIO/devmem here. Falls back to
-        # the fan-only override if the binary is absent or the cut fails.
-        if [ -x "$DAEMON" ]; then
-            if "$DAEMON" --safe-off >> $LOGFILE 2>&1; then
-                echo "$(date): SAFETY: --safe-off returned command/readback evidence; physical rail state was not measured" >> $LOGFILE
-            else
-                echo "$(date): WARN: $DAEMON --safe-off failed (rc=$?) — falling back to fan-only safety override" >> $LOGFILE
-                fan_safety_override
-            fi
-        else
-            echo "$(date): WARN: $DAEMON absent — PSU cut unavailable, fan-only safety override" >> $LOGFILE
-            fan_safety_override
+        # the fan-only override if the binary is absent, polarity is unknown, or
+        # the cut fails, so an emergency NEVER ends up doing nothing.
+        if [ "$IS_AM2" = "1" ] && ! am2_pwr_control_polarity_known; then
+            echo "$(date): SAFETY-FAIL: AM2 PWR_CONTROL polarity unknown; fan-only fallback is not a power-cut receipt" >> "$LOGFILE"
+            fan_safety_override || true
+            exit 1
         fi
+        if [ ! -x "$DAEMON" ]; then
+            echo "$(date): SAFETY-FAIL: $DAEMON absent; PSU cut unavailable" >> "$LOGFILE"
+            exit 1
+        fi
+        if ! "$DAEMON" --safe-off >> "$LOGFILE" 2>&1; then
+            echo "$(date): SAFETY-FAIL: $DAEMON --safe-off failed; fan-only fallback is not a power-cut receipt" >> "$LOGFILE"
+            fan_safety_override || true
+            exit 1
+        fi
+        if ! fan_safety_override; then
+            echo "$(date): SAFETY-FAIL: power cut returned evidence but persistent fan custody failed" >> "$LOGFILE"
+            exit 1
+        fi
+        echo "$(date): SAFETY: power-cut command/readback and persistent fan custody returned evidence; physical rail state remains separately classified" >> "$LOGFILE"
         ;;
 
     status)
-        if start-stop-daemon -K -p "$PIDFILE" -t -q 2>/dev/null; then
+        if "$START_STOP_DAEMON" -K -p "$PIDFILE" -t -q 2>/dev/null; then
             PID=$(cat "$PIDFILE" 2>/dev/null)
             echo "dcentrald is running (PID $PID)"
         else

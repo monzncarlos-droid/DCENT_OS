@@ -24,7 +24,7 @@ use log::{debug, error, info, warn};
 
 use dcentaxe_stratum::work::increment_bitmask;
 use dcentaxe_stratum::{
-    MiningEvent, MiningWork, ShareSubmission, StratumEvent, StratumJob, WorkBuilder,
+    MiningEvent, MiningWork, PowAlgorithm, ShareSubmission, StratumEvent, StratumJob, WorkBuilder,
 };
 
 use crate::stats::MiningStats;
@@ -125,13 +125,23 @@ fn validate_work_header(
     warn_on_reversed: bool,
 ) -> ([u8; 80], f64, bool) {
     let mut header = build_validation_header(work, version, nonce);
+    // P1 Scrypt seam: validation dispatches on the work's algorithm. Sha256d is
+    // byte-identical to the pre-seam call; Scrypt1024 fails closed (0.0, false)
+    // so a Scrypt-stamped work unit can never mint a share until P2.
     let (mut achieved_diff, mut meets_pool_target) =
-        dcentaxe_stratum::work::full_header_difficulty_and_target(&header, &work.share_target);
+        dcentaxe_stratum::work::full_header_difficulty_and_target_for(
+            work.algorithm,
+            &header,
+            &work.share_target,
+        );
 
-    if achieved_diff < 1.0 {
+    // The reversed-word fallback heuristic is Sha256d-only (design §4.6): it
+    // models Bitmain BM-family ASIC byte order; LT0051's byte order is un-RE'd.
+    if achieved_diff < 1.0 && work.algorithm == PowAlgorithm::Sha256d {
         let reversed_header = reverse_validation_words(&header);
         let (reversed_diff, reversed_meets_pool_target) =
-            dcentaxe_stratum::work::full_header_difficulty_and_target(
+            dcentaxe_stratum::work::full_header_difficulty_and_target_for(
+                work.algorithm,
                 &reversed_header,
                 &work.share_target,
             );
@@ -222,6 +232,12 @@ pub struct DispatcherConfig {
     /// True for BM1397 which uses midstate indices (0-3) in rolled_version field.
     /// False for BM1366/68/70 which return actual rolled version bits.
     pub midstate_mode: bool,
+    /// Proof-of-work algorithm this dispatcher mines (P1 Scrypt seam).
+    /// Threaded into every WorkBuilder it constructs, and from there onto
+    /// every `MiningWork` (see `pool_work_builder`). All chip constructors
+    /// and `Default` set `Sha256d`; `Scrypt1024` is fail-closed end-to-end
+    /// until P2 and unreachable from any shipping configuration.
+    pub algorithm: PowAlgorithm,
 }
 
 impl Default for DispatcherConfig {
@@ -234,6 +250,7 @@ impl Default for DispatcherConfig {
             job_id_step: 8,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 }
@@ -257,6 +274,21 @@ impl DispatcherConfig {
         modulus / gcd(modulus, step)
     }
 
+    /// Round a chip count up to the next power of two, exactly like ESP-Miner's
+    /// `_next_power_of_two()` (`components/asic/asic_common.c`): 0 and 1 map
+    /// to 1, powers of two map to themselves, everything else rounds UP.
+    ///
+    /// ESP-Miner (since LVXX `c8bf44e`, "functions to control nonce space and
+    /// timeouts for all chip topologies") computes the job interval as
+    /// `default_asic_timeout / _next_power_of_two(asic_count)` because chip
+    /// addressing splits the nonce space in power-of-two slices: on a 6-chip
+    /// chain each chip covers a 1/8 slice, so work must be refreshed at the
+    /// 1/8 rate, not the 1/6 rate. Plain division agrees only when the chip
+    /// count is itself a power of two.
+    fn next_power_of_two(asic_count: u8) -> u64 {
+        (asic_count as u64).max(1).next_power_of_two()
+    }
+
     /// Create a dispatcher config scaled for multi-ASIC boards.
     ///
     /// Calculate job interval dynamically based on ASIC specs.
@@ -272,10 +304,13 @@ impl DispatcherConfig {
 
     /// Config for BM1366 (job ID step +8, extraction: id & 0xF8)
     /// BM1366 has 3-bit small_core_id → 16 unique job slots (step 8, mod 128)
-    /// ESP-Miner uses hardcoded 2000/asic_count for BM1366 (version rolling means
-    /// the ASIC can mine the full nonce space internally for ~2 seconds per job).
+    /// ESP-Miner uses `default_asic_timeout=2000` divided by the chip count
+    /// rounded UP to a power of two (`_next_power_of_two`, see the helper doc):
+    /// version rolling means the ASIC can mine its power-of-two nonce-space
+    /// slice internally for that long per job. Hex Ultra (6 chips) ⇒ 2000/8 =
+    /// 250 ms; Lucky LV08 (9 chips) ⇒ 2000/16 = 125 ms.
     pub fn for_bm1366(frequency_mhz: f32, asic_count: u8) -> Self {
-        let count = (asic_count as u64).max(1);
+        let count = Self::next_power_of_two(asic_count);
         let interval = (2000u64 / count).max(10);
         info!(
             "Dispatcher: BM1366 job interval = {}ms (freq={:.0}MHz, {} chips, 2000/{})",
@@ -286,6 +321,7 @@ impl DispatcherConfig {
             job_id_step: 8,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 
@@ -294,8 +330,21 @@ impl DispatcherConfig {
     /// TODO(RE): ESP-Miner dispatches BM1368/BM1370 with +24 mod 128. Switch
     /// BM1368 away from +16 only after Hex Supra hardware soak proves no job
     /// aliasing or HW-error regression.
-    /// Job interval: ESP-Miner hardcodes 500 / asic_count for BM1368/BM1370.
-    /// The formula-based calculation gives ~1ms which overloads UART.
+    /// Job interval: **deliberately PLAIN division** (`500 / asic_count`),
+    /// NOT the pow2 divisor. ESP-Miner ≥ LVXX `c8bf44e` computes
+    /// `500 / _next_power_of_two(asic_count)` (Hex Supra 6 chips ⇒ 62 ms), and
+    /// BM1366/BM1370 here already follow it — but BM1368 is HELD on plain
+    /// division (6 chips ⇒ 83 ms) pending a Hex Supra hardware soak
+    /// (coordinator decision 2026-07-27). Rationale: Hex Supra is the one
+    /// LIVE-PROVEN board this would retime (~3.7 TH/s focused run), BM1368 is
+    /// the chip with the documented job-ID echo mismatch history (87% HW
+    /// errors before the slot-scan fix), and conservative step-16 gives it
+    /// only 8 job slots — tightening the slot-wrap from 664 ms to 500 ms with
+    /// no hardware to verify on is the riskiest possible retime. Do NOT
+    /// "consistency-refactor" this onto `next_power_of_two` without an
+    /// explicit soak-backed decision (regression-pinned by
+    /// `bm1368_deliberately_holds_plain_division_pending_soak`). The
+    /// formula-based calculation gives ~1ms which overloads UART.
     pub fn for_bm1368(frequency_mhz: f32, asic_count: u8) -> Self {
         let count = (asic_count as u64).max(1);
         let interval = (500u64 / count).max(10);
@@ -308,12 +357,17 @@ impl DispatcherConfig {
             job_id_step: 16,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 
     /// Config for BM1370 (job ID step +8 mod 128, extraction: (id & 0xf0) >> 1)
+    /// Job interval mirrors BM1368: ESP-Miner `default_asic_timeout=500`
+    /// divided by `_next_power_of_two(asic_count)`. All shipping BM1370 boards
+    /// (Gamma 1x, GT 2x) have power-of-two counts, so this is behavior-neutral
+    /// today and only diverges from plain division on future 3/5/6/9-chip SKUs.
     pub fn for_bm1370(frequency_mhz: f32, asic_count: u8) -> Self {
-        let count = (asic_count as u64).max(1);
+        let count = Self::next_power_of_two(asic_count);
         let interval = (500u64 / count).max(10);
         info!(
             "Dispatcher: BM1370 job interval = {}ms (freq={:.0}MHz, {} chips, 500/{})",
@@ -324,10 +378,20 @@ impl DispatcherConfig {
             job_id_step: 8,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 
     /// Config for BM1397 (job ID step +4 mod 128, 672 small cores, midstate mode)
+    ///
+    /// Interval formula matches upstream ESP-Miner (pre-LVXX `c8bf44e`):
+    /// `2^32 / (freq_kHz * 672) / asic_count`, clamped [5, 500] ms. The newer
+    /// LVXX tree instead routes BM1397 through `calculate_bm_timeout_ms`
+    /// (pow2-rounded cores=256, midstates=4, version_size=4, base
+    /// 20/next_pow2(count)), which yields ~2.6x LONGER intervals (e.g. ~39.5 ms
+    /// vs our ~15 ms at 425 MHz, 1 chip). That is a semantic change, not a
+    /// divisor fix; our shorter interval errs toward fresher work, so it is
+    /// deliberately HELD until BM1397 hardware soak can compare the two.
     pub fn for_bm1397(frequency_mhz: f32, asic_count: u8) -> Self {
         let interval = Self::calculate_interval(frequency_mhz, 672, asic_count);
         info!(
@@ -339,6 +403,7 @@ impl DispatcherConfig {
             job_id_step: 4,
             job_id_max: 128,
             midstate_mode: true,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 
@@ -371,6 +436,56 @@ impl DispatcherConfig {
             job_id_step: 1,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
+        }
+    }
+
+    /// Job cadence for a Scrypt chain, derived from **measured MH/s**.
+    ///
+    /// ⚠ The SHA-256 formula in [`Self::calculate_interval`] is wrong by ~4
+    /// orders of magnitude for Scrypt (design §2.4): it assumes ~1 hash per
+    /// core per clock, but a scrypt "core" spends ~10^4 clocks per hash because
+    /// of the 128 KiB ROMix. Feeding a Scrypt chain through it would ask for a
+    /// new job every few milliseconds, saturating the UART for no benefit.
+    ///
+    /// Correct model: the chain sweeps a 2^32 nonce space at its MEASURED
+    /// aggregate hashrate, so a job lasts `2^32 / (MH/s * 1e6)` seconds —
+    /// e.g. ~28 s for a 150 MH/s DC02, ~9.5 s for a 450 MH/s DC06. We refresh
+    /// well before exhaustion.
+    ///
+    /// `measured_mhs` is the chain's aggregate measured rate. Callers that
+    /// have not measured yet should pass the model's rated figure and re-derive
+    /// once real telemetry exists; a wrong value costs work freshness, never
+    /// safety.
+    pub fn for_lt0051(measured_mhs: f32, asic_count: u8) -> Self {
+        const NONCE_SPACE: f64 = 4_294_967_296.0; // 2^32
+                                                  // Fraction of the nonce-space sweep after which we push fresh work.
+                                                  // 1/4 leaves generous headroom for a measurement that overestimates
+                                                  // the chain's real rate.
+        const REFRESH_FRACTION: f64 = 0.25;
+
+        let mhs = (measured_mhs as f64).max(1.0);
+        let sweep_ms = NONCE_SPACE / (mhs * 1.0e6) * 1000.0;
+        // Clamp to the same [5, 500] ms UART envelope every other chip uses:
+        // < 5 ms overloads the UART; > 500 ms is a pointlessly stale job.
+        let interval = ((sweep_ms * REFRESH_FRACTION) as u64).clamp(5, 500);
+        info!(
+            "Dispatcher: LT0051 job interval = {}ms (measured {:.1} MH/s over {} chips; \
+             full nonce sweep ~{:.1}s — NOT the SHA-256 core-count formula)",
+            interval,
+            measured_mhs,
+            asic_count,
+            sweep_ms as f64 / 1000.0
+        );
+        Self {
+            job_interval_ms: interval,
+            // MSBT0501 echoes the job id plainly as 7 bits and the counter
+            // steps by +1 wrapping at 127 (MSBT0501_PROTOCOL.md §5.2). Not
+            // BM1370's `(id & 0xf0) >> 1`, not BM1368's no-echo.
+            job_id_step: 1,
+            job_id_max: 128,
+            midstate_mode: false,
+            algorithm: PowAlgorithm::Scrypt1024,
         }
     }
 
@@ -416,6 +531,7 @@ impl DispatcherConfig {
             job_id_step: 16,
             job_id_max: 128,
             midstate_mode: false,
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 }
@@ -606,6 +722,24 @@ impl MiningDispatcher {
         let mut valid_jobs = Vec::with_capacity(MAX_ACTIVE_JOBS);
         valid_jobs.resize(MAX_ACTIVE_JOBS, false);
 
+        // Design §2.5 / R9: the Scrypt host verifier needs a 128 KiB scratchpad.
+        // Allocate it ONCE here — on the thread that will own the mining loop,
+        // before any nonce arrives — instead of lazily inside `handle_nonce`,
+        // so a large allocation can never land in the middle of an RX drain.
+        // A SHA-256 board pays nothing (no allocation at all).
+        if config.algorithm == PowAlgorithm::Scrypt1024 {
+            match dcentaxe_stratum::scrypt::prewarm() {
+                Ok(()) => info!(
+                    "Dispatcher: scrypt verify scratchpad ready ({} KiB, allocated once)",
+                    dcentaxe_stratum::scrypt::LTC_SCRATCH_LEN / 1024
+                ),
+                Err(e) => error!(
+                    "Dispatcher: scrypt scratchpad allocation failed ({e}); \
+                     share verification will fail CLOSED (no shares submitted)"
+                ),
+            }
+        }
+
         Self {
             pools,
             active_jobs,
@@ -679,14 +813,49 @@ impl MiningDispatcher {
         })
     }
 
-    fn effective_hardware_mask(&self, work_mask: u32) -> u32 {
-        if self.config.midstate_mode {
+    /// P1 Scrypt seam — the PRODUCTION choice of algorithm for every
+    /// WorkBuilder this dispatcher creates. Pure function of the config so the
+    /// wiring (config → builder → MiningWork.algorithm) has its own test
+    /// (`dispatcher_production_path_threads_config_algorithm_into_work`)
+    /// instead of only resolver-level coverage. BOTH WorkBuilder construction
+    /// sites (`init_work_builder`, the `ExtranonceChanged` handler) MUST route
+    /// through this function; do not re-inline `WorkBuilder::new` there.
+    fn new_pool_work_builder(
+        config: &DispatcherConfig,
+        extranonce1: &str,
+        extranonce2_size: usize,
+    ) -> WorkBuilder {
+        WorkBuilder::new_for_algorithm(extranonce1, extranonce2_size, config.algorithm)
+    }
+
+    /// Which version-rolling mask the HARDWARE is programmed with for this
+    /// work unit.
+    ///
+    /// P2: an algorithm that does not roll version (Scrypt) must NEVER be
+    /// upgraded to the canonical BIP320 mask. Doing so would make
+    /// `actual_version_for` splice ASIC-returned bits into the header version
+    /// on a chip that never rolled it, silently corrupting every reconstructed
+    /// header. Extracted as a pure associated function so the production
+    /// choice is unit-testable without a dispatcher instance.
+    pub(crate) fn hardware_mask_for(
+        algorithm: PowAlgorithm,
+        midstate_mode: bool,
+        work_mask: u32,
+    ) -> u32 {
+        if !algorithm.supports_version_rolling() {
+            return 0;
+        }
+        if midstate_mode {
             work_mask
         } else if work_mask == 0 {
             BIP320_DEFAULT_VERSION_MASK
         } else {
             work_mask
         }
+    }
+
+    fn effective_hardware_mask(&self, work_mask: u32) -> u32 {
+        Self::hardware_mask_for(self.config.algorithm, self.config.midstate_mode, work_mask)
     }
 
     fn active_hardware_mask(&self) -> Option<u32> {
@@ -1052,8 +1221,10 @@ impl MiningDispatcher {
                         }
                     }
                     StratumEvent::DifficultyChanged(diff) => {
-                        // Floor at 1.0 to prevent share flooding on difficulty 0
-                        let safe_diff = if diff < 1.0 { 1.0 } else { diff };
+                        // STRATUM-2, algorithm-conditional (P2). This floor and
+                        // `work::difficulty_to_target*` MUST move together —
+                        // they now share ONE source, `min_pool_difficulty()`.
+                        let safe_diff = Self::floor_pool_difficulty(self.config.algorithm, diff);
                         info!(
                             "Dispatcher: pool[{}] difficulty changed to {} (clamped: {})",
                             pool_idx, diff, safe_diff
@@ -1100,11 +1271,13 @@ impl MiningDispatcher {
                             "Dispatcher: pool[{}] extranonce changed -- en1={}, en2_size={}",
                             pool_idx, extranonce1, extranonce2_size
                         );
+                        let config = &self.config;
                         let pool = &mut self.pools[pool_idx];
                         if let Some(ref mut wb) = pool.work_builder {
                             wb.set_extranonce(&extranonce1, extranonce2_size);
                         } else {
-                            let mut wb = WorkBuilder::new(&extranonce1, extranonce2_size);
+                            let mut wb =
+                                Self::new_pool_work_builder(config, &extranonce1, extranonce2_size);
                             wb.set_version_mask(pool.version_mask);
                             wb.set_difficulty(pool.difficulty);
                             pool.work_builder = Some(wb);
@@ -1169,12 +1342,38 @@ impl MiningDispatcher {
         }
     }
 
+    /// STRATUM-2 pool-difficulty floor, made **algorithm-conditional** in P2.
+    ///
+    /// Extracted as a pure function (the policy-wiring rule) so the production
+    /// choice is directly testable and so this site and
+    /// `work::difficulty_to_target_for` provably read the SAME policy — the
+    /// STRATUM-2 note requires the two to change together, and now they cannot
+    /// drift because both call `PowAlgorithm::min_pool_difficulty()`.
+    ///
+    /// - `Sha256d`: floors at 1.0, byte-for-byte the historical behaviour
+    ///   (SHA-256 ASIC pools never send diff<1 to a BitAxe).
+    /// - `Scrypt1024`: floors at the btc-scale diff-1 equivalent so a
+    ///   legitimate fractional difficulty from a btc-scale scrypt pool is
+    ///   honoured instead of silently over-tightened by 65536x.
+    ///
+    /// A non-finite difficulty always floors (fail-closed): `NaN < floor` is
+    /// false, so it is caught explicitly.
+    pub(crate) fn floor_pool_difficulty(algorithm: PowAlgorithm, diff: f64) -> f64 {
+        let floor = algorithm.min_pool_difficulty();
+        if !diff.is_finite() || diff < floor {
+            floor
+        } else {
+            diff
+        }
+    }
+
     /// Initialize the WorkBuilder for pool 0 with session data.
     ///
     /// Called after the Stratum handshake completes. For single-pool backward compat.
     pub fn init_work_builder(&mut self, extranonce1: &str, extranonce2_size: usize) {
+        let config = &self.config;
         if let Some(pool) = self.pools.get_mut(0) {
-            let mut wb = WorkBuilder::new(extranonce1, extranonce2_size);
+            let mut wb = Self::new_pool_work_builder(config, extranonce1, extranonce2_size);
             wb.set_version_mask(pool.version_mask);
             wb.set_difficulty(pool.difficulty);
             pool.work_builder = Some(wb);
@@ -1260,6 +1459,15 @@ impl MiningDispatcher {
     }
 
     fn actual_version_for(&self, item: &WorkItem, rolled_version: u32) -> u32 {
+        // P2: on an algorithm without version rolling (Scrypt) the chip never
+        // touched the header version, so ANY bits in `rolled_version` are
+        // status/aux payload, not version bits. Splicing them in would corrupt
+        // the reconstructed header and reject every share. Bail before the
+        // mask logic — this is the second, defence-in-depth leg alongside
+        // `hardware_mask_for` returning 0.
+        if !item.work.algorithm.supports_version_rolling() {
+            return item.work.version;
+        }
         if self.config.midstate_mode {
             if item.work.version_mask == 0 {
                 return item.work.version;
@@ -1865,6 +2073,7 @@ mod tests {
             nbits: 0x1d00ffff,
             extranonce2: "00".into(),
             share_target: [0xFFu8; 32],
+            algorithm: PowAlgorithm::Sha256d,
         }
     }
 
@@ -1930,6 +2139,7 @@ mod tests {
                 job_id_step: 16,
                 job_id_max: 128,
                 midstate_mode: false,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
 
@@ -2305,6 +2515,7 @@ mod tests {
                 nbits: 0,
                 extranonce2: "00".into(),
                 share_target: [0xFFu8; 32],
+                algorithm: PowAlgorithm::Sha256d,
             },
             dispatched_at: Instant::now(),
             pool_index: 0,
@@ -2333,6 +2544,7 @@ mod tests {
                 nbits: 0,
                 extranonce2: "00".into(),
                 share_target: [0xFFu8; 32],
+                algorithm: PowAlgorithm::Sha256d,
             },
             dispatched_at: Instant::now(),
             pool_index: 1,
@@ -2695,6 +2907,7 @@ mod tests {
                 job_id_step: 4,
                 job_id_max: 128,
                 midstate_mode: true,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
 
@@ -2745,6 +2958,7 @@ mod tests {
                 job_id_step: 4,
                 job_id_max: 128,
                 midstate_mode: true,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
         let mut item = make_test_item("midstate-clamp", 0, 0, 0);
@@ -2818,6 +3032,136 @@ mod tests {
         // which is the intended "always fresh work" behavior for dense chains.
         assert_eq!(DispatcherConfig::for_bm1397(425.0, 4).job_interval_ms, 5);
         assert_eq!(DispatcherConfig::for_bm1397(425.0, 6).job_interval_ms, 5);
+    }
+
+    /// ESP-Miner parity: the shared power-of-two rounding helper behind the
+    /// BM1366/68/70 job intervals must match `_next_power_of_two()` in
+    /// ESP-Miner `components/asic/asic_common.c` exactly (0 and 1 → 1, powers
+    /// of two → themselves, everything else rounds UP).
+    #[test]
+    fn next_power_of_two_matches_esp_miner() {
+        for (count, expected) in [
+            (0u8, 1u64),
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 4),
+            (5, 8),
+            (6, 8),
+            (7, 8),
+            (8, 8),
+            (9, 16),
+            (12, 16),
+            (16, 16),
+            (17, 32),
+            (255, 256),
+        ] {
+            assert_eq!(
+                DispatcherConfig::next_power_of_two(count),
+                expected,
+                "next_power_of_two({count})"
+            );
+        }
+    }
+
+    /// Job-interval formula pins for BM1366/BM1368/BM1370, hand-computed for
+    /// chip counts 1, 2, 4, 6, 8, 9, 16. Frequency does not enter these
+    /// families' interval at all.
+    ///
+    /// - **BM1366 + BM1370**: ESP-Miner ≥ LVXX `c8bf44e` parity —
+    ///   `default_asic_timeout / _next_power_of_two(asic_count)` with timeouts
+    ///   2000 / 500 (`device_config.h` + `ASIC_get_asic_job_frequency_ms`).
+    /// - **BM1368**: deliberately PLAIN `500 / asic_count` (coordinator hold
+    ///   2026-07-27, see `for_bm1368` doc + the dedicated
+    ///   `bm1368_deliberately_holds_plain_division_pending_soak` pin).
+    #[test]
+    fn bm_family_job_intervals_match_esp_miner_pow2_formula() {
+        // (asic_count, bm1366_ms, bm1368_ms, bm1370_ms)
+        for (count, i1366, i1368, i1370) in [
+            (1u8, 2000u64, 500u64, 500u64),
+            (2, 1000, 250, 250),
+            (4, 500, 125, 125),
+            (6, 250, 83, 62), // 1366: pow2(6)=8 NOT 333; 1368 plain: 500/6=83
+            (8, 250, 62, 62),
+            (9, 125, 55, 31), // 1366: pow2(9)=16 NOT 222; 1368 plain: 500/9=55
+            (16, 125, 31, 31),
+        ] {
+            assert_eq!(
+                DispatcherConfig::for_bm1366(485.0, count).job_interval_ms,
+                i1366,
+                "BM1366 interval for {count} chips"
+            );
+            assert_eq!(
+                DispatcherConfig::for_bm1368(490.0, count).job_interval_ms,
+                i1368,
+                "BM1368 interval for {count} chips"
+            );
+            assert_eq!(
+                DispatcherConfig::for_bm1370(525.0, count).job_interval_ms,
+                i1370,
+                "BM1370 interval for {count} chips"
+            );
+        }
+
+        // The 10 ms UART floor survives absurd chip counts (500/256 = 1 → 10,
+        // 2000/256 = 7 → 10).
+        assert_eq!(DispatcherConfig::for_bm1366(485.0, 255).job_interval_ms, 10);
+        assert_eq!(DispatcherConfig::for_bm1368(490.0, 255).job_interval_ms, 10);
+        assert_eq!(DispatcherConfig::for_bm1370(525.0, 255).job_interval_ms, 10);
+    }
+
+    /// Behaviour-change pins (2026-07-27 ESP-Miner pow2 parity fix). These are
+    /// the two BM1366 boards whose dispatch interval CHANGED when plain
+    /// division was replaced by the pow2 divisor — keep them explicit so a
+    /// revert to `2000 / count` is caught by name:
+    /// - Hex Ultra (6× BM1366): 333 ms → 250 ms
+    /// - Lucky LV08 (9× BM1366): 222 ms → 125 ms
+    ///
+    /// (Hex Supra 6× BM1368 deliberately did NOT change — see
+    /// `bm1368_deliberately_holds_plain_division_pending_soak`.)
+    #[test]
+    fn hex_ultra_and_lv08_intervals_changed_by_pow2_parity_fix() {
+        let hex_ultra = DispatcherConfig::for_bm1366(485.0, 6);
+        assert_eq!(
+            hex_ultra.job_interval_ms, 250,
+            "Hex Ultra (6x BM1366) must dispatch at 2000/pow2(6)=2000/8=250 ms, \
+             not the old 2000/6=333 ms"
+        );
+
+        let lv08 = DispatcherConfig::for_bm1366(485.0, 9);
+        assert_eq!(
+            lv08.job_interval_ms, 125,
+            "Lucky LV08 (9x BM1366) must dispatch at 2000/pow2(9)=2000/16=125 ms, \
+             not the old 2000/9=222 ms"
+        );
+    }
+
+    /// DELIBERATE-HOLD pin (coordinator decision 2026-07-27): BM1368 stays on
+    /// PLAIN `500 / asic_count`, NOT the ESP-Miner ≥`c8bf44e` pow2 divisor,
+    /// pending a Hex Supra hardware soak. Hex Supra is live-proven at the
+    /// plain-division cadence (~3.7 TH/s focused run), BM1368 has the
+    /// documented job-ID echo-mismatch history (87% HW errors pre-slot-scan),
+    /// and step-16 gives it only 8 job slots — so its dispatch timing is NOT
+    /// to be retimed by a "consistency" refactor. If a soak later approves the
+    /// pow2 divisor, change `for_bm1368` AND this test together, on purpose.
+    #[test]
+    fn bm1368_deliberately_holds_plain_division_pending_soak() {
+        // Non-power-of-two counts are exactly where plain and pow2 division
+        // disagree — pin the plain-division values there.
+        let hex_supra = DispatcherConfig::for_bm1368(490.0, 6);
+        assert_eq!(
+            hex_supra.job_interval_ms, 83,
+            "Hex Supra (6x BM1368) must stay at plain 500/6=83 ms (pow2 would \
+             give 62 ms) until a hardware soak approves the retime"
+        );
+        assert_eq!(
+            DispatcherConfig::for_bm1368(490.0, 9).job_interval_ms,
+            55,
+            "9x BM1368 must stay at plain 500/9=55 ms (pow2 would give 31 ms)"
+        );
+        // Power-of-two counts agree under both formulas; pin one as a sanity
+        // anchor so the test still exercises the divisor itself.
+        assert_eq!(DispatcherConfig::for_bm1368(490.0, 4).job_interval_ms, 125);
     }
 
     /// Default-preserving guarantee: full-header boards (BM1366/68/70/73,
@@ -3208,6 +3552,7 @@ mod tests {
                 job_id_step: 16,
                 job_id_max: 128,
                 midstate_mode: false,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
         insert_test_item(&mut dispatcher, 0, "submask-recovered", 0, 0);
@@ -3257,6 +3602,7 @@ mod tests {
                 job_id_step: 16,
                 job_id_max: 128,
                 midstate_mode: false,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
         insert_test_item(&mut dispatcher, 0, "submask-recovered-ok", 0, 0);
@@ -3296,6 +3642,7 @@ mod tests {
                 job_id_step: 4,
                 job_id_max: 128,
                 midstate_mode: true,
+                algorithm: PowAlgorithm::Sha256d,
             },
         );
         let mut item = make_test_item("bm1397", 0, 0, 0);
@@ -3306,5 +3653,434 @@ mod tests {
             "midstate_mode must never treat a midstate index as an out-of-mask roll"
         );
         drop(event_tx);
+    }
+
+    // ── P1 Scrypt seam: PRODUCTION-PATH algorithm threading ─────────────────
+    //
+    // These tests drive the dispatcher through its public surface (event
+    // channel + run_once), NOT by calling WorkBuilder directly, so they see
+    // exactly what production passes (the policy-wiring-needs-its-own-test
+    // rule). They deliberately use the NON-default `Scrypt1024` value: if any
+    // WorkBuilder construction site regresses to plain `WorkBuilder::new`
+    // (default `Sha256d`), the dispatched work's stamp silently reverts to the
+    // default and these assertions FAIL. (Mutation-checked: re-inlining
+    // `WorkBuilder::new` at either construction site fails both lanes.)
+
+    fn scrypt_test_config() -> DispatcherConfig {
+        DispatcherConfig {
+            job_interval_ms: 0,
+            job_id_step: 8,
+            job_id_max: 128,
+            midstate_mode: false,
+            algorithm: PowAlgorithm::Scrypt1024,
+        }
+    }
+
+    fn run_once_capturing(dispatcher: &mut MiningDispatcher) -> Vec<MiningWork> {
+        let mut sent: Vec<MiningWork> = Vec::new();
+        let mut send_work = |work: &MiningWork, _job_id: u8| -> Result<(), String> {
+            sent.push(work.clone());
+            Ok(())
+        };
+        let mut process_work = || Vec::new();
+        let mut apply_hw = |_d: Option<f64>, _m: Option<u32>| {};
+        dispatcher.run_once(&mut send_work, &mut process_work, &mut apply_hw);
+        sent
+    }
+
+    #[test]
+    fn dispatcher_production_path_threads_config_algorithm_into_work() {
+        // Lane 1: init_work_builder (the post-handshake production path).
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        dispatcher.init_work_builder("aabbccdd", 4);
+        event_tx.send(StratumEvent::Reconnected).unwrap();
+        event_tx
+            .send(StratumEvent::NewJob(make_stratum_job("seam-job-1", true)))
+            .unwrap();
+        let sent = run_once_capturing(&mut dispatcher);
+        assert_eq!(sent.len(), 1, "dispatcher must dispatch one work unit");
+        assert_eq!(
+            sent[0].algorithm,
+            PowAlgorithm::Scrypt1024,
+            "config.algorithm must reach the dispatched MiningWork (lane 1)"
+        );
+        // Scrypt properties must travel WITH the production work unit: no
+        // midstates (a SHA-256 concept), and a target derived from the
+        // ltc-scale diff-1 constant rather than Bitcoin's.
+        assert!(sent[0].midstates.is_empty());
+        assert_eq!(
+            sent[0].share_target,
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1.0)
+        );
+        assert_ne!(
+            sent[0].share_target,
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Sha256d, 1.0),
+            "Scrypt work must not be targeted with the Bitcoin diff-1 constant"
+        );
+        drop(event_tx);
+    }
+
+    #[test]
+    fn dispatcher_extranonce_event_lane_threads_config_algorithm() {
+        // Lane 2: the ExtranonceChanged handler's WorkBuilder construction.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        event_tx
+            .send(StratumEvent::ExtranonceChanged {
+                extranonce1: "aabbccdd".into(),
+                extranonce2_size: 4,
+            })
+            .unwrap();
+        event_tx.send(StratumEvent::Reconnected).unwrap();
+        event_tx
+            .send(StratumEvent::NewJob(make_stratum_job("seam-job-2", true)))
+            .unwrap();
+        let sent = run_once_capturing(&mut dispatcher);
+        assert_eq!(sent.len(), 1, "dispatcher must dispatch one work unit");
+        assert_eq!(
+            sent[0].algorithm,
+            PowAlgorithm::Scrypt1024,
+            "config.algorithm must reach the dispatched MiningWork (lane 2)"
+        );
+        drop(event_tx);
+    }
+
+    #[test]
+    fn dispatcher_default_config_ships_sha256d_work_with_midstates() {
+        // Shipping-path regression pin: every real constructor and Default use
+        // Sha256d, and the dispatched work keeps its midstates + real target.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let mut config = DispatcherConfig::default();
+        config.job_interval_ms = 0;
+        assert_eq!(config.algorithm, PowAlgorithm::Sha256d);
+        assert_eq!(
+            DispatcherConfig::for_bm1370(525.0, 1).algorithm,
+            PowAlgorithm::Sha256d
+        );
+        assert_eq!(
+            DispatcherConfig::for_bm1397(485.0, 1).algorithm,
+            PowAlgorithm::Sha256d
+        );
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, config);
+        dispatcher.init_work_builder("aabbccdd", 4);
+        event_tx.send(StratumEvent::Reconnected).unwrap();
+        event_tx
+            .send(StratumEvent::NewJob(make_stratum_job("seam-job-3", true)))
+            .unwrap();
+        let sent = run_once_capturing(&mut dispatcher);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].algorithm, PowAlgorithm::Sha256d);
+        assert!(
+            !sent[0].midstates.is_empty(),
+            "Sha256d work must keep its midstates (behavior unchanged)"
+        );
+        assert_ne!(sent[0].share_target, [0u8; 32]);
+        drop(event_tx);
+    }
+
+    #[test]
+    fn scrypt_stamped_work_is_validated_with_scrypt_not_sha256d() {
+        // Supersedes the P1 pin `scrypt_stamped_work_can_never_mint_a_share`.
+        // In P2 the Scrypt validator is REAL, so the invariant to hold is no
+        // longer "refuses everything" — it is "the dispatcher's PRODUCTION
+        // validation path runs scrypt over the reconstructed header, and
+        // credits difficulty on the ltc scale". A regression to the SHA-256d
+        // validator produces a wildly different difficulty and fails here.
+        //
+        // Product-level fail-closed posture now lives where it belongs: the
+        // LT0051 driver refuses `init`, and every Hammer DC0x board row
+        // declares fan/temp/power = None so `BoardConfig::validate()` refuses
+        // mining. See `hammer_dc0x_boards` in dcentaxe-hal.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        let mut item = make_test_item("scrypt-job", 0, 0, 0);
+        item.work.algorithm = PowAlgorithm::Scrypt1024;
+        item.work.share_target = [0xFFu8; 32]; // loosest — everything "meets" it
+        item.ticket_difficulty = 0.0;
+        let expected_header = build_validation_header(&item.work, item.work.version, 0x1234_5678);
+        dispatcher.active_jobs[0] = Some(item);
+        dispatcher.valid_jobs[0] = true;
+        dispatcher.dispatch_seq = 1;
+        dispatcher.stats.ticket_difficulty = 0.0;
+
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+
+        assert!(
+            share_rx.try_recv().is_ok(),
+            "with the loosest target the Scrypt path must submit — the P1 stub is gone"
+        );
+        let (scrypt_diff, _) = dcentaxe_stratum::work::full_header_difficulty_and_target_for(
+            PowAlgorithm::Scrypt1024,
+            &expected_header,
+            &[0xFFu8; 32],
+        );
+        let (sha_diff, _) = dcentaxe_stratum::work::full_header_difficulty_and_target_for(
+            PowAlgorithm::Sha256d,
+            &expected_header,
+            &[0xFFu8; 32],
+        );
+        assert_eq!(
+            dispatcher.stats.best_difficulty, scrypt_diff,
+            "difficulty must come from the SCRYPT validator"
+        );
+        assert_ne!(
+            dispatcher.stats.best_difficulty, sha_diff,
+            "a regression to the SHA-256d validator must be visible here"
+        );
+        drop(event_tx);
+    }
+
+    #[test]
+    fn scrypt_work_with_a_reject_all_target_still_submits_nothing() {
+        // The fail-closed target arm survives P2: a garbage/absent difficulty
+        // yields [0;32], and nothing can meet it.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        let mut item = make_test_item("scrypt-job", 0, 0, 0);
+        item.work.algorithm = PowAlgorithm::Scrypt1024;
+        item.work.share_target =
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Scrypt1024, 0.0);
+        assert_eq!(item.work.share_target, [0u8; 32]);
+        dispatcher.active_jobs[0] = Some(item);
+        dispatcher.valid_jobs[0] = true;
+        dispatcher.dispatch_seq = 1;
+        dispatcher.stats.ticket_difficulty = 0.0;
+
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+
+        assert!(share_rx.try_recv().is_err());
+        assert_eq!(dispatcher.stats.accepted, 0);
+        drop(event_tx);
+    }
+
+    // ── P2: STRATUM-2 floor is algorithm-conditional, from ONE source ───────
+
+    #[test]
+    fn pool_difficulty_floor_is_algorithm_conditional_and_matches_the_target_math() {
+        // SHA-256: historical 1.0 floor, unchanged.
+        assert_eq!(
+            MiningDispatcher::floor_pool_difficulty(PowAlgorithm::Sha256d, 0.05),
+            1.0
+        );
+        assert_eq!(
+            MiningDispatcher::floor_pool_difficulty(PowAlgorithm::Sha256d, 0.0),
+            1.0
+        );
+        assert_eq!(
+            MiningDispatcher::floor_pool_difficulty(PowAlgorithm::Sha256d, 4096.0),
+            4096.0
+        );
+
+        // Scrypt: a legitimate btc-scale fractional difficulty survives.
+        assert_eq!(
+            MiningDispatcher::floor_pool_difficulty(PowAlgorithm::Scrypt1024, 0.05),
+            0.05
+        );
+        let floor = PowAlgorithm::Scrypt1024.min_pool_difficulty();
+        assert!(floor < 1.0);
+        assert_eq!(
+            MiningDispatcher::floor_pool_difficulty(PowAlgorithm::Scrypt1024, floor / 100.0),
+            floor
+        );
+
+        // Both fail closed on garbage.
+        for algo in [PowAlgorithm::Sha256d, PowAlgorithm::Scrypt1024] {
+            for bad in [f64::NAN, f64::NEG_INFINITY, -5.0, 0.0] {
+                assert_eq!(
+                    MiningDispatcher::floor_pool_difficulty(algo, bad),
+                    algo.min_pool_difficulty(),
+                    "{algo:?} must floor garbage difficulty {bad}"
+                );
+            }
+        }
+
+        // THE STRATUM-2 REQUIREMENT: this site and the target math must move
+        // together. They read the same policy function, so a floored
+        // difficulty and its target agree by construction.
+        for algo in [PowAlgorithm::Sha256d, PowAlgorithm::Scrypt1024] {
+            let floored = MiningDispatcher::floor_pool_difficulty(algo, 1e-9);
+            assert_eq!(
+                dcentaxe_stratum::work::difficulty_to_target_for(algo, 1e-9),
+                dcentaxe_stratum::work::difficulty_to_target_for(algo, floored),
+                "{algo:?}: dispatcher floor and target math disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatcher_difficulty_event_uses_the_algorithm_conditional_floor() {
+        // Production path, not the helper: feed a real DifficultyChanged event
+        // through the channel on a Scrypt config and assert the sub-1 value
+        // SURVIVES (the old hardcoded `if diff < 1.0 { 1.0 }` would clamp it).
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        dispatcher.init_work_builder("aabbccdd", 4);
+        event_tx
+            .send(StratumEvent::DifficultyChanged(0.25))
+            .unwrap();
+        event_tx.send(StratumEvent::Reconnected).unwrap();
+        event_tx
+            .send(StratumEvent::NewJob(make_stratum_job("floor-job", true)))
+            .unwrap();
+        let sent = run_once_capturing(&mut dispatcher);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].share_target,
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Scrypt1024, 0.25),
+            "a sub-1 Scrypt difficulty must reach the target math un-floored"
+        );
+        assert_ne!(
+            sent[0].share_target,
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Scrypt1024, 1.0),
+            "the old unconditional 1.0 floor must be gone on the Scrypt path"
+        );
+        drop(event_tx);
+    }
+
+    #[test]
+    fn sha256d_difficulty_event_keeps_the_historical_one_point_zero_floor() {
+        // The other half of the same change: SHA-256 behaviour is unchanged.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let mut config = DispatcherConfig::default();
+        config.job_interval_ms = 0;
+        let mut dispatcher = MiningDispatcher::new(event_rx, share_tx, config);
+        dispatcher.init_work_builder("aabbccdd", 4);
+        event_tx
+            .send(StratumEvent::DifficultyChanged(0.25))
+            .unwrap();
+        event_tx.send(StratumEvent::Reconnected).unwrap();
+        event_tx
+            .send(StratumEvent::NewJob(make_stratum_job(
+                "floor-job-sha",
+                true,
+            )))
+            .unwrap();
+        let sent = run_once_capturing(&mut dispatcher);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].share_target,
+            dcentaxe_stratum::work::difficulty_to_target_for(PowAlgorithm::Sha256d, 1.0),
+            "SHA-256 must still floor a sub-1 pool difficulty to 1.0"
+        );
+        drop(event_tx);
+    }
+
+    // ── P2: no version rolling anywhere on a Scrypt work unit ───────────────
+
+    #[test]
+    fn scrypt_never_gets_a_hardware_version_mask() {
+        // `hardware_mask_for` is the production chooser used by
+        // `effective_hardware_mask`. Upgrading mask 0 -> canonical BIP320 on a
+        // chip that does not roll version would make `actual_version_for`
+        // splice status bytes into the header version.
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Scrypt1024, false, 0),
+            0
+        );
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Scrypt1024, false, 0x1FFF_E000),
+            0
+        );
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Scrypt1024, true, 0x1FFF_E000),
+            0
+        );
+        // SHA-256d behaviour byte-for-byte unchanged.
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Sha256d, false, 0),
+            BIP320_DEFAULT_VERSION_MASK
+        );
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Sha256d, false, 0x00FF_0000),
+            0x00FF_0000
+        );
+        assert_eq!(
+            MiningDispatcher::hardware_mask_for(PowAlgorithm::Sha256d, true, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn scrypt_version_reconstruction_never_rolls() {
+        // Defence-in-depth leg: even if a mask leaked into a work item, the
+        // reconstructed version for Scrypt work must be the base version.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (share_tx, _share_rx) = mpsc::channel();
+        let dispatcher = MiningDispatcher::new(event_rx, share_tx, scrypt_test_config());
+        let mut item = make_test_item("scrypt-ver", 0, 0, 0);
+        item.work.algorithm = PowAlgorithm::Scrypt1024;
+        item.work.version_mask = BIP320_DEFAULT_VERSION_MASK;
+        item.hardware_version_mask = BIP320_DEFAULT_VERSION_MASK;
+        let base = item.work.version;
+        for rolled in [0u32, 0x0000_4000, 0x1FFF_E000, u32::MAX] {
+            assert_eq!(
+                dispatcher.actual_version_for(&item, rolled),
+                base,
+                "Scrypt must never splice rolled bits (rolled=0x{rolled:08x})"
+            );
+        }
+        // …and the same item stamped Sha256d DOES roll, proving the guard is
+        // the algorithm, not something else about the fixture.
+        item.work.algorithm = PowAlgorithm::Sha256d;
+        assert_ne!(dispatcher.actual_version_for(&item, 0x0000_4000), base);
+        drop(event_tx);
+    }
+
+    // ── P2: Scrypt job cadence comes from measured MH/s ─────────────────────
+
+    #[test]
+    fn lt0051_job_cadence_is_derived_from_measured_mhs_not_the_sha256_formula() {
+        // The SHA-256 formula assumes ~1 hash/core/clock; a scrypt core takes
+        // ~10^4 clocks per hash, so reusing it is ~4 orders of magnitude wrong
+        // and would hammer the UART with a new job every few ms.
+        let dc02 = DispatcherConfig::for_lt0051(150.0, 2);
+        let dc04 = DispatcherConfig::for_lt0051(300.0, 4);
+        let dc06 = DispatcherConfig::for_lt0051(450.0, 6);
+
+        assert_eq!(dc02.algorithm, PowAlgorithm::Scrypt1024);
+        assert!(!dc02.midstate_mode);
+        // MSBT0501 job id: plain 7-bit echo, counter +1 wrapping at 127.
+        assert_eq!(dc02.job_id_step, 1);
+        assert_eq!(dc02.job_id_max, 128);
+
+        // 2^32 / 150e6 ≈ 28.6 s sweep; a quarter of that is ~7.2 s, clamped to
+        // the 500 ms UART envelope every chip shares.
+        assert_eq!(dc02.job_interval_ms, 500);
+        // Faster chains still clamp at the same ceiling — the point is that
+        // NONE of them land in the single-digit-millisecond regime the
+        // SHA-256 formula would produce.
+        assert_eq!(dc04.job_interval_ms, 500);
+        assert_eq!(dc06.job_interval_ms, 500);
+        for cfg in [&dc02, &dc04, &dc06] {
+            assert!(
+                (5..=500).contains(&cfg.job_interval_ms),
+                "interval must stay inside the shared UART envelope"
+            );
+        }
+
+        // The SHA-256 core-count formula for the same nominal numbers is off
+        // by orders of magnitude — pin the contrast so nobody "unifies" them.
+        let sha_formula = DispatcherConfig::calculate_interval(2300.0, 672, 2);
+        assert_eq!(
+            sha_formula, 5,
+            "the SHA-256 formula bottoms out at the 5 ms floor for a Scrypt chain"
+        );
+        assert!(dc02.job_interval_ms > sha_formula * 10);
+
+        // A hypothetical very fast chain shortens the interval — the cadence
+        // genuinely tracks measured rate rather than being a constant.
+        let fast = DispatcherConfig::for_lt0051(50_000.0, 6);
+        assert!(fast.job_interval_ms < 500);
+        // Degenerate/zero measurement must not divide by zero or panic.
+        let unmeasured = DispatcherConfig::for_lt0051(0.0, 2);
+        assert_eq!(unmeasured.job_interval_ms, 500);
     }
 }

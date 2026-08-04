@@ -45,8 +45,9 @@ pub const CHIP_ID: u16 = 0x1368;
 /// BM1368 chips per chain on S21 (verified from live probe).
 pub const CHIPS_PER_CHAIN_S21: u8 = 108;
 
-/// S21 fixture uses address_interval=2 (108 chips across 12 voltage domains).
-pub const FIXTURE_ADDRESS_INTERVAL: u8 = 2;
+/// S21 fixture address interval — pure SSOT `floor(256/108)=2`.
+pub const FIXTURE_ADDRESS_INTERVAL: u8 =
+    dcentrald_common::bm1397plus_addr_interval(CHIPS_PER_CHAIN_S21);
 
 /// Bitmain fixture uses ticket mask 0x7f for BM1368.
 pub const FIXTURE_TICKET_MASK: u32 = 0x0000_007F;
@@ -70,44 +71,24 @@ pub const JOB_ID_INCREMENT: u8 = 24;
 const FREQ_MULT: f64 = 25.0;
 
 /// Minimum feedback divider value for PLL search.
-const FB_DIV_MIN: u16 = 144;
+const FB_DIV_MIN: u16 = dcentrald_common::BM1368_FB_DIV_MIN;
 
-/// Maximum feedback divider value for PLL search.
-const FB_DIV_MAX: u16 = 235;
+/// Maximum feedback divider value for PLL search (pure SSOT).
+const FB_DIV_MAX: u16 = dcentrald_common::BM1368_FB_DIV_MAX;
 
-/// BM1368 PLL VCO lock-range bounds — **Bitmain-canonical, from the unstripped
-/// S21 (BM1368) jig** `single_board_test.dec/get_pllparam_divider@CF634` (RE
-/// 2026-06-02): the jig accepts a PLL config only when `2000 ≤ VCO ≤ 3200` MHz,
-/// additionally `VCO ≤ 3125` when `REFDIV == 1` (`VCO = 25 MHz × FBDIV/REFDIV`)
-/// — byte-identical to the BM1370 S21 Pro jig constraint.
-///
-/// The curated [`BM1368_PLL_TABLE`] (REFDIV=2, FBDIV 160-225) is already fully
-/// inside this range (VCO 2000-2812; pinned by
-/// `bm1368_pll_lookup_table_within_jig_vco_range`). The **brute-force fallback**
-/// `bm1368_pll_search` (FBDIV 144-235, REFDIV 1-2) has NO VCO clamp, so for
-/// off-table targets it can select a REFDIV=1 / VCO 3600-5875 config OR a
-/// REFDIV=2 / VCO 1800-1987 config (low FBDIV) that the jig would reject. Same
-/// finding-class + gate as BM1370 ([`super::bm1370`]); see RE-ASK-BM1370-RAMP-VCO.
-const PLL_VCO_MIN_MHZ: f64 = 2000.0;
-const PLL_VCO_MAX_MHZ: f64 = 3200.0;
-const PLL_VCO_MAX_REFDIV1_MHZ: f64 = 3125.0;
+/// G30: jig VCO envelope is pure SSOT (`BM1370_JIG_VCO_*` / `bm1368_vco_in_jig_range`).
+/// Table path is always in-jig; fallback clamp is EXPERIMENTAL env-gated default-OFF.
+const PLL_VCO_MIN_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MIN_MHZ;
+const PLL_VCO_MAX_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MAX_MHZ;
+const PLL_VCO_MAX_REFDIV1_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MAX_REFDIV1_MHZ;
 
-/// Env gate (default-OFF): constrain the BM1368 PLL **fallback** search to the
-/// Bitmain S21-jig VCO lock range. OFF = byte-identical to ESP-Miner (the curated
-/// lookup table is unaffected — it's already in range). ON = the off-table
-/// fallback never selects a config the jig would reject. Resolve the true BM1368
-/// VCO range on the live `a lab unit` S21 alongside RE-ASK-BM1370-RAMP-VCO.
+/// Env gate (default-OFF): constrain BM1368 **fallback** search to Bitmain S21 jig VCO.
 const JIG_VCO_CLAMP_ENV: &str = "DCENT_BM1368_JIG_VCO_CLAMP";
 
-/// `true` iff `vco` is inside the Bitmain S21 (BM1368) jig's accepted VCO range
-/// for `refdiv`.
+/// Pure SSOT for jig VCO membership (G30).
+#[inline]
 fn vco_in_jig_range(vco: f64, refdiv: u8) -> bool {
-    let cap = if refdiv == 1 {
-        PLL_VCO_MAX_REFDIV1_MHZ
-    } else {
-        PLL_VCO_MAX_MHZ
-    };
-    (PLL_VCO_MIN_MHZ..=PLL_VCO_MAX_MHZ).contains(&vco) && vco <= cap
+    dcentrald_common::bm1368_vco_in_jig_range(vco, refdiv)
 }
 
 /// BM1368 register addresses.
@@ -140,10 +121,8 @@ pub mod regs {
 // ESP-Miner verified init register values (from esp-miner-asic-driver-analysis)
 // ---------------------------------------------------------------------------
 
-/// Version mask register value: 0x9000FFFF
-/// Encodes: prefix 0x9000 + (version_mask >> 13) where mask = 0x1FFFE000.
-/// 0x1FFFE000 >> 13 = 0xFFFF, so register = 0x9000FFFF.
-const VERSION_MASK_REG: u32 = 0x9000_FFFF;
+/// G28 pure SSOT: BIP-320 mask → reg 0xA4 (`version_rolling_reg_value`).
+const VERSION_MASK_REG: u32 = dcentrald_common::VERSION_ROLLING_REG_BIP320_DEFAULT;
 
 /// Reg 0xA8 broadcast init value.
 const REG_A8_BCAST_INIT: u32 = 0x0007_0000;
@@ -275,113 +254,20 @@ const DEFAULT_ASIC_DIFFICULTY: u32 = 128;
 // PLL computation
 // ---------------------------------------------------------------------------
 
-/// Bitmain-verified BM1368 PLL lookup table.
-///
-/// Source: S21 fixture test jig (`single_board_test` ch0_0.log, 2023-09-14).
-/// 68 entries from 56.25 MHz to 475.00 MHz in 6.25 MHz steps.
-/// All entries: refdiv=2, usr_divider=1, zero PLL error (exact lock).
-///
-/// Format: (freq_mhz_x100, fbdiv, postdiv1, postdiv2)
-/// freq_mhz_x100 avoids floating point: 5625 = 56.25 MHz, 40000 = 400.00 MHz
-const BM1368_PLL_TABLE: &[(u16, u8, u8, u8)] = &[
-    (5625, 162, 6, 6),
-    (6250, 175, 7, 5),
-    (6875, 165, 6, 5),
-    (7500, 168, 7, 4),
-    (8125, 182, 7, 4),
-    (8750, 168, 6, 4),
-    (9375, 180, 6, 4),
-    (10000, 168, 7, 3),
-    (10625, 170, 5, 4),
-    (11250, 162, 6, 3),
-    (11875, 171, 6, 3),
-    (12500, 180, 6, 3),
-    (13125, 189, 6, 3),
-    (13750, 165, 5, 3),
-    (14375, 161, 7, 2),
-    (15000, 168, 7, 2),
-    (15625, 175, 7, 2),
-    (16250, 182, 7, 2),
-    (16875, 162, 6, 2),
-    (17500, 168, 6, 2),
-    (18125, 174, 6, 2),
-    (18750, 180, 6, 2),
-    (19375, 186, 6, 2),
-    (20000, 160, 5, 2),
-    (20625, 165, 5, 2),
-    (21250, 170, 5, 2),
-    (21875, 175, 5, 2),
-    (22500, 180, 5, 2),
-    (23125, 185, 5, 2),
-    (23750, 190, 5, 2),
-    (24375, 195, 5, 2),
-    (25000, 160, 4, 2),
-    (25625, 164, 4, 2),
-    (26250, 168, 4, 2),
-    (26875, 172, 4, 2),
-    (27500, 176, 4, 2),
-    (28125, 180, 4, 2),
-    (28750, 161, 7, 1),
-    (29375, 188, 4, 2),
-    (30000, 168, 7, 1),
-    (30625, 196, 4, 2),
-    (31250, 175, 7, 1),
-    (31875, 204, 4, 2),
-    (32500, 182, 7, 1),
-    (33125, 212, 4, 2),
-    (33750, 162, 6, 1),
-    (34375, 165, 6, 1),
-    (35000, 168, 6, 1),
-    (35625, 171, 6, 1),
-    (36250, 174, 6, 1),
-    (36875, 177, 6, 1),
-    (37500, 180, 6, 1),
-    (38125, 183, 6, 1),
-    (38750, 186, 6, 1),
-    (39375, 189, 6, 1),
-    (40000, 160, 5, 1),
-    (40625, 195, 6, 1),
-    (41250, 165, 5, 1),
-    (41875, 201, 6, 1),
-    (42500, 170, 5, 1),
-    (43125, 207, 6, 1),
-    (43750, 175, 5, 1),
-    (44375, 213, 6, 1),
-    (45000, 180, 5, 1),
-    (45625, 219, 6, 1),
-    (46250, 185, 5, 1),
-    (46875, 225, 6, 1),
-    (47500, 190, 5, 1),
-];
+/// G30: pure SSOT table lives in `dcentrald_common::BM1368_PLL_TABLE`.
+pub use dcentrald_common::BM1368_PLL_TABLE;
 
-/// Look up PLL parameters from Bitmain's verified table.
+/// Look up PLL parameters from Bitmain's verified table (pure thin-wrap).
 /// Returns (fbdiv, refdiv, postdiv1, postdiv2, actual_freq) or None if not in table.
 fn bm1368_pll_lookup(target_mhz: f64) -> Option<(u8, u8, u8, u8, f64)> {
-    // Convert to x100 integer for lookup (e.g., 400.0 → 40000)
-    let target_x100 = (target_mhz * 100.0).round() as u16;
-
-    // Find closest entry (within 3.125 MHz = half a step)
-    for &(freq_x100, fbdiv, pd1, pd2) in BM1368_PLL_TABLE {
-        if freq_x100 == target_x100 {
-            let actual = FREQ_MULT * fbdiv as f64 / (2.0 * pd1 as f64 * pd2 as f64);
-            return Some((fbdiv, 2, pd1, pd2, actual));
-        }
-    }
-
-    // Try nearest 6.25 MHz step
-    let snapped = ((target_mhz / 6.25).round() * 6.25 * 100.0).round() as u16;
-    for &(freq_x100, fbdiv, pd1, pd2) in BM1368_PLL_TABLE {
-        if freq_x100 == snapped {
-            let actual = FREQ_MULT * fbdiv as f64 / (2.0 * pd1 as f64 * pd2 as f64);
-            return Some((fbdiv, 2, pd1, pd2, actual));
-        }
-    }
-
-    None
+    let d = dcentrald_common::bm1368_pll_table_lookup(target_mhz)?;
+    let actual = FREQ_MULT * f64::from(d.fb_div)
+        / (f64::from(d.ref_div) * f64::from(d.post_div1) * f64::from(d.post_div2));
+    Some((d.fb_div as u8, d.ref_div, d.post_div1, d.post_div2, actual))
 }
 
 /// Top of Bitmain's verified BM1368 PLL lookup table (x100 MHz) = 475.00 MHz.
-const BM1368_PLL_TABLE_MAX_X100: u32 = 47500;
+const BM1368_PLL_TABLE_MAX_X100: u32 = dcentrald_common::BM1368_PLL_TABLE_MAX_X100;
 
 /// PERF-005: capability ceiling (x100 MHz) for the BM1368 PLL ramp = 600.00 MHz.
 ///
@@ -395,165 +281,52 @@ const BM1368_PLL_TABLE_MAX_X100: u32 = 47500;
 /// (S21 default stays in the table window), so a default tune produces
 /// byte-identical ramp output to before. Raising the *requested* frequency is a
 /// separate, operator-driven config change.
-const BM1368_PLL_RAMP_MAX_X100: u32 = 60000;
+const BM1368_PLL_RAMP_MAX_X100: u32 = dcentrald_common::BM1368_PLL_RAMP_MAX_X100;
 
-/// Build the fixture-style PLL ramp from the BM1368 default 50 MHz state.
+/// G30: pure fixture-style PLL ramp (`plan_bm1368_pll_ramp`).
 ///
-/// The programmable table starts at 56.25 MHz, so the first explicit write is
-/// 56.25 MHz and then increments in 6.25 MHz steps up to the snapped target.
-///
-/// PERF-005: for targets above the verified table max (475 MHz) and up to the
-/// capability ceiling (600 MHz), the ramp first walks the whole verified table,
-/// then appends brute-force-searched 6.25 MHz steps for the 475→target segment
-/// so the chip is ramped (not slammed) all the way to the commanded frequency.
+/// Default unclamped policy (table-first + EspMinerFull fallback). Env jig
+/// clamp is honored for off-table steps only.
 pub fn pll_ramp_sequence(target_mhz: u16) -> Vec<(u32, u32)> {
-    let target_x100 = ((target_mhz as u32 * 100 + 312) / 625) * 625;
-    let clamped_target = target_x100.clamp(5625, BM1368_PLL_RAMP_MAX_X100);
-    let mut steps = Vec::new();
-
-    // Phase 1: verified-table steps up to min(target, table max).
-    let table_target = clamped_target.min(BM1368_PLL_TABLE_MAX_X100);
-    for &(freq_x100, fbdiv, pd1, pd2) in BM1368_PLL_TABLE {
-        let freq_x100 = freq_x100 as u32;
-        if freq_x100 > table_target {
-            break;
-        }
-        let reg = bm1368_pll_encode(fbdiv, 2, pd1, pd2);
-        steps.push((reg, freq_x100));
-    }
-
-    // Phase 2 (PERF-005): for targets above the table, continue ramping in
-    // 6.25 MHz steps using the brute-force PLL search. Keeps the staged
-    // ramp behavior above the fixture window instead of a single slam.
-    if clamped_target > BM1368_PLL_TABLE_MAX_X100 {
-        let mut next = BM1368_PLL_TABLE_MAX_X100 + 625;
-        while next <= clamped_target {
-            let mhz = next as f64 / 100.0;
-            let (fbdiv, refdiv, pd1, pd2, _) = bm1368_pll_search(mhz);
-            steps.push((bm1368_pll_encode(fbdiv, refdiv, pd1, pd2), next));
-            next += 625;
-        }
-        // Ensure the final step lands exactly on the (clamped) target if the
-        // 6.25 MHz cadence didn't divide evenly into it.
-        if steps.last().map(|&(_, f)| f) != Some(clamped_target) {
-            let mhz = clamped_target as f64 / 100.0;
-            let (fbdiv, refdiv, pd1, pd2, _) = bm1368_pll_search(mhz);
-            steps.push((bm1368_pll_encode(fbdiv, refdiv, pd1, pd2), clamped_target));
-        }
-    }
-
-    if steps.is_empty() {
-        let (fbdiv, refdiv, pd1, pd2, _) = bm1368_pll_search(target_mhz as f64);
-        steps.push((
-            bm1368_pll_encode(fbdiv, refdiv, pd1, pd2),
-            target_mhz as u32 * 100,
-        ));
-    }
-
-    steps
-}
-
-/// PLL parameters for the BM1366/BM1368/BM1370 family.
-///
-/// First checks Bitmain's verified lookup table (from S21 fixture test jig).
-/// Falls back to ESP-Miner brute-force search for frequencies not in the table.
-///
-///   freq = FREQ_MULT * fb_div / (ref_div * postdiv1 * postdiv2)
-///
-/// Constraints:
-///   - ref_div: 1 or 2
-///   - postdiv1: 1..=7
-///   - postdiv2: 1..=7
-///   - postdiv1 > postdiv2
-///   - fb_div: FB_DIV_MIN..=FB_DIV_MAX (144-235 for BM1368)
-///
-/// Selects: closest frequency, then lowest VCO, then lowest postdiv product.
-fn bm1368_pll_search(target_mhz: f64) -> (u8, u8, u8, u8, f64) {
-    // Try Bitmain's verified lookup table first
-    if let Some(params) = bm1368_pll_lookup(target_mhz) {
-        return params;
-    }
-    // Fall back to brute-force search (Bitmain-jig VCO clamp opt-in — same
-    // gate/finding as BM1370; OFF = byte-identical ESP-Miner behaviour).
     let clamp_vco = std::env::var(JIG_VCO_CLAMP_ENV).as_deref() == Ok("1");
-    bm1368_pll_fallback(target_mhz, clamp_vco)
+    let policy = if clamp_vco {
+        dcentrald_common::Bm1368VcoPolicy::BitmainJigClamp
+    } else {
+        dcentrald_common::Bm1368VcoPolicy::EspMinerUnclamped
+    };
+    dcentrald_common::plan_bm1368_pll_ramp(target_mhz, policy)
 }
 
-/// Brute-force PLL search fallback (off-table targets), with the optional
-/// Bitmain-jig VCO clamp. Separated from [`bm1368_pll_search`] so the clamp is
-/// deterministically testable without env races.
+/// G30: pure table-first + EspMinerFull fallback (`resolve_bm1368_pll_mhz`).
+fn bm1368_pll_search(target_mhz: f64) -> (u8, u8, u8, u8, f64) {
+    let clamp_vco = std::env::var(JIG_VCO_CLAMP_ENV).as_deref() == Ok("1");
+    let policy = if clamp_vco {
+        dcentrald_common::Bm1368VcoPolicy::BitmainJigClamp
+    } else {
+        dcentrald_common::Bm1368VcoPolicy::EspMinerUnclamped
+    };
+    let (_sol, d) = dcentrald_common::resolve_bm1368_pll_mhz(target_mhz, policy);
+    let actual = FREQ_MULT * f64::from(d.fb_div)
+        / (f64::from(d.ref_div) * f64::from(d.post_div1) * f64::from(d.post_div2));
+    (d.fb_div as u8, d.ref_div, d.post_div1, d.post_div2, actual)
+}
+
+/// G30: pure off-table fallback only (deterministic tests; no env).
 fn bm1368_pll_fallback(target_mhz: f64, clamp_vco: bool) -> (u8, u8, u8, u8, f64) {
-    let mut best_fb: u8 = 144;
-    let mut best_ref: u8 = 1;
-    let mut best_pd1: u8 = 1;
-    let mut best_pd2: u8 = 1;
-    let mut best_freq: f64 = 0.0;
-    let mut best_diff: f64 = f64::MAX;
-    let mut best_vco: f64 = f64::MAX;
-    let mut best_pdprod: u8 = u8::MAX;
-
-    for ref_div in [1u8, 2] {
-        for postdiv1 in 1u8..=7 {
-            for postdiv2 in 1u8..=7 {
-                if postdiv1 <= postdiv2 && postdiv1 != postdiv2 {
-                    continue;
-                }
-                // postdiv1 must be > postdiv2 (ESP-Miner constraint),
-                // OR they can be equal (both 1).
-                if postdiv1 < postdiv2 {
-                    continue;
-                }
-                for fb_div in FB_DIV_MIN..=FB_DIV_MAX {
-                    let freq = FREQ_MULT * fb_div as f64
-                        / (ref_div as f64 * postdiv1 as f64 * postdiv2 as f64);
-                    let diff = (freq - target_mhz).abs();
-                    let vco = FREQ_MULT * fb_div as f64 / ref_div as f64;
-                    let pdprod = postdiv1 * postdiv2;
-
-                    // Skip configs the S21 jig would reject as out-of-VCO-range
-                    // (gated; OFF = byte-identical ESP-Miner behaviour).
-                    if clamp_vco && !vco_in_jig_range(vco, ref_div) {
-                        continue;
-                    }
-
-                    let better = diff < best_diff
-                        || (diff == best_diff && vco < best_vco)
-                        || (diff == best_diff && vco == best_vco && pdprod < best_pdprod);
-
-                    if better {
-                        best_fb = fb_div as u8;
-                        best_ref = ref_div;
-                        best_pd1 = postdiv1;
-                        best_pd2 = postdiv2;
-                        best_freq = freq;
-                        best_diff = diff;
-                        best_vco = vco;
-                        best_pdprod = pdprod;
-                    }
-                }
-            }
-        }
-    }
-
-    (best_fb, best_ref, best_pd1, best_pd2, best_freq)
+    let policy = if clamp_vco {
+        dcentrald_common::Bm1368VcoPolicy::BitmainJigClamp
+    } else {
+        dcentrald_common::Bm1368VcoPolicy::EspMinerUnclamped
+    };
+    let (_sol, d) = dcentrald_common::resolve_bm1368_pll_fallback_mhz(target_mhz, policy);
+    let actual = FREQ_MULT * f64::from(d.fb_div)
+        / (f64::from(d.ref_div) * f64::from(d.post_div1) * f64::from(d.post_div2));
+    (d.fb_div as u8, d.ref_div, d.post_div1, d.post_div2, actual)
 }
 
-/// Encode PLL parameters into the 32-bit register value for BM1368.
-///
-/// Register 0x08 byte layout:
-///   Byte 0: VDO_SCALE (0x40 if VCO < 2400 MHz, 0x50 if >= 2400 MHz)
-///   Byte 1: FBDIV
-///   Byte 2: REFDIV
-///   Byte 3: ((POSTDIV1-1) << 4) | (POSTDIV2-1)
+/// G30: pure crystal-25 register encode.
 fn bm1368_pll_encode(fb_div: u8, ref_div: u8, postdiv1: u8, postdiv2: u8) -> u32 {
-    let vco = FREQ_MULT * fb_div as f64 / ref_div as f64;
-    let vdo_scale: u8 = if vco >= 2400.0 { 0x50 } else { 0x40 };
-    let postdiv_byte = ((postdiv1.saturating_sub(1)) << 4) | postdiv2.saturating_sub(1);
-
-    ((vdo_scale as u32) << 24)
-        | ((fb_div as u32) << 16)
-        | ((ref_div as u32) << 8)
-        | (postdiv_byte as u32)
+    dcentrald_common::crystal25_pll_encode_reg(fb_div, ref_div, postdiv1, postdiv2)
 }
 
 /// BM1368 driver implementation.
@@ -617,6 +390,39 @@ impl Bm1368Driver {
         chain.write_cmd(w0);
         chain.write_cmd(w1);
     }
+
+    /// G20: ESP-Miner-faithful MiscCtrl **single** broadcast (pure SSOT).
+    fn misc_ctrl_single_write_broadcast(chain: &mut FpgaChain, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_broadcast(value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
+    }
+
+    /// G20: ESP-Miner-faithful MiscCtrl **single** per-chip (pure SSOT).
+    fn misc_ctrl_single_write_chip(chain: &mut FpgaChain, chip_addr: u8, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_chip(chip_addr, value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBm1397Plus {
+                chip_addr: addr,
+                reg,
+                value,
+            } = op
+            {
+                Self::write_reg_single(chain, addr, reg, value);
+            }
+        }
+    }
 }
 
 impl ChipDriver for Bm1368Driver {
@@ -672,18 +478,23 @@ impl ChipDriver for Bm1368Driver {
         chain.set_baud(fpga_chain::BAUD_REG_115200);
         tracing::debug!(chain_id = chain.chain_id, "FPGA baud set to 115200");
 
-        // Step 2: Version mask (sent 4 times — BM1368 requires 4x, vs 3x for BM1366).
-        // This configures the hardware version rolling mask before chip enumeration.
-        for i in 0..4 {
-            Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, VERSION_MASK_REG);
-            if i == 0 {
-                tracing::debug!(
-                    chain_id = chain.chain_id,
-                    value = format_args!("0x{:08X}", VERSION_MASK_REG),
-                    "Version mask set (x4)",
-                );
+        // Step 2: Version mask ×4 (ESP-Miner BM1368). G21 pure SSOT.
+        debug_assert_eq!(
+            regs::VERSION_ROLLING,
+            dcentrald_common::VERSION_ROLLING_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_version_rolling_quad_write_broadcast(VERSION_MASK_REG) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
             }
         }
+        tracing::debug!(
+            chain_id = chain.chain_id,
+            value = format_args!("0x{:08X}", VERSION_MASK_REG),
+            "Version mask set (x4)",
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Step 3: Bulk init registers (broadcast to all chips).
@@ -698,7 +509,8 @@ impl ChipDriver for Bm1368Driver {
         );
 
         // 3b) Misc control
-        Self::write_reg_broadcast(chain, regs::MISC_CONTROL, MISC_CTRL_BCAST_INIT);
+        // G20 pure single-write (ESP-Miner; not BM1362 triple cadence).
+        Self::misc_ctrl_single_write_broadcast(chain, MISC_CTRL_BCAST_INIT);
         tracing::debug!(
             chain_id = chain.chain_id,
             "MiscCtrl = 0x{:08X}",
@@ -759,22 +571,15 @@ impl ChipDriver for Bm1368Driver {
         // Step 4: Per-chip configuration.
         // Each chip gets individual register writes with its assigned address.
         // BM1368 requires 500ms delay between per-chip configurations (ESP-Miner).
-        let addr_interval = if chip_count == CHIPS_PER_CHAIN_S21 {
-            FIXTURE_ADDRESS_INTERVAL as u16
-        } else if chip_count > 0 {
-            256 / chip_count as u16
-        } else {
-            256
-        };
+        // P1-3: full-population stride SSOT (S21 108 → 2; not open-coded 256/N).
+        let addr_interval = dcentrald_common::bm1397plus_addr_interval(chip_count);
 
-        for i in 0..chip_count {
-            let chip_addr = (i as u16 * addr_interval) as u8;
-
+        for chip_addr in dcentrald_common::linear_chip_addresses(chip_count, addr_interval) {
             // 4a) Reg 0xA8 per-chip
             Self::write_reg_single(chain, chip_addr, regs::REG_A8, REG_A8_PER_CHIP);
 
             // 4b) Misc control per-chip
-            Self::write_reg_single(chain, chip_addr, regs::MISC_CONTROL, MISC_CTRL_PER_CHIP);
+            Self::misc_ctrl_single_write_chip(chain, chip_addr, MISC_CTRL_PER_CHIP);
 
             // 4c) Core register control — first (same as broadcast)
             Self::write_reg_single(chain, chip_addr, regs::CORE_REG_CTRL, CORE_REG_CTRL_1);
@@ -868,8 +673,14 @@ impl ChipDriver for Bm1368Driver {
             HASH_COUNTING_VAL,
         );
 
-        // Step 10: Final version mask set.
-        Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, VERSION_MASK_REG);
+        // Step 10: Final version mask set (G23 pure single).
+        for op in dcentrald_common::plan_version_rolling_single_write_broadcast(VERSION_MASK_REG) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
         tracing::debug!(
             chain_id = chain.chain_id,
             "Final version mask = 0x{:08X}",
@@ -967,14 +778,14 @@ impl ChipDriver for Bm1368Driver {
 
     fn set_voltage(&self, _pic: &mut PicController, _voltage_mv: u16) -> Result<()> {
         // S21 does NOT use PIC for voltage control (TAS5782M / NoPic path).
-        // ADR-0010: refuse silent Ok(()) — callers must use the real voltage rail.
-        tracing::warn!(
-            "BM1368: set_voltage() called — S21 uses TAS5782M DAC, not PIC. \
-             On S9 control board, use PicController directly.",
-        );
-        Err(crate::AsicError::InvalidParameter(
-            "BM1368/S21 voltage is TAS5782M/NoPic (not PicController ChipDriver path)".into(),
-        ))
+        // ADR-0010 / P1-2: pure VoltageOwnership SSOT refuses ChipDriver path.
+        dcentrald_common::chip_driver_set_voltage_admission(
+            dcentrald_common::AsicProtocolIdentity::Bm1368,
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "BM1368::set_voltage refused by VoltageOwnership SSOT");
+            crate::AsicError::InvalidParameter(e.to_string())
+        })
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -1122,10 +933,11 @@ impl ChipDriver for Bm1368Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // Dynamic ticket mask: difficulty - 1 (matching BM1366/BM1370/BM1397/BM1398).
-        // Fixture uses hardcoded 0x7F (diff 128) for testing, but production needs
-        // dynamic difficulty matching the pool's suggested difficulty.
-        difficulty.max(1).saturating_sub(1)
+        // G24 pure SSOT: industrial plain (FIXTURE_TICKET_MASK 0x7F @ diff 128).
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty.max(1),
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

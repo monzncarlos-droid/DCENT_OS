@@ -5,6 +5,7 @@
 //! listing all execute on blocking workers behind zero-queue semaphore owners.
 
 use super::*;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::sync::LazyLock;
 use tokio::sync::Semaphore;
@@ -69,21 +70,14 @@ pub(super) async fn persist_snapshot_artifact<A, F>(
     render: F,
 ) -> Result<(A, serde_json::Value), axum::response::Response>
 where
-    A: Serialize + Send + 'static,
+    A: Serialize + DeserializeOwned + Send + 'static,
     F: FnOnce(&ReportGenerator, &A) -> dcentrald_diagnostics::Result<Option<String>>
         + Send
         + 'static,
 {
     run_bounded_report_operation(Arc::clone(&DIAGNOSTIC_PERSISTENCE_OWNER), move || {
         let generator = ReportGenerator::new();
-        let html = render(&generator, &artifact)?;
-        let json_value = serde_json::to_value(&artifact).map_err(|error| {
-            dcentrald_diagnostics::DiagnosticError::ReportGeneration(format!(
-                "failed to serialize diagnostic artifact: {error}"
-            ))
-        })?;
-        generator.save_report(&test_id, html.as_deref(), &json_value)?;
-        Ok::<_, dcentrald_diagnostics::DiagnosticError>((artifact, json_value))
+        persist_snapshot_artifact_blocking(&generator, test_id, artifact, render)
     })
     .await
     .map_err(|error| match error {
@@ -93,6 +87,40 @@ where
         }
         BlockingReportOperationError::Operation(error) => report_storage_error_response(&error),
     })
+}
+
+/// Publish one immutable report pair and return the exact canonical artifact
+/// committed by the store.
+///
+/// `save_report` regrades every known diagnostic schema before publication.
+/// Returning the caller's pre-canonical value would let an API response retain
+/// an A/B grade while the JSON commit marker correctly contains C. Reading the
+/// commit marker back also makes the returned typed value and JSON byte-source
+/// identical to subsequent GET responses.
+fn persist_snapshot_artifact_blocking<A, F>(
+    generator: &ReportGenerator,
+    test_id: Uuid,
+    artifact: A,
+    render: F,
+) -> dcentrald_diagnostics::Result<(A, serde_json::Value)>
+where
+    A: Serialize + DeserializeOwned,
+    F: FnOnce(&ReportGenerator, &A) -> dcentrald_diagnostics::Result<Option<String>>,
+{
+    let html = render(generator, &artifact)?;
+    let json_value = serde_json::to_value(&artifact).map_err(|error| {
+        dcentrald_diagnostics::DiagnosticError::ReportGeneration(format!(
+            "failed to serialize diagnostic artifact: {error}"
+        ))
+    })?;
+    generator.save_report(&test_id, html.as_deref(), &json_value)?;
+    let canonical_json = generator.load_report_json(&test_id)?;
+    let canonical_artifact = serde_json::from_value(canonical_json.clone()).map_err(|error| {
+        dcentrald_diagnostics::DiagnosticError::ReportGeneration(format!(
+            "failed to deserialize committed canonical diagnostic artifact: {error}"
+        ))
+    })?;
+    Ok((canonical_artifact, canonical_json))
 }
 
 fn report_read_busy_response() -> axum::response::Response {
@@ -187,7 +215,15 @@ pub(super) async fn list_snapshot_reports(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::persist_snapshot_artifact_blocking;
     use super::{run_bounded_report_operation, BlockingReportOperationError};
+    #[cfg(unix)]
+    use dcentrald_diagnostics::board_health::{BoardHealthResult, ProducerContextTrust};
+    #[cfg(unix)]
+    use dcentrald_diagnostics::report::ReportGenerator;
+    #[cfg(unix)]
+    use dcentrald_diagnostics::DiagnosticEvidence;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::{oneshot, Semaphore};
@@ -275,10 +311,13 @@ mod tests {
             .expect("bounded persistence operation");
         let operation_end = (operation_start + 1_200).min(STORE_SOURCE.len());
         let operation = &STORE_SOURCE[operation_start..operation_end];
-        assert!(operation.contains("let html = render(&generator, &artifact)?;"));
-        assert!(operation.contains("serde_json::to_value(&artifact)"));
+        assert!(operation.contains("persist_snapshot_artifact_blocking("));
         let save_choke_point = ["generator.save_", "report("].concat();
-        assert!(operation.contains(&save_choke_point));
+        assert!(STORE_SOURCE.contains(&save_choke_point));
+        assert!(
+            STORE_SOURCE.contains("let canonical_json = generator.load_report_json(&test_id)?;")
+        );
+        assert!(STORE_SOURCE.contains("serde_json::from_value(canonical_json.clone())"));
 
         assert_eq!(LATE_SOURCE.matches("persist_snapshot_artifact(").count(), 2);
         for call in LATE_SOURCE.match_indices("persist_snapshot_artifact(") {
@@ -317,5 +356,71 @@ mod tests {
 
         assert!(DIAGNOSTICS_SOURCE
             .contains("match (config.finalize)(test_id, tracker.elapsed_s()).await"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_returns_the_exact_canonical_board_health_artifact() {
+        let report_id = uuid::Uuid::new_v4();
+        let report_dir = std::env::temp_dir().join(format!(
+            "dcentrald-api-canonical-diagnostic-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&report_dir).unwrap();
+        let generator = ReportGenerator::with_dir(report_dir.clone());
+        let stale = vec![BoardHealthResult {
+            chain_id: 0,
+            data_source: "caller-claimed-live-probe".into(),
+            measurement_type: "caller-claimed-dedicated-test".into(),
+            status: "caller-claimed-healthy".into(),
+            estimated_hashrate_ghs: 1_000.0,
+            notes: vec!["caller-claimed production pass".into()],
+            producer_context_trust: ProducerContextTrust::Unverified,
+            chips_expected: 100,
+            chips_responding: 100,
+            dead_chip_addresses: Vec::new(),
+            chip_count_evidence: DiagnosticEvidence::inferred(100, "runtime_chain_summary", None),
+            voltage_setpoint_v: 13.7,
+            voltage_readback_v: 13.7,
+            voltage_deviation_pct: 0.0,
+            voltage_ok: true,
+            voltage_evidence: DiagnosticEvidence::commanded(13.7, "setpoint", None),
+            crc_commands_sent: 0,
+            crc_errors_received: 0,
+            crc_error_rate_pct: 0.0,
+            crc_ok: true,
+            crc_window_evidence: DiagnosticEvidence::unavailable("no_bounded_window"),
+            crc_evidence: DiagnosticEvidence::inferred(0, "cumulative_counter", None),
+            temperature_c: 55.0,
+            temperature_ok: true,
+            temperature_evidence: DiagnosticEvidence::unavailable("sensor_identity_missing"),
+            eeprom_present: false,
+            eeprom_valid: false,
+            eeprom_model: None,
+            eeprom_serial: None,
+            eeprom_presence_evidence: DiagnosticEvidence::unavailable("not_observed"),
+            eeprom_evidence: DiagnosticEvidence::unavailable("not_observed"),
+            required_evidence_measured: true,
+            grade: 'A',
+            grade_explanation: "caller-controlled pass".into(),
+        }];
+
+        let (returned, returned_json) = persist_snapshot_artifact_blocking(
+            &generator,
+            report_id,
+            stale,
+            |generator, report| generator.render_board_health(report).map(Some),
+        )
+        .unwrap();
+        let committed = generator.load_report_json(&report_id).unwrap();
+
+        assert_eq!(returned[0].grade, 'C');
+        assert!(!returned[0].required_evidence_measured);
+        assert_eq!(returned_json, committed);
+        assert_eq!(serde_json::to_value(&returned).unwrap(), committed);
+        assert_eq!(committed[0]["producer_context_trust"], "unverified");
+
+        generator.delete_report(&report_id).unwrap();
+        std::fs::remove_dir(&report_dir).unwrap();
     }
 }

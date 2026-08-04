@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { DAEMON_DISCONNECTED_EVENT, DAEMON_RECONNECTED_EVENT } from '../api/client';
+import { useMinerStore } from '../store/miner';
 
 export type DaemonState = 'alive' | 'starting' | 'dead' | 'unknown';
 
@@ -109,10 +110,19 @@ export function useDaemonHeartbeat(): DaemonHealth {
         const apiAgeMs = lastApiSuccessRef.current
           ? now - lastApiSuccessRef.current
           : Infinity;
+        // A live WebSocket frame also proves dcentrald's API is answering — the WS
+        // server IS dcentrald. Without this, a WS-live unit whose REST stats endpoint
+        // legitimately 404s (heater builds / early bring-up) flips to a false
+        // "NOT RESPONDING" banner after the grace window, because
+        // DAEMON_RECONNECTED_EVENT only fires on a 2xx REST response. Use the freshest
+        // of the two contact signals for both the liveness decision and lastSeenSec.
+        const wsFrameAt = useMinerStore.getState().lastWsFrameAt;
+        const wsFrameAgeMs = wsFrameAt > 0 ? now - wsFrameAt : Infinity;
+        const contactAgeMs = Math.min(apiAgeMs, wsFrameAgeMs);
 
         if (!pidAlive) {
           state = 'dead';
-        } else if (apiAgeMs <= STALE_THRESHOLD_SEC * 1000) {
+        } else if (contactAgeMs <= STALE_THRESHOLD_SEC * 1000) {
           state = 'alive';
         } else if (sinceStartMs <= STARTING_GRACE_MS) {
           state = 'starting';
@@ -120,8 +130,8 @@ export function useDaemonHeartbeat(): DaemonHealth {
           state = 'dead';
         }
 
-        const lastSeenSec = lastApiSuccessRef.current
-          ? Math.max(0, Math.round(apiAgeMs / 1000))
+        const lastSeenSec = Number.isFinite(contactAgeMs)
+          ? Math.max(0, Math.round(contactAgeMs / 1000))
           : null;
 
         setHealth({

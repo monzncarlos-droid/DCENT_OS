@@ -119,14 +119,24 @@ use thiserror::Error;
 ///   — distinct nonce slots the FPGA can attribute back to a chip. This
 ///   is what `expected_nps_for_chip` and `cores_for_chip` return.
 ///
-/// For BM1387/BM1366/BM1368/BM1370 the two values are identical. BM1362
-/// is the split case: 4 big engines, 894 nonce-attribution slots.
+/// For BM1387/BM1366/BM1368 the two values are identical. BM1362 is the
+/// split case: 4 big engines vs 894 declared (514 SG-1-corrected) slots.
+///
+/// SG-1 (rank 24, 2026-08-02): `cores_for_chip` and `expected_nps_for_chip`
+/// honour the default-OFF `DCENT_SG1_CORRECTED_NONCE_CORES=1` flag via
+/// `MinerProfile::nonce_attribution_cores_effective` — flag unset, they
+/// return exactly the declared values (BM1362=894, BM1370=1280); flag set,
+/// the corrected BM1362=514 / BM1370=2040. See
+/// `dcentrald_asic::drivers::sg1_corrected_nonce_attribution_cores` for the
+/// evidence chain.
 pub mod chip_geometry {
     /// Get nonce-attribution slot count for any supported chip ID.
     ///
-    /// Returns the `MinerProfile::nonce_attribution_cores` field — the
+    /// Returns `MinerProfile::nonce_attribution_cores_effective()` — the
     /// count of distinct nonce slots the FPGA can attribute back to a
-    /// chip. Used for nonces-per-second math, NOT for engine-state
+    /// chip, honouring the default-OFF SG-1 correction flag (with the flag
+    /// unset this is exactly the declared `nonce_attribution_cores`
+    /// field). Used for nonces-per-second math, NOT for engine-state
     /// bookkeeping.
     ///
     /// Falls back to a conservative 114 (BM1387) for unknown chip IDs so
@@ -135,7 +145,7 @@ pub mod chip_geometry {
     #[inline]
     pub fn cores_for_chip(chip_id: u16) -> u32 {
         dcentrald_asic::drivers::MinerProfile::for_chip(chip_id)
-            .map(|profile| profile.nonce_attribution_cores)
+            .map(|profile| profile.nonce_attribution_cores_effective())
             .unwrap_or(114)
     }
 
@@ -183,12 +193,57 @@ pub mod chip_geometry {
     }
 }
 
-/// Parse a chip ID from a chip type string like `BM1387`.
+/// Parse a chip ID from a chip type string.
+///
+/// Accepted forms (trimmed, case-insensitive family prefix):
+/// - `BM1387` / `bm1362` — canonical product name used by drivers/daemon
+/// - `0x1362` / `0X1387` — hex form the daemon may emit when chip-name
+///   lookup fails (`format!("0x{:04X}", chip_id)`)
+///
+/// Returns `None` for empty/unknown strings. Callers that need a PLL
+/// policy chip ID must **not** invent BM1387 for `None` — use
+/// [`chip_id_for_pll_policy`] which fail-closes to `0` (empty PLL table).
 #[inline]
 pub fn chip_id_from_type(chip_type: &str) -> Option<u16> {
-    chip_type
+    let s = chip_type.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Canonical "BM####" / "bm####" product names.
+    if let Some(rest) = s
         .strip_prefix("BM")
-        .and_then(|s| u16::from_str_radix(s, 16).ok())
+        .or_else(|| s.strip_prefix("bm"))
+        .or_else(|| s.strip_prefix("Bm"))
+        .or_else(|| s.strip_prefix("bM"))
+    {
+        // Reject empty or non-hex tails; require pure hex digits.
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(id) = u16::from_str_radix(rest, 16) {
+                return Some(id);
+            }
+        }
+    }
+    // Daemon fallback label when ChipRegistry::detect misses: "0x1362".
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(id) = u16::from_str_radix(rest, 16) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a chip ID for **PLL table / frequency-snap policy**.
+///
+/// Unknown or unparseable `chip_type` yields `0` (no registered PLL table)
+/// rather than a silent BM1387 alias. Production snaps use
+/// [`dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip`] +
+/// empty-safe [`snap_pll_floor`](dcentrald_asic::drivers::MinerProfile::snap_pll_floor);
+/// `0` maps to an empty table so the path refuses or floors safely.
+#[inline]
+pub fn chip_id_for_pll_policy(chip_type: &str) -> u16 {
+    chip_id_from_type(chip_type).unwrap_or(0)
 }
 
 /// W6.3 + W6.4: snapshot consumed by the autotuner step-up gate.
@@ -538,6 +593,12 @@ pub enum AutoTunerError {
     #[error("chain {chain_id} not available for tuning")]
     ChainUnavailable { chain_id: u8 },
 
+    /// No discrete PLL table is registered for this chip ID (decade backlog P1-4).
+    ///
+    /// Fail-closed: never fall back to BM1387 / S9 frequencies for unknown silicon.
+    #[error("no PLL frequency table for chip_id=0x{chip_id:04X}; refuse silent BM1387 fallback")]
+    UnknownChipPll { chip_id: u16 },
+
     /// W13.C3 (2026-05-10): The proposed `(freq, volt)` tuple is outside
     /// the per-SKU PVT envelope published by `dcentrald-silicon-profiles`
     /// (`Bm1362HashboardSku::freq_voltage_table()`).
@@ -643,6 +704,35 @@ pub use tuner::{
 
 #[cfg(test)]
 mod tests {
+    /// G4: chip type parse must accept daemon hex labels and never invent BM1387.
+    #[test]
+    fn chip_id_from_type_accepts_bm_and_hex_forms_fail_closed() {
+        assert_eq!(crate::chip_id_from_type("BM1387"), Some(0x1387));
+        assert_eq!(crate::chip_id_from_type("bm1362"), Some(0x1362));
+        assert_eq!(crate::chip_id_from_type("0x1362"), Some(0x1362));
+        assert_eq!(crate::chip_id_from_type("0X1398"), Some(0x1398));
+        assert_eq!(crate::chip_id_from_type("  0x1370  "), Some(0x1370));
+        assert_eq!(crate::chip_id_from_type(""), None);
+        assert_eq!(crate::chip_id_from_type("S19jPro"), None);
+        assert_eq!(crate::chip_id_from_type("unknown"), None);
+        // PLL policy: unparseable → 0 (empty table), not silent 0x1387.
+        assert_eq!(crate::chip_id_for_pll_policy("S19jPro"), 0);
+        assert_eq!(crate::chip_id_for_pll_policy("0x1362"), 0x1362);
+        assert_eq!(crate::chip_id_for_pll_policy("BM1368"), 0x1368);
+        assert!(
+            !dcentrald_asic::drivers::MinerProfile::has_pll_table(crate::chip_id_for_pll_policy(
+                "garbage"
+            )),
+            "unknown chip_type must map to empty-PLL policy id"
+        );
+        assert!(
+            dcentrald_asic::drivers::MinerProfile::has_pll_table(crate::chip_id_for_pll_policy(
+                "0x1362"
+            )),
+            "daemon hex label for BM1362 must resolve a real PLL table"
+        );
+    }
+
     #[test]
     fn test_chip_geometry_uses_centralized_miner_profile_hashrate() {
         let expected = dcentrald_asic::drivers::MinerProfile::for_chip(0x1398)
@@ -670,6 +760,13 @@ mod tests {
     /// caused a 30% low hashrate prediction on every S21 unit. If anyone
     /// reintroduces a hardcoded 894 for BM1368 in `chip_geometry`, this
     /// test fails and the offline CI gate fails alongside it.
+    ///
+    /// SG-1 rank-24 edit (2026-08-02, deliberate): BM1368's 1280 is
+    /// MEASURED (80×16 S21 fixture RE 2026-04-12, live S21 `a lab unit` shares)
+    /// and is consistent with its own ghs_per_mhz (1.235 → ~1235, within
+    /// the rank-3 gate's 10% bar), so BM1368 is exempt from the SG-1
+    /// correction table — asserted below so a future wave cannot "helpfully"
+    /// extend the correction to a measured chip.
     #[test]
     fn test_bm1368_cores_match_minerprofile_not_894() {
         let profile = dcentrald_asic::drivers::MinerProfile::for_chip(0x1368)
@@ -679,6 +776,14 @@ mod tests {
             "BM1368 MinerProfile must report 1280 nonce-attribution slots \
              (80 big × 16 small, S21 fixture RE 2026-04-12)",
         );
+        // SG-1 exemption: no correction entry may exist for BM1368, so the
+        // corrected pure path returns the same measured 1280.
+        assert_eq!(
+            dcentrald_asic::drivers::sg1_corrected_nonce_attribution_cores(0x1368),
+            None,
+            "BM1368's 1280 is measured — it must never gain an SG-1 correction entry",
+        );
+        assert_eq!(profile.nonce_attribution_cores_with_correction(true), 1280);
         assert_eq!(
             profile.cores_per_chip, 1280,
             "BM1368 cores_per_chip and nonce_attribution_cores agree at 1280 \
@@ -702,9 +807,20 @@ mod tests {
     }
 
     /// W6.8: BM1362 is the canonical "split" chip — 4 big SHA-256 engines
-    /// per chip, 894 nonce-attribution slots per chip. The autotuner must
-    /// see 894 (slots), the driver must see 4 (engines). This test pins
-    /// both and proves they live in distinct `MinerProfile` fields.
+    /// per chip vs a much larger nonce-attribution slot count. The
+    /// autotuner must see slots, the driver must see 4 (engines). This test
+    /// pins both and proves they live in distinct `MinerProfile` fields.
+    ///
+    /// SG-1 rank-24 edit (2026-08-02, deliberate — NOT a deletion): the
+    /// W6.8 894 pin is kept, but re-scoped to what it truly proves — the
+    /// DECLARED flag-off default. 894 is inconsistent with BM1362's own
+    /// ghs_per_mhz (0.550 → ~550 implied slots; +63% over-prediction that
+    /// throttles healthy S19j Pro silicon, SG-1). The corrected value 514
+    /// ships behind the default-OFF `DCENT_SG1_CORRECTED_NONCE_CORES` flag
+    /// and is pinned here through the PURE correction path so this test
+    /// stays env-independent. The env wiring itself is proven by
+    /// `sg1_flag_default_off_then_env_wires_production_path` in
+    /// dcentrald-asic's consistency-gate binary (single env-mutating test).
     #[test]
     fn test_bm1362_distinguishes_big_engines_from_nonce_attribution() {
         let profile = dcentrald_asic::drivers::MinerProfile::for_chip(0x1362)
@@ -715,18 +831,37 @@ mod tests {
         );
         assert_eq!(
             profile.nonce_attribution_cores, 894,
-            "BM1362 must expose 894 nonce-attribution slots for hashrate prediction",
+            "BM1362's DECLARED slot count stays 894 (the flag-off legacy default; \
+             SG-1 rank 24 ships 514 behind DCENT_SG1_CORRECTED_NONCE_CORES). If \
+             the default has deliberately flipped, update this pin, the SG-1 \
+             correction table, and the rank-3 consistency gate in ONE commit.",
         );
         assert_ne!(
             profile.cores_per_chip, profile.nonce_attribution_cores,
             "BM1362 is the split chip — engine count and slot count must differ",
         );
+        // SG-1 corrected slot count (pure path, env-independent): 514,
+        // admitted by BM1362's own ghs_per_mhz (0.550 → ~550, 7.0% off).
+        assert_eq!(
+            profile.nonce_attribution_cores_with_correction(true),
+            514,
+            "BM1362 SG-1 corrected slot count must be 514 (rank 24)",
+        );
 
-        // Autotuner public surface returns the slot count, not the engine count.
+        // Autotuner public surface returns the slot count, not the engine
+        // count. `cores_for_chip` consumes the effective (flag-aware)
+        // accessor; under the default flag-off CI environment that is the
+        // declared 894 — and never the 4-engine count.
         let cores = crate::chip_geometry::cores_for_chip(0x1362);
         assert_eq!(
-            cores, 894,
-            "autotuner chip_geometry::cores_for_chip(0x1362) returns nonce_attribution_cores (894), not cores_per_chip (4)",
+            cores,
+            profile.nonce_attribution_cores_effective(),
+            "autotuner chip_geometry::cores_for_chip(0x1362) must return the \
+             effective nonce-attribution slot count, not cores_per_chip (4)",
+        );
+        assert_ne!(
+            cores, profile.cores_per_chip,
+            "cores_for_chip must never return the 4-engine count for BM1362",
         );
 
         // BM1387 control: both fields agree at 114.

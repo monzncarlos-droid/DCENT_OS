@@ -24,6 +24,55 @@
 //! match bosminer's observed low-bit GPIO state, not as proof that this bank is
 //! solely or sufficiently a chain-return relay control.
 //!
+//! ## ⚠ THE NAME "UART RELAY" IS A MISNOMER — read this before chasing enum=0
+//!
+//! Adjudicated 2026-08-03 (W8, ) against `C2-CPLD-GLUE-LOGIC.md` §9
+//! correction `C2-C6`. **The ambiguity above is resolved: this bank is the am2
+//! PSU SMBus.** There is no UART-relay device behind these two pins. Three
+//! independent first-party facts already in this tree say so:
+//!
+//! 1. **Live `a lab unit` measurement, 2026-05-23** (outranks any inference):
+//!    `/sys/class/gpio/gpiochip895/label = /amba_pl/gpio@41220000`,
+//!    `base=895 ngpio=2`, with `gpio895 = SDA` (bit 0) and `gpio896 = SCL`
+//!    (bit 1) — [`crate::psu_gpio_i2c`], `AM2_PSU_SDA_BIT` / `AM2_PSU_SCL_BIT`.
+//!    A 2-line bank cannot simultaneously be the SMBus pair and a separate
+//!    relay pair.
+//! 2. **Our own production guard already assumes it.** `s19j_hybrid_mining.rs`
+//!    refuses to call this helper unless the dumb-PSU bypass owns the bus,
+//!    stating outright that "the relay RMW drives gpio895/896 (PSU SMBus
+//!    SDA/SCL)". A shipped fail-closed guard is a stronger statement of intent
+//!    than a doc comment.
+//! 3. **Braiins' own pin constraints agree** for the sibling am1-s9 fabric:
+//!    `zynq-io-am1-s9-braiins/design/src/constrs/pin_assignment_xc7z007s.tcl:80-84`
+//!    puts `iic_psu_scl_io` @ `F15` and `iic_psu_sda_io` @ `H14`, both
+//!    `LVCMOS33 PULLUP true`. (Corroboration only — that is the am1 design.)
+//!
+//! So `DATA=0b11 / TRI=0b00` is **not** "enabling a relay". It parks a
+//! bit-banged open-drain I²C pair driven high — the idle state an unused SMBus
+//! should sit in, and byte-identical to where bosminer leaves it. That is
+//! exactly consistent with the live v+2 result: matching the byte succeeded and
+//! **enum stayed 0**.
+//!
+//! One thing the census got wrong and must not be copied: it is *not* true that
+//! "there is no external device on the far side of these pins". On am2 the far
+//! side is the **PSU SMBus peer** (the Loki spoof board / APW). What is absent
+//! is a *UART relay*, not a device.
+//!
+//! **Why nothing is renamed.** `DCENT_AM2_FPGA_UART_RELAY_COLD`,
+//! [`enable_am2_uart_relay_cold`], [`AM2_UART_RELAY_GPIO_BASE`],
+//! [`UART_RELAY_ENABLE_BITS`] and
+//! [`UartRelayEnableResult::relay_confirmed`] are on the live-exercised `a lab unit`
+//! path, appear in shipped launcher scripts, and are pinned by name in
+//! `dcentrald/tests/am2_class_gate_boundary.rs`. A rename here is **not inert**
+//! and could break the fragile `a lab unit` recipe, so the identifiers stay and this
+//! banner carries the correction instead. The bosminer-side name is real —
+//! bosminer genuinely has a `UartRelayReg` and an `" Enabling UART relay chip: "`
+//! string — our error was binding that concept to *this address*, which remains
+//! unproven and is listed as stale in
+//! :129-134`.
+//!
+//! Change **nothing** about `a lab unit` behaviour on the strength of this note.
+//!
 //! ## Why this was a plausible `a lab unit` standalone enum=0 root-cause
 //!
 //! The device-tree reset default for this GPIO is `tri-default = 0xffffffff`
@@ -263,6 +312,48 @@ mod tests {
         assert!(
             src.contains("0x43d00000") || src.contains("miner-glitch-monitor"),
             "must keep the mirror-vs-control reconciliation"
+        );
+    }
+
+    #[test]
+    fn doc_keeps_the_psu_smbus_misnomer_correction() {
+        // W8 (2026-08-03), C2-C6. Pins the misnomer banner so a later "tidy the
+        // docs" pass cannot delete the one note that stops the next enum=0
+        // investigation spending a wave on a relay that is not there.
+        //
+        // Self-match discipline:
+        // this contract include_str!s its OWN file, so a contiguous literal here
+        // would satisfy itself even after the doc text was deleted. Every needle
+        // below is therefore assembled from fragments that never appear
+        // contiguously anywhere except in the doc comment being pinned.
+        let src = include_str!("fpga_uart_relay.rs");
+
+        let misnomer = ["UART RELAY", r#"" IS A MISNOMER"#].concat();
+        assert!(
+            src.contains(&misnomer),
+            "the misnomer banner headline must remain"
+        );
+
+        let smbus_pair = ["gpio895 = ", "SDA"].concat();
+        assert!(
+            src.contains(&smbus_pair),
+            "the live gpio895=SDA / gpio896=SCL pinning must remain"
+        );
+
+        let no_rename = ["A rename here is **not", " inert**"].concat();
+        assert!(
+            src.contains(&no_rename),
+            "the do-not-rename rationale must remain — the identifiers are on the \
+             live-exercised .25 path and pinned by name elsewhere"
+        );
+
+        // Negative half, also fragment-split so the banned phrase is not present
+        // in this file by virtue of the assertion itself: the correction must
+        // never be softened back into a claim that this bank IS a relay.
+        let banned = ["this bank is the chain-return relay", " control"].concat();
+        assert!(
+            !src.contains(&banned),
+            "0x41220000 must not be re-asserted as a chain-return relay control"
         );
     }
 }

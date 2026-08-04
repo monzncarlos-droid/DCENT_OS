@@ -78,9 +78,12 @@ pub const REG_CONTROL_BOARD_MODE: u32 = 0x04;
 pub const REG_BOARD_ID_1: u32 = REG_CONTROL_BOARD_MODE;
 
 /// Braiins control-board C49 mode: 1 PWM output.
-pub const CONTROL_BOARD_MODE_C49: u32 = 0x31;
+/// Low-byte value is shared with `dcentrald_common::C49_MODE_LOW_BYTE` (P1-7).
+pub const CONTROL_BOARD_MODE_C49: u32 = dcentrald_common::C49_MODE_LOW_BYTE as u32;
 /// Braiins control-board C52 mode: 2 PWM outputs.
-pub const CONTROL_BOARD_MODE_C52: u32 = 0x34;
+///
+/// Low-byte value is shared with `dcentrald_common::C52_MODE_LOW_BYTE` (P1-7).
+pub const CONTROL_BOARD_MODE_C52: u32 = dcentrald_common::C52_MODE_LOW_BYTE as u32;
 /// Mask for the low-byte board mode value.
 pub const CONTROL_BOARD_MODE_MASK: u32 = 0xFF;
 
@@ -305,6 +308,137 @@ pub struct BoardControl {
     regs: UioDevice,
 }
 
+/// Exact AM2 reset evidence. This proves only the volatile AXI-GPIO DATA
+/// register reflected the requested LOW assertion and HIGH release; it does
+/// not claim that the package pin or hashboard reset net was electrically
+/// observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactAm2ResetRegisterReceipt {
+    slot: u8,
+    gpio: u32,
+    reset_bit: u32,
+    asserted_data: u32,
+    released_data: u32,
+}
+
+impl ExactAm2ResetRegisterReceipt {
+    pub fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    pub fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    pub fn reset_bit(&self) -> u32 {
+        self.reset_bit
+    }
+
+    pub fn asserted_data(&self) -> u32 {
+        self.asserted_data
+    }
+
+    pub fn released_data(&self) -> u32 {
+        self.released_data
+    }
+}
+
+/// Narrow terminal evidence that the exact AM2 reset DATA bit was observed
+/// HIGH. It does not prove that the preceding LOW assertion happened and does
+/// not claim package-pin or hashboard-net voltage.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExactAm2ResetReleaseRegisterReceipt {
+    target: ExactAm2ResetReleaseTarget,
+    released_data: u32,
+}
+
+impl ExactAm2ResetReleaseRegisterReceipt {
+    pub fn slot(&self) -> u8 {
+        self.target.slot
+    }
+
+    pub fn gpio(&self) -> u32 {
+        self.target.gpio
+    }
+
+    pub fn reset_bit(&self) -> u32 {
+        self.target.reset_bit
+    }
+
+    pub fn released_data(&self) -> u32 {
+        self.released_data
+    }
+}
+
+/// HAL-constructed identity of the exact reset line whose release remains
+/// unresolved. Private fields prevent callers from manufacturing a target for
+/// any future terminal HIGH-only normalization operation. The target is
+/// deliberately move-only so one returned failure cannot authorize duplicate
+/// normalization attempts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExactAm2ResetReleaseTarget {
+    slot: u8,
+    gpio: u32,
+    reset_bit: u32,
+}
+
+impl ExactAm2ResetReleaseTarget {
+    pub fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    pub fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    pub fn reset_bit(&self) -> u32 {
+        self.reset_bit
+    }
+}
+
+/// Phase-aware exact-reset failure. Callers may use assertion-unverified/HIGH
+/// release only as terminal register evidence; a release-unknown result remains
+/// negative shutdown evidence because at least one MMIO mutation was issued.
+#[derive(Debug, thiserror::Error)]
+pub enum ExactAm2ResetFailure {
+    #[error("exact AM2 reset failed before MMIO mutation: {0}")]
+    BeforeMutation(#[source] HalError),
+    #[error("exact AM2 reset assertion was not observed but release register is HIGH: {detail}")]
+    AssertionUnverifiedButReleaseRegisterVerified {
+        asserted_data: u32,
+        release: ExactAm2ResetReleaseRegisterReceipt,
+        detail: String,
+    },
+    #[error("exact AM2 reset release outcome is unknown: {detail}")]
+    ReleaseOutcomeUnknown {
+        target: ExactAm2ResetReleaseTarget,
+        asserted_data: u32,
+        released_data: u32,
+        detail: String,
+    },
+}
+
+impl ExactAm2ResetFailure {
+    pub fn mutation_entered(&self) -> bool {
+        !matches!(self, Self::BeforeMutation(_))
+    }
+
+    pub fn release_register_receipt(&self) -> Option<&ExactAm2ResetReleaseRegisterReceipt> {
+        match self {
+            Self::AssertionUnverifiedButReleaseRegisterVerified { release, .. } => Some(release),
+            Self::BeforeMutation(_) | Self::ReleaseOutcomeUnknown { .. } => None,
+        }
+    }
+
+    pub fn unresolved_release_target(&self) -> Option<&ExactAm2ResetReleaseTarget> {
+        match self {
+            Self::ReleaseOutcomeUnknown { target, .. } => Some(target),
+            Self::BeforeMutation(_)
+            | Self::AssertionUnverifiedButReleaseRegisterVerified { .. } => None,
+        }
+    }
+}
+
 impl BoardControl {
     /// Open the board-control device.
     ///
@@ -505,6 +639,57 @@ impl BoardControl {
         write_sysfs_gpio_value(gpio, true)?; // release HIGH
         tracing::info!(slot, gpio, method = "sysfs", "am2 hashboard reset pulsed");
         Ok(())
+    }
+
+    /// Pulse one admitted AM2 reset line without coupling reset authority to
+    /// the contradictory legacy gpio901 power-bit convention.
+    ///
+    /// The exact BM1362 direct-serial route owns PWR_CONTROL through GPIO907.
+    /// Its devmem reset transaction therefore preserves every non-reset DATA
+    /// and TRI bit exactly as observed; it may change only the selected reset
+    /// bit. Legacy callers retain [`Self::pulse_reset`] and its compatibility
+    /// behavior until their older gpio901 evidence is separately retired.
+    pub fn pulse_reset_exact(
+        &self,
+        slot: u8,
+    ) -> std::result::Result<ExactAm2ResetRegisterReceipt, ExactAm2ResetFailure> {
+        if (slot as usize) >= AM2_RESET_GPIOS.len() {
+            return Err(ExactAm2ResetFailure::BeforeMutation(HalError::Platform(
+                format!(
+                    "board-control: exact reset slot {} out of range (0..{})",
+                    slot,
+                    AM2_RESET_GPIOS.len()
+                ),
+            )));
+        }
+        let gpio = resolve_reset_gpio(slot).unwrap_or(AM2_RESET_GPIOS[slot as usize]);
+        if !(AM2_GPIO_OUT_CHIP_FIRST..AM2_GPIO_OUT_CHIP_LAST).contains(&gpio) {
+            return Err(ExactAm2ResetFailure::BeforeMutation(HalError::Platform(format!(
+                "board-control: exact reset slot {} (gpio {}) is not one of the reset-only PL bank lines {}..{}",
+                slot,
+                gpio,
+                AM2_GPIO_OUT_CHIP_FIRST,
+                AM2_GPIO_OUT_CHIP_LAST - 1
+            ))));
+        }
+        let reset_bit = 1u32 << (gpio - AM2_GPIO_OUT_CHIP_FIRST);
+        let readback = hold_am2_reset_devmem_observed(
+            reset_bit,
+            10,
+            Am2DevmemResetPowerPolicy::PreserveObserved,
+        )
+        .map_err(ExactAm2ResetFailure::BeforeMutation)?;
+        let receipt = validate_exact_am2_reset_readback(slot, gpio, reset_bit, readback)?;
+        tracing::info!(
+            slot,
+            gpio,
+            reset_bit = format!("0x{reset_bit:08X}"),
+            asserted_data = format!("0x{:08X}", receipt.asserted_data),
+            released_data = format!("0x{:08X}", receipt.released_data),
+            method = "devmem-reset-only",
+            "exact AM2 hashboard reset DATA assertion and release registers verified without gpio901 mutation"
+        );
+        Ok(receipt)
     }
 
     /// Hold a single hashboard reset line LOW for `hold_ms` via the proven
@@ -817,6 +1002,115 @@ fn verify_sysfs_gpio_value(gpio: u32, expected_high: bool) -> Result<()> {
 /// configured `am2_reset_hold_ms` (). The 0x07 short-pulse contract on
 /// the proven fleet is preserved by passing 10 from the existing caller.
 fn hold_am2_reset_devmem(reset_bit: u32, hold_ms: u64) -> Result<()> {
+    hold_am2_reset_devmem_with_policy(
+        reset_bit,
+        hold_ms,
+        Am2DevmemResetPowerPolicy::ForceLegacyBankBitHigh,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Am2DevmemResetPowerPolicy {
+    /// Exact route: every non-reset bit remains identical to the value read in
+    /// the same RMW transaction.
+    PreserveObserved,
+    /// Compatibility route for historical images that treated bank bit 4 as
+    /// an asserted power hold independent of canonical GPIO907 ownership.
+    ForceLegacyBankBitHigh,
+}
+
+impl Am2DevmemResetPowerPolicy {
+    fn forced_high_mask(self) -> u32 {
+        match self {
+            Self::PreserveObserved => 0,
+            Self::ForceLegacyBankBitHigh => AM2_GPIO_OUT_PWR_CONTROL_BIT,
+        }
+    }
+}
+
+fn am2_reset_data_rmw(
+    observed: u32,
+    reset_bit: u32,
+    assert_reset: bool,
+    policy: Am2DevmemResetPowerPolicy,
+) -> u32 {
+    let reset_value = if assert_reset {
+        observed & !reset_bit
+    } else {
+        observed | reset_bit
+    };
+    reset_value | policy.forced_high_mask()
+}
+
+fn am2_reset_tri_rmw(observed: u32, reset_bit: u32, policy: Am2DevmemResetPowerPolicy) -> u32 {
+    observed & !(reset_bit | policy.forced_high_mask())
+}
+
+fn hold_am2_reset_devmem_with_policy(
+    reset_bit: u32,
+    hold_ms: u64,
+    policy: Am2DevmemResetPowerPolicy,
+) -> Result<()> {
+    hold_am2_reset_devmem_observed(reset_bit, hold_ms, policy).map(drop)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Am2ResetDataReadback {
+    asserted_data: u32,
+    released_data: u32,
+}
+
+fn validate_exact_am2_reset_readback(
+    slot: u8,
+    gpio: u32,
+    reset_bit: u32,
+    readback: Am2ResetDataReadback,
+) -> std::result::Result<ExactAm2ResetRegisterReceipt, ExactAm2ResetFailure> {
+    let target = ExactAm2ResetReleaseTarget {
+        slot,
+        gpio,
+        reset_bit,
+    };
+    if readback.released_data & reset_bit == 0 {
+        return Err(ExactAm2ResetFailure::ReleaseOutcomeUnknown {
+            target,
+            asserted_data: readback.asserted_data,
+            released_data: readback.released_data,
+            detail: format!(
+                "slot {slot} gpio {gpio} DATA readback 0x{:08X} did not reflect reset HIGH release",
+                readback.released_data
+            ),
+        });
+    }
+    if readback.asserted_data & reset_bit != 0 {
+        return Err(
+            ExactAm2ResetFailure::AssertionUnverifiedButReleaseRegisterVerified {
+                asserted_data: readback.asserted_data,
+                release: ExactAm2ResetReleaseRegisterReceipt {
+                    target,
+                    released_data: readback.released_data,
+                },
+                detail: format!(
+                    "slot {slot} gpio {gpio} DATA readback 0x{:08X} did not reflect reset LOW; release DATA 0x{:08X} did reflect HIGH",
+                    readback.asserted_data, readback.released_data
+                ),
+            },
+        );
+    }
+    Ok(ExactAm2ResetRegisterReceipt {
+        slot,
+        gpio,
+        reset_bit,
+        asserted_data: readback.asserted_data,
+        released_data: readback.released_data,
+    })
+}
+
+fn hold_am2_reset_devmem_observed(
+    reset_bit: u32,
+    hold_ms: u64,
+    policy: Am2DevmemResetPowerPolicy,
+) -> Result<Am2ResetDataReadback> {
     let mem_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -858,9 +1152,9 @@ fn hold_am2_reset_devmem(reset_bit: u32, hold_ms: u64) -> Result<()> {
         // two bits the DATA RMW below already drives (reset + PWR_CONTROL),
         // preserving all other TRI bits — never widening the driven set.
         let tri_reg = unsafe { reg.add(1) };
-        let tri_target = reset_bit | AM2_GPIO_OUT_PWR_CONTROL_BIT;
+        let tri_target = reset_bit | policy.forced_high_mask();
         let tri_before = unsafe { std::ptr::read_volatile(tri_reg) };
-        let tri_desired = tri_before & !tri_target;
+        let tri_desired = am2_reset_tri_rmw(tri_before, reset_bit, policy);
         unsafe { std::ptr::write_volatile(tri_reg, tri_desired) };
         let tri_after = unsafe { std::ptr::read_volatile(tri_reg) };
         let bits_cleared = (tri_after & tri_target) == 0;
@@ -882,18 +1176,21 @@ fn hold_am2_reset_devmem(reset_bit: u32, hold_ms: u64) -> Result<()> {
     // at offset 0 are sound. Bits outside `reset_bit` are preserved by RMW. The
     // `| AM2_GPIO_OUT_PWR_CONTROL_BIT` OR guarantees gpio-901 stays HIGH across
     // the pulse, which is the whole point of this devmem workaround.
-    unsafe {
+    let (asserted_data, released_data) = unsafe {
         // Assert reset: clear `reset_bit`, force PWR_CONTROL HIGH.
         let before = std::ptr::read_volatile(reg);
-        let low = (before & !reset_bit) | AM2_GPIO_OUT_PWR_CONTROL_BIT;
+        let low = am2_reset_data_rmw(before, reset_bit, true, policy);
         std::ptr::write_volatile(reg, low);
+        let asserted_data = std::ptr::read_volatile(reg);
         sleep(Duration::from_millis(hold_ms));
 
         // Release reset: set `reset_bit`, still force PWR_CONTROL HIGH.
         let mid = std::ptr::read_volatile(reg);
-        let high = mid | reset_bit | AM2_GPIO_OUT_PWR_CONTROL_BIT;
+        let high = am2_reset_data_rmw(mid, reset_bit, false, policy);
         std::ptr::write_volatile(reg, high);
-    }
+        let released_data = std::ptr::read_volatile(reg);
+        (asserted_data, released_data)
+    };
 
     // Release the 4 KB /dev/mem mapping before returning so repeated cold-boot /
     // HB_RESET-faithful retry calls (s19j_hybrid_mining reset->enum loop) don't
@@ -904,7 +1201,10 @@ fn hold_am2_reset_devmem(reset_bit: u32, hold_ms: u64) -> Result<()> {
     // outstanding pointer into the page (`reg`) is used after this point.
     let _ = unsafe { nix::sys::mman::munmap(mapped, 4096) };
     drop(mem_file);
-    Ok(())
+    Ok(Am2ResetDataReadback {
+        asserted_data,
+        released_data,
+    })
 }
 
 /// devmem-based multi-slot reset hold on the am2 `0x41210000` PL GPIO bank.
@@ -1299,6 +1599,109 @@ mod tests {
         assert_eq!(AM2_GPIO_OUT_PWR_CONTROL_BIT, 1 << 4);
         assert_eq!(AM2_GPIO_OUT_TRI, 0x04);
         assert_eq!(AM2_PSU_ENABLE_GPIO, 907);
+    }
+
+    #[test]
+    fn exact_am2_reset_rmw_changes_only_the_selected_reset_bit() {
+        let reset_bit = 1 << 2;
+        let policy = Am2DevmemResetPowerPolicy::PreserveObserved;
+        for before in [0, u32::MAX, 0xA5A5_5A5A, AM2_GPIO_OUT_PWR_CONTROL_BIT] {
+            let asserted = am2_reset_data_rmw(before, reset_bit, true, policy);
+            assert_eq!((asserted ^ before) & !reset_bit, 0);
+            assert_eq!(asserted & reset_bit, 0);
+            assert_eq!(
+                asserted & AM2_GPIO_OUT_PWR_CONTROL_BIT,
+                before & AM2_GPIO_OUT_PWR_CONTROL_BIT
+            );
+
+            let released = am2_reset_data_rmw(asserted, reset_bit, false, policy);
+            assert_eq!((released ^ asserted) & !reset_bit, 0);
+            assert_eq!(released & reset_bit, reset_bit);
+            assert_eq!(
+                released & AM2_GPIO_OUT_PWR_CONTROL_BIT,
+                before & AM2_GPIO_OUT_PWR_CONTROL_BIT
+            );
+
+            let tri = am2_reset_tri_rmw(before, reset_bit, policy);
+            assert_eq!((tri ^ before) & !reset_bit, 0);
+            assert_eq!(tri & reset_bit, 0);
+        }
+    }
+
+    #[test]
+    fn exact_am2_reset_receipt_requires_assert_and_release_register_readback() {
+        let reset_bit = 1 << 2;
+        let receipt = validate_exact_am2_reset_readback(
+            2,
+            899,
+            reset_bit,
+            Am2ResetDataReadback {
+                asserted_data: 0x10,
+                released_data: 0x14,
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.slot(), 2);
+        assert_eq!(receipt.gpio(), 899);
+        assert_eq!(receipt.reset_bit(), reset_bit);
+        assert_eq!(receipt.asserted_data() & reset_bit, 0);
+        assert_eq!(receipt.released_data() & reset_bit, reset_bit);
+
+        let assertion_unverified = validate_exact_am2_reset_readback(
+            2,
+            899,
+            reset_bit,
+            Am2ResetDataReadback {
+                asserted_data: reset_bit,
+                released_data: reset_bit,
+            },
+        )
+        .unwrap_err();
+        assert!(assertion_unverified.mutation_entered());
+        let release = assertion_unverified
+            .release_register_receipt()
+            .expect("HIGH/HIGH must retain narrow terminal release evidence");
+        assert_eq!(release.slot(), 2);
+        assert_eq!(release.gpio(), 899);
+        assert_eq!(release.reset_bit(), reset_bit);
+        assert_eq!(release.released_data() & reset_bit, reset_bit);
+        assert!(assertion_unverified.unresolved_release_target().is_none());
+
+        for asserted_data in [0, reset_bit] {
+            let release_unknown = validate_exact_am2_reset_readback(
+                2,
+                899,
+                reset_bit,
+                Am2ResetDataReadback {
+                    asserted_data,
+                    released_data: 0,
+                },
+            )
+            .unwrap_err();
+            assert!(release_unknown.mutation_entered());
+            assert!(release_unknown.release_register_receipt().is_none());
+            let target = release_unknown
+                .unresolved_release_target()
+                .expect("LOW release readback must retain its exact unresolved target");
+            assert_eq!(target.slot(), 2);
+            assert_eq!(target.gpio(), 899);
+            assert_eq!(target.reset_bit(), reset_bit);
+        }
+    }
+
+    #[test]
+    fn legacy_am2_reset_power_bit_is_an_explicit_compatibility_policy() {
+        let reset_bit = 1 << 1;
+        let policy = Am2DevmemResetPowerPolicy::ForceLegacyBankBitHigh;
+        assert_eq!(
+            am2_reset_data_rmw(0, reset_bit, true, policy),
+            AM2_GPIO_OUT_PWR_CONTROL_BIT
+        );
+        assert_eq!(
+            am2_reset_tri_rmw(u32::MAX, reset_bit, policy)
+                & (reset_bit | AM2_GPIO_OUT_PWR_CONTROL_BIT),
+            0
+        );
     }
 
     #[test]

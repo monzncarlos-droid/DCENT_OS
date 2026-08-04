@@ -93,11 +93,20 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_NERDAXE").is_some() {
         selected_targets.push("nerdaxe");
     }
+    if std::env::var_os("CARGO_FEATURE_NERDAXE_GAMMA").is_some() {
+        selected_targets.push("nerdaxe-gamma");
+    }
     if std::env::var_os("CARGO_FEATURE_NERDQAXE_PLUS").is_some() {
         selected_targets.push("nerdqaxe-plus");
     }
     if std::env::var_os("CARGO_FEATURE_NERDQAXE_PP").is_some() {
         selected_targets.push("nerdqaxe-pp");
+    }
+    if std::env::var_os("CARGO_FEATURE_NERDOCTAXE_PLUS").is_some() {
+        selected_targets.push("nerdoctaxe-plus");
+    }
+    if std::env::var_os("CARGO_FEATURE_NERDOCTAXE_GAMMA").is_some() {
+        selected_targets.push("nerdoctaxe-gamma");
     }
     if std::env::var_os("CARGO_FEATURE_DCENT_AXE_BM1397").is_some() {
         selected_targets.push("dcent-axe-bm1397");
@@ -107,6 +116,63 @@ fn main() {
     }
     if std::env::var_os("CARGO_FEATURE_DCENT_AXE_HEX_BM1397").is_some() {
         selected_targets.push("dcent-axe-hex-bm1397");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_BC01").is_some() {
+        selected_targets.push("hammer-bc01");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_BC01_PRO").is_some() {
+        selected_targets.push("hammer-bc01-pro");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_BC02").is_some() {
+        selected_targets.push("hammer-bc02");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_BC04").is_some() {
+        selected_targets.push("hammer-bc04");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_DC02").is_some() {
+        selected_targets.push("hammer-dc02");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_DC04").is_some() {
+        selected_targets.push("hammer-dc04");
+    }
+    if std::env::var_os("CARGO_FEATURE_HAMMER_DC06").is_some() {
+        selected_targets.push("hammer-dc06");
+    }
+    // Lucky Miner LVxx (EXPERIMENTAL). Without these arms a lucky-* build hits
+    // the `selected_targets.len() != 1` panic below (0 targets) — loud, but
+    // the arms are still required for the SKU to build at all.
+    if std::env::var_os("CARGO_FEATURE_LUCKY_LV06").is_some() {
+        selected_targets.push("lucky-lv06");
+    }
+    if std::env::var_os("CARGO_FEATURE_LUCKY_LV07").is_some() {
+        selected_targets.push("lucky-lv07");
+    }
+    if std::env::var_os("CARGO_FEATURE_LUCKY_LV08").is_some() {
+        selected_targets.push("lucky-lv08");
+    }
+    if std::env::var_os("CARGO_FEATURE_BITFORGE_NANO").is_some() {
+        selected_targets.push("bitforge-nano");
+    }
+    if std::env::var_os("CARGO_FEATURE_BITAXE_NAJA").is_some() {
+        selected_targets.push("bitaxe-naja");
+    }
+    // Nerd multi-ASIC + Q-series (EXPERIMENTAL). Same note as the Lucky arms:
+    // without these, a `--features nerdqx` build fails the len()!=1 panic below
+    // with 0 targets — loud, but the arm is what makes the SKU buildable.
+    if std::env::var_os("CARGO_FEATURE_NERDQX").is_some() {
+        selected_targets.push("nerdqx");
+    }
+    if std::env::var_os("CARGO_FEATURE_NERDHAXE_GAMMA").is_some() {
+        selected_targets.push("nerdhaxe-gamma");
+    }
+    if std::env::var_os("CARGO_FEATURE_NERDEKO").is_some() {
+        selected_targets.push("nerdeko");
+    }
+    if std::env::var_os("CARGO_FEATURE_Q1370").is_some() {
+        selected_targets.push("q1370");
+    }
+    if std::env::var_os("CARGO_FEATURE_Q1373").is_some() {
+        selected_targets.push("q1373");
     }
 
     if selected_targets.len() != 1 {

@@ -1,7 +1,10 @@
 //! Core types shared across the stratum subsystem.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
+
+use crate::work_domain::{V1WorkDomain, WorkGeneration};
 
 /// Default Stratum V1 extranonce2 byte width used when a pool omits it.
 pub const DEFAULT_V1_EXTRANONCE2_SIZE: usize = 4;
@@ -49,6 +52,16 @@ pub enum StratumError {
 /// and package ASIC-ready work units.
 #[derive(Debug, Clone)]
 pub struct JobTemplate {
+    /// Monotonic internal subscription/job identity.
+    pub work_generation: WorkGeneration,
+
+    /// Shared finite allocator for Stratum V1 jobs.
+    ///
+    /// Every clone and every parallel chain draws from this one domain. SV2
+    /// templates use `None` because their upstream job/channel identity owns
+    /// nonce-space allocation.
+    pub v1_work_domain: Option<Arc<V1WorkDomain>>,
+
     /// Pool-assigned unique job identifier (e.g., "bf", "1a3f")
     pub job_id: String,
 
@@ -176,6 +189,9 @@ impl JobTemplate {
 /// A valid share to submit to the pool via mining.submit.
 #[derive(Debug, Clone)]
 pub struct ValidShare {
+    /// Exact internal generation that produced this share.
+    pub work_generation: WorkGeneration,
+
     /// Worker name used for authorization.
     pub worker_name: String,
 
@@ -636,6 +652,10 @@ pub struct StratumConfig {
     /// REGARDLESS of this flag. Setting it `false` does not stop hashing on
     /// pool loss — it only suppresses the `info!` note in `v1/client.rs`.
     ///
+    /// Decade backlog **P2-8**: use [`HASH_ON_DISCONNECT_CUTS_ASIC_HASH`] and
+    /// [`hash_on_disconnect_semantics`] when product copy or UI needs honest
+    /// labels — never imply this flag powers ASICs off.
+    ///
     /// The real "don't spin hot forever" backstop is thermal supervision (the
     /// PID/threshold loop), NOT pool connection state — chips hashing stale
     /// work are bounded by measured temperature, not by pool reachability. Do
@@ -644,8 +664,13 @@ pub struct StratumConfig {
     pub hash_on_disconnect: bool,
 
     /// Nominal device hashrate in GH/s for SV2 OpenStandardMiningChannel.
-    /// Helps pool set appropriate initial difficulty. Default: 13500 (S9 ~13.5 TH/s).
-    /// Set by daemon from mining config (frequency × chips × chains × cores / 1000).
+    /// Helps pool set appropriate initial difficulty.
+    ///
+    /// **Default is S9-class only** (~13.5 TH/s = 13500 GH/s) for backward
+    /// compatibility. Multi-TH/s platforms (S19/S21) **must** override via
+    /// daemon config using `MinerProfile::nominal_hashrate_ghs` (or
+    /// `nominal_hashrate_ghs_for_chip`) — never leave the S9 default on a
+    /// Standard SV2 channel for fleet hashrate (decade backlog P2-9 footgun).
     #[serde(default = "default_nominal_hashrate")]
     pub nominal_hashrate_ghs: f32,
 
@@ -667,12 +692,132 @@ fn default_true() -> bool {
     true
 }
 
+/// P2-8 honesty pin: `StratumConfig::hash_on_disconnect` never cuts ASIC hash.
+///
+/// Same-pool reconnect keeps the last job active regardless of the flag; only
+/// a pool *switch* flushes the dispatcher. Product/UI must not claim this
+/// boolean is a power-off or safety stop.
+pub const HASH_ON_DISCONNECT_CUTS_ASIC_HASH: bool = false;
+
+/// Stable semantics label for `hash_on_disconnect` (config field name kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashOnDisconnectSemantics {
+    /// Flag only controls whether the reconnect path emits an informational log.
+    LogNoteOnly,
+}
+
+/// Documented behavior of [`StratumConfig::hash_on_disconnect`].
+pub fn hash_on_disconnect_semantics() -> HashOnDisconnectSemantics {
+    // Compile-time honesty: if someone flips the constant without wiring cut
+    // behavior, tests fail. Today the constant is always false.
+    // Compile-time, not `debug_assert!`: the constant is `false` today, so the
+    // runtime form is `debug_assert!(true)` and clippy correctly notes it is
+    // optimised out. `const _` keeps the tripwire and fires in ALL profiles the
+    // moment anyone flips the constant.
+    const _: () = assert!(!HASH_ON_DISCONNECT_CUTS_ASIC_HASH);
+    HashOnDisconnectSemantics::LogNoteOnly
+}
+
 pub fn default_version_rolling_mask() -> u32 {
     0x1fff_e000
 }
 
-fn default_nominal_hashrate() -> f32 {
-    13500.0 // S9 default: ~13.5 TH/s = 13500 GH/s
+/// S9-class serde default only — not a universal fleet rate (see field docs).
+pub fn default_nominal_hashrate() -> f32 {
+    13500.0 // S9 ~13.5 TH/s = 13500 GH/s
+}
+
+/// True when `nominal_hashrate_ghs` is still the serde S9 default and should
+/// not be trusted for multi-TH Standard SV2 channel selection.
+pub fn is_s9_default_nominal_hashrate(ghs: f32) -> bool {
+    (ghs - default_nominal_hashrate()).abs() < f32::EPSILON
+}
+
+/// Where [`resolve_nominal_hashrate_ghs`] obtained its value (P2-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NominalHashrateSource {
+    /// Operator/config set a positive non-S9-default value.
+    ConfiguredExplicit,
+    /// Live/enumerated chip geometry (preferred over static profile defaults).
+    EnumeratedGeometry,
+    /// Filled from MinerProfile / planned silicon geometry.
+    MinerProfile,
+    /// Still the serde S9 ~13.5 TH/s default (multi-TH Standard SV2 footgun).
+    S9SerdeDefault,
+    /// Explicitly unset (`0`) — paths that do not pre-claim a rate.
+    UnsetZero,
+}
+
+/// Hard Standard-channel unsafety threshold (GH/s). Above this, Standard SV2
+/// exhausts nonce space; mirrors router `SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS`.
+pub const SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS: f32 = 1_000.0;
+
+/// Soft Extended-channel preference threshold (GH/s).
+pub const SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS: f32 = 5_000.0;
+
+/// Resolve channel-seed hashrate for [`StratumConfig::nominal_hashrate_ghs`].
+///
+/// Priority:
+/// 1. Positive configured value that is **not** the S9 serde default → explicit
+/// 2. Positive **enumerated geometry** when config is `0` or still S9 default
+/// 3. Positive profile estimate when config is `0` or still S9 default → profile
+/// 4. Non-positive / non-finite config with no better source → `UnsetZero` (`0.0`)
+/// 5. Remaining S9 default with no better source → `S9SerdeDefault`
+///
+/// Prefer [`resolve_nominal_hashrate_ghs_with_geometry`] once boards are
+/// enumerated so partial fleets do not over-claim Standard SV2 nonce space.
+/// Pure geometry math: [`dcentrald_common::nominal_hashrate_ghs_from_geometry`].
+pub fn resolve_nominal_hashrate_ghs(
+    configured_ghs: f32,
+    profile_nominal_ghs: Option<f32>,
+) -> (f32, NominalHashrateSource) {
+    resolve_nominal_hashrate_ghs_with_geometry(configured_ghs, profile_nominal_ghs, None)
+}
+
+/// Like [`resolve_nominal_hashrate_ghs`], with optional live-enum GH/s.
+///
+/// `enumerated_geometry_ghs` should come from
+/// [`dcentrald_common::nominal_hashrate_ghs_from_geometry`] using **responding**
+/// chip counts (not marketing product geometry alone).
+pub fn resolve_nominal_hashrate_ghs_with_geometry(
+    configured_ghs: f32,
+    profile_nominal_ghs: Option<f32>,
+    enumerated_geometry_ghs: Option<f32>,
+) -> (f32, NominalHashrateSource) {
+    let cfg_positive = configured_ghs.is_finite() && configured_ghs > 0.0;
+    if cfg_positive && !is_s9_default_nominal_hashrate(configured_ghs) {
+        return (configured_ghs, NominalHashrateSource::ConfiguredExplicit);
+    }
+    let config_is_placeholder = !cfg_positive || is_s9_default_nominal_hashrate(configured_ghs);
+    if config_is_placeholder {
+        if let Some(e) = enumerated_geometry_ghs {
+            if e.is_finite() && e > 0.0 {
+                return (e, NominalHashrateSource::EnumeratedGeometry);
+            }
+        }
+        if let Some(p) = profile_nominal_ghs {
+            if p.is_finite() && p > 0.0 {
+                return (p, NominalHashrateSource::MinerProfile);
+            }
+        }
+    }
+    if !cfg_positive {
+        return (0.0, NominalHashrateSource::UnsetZero);
+    }
+    (
+        default_nominal_hashrate(),
+        NominalHashrateSource::S9SerdeDefault,
+    )
+}
+
+/// True when Standard SV2 is unsafe for this nominal GH/s (>1 TH/s).
+pub fn sv2_standard_channel_unsafe_for_ghs(ghs: f32) -> bool {
+    ghs > SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS
+}
+
+/// Soft prefer Extended channel at ≥5 TH/s.
+pub fn sv2_prefer_extended_for_ghs(ghs: f32) -> bool {
+    ghs >= SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS
 }
 
 /// Current state of the stratum connection.
@@ -1080,6 +1225,95 @@ mod tests {
     }
 
     #[test]
+    fn s9_default_nominal_hashrate_is_explicit_and_detectable() {
+        // P2-9: multi-TH platforms must not silently inherit S9 13.5 TH/s.
+        assert_eq!(default_nominal_hashrate(), 13500.0);
+        assert!(is_s9_default_nominal_hashrate(13500.0));
+        assert!(!is_s9_default_nominal_hashrate(110_000.0));
+        assert!(!is_s9_default_nominal_hashrate(500.0));
+    }
+
+    #[test]
+    fn hash_on_disconnect_is_log_note_only_never_cuts_hash() {
+        // P2-8: field name is historical; semantics must stay log-only until a
+        // real cut path is designed (thermal remains the safety backstop).
+        assert!(!HASH_ON_DISCONNECT_CUTS_ASIC_HASH);
+        assert_eq!(
+            hash_on_disconnect_semantics(),
+            HashOnDisconnectSemantics::LogNoteOnly
+        );
+    }
+
+    #[test]
+    fn resolve_nominal_prefers_profile_over_zero_and_s9_default() {
+        let s19j_class = 110_000.0_f32;
+        let (ghs, src) = resolve_nominal_hashrate_ghs(0.0, Some(s19j_class));
+        assert_eq!(ghs, s19j_class);
+        assert_eq!(src, NominalHashrateSource::MinerProfile);
+
+        let (ghs, src) = resolve_nominal_hashrate_ghs(default_nominal_hashrate(), Some(s19j_class));
+        assert_eq!(ghs, s19j_class);
+        assert_eq!(src, NominalHashrateSource::MinerProfile);
+        assert!(sv2_standard_channel_unsafe_for_ghs(ghs));
+        assert!(sv2_prefer_extended_for_ghs(ghs));
+    }
+
+    #[test]
+    fn resolve_nominal_prefers_enumerated_geometry_over_profile() {
+        // Partial enum (e.g. 2 of 3 boards) must win over full profile claim.
+        let profile = 110_000.0_f32;
+        let enumerated = 73_000.0_f32;
+        let (ghs, src) =
+            resolve_nominal_hashrate_ghs_with_geometry(0.0, Some(profile), Some(enumerated));
+        assert_eq!(ghs, enumerated);
+        assert_eq!(src, NominalHashrateSource::EnumeratedGeometry);
+
+        // Also when config still holds the S9 serde default footgun.
+        let (ghs, src) = resolve_nominal_hashrate_ghs_with_geometry(
+            default_nominal_hashrate(),
+            Some(profile),
+            Some(enumerated),
+        );
+        assert_eq!(ghs, enumerated);
+        assert_eq!(src, NominalHashrateSource::EnumeratedGeometry);
+
+        // Explicit operator config still wins over live geometry.
+        let (ghs, src) =
+            resolve_nominal_hashrate_ghs_with_geometry(50_000.0, Some(profile), Some(enumerated));
+        assert_eq!(ghs, 50_000.0);
+        assert_eq!(src, NominalHashrateSource::ConfiguredExplicit);
+
+        // No enum → fall back to profile (legacy two-arg path).
+        let (ghs, src) = resolve_nominal_hashrate_ghs_with_geometry(0.0, Some(profile), None);
+        assert_eq!(ghs, profile);
+        assert_eq!(src, NominalHashrateSource::MinerProfile);
+    }
+
+    #[test]
+    fn resolve_nominal_keeps_explicit_non_s9_config() {
+        let (ghs, src) = resolve_nominal_hashrate_ghs(50_000.0, Some(110_000.0));
+        assert_eq!(ghs, 50_000.0);
+        assert_eq!(src, NominalHashrateSource::ConfiguredExplicit);
+    }
+
+    #[test]
+    fn resolve_nominal_unset_zero_without_profile() {
+        let (ghs, src) = resolve_nominal_hashrate_ghs(0.0, None);
+        assert_eq!(ghs, 0.0);
+        assert_eq!(src, NominalHashrateSource::UnsetZero);
+        assert!(!sv2_standard_channel_unsafe_for_ghs(ghs));
+    }
+
+    #[test]
+    fn resolve_nominal_s9_default_when_no_profile() {
+        let (ghs, src) = resolve_nominal_hashrate_ghs(default_nominal_hashrate(), None);
+        assert_eq!(ghs, default_nominal_hashrate());
+        assert_eq!(src, NominalHashrateSource::S9SerdeDefault);
+        assert!(sv2_standard_channel_unsafe_for_ghs(ghs));
+        assert!(sv2_prefer_extended_for_ghs(ghs));
+    }
+
+    #[test]
     fn default_version_rolling_mask_is_bip310_canonical() {
         // 0x1fff_e000 is the BIP310 canonical version-rolling mask used
         // by every standard ASICBoost implementation. A refactor that
@@ -1131,6 +1365,8 @@ mod tests {
 
     fn flush_only_template() -> JobTemplate {
         JobTemplate {
+            work_generation: WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: String::new(),
             prev_block_hash: [0u8; 32],
             coinbase1: Vec::new(),
@@ -1223,6 +1459,8 @@ mod tests {
 
     fn ntime_roll_template(base_ntime: u32) -> JobTemplate {
         JobTemplate {
+            work_generation: WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: "roll".to_string(),
             prev_block_hash: [0x11; 32],
             coinbase1: vec![0x01],

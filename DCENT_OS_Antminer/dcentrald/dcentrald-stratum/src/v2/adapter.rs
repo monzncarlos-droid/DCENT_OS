@@ -68,6 +68,8 @@ pub fn extended_job_to_job_template(input: ExtendedJobAssembly<'_>) -> JobTempla
         0
     };
     JobTemplate {
+        work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+        v1_work_domain: None,
         job_id: input.job_id.to_string(),
         prev_block_hash: input.prev_hash,
         coinbase1: Vec::new(),
@@ -137,6 +139,8 @@ pub fn sv2_to_job_template(
     share_target: [u8; 32],
 ) -> JobTemplate {
     JobTemplate {
+        work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+        v1_work_domain: None,
         job_id: job.job_id.to_string(),
         prev_block_hash: prev_hash.prev_hash,
         // SV2 Standard Channels: pool provides the merkle root directly.
@@ -212,6 +216,8 @@ pub fn custom_job_to_job_template(
     let coinbase_hash = crate::work::double_sha256(&coinbase);
     let merkle_root = compute_merkle_root(&coinbase_hash, &candidate.merkle_path);
     JobTemplate {
+        work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+        v1_work_domain: None,
         job_id: job_id.to_string(),
         prev_block_hash: candidate.prev_hash,
         coinbase1: Vec::new(),
@@ -659,6 +665,7 @@ mod tests {
     #[test]
     fn test_valid_share_to_sv2_submit() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test.worker".to_string(),
             job_id: "42".to_string(),
             extranonce2: "00000000".to_string(),
@@ -682,6 +689,7 @@ mod tests {
     #[test]
     fn test_valid_share_no_version_bits() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test".to_string(),
             job_id: "1".to_string(),
             extranonce2: "00".to_string(),
@@ -932,6 +940,7 @@ mod tests {
     #[test]
     fn valid_share_to_sv2_submit_malformed_nonce_hex_falls_back_to_zero() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test".to_string(),
             job_id: "1".to_string(),
             extranonce2: "00".to_string(),
@@ -951,6 +960,7 @@ mod tests {
     #[test]
     fn valid_share_to_sv2_submit_malformed_ntime_hex_falls_back_to_zero() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test".to_string(),
             job_id: "1".to_string(),
             extranonce2: "00".to_string(),
@@ -967,6 +977,7 @@ mod tests {
     #[test]
     fn valid_share_to_sv2_submit_non_numeric_job_id_falls_back_to_zero() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test".to_string(),
             job_id: "not-a-number".to_string(),
             extranonce2: "00".to_string(),
@@ -983,6 +994,7 @@ mod tests {
     #[test]
     fn valid_share_to_sv2_submit_passes_through_channel_id_and_sequence() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "test".to_string(),
             job_id: "42".to_string(),
             extranonce2: "00".to_string(),
@@ -1003,6 +1015,7 @@ mod tests {
         // is case-insensitive, so a refactor to manual hex parsing must
         // preserve this.
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "t".to_string(),
             job_id: "1".to_string(),
             extranonce2: "00".to_string(),
@@ -1024,6 +1037,7 @@ mod tests {
         // (was reconstructing from version_bits delta only). Pin so the
         // bug doesn't return.
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "t".to_string(),
             job_id: "1".to_string(),
             extranonce2: "00".to_string(),
@@ -1045,6 +1059,7 @@ mod tests {
     #[test]
     fn valid_share_to_sv2_submit_max_u32_job_id_round_trips() {
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "t".to_string(),
             job_id: u32::MAX.to_string(),
             extranonce2: "00".to_string(),
@@ -1208,6 +1223,7 @@ mod tests {
         assert!(template.clean_jobs);
 
         let share = crate::types::ValidShare {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
             worker_name: "rig.1".to_string(),
             job_id: job.job_id.to_string(),
             extranonce2: String::new(),

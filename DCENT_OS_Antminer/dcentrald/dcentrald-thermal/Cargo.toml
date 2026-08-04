@@ -8,6 +8,8 @@ license = "GPL-3.0"
 [dependencies]
 dcentrald-hal = { path = "../dcentrald-hal", optional = true }
 dcentrald-api-types = { path = "../dcentrald-api-types" }
+# Pure home fan policy (P1-6 / FanCommand) — HAL-free, host-testable.
+dcentrald-common = { path = "../dcentrald-common" }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

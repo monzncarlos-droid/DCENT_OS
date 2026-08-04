@@ -14,87 +14,15 @@ pub struct PllExpectation {
 const MASTER: &str = "";
 
 pub static PLL_EXPECTATIONS: &[PllExpectation] = &[
-    PllExpectation {
-        chip_id: 0x1387,
-        register: 0x0c,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: Some(650),
-        representative_value: Some(0x0068_0221),
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1391,
-        register: 0x0c,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: None,
-        representative_value: None,
-        provenance: ":freq_pll_1385",
-    },
-    PllExpectation {
-        chip_id: 0x1397,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: Some(0xc060_0161),
-        representative_frequency_mhz: Some(650),
-        representative_value: None,
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1398,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: Some(0xc060_0161),
-        representative_frequency_mhz: Some(650),
-        representative_value: None,
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1362,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: Some(545),
-        representative_value: Some(0x50da_0141),
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1366,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: Some(670),
-        representative_value: None,
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1368,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: Some(525),
-        representative_value: None,
-        provenance: MASTER,
-    },
-    PllExpectation {
-        chip_id: 0x1370,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: Some(525),
-        representative_value: None,
-        provenance: ":get_pllparam_divider@0x000cb644",
-    },
-    PllExpectation {
-        chip_id: 0x1372,
-        register: 0x08,
-        reference_clock_mhz: 25,
-        reset_value: None,
-        representative_frequency_mhz: None,
-        representative_value: None,
-        provenance: "SCAFFOLD_NO_GROUND_TRUTH",
-    },
+    PllExpectation { chip_id: 0x1387, register: 0x0c, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: Some(650), representative_value: Some(0x0068_0221), provenance: MASTER },
+    PllExpectation { chip_id: 0x1391, register: 0x0c, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: None, representative_value: None, provenance: ":freq_pll_1385" },
+    PllExpectation { chip_id: 0x1397, register: 0x08, reference_clock_mhz: 25, reset_value: Some(0xc060_0161), representative_frequency_mhz: Some(650), representative_value: None, provenance: MASTER },
+    PllExpectation { chip_id: 0x1398, register: 0x08, reference_clock_mhz: 25, reset_value: Some(0xc060_0161), representative_frequency_mhz: Some(650), representative_value: None, provenance: MASTER },
+    PllExpectation { chip_id: 0x1362, register: 0x08, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: Some(545), representative_value: Some(0x50da_0141), provenance: MASTER },
+    PllExpectation { chip_id: 0x1366, register: 0x08, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: Some(670), representative_value: None, provenance: MASTER },
+    PllExpectation { chip_id: 0x1368, register: 0x08, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: Some(525), representative_value: None, provenance: MASTER },
+    PllExpectation { chip_id: 0x1370, register: 0x08, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: Some(525), representative_value: None, provenance: ":get_pllparam_divider@0x000cb644" },
+    PllExpectation { chip_id: 0x1372, register: 0x08, reference_clock_mhz: 25, reset_value: None, representative_frequency_mhz: None, representative_value: None, provenance: "SCAFFOLD_NO_GROUND_TRUTH" },
 ];
 
 pub fn pll_expectation(chip_id: u16) -> Option<&'static PllExpectation> {
@@ -106,6 +34,24 @@ pub fn pll_expectation(chip_id: u16) -> Option<&'static PllExpectation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W8 CLK-4: the per-chip declared reference is uniformly 25 MHz today.
+    /// This field is enforced against the production PLL solvers by
+    /// `dcentrald_common::pll_model::PLL_REFERENCE_HZ` (compile-time pinned in
+    /// the BM1362 driver, cross-pinned by
+    /// `dcentrald-asic/tests/w8_clk4_pll_reference_crosspin.rs`). If a chip
+    /// with a genuinely different XIN is RE'd, change this pin deliberately
+    /// together with a fail-closed solver path — never by editing one side.
+    #[test]
+    fn every_declared_reference_clock_is_25_mhz_today() {
+        for row in PLL_EXPECTATIONS {
+            assert_eq!(
+                row.reference_clock_mhz, 25,
+                "chip {:#06x}: reference_clock_mhz drifted from the uniform 25 MHz corpus",
+                row.chip_id
+            );
+        }
+    }
 
     #[test]
     fn representative_known_values_are_pinned() {

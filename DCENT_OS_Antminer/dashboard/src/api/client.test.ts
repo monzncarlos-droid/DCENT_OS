@@ -238,3 +238,41 @@ describe('api rolling metrics route', () => {
     await expect(api.getRollingMetrics()).resolves.toBeNull();
   });
 });
+
+describe('api share history result truth contract (RALPH 9D9/9F)', () => {
+  it('defaults a missing share result to "unknown", never fabricates "accepted"', async () => {
+    // A daemon serialization that drops `result` must NOT be shown as pool-accepted.
+    const body = JSON.stringify({ events: [{ timestamp_ms: 1753142400000, job_id: 'ab12' }] });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    (globalThis as { fetch: typeof fetch }).fetch = fetchMock as unknown as typeof fetch;
+    const { api } = await import('./client');
+
+    const history = await api.getShareHistory();
+    expect(history.events).toHaveLength(1);
+    expect(history.events[0].result).toBe('unknown');
+  });
+});
+
+describe('history normalization (finding 8: no fabricated 1970 timestamps)', () => {
+  it('drops a point with no usable timestamp instead of bucketing it at the epoch', async () => {
+    const body = JSON.stringify({
+      history: [
+        { timestamp: 1753142400000, hashrate_ghs: 100, temp_c: 60, power_watts: 3000 },
+        { hashrate_ghs: 100, temp_c: 60, power_watts: 3000 }, // no timestamp / timestamp_s
+      ],
+    });
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    (globalThis as { fetch: typeof fetch }).fetch = fetchMock as unknown as typeof fetch;
+    const { api } = await import('./client');
+
+    const res = await api.getHistory();
+    expect(res.history).toHaveLength(1);
+    expect(res.history.every((p) => p.timestamp > 0)).toBe(true);
+  });
+});

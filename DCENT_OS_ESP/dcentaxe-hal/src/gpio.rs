@@ -36,11 +36,17 @@ pub struct GpioController<'d> {
     /// ASIC chain reset pin — active low (low = reset, high = normal)
     asic_reset: PinDriver<'d, Output>,
     /// Buck converter enable pin
-    buck_enable: PinDriver<'d, Output>,
+    buck_enable: Option<PinDriver<'d, Output>>,
     /// True if buck enable is active-low (Max/Ultra DS4432U boards)
     buck_active_low: bool,
     /// Status LED pin — high = on (polarity may vary by board)
     led: PinDriver<'d, Output>,
+    /// ASIC LDO enable pin — ACTIVE-HIGH, `None` on boards with no LDO rail.
+    ///
+    /// A SECOND supply, not a second handle on the buck. See
+    /// [`crate::board::LdoEnable`]: on the multi-phase Nerd line the dies need
+    /// both this and the core rail, and the LDO must be up first.
+    ldo_enable: Option<PinDriver<'d, Output>>,
 }
 
 impl<'d> GpioController<'d> {
@@ -87,10 +93,117 @@ impl<'d> GpioController<'d> {
 
         Ok(Self {
             asic_reset,
-            buck_enable,
+            buck_enable: Some(buck_enable),
             buck_active_low,
             led,
+            ldo_enable: None,
         })
+    }
+
+    /// Initialize reset + buck + LED **and** a discrete ASIC LDO enable.
+    ///
+    /// For the multi-phase Nerd line, whose dies are fed by an LDO bank on top
+    /// of the TPS5364x core rail (`crate::board::LdoEnable`). The LDO starts
+    /// LOW — off — exactly as upstream's `initBoard` leaves it, so nothing is
+    /// energized by construction; `enable_ldo(true)` is a separate, ordered
+    /// step in the power-up sequence.
+    pub fn new_with_ldo(
+        asic_reset_pin: impl OutputPin + 'd,
+        buck_enable_pin: impl OutputPin + 'd,
+        led_pin: impl OutputPin + 'd,
+        ldo_enable_pin: impl OutputPin + 'd,
+        buck_active_low: bool,
+    ) -> Result<Self, GpioError> {
+        let mut ctrl = Self::new(asic_reset_pin, buck_enable_pin, led_pin, buck_active_low)?;
+        let mut ldo = PinDriver::output(ldo_enable_pin)
+            .map_err(|e| GpioError::ConfigFailed(format!("ldo_enable: {:?}", e)))?;
+        ldo.set_low()
+            .map_err(|e| GpioError::SetLevelFailed(format!("ldo_enable low(off): {:?}", e)))?;
+        ctrl.ldo_enable = Some(ldo);
+        info!("GPIO controller: ASIC LDO enable configured (OFF)");
+        Ok(ctrl)
+    }
+
+    /// Initialize reset + status LED without claiming a buck-enable GPIO.
+    ///
+    /// Hammer boards use this path: GPIO46 is ST7789 D5, GPIO15 is a shared
+    /// board/LCD-power net, and no discrete regulator-enable pin is verified.
+    /// An absent buck is represented explicitly rather than borrowing a panel
+    /// or PGOOD pin as a "safe" dummy output.
+    pub fn new_without_buck(
+        asic_reset_pin: impl OutputPin + 'd,
+        led_pin: impl OutputPin + 'd,
+    ) -> Result<Self, GpioError> {
+        let mut asic_reset = PinDriver::output(asic_reset_pin)
+            .map_err(|e| GpioError::ConfigFailed(format!("asic_reset: {:?}", e)))?;
+        let mut led = PinDriver::output(led_pin)
+            .map_err(|e| GpioError::ConfigFailed(format!("led: {:?}", e)))?;
+
+        asic_reset
+            .set_high()
+            .map_err(|e| GpioError::SetLevelFailed(format!("asic_reset high: {:?}", e)))?;
+        led.set_low()
+            .map_err(|e| GpioError::SetLevelFailed(format!("led low: {:?}", e)))?;
+
+        info!("GPIO controller initialized (reset=HIGH, buck=ABSENT, led=OFF)");
+        Ok(Self {
+            asic_reset,
+            buck_enable: None,
+            buck_active_low: false,
+            led,
+            ldo_enable: None,
+        })
+    }
+
+    /// Whether this board has a discrete ASIC LDO enable bound.
+    ///
+    /// `false` means the board genuinely has no separate LDO rail — NOT that
+    /// one exists and failed to bind. The binder cannot produce the second
+    /// case: an arm either hands `new_with_ldo` a pin or does not exist.
+    pub fn has_ldo(&self) -> bool {
+        self.ldo_enable.is_some()
+    }
+
+    /// Whether the ASIC LDO is currently being driven HIGH.
+    ///
+    /// Reads the driver's own output state rather than a shadow flag, so it
+    /// cannot drift from the pin. `false` for a board with no LDO — "not
+    /// energized" is the truthful answer there, and it lets a shutdown path
+    /// skip the LDO step without a second `has_ldo()` call.
+    ///
+    /// This is what makes the fail-closed LDO drop IDEMPOTENT. That path is
+    /// reachable from the supervisor loop (POWER FAULT, INA260 over-current),
+    /// and its 500 ms settle must happen at most once — a settle re-run every
+    /// tick would spend the task-WDT budget on a rail that is already down.
+    pub fn ldo_is_enabled(&self) -> bool {
+        self.ldo_enable
+            .as_ref()
+            .map(|p| p.is_set_high())
+            .unwrap_or(false)
+    }
+
+    /// Drive the ASIC LDO enable. ACTIVE-HIGH: `true` powers the LDO bank.
+    ///
+    /// Returns `Err` only when this board has no LDO pin at all. That is a
+    /// TOPOLOGY report, exactly like `enable_buck`'s on a board with no buck
+    /// GPIO — read it through [`Self::has_ldo`], never as an actuation failure.
+    /// The distinction is the whole subject of
+    /// : one un-`ok()`d call
+    /// site turned that same sentinel into a permanent mining refusal for three
+    /// boards.
+    pub fn enable_ldo(&mut self, on: bool) -> Result<(), GpioError> {
+        let ldo = self.ldo_enable.as_mut().ok_or_else(|| {
+            GpioError::ConfigFailed("board has no ASIC LDO enable pin".to_string())
+        })?;
+        if on {
+            ldo.set_high()
+                .map_err(|e| GpioError::SetLevelFailed(format!("ldo_enable high: {:?}", e)))?;
+        } else {
+            ldo.set_low()
+                .map_err(|e| GpioError::SetLevelFailed(format!("ldo_enable low: {:?}", e)))?;
+        }
+        info!("ASIC LDO {}", if on { "ENABLED" } else { "DISABLED" });
+        Ok(())
     }
 
     /// Reset the ASIC chain by pulsing the reset pin low for 100 ms.
@@ -173,17 +286,23 @@ impl<'d> GpioController<'d> {
     /// # Arguments
     /// * `on` - `true` to enable the buck converter, `false` to disable
     pub fn enable_buck(&mut self, on: bool) -> Result<(), GpioError> {
+        let buck_enable = self.buck_enable.as_mut().ok_or_else(|| {
+            GpioError::ConfigFailed(format!(
+                "buck-enable GPIO is not bound; refusing request to turn rail {}",
+                if on { "on" } else { "off" }
+            ))
+        })?;
         // Active-low: LOW=enabled, HIGH=disabled
         // Active-high: HIGH=enabled, LOW=disabled
         // Single source of truth shared with the fail-closed panic hook
         // (XPSAFE-1) so the driver and the hook can never disagree on polarity.
         let level_high = crate::safety::buck_level_high(self.buck_active_low, on);
         if level_high {
-            self.buck_enable
+            buck_enable
                 .set_high()
                 .map_err(|e| GpioError::SetLevelFailed(format!("buck high: {:?}", e)))?;
         } else {
-            self.buck_enable
+            buck_enable
                 .set_low()
                 .map_err(|e| GpioError::SetLevelFailed(format!("buck low: {:?}", e)))?;
         }

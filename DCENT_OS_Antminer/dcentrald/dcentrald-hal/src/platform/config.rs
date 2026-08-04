@@ -124,7 +124,8 @@ pub enum ChainTransport {
     ///
     /// Unlike FpgaUio (BraiinsOS per-chain UIO devices), the stock FPGA uses:
     ///   - /dev/axi_fpga_dev (major 245) for 352-byte register block at 0x43C00000
-    ///   - /dev/fpga_mem (major 244) for 16 MB DMA buffer at 0x1F000000
+    ///   - /dev/fpga_mem (major 244) for a 16 MB DMA buffer at the
+    ///     RAM-dependent stock base (0x0F000000/0x1F000000/0x3F000000)
     ///   - BC_WRITE_COMMAND register for ASIC commands (broadcast to chains)
     ///   - DHASH accelerator + DMA for work dispatch (all chains simultaneously)
     ///   - Shared RETURN_NONCE FIFO for nonce collection

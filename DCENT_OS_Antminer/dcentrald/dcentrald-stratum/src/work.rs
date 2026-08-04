@@ -10,7 +10,10 @@
 //! 5. Compute SHA-256 midstate of first 64 bytes
 //! 6. Package ASIC job (midstate + merkle4 + ntime + nbits + nonce)
 
-use crate::types::{JobTemplate, MAX_V1_EXTRANONCE2_SIZE};
+use crate::types::JobTemplate;
+#[cfg(test)]
+use crate::types::MAX_V1_EXTRANONCE2_SIZE;
+use crate::work_domain::{WorkBuildError, WorkGeneration};
 use sha2::{Digest, Sha256};
 
 /// ASIC-ready mining work unit.
@@ -20,6 +23,9 @@ use sha2::{Digest, Sha256};
 /// For chips with version rolling, up to 4 midstates are pre-computed.
 #[derive(Debug, Clone)]
 pub struct MiningWork {
+    /// Exact internal subscription/job generation for this work.
+    pub work_generation: WorkGeneration,
+
     /// Pre-computed SHA-256 midstate(s). One per version-rolled variant.
     /// midstates[0] = original version, midstates[1..3] = rolled versions.
     pub midstates: Vec<[u8; 32]>,
@@ -62,9 +68,6 @@ pub struct MiningWork {
 ///
 /// Maintains the extranonce2 counter and version rolling state.
 pub struct WorkBuilder {
-    /// Incrementing extranonce2 counter.
-    extranonce2_counter: u64,
-
     /// Negotiated version rolling mask. 0 = no rolling.
     version_mask: u32,
 }
@@ -77,10 +80,7 @@ impl Default for WorkBuilder {
 
 impl WorkBuilder {
     pub fn new() -> Self {
-        Self {
-            extranonce2_counter: 0,
-            version_mask: 0,
-        }
+        Self { version_mask: 0 }
     }
 
     /// Set the version rolling mask after BIP 310 negotiation.
@@ -88,21 +88,37 @@ impl WorkBuilder {
         self.version_mask = mask;
     }
 
-    /// Reset the extranonce2 counter (called on clean_jobs).
-    pub fn reset_extranonce2(&mut self) {
-        self.extranonce2_counter = 0;
-    }
+    /// Compatibility hook retained for older callers.
+    ///
+    /// V1 allocation is owned by the generation-bound shared domain carried by
+    /// `JobTemplate`, so resetting an individual builder must not restart the
+    /// counter and duplicate another chain's work.
+    pub fn reset_extranonce2(&mut self) {}
 
     /// Generate the next mining work unit from a job template.
     ///
     /// Each call increments extranonce2, producing a unique coinbase
     /// and therefore a unique merkle root and work unit.
-    pub fn next_work(&mut self, job: &JobTemplate) -> MiningWork {
-        let extranonce2 = self.extranonce2_counter;
-        self.extranonce2_counter += 1;
-
-        // Format extranonce2 as hex string of the required byte length
-        let extranonce2_hex = format_extranonce2(extranonce2, job.extranonce2_size);
+    pub fn next_work(&mut self, job: &JobTemplate) -> Result<MiningWork, WorkBuildError> {
+        let extranonce2_hex = if job.extranonce2_size == 0 && job.merkle_root != [0u8; 32] {
+            // SV2 Standard jobs carry a pool-computed merkle root and do not use
+            // the V1 coinbase/extranonce2 allocator.
+            String::new()
+        } else {
+            let domain = job
+                .v1_work_domain
+                .as_ref()
+                .ok_or(WorkBuildError::MissingV1WorkDomain(job.work_generation))?;
+            if domain.extranonce2_size() != job.extranonce2_size {
+                return Err(WorkBuildError::MismatchedV1WorkDomain {
+                    job: job.work_generation,
+                    domain: domain.generation(),
+                    job_width: job.extranonce2_size,
+                    domain_width: domain.extranonce2_size(),
+                });
+            }
+            domain.allocate_hex_for(job.work_generation)?
+        };
         let extranonce2_bytes = hex_decode(&extranonce2_hex);
 
         // Step 1-3: Compute or use pre-computed merkle root.
@@ -164,7 +180,8 @@ impl WorkBuilder {
         let mut merkle4 = [0u8; 4];
         merkle4.copy_from_slice(&merkle_root[28..32]);
 
-        MiningWork {
+        Ok(MiningWork {
+            work_generation: job.work_generation,
             midstates,
             merkle4,
             ntime: job.ntime,
@@ -176,7 +193,7 @@ impl WorkBuilder {
             share_target: job.share_target,
             merkle_root,
             prev_block_hash: prev_hash,
-        }
+        })
     }
 }
 
@@ -290,13 +307,25 @@ fn increment_bitmask(value: u32, mask: u32) -> u32 {
 ///
 /// extranonce2 is transmitted as a hex string with exactly
 /// `byte_count * 2` hex characters (zero-padded, little-endian).
-fn format_extranonce2(counter: u64, byte_count: usize) -> String {
-    let byte_count = byte_count.min(MAX_V1_EXTRANONCE2_SIZE);
+#[cfg(test)]
+fn format_extranonce2(counter: u64, byte_count: usize) -> Result<String, WorkBuildError> {
+    if !(1..=MAX_V1_EXTRANONCE2_SIZE).contains(&byte_count) {
+        return Err(WorkBuildError::InvalidExtranonce2Size(byte_count));
+    }
+    let max = if byte_count == MAX_V1_EXTRANONCE2_SIZE {
+        u64::MAX
+    } else {
+        (1u64 << (byte_count * 8)) - 1
+    };
+    if counter > max {
+        return Err(WorkBuildError::Extranonce2OutOfDomain {
+            value: counter,
+            width: byte_count,
+            max,
+        });
+    }
     let le_bytes = counter.to_le_bytes();
-    let copy_len = byte_count.min(8);
-    let mut buf = vec![0u8; byte_count];
-    buf[..copy_len].copy_from_slice(&le_bytes[..copy_len]);
-    hex::encode(buf)
+    Ok(hex::encode(&le_bytes[..byte_count]))
 }
 
 /// Decode a hex string to bytes.
@@ -666,14 +695,13 @@ mod tests {
 
     #[test]
     fn test_format_extranonce2() {
-        assert_eq!(format_extranonce2(1, 0), "");
-        assert_eq!(format_extranonce2(0, 4), "00000000");
-        assert_eq!(format_extranonce2(1, 4), "01000000");
-        assert_eq!(format_extranonce2(256, 4), "00010000");
-        assert_eq!(
-            format_extranonce2(1, MAX_V1_EXTRANONCE2_SIZE + 1024).len(),
-            MAX_V1_EXTRANONCE2_SIZE * 2
-        );
+        assert!(matches!(
+            format_extranonce2(1, 0),
+            Err(WorkBuildError::InvalidExtranonce2Size(0))
+        ));
+        assert_eq!(format_extranonce2(0, 4).unwrap(), "00000000");
+        assert_eq!(format_extranonce2(1, 4).unwrap(), "01000000");
+        assert_eq!(format_extranonce2(256, 4).unwrap(), "00010000");
     }
 
     #[test]
@@ -726,7 +754,13 @@ mod tests {
         let mut builder = WorkBuilder::new();
         builder.set_version_mask(0x1fffe000);
 
+        let generation = WorkGeneration { session: 1, job: 1 };
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
         let job = crate::types::JobTemplate {
+            work_generation: generation,
+            v1_work_domain: Some(
+                crate::work_domain::V1WorkDomain::new(generation, 4, control_tx).unwrap(),
+            ),
             job_id: "1".to_string(),
             prev_block_hash: [0u8; 32],
             coinbase1: vec![0x01],
@@ -749,7 +783,7 @@ mod tests {
             pool_difficulty: 1.0,
         };
 
-        let work = builder.next_work(&job);
+        let work = builder.next_work(&job).unwrap();
         assert_eq!(work.midstates.len(), 8);
         assert!(work.midstates.windows(2).all(|w| w[0] != w[1]));
     }
@@ -1455,24 +1489,35 @@ mod tests {
     fn format_extranonce2_le_byte_layout_for_size_4() {
         // Counter = 0xDEADBEEF, size = 4.
         // LE bytes: [EF, BE, AD, DE] → hex "efbeadde".
-        let hex = format_extranonce2(0xDEAD_BEEF, 4);
+        let hex = format_extranonce2(0xDEAD_BEEF, 4).unwrap();
         assert_eq!(hex, "efbeadde");
     }
 
     #[test]
     fn format_extranonce2_zero_pads_when_counter_smaller_than_size() {
         // Counter=1, size=8 → [01, 00, 00, 00, 00, 00, 00, 00].
-        let hex = format_extranonce2(1, 8);
+        let hex = format_extranonce2(1, 8).unwrap();
         assert_eq!(hex, "0100000000000000");
     }
 
     #[test]
-    fn format_extranonce2_clamps_size_at_max() {
-        // Sizes > MAX_V1_EXTRANONCE2_SIZE silently clamp. Pin the cap
-        // so a refactor that changes the constant doesn't silently
-        // change the wire format.
-        let hex = format_extranonce2(0, MAX_V1_EXTRANONCE2_SIZE + 100);
-        assert_eq!(hex.len(), MAX_V1_EXTRANONCE2_SIZE * 2);
+    fn format_extranonce2_rejects_size_above_max() {
+        assert!(matches!(
+            format_extranonce2(0, MAX_V1_EXTRANONCE2_SIZE + 100),
+            Err(WorkBuildError::InvalidExtranonce2Size(_))
+        ));
+    }
+
+    #[test]
+    fn format_extranonce2_rejects_value_outside_width_instead_of_truncating() {
+        assert_eq!(
+            format_extranonce2(256, 1),
+            Err(WorkBuildError::Extranonce2OutOfDomain {
+                value: 256,
+                width: 1,
+                max: 255,
+            })
+        );
     }
 
     #[test]

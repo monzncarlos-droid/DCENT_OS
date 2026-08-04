@@ -427,6 +427,7 @@ fn build_happy_share(family: &str, midstate: &[u8; 32]) -> ValidShare {
     let extranonce2_bytes = [midstate[8], midstate[9], midstate[10], midstate[11]];
 
     ValidShare {
+        work_generation: dcentrald_stratum::WorkGeneration { session: 1, job: 1 },
         worker_name: format!("worker.{family}"),
         job_id,
         extranonce2: hex::encode(extranonce2_bytes),

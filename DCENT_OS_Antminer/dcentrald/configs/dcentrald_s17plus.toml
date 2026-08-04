@@ -1,5 +1,16 @@
-# DCENT_OS runtime template for Antminer S17+ (BM1396).
-# Experimental management-only template; BM1396 dispatch intentionally fails closed.
+# DCENT_OS runtime template for Antminer S17+.
+#
+# 2026-08-03 mapping correction (W8-G): the S17+ carries BM1397 (0x1397), not
+# BM1396 — the "e" variants (S17e/T17e) are the BM1396 parts. The catalog data
+# has been corrected repo-wide.
+#
+# `serial_chip_type` is now "BM1397" too. Operator decision 2026-08-03 promoted
+# these boards from fail-closed-on-an-unregistered-chip to Experimental dispatch
+# on the REGISTERED BM1397 driver — the same driver S17 / S17 Pro / T17 already
+# use, because it is the same silicon. [mining] stays enabled = false: this is
+# still a management-only template and there is no S17+/T17+ unit on the fleet,
+# so this is implemented-and-instrumented, NOT bench-proven. Chip COUNT is the
+# part that differs from S17 (65 per chain here, not 48) — do not "align" it.
 
 [general]
 hostname = "dcentos-s17plus"
@@ -21,7 +32,7 @@ passthrough = false
 suggest_difficulty = 256
 serial_device = "/dev/ttyS1"
 serial_chip_count = 65
-serial_chip_type = "BM1396"
+serial_chip_type = "BM1397"
 am2_no_nonce_timeout_s = 90
 
 [power]

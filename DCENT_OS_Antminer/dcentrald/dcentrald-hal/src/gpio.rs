@@ -64,6 +64,44 @@ pub const BOARD_ENABLE_J7: u32 = BOARD_RESET_J7;
 pub const BOARD_ENABLE_J8: u32 = BOARD_RESET_J8;
 pub const BOARD_ENABLE_ALL: u32 = BOARD_RESET_ALL;
 
+/// AXI-GPIO bit layout selected from the proven control-board topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpioLayout {
+    /// S9/T9: plug bits 5..7 and reset bits 9..11.
+    Am1S9,
+    /// AM2 S17/S19: plug bits 0..2 and reset bits 0..2.
+    ///
+    /// The fourth AM2 logical FPGA chain slot has no fourth position in the
+    /// platform-neutral three-board GPIO trait. BoardControl owns any explicit
+    /// slot-4 operation.
+    Am2,
+}
+
+impl GpioLayout {
+    const fn plug_masks(self) -> [u32; 3] {
+        match self {
+            Self::Am1S9 => [PLUG_DETECT_J6, PLUG_DETECT_J7, PLUG_DETECT_J8],
+            Self::Am2 => [1 << 0, 1 << 1, 1 << 2],
+        }
+    }
+
+    const fn reset_masks(self) -> [u32; 3] {
+        match self {
+            Self::Am1S9 => [BOARD_RESET_J6, BOARD_RESET_J7, BOARD_RESET_J8],
+            Self::Am2 => [1 << 0, 1 << 1, 1 << 2],
+        }
+    }
+
+    const fn all_reset_mask(self) -> u32 {
+        let masks = self.reset_masks();
+        masks[0] | masks[1] | masks[2]
+    }
+}
+
+fn decode_plug_detect(layout: GpioLayout, data: u32) -> [bool; 3] {
+    layout.plug_masks().map(|mask| data & mask != 0)
+}
+
 /// LED identifiers.
 ///
 /// S9 LEDs are Linux LED class devices under `/sys/class/leds/`.
@@ -111,6 +149,8 @@ pub struct GpioController {
     input_base: *mut u32,
     /// mmap'd pointer to the output GPIO register block (0x41210000).
     output_base: *mut u32,
+    /// Proven register bit layout for this control-board family.
+    layout: GpioLayout,
 }
 
 // SAFETY: Same as UioDevice -- process-global mmap.
@@ -120,6 +160,11 @@ unsafe impl Sync for GpioController {}
 impl GpioController {
     /// Create a new GPIO controller by mmapping the AXI GPIO registers via /dev/mem.
     pub fn new() -> crate::Result<Self> {
+        Self::new_with_layout(GpioLayout::Am1S9)
+    }
+
+    /// Create a controller with an explicit, evidence-backed register layout.
+    pub fn new_with_layout(layout: GpioLayout) -> crate::Result<Self> {
         let mem_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -172,6 +217,7 @@ impl GpioController {
         Ok(Self {
             input_base: input_ptr.as_ptr() as *mut u32,
             output_base: output_ptr.as_ptr() as *mut u32,
+            layout,
         })
     }
 
@@ -180,11 +226,7 @@ impl GpioController {
     /// Returns [J6_present, J7_present, J8_present].
     pub fn read_plug_detect(&self) -> [bool; 3] {
         let data = unsafe { std::ptr::read_volatile(self.input_base) };
-        [
-            data & PLUG_DETECT_J6 != 0,
-            data & PLUG_DETECT_J7 != 0,
-            data & PLUG_DETECT_J8 != 0,
-        ]
+        decode_plug_detect(self.layout, data)
     }
 
     /// Assert or release the hash board RESET line.
@@ -196,11 +238,8 @@ impl GpioController {
     /// always present from the PSU. Asserting reset (LOW) holds all ASIC chips
     /// in their default state. Releasing reset (HIGH) lets them boot.
     pub fn set_board_enable(&self, chain: u8, enable: bool) {
-        let bit = match chain {
-            0 => BOARD_RESET_J6,
-            1 => BOARD_RESET_J7,
-            2 => BOARD_RESET_J8,
-            _ => return,
+        let Some(&bit) = self.layout.reset_masks().get(chain as usize) else {
+            return;
         };
 
         let current = unsafe { std::ptr::read_volatile(self.output_base) };
@@ -215,10 +254,11 @@ impl GpioController {
     /// Assert or release ALL hash board RESET lines at once.
     pub fn set_all_boards_enable(&self, enable: bool) {
         let current = unsafe { std::ptr::read_volatile(self.output_base) };
+        let reset_mask = self.layout.all_reset_mask();
         let new = if enable {
-            current | BOARD_RESET_ALL
+            current | reset_mask
         } else {
-            current & !BOARD_RESET_ALL
+            current & !reset_mask
         };
         unsafe { std::ptr::write_volatile(self.output_base, new) };
     }
@@ -318,5 +358,25 @@ impl Drop for GpioController {
         // GPIO mmaps are process-lifetime resources. Let the kernel reclaim
         // them at exit instead of touching device-backed mappings during the
         // very end of shutdown.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s9_and_am2_gpio_layouts_decode_distinct_proven_bits() {
+        assert_eq!(
+            decode_plug_detect(GpioLayout::Am1S9, (1 << 5) | (1 << 7)),
+            [true, false, true]
+        );
+        assert_eq!(
+            decode_plug_detect(GpioLayout::Am2, (1 << 0) | (1 << 2)),
+            [true, false, true]
+        );
+        assert_eq!(decode_plug_detect(GpioLayout::Am2, 1 << 5), [false; 3]);
+        assert_eq!(GpioLayout::Am1S9.all_reset_mask(), 0x0E00);
+        assert_eq!(GpioLayout::Am2.all_reset_mask(), 0x0007);
     }
 }

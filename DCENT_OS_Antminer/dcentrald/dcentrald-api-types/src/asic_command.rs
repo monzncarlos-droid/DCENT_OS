@@ -184,6 +184,10 @@ impl LinearAddressPlan {
     /// Construct the historical BM1397+ `floor(256 / chip_count)` plan with
     /// explicit validation. Callers should persist the returned plan rather
     /// than recomputing its stride from mutable geometry.
+    ///
+    /// Stride SSOT: [`dcentrald_common::bm1397plus_addr_interval`] (one-chip
+    /// returns 1, not wrap-to-0). `chip_count == 256` is the only count above
+    /// `u8::MAX` still admitted (interval 1).
     pub const fn from_truncated_byte_space(
         chip_count: u16,
     ) -> Result<Self, LinearAddressPlanError> {
@@ -193,13 +197,10 @@ impl LinearAddressPlan {
         if chip_count > 256 {
             return Err(LinearAddressPlanError::TooManyChips { chip_count });
         }
-        // A one-chip repair fixture has only address 0; the mathematical
-        // interval 256 is not representable on an 8-bit bus and must not wrap
-        // to zero. Use the smallest canonical non-zero interval instead.
-        let interval = if chip_count == 1 {
-            1
+        let interval = if chip_count == 256 {
+            1u8
         } else {
-            (256 / chip_count) as u8
+            dcentrald_common::bm1397plus_addr_interval(chip_count as u8)
         };
         Self::try_new(0, chip_count, interval)
     }
@@ -249,10 +250,23 @@ impl LinearAddressPlan {
 ///
 /// New code should retain a validated [`LinearAddressPlan`] so invalid
 /// geometry cannot be confused with a legitimate zero stride.
+/// Historical u32 address stride helper.
+///
+/// BM1397+ paths for `chip_count` in 2..=255 thin-wrap
+/// [`dcentrald_common::bm1397plus_addr_interval`]. **One-chip historical
+/// result remains `256`** (u32 `256/1`) — prefer
+/// [`LinearAddressPlan::from_truncated_byte_space`] for new code (one-chip
+/// interval = `1`).
 pub fn address_stride(family: ChipFamily, chip_count: u32) -> u32 {
     match family {
         ChipFamily::Bm1387 => 4,
         _ if chip_count == 0 => 0,
+        // Historical u32 API pin: 256/1 = 256 (not pure one-chip rule = 1).
+        _ if chip_count == 1 => 256,
+        _ if chip_count <= 255 => {
+            u32::from(dcentrald_common::bm1397plus_addr_interval(chip_count as u8))
+        }
+        // chip_count >= 256: full-population math still floor-divides 256.
         _ => 256 / chip_count,
     }
 }
@@ -438,9 +452,34 @@ mod tests {
         assert_eq!(plan.dense_index(1), None);
     }
 
+    /// P1-3: LinearAddressPlan stride must match pure common SSOT for every
+    /// representable population (one-chip rule = 1, not wrap-to-0).
+    #[test]
+    fn linear_address_plan_interval_matches_common_pure_ssot() {
+        for n in 1u16..=255 {
+            let plan = LinearAddressPlan::from_truncated_byte_space(n).unwrap();
+            assert_eq!(
+                plan.address_interval(),
+                dcentrald_common::bm1397plus_addr_interval(n as u8),
+                "chip_count={n}"
+            );
+        }
+        let plan_256 = LinearAddressPlan::from_truncated_byte_space(256).unwrap();
+        assert_eq!(plan_256.address_interval(), 1);
+    }
+
     #[test]
     fn historical_stride_wrapper_preserves_one_chip_u32_result() {
         assert_eq!(address_stride(ChipFamily::Bm1398, 1), 256);
+        // Non-one-chip BM1397+ must match pure common SSOT (not a divergent fork).
+        for n in 2u32..=255 {
+            assert_eq!(
+                address_stride(ChipFamily::Bm1398, n),
+                u32::from(dcentrald_common::bm1397plus_addr_interval(n as u8)),
+                "chip_count={n}"
+            );
+        }
+        assert_eq!(address_stride(ChipFamily::Bm1398, 256), 1);
     }
 
     #[test]

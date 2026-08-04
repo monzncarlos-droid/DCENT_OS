@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::board_health::BoardHealthResult;
+use crate::board_health::{BoardHealthResult, ProducerContextTrust};
 use crate::chip_health::{
     ChipColor, ChipHealthChainSnapshot, ChipHealthSnapshot, ChipMap, ChipMapCell,
 };
@@ -209,6 +209,26 @@ pub fn build_chip_health_snapshot(
             "runtime_chain_summary".to_string()
         };
 
+        // Localize physical faults from the ChipMap: turn the grid into a
+        // component-level diagnosis (chain break vs. domain regulator vs. rail
+        // vs. signal integrity vs. specific weak silicon). Inferred-grade, pure,
+        // no hardware contact. Prefer RE-verified domain geometry when chip_id
+        // is known so the domain-boundary discriminator can fire.
+        let repair_ctx = context
+            .chip_id
+            .map(crate::repair_advisor::RepairContext::for_chip_id)
+            .unwrap_or_default();
+        let repair_recommendations = crate::repair_advisor::analyze_chipmap(&chipmap, &repair_ctx);
+        for rec in &repair_recommendations {
+            recommendations.push(format!(
+                "[{} / {} confidence] {} Next: {}",
+                rec.suspected_component.as_str(),
+                rec.confidence.as_str(),
+                rec.summary,
+                rec.bench_next_step,
+            ));
+        }
+
         let average_score = if chipmap.cells.is_empty() {
             0.0
         } else {
@@ -219,7 +239,8 @@ pub fn build_chip_health_snapshot(
                 .sum::<f64>()
                 / chipmap.cells.len() as f64
         };
-        if average_score < 0.7 {
+        // Fall back to the generic nudge only when no specific fault localized.
+        if repair_recommendations.is_empty() && average_score < 0.7 {
             recommendations.push(format!(
                 "Inspect chain {} for weak silicon, thermal imbalance, or communication faults before increasing frequency.",
                 chain.chain_id
@@ -238,6 +259,7 @@ pub fn build_chip_health_snapshot(
             voltage_mv: chain.voltage_mv,
             errors: chain.errors,
             status: chain.status.clone(),
+            repair_recommendations,
             chipmap,
         });
     }
@@ -298,18 +320,28 @@ pub fn build_board_health_snapshot(
                     .get(&chain.chain_id)
                     .map(|chip_chain| chip_chain.source.clone())
                     .unwrap_or_else(|| "runtime_chain_summary".to_string()),
-                measurement_type: "live_snapshot".to_string(),
+                measurement_type: dcentrald_common::DiagnosticRunMode::Snapshot
+                    .as_measurement_type()
+                    .to_string(),
                 status: chain.status.clone(),
                 estimated_hashrate_ghs: chain.hashrate_ghs,
                 notes: vec![
                     "Board-health values are derived from the miner's current runtime snapshot; no standalone stress pass was launched.".to_string(),
+                    "Responding-chip count comes from an unqualified runtime chain summary, not a bounded enumeration transcript.".to_string(),
+                    "Board temperature has no sensor identity or observation provenance in SnapshotChain; it is useful for triage but cannot support a measured pass.".to_string(),
                     "Voltage shown is the commanded/last-known setpoint — the rail was NOT measured in snapshot mode (no PIC/dsPIC set/get readback); deviation is not available. A collapsed rail can still show a non-zero commanded value.".to_string(),
                     "CRC status is inferred from a cumulative runtime counter; no bounded command window was measured, so zero errors cannot prove a measured PASS.".to_string(),
                     "Board model/serial metadata is not EEPROM checksum or schema validation; EEPROM validity is unavailable in snapshot mode.".to_string(),
                 ],
+                producer_context_trust: ProducerContextTrust::Unverified,
                 chips_expected: expected,
                 chips_responding: chain.chips,
                 dead_chip_addresses,
+                chip_count_evidence: DiagnosticEvidence::inferred(
+                    chain.chips,
+                    "runtime_chain_summary_without_bounded_enumeration",
+                    None,
+                ),
                 // NOTE: snapshot mode performs no PIC/dsPIC readback. readback ==
                 // setpoint and deviation == 0.0 are NOT measurements; report.rs
                 // renders this honestly (gated on measurement_type=="live_snapshot")
@@ -328,6 +360,9 @@ pub fn build_board_health_snapshot(
                 crc_errors_received: chain.errors,
                 crc_error_rate_pct: 0.0,
                 crc_ok,
+                crc_window_evidence: DiagnosticEvidence::unavailable(
+                    "bounded_crc_window_not_run_in_snapshot",
+                ),
                 crc_evidence: DiagnosticEvidence::inferred(
                     chain.errors,
                     "runtime_cumulative_error_counter_without_test_window",
@@ -335,12 +370,20 @@ pub fn build_board_health_snapshot(
                 ),
                 temperature_c: chain.temp_c,
                 temperature_ok: temp_ok,
+                temperature_evidence: DiagnosticEvidence::inferred(
+                    chain.temp_c,
+                    "runtime_chain_temperature_without_sensor_provenance",
+                    None,
+                ),
                 // Runtime model metadata does not prove that EEPROM bytes were
                 // read or that their checksum/schema was validated.
                 eeprom_present: false,
                 eeprom_valid: false,
                 eeprom_model: context.board_type.clone(),
                 eeprom_serial: context.serial.clone(),
+                eeprom_presence_evidence: DiagnosticEvidence::unavailable(
+                    "eeprom_presence_not_observed_in_snapshot",
+                ),
                 eeprom_evidence: context
                     .board_type
                     .as_ref()
@@ -384,7 +427,7 @@ pub fn build_hashreport_snapshot(
     let windows = build_windows(context, chain_filter);
     let unit_grade = calculate_unit_grade(&boards);
     let unit_grade_explanation = format!(
-        "{} snapshot board(s) analyzed using current runtime state{}. Passing grade withheld because snapshot voltage is commanded and CRC validity is inferred rather than measured in a bounded test window.",
+        "{} snapshot board(s) analyzed using current runtime state{}. Passing grade withheld because chip enumeration and temperature lack typed measurement provenance, voltage is commanded, and CRC validity is inferred rather than measured in a bounded test window.",
         boards.len(),
         if duration_seconds > 0 {
             format!(" and {}s of retained history", duration_seconds)
@@ -395,10 +438,12 @@ pub fn build_hashreport_snapshot(
 
     HashReport {
         report_id: context.report_id,
-        report_version: "snapshot-v1".to_string(),
+        report_version: "snapshot-v2".to_string(),
         generated_at: context.generated_at.clone(),
         duration_seconds,
-        report_kind: "snapshot".to_string(),
+        report_kind: dcentrald_common::DiagnosticRunMode::Snapshot
+            .as_report_kind()
+            .to_string(),
         source: if context.history.is_empty() {
             "live_runtime".to_string()
         } else {
@@ -489,6 +534,11 @@ fn build_board_results(chip_health: &ChipHealthSnapshot) -> Vec<BoardResult> {
                 chain_id: chain.chain_id,
                 chips_expected: chain.chip_count as u8,
                 chips_responding: chain.responding_chips,
+                chip_count_evidence: DiagnosticEvidence::inferred(
+                    chain.responding_chips,
+                    "runtime_chain_summary_without_bounded_enumeration",
+                    None,
+                ),
                 chips_dead,
                 hashrate_ghs: chain.board_hashrate_ghs as f32,
                 voltage_v: chain.voltage_mv as f32 / 1000.0,
@@ -498,11 +548,28 @@ fn build_board_results(chip_health: &ChipHealthSnapshot) -> Vec<BoardResult> {
                     None,
                 ),
                 temp_c: chain.board_temp_c,
+                temperature_evidence: DiagnosticEvidence::inferred(
+                    chain.board_temp_c,
+                    "runtime_chain_temperature_without_sensor_provenance",
+                    None,
+                ),
                 crc_errors: chain.errors,
+                crc_commands_sent: 0,
+                crc_window_evidence: DiagnosticEvidence::unavailable(
+                    "bounded_crc_window_not_run_in_snapshot",
+                ),
                 crc_evidence: DiagnosticEvidence::inferred(
                     chain.errors,
                     "runtime_cumulative_error_counter_without_test_window",
                     None,
+                ),
+                eeprom_present: false,
+                eeprom_presence_evidence: DiagnosticEvidence::unavailable(
+                    "eeprom_presence_not_observed_in_snapshot",
+                ),
+                eeprom_valid: false,
+                eeprom_evidence: DiagnosticEvidence::unavailable(
+                    "eeprom_validity_not_observed_in_snapshot",
                 ),
                 grade: if matches!(health_grade, 'A' | 'B') {
                     'C'

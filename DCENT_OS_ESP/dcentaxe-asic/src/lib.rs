@@ -23,11 +23,20 @@ pub mod bm1397;
 #[cfg(feature = "asic-kf1950")]
 pub mod kf1950;
 
+// MSBT0501 / LT0051 — the Scrypt ASIC in the Hammer DC0x line.
+// Gated by `asic-lt0051`, default OFF. The driver is a FAIL-CLOSED scaffold
+// (every trait method returns Err) whose frame builders/parsers are real and
+// host-tested; see the module header for the open protocol residuals.
+#[cfg(feature = "asic-lt0051")]
+pub mod lt0051;
+
 #[cfg(test)]
 mod test_utils;
 
 // Re-export key types at crate root for convenience
-pub use common::{AsicError, AsicModel, AsicResult, MiningJob, RegisterData, RegisterType};
+pub use common::{
+    AsicError, AsicModel, AsicResult, MiningJob, PowAlgorithm, RegisterData, RegisterType,
+};
 pub use serial::SerialPort;
 
 /// Core ASIC driver trait -- each chip variant implements this.
@@ -101,8 +110,81 @@ pub trait AsicDriver: Send {
     fn set_max_baud(&mut self) -> Result<u32, AsicError>;
 }
 
+/// A driver that refuses every operation, used where a chip is recognised but
+/// its driver is not compiled into this build.
+///
+/// This exists so an unrecognised-driver situation is a REFUSAL rather than a
+/// fallthrough to some other chip's driver. Running the wrong chip's init
+/// sequence against live silicon is the failure mode this type prevents.
+pub struct UnsupportedAsicDriver {
+    chip: &'static str,
+    reason: &'static str,
+}
+
+impl UnsupportedAsicDriver {
+    pub const fn new(chip: &'static str, reason: &'static str) -> Self {
+        Self { chip, reason }
+    }
+
+    fn refuse<T>(&self, op: &str) -> Result<T, AsicError> {
+        Err(AsicError::InitFailed(format!(
+            "{} {op}: driver not available in this build ({})",
+            self.chip, self.reason
+        )))
+    }
+}
+
+impl AsicDriver for UnsupportedAsicDriver {
+    fn init(&mut self, _f: f32, _c: u8, _d: f64) -> Result<u8, AsicError> {
+        self.refuse("init")
+    }
+    fn send_work(&mut self, _job: &MiningJob) -> Result<(), AsicError> {
+        self.refuse("send_work")
+    }
+    fn process_work(&mut self, _rx: &[u8]) -> Result<Vec<AsicResult>, AsicError> {
+        self.refuse("process_work")
+    }
+    fn set_frequency(&mut self, _f: f32) -> Result<(), AsicError> {
+        self.refuse("set_frequency")
+    }
+    fn set_version_mask(&mut self, _m: u32) -> Result<(), AsicError> {
+        self.refuse("set_version_mask")
+    }
+    fn read_registers(&mut self) -> Result<Vec<RegisterData>, AsicError> {
+        self.refuse("read_registers")
+    }
+    fn chip_count(&self) -> u8 {
+        0
+    }
+    fn current_frequency(&self) -> f32 {
+        0.0
+    }
+    fn read_responses(&mut self, _t: u16) -> Result<Vec<AsicResult>, AsicError> {
+        self.refuse("read_responses")
+    }
+    fn set_difficulty(&mut self, _d: f64) -> Result<(), AsicError> {
+        self.refuse("set_difficulty")
+    }
+    fn set_max_baud(&mut self) -> Result<u32, AsicError> {
+        self.refuse("set_max_baud")
+    }
+}
+
 /// Supported ASIC model metadata
 impl AsicModel {
+    /// Which proof-of-work function this chip computes.
+    ///
+    /// Every Bitmain/Canaan/WhatsMiner part here is SHA-256d; MSBT0501 is the
+    /// first Scrypt part. This is the single mapping that lets a board's
+    /// dispatcher/stratum algorithm be derived from its chip rather than
+    /// hand-set at each site.
+    pub const fn pow_algorithm(&self) -> PowAlgorithm {
+        match self {
+            Self::Lt0051 => PowAlgorithm::Scrypt1024,
+            _ => PowAlgorithm::Sha256d,
+        }
+    }
+
     /// Default operating frequency for this ASIC model (MHz)
     pub fn default_frequency(&self) -> f32 {
         match self {
@@ -111,6 +193,10 @@ impl AsicModel {
             Self::BM1370 => 525.0,
             Self::BM1373 => 550.0, // PROJECTED — verify on hardware
             Self::BM1397 => 400.0,
+            // MSBT0501: the vendor's own stock default (0x8FC = 2300 MHz).
+            // The vendor CLAMP is 700-2600 MHz, but that is what the app
+            // permits, not a bench-proven envelope — see `max_frequency`.
+            Self::Lt0051 => 2300.0,
             // KF1950: PLL formula not RE'd; the upstream fork hardcodes
             // pll_n=0x80 regardless of target. 400 MHz is a safe placeholder.
             #[cfg(feature = "asic-kf1950")]
@@ -130,6 +216,12 @@ impl AsicModel {
             Self::BM1370 => 650.0,
             Self::BM1373 => 700.0, // PROJECTED — verify on hardware
             Self::BM1397 => 500.0,
+            // MSBT0501: pinned to the vendor STOCK default, i.e. ZERO
+            // overclock headroom. The vendor firmware clamp tops out at
+            // 2600 MHz and its web UI shows 2400, but neither is bench-proven
+            // and the protocol contract explicitly says to treat neither as a
+            // safe limit. Raise only from a wattmeter+thermal-witnessed soak.
+            Self::Lt0051 => 2300.0,
             // KF1950: M30S/M30S+ class — stock WhatsMiner runs ~600-700 MHz
             // per chip. Conservative bound until verified.
             #[cfg(feature = "asic-kf1950")]
@@ -148,6 +240,8 @@ impl AsicModel {
             Self::BM1370 => 100.0,
             Self::BM1373 => 100.0, // PROJECTED
             Self::BM1397 => 50.0,
+            // MSBT0501: the vendor firmware clamp's lower bound.
+            Self::Lt0051 => 700.0,
             #[cfg(feature = "asic-kf1950")]
             Self::KF1950 => 100.0,
             // Avalon CPM-table bottom entry (~99 MHz, rounded up).
@@ -162,8 +256,19 @@ impl AsicModel {
             Self::BM1366 => 0x1366,
             Self::BM1368 => 0x1368,
             Self::BM1370 => 0x1370,
-            Self::BM1373 => 0x1373,
+            // PROVEN (BM1373_DOSSIER.md, 2026-07-27): real BM1373 silicon
+            // reports 0x1372, NOT the 0x1373 part number. The driver's accept
+            // logic (`bm1373::chip_id_accepted`) admits both, mirroring the
+            // vendor's own fix; this single-valued metadata reports what the
+            // silicon actually says.
+            Self::BM1373 => 0x1372,
             Self::BM1397 => 0x1397,
+            // MSBT0501 has no 16-bit chip-ID register in the RE'd protocol —
+            // enumeration is a broadcast READ of reg 0x10 whose responders are
+            // COUNTED, not identity-checked (MSBT0501_PROTOCOL.md §6 step 1).
+            // 0 is an honest "no chip-ID contract", not a placeholder to
+            // compare against.
+            Self::Lt0051 => 0x0000,
             #[cfg(feature = "asic-kf1950")]
             Self::KF1950 => 0x1950,
             // Avalon AVA_P_DETECT response carries DNA/version, not a 16-bit
@@ -175,10 +280,12 @@ impl AsicModel {
         }
     }
 
-    /// ASIC response size in bytes (BM1397=9, KF1950=11, others=11)
+    /// ASIC response size in bytes (BM1397=9, MSBT0501=11, others=11)
     pub fn response_size(&self) -> usize {
         match self {
             Self::BM1397 => 9,
+            // MSBT0501 is also 11 bytes, but for a completely different
+            // reason and with a different layout — see `lt0051::parse_response`.
             _ => 11,
         }
     }
@@ -198,6 +305,20 @@ pub fn create_driver(model: AsicModel, serial_port: SerialPort) -> Box<dyn AsicD
         AsicModel::BM1370 => Box::new(bm1370::BM1370::new(serial_port)),
         AsicModel::BM1373 => Box::new(bm1373::BM1373::new(serial_port)),
         AsicModel::BM1397 => Box::new(bm1397::BM1397::new(serial_port)),
+        // MSBT0501 / LT0051 (Scrypt). With `asic-lt0051` the real fail-closed
+        // scaffold is used; without it, a refusing driver — NEVER a fallthrough
+        // to a Bitmain driver, which would run a SHA-256 init sequence against
+        // Scrypt silicon.
+        #[cfg(feature = "asic-lt0051")]
+        AsicModel::Lt0051 => Box::new(lt0051::Lt0051::new(serial_port)),
+        #[cfg(not(feature = "asic-lt0051"))]
+        AsicModel::Lt0051 => {
+            let _ = serial_port;
+            Box::new(UnsupportedAsicDriver::new(
+                "MSBT0501/LT0051",
+                "build without the `asic-lt0051` feature",
+            ))
+        }
         #[cfg(feature = "asic-kf1950")]
         AsicModel::KF1950 => Box::new(kf1950::Kf1950::new(serial_port)),
         #[cfg(feature = "asic-avalon")]

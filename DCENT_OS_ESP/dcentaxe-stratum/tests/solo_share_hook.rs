@@ -51,7 +51,9 @@ fn real_client_solo_share_intercept_drain_and_handle() {
             "aabbccdd",
         )))
         .unwrap();
-    client.drain_pending_shares().expect("solo must not pool-submit");
+    client
+        .drain_pending_shares()
+        .expect("solo must not pool-submit");
     assert_eq!(HOOK_HITS.load(Ordering::SeqCst), 1);
     assert_eq!(EN2_OK.load(Ordering::SeqCst), 1);
 

@@ -392,6 +392,7 @@ impl ChipBinningDatabase {
     ///
     /// `chip_id`: ASIC chip ID for PLL table lookup. Pass 0x1387 for BM1387 (default).
     pub fn suggested_frequencies(&self, chip_id: u16) -> Vec<u16> {
+        // P1-4: empty table for unknown chips — no silent BM1387 snap.
         let pll = MinerProfile::pll_frequencies_for_chip(chip_id);
         let min_pll = pll.first().copied().unwrap_or(100);
 
@@ -403,13 +404,7 @@ impl ChipBinningDatabase {
                 }
 
                 let target = stats.mean_freq_mhz.round() as u16;
-
-                // Find nearest PLL entry <= target
-                pll.iter()
-                    .rev()
-                    .find(|&&f| f <= target)
-                    .copied()
-                    .unwrap_or(min_pll)
+                MinerProfile::snap_pll_floor(pll, target).unwrap_or(min_pll)
             })
             .collect()
     }

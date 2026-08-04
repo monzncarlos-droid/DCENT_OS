@@ -11,8 +11,8 @@ use log::*;
 
 use crate::config::DcentAxeConfig;
 use dcentaxe_hal::board::{
-    BitAxeModel, BoardConfig, BoardHardwareConfig, BoardVersionProfile, FanControllerKind,
-    PowerControllerKind, TempSensorKind,
+    resolve_identity, BitAxeModel, BoardConfig, BoardHardwareConfig, BoardVersionProfile,
+    FanControllerKind, IdentityVerdict, PowerControllerKind, TempSensorKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -552,6 +552,11 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
 
     let device_model = read_str("devicemodel");
     let board_version = read_str("boardversion");
+    // Lucky-enablement SPEC §3 step 1: the vendor-only `minermodel` key.
+    // Only Lucky factory firmware writes it ("LV06"/"LV07"/"LV08"); a genuine
+    // BitAxe never does — the most reliable inbound identity signal. Persisted
+    // verbatim so the boot identity gate can re-run the disambiguation.
+    let miner_model = read_str("minermodel");
     let asic_model = read_str("asicmodel");
     let hostname = read_str("hostname");
     let stratum_url = read_str("stratumurl");
@@ -567,17 +572,65 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
         device_model, stratum_url, stratum_port
     );
 
-    let custom_board =
-        !board_version.is_empty() && BoardVersionProfile::find(&board_version).is_none();
-    let resolved_profile = if let Some(profile) = BoardVersionProfile::find(&board_version) {
-        profile
-    } else if let Some(model) = BitAxeModel::from_device_model(&device_model) {
-        BoardVersionProfile::default_for_model(model)
-    } else if !asic_model.is_empty() {
-        BoardVersionProfile::infer("", "", &asic_model)
-    } else {
-        crate::config::default_profile_for_build()
+    // ── Lucky-enablement SPEC §3: resolve identity on the WHOLE tuple
+    // (boardversion, devicemodel, minermodel) — NEVER board_version alone.
+    // The old `BoardVersionProfile::find(&board_version)` first-match resolved
+    // an unlocked Lucky LV08 (boardversion=302, devicemodel=lv08) as a BitAxe
+    // Hex Ultra: 3 series voltage domains ⇒ 1.2 V × 3 = 3.6 V driven onto
+    // nine PARALLEL dies. ──
+    let verdict = resolve_identity(&board_version, &device_model, &miner_model);
+    let naive_row = BoardVersionProfile::find(&board_version);
+    // (resolved row for defaults, tuple-resolution CORRECTED the naive lookup,
+    //  identity is ambiguous and left raw for the boot gate to probe)
+    let (resolved_profile, identity_correction, identity_ambiguous) = match verdict {
+        IdentityVerdict::Resolved(profile) => {
+            let row = BoardVersionProfile::find(profile.board_version)
+                .expect("resolve_identity only returns registered rows");
+            let corrected = naive_row.map(|r| r.board_version) != Some(row.board_version);
+            if corrected {
+                info!(
+                    "NVS migration: identity tuple (bv='{}', dm='{}', mm='{}') corrects the \
+                     naive board_version lookup → canonical board {}",
+                    board_version, device_model, miner_model, row.board_version
+                );
+            }
+            (row, corrected, false)
+        }
+        IdentityVerdict::Ambiguous { reason, .. } => {
+            // Cannot be settled from strings, and this migration path has no
+            // I2C access for the LV08 regulator probe. Store the RAW identity
+            // (plus minermodel) and asic_count=0 so nothing hazardous is
+            // baked; the boot identity gate in main.rs probes — or refuses to
+            // energize — before any rail bring-up.
+            warn!(
+                "NVS migration: board identity AMBIGUOUS ({}) — storing raw identity; the \
+                 boot identity gate will disambiguate (or fail closed) before energizing",
+                reason
+            );
+            let legacy = naive_row.unwrap_or_else(|| {
+                BitAxeModel::from_device_model(&device_model)
+                    .map(BoardVersionProfile::default_for_model)
+                    .unwrap_or_else(crate::config::default_profile_for_build)
+            });
+            (legacy, false, true)
+        }
+        // Unknown ⇒ find(board_version) AND from_device_model both failed —
+        // the pre-existing asic-model/build-default ladder, unchanged.
+        IdentityVerdict::Unknown => {
+            let legacy = if !asic_model.is_empty() {
+                BoardVersionProfile::infer("", "", &asic_model)
+            } else {
+                crate::config::default_profile_for_build()
+            };
+            (legacy, false, false)
+        }
     };
+    // An identity the tuple-resolver recognized is NOT a custom board even
+    // when the raw boardversion has no row (e.g. the vendor "302A" spelling) —
+    // arming the AxeOS hardware-override path there would misconfigure a known
+    // board. The pre-existing custom-board semantics are otherwise unchanged.
+    let identity_resolved = matches!(verdict, IdentityVerdict::Resolved(_));
+    let custom_board = !identity_resolved && !board_version.is_empty() && naive_row.is_none();
     let resolved_board = BoardConfig::for_profile(resolved_profile);
 
     let hardware_override = if custom_board {
@@ -627,7 +680,14 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
     // verbatim — a divergent AxeOS import (stored asicmodel differs from the
     // board_version-resolved chip) would drive one chip while rolling for the
     // other (losing ASICBoost or rolling a BM1397 that can't).
-    let final_asic_model = if asic_model.is_empty() {
+    let final_asic_model = if identity_correction {
+        // SPEC §3: when the tuple resolution corrected the naive identity, the
+        // canonical row's chip is authoritative. A stock Lucky's NVS carries
+        // the SPOOFED BitAxe asicmodel ("BM1368" for the fake Supra identity)
+        // while the silicon is BM1366 — keeping the stored string would run
+        // the wrong chip's init sequence.
+        resolved_profile.asic_model.to_string()
+    } else if asic_model.is_empty() {
         resolved_profile.asic_model.to_string()
     } else {
         asic_model.clone()
@@ -661,17 +721,39 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
             version_rolling: crate::config::chip_rolls_versions(&final_asic_model),
         },
         mining_mode: crate::config::MiningMode::Pool,
-        board_model: if device_model.is_empty() {
+        board_model: if identity_correction {
+            // Canonical model key for a tuple-corrected (Lucky) identity.
+            resolved_profile.model.canonical_key().to_string()
+        } else if device_model.is_empty() {
             resolved_profile.device_model.into()
         } else {
             device_model
         },
-        board_version: if board_version.is_empty() {
+        board_version: if identity_correction {
+            // Store the canonical 2XXX row so every later boot resolves
+            // without ambiguity (raw vendor spellings like "302"/"302A" are
+            // handled by resolve_identity, but canonical-at-rest is safer).
+            resolved_profile.board_version.to_string()
+        } else if board_version.is_empty() {
             resolved_profile.board_version.into()
         } else {
-            board_version
+            board_version.clone()
         },
         asic_model: final_asic_model,
+        // SPEC §3: persist the vendor-only `minermodel` key verbatim (already
+        // fed to `resolve_identity` above) so the boot identity gate keeps the
+        // vendor's most reliable signal instead of silently dropping it.
+        miner_model: miner_model.clone(),
+        // SPEC §1.2: latch the anonymous-subscribe request from the RAW
+        // boardversion HERE — for a tuple-corrected identity the canonical
+        // rewrite above already erased the `A` suffix, so the defensive
+        // re-latch in canonicalize_identity would come too late.
+        anonymous_subscribe: crate::config::board_version_requests_anonymous_subscribe(
+            &board_version,
+        ),
+        // Runtime-only (#[serde(skip)]) — set by the boot identity gate, never
+        // loaded from storage.
+        identity_refusal: None,
         // MQTT/HA is a DCENT_axe-native feature with no legacy AxeOS NVS key —
         // default-OFF on migration; the operator opts in via Settings.
         mqtt: crate::config::MqttConfig::default(),
@@ -698,7 +780,10 @@ fn migrate_axeos_config(nvs_partition: &EspDefaultNvsPartition) -> Option<DcentA
         } else {
             fan_speed.min(100) as u8
         },
-        asic_count: if custom_board {
+        asic_count: if custom_board || identity_ambiguous {
+            // Ambiguous identity: never bake a colliding chip count (Hex's 6
+            // vs LV08's 9) — 0 = auto, re-derived after the boot gate settles
+            // the identity.
             0
         } else {
             resolved_board.asic_count

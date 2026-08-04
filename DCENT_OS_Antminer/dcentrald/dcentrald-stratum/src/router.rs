@@ -31,26 +31,14 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-/// Hard ceiling for SV2 Standard channels.
-///
-/// Above this nominal hashrate, the pool-owned coinbase/extranonce space gets
-/// exhausted before the channel can keep up — see
-///  (S9 13 TH/s exhausts Standard in 2.5s).
-/// Operators on multi-TH/s miners must use Extended/JD or fall back to V1.
-const SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS: f32 = 1_000.0;
-
-/// W5.3: at or above this nominal hashrate, Auto/V2 modes prefer
-/// `OpenExtendedMiningChannel` over `OpenStandardMiningChannel`. The number
-/// is set conservatively below the Standard-exhaustion ceiling so the
-/// Extended preference kicks in well before any pool-side throttling.
-///
-/// Per-platform tuning is exposed through `StratumConfig::nominal_hashrate_ghs`.
-/// The daemon owns wiring this from the active silicon profile (Phase 2 will
-/// pipe the value from the BM1387/BM1366/BM1368/BM1362/BM1370/etc. profile's
-/// `expected_hashrate_ghs` instead of the current placeholder 0.0). Until the
-/// daemon plumbs the live value, this hint stays conservative — 0.0 fails the
-/// check so SV2 channel-open decisions fall through to existing logic.
-const SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS: f32 = 5_000.0;
+// Hard Standard ceiling + soft Extended preference: shared with types so P2-9
+// resolve helpers and the router cannot drift (see
+//  — S9 13 TH/s exhausts Standard in ~2.5s).
+// Daemon `build_stratum_config` now fills `nominal_hashrate_ghs` from
+// MinerProfile when `mining.model` is set; 0.0 remains UnsetZero without a model.
+use crate::types::{
+    SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS, SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS,
+};
 
 /// Protocol selection mode, derived from config at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]

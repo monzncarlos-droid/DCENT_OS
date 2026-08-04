@@ -193,6 +193,83 @@ describe('useMinerData', () => {
     }));
   });
 
+  it('does not throw and preserves fans/pool when a WebSocket stats frame omits them (untrusted frame)', async () => {
+    h.wsManager.connected = true;
+    h.state.status = { ...STATUS, fans: { pwm: 15, rpm: 900, per_fan: [] }, pool: { status: 'mining' } };
+
+    renderHook(() => useMinerData());
+    // A partial/version-skewed frame with no `fans` (and no `pool`) must NOT throw out
+    // of the WS listener — that would freeze telemetry while the chip still reads LIVE
+    // (the REST fallback is suppressed while transport === 'ws-live'). Pre-fix this
+    // rejected with a TypeError on `msg.fans.per_fan`.
+    await expect(emitWs({
+      type: 'stats',
+      hashrate_ghs: 4100,
+      hashrate_5s_ghs: 4120,
+      accepted: 1,
+      rejected: 0,
+      chains: [],
+    })).resolves.toBeUndefined();
+    const call = h.actions.setStatus.mock.calls.at(-1)?.[0];
+    expect(call).toBeTruthy();
+    expect(call.fans).toEqual({ pwm: 15, rpm: 900, per_fan: [] });
+    expect(call.pool).toEqual({ status: 'mining' });
+  });
+
+  it('RESUMES the REST status poll when the WebSocket is "live" but telemetry is stale', async () => {
+    h.wsManager.connected = true;
+    h.state.transport = 'ws-live';
+    // Wedged stats publisher: only log frames keep the transport "live", but no
+    // telemetry has been stored in a long time — the fallback must resume.
+    h.state.lastUpdate = Date.now() - 60_000;
+    renderHook(() => useMinerData());
+    await flush();
+    expect(h.api.getStatus).toHaveBeenCalled();
+  });
+
+  it('still skips the REST poll while the WebSocket is live AND telemetry is fresh', async () => {
+    h.wsManager.connected = true;
+    h.state.transport = 'ws-live';
+    h.state.lastUpdate = Date.now();
+    renderHook(() => useMinerData());
+    await flush();
+    expect(h.api.getStatus).not.toHaveBeenCalled();
+  });
+
+  it('excludes the temp_c=0 unpowered-board sentinel from the recorded average temperature', async () => {
+    h.wsManager.connected = false;
+    const chains = [
+      { id: 0, chips: 63, frequency_mhz: 650, voltage_mv: 0, temp_c: 60, hashrate_ghs: 4000, errors: 0, status: 'Active' },
+      { id: 1, chips: 63, frequency_mhz: 650, voltage_mv: 0, temp_c: 62, hashrate_ghs: 4000, errors: 0, status: 'Active' },
+      { id: 2, chips: 63, frequency_mhz: 650, voltage_mv: 0, temp_c: 0, hashrate_ghs: 0, errors: 0, status: 'Idle' },
+    ];
+    h.api.getStatus.mockResolvedValue({ ...STATUS, hashrate_ghs: 8000, chains });
+    renderHook(() => useMinerData());
+    await flush();
+    // (60 + 62) / 2 = 61, NOT (60 + 62 + 0) / 3 = 40.67
+    expect(h.actions.pushHistory).toHaveBeenCalledWith(8000, 61, 0);
+  });
+
+  it('preserves the REST-sourced heater hashrate across a WebSocket heater frame (no clobber to 0)', async () => {
+    h.state.heaterStatus = {
+      power_watts: 700, wall_watts: 800, btu_h: 2730, source: 'pmbus',
+      power_source_detail: 'pmbus_measured', live_power_available: true, power_modeled: false,
+      noise_db: null, airflow_cfm: 0, preset: 'balanced', room_temp_c: null,
+      cost_today_usd: 0, sats_today: 0, night_mode_active: false, night_mode_starts_in_s: null,
+      hashrate_ghs: 4000,
+    };
+    renderHook(() => useMinerData());
+    await emitWs({
+      type: 'heater_status',
+      power_watts: 700, wall_watts: 800, btu_h: 2730, noise_db: null, airflow_cfm: 0,
+      preset: 'quiet', room_temp_c: null, cost_today_usd: 0, sats_today: 0,
+      night_mode_active: false, night_mode_starts_in_s: null,
+    });
+    expect(h.actions.setHeaterStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ hashrate_ghs: 4000 }),
+    );
+  });
+
   it('shows the status-poll-failure toast only ONCE across repeated failures', async () => {
     h.wsManager.connected = false;
     h.api.getStatus.mockRejectedValue(new Error('down'));

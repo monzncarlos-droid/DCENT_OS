@@ -48,6 +48,8 @@ default = ["bitaxe-gamma"]
 # ── Sub-features (mirrored from HAL for #[cfg] in main.rs) ──
 pins-bitaxe = ["dcentaxe-hal/pins-bitaxe"]
 pins-nerd = ["dcentaxe-hal/pins-nerd"]
+pins-hammer-bc = ["dcentaxe-hal/pins-hammer-bc"]
+pins-hammer-dc = ["dcentaxe-hal/pins-hammer-dc"]
 display-ssd1306 = ["dcentaxe-hal/display-ssd1306"]
 display-none = ["dcentaxe-hal/display-none"]
 
@@ -62,10 +64,73 @@ bitaxe-hex-ultra = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546
 bitaxe-hex-supra = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2302"]
 
 # ── Nerd family ──
-nerdnos          = ["pins-nerd", "display-none", "dcentaxe-hal/power-fixed",  "dcentaxe-hal/fan-none"]
-nerdaxe          = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2101"]
-nerdqaxe-plus    = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2101"]
-nerdqaxe-pp      = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2101"]
+# Sources: ESP-Miner-NerdQAxePlus/main/boards/*.cpp constructors (the upstream
+# firmware these boards ship with) + the NerdAxe / NerdOCTAXE-* KiCad repos.
+#
+# NerdAxe is a single-ASIC 5 V board with a genuine TPS546 and an EMC2101 —
+# the only Nerd board whose peripherals match the BitAxe-class drivers we
+# already ship, so it is the only one that keeps `power-tps546`.
+#
+# The multi-ASIC boards below carry a TPS53647/TPS53667 multi-phase VRM
+# (`power-tps5364x`) and a DUAL-fan EMC2302 (`m_numFans = 2`, fan labels "M2"
+# ASIC / "M1" VReg — upstream nerdqaxeplus.cpp includes EMC2302.h). They were
+# previously declared as `power-tps546` + `fan-emc2101`, which described neither
+# the regulator nor the fan controller actually fitted.
+#
+# `nerdnos` remains registration + fail-closed identity only: its row declares
+# `temp_sensor: None` (no driver for whatever it carries), and a TPS5364x grants
+# no thermal trust by itself, so `BoardConfig::validate()` REFUSES mining. It
+# boots, identifies and serves the dashboard but does not mine.
+#
+# The rest of the Nerd line is mining-capable as of the TMP1075 driver: their
+# rows declare `TempSensorKind::Tmp1075` backed by a real driver, and `main.rs`
+# still refuses to mine if the part does not answer at boot.
+#
+# `display-none` throughout is deliberate and separate: these boards carry a
+# Lilygo T-Display S3 (`display_kind()` says so honestly) but no ST7789 driver
+# ships, so the firmware runs them headless rather than claiming a panel.
+nerdnos          = ["pins-nerd", "display-none", "dcentaxe-hal/power-fixed",    "dcentaxe-hal/fan-none"]
+# NerdAxe is BM1366 on a DS4432U current-DAC steering a TPS40305 — NOT the
+# TPS546 this line used to link. It was pulling the wrong regulator driver
+# entirely, on a board whose enable GPIO is also inverted (see
+# `BitAxeModel::buck_enable_wiring`). NerdAxe-γ is the TPS546 board of the pair.
+nerdaxe          = ["pins-nerd", "display-none", "dcentaxe-hal/power-ds4432u",  "dcentaxe-hal/fan-emc2101"]
+nerdaxe-gamma    = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps546",   "dcentaxe-hal/fan-emc2101"]
+nerdqaxe-plus    = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+nerdqaxe-pp      = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+# NerdOCTAXE+ — 8x BM1368, 3-phase TPS53647, ~5 TH/s at ~100 W (upstream README).
+nerdoctaxe-plus  = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+# NerdOCTAXE-γ — 8x BM1370. ⚠ TWO power stages ship under this one name:
+# rev ≤3.3 is a 4-phase TPS53647, rev 3.4 is a 6-phase TPS53667. The part is
+# identified from its PMBus device code at bring-up and a mismatch is refused;
+# the board row declares only the conservative 4-phase envelope.
+#
+# `temp-tmp451` is what turns its declared `Tmp451DiodeMux` into readings: two
+# TMP451s at 0x4C/0x4E, fanned across four analog mux channels on GPIO2/GPIO12,
+# reach all eight BM1370 diodes. Without it the row would declare a per-ASIC
+# die sensor the firmware never reads — and the board would fall back to its
+# TMP1075, which is an airflow proxy, not a junction temperature.
+nerdoctaxe-gamma = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302", "temp-tmp451"]
+# NerdQX — 4x BM1370, 3-phase TPS53647. ⚠ Its TMP451 mux is its identity check
+# upstream (probe fails => "assuming non-QX board" => clamp to 495 MHz /
+# 1150 mV). We ship the clamped envelope until that probe is wired, so this
+# target mines at the conservative operating point, not the nominal 777 MHz.
+nerdqx           = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+# NerdHaxe-γ — 6x BM1370, 4-phase TPS53647 (120 A).
+nerdhaxe-gamma   = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+# NerdEKO — 12x BM1370 on a 6-phase TPS53667 (240 A). The largest board in the
+# registry; the same driver identifies the '667 from its device code.
+nerdeko          = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+
+# ── Q-series (FXL6408 port-expander topology) ──
+# ⚠ ASIC reset / VREG enable / LDO enable are behind an FXL6408 I2C expander at
+# 0x43, not ESP GPIOs — so `io-expander-fxl6408` is not an accessory here, it is
+# the board's only rail actuator. Without it these two classify as having NO way
+# to raise or cut a rail and are refused before bring-up; with it they raise the
+# LDO, configure the TPS5364x, then assert VREG, and the panic hook gets a
+# bounded I2C cut that drives reset/VREG/LDO all low in one write.
+q1370            = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302", "io-expander-fxl6408"]
+q1373            = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302", "io-expander-fxl6408"]
 
 # ── BitAxe Touch / Turbo Touch ──
 # Touch = single BM1370 mining board + LVGL accessory. Electrically the same
@@ -85,6 +150,102 @@ bitaxe-gt-touch  = ["bitaxe-gt",    "bap"]
 dcent-axe-bm1397      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2101", "bap"]
 dcent-axe-quad-bm1397 = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2302", "bap"]
 dcent-axe-hex-bm1397  = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546",  "dcentaxe-hal/fan-emc2302", "bap"]
+
+# ── Hammer BC0x family (Volc/Hammer ODM, SHA-256 — EXPERIMENTAL) ──
+# Identity + envelope registration only (2026-07-27 Hammer RE wave): the board
+# profiles declare fan/temp/power = None (no Hammer peripheral driver exists
+# yet), so these images boot, identify and serve the dashboard but REFUSE
+# mining fail-closed. `pins-hammer-bc` binds I2C0 to SDA44/SCL43; UART remains
+# SKU-specific because BC01/BC01-Pro/BC02 use TX18/RX17 while BC04 uses
+# TX17/RX18. `display-none`: the vendor ST7789 LCD is not
+# driven. Hammer hardware is 16 MB flash — build with
+# ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.hammer-16mb"
+# to select the 16 MB partition layout (partitions-hammer-16mb.csv).
+hammer-bc01     = ["pins-hammer-bc", "display-none", "dcentaxe-hal/fan-none"]
+hammer-bc01-pro = ["pins-hammer-bc", "display-none", "dcentaxe-hal/fan-none"]
+hammer-bc02     = ["pins-hammer-bc", "display-none", "dcentaxe-hal/fan-none"]
+hammer-bc04     = ["pins-hammer-bc", "display-none", "dcentaxe-hal/fan-none"]
+
+# ── Hammer DC0x family (Volc/Hammer ODM, **SCRYPT** — EXPERIMENTAL) ──
+# The first non-SHA-256 SKUs. Each pulls `dcentaxe-asic/asic-lt0051` so the
+# MSBT0501 driver scaffold is compiled in (it refuses every operation — two
+# wire-protocol residuals are open; see dcentaxe-asic/src/lt0051.rs).
+# The board profiles declare temp/power = None, so `BoardConfig::validate()`
+# REFUSES mining fail-closed: these images boot, identify and serve the
+# dashboard but do not mine. DC04/DC06 pull `fan-emc2302` because their fan
+# controller genuinely IS an EMC2302 @0x2E with a register map matching the
+# shipped driver; DC02's fan is SoC LEDC PWM (not our shipping path) so it
+# takes `fan-none`.
+# `pins-hammer-dc` binds I2C0 to SDA44/SCL43. UART stays SKU-specific
+# (DC02 TX18/RX17 vs DC04/DC06 TX17/RX18); DC02's second I2C bus 11/12 is
+# deliberately not represented yet because its power driver remains refused.
+# FIVE GPIOs differ in
+# function between DC02 and DC04 — never share a pin family across them.
+# Hammer hardware is 16 MB flash — build with
+# ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.hammer-16mb".
+hammer-dc02     = ["pins-hammer-dc", "display-none", "dcentaxe-hal/fan-none",    "dcentaxe-asic/asic-lt0051"]
+hammer-dc04     = ["pins-hammer-dc", "display-none", "dcentaxe-hal/fan-emc2302", "dcentaxe-asic/asic-lt0051"]
+hammer-dc06     = ["pins-hammer-dc", "display-none", "dcentaxe-hal/fan-emc2302", "dcentaxe-asic/asic-lt0051"]
+
+# ── Lucky Miner LVxx family (third-party BitAxe-class, BM1366 — EXPERIMENTAL) ──
+# No Lucky hardware exists on any bench (SPEC §8): these SKUs are registration +
+# fail-closed identity/safety wiring only; nothing is live-proven. Pin map is
+# 100% stock BitAxe (SPEC §1) ⇒ they reuse `pins-bitaxe` — do NOT create a
+# `pins-lucky`. Peripherals map to already-shipped drivers: SSD1306 OLED @0x3C,
+# TPS546 PMBus VRM (LV08: three in parallel @0x24/0x7F/0x14), EMC2302 dual fan
+# @0x2F (LV07/LV08 additionally require boot tach proof via the board rows'
+# `fan_tach_required`). Lucky hardware is ESP32-S3 N16R8 (16 MB flash) — build
+# with the 16 MB sdkconfig/partition overlay (generalized from the Hammer
+# 16 MB pattern) to select the 16 MB layout.
+lucky-lv06      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2302"]
+lucky-lv07      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2302"]
+lucky-lv08      = ["pins-bitaxe", "display-ssd1306", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2302"]
+
+# ── BitForge (CERN-OHL-S open hardware; EXPERIMENTAL, no live hardware) ──
+# BitForge Nano: 2x BM1370 in parallel on one TPS546A24 1.2 V rail, ESP32-S3,
+# INA260, headless (two status LEDs, no panel). Stock BitAxe I2C pins
+# (SDA 47 / SCL 48), so it reuses `pins-bitaxe`.
+#
+# `i2c-mux-pca9544` is what makes the thermal declaration honest: this board's
+# TWO EMC2101s share the EMC2101's hard-wired address and are reachable ONLY by
+# selecting a PCA9544A channel first (0x70, channels 2 and 3). Without the mux
+# feature the row would declare a temperature sensor the firmware cannot read.
+bitforge-nano   = ["pins-bitaxe", "display-none", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2101", "i2c-mux-pca9544"]
+
+# ── bitaxeorg prototype (CERN-OHL-S; EXPERIMENTAL, schematic-only) ──
+# BitAxe Naja: 2x BM1373 ("BM1340" on the silkscreen) in parallel on ONE
+# 2-phase TPS546D24A rail, ESP32-S3-WROOM-1-N16R8, headless. Stock BitAxe pins
+# (UART 17/18, SDA 47 / SCL 48, RST 1), so it reuses `pins-bitaxe`.
+#
+# `fan-emc2103`, not `fan-emc2101`: the single EMC2103-2 carries BOTH ASIC
+# diodes on its two external channels, which is why — unlike the BitForge above
+# — this board needs no bus mux to read its own sensors.
+bitaxe-naja     = ["pins-bitaxe", "display-none", "dcentaxe-hal/power-tps546", "dcentaxe-hal/fan-emc2103"]
+
+# Forwards the HAL's PCA9544A bus-mux driver AND gates this crate's
+# `select_thermal_mux_channel` consumer. It must be a feature of THIS crate, not
+# just a `dcentaxe-hal/...` passthrough, because `cfg!(feature = ...)` in
+# main.rs resolves against this crate's own feature set — a passthrough would
+# compile the driver while silently leaving the caller on the refusing fallback.
+i2c-mux-pca9544 = ["dcentaxe-hal/i2c-mux-pca9544"]
+
+# Forwards the HAL's FXL6408 port-expander transport AND gates this crate's rail
+# bring-up for it. Must be a feature of THIS crate for the same reason as the
+# two above — `cfg!(feature = ...)` in main.rs resolves against the binary's own
+# feature set, so a bare `dcentaxe-hal/...` passthrough would compile the driver
+# and leave the supervisor refusing the board for having no actuator.
+#
+# On this part that failure mode is not cosmetic: the expander IS the rail.
+io-expander-fxl6408 = ["dcentaxe-hal/io-expander-fxl6408"]
+
+# Forwards the HAL's TMP451 driver AND gates this crate's per-ASIC diode sweep.
+# Same reason as the bus mux above: `cfg!(feature = ...)` in main.rs resolves
+# against THIS crate's features, so a bare `dcentaxe-hal/...` passthrough would
+# compile the driver and leave the supervisor reading no diodes at all.
+#
+# ⚠ Claims two GPIOs for the mux select lines. See the `compile_error!` pair at
+# the top of main.rs for the feature combinations that collide with them.
+temp-tmp451 = ["dcentaxe-hal/temp-tmp451"]
 
 # ── Protocol (orthogonal — combine with any board) ──
 stratum-v2 = ["dcentaxe-stratum-v2"]

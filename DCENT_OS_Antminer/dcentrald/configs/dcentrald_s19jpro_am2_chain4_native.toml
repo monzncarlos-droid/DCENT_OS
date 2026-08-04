@@ -59,10 +59,18 @@ metrics_require_auth = true
 enabled = false
 
 [watchdog]
-enabled = false
+# Exact BM1362 direct serial refuses energization without an armed SoC
+# watchdog. Keep this historical chain fixture runnable under the current
+# Experimental lifecycle contract instead of shipping a contradictory config.
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
 
 [hash_on_disconnect]
-enabled = true
+# Exact BM1362 cannot synchronously withdraw a work frame already committed to
+# the ASIC chain. Revoke hashing authority and enter terminal safe-off on pool
+# loss instead of leaving an unattended stale job running indefinitely.
+enabled = false
 
 [mode]
 active = "standard"

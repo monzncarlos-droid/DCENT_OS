@@ -310,6 +310,22 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[test]
+    fn system_soc_label_distinguishes_am3_bb_from_zynq_and_amlogic() {
+        assert_eq!(
+            system_soc_label("BeagleBone am3-bb-s19jpro"),
+            "AM335x (TI Sitara)"
+        );
+        assert_eq!(system_soc_label("Zynq am2-s19jpro"), "Zynq XC7Z020");
+        assert_eq!(system_soc_label("AML am3-s21"), "Amlogic A113D");
+        assert_eq!(system_soc_label("Zynq am1-s9"), "Zynq XC7Z010");
+        assert_eq!(system_soc_label("Unknown"), "Unknown");
+        assert_eq!(system_soc_label("unadmitted configured am2"), "Unknown");
+        assert_eq!(system_platform_key("Unknown"), "unknown");
+        assert_eq!(system_platform_key("unadmitted configured am2"), "unknown");
+        assert_eq!(system_platform_key("Zynq am2-s19jpro"), "am2-zynq");
+    }
+
     #[tokio::test]
     async fn config_persistence_storage_full_response_has_typed_code() {
         let response = ConfigPersistenceError::from_io(
@@ -1864,6 +1880,7 @@ end_hour = 5
         assert!(system_info.contains("\"power\": measured_wall_watts"));
         assert!(system_info.contains("\"identification_confidence\""));
         assert!(system_info.contains("\"identification\": &hw.identification"));
+        assert!(system_info.contains("\"board_target\": hw.identification.declared_board_target()"));
         assert!(!system_info.contains("\"power\": wall_watts"));
     }
 
@@ -8193,6 +8210,42 @@ pub(super) fn read_thermal_temp_c(path: &std::path::Path) -> Option<f64> {
     })
 }
 
+fn system_soc_label(control_board: &str) -> &'static str {
+    let normalized = control_board.to_ascii_lowercase();
+    if normalized.contains("beaglebone")
+        || normalized.contains("am3-bb")
+        || normalized.contains("am335")
+    {
+        "AM335x (TI Sitara)"
+    } else if normalized.starts_with("aml") || normalized.contains("amlogic") {
+        "Amlogic A113D"
+    } else if normalized.contains("zynq") && normalized.contains("am2") {
+        "Zynq XC7Z020"
+    } else if normalized.contains("zynq") {
+        "Zynq XC7Z010"
+    } else {
+        "Unknown"
+    }
+}
+
+fn system_platform_key(control_board: &str) -> &'static str {
+    let normalized = control_board.to_ascii_lowercase();
+    if normalized.starts_with("aml") || normalized.contains("amlogic") {
+        "am3-aml"
+    } else if normalized.contains("beaglebone")
+        || normalized.contains("am3-bb")
+        || normalized.contains("am335")
+    {
+        "am3-bb"
+    } else if normalized.contains("zynq") && normalized.contains("am2") {
+        "am2-zynq"
+    } else if normalized.contains("zynq") {
+        "am1-zynq"
+    } else {
+        "unknown"
+    }
+}
+
 /// GET /api/system/info -- System identification (pyasic compatible).
 ///
 /// Returns firmware version, model, MAC, IP, uptime, chip type, chip count.
@@ -8248,14 +8301,10 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
         measured_wall_watts,
     );
 
-    // Derive SoC and model from control board detection
-    let soc = if hw.control_board.starts_with("AML") {
-        "Amlogic A113D".to_string()
-    } else if hw.control_board.contains("am2") {
-        "Zynq XC7Z020".to_string()
-    } else {
-        "Zynq XC7Z010".to_string()
-    };
+    // Derive SoC and model from the same control-board identity used by the
+    // platform capability key. AM3-BB must never inherit the historical Zynq
+    // default merely because it runs through the standalone/native API path.
+    let soc = system_soc_label(&hw.control_board).to_string();
     let board = antminer_board_version(&hw);
 
     // APIC-2: canonical platform tier key for the dashboard's fail-closed
@@ -8265,28 +8314,7 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
     // am3-bb is distinguished by its BeagleBone/AM335x control board. Fail-closed
     // to "unknown" when the control board is not yet identified so the dashboard
     // hides hardware-control cards rather than rendering an irrelevant inspector.
-    let cb_lower = hw.control_board.to_ascii_lowercase();
-    let platform_key = if hw.control_board.trim().is_empty()
-        || cb_lower == "unknown"
-        || cb_lower == "idle-first boot"
-    {
-        // Fail closed: detect_control_board() returns the literal "Unknown"
-        // (never empty) for an unidentified board, and the pre-detection boot
-        // placeholder is "Idle-first boot" — both must map to "unknown" so the
-        // dashboard hides hardware-control cards rather than asserting S9.
-        "unknown"
-    } else if hw.control_board.starts_with("AML") {
-        "am3-aml"
-    } else if cb_lower.contains("beaglebone")
-        || cb_lower.contains("am3-bb")
-        || cb_lower.contains("am335")
-    {
-        "am3-bb"
-    } else if hw.control_board.contains("am2") {
-        "am2-zynq"
-    } else {
-        "am1-zynq"
-    };
+    let platform_key = system_platform_key(&hw.control_board);
 
     // P1-3 (D-8): real windowed hashrate averages instead of fabricated ones.
     // Previously `hashRate_10m` and `hashRate_1h` were BOTH set to the same
@@ -8318,6 +8346,7 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
         "uptime": miner.uptime_s,
         "uptimeSeconds": miner.uptime_s,
         "chip_type": &hw.chip_type,
+        "board_target": hw.identification.declared_board_target(),
         "identification_confidence": &hw.identification.confidence,
         "identification": &hw.identification,
         "chip_count": total_chips,
@@ -8431,8 +8460,9 @@ pub(super) async fn get_system_asic(State(state): State<Arc<AppState>>) -> impl 
     let total_chips: u16 = miner.chains.iter().map(|c| c.chips as u16).sum();
     let chip_id = chip_type_to_chip_id(&hw.chip_type);
     let profile = chip_id.and_then(MinerProfile::for_chip);
+    // P1-4: unknown/missing chip identity → empty options (never silent BM1387 list).
     let frequency_options: Vec<u16> = chip_id
-        .map(MinerProfile::pll_frequencies_for_chip)
+        .and_then(MinerProfile::try_pll_frequencies_for_chip)
         .map(|freqs| freqs.to_vec())
         .unwrap_or_default();
     let dcent_swarm = dcent_swarm_info(
@@ -11025,6 +11055,7 @@ pub(crate) async fn post_fan(
                 Json(serde_json::json!({
                     "status": "error",
                     "message": "hardware mutation admission rejected",
+                    "hardware_access_attempted": false,
                     "detail": detail,
                 })),
             )
@@ -11152,6 +11183,7 @@ mod fan_mutation_admission_tests {
             body["message"].as_str(),
             Some("hardware mutation admission rejected")
         );
+        assert_eq!(body["hardware_access_attempted"].as_bool(), Some(false));
         let detail = body["detail"].as_str().unwrap_or_default();
         assert!(
             detail.contains(expected_detail),
@@ -11173,6 +11205,74 @@ mod fan_mutation_admission_tests {
             granted_state_with_gate(dcentrald_hal::platform::HardwareMutationGate::new_closed());
 
         assert_rest_fan_admission_denied(state, "closed for teardown").await;
+    }
+
+    fn exact_am2_state_with_closed_mutation_surface() -> Arc<AppState> {
+        let state = crate::build_minimal_app_state_with_hardware_mutation_gate(
+            crate::MinimalAppStateInputs {
+                api_config: crate::ApiConfig::default(),
+                pool_url: String::new(),
+                pool_protocol: "sv1".to_string(),
+                mode: crate::OperatingMode::Hacker,
+                firmware_version: "exact-am2-closed-mutation-test".to_string(),
+                fan_pwm: 20,
+                network_block: crate::NetworkBlockConfig::default(),
+                profile_path: "/tmp/exact-am2-closed-mutation-test".to_string(),
+                control_board_label: "Zynq am2-s19jpro".to_string(),
+                chip_type_label: "BM1362".to_string(),
+                external_state_rx: None,
+            },
+            dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+        );
+        {
+            let mut hardware = state.hardware_info.lock().unwrap();
+            hardware.identification = crate::HardwareIdentification::from_evidence(
+                vec![
+                    crate::HardwareIdentityEvidence::declared_asic_config("s19jpro", "BM1362"),
+                    crate::HardwareIdentityEvidence::declared_asic_board_target(
+                        "am2-s19j", "BM1362",
+                    ),
+                    crate::HardwareIdentityEvidence::measured_asic_enumeration(
+                        0x1362,
+                        "BM1362",
+                        crate::HardwareCompositionToken::new(1, "test:am2-s19j"),
+                    ),
+                ],
+                Some("exact AM2 mutation-surface test evidence".to_string()),
+            );
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn exact_am2_closed_surface_rejects_fan_and_psu_before_hardware() {
+        let state = exact_am2_state_with_closed_mutation_surface();
+        assert_rest_fan_admission_denied(state.clone(), "closed for teardown").await;
+
+        let response = post_debug_psu_control(
+            State(state),
+            Json(PsuControlRequest {
+                action: "enable_output".to_string(),
+                voltage_v: None,
+                confirm: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["message"].as_str(),
+            Some("hardware mutation admission rejected")
+        );
+        assert_eq!(body["hardware_access_attempted"].as_bool(), Some(false));
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("closed for teardown"));
     }
 }
 
@@ -12185,6 +12285,16 @@ async fn post_offgrid_test_recovery(Json(body): Json<OffGridConfigPayload>) -> i
                         } else {
                             String::from(", voltage-only backend")
                         }
+                    )
+                }
+                // Mirror the success branch: never print an amp/watt figure for
+                // a backend that cannot measure current. Those fields are zero
+                // on a voltage-only source, and printing them here reads as a
+                // measurement of zero rather than the absence of one.
+                _ if !has_current => {
+                    format!(
+                        "ADC probe returned an implausible voltage ({:.2} V) from a voltage-only backend. Verify divider, path, and live wiring before trusting this backend.",
+                        reading.voltage_v
                     )
                 }
                 _ => {
@@ -15874,6 +15984,29 @@ pub(super) async fn post_debug_psu_control(
         return resp.into_response();
     }
 
+    // Even an unavailable mutator must honor the runtime's lifecycle gate.
+    // Exact AM2 serial mining publishes a terminally closed gate because the
+    // API owns neither its polarity-bound GPIO guard nor its final commit
+    // fence. Report that policy before any future broker implementation could
+    // accidentally grow a raw hardware fallback here.
+    let _hardware_mutation_lease =
+        match acquire_hardware_mutation_lease(&state, "POST /api/debug/psu/control") {
+            Ok(lease) => lease,
+            Err(detail) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "action": body.action,
+                        "hardware_access_attempted": false,
+                        "message": "hardware mutation admission rejected",
+                        "detail": detail,
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
     push_rest_audit_free(
         &state,
         "psu",
@@ -15928,10 +16061,10 @@ async fn post_debug_psu_control_recovery(
         format!("PSU control requested: action={}", body.action),
     );
 
-    // Hold admission across the complete blocking hardware call. Teardown
-    // closes this gate and drains every admitted lease before it observes
-    // safe-off, so an in-flight Hacker request cannot re-enable a rail after
-    // the engine has minted its GPIO-low evidence.
+    // Hold admission across the request and enter the lease's generation-bound
+    // final commit fence for the physical write below. Teardown closes the
+    // generation and waits that same fence before safe-off, so even a lease
+    // surviving the bounded drain timeout cannot re-enable the rail afterward.
     let _hardware_mutation_lease = match state.hardware_mutation_gate.try_acquire() {
         Ok(lease) => lease,
         Err(error) => {
@@ -15949,52 +16082,20 @@ async fn post_debug_psu_control_recovery(
     };
 
     match body.action.as_str() {
-        "enable_output" | "disable_output" if hw.control_board.starts_with("AML") => {
+        "enable_output" | "disable_output"
+            if hw.control_board.starts_with("AML")
+                || hw.control_board.starts_with("Zynq am2-s17") =>
+        {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "status": "error",
                     "action": body.action,
                     "hardware_access_attempted": false,
-                    "message": "Amlogic PSU control requires the mining engine's retained power/thermal owner and terminal fence; this recovery route does not own either capability",
+                    "message": "Direct PSU GPIO control requires the mining engine's retained, polarity-aware power owner and terminal fence; this recovery route owns neither capability",
                 })),
             )
                 .into_response();
-        }
-        "enable_output" | "disable_output" if hw.control_board.starts_with("Zynq am2-s17") => {
-            let result = if body.action == "enable_output" {
-                dcentrald_hal::platform::zynq::enable_psu_output()
-            } else {
-                dcentrald_hal::platform::zynq::disable_psu_output()
-            };
-
-            return match result {
-                Ok(()) => Json(serde_json::json!({
-                    "status": "ok",
-                    "action": body.action,
-                    "control_mode": "gpio_enable",
-                    "output_gate_enabled": dcentrald_hal::platform::zynq::is_psu_output_enabled(),
-                    "output_enabled": null,
-                    "voltage_out": null,
-                    "telemetry_source": "unavailable_until_daemon_owned_psu_snapshot",
-                    "hardware_bus_access_attempted": false,
-                    "message": if body.action == "enable_output" {
-                        "Zynq PSU output gate enabled"
-                    } else {
-                        "Zynq PSU output gate disabled"
-                    },
-                }))
-                .into_response(),
-                Err(e) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "action": body.action,
-                        "message": e.to_string(),
-                    })),
-                )
-                    .into_response(),
-            };
         }
         "enable_output" | "disable_output" => {
             return (
@@ -20909,7 +21010,7 @@ pub(super) fn load_onboarding_state() -> OnboardingState {
                 dirty = true;
             }
             state.phase = onboarding_phase_for(&state).to_string();
-            if dirty {
+            if dirty && !crate::auth::observer_only_enabled() {
                 let _ = save_onboarding_state(&state);
             }
             return state;
@@ -20945,11 +21046,19 @@ pub(super) fn load_onboarding_state() -> OnboardingState {
         state.steps.safety_ack = true;
     }
     state.phase = onboarding_phase_for(&state).to_string();
-    let _ = save_onboarding_state(&state);
+    if !crate::auth::observer_only_enabled() {
+        let _ = save_onboarding_state(&state);
+    }
     state
 }
 
 pub(super) fn save_onboarding_state(state: &OnboardingState) -> std::io::Result<()> {
+    if crate::auth::observer_only_enabled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "observer-only API forbids onboarding persistence",
+        ));
+    }
     if let Some(parent) = std::path::Path::new(ONBOARDING_FILE).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -23546,7 +23655,10 @@ mod capability_contract_tests {
         let cv = declared_hardware("BM1362", "CVITEK CV1835", "cv1835-s19jpro");
         let cv_metadata = update_metadata_payload(&empty_miner(), &cv);
         assert_eq!(cv_metadata.board_target, "cv1835-s19jpro");
-        assert_eq!(cv_metadata.package_type, "offline_analysis");
+        assert_eq!(
+            cv_metadata.package_type, "none",
+            "CV1835 is evidence-only: BoardDesc denies installation and declares no artifact lane"
+        );
         assert!(!cv_metadata.inactive_slot_supported);
         assert_eq!(cv_metadata.upload_endpoint, None);
         assert!(cv_metadata.toolbox.install_command.is_empty());

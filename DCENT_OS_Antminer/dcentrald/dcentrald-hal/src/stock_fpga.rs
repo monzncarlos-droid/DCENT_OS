@@ -24,7 +24,7 @@
 //!
 //! Device files:
 //!   /dev/axi_fpga_dev  (major 245) - FPGA registers, mmap to 0x43C00000 (0x160 bytes)
-//!   /dev/fpga_mem      (major 244) - DMA buffers, mmap to 0x1F000000 (16 MB)
+//!   /dev/fpga_mem      (major 244) - 16 MB DMA buffer at a RAM-dependent base
 
 use std::num::NonZeroUsize;
 
@@ -71,7 +71,8 @@ pub const REG_FAN_SPEED: u32 = 0x004;
 /// 0xE0 = all 3 boards present.
 pub const REG_HASH_ON_PLUG: u32 = 0x008;
 
-/// Available work buffer space (mirrors HASH_ON_PLUG when idle).
+/// Available work-buffer bitmask (`axi[3]`); open-core waits for the
+/// selected chain bit, and the register mirrors HASH_ON_PLUG when idle.
 pub const REG_BUFFER_SPACE: u32 = 0x00C;
 
 /// Nonce FIFO read port (32-bit nonce value).
@@ -105,8 +106,10 @@ pub const REG_BMC_CMD_COUNTER: u32 = 0x038;
 /// Idle: 0x0080800F = all chains enabled.
 pub const REG_QN_WRITE_DATA_COMMAND: u32 = 0x080;
 
-/// Fan PWM control register.
-/// Bits [23:16] = PWM duty (0-255), Bits [7:0] = fan scale/prescaler.
+/// Fan PWM control register (T9+ `axi_fpga_addr[33]`).
+///
+/// G44 pure pack: [`dcentrald_common::stock_fan_control_value`] —
+/// `((5000−50·pct)/100)|((pct>>1)<<16)`, **not** invent `(pct*255/100)<<16`.
 pub const REG_FAN_CONTROL: u32 = 0x084;
 
 /// ASIC response timeout.
@@ -120,12 +123,23 @@ pub const REG_TICKET_MASK: u32 = 0x08C;
 /// Hash counting number (FPGA hash rate counter).
 pub const REG_HASH_COUNTING_NUMBER: u32 = 0x090;
 
+/// Task-write command base (axi[16]) — VIL open_core 13-word dummy works.
+pub const REG_TW_WRITE_COMMAND: u32 = 0x40;
+
 /// Broadcast command write register.
 /// Used for ASIC register reads/writes (frequency, chip config).
 pub const REG_BC_WRITE_COMMAND: u32 = 0x0C0;
 
-/// Broadcast command data buffer.
+/// Broadcast command data buffer (word0; words 1–2 at +4 / +8).
+///
+/// T9+ `set_BC_command_buffer` writes three consecutive words at
+/// `axi_fpga_addr[49..51]` = `0x0C4`, `0x0C8`, `0x0CC`. Execute path:
+/// [`crate::stock_bc_execute::execute_stock_bc_set_config`].
 pub const REG_BC_COMMAND_BUFFER: u32 = 0x0C4;
+/// BC_COMMAND_BUFFER word1 (matches pure `STOCK_REG_BC_COMMAND_BUFFER_W1`).
+pub const REG_BC_COMMAND_BUFFER_W1: u32 = 0x0C8;
+/// BC_COMMAND_BUFFER word2 (matches pure `STOCK_REG_BC_COMMAND_BUFFER_W2`).
+pub const REG_BC_COMMAND_BUFFER_W2: u32 = 0x0CC;
 
 /// FPGA chip ID (64-bit, split across two registers).
 pub const REG_FPGA_CHIP_ID_LO: u32 = 0x0F0;
@@ -430,6 +444,12 @@ impl Drop for StockFpga {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_space_offset_matches_pure_axi_word_three() {
+        assert_eq!(REG_BUFFER_SPACE, 3 * std::mem::size_of::<u32>() as u32);
+        assert_eq!(REG_BUFFER_SPACE, dcentrald_common::STOCK_REG_BUFFER_SPACE);
+    }
 
     #[test]
     fn stock_fpga_register_offset_guard_rejects_oob_and_misaligned_offsets() {

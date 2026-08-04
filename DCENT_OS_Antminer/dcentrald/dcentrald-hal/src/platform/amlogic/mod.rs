@@ -82,16 +82,29 @@ use super::config::{
 use super::{BoardType, ChainAccess, FanAccess, GpioAccess, Platform};
 use crate::i2c::{
     spawn_i2c_service_no_register_touch_with_denylist,
-    spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation, I2cBus,
-    I2cMutationLabel, I2cServiceHandle, I2cTransactionStep, Lm75TemperatureRegister,
+    spawn_owned_i2c_service_no_register_touch_with_denylist_and_reserved_preparation, I2cBus,
+    I2cMutationLabel, I2cServiceCloseReceipt, I2cServiceHandle, I2cServiceOwner,
+    I2cServiceTerminalFence, I2cTransactionStep, Lm75TemperatureRegister,
     TerminalSafeOffTransition,
 };
 use crate::serial::SerialChain;
 use crate::{HalError, Result};
 
-/// I²C bus that carries hashboard EEPROMs on am3-aml (S21, S19j Pro Amlogic,
-/// S19K Pro). PSU lives on bus 1 at 0x1f and is intentionally NOT on the
-/// denylist — bus 1 is owned separately by `AmlogicPowerThermalService`.
+/// Bus protected by [`spawn_amlogic_protected_i2c0_service`].
+///
+/// CORRECTION (2026-07-27): this constant used to be documented as "the I²C bus
+/// that carries hashboard EEPROMs on am3-aml". That was wrong. The am3-aml
+/// hashboard EEPROMs answer on bus **1**, not bus 0 — see the evidence cited at
+/// [`AmlogicPowerThermalService::spawn`], which is where the EEPROM denylist
+/// actually has to be registered.
+///
+/// The name is therefore misleading, but the VALUE is correct and must stay `0`:
+/// this constant selects the bus that `spawn_amlogic_protected_i2c0_service`
+/// opens (called from `daemon.rs`), and it also drives a bus comparison further
+/// down this module. Changing it to `1` would make that helper a *second* owner
+/// of a bus already held under reservation by `AmlogicPowerThermalService` —
+/// exactly the conflict the cross-process fabric lease exists to refuse.
+/// Rename it if you like; do not repoint it.
 pub const AMLOGIC_HASHBOARD_EEPROM_BUS: u8 = 0;
 
 /// AT24C-class hashboard EEPROM addresses on am3-aml `/dev/i2c-0`.
@@ -314,7 +327,17 @@ fn amlogic_handoff_identity_matches_profile(
     }
 }
 
-fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<()> {
+fn amlogic_board_target_matches_profile(expected: AmlogicNoPicProfile, board_target: &str) -> bool {
+    match expected {
+        AmlogicNoPicProfile::S19k => board_target == "am3-s19k",
+        AmlogicNoPicProfile::S21 => matches!(
+            board_target,
+            "am3-s21" | "am3-s21pro" | "am3-s21xp" | "am3-t21"
+        ),
+    }
+}
+
+fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<String> {
     let metadata = fs::symlink_metadata(AML_BOOT_SAFE_RECEIPT).map_err(|error| {
         HalError::Platform(format!(
             "Amlogic NoPic admission requires boot-safe handoff {AML_BOOT_SAFE_RECEIPT}: {error}"
@@ -392,7 +415,7 @@ fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<(
             "Amlogic boot-safe live revalidation failed: direction={direction:?} value={value:?} active_low={active_low:?} fan0={fan0:?}/{fan0_period:?}/{fan0_enabled:?} fan1={fan1:?}/{fan1_period:?}/{fan1_enabled:?}"
         )));
     }
-    Ok(())
+    Ok(board_target)
 }
 
 impl AmlogicNoPicProfile {
@@ -408,7 +431,9 @@ impl AmlogicNoPicProfile {
 #[derive(Debug)]
 pub struct AmlogicNoPicAdmission {
     profile: AmlogicNoPicProfile,
+    board_target: String,
     active_slot: u8,
+    serial_device: String,
     populated_slots: [bool; 3],
 }
 
@@ -428,14 +453,23 @@ impl AmlogicNoPicAdmission {
             )));
         }
         let observed = detect_amlogic_nopic_profile()?;
-        validate_amlogic_boot_safe_handoff(expected)?;
+        let board_target = validate_amlogic_boot_safe_handoff(expected)?;
         let populated_slots = read_plug_topology_checked()?;
-        Self::from_profile_evidence(expected, active_slot, observed, populated_slots)
+        Self::from_profile_evidence(
+            expected,
+            active_slot,
+            serial_device,
+            &board_target,
+            observed,
+            populated_slots,
+        )
     }
 
     fn from_profile_evidence(
         expected: AmlogicNoPicProfile,
         active_slot: u8,
+        serial_device: &str,
+        board_target: &str,
         observed: AmlogicNoPicProfile,
         populated_slots: [bool; 3],
     ) -> Result<Self> {
@@ -446,9 +480,20 @@ impl AmlogicNoPicAdmission {
                 observed.label()
             )));
         }
+        if !amlogic_board_target_matches_profile(expected, board_target) {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic board target {board_target:?} is incompatible with {}",
+                expected.label()
+            )));
+        }
         if active_slot > 2 {
             return Err(HalError::Platform(format!(
                 "Amlogic NoPic active slot {active_slot} is outside the verified three-slot topology"
+            )));
+        }
+        if amlogic_slot_from_serial_device(serial_device) != Some(active_slot) {
+            return Err(HalError::Platform(format!(
+                "Amlogic NoPic serial endpoint {serial_device:?} does not resolve to admitted slot {active_slot}"
             )));
         }
         if !populated_slots[active_slot as usize] {
@@ -458,7 +503,9 @@ impl AmlogicNoPicAdmission {
         }
         Ok(Self {
             profile: observed,
+            board_target: board_target.to_owned(),
             active_slot,
+            serial_device: serial_device.to_owned(),
             populated_slots,
         })
     }
@@ -467,8 +514,16 @@ impl AmlogicNoPicAdmission {
         self.profile
     }
 
+    pub fn board_target(&self) -> &str {
+        &self.board_target
+    }
+
     pub fn active_slot(&self) -> u8 {
         self.active_slot
+    }
+
+    pub fn serial_device(&self) -> &str {
+        &self.serial_device
     }
 
     pub fn populated_slots(&self) -> [bool; 3] {
@@ -555,6 +610,14 @@ impl AmlogicPlatform {
     /// Resolve enough file-backed identity to emit a precise refusal. The
     /// generic `Platform` lifecycle cannot carry the retained bus-1 owner, so
     /// production Amlogic mining must use the native serial engine.
+    ///
+    /// Status classification (H7 G8): this refusal is an ARCHITECTURAL
+    /// ROUTING fact, not a capability gap — Amlogic mines via the native
+    /// serial lane. Every Amlogic `BoardDesc` row that names that lane is
+    /// `RuntimeStatus::SpecialisedLifecycle { lane: AmlogicNativeSerial,
+    /// generic_construction: Refused }`, which is deliberately distinct from
+    /// CVitek's `EvidenceRetainedNotImplemented`. See
+    /// `dcentrald-common::board_desc` and `dcent_schema::hardware::RuntimeStatus`.
     pub fn new() -> Result<Self> {
         // Verify we're actually on Amlogic
         if !["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"]
@@ -1312,23 +1375,120 @@ const GPIO_PINMUX_FIX: [u32; 2] = [476, 477];
 /// Retained single owner of the Amlogic management fabric. APW power commands
 /// and LM75 telemetry must use this service for the complete hardware session;
 /// callers never receive its generic I2C handle.
-#[derive(Clone)]
 pub struct AmlogicPowerThermalService {
+    i2c: I2cServiceHandle,
+    required_slots: [bool; 3],
+    lifecycle_owner: Option<AmlogicPowerThermalLifecycleOwner>,
+    psu_commit: Arc<AmlogicPsuCommitAuthority>,
+    psu_enable_operation_available: bool,
+}
+
+/// Cloneable read-only facade for periodic board-temperature sampling. It has
+/// no GPIO or APW enable operation and cannot close the retained worker.
+#[derive(Clone)]
+pub struct AmlogicThermalPort {
     i2c: I2cServiceHandle,
     required_slots: [bool; 3],
 }
 
-/// Cloneable, operation-free capability used by teardown guards to fence all
-/// future bus-1 mutations before they cut GPIO437.
-#[derive(Clone)]
-pub struct AmlogicPowerThermalFence {
-    i2c: I2cServiceHandle,
+/// Move-only terminal owner transferred to the PSU guard before energization.
+/// It combines the sender-free barrier with the exact worker JoinHandle.
+pub struct AmlogicPowerThermalLifecycleOwner {
+    owner: I2cServiceOwner,
+    fence: I2cServiceTerminalFence,
+    psu_commit: Arc<AmlogicPsuCommitAuthority>,
 }
 
-impl AmlogicPowerThermalFence {
-    pub fn latch_terminal_safe_off(&self) -> TerminalSafeOffTransition {
-        self.i2c.latch_terminal_safe_off()
+#[derive(Debug, Default)]
+struct AmlogicPsuCommitAuthority {
+    terminal: AtomicBool,
+    gpio_commit: Mutex<()>,
+}
+
+impl AmlogicPsuCommitAuthority {
+    fn latch_terminal(&self) {
+        self.terminal.store(true, Ordering::SeqCst);
     }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::SeqCst)
+    }
+
+    fn begin_enable(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        if self.is_terminal() {
+            return Err(amlogic_psu_enable_superseded(
+                "Amlogic power lifecycle was terminally fenced before GPIO enable",
+            ));
+        }
+        let commit = match self.gpio_commit.lock() {
+            Ok(commit) => commit,
+            Err(poisoned) => {
+                let commit = poisoned.into_inner();
+                let rollback = disable_psu_checked();
+                drop(commit);
+                return Err(HalError::Platform(match rollback {
+                    Ok(_) => "Amlogic PSU GPIO commit fence was poisoned; checked LOW rollback completed and enable was refused".into(),
+                    Err(error) => format!(
+                        "Amlogic PSU GPIO commit fence was poisoned; enable was refused and checked LOW rollback failed ({error})"
+                    ),
+                }));
+            }
+        };
+        if self.is_terminal() {
+            return Err(amlogic_psu_enable_superseded(
+                "Amlogic power lifecycle became terminal while waiting for the GPIO commit fence",
+            ));
+        }
+        Ok(commit)
+    }
+
+    fn begin_terminal_cut(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.latch_terminal();
+        self.gpio_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn amlogic_psu_enable_superseded(detail: &'static str) -> HalError {
+    HalError::I2cSafetySuperseded {
+        bus: AMLOGIC_MANAGEMENT_I2C_BUS,
+        addr: APW_PMBUS_ADDR,
+        detail: detail.into(),
+    }
+}
+
+impl AmlogicPowerThermalLifecycleOwner {
+    pub fn latch_terminal_safe_off(&self) -> TerminalSafeOffTransition {
+        self.psu_commit.latch_terminal();
+        self.fence.latch_terminal_safe_off()
+    }
+
+    /// Latch both mutation domains and complete the checked GPIO LOW operation
+    /// while holding the same commit fence used by the one-shot HIGH path.
+    /// Once this returns, no enable operation can commit a later HIGH write.
+    pub fn latch_terminal_and_disable_psu_checked(
+        &self,
+    ) -> Result<(TerminalSafeOffTransition, PsuSafeOffReceipt)> {
+        self.psu_commit.latch_terminal();
+        let transition = self.fence.latch_terminal_safe_off();
+        let _gpio_commit = self.psu_commit.begin_terminal_cut();
+        let receipt = disable_psu_checked()?;
+        Ok((transition, receipt))
+    }
+
+    pub fn close_and_join_until(&mut self, deadline: Instant) -> Result<I2cServiceCloseReceipt> {
+        let _ = self.latch_terminal_safe_off();
+        self.owner.close_and_join_until(deadline)
+    }
+}
+
+/// Move-only, one-shot composite PSU enable operation. A terminal owner sets
+/// the shared flag before fencing I2C, so a GPIO-high race is rechecked before
+/// the APW transaction and rolls GPIO437 back down.
+pub struct AmlogicPsuEnableOperation {
+    i2c: I2cServiceHandle,
+    psu_commit: Arc<AmlogicPsuCommitAuthority>,
 }
 
 /// Software evidence that both fixed APW enable writes completed. Optional
@@ -1353,53 +1513,155 @@ impl AmlogicPowerThermalService {
     /// Reserve `/dev/i2c-1`, perform the checked BOS-3528 pinmux preparation
     /// under that reservation, and start one kernel-fd-only service.
     fn spawn(admission: &AmlogicNoPicAdmission) -> Result<Self> {
-        let i2c = spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation(
-            AMLOGIC_MANAGEMENT_I2C_BUS,
-            Vec::new(),
-            prepare_management_i2c_pinmux,
-        )
-        .map_err(|error| {
-            HalError::Platform(format!(
-                "failed to reserve Amlogic management I2C fabric: {error}"
-            ))
-        })?;
+        // The hashboard EEPROM write-denylist belongs HERE, not only on the
+        // bus-0 helper. On am3-aml the AT24C-class hashboard EEPROMs answer on
+        // bus 1 — this bus — so registering an empty denylist left the
+        // post-`a lab unit` write-protection guarantee covering a bus with no EEPROMs
+        // on it. Evidence, three independent arms:
+        //   * the artifact we ship ourselves declares `"i2c_bus": 1` for every
+        //     board (board/amlogic/am3-s19kpro/.../etc/dcentos/hashboard_decoded.json,
+        //     pinned by a test in `i2c_eeprom_denylist_breadth.rs`)
+        //   * the live `a lab unit` probe: bus 0 scans entirely empty and every bus-0
+        //     read fails, while bus 1 answers at 0x50/0x51/0x52
+        //   * S21 dmesg pins `i2c-1` to the AO adapter 0xff805000
+        // The denylist is write-only, so hashboard identity READS are unaffected.
+        let owner =
+            spawn_owned_i2c_service_no_register_touch_with_denylist_and_reserved_preparation(
+                AMLOGIC_MANAGEMENT_I2C_BUS,
+                AMLOGIC_EEPROM_DENYLIST.to_vec(),
+                prepare_management_i2c_pinmux,
+            )
+            .map_err(|error| {
+                HalError::Platform(format!(
+                    "failed to reserve Amlogic management I2C fabric: {error}"
+                ))
+            })?;
+        let i2c = owner.request_handle();
+        let fence = owner.terminal_fence();
+        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::default());
         // A synchronous control round-trip proves the worker opened its fd and
         // accepted the fixed timeout before any power or telemetry operation.
         i2c.set_timeout(10)?;
         Ok(Self {
             i2c,
             required_slots: admission.populated_slots(),
+            lifecycle_owner: Some(AmlogicPowerThermalLifecycleOwner {
+                owner,
+                fence,
+                psu_commit: Arc::clone(&psu_commit),
+            }),
+            psu_commit,
+            psu_enable_operation_available: true,
         })
     }
 
-    pub fn terminal_fence(&self) -> AmlogicPowerThermalFence {
-        AmlogicPowerThermalFence {
-            i2c: self.i2c.clone(),
-        }
+    pub fn take_lifecycle_owner(&mut self) -> Result<AmlogicPowerThermalLifecycleOwner> {
+        self.lifecycle_owner.take().ok_or_else(|| {
+            HalError::Platform(
+                "Amlogic power/thermal lifecycle owner was already transferred".into(),
+            )
+        })
     }
 
+    pub fn take_psu_enable_operation(&mut self) -> Result<AmlogicPsuEnableOperation> {
+        if !self.psu_enable_operation_available {
+            return Err(HalError::Platform(
+                "Amlogic PSU enable operation was already consumed".into(),
+            ));
+        }
+        if self.psu_commit.is_terminal() {
+            return Err(amlogic_psu_enable_superseded(
+                "Amlogic power lifecycle was terminally fenced before PSU enable",
+            ));
+        }
+        self.psu_enable_operation_available = false;
+        Ok(AmlogicPsuEnableOperation {
+            i2c: self.i2c.clone(),
+            psu_commit: Arc::clone(&self.psu_commit),
+        })
+    }
+
+    pub fn thermal_port(&self) -> AmlogicThermalPort {
+        AmlogicThermalPort {
+            i2c: self.i2c.clone(),
+            required_slots: self.required_slots,
+        }
+    }
+}
+
+struct AmlogicPsuGpioRollback {
+    armed: bool,
+}
+
+impl AmlogicPsuGpioRollback {
+    fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn attach_checked_rollback(&mut self, primary: HalError, operation: &'static str) -> HalError {
+        match disable_psu_checked() {
+            Ok(_) => {
+                self.disarm();
+                primary
+            }
+            Err(rollback_error) => HalError::Platform(format!(
+                "{operation} ({primary}); checked rollback also failed ({rollback_error})"
+            )),
+        }
+    }
+}
+
+impl Drop for AmlogicPsuGpioRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = disable_psu_checked() {
+                tracing::error!(
+                    %error,
+                    "Amlogic PSU enable unwound with possible GPIO HIGH state; emergency checked LOW rollback failed"
+                );
+            }
+        }
+    }
+}
+
+impl AmlogicPsuEnableOperation {
     /// Enable GPIO437 and issue the two fixed DCENT APW compatibility writes
     /// derived from captured S19K Pro `a lab unit` U-Boot command text. Any failure
     /// after the GPIO mutation performs checked GPIO rollback before returning.
-    pub fn enable_psu(&self) -> Result<ApwEnableReceipt> {
+    pub fn enable_psu(self) -> Result<ApwEnableReceipt> {
+        let gpio_commit = self.psu_commit.begin_enable()?;
+        // Arm before the first GPIO call: an unwind after any partial sysfs
+        // mutation must issue LOW while the commit fence is still held.
+        let mut rollback = AmlogicPsuGpioRollback::armed();
         if let Err(enable_error) = enable_psu_gpio() {
-            return match disable_psu_checked() {
-                Ok(_) => Err(enable_error),
-                Err(rollback_error) => Err(HalError::Platform(format!(
-                    "PSU GPIO enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
-                ))),
-            };
+            return Err(rollback.attach_checked_rollback(enable_error, "PSU GPIO enable failed"));
+        }
+        if self.psu_commit.is_terminal() {
+            let superseded = amlogic_psu_enable_superseded(
+                "terminal safe-off raced GPIO enable before the APW transaction",
+            );
+            return Err(rollback
+                .attach_checked_rollback(superseded, "PSU enable was terminally superseded"));
         }
         if let Err(enable_error) = self.enable_apw() {
-            return match disable_psu_checked() {
-                Ok(_) => Err(enable_error),
-                Err(rollback_error) => Err(HalError::Platform(format!(
-                    "PSU PMBus enable failed ({enable_error}); checked rollback also failed ({rollback_error})"
-                ))),
-            };
+            return Err(rollback.attach_checked_rollback(enable_error, "PSU PMBus enable failed"));
+        }
+        if self.psu_commit.is_terminal() {
+            let superseded = amlogic_psu_enable_superseded(
+                "terminal safe-off raced the APW transaction before GPIO HIGH commit",
+            );
+            return Err(rollback
+                .attach_checked_rollback(superseded, "PSU enable was terminally superseded"));
         }
 
         let writes_completed_at = Instant::now();
+        rollback.disarm();
+        drop(rollback);
+        drop(gpio_commit);
         std::thread::sleep(Duration::from_secs(2));
         let status_word = match self.read_apw_status_word() {
             Ok(status) => {
@@ -1458,7 +1720,9 @@ impl AmlogicPowerThermalService {
         })?;
         Ok(u16::from_le_bytes(bytes))
     }
+}
 
+impl AmlogicThermalPort {
     /// Capture all statically mapped board sensors through the same retained
     /// fabric owner. Unpowered/unpopulated endpoints remain explicit evidence
     /// in the returned snapshot rather than causing an adapter reset.
@@ -1937,7 +2201,7 @@ impl AmlogicTemperatureSnapshot {
 }
 
 // Board temperatures are available only through
-// `AmlogicPowerThermalService::read_board_temperatures`.
+// `AmlogicThermalPort::read_board_temperatures`.
 fn normalize_model_token(model: &str) -> String {
     model
         .trim()
@@ -2239,6 +2503,52 @@ mod tests {
     }
 
     #[test]
+    fn psu_gpio_commit_fence_orders_terminal_cut_after_inflight_enable() {
+        let authority = Arc::new(AmlogicPsuCommitAuthority::default());
+        let simulated_gpio_high = Arc::new(AtomicBool::new(false));
+        let (enable_locked_tx, enable_locked_rx) = std::sync::mpsc::channel();
+        let (release_enable_tx, release_enable_rx) = std::sync::mpsc::channel();
+
+        let enable_authority = Arc::clone(&authority);
+        let enable_gpio = Arc::clone(&simulated_gpio_high);
+        let enable = std::thread::spawn(move || {
+            let _commit = enable_authority.begin_enable().unwrap();
+            enable_gpio.store(true, Ordering::SeqCst);
+            enable_locked_tx.send(()).unwrap();
+            release_enable_rx.recv().unwrap();
+            if enable_authority.is_terminal() {
+                enable_gpio.store(false, Ordering::SeqCst);
+            }
+        });
+        enable_locked_rx.recv().unwrap();
+
+        let (terminal_latched_tx, terminal_latched_rx) = std::sync::mpsc::channel();
+        let (terminal_receipt_tx, terminal_receipt_rx) = std::sync::mpsc::channel();
+        let terminal_authority = Arc::clone(&authority);
+        let terminal_gpio = Arc::clone(&simulated_gpio_high);
+        let terminal = std::thread::spawn(move || {
+            terminal_authority.latch_terminal();
+            terminal_latched_tx.send(()).unwrap();
+            let _commit = terminal_authority.begin_terminal_cut();
+            terminal_gpio.store(false, Ordering::SeqCst);
+            terminal_receipt_tx.send(()).unwrap();
+        });
+        terminal_latched_rx.recv().unwrap();
+        assert!(simulated_gpio_high.load(Ordering::SeqCst));
+        assert!(matches!(
+            terminal_receipt_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        release_enable_tx.send(()).unwrap();
+        enable.join().unwrap();
+        terminal_receipt_rx.recv().unwrap();
+        terminal.join().unwrap();
+        assert!(!simulated_gpio_high.load(Ordering::SeqCst));
+        assert!(authority.begin_enable().is_err());
+    }
+
+    #[test]
     fn shipped_amlogic_platform_tokens_are_explicitly_classified_or_refused() {
         for marker in [
             "am3-aml-s19k",
@@ -2301,17 +2611,23 @@ mod tests {
         let admission = AmlogicNoPicAdmission::from_profile_evidence(
             AmlogicNoPicProfile::S21,
             1,
+            "/dev/ttyS2",
+            "am3-s21",
             AmlogicNoPicProfile::S21,
             [true, true, false],
         )
         .unwrap();
         assert_eq!(admission.profile(), AmlogicNoPicProfile::S21);
+        assert_eq!(admission.board_target(), "am3-s21");
         assert_eq!(admission.active_slot(), 1);
+        assert_eq!(admission.serial_device(), "/dev/ttyS2");
         assert_eq!(admission.populated_slots(), [true, true, false]);
 
         assert!(AmlogicNoPicAdmission::from_profile_evidence(
             AmlogicNoPicProfile::S21,
             1,
+            "/dev/ttyS2",
+            "am3-s21",
             AmlogicNoPicProfile::S19k,
             [false, true, false],
         )
@@ -2319,6 +2635,8 @@ mod tests {
         assert!(AmlogicNoPicAdmission::from_profile_evidence(
             AmlogicNoPicProfile::S21,
             3,
+            "/dev/ttyS2",
+            "am3-s21",
             AmlogicNoPicProfile::S21,
             [false, true, false],
         )
@@ -2326,8 +2644,28 @@ mod tests {
         assert!(AmlogicNoPicAdmission::from_profile_evidence(
             AmlogicNoPicProfile::S21,
             1,
+            "/dev/ttyS1",
+            "am3-s21",
+            AmlogicNoPicProfile::S21,
+            [true, true, false],
+        )
+        .is_err());
+        assert!(AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            1,
+            "/dev/ttyS2",
+            "am3-s21",
             AmlogicNoPicProfile::S21,
             [true, false, false],
+        )
+        .is_err());
+        assert!(AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            1,
+            "/dev/ttyS2",
+            "am3-s19k",
+            AmlogicNoPicProfile::S21,
+            [true, true, false],
         )
         .is_err());
     }
@@ -2456,18 +2794,30 @@ mod tests {
     #[test]
     fn apw_enable_writes_complete_even_when_optional_status_is_unavailable() {
         let backend = std::sync::Arc::new(ApwSequenceBackend::new());
-        let service = AmlogicPowerThermalService {
-            i2c: crate::i2c::spawn_sim_i2c_service(
-                AMLOGIC_MANAGEMENT_I2C_BUS,
-                backend.clone(),
-                Vec::new(),
-            )
-            .unwrap(),
+        let owner = crate::i2c::spawn_owned_sim_i2c_service(
+            AMLOGIC_MANAGEMENT_I2C_BUS,
+            backend.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let i2c = owner.request_handle();
+        let fence = owner.terminal_fence();
+        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::default());
+        let mut service = AmlogicPowerThermalService {
+            i2c,
             required_slots: [false, true, false],
+            lifecycle_owner: Some(AmlogicPowerThermalLifecycleOwner {
+                owner,
+                fence,
+                psu_commit: Arc::clone(&psu_commit),
+            }),
+            psu_commit,
+            psu_enable_operation_available: true,
         };
+        let operation = service.take_psu_enable_operation().unwrap();
 
-        service.enable_apw().unwrap();
-        assert!(service.read_apw_status_word().is_err());
+        operation.enable_apw().unwrap();
+        assert!(operation.read_apw_status_word().is_err());
         assert_eq!(
             *backend
                 .writes
@@ -2628,10 +2978,7 @@ mod tests {
     struct FailingEdgeMock;
     impl FanTachSource for FailingEdgeMock {
         fn sample_falling_edges(&self, _window: Duration) -> std::io::Result<u32> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected tach failure",
-            ))
+            Err(std::io::Error::other("injected tach failure"))
         }
     }
 
@@ -2666,10 +3013,26 @@ mod tests {
     }
 
     #[test]
-    fn amlogic_hashboard_eeprom_bus_is_zero() {
-        //: hashboard
-        // EEPROMs are on /dev/i2c-0. PSU is on /dev/i2c-1 at 0x1f and must
-        // NOT carry the denylist (PSU enable writes would be blocked).
+    fn amlogic_bus0_helper_selector_stays_zero() {
+        // This pins the bus that `spawn_amlogic_protected_i2c0_service` opens.
+        // It is NOT a statement about where hashboard EEPROMs live.
+        //
+        // CORRECTION (2026-07-28): the comment previously here claimed am3-aml
+        // hashboard EEPROMs answer on `/dev/i2c-0`. They do not. The live `a lab unit`
+        // capture shows i2c-0 EMPTY, with the LM75s and the hashboard EEPROMs
+        // both answering on i2c-1 — which is exactly why the write-denylist is
+        // ALSO registered on bus 1 inside `AmlogicPowerThermalService::spawn`.
+        //
+        // Do not use the old comment's reasoning to strip that bus-1
+        // registration. Its stated fear was that denying bus 1 would block PSU
+        // enable writes; it does not. The APW answers at 0x1f, which is outside
+        // the 0x50..=0x57 range, so PSU writes are unaffected. Removing the
+        // bus-1 denylist would re-open the post-`a lab unit` EEPROM write hole on the
+        // one bus that actually carries the EEPROMs.
+        //
+        // The VALUE must still stay 0: this constant selects the bus the bus-0
+        // helper opens, and repointing it would make that helper a second owner
+        // of a bus already held under reservation. See the constant's own doc.
         assert_eq!(AMLOGIC_HASHBOARD_EEPROM_BUS, 0);
     }
 
@@ -2933,18 +3296,18 @@ mod tests {
     }
 
     #[test]
-    fn bhb56_subtype_returns_dspic() {
-        // S19k Pro at .78 (`AMLCtrl_BHB56902`) and any future
-        // BHB56xxx-class hashboard must stay on the existing dsPIC33EP
-        // path. This is the no-regression guard for the .78 platform.
+    fn bhb56_subtype_remains_nopic_from_live_evidence() {
+        // S19k Pro at .78 (`AMLCtrl_BHB56902`) is live-confirmed NoPic.
+        // Unobserved BHB56 suffixes cannot widen that identity into dsPIC
+        // controller authority.
         use crate::platform::subtype::classify_voltage_controller;
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56902")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
         assert_eq!(
             classify_voltage_controller(Some("AMLCtrl_BHB56xxx")),
-            VoltageControllerKind::Dspic33Ep,
+            VoltageControllerKind::NoPic,
         );
     }
 

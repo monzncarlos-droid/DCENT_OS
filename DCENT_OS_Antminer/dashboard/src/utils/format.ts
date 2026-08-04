@@ -1,6 +1,7 @@
 // Formatting utilities for hashrate, uptime, temp, BTU, sats, difficulty
 
 export function formatHashrate(ghs: number): string {
+  if (!Number.isFinite(ghs)) return '—'; // honest placeholder, never "NaN MH/s"
   // Decimals per the Terminology Lexicon hashrate ladder (TERM-3 §3.1):
   // PH/s & TH/s = .2, GH/s = .1 (canonical — matches formatHashrateShort and
   // axe's fHR; a single-GH/s resolution beyond one decimal is noise), MH/s = .0.
@@ -11,6 +12,7 @@ export function formatHashrate(ghs: number): string {
 }
 
 export function formatHashrateShort(ghs: number): { value: string; unit: string } {
+  if (!Number.isFinite(ghs)) return { value: '—', unit: '' };
   if (ghs >= 1000000) return { value: (ghs / 1000000).toFixed(2), unit: 'PH/s' };
   if (ghs >= 1000) return { value: (ghs / 1000).toFixed(2), unit: 'TH/s' };
   if (ghs >= 1) return { value: ghs.toFixed(1), unit: 'GH/s' };
@@ -27,6 +29,7 @@ export function formatUptime(seconds: number): string {
 }
 
 export function formatTemp(c: number): string {
+  if (!Number.isFinite(c)) return '—';
   return `${c.toFixed(1)}°C`;
 }
 
@@ -35,8 +38,9 @@ export function formatTempF(c: number): string {
 }
 
 export function formatWatts(w: number): string {
+  if (!Number.isFinite(w)) return '—';
   if (w >= 1000) return `${(w / 1000).toFixed(2)} kW`;
-  return `${w} W`;
+  return `${Math.round(w)} W`; // round: raw floats rendered "743.2800001 W"
 }
 
 export function formatBtu(btu: number): string {
@@ -44,10 +48,11 @@ export function formatBtu(btu: number): string {
 }
 
 export function formatSats(sats: number): string {
+  if (!Number.isFinite(sats)) return '—';
   if (sats >= 100000000) return `${(sats / 100000000).toFixed(8)} BTC`;
   if (sats >= 1000000) return `${(sats / 1000000).toFixed(2)}M sats`;
   if (sats >= 1000) return `${(sats / 1000).toFixed(1)}K sats`;
-  return `${sats} sats`;
+  return `${Math.round(sats)} sats`;
 }
 
 export function formatEfficiency(jth: number): string {

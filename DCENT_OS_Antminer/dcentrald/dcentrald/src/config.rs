@@ -11,7 +11,8 @@
 use anyhow::{Context, Result};
 use dcentrald_api::{solar_provider_support, supported_solar_providers, NetworkBlockConfig};
 use dcentrald_stratum::types::{
-    DonationConfig as StratumDonationConfig, PoolConfig as StratumPoolConfig, StratumConfig,
+    resolve_nominal_hashrate_ghs_with_geometry, DonationConfig as StratumDonationConfig,
+    NominalHashrateSource, PoolConfig as StratumPoolConfig, StratumConfig,
 };
 use dcentrald_stratum::url_validator::{validate_sv2_pool_url, validate_v1_pool_url};
 use serde::{Deserialize, Serialize};
@@ -92,17 +93,89 @@ fn failover_stratum_pool(config: &PoolEndpoint) -> StratumPoolConfig {
     }
 }
 
+/// Profile nominal GH/s from `mining.model` + frequency (no live enum).
+pub fn profile_nominal_hashrate_ghs(config: &DcentraldConfig) -> Option<f32> {
+    config.mining.model_chip_id().and_then(|chip_id| {
+        dcentrald_asic::drivers::MinerProfile::nominal_hashrate_ghs_for_chip(
+            chip_id,
+            config.mining.frequency_mhz,
+        )
+    })
+}
+
+/// Enumerated-geometry nominal GH/s from responding chip total (P2-9).
+///
+/// Uses profile `ghs_per_mhz` for the chip family and
+/// [`dcentrald_common::nominal_hashrate_ghs_from_geometry`]. Returns `None`
+/// when chip id/freq/geometry cannot support a positive rate (fail-closed).
+pub fn enumerated_nominal_hashrate_ghs(
+    config: &DcentraldConfig,
+    enumerated_total_chips: u32,
+) -> Option<f32> {
+    if enumerated_total_chips == 0 {
+        return None;
+    }
+    let chip_id = config.mining.model_chip_id()?;
+    let profile = dcentrald_asic::drivers::MinerProfile::for_chip(chip_id)?;
+    dcentrald_common::nominal_hashrate_ghs_from_geometry(
+        enumerated_total_chips,
+        config.mining.frequency_mhz,
+        profile.ghs_per_mhz,
+    )
+}
+
+/// Resolve stratum nominal GH/s + provenance for tests and post-enum fill.
+///
+/// Priority: explicit non-S9 config (unused here — seed is always 0.0 from
+/// build) → enumerated geometry → MinerProfile → UnsetZero.
+pub fn resolve_stratum_nominal_hashrate(
+    config: &DcentraldConfig,
+    enumerated_total_chips: Option<u32>,
+) -> (f32, NominalHashrateSource) {
+    let profile_ghs = profile_nominal_hashrate_ghs(config);
+    let enumerated_ghs =
+        enumerated_total_chips.and_then(|n| enumerated_nominal_hashrate_ghs(config, n));
+    resolve_nominal_hashrate_ghs_with_geometry(0.0, profile_ghs, enumerated_ghs)
+}
+
 /// Build one Stratum router config shape for every daemon mining path.
 ///
 /// Runtime-only lanes used to duplicate this by hand and several paths dropped
 /// `[pool.failover1]` / `[pool.failover2]`. Keep pool routing centralized so
 /// accepted config is what the mining loop actually uses.
+///
+/// When chip enum is not yet known, call this with no geometry (profile only).
+/// After enum, prefer [`build_stratum_config_with_enumerated_chips`].
 pub fn build_stratum_config(
     config: &DcentraldConfig,
     donation: StratumDonationConfig,
     version_rolling: bool,
     sv2_extended_channel: bool,
 ) -> StratumConfig {
+    build_stratum_config_with_enumerated_chips(
+        config,
+        donation,
+        version_rolling,
+        sv2_extended_channel,
+        None,
+    )
+}
+
+/// Like [`build_stratum_config`], seeding nominal GH/s from live chip totals.
+///
+/// `enumerated_total_chips` is the sum of responding chips across active
+/// chains (not marketing product geometry alone). When `Some` and positive,
+/// resolution prefers [`NominalHashrateSource::EnumeratedGeometry`] over the
+/// full MinerProfile claim (partial boards must not over-claim SV2 Standard).
+pub fn build_stratum_config_with_enumerated_chips(
+    config: &DcentraldConfig,
+    donation: StratumDonationConfig,
+    version_rolling: bool,
+    sv2_extended_channel: bool,
+    enumerated_total_chips: Option<u32>,
+) -> StratumConfig {
+    let (nominal_hashrate_ghs, _source) =
+        resolve_stratum_nominal_hashrate(config, enumerated_total_chips);
     StratumConfig {
         pool1: primary_stratum_pool(&config.pool),
         pool2: config.pool.failover1.as_ref().map(failover_stratum_pool),
@@ -129,7 +202,8 @@ pub fn build_stratum_config(
         suggest_difficulty: Some(config.mining.suggest_difficulty),
         hash_on_disconnect: config.hash_on_disconnect.enabled,
         protocol: config.pool.protocol.clone(),
-        nominal_hashrate_ghs: 0.0,
+        // P2-9: profile and/or enumerated geometry; UnsetZero without model.
+        nominal_hashrate_ghs,
         sv2_extended_channel,
     }
 }
@@ -442,13 +516,18 @@ impl DcentraldConfig {
         // range here so it fails closed at load. Shipped values are 12.8 / 14.0;
         // the default is 12.0.
         if let Some(ref ovr) = self.power.psu_override {
-            if ovr.voltage_v <= 5.0 || ovr.voltage_v > 20.0 {
+            if !ovr.voltage_v.is_finite() || ovr.voltage_v <= 5.0 || ovr.voltage_v > 20.0 {
                 anyhow::bail!(
                     "power.psu_override.voltage_v ({:.2}) is outside the sane PSU rail range \
-                     (5.0-20.0 V). This is the PSU OUTPUT rail (APW3/APW7 ~12.0-14.0 V), NOT \
+                     (finite 5.0-20.0 V). This is the PSU OUTPUT rail (APW3/APW7 ~12.0-14.0 V), NOT \
                      the ~1.3 V chip voltage. A value this far out is almost always a typo; \
                      set it to the PSU's physically-set output (default 12.0).",
                     ovr.voltage_v
+                );
+            }
+            if ovr.enabled && ovr.model.trim().is_empty() {
+                anyhow::bail!(
+                    "enabled power.psu_override requires a non-empty model name so bypass applicability is explicit"
                 );
             }
         }
@@ -2161,8 +2240,11 @@ fn default_psu_voltage() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_write, build_stratum_config, stratum_donation_config, CurtailmentScheduleConfig,
-        DcentraldConfig, MiningConfig, PowerConfig, WatchdogConfig, MAX_PERSISTED_CONFIG_BYTES,
+        atomic_write, build_stratum_config, build_stratum_config_with_enumerated_chips,
+        enumerated_nominal_hashrate_ghs, profile_nominal_hashrate_ghs,
+        resolve_stratum_nominal_hashrate, stratum_donation_config, CurtailmentScheduleConfig,
+        DcentraldConfig, MiningConfig, NominalHashrateSource, PowerConfig, PsuOverride,
+        WatchdogConfig, MAX_PERSISTED_CONFIG_BYTES,
     };
     use dcentrald_api::NetworkBlockConfig;
     use proptest::prelude::*;
@@ -2268,6 +2350,32 @@ mod tests {
             !cfg.mining_start_enabled(),
             "management-only default must NOT start mining (no PSU/chain energize)"
         );
+    }
+
+    #[test]
+    fn enabled_psu_override_requires_finite_voltage_and_named_applicability() {
+        let mut cfg = DcentraldConfig::management_only_default();
+        cfg.power.psu_override = Some(PsuOverride {
+            enabled: true,
+            model: "APW3".to_string(),
+            voltage_v: f64::NAN,
+            no_smbus_peer: None,
+            psu_hardware_variant: None,
+        });
+        assert!(cfg.validate().unwrap_err().to_string().contains("finite"));
+
+        let override_config = cfg.power.psu_override.as_mut().unwrap();
+        override_config.voltage_v = 12.8;
+        override_config.model = "  ".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty model"));
+
+        let override_config = cfg.power.psu_override.as_mut().unwrap();
+        override_config.model = "APW3".to_string();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -2691,6 +2799,113 @@ suggest_difficulty = 2048
         assert_eq!(stratum_config.routing_mode, "weighted_split");
         assert_eq!(stratum_config.suggest_difficulty, Some(2048));
         assert!(stratum_config.version_rolling);
+        // No mining.model → UnsetZero (am3-bb intentional non-claim path).
+        assert_eq!(stratum_config.nominal_hashrate_ghs, 0.0);
+    }
+
+    /// P2-9: when `mining.model` is set, nominal GH/s comes from MinerProfile
+    /// so multi-TH SV2 Standard-channel footguns are not defaulted to 0/S9.
+    #[test]
+    fn build_stratum_config_fills_nominal_hashrate_from_mining_model() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[pool]
+url = "stratum+tcp://primary.example.com:3333"
+worker = "primary.worker"
+
+[mining]
+model = "s19j-pro"
+frequency_mhz = 525
+"#,
+        )
+        .expect("model config should deserialize");
+        let stratum_config = build_stratum_config(
+            &config,
+            stratum_donation_config(&config.donation),
+            config.mining.version_rolling,
+            false,
+        );
+        let expected = dcentrald_asic::drivers::MinerProfile::nominal_hashrate_ghs_for_chip(
+            config.mining.model_chip_id().expect("s19j-pro chip id"),
+            525,
+        )
+        .expect("profile nominal");
+        assert!(
+            (stratum_config.nominal_hashrate_ghs - expected).abs() < f32::EPSILON,
+            "got {} expected {}",
+            stratum_config.nominal_hashrate_ghs,
+            expected
+        );
+        assert!(stratum_config.nominal_hashrate_ghs > 1_000.0);
+    }
+
+    /// P2-9: post-enum total chips prefer EnumeratedGeometry over full profile.
+    #[test]
+    fn build_stratum_config_prefers_enumerated_chips_over_profile() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[pool]
+url = "stratum+tcp://primary.example.com:3333"
+worker = "primary.worker"
+
+[mining]
+model = "s19j-pro"
+frequency_mhz = 525
+"#,
+        )
+        .expect("model config");
+        let profile = profile_nominal_hashrate_ghs(&config).expect("profile");
+        // Half the profile chip total (partial enum) must yield lower GH/s.
+        let profile_struct = dcentrald_asic::drivers::MinerProfile::for_chip(
+            config.mining.model_chip_id().expect("chip"),
+        )
+        .expect("profile");
+        let full_chips = dcentrald_common::total_chips_from_profile_geometry(
+            profile_struct.chain_count,
+            profile_struct.chips_per_chain,
+        )
+        .expect("geometry");
+        let half_chips = (full_chips / 2).max(1);
+        let (ghs, src) = resolve_stratum_nominal_hashrate(&config, Some(half_chips));
+        assert_eq!(src, NominalHashrateSource::EnumeratedGeometry);
+        assert!(ghs < profile);
+        assert!(ghs > 0.0);
+        let sc = build_stratum_config_with_enumerated_chips(
+            &config,
+            stratum_donation_config(&config.donation),
+            false,
+            false,
+            Some(half_chips),
+        );
+        assert!((sc.nominal_hashrate_ghs - ghs).abs() < f32::EPSILON);
+        // Zero enum chips → fall back to profile (not UnsetZero when model set).
+        let (ghs0, src0) = resolve_stratum_nominal_hashrate(&config, Some(0));
+        assert_eq!(src0, NominalHashrateSource::MinerProfile);
+        assert!((ghs0 - profile).abs() < f32::EPSILON);
+        // Pure helper refuse on zero chips.
+        assert!(enumerated_nominal_hashrate_ghs(&config, 0).is_none());
+    }
+
+    #[test]
+    fn enumerated_nominal_matches_geometry_ssot() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[mining]
+model = "s9"
+frequency_mhz = 650
+"#,
+        )
+        .expect("s9 config");
+        let chips = 63u32 * 3; // one full S9 profile geometry
+        let via_helper = enumerated_nominal_hashrate_ghs(&config, chips).expect("enum ghs");
+        let profile = dcentrald_asic::drivers::MinerProfile::for_chip(0x1387).expect("bm1387");
+        let via_ssot =
+            dcentrald_common::nominal_hashrate_ghs_from_geometry(chips, 650, profile.ghs_per_mhz)
+                .expect("ssot");
+        assert!((via_helper - via_ssot).abs() < f32::EPSILON);
+        // Profile nominal at same freq should match full geometry.
+        let via_profile = profile.nominal_hashrate_ghs(650).expect("profile");
+        assert!((via_helper - via_profile).abs() < 1.0);
     }
 
     /// Armada 2026-06-09: the four failover-robustness knobs were hardcoded
@@ -3837,6 +4052,33 @@ voltage_mv = 14800
     }
 
     #[test]
+    fn am2_chain4_native_fixture_satisfies_exact_serial_watchdog_contract() {
+        let config_text = include_str!("../../configs/dcentrald_s19jpro_am2_chain4_native.toml");
+        let mut config: DcentraldConfig = toml::from_str(config_text)
+            .expect("AM2 chain4 native fixture must deserialize against the live schema");
+        config
+            .normalize_legacy_fields()
+            .expect("AM2 chain4 native fixture must normalize cleanly");
+        with_forced_am2_clamp(|| {
+            config
+                .validate()
+                .expect("AM2 chain4 native fixture must pass the AM2 safety envelope")
+        });
+
+        assert_eq!(config.mining.model.as_deref(), Some("s19jpro"));
+        assert_eq!(config.mining.serial_chip_count, Some(126));
+        assert!(!config.mining.passthrough);
+        assert!(
+            config.watchdog.enabled,
+            "exact BM1362 direct serial must never ship an opt-out watchdog fixture"
+        );
+        assert!(config.watchdog.timeout_s >= 10);
+        assert!(config.watchdog.kick_interval_s > 0);
+        assert!(config.watchdog.kick_interval_s < config.watchdog.timeout_s);
+        assert!(!config.hash_on_disconnect.enabled);
+    }
+
+    #[test]
     fn am2_baked_defaults_pin_four_fan_supervisor_floor() {
         for (label, config_text) in [
             (
@@ -3909,7 +4151,8 @@ voltage_mv = 14800
                 "s17plus",
                 include_str!("../../configs/dcentrald_s17plus.toml"),
                 "s17+",
-                "BM1396",
+                // 2026-08-03: promoted to the registered BM1397 driver.
+                "BM1397",
                 Some(65),
             ),
             (
@@ -3923,7 +4166,8 @@ voltage_mv = 14800
                 "t17plus",
                 include_str!("../../configs/dcentrald_t17plus.toml"),
                 "t17+",
-                "BM1396",
+                // 2026-08-03: promoted to the registered BM1397 driver.
+                "BM1397",
                 Some(44),
             ),
             (

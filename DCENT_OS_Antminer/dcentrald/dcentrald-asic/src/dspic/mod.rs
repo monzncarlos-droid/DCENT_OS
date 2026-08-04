@@ -87,6 +87,16 @@ pub mod fw8a;
 //   cannot recur here even if a future agent reuses this module incorrectly.
 pub mod bosminer_warmup;
 
+// UB-19 (2026-08-02): framed-transport robustness parameters imported from
+// ePIC's GPL, unstripped `pic_driver.ko` (DESK EVIDENCE — protocol/timing
+// only, NO ePIC register addresses). Bounded retry (4 × 20 ms), exact
+// retryable-errno allowlist, never-retry 0x3B/0x3C, plus reference pacing
+// constants. Wiring into `DspicService` transport is default-OFF behind
+// `DCENT_DSPIC_EPIC_RETRY=1` — see the module doc for why (heartbeat
+// consecutive-failure counters and the `a lab unit`/`a lab unit` proven paths are
+// load-bearing on fail-fast semantics).
+pub mod epic_pacing;
+
 // W12.1 (RE3 R3-6, 2026-05-10): dsPIC fw=0x86 software recovery.
 //
 // `recovery_fw86` is research/test-only behind `recovery-tool`. It preserves
@@ -158,13 +168,56 @@ pub const CMD_ENABLE_VOLTAGE: u8 = 0x15;
 /// 0x16 at all — do not rely on it as the canonical app-mode keepalive.)
 pub const CMD_HEARTBEAT: u8 = 0x16;
 
-/// Legacy get-voltage / passthrough command.
+/// LM75A temperature passthrough — WRITE half (set the sensor register
+/// pointer). NOT a voltage read.
 ///
-/// Ghidra RE of `bosminer.bin` (2026-06-01) shows fw=0x89 rail measurement uses
-/// `CMD_MEASURE_VOLTAGE` (0x3A), not this opcode. On `a lab unit` captures, framed
-/// `0x3B` with sensor args `0x48..0x4B` is the LM75 passthrough WRITE half.
-/// Keep this constant for bare-path compatibility and non-0x89 research only.
-pub const CMD_GET_VOLTAGE: u8 = 0x3B;
+/// UB-11 rename (2026-08-02): this constant was historically named
+/// `CMD_GET_VOLTAGE`, a naming/semantics contradiction its own doc comment
+/// already disproved. Adjudicated evidence, strongest first:
+///   1. **Our live `a lab unit` captures** (`wave38-bosminer-truth/bosminer-i2c0-slave20.txt`):
+///      framed `0x3B` with sensor args `0x48..0x4B` is the LM75 passthrough
+///      WRITE half, paired with `0x3C` as the READ half (see
+///      [`bosminer_warmup::LM75_PT_OPCODE_WRITE`]/[`bosminer_warmup::LM75_PT_OPCODE_READ`]
+///      and [`DspicService::read_lm75_passthrough_temp`]).
+///   2. **DESK EVIDENCE, ePIC `pic_driver.ko` (GPL, unstripped, 2026-08-01)**:
+///      independently uses `[0x3B, dev, 0x00]` then `[0x3C, dev, 0x02]` as a
+///      PIC-mediated I²C passthrough pair over `temp_regs = {0x48..0x4B}`,
+///      and NEVER retries either opcode (a retry corrupts the passthrough
+///      sequence). This *concurs* with our live captures; our captures remain
+///      the authority on our hardware.
+///   3. Ghidra RE of `bosminer.bin` (2026-06-01): fw=0x89 rail measurement is
+///      `CMD_MEASURE_VOLTAGE` (0x3A), not 0x3B.
+///
+/// ⚠️ **SUPERSEDED PREMISE — do not re-derive:** the planned " framed
+/// 0x3B/0x3A rail-up-vs-dead proxy" bring-up step rested on the old
+/// `0x3B = GET_VOLTAGE` reading. `0x3B` is temperature passthrough; only
+/// `0x3A` (`CMD_MEASURE_VOLTAGE`, ADC decode) is a rail-up proxy. Any future
+/// rail-readback plan must use 0x3A (and/or 0x18 DAC readback) alone.
+///
+/// The bare-protocol (fw=0x82/0x86) `read_voltage` research path that sends
+/// bare `[55 AA 3B]` is retained UNCHANGED for non-0x89 research (see
+/// `read_voltage` — it already refuses fw=0x89/0x8A); only the NAME changed
+/// so it cannot mislead. Also mirrored as `DspicOpcode::GetV2` in
+/// `dcentrald-api-types::dspic_frame` (annotated there-adjacent via this doc).
+pub const CMD_LM75_PASSTHROUGH_WRITE: u8 = 0x3B;
+
+/// LM75A temperature passthrough — READ half (read temperature bytes through
+/// the dsPIC's PIC-mediated I²C bridge).
+///
+/// Pairs with [`CMD_LM75_PASSTHROUGH_WRITE`]; live-proven on `a lab unit`
+/// (`[55 AA 06 3C SENSOR 02 00 SUM]` → 6-byte reply `[3C 01 hi lo 01 SUM]`).
+/// DESK EVIDENCE (ePIC `pic_driver.ko`): `0x3B`/`0x3C` are NEVER retried —
+/// see [`epic_pacing::opcode_may_retry`].
+pub const CMD_LM75_PASSTHROUGH_READ: u8 = 0x3C;
+
+/// Deprecated alias for [`CMD_LM75_PASSTHROUGH_WRITE`] kept only so
+/// out-of-tree research code keeps compiling. Do not use in new code.
+#[deprecated(
+    note = "UB-11: 0x3B is the LM75 temperature passthrough WRITE half, not a \
+            voltage read — use CMD_LM75_PASSTHROUGH_WRITE (rail readback is \
+            CMD_MEASURE_VOLTAGE 0x3A / CMD_GET_VOLTAGE_DAC 0x18)"
+)]
+pub const CMD_GET_VOLTAGE: u8 = CMD_LM75_PASSTHROUGH_WRITE;
 
 /// Measure the ACTUAL chain-rail voltage via the dsPIC analog ADC.
 ///
@@ -179,9 +232,9 @@ pub const CMD_MEASURE_VOLTAGE: u8 = 0x3A;
 
 /// Read back the dsPIC's COMMANDED voltage DAC setpoint (framed, fw=0x86+).
 ///
-/// Distinct from the three other voltage opcodes: `CMD_SET_VOLTAGE` (0x10) writes the
+/// Distinct from the other opcodes: `CMD_SET_VOLTAGE` (0x10) writes the
 /// DAC, `CMD_MEASURE_VOLTAGE` (0x3A) reads the ACTUAL rail via the analog ADC, and
-/// `CMD_GET_VOLTAGE` (0x3B) is LM75 passthrough on `a lab unit`. This opcode reads back the
+/// `CMD_LM75_PASSTHROUGH_WRITE` (0x3B) is LM75 passthrough. This opcode reads back the
 /// last-commanded DAC code so a caller can confirm a `SET_VOLTAGE` write took effect
 /// (the autotuner-confirm-write use the bible cites). LuxOS/VNish both read this.
 ///
@@ -238,9 +291,27 @@ pub(crate) fn framed_voltage_dac(voltage_mv: u16) -> u8 {
 /// the inline frame builders in `set_voltage`, `enable_voltage`, `send_heartbeat`
 /// which were always correct (`LEN=0x04` for 1-byte payload, `LEN=0x05` for
 /// 2-byte ENABLE_VOLTAGE payload).
+/// UB-10 reply-shape annotation (2026-08-02, desk re-adjudication): the
+/// historical shape comments below assume NO length prefix, but the strongest
+/// held evidence says framed app-mode replies longer than 2 bytes ARE
+/// length-prefixed (`reply[0] == reply_len && reply[1] == cmd`):
+///   - DESK EVIDENCE, ePIC `pic_driver.ko` (GPL, unstripped): validates
+///     exactly that contract for every reply > 2 bytes.
+///   - Our own `a lab unit` bosminer capture (WAVE46-EEPROM-BUS-WARMUP.md): the
+///     framed GET_VERSION reply logged as `[17 89 00 A5]` only checksums when
+///     a leading LEN byte 0x05 participates in the sum
+///     (0x05 + 0x17 + 0x89 + 0x00 = 0xA5) — i.e. the wire reply is
+///     `[05 17 89 00 A5]` and the per-byte reader had already consumed LEN.
+/// So e.g. the `CMD_GET_VERSION => 5` entry's 5 bytes are really
+/// `[LEN=0x05, CMD=0x17, fw, SUM_HI=0x00, SUM_LO]`, not
+/// `[cmd_echo, status, version, ?, checksum]`. The *byte counts* below are
+/// unchanged (they were sized from live reads and stay correct); only the
+/// labeling of what those bytes mean is corrected. See
+/// [`parse_length_prefixed_framed_reply`] for the validating parser and the
+/// honest 0x45 verdict.
 fn dspic_response_len(cmd: u8) -> u8 {
     match cmd {
-        CMD_GET_VERSION => 5,     // [cmd_echo, status, version, ?, checksum]
+        CMD_GET_VERSION => 5,     // UB-10: [LEN=0x05, CMD=0x17, fw, SUM_HI, SUM_LO]
         CMD_JUMP_TO_APP => 2,     // [cmd_echo, status]
         CMD_RESET => 2,           // [cmd_echo, status]
         CMD_SET_VOLTAGE => 3,     // [cmd_echo, status, ?]
@@ -248,9 +319,10 @@ fn dspic_response_len(cmd: u8) -> u8 {
         CMD_HEARTBEAT => 6,       // [cmd_echo, status, ?, ?, ?, ?]
         CMD_MEASURE_VOLTAGE => 2, // fw=0x89-shape: be16(raw_adc) in post-envelope reply
         CMD_GET_VOLTAGE_DAC => 4, // [cmd_echo, status, dac_hi, dac_lo] — DAC setpoint readback
-        CMD_GET_VOLTAGE => 9,     // legacy/non-0x89 research only; not rail on `a lab unit`
-        CMD_READ_TEMP => 4,       // [cmd_echo, status, temp_hi, temp_lo]
-        _ => 2,                   // default: [cmd_echo, status]
+        CMD_LM75_PASSTHROUGH_WRITE => 9, // UB-11: LM75 passthrough WRITE half (was mis-named GET_VOLTAGE); bare-path research read budget
+        CMD_LM75_PASSTHROUGH_READ => 6,  // live-proven `a lab unit` reply [3C 01 hi lo 01 SUM]
+        CMD_READ_TEMP => 4,              // [cmd_echo, status, temp_hi, temp_lo]
+        _ => 2,                          // default: [cmd_echo, status]
     }
 }
 
@@ -627,6 +699,70 @@ fn parse_get_version_reply(buf: &[u8]) -> Option<u8> {
         return Some(buf[0]);
     }
 
+    None
+}
+
+/// UB-10 (2026-08-02): validate a **length-prefixed** framed dsPIC REPLY and
+/// return its payload, or `None`.
+///
+/// Contract (DESK EVIDENCE, ePIC `pic_driver.ko` GPL/unstripped): framed
+/// replies longer than 2 bytes are length-prefixed —
+/// `reply[0] == reply_len && reply[1] == cmd` — followed by the payload and a
+/// checksum over `LEN + CMD + Σpayload`. This is corroborated by our OWN held
+/// `a lab unit` capture (`WAVE46-EEPROM-BUS-WARMUP.md`): the bosminer framed
+/// GET_VERSION reply logged as `[17 89 00 A5]` only checksums when a leading
+/// `LEN = 0x05` participates in the sum (`0x05 + 0x17 + 0x89 + 0x00 = 0xA5`),
+/// i.e. the wire reply is `[05 17 89 00 A5]` and bosminer's one-SMBus-txn-
+/// per-byte reader had already consumed the LEN byte before the logged
+/// remainder. The same reading also explains the VNish-RE'd ENABLE frame
+/// `[55 AA 05 15 01 00 1B]`'s "extra 0x00 arg byte": it is `SUM_HI` of the
+/// BE16 checksum pair (see `dcentrald-api-types::dspic_frame`, UB-09).
+///
+/// Checksum acceptance mirrors the UB-09 dual model: the BE16 pair
+/// `[SUM_HI, SUM_LO]` is preferred; the legacy single trailing byte
+/// (`sum & 0xFF`) is accepted as fallback. For `sum <= 0xFF` both agree
+/// byte-for-byte (BE16 payload is one `0x00` shorter).
+///
+/// **Honest `a lab unit` `0x45` verdict (desk, no code behaviour changed by it):**
+/// the long-unexplained single byte `0x45` ('E') that `a lab unit` returned to a
+/// framed GET_VERSION does NOT resolve under this model — as a length prefix
+/// it would claim a 69-byte reply, which is implausible. It was read from a
+/// chip later proven () to be sitting in the fw=0x82 BOOTLOADER sync
+/// FSM where framed app opcodes are not recognized (RESET/JUMP were echoed as
+/// `0x07`/`0x06`; GET_VERSION got `0x45`, most plausibly a bootloader
+/// error/artifact byte). The length-prefix model explains the *bosminer
+/// app-mode* reply `[05 17 89 00 A5]` byte-exactly, not the bootloader `0x45`.
+pub fn parse_length_prefixed_framed_reply(cmd: u8, reply: &[u8]) -> Option<Vec<u8>> {
+    // Minimum: LEN + CMD + 1 checksum byte with a non-empty frame contract.
+    if reply.len() < 3 {
+        return None;
+    }
+    if reply[0] as usize != reply.len() || reply[1] != cmd {
+        return None;
+    }
+    if reply.iter().all(|&b| b == 0xFF) || reply.iter().all(|&b| b == 0x00) {
+        return None;
+    }
+    let sum_over = |bytes: &[u8]| -> u16 {
+        bytes
+            .iter()
+            .fold(0u16, |acc, &b| acc.wrapping_add(u16::from(b)))
+    };
+    // BE16 pair preferred (needs LEN >= 4: LEN + CMD + SUM_HI + SUM_LO).
+    if reply.len() >= 4 {
+        let body_end = reply.len() - 2;
+        let sum16 = sum_over(&reply[..body_end]);
+        let found16 = u16::from_be_bytes([reply[body_end], reply[body_end + 1]]);
+        if sum16 == found16 {
+            return Some(reply[2..body_end].to_vec());
+        }
+    }
+    // Legacy single trailing checksum byte.
+    let body_end = reply.len() - 1;
+    let sum8 = (sum_over(&reply[..body_end]) & 0xFF) as u8;
+    if sum8 == reply[body_end] {
+        return Some(reply[2..body_end].to_vec());
+    }
     None
 }
 
@@ -1984,7 +2120,11 @@ impl<'a> DspicController<'a> {
             });
         }
 
-        let cmd = [DSPIC_PREAMBLE[0], DSPIC_PREAMBLE[1], CMD_GET_VOLTAGE];
+        let cmd = [
+            DSPIC_PREAMBLE[0],
+            DSPIC_PREAMBLE[1],
+            CMD_LM75_PASSTHROUGH_WRITE,
+        ];
         let mut buf = [0u8; 4]; // [cmd_echo, status, voltage_hi, voltage_lo]
         self.write_read_command(&cmd, &mut buf)?;
 
@@ -2024,7 +2164,7 @@ impl<'a> DspicController<'a> {
         // needs the raw fw=0x89 reply bytes captured first — do NOT guess the offset.
         let voltage_mv = dcentrald_common::dspic_decode::decode_bare_voltage_reply(
             rx_cmd,
-            CMD_GET_VOLTAGE,
+            CMD_LM75_PASSTHROUGH_WRITE,
             buf[2],
             buf[3],
             DSPIC_MAX_VOLTAGE_MV,
@@ -2526,6 +2666,93 @@ fn keepalive_sleep_slices(total_ms: u64, interval_ms: u64) -> Vec<u64> {
     out
 }
 
+const DSPIC_CANCELLABLE_WAIT_QUANTUM: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn require_dspic_boot_active(
+    address: u8,
+    is_cancelled: &mut impl FnMut() -> bool,
+    stage: &'static str,
+) -> Result<()> {
+    if is_cancelled() {
+        return Err(crate::AsicError::Pic {
+            addr: address,
+            detail: format!("dsPIC cold boot cancelled before {stage}"),
+        });
+    }
+    Ok(())
+}
+
+fn wait_dspic_boot_active(
+    address: u8,
+    duration: std::time::Duration,
+    wait_quantum: std::time::Duration,
+    stage: &'static str,
+    is_cancelled: &mut impl FnMut() -> bool,
+    sleep: &mut impl FnMut(std::time::Duration),
+) -> Result<()> {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        require_dspic_boot_active(address, is_cancelled, stage)?;
+        let chunk = remaining.min(wait_quantum);
+        sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    require_dspic_boot_active(address, is_cancelled, stage)
+}
+
+fn run_dspic_pre_voltage_warmup(
+    address: u8,
+    bare: bool,
+    wait_quantum: std::time::Duration,
+    is_cancelled: &mut impl FnMut() -> bool,
+    sleep: &mut impl FnMut(std::time::Duration),
+    heartbeat: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut stable_heartbeats = 0u8;
+    for tick in 1..=5 {
+        wait_dspic_boot_active(
+            address,
+            std::time::Duration::from_millis(1000),
+            wait_quantum,
+            "pre-voltage heartbeat wait",
+            is_cancelled,
+            sleep,
+        )?;
+        require_dspic_boot_active(address, is_cancelled, "pre-voltage heartbeat")?;
+        match heartbeat() {
+            Ok(()) => {
+                stable_heartbeats += 1;
+                tracing::info!(
+                    addr = format_args!("0x{:02X}", address),
+                    tick,
+                    stable_heartbeats,
+                    bare,
+                    "dsPIC service pre-voltage heartbeat tick",
+                );
+            }
+            Err(error) => {
+                stable_heartbeats = 0;
+                tracing::warn!(
+                    addr = format_args!("0x{:02X}", address),
+                    tick,
+                    error = %error,
+                    "dsPIC service pre-voltage heartbeat failed",
+                );
+            }
+        }
+    }
+
+    if stable_heartbeats < 5 {
+        return Err(crate::AsicError::Pic {
+            addr: address,
+            detail: format!(
+                "dsPIC service did not complete 5 stable pre-voltage heartbeats (stable={stable_heartbeats})"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Service-backed dsPIC33EP voltage controller.
 ///
 /// This mirrors the public, raw-`I2cBus` `DspicController` methods while routing
@@ -2640,6 +2867,7 @@ pub struct DspicService {
 pub struct DspicEndpointSession {
     i2c: I2cServiceHandle,
     address: u8,
+    observed_firmware: Option<u8>,
 }
 
 impl DspicEndpointSession {
@@ -2661,6 +2889,7 @@ impl DspicEndpointSession {
         Ok(Self {
             i2c,
             address: endpoint.address(),
+            observed_firmware: endpoint.observed_firmware(),
         })
     }
 
@@ -2679,6 +2908,64 @@ impl DspicEndpointSession {
     /// by this session.
     pub fn service_with_firmware(&self, firmware: DspicFirmware) -> DspicService {
         DspicService::new_legacy_parts_with_firmware(self.i2c.clone(), self.address, firmware)
+    }
+
+    /// Consume topology/presence authority into an exact observed-protocol
+    /// owner. Discovery-provided firmware is reused without another probe;
+    /// otherwise one serialized GET_VERSION preflight is required. Unknown or
+    /// unsupported revisions never become runtime voltage authority.
+    pub fn observe_firmware(self) -> Result<ObservedDspicEndpointSession> {
+        let mut controller = match self.observed_firmware {
+            Some(version) => DspicService::new_legacy_parts_with_firmware(
+                self.i2c.clone(),
+                self.address,
+                DspicFirmware::from_version(version),
+            ),
+            None => DspicService::new_legacy_parts(self.i2c.clone(), self.address),
+        };
+        if self.observed_firmware.is_none() {
+            controller.preflight()?;
+        }
+        let firmware = controller.firmware();
+        ensure_dspic_runtime_protocol_is_proven(
+            self.address,
+            firmware,
+            "endpoint firmware observation",
+        )?;
+        Ok(ObservedDspicEndpointSession {
+            controller,
+            i2c: self.i2c,
+            address: self.address,
+            firmware,
+        })
+    }
+}
+
+/// Move-only topology, presence, and supported firmware authority for one
+/// service-backed dsPIC endpoint. All controller views preserve the consumed
+/// endpoint identity; callers cannot substitute an address or protocol hint.
+pub struct ObservedDspicEndpointSession {
+    controller: DspicService,
+    i2c: I2cServiceHandle,
+    address: u8,
+    firmware: DspicFirmware,
+}
+
+impl ObservedDspicEndpointSession {
+    pub fn address(&self) -> u8 {
+        self.address
+    }
+
+    pub fn firmware(&self) -> DspicFirmware {
+        self.firmware
+    }
+
+    pub fn controller_mut(&mut self) -> &mut DspicService {
+        &mut self.controller
+    }
+
+    pub fn controller(&self) -> DspicService {
+        DspicService::new_legacy_parts_with_firmware(self.i2c.clone(), self.address, self.firmware)
     }
 }
 
@@ -3026,7 +3313,25 @@ impl DspicService {
     /// `cold_boot_init_with_options(voltage_mv, true)` to skip the
     /// duplicate-and-slow internal loop.
     pub fn cold_boot_init(&mut self, voltage_mv: u16) -> Result<()> {
-        self.cold_boot_init_with_options(voltage_mv, false)
+        self.cold_boot_init_with_options_policy(voltage_mv, false, std::time::Duration::MAX, || {
+            false
+        })
+    }
+
+    /// Cancellation-aware default cold boot. Cancellation is checked before
+    /// every rail-touching mutation and at bounded intervals throughout the
+    /// pre-voltage warmup.
+    pub fn cold_boot_init_cancellable(
+        &mut self,
+        voltage_mv: u16,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
+        self.cold_boot_init_with_options_policy(
+            voltage_mv,
+            false,
+            DSPIC_CANCELLABLE_WAIT_QUANTUM,
+            is_cancelled,
+        )
     }
 
     /// Variant of `cold_boot_init` with an explicit `skip_warmup_loop` knob.
@@ -3045,11 +3350,42 @@ impl DspicService {
         voltage_mv: u16,
         skip_warmup_loop: bool,
     ) -> Result<()> {
+        self.cold_boot_init_with_options_policy(
+            voltage_mv,
+            skip_warmup_loop,
+            std::time::Duration::MAX,
+            || false,
+        )
+    }
+
+    pub fn cold_boot_init_with_options_cancellable(
+        &mut self,
+        voltage_mv: u16,
+        skip_warmup_loop: bool,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
+        self.cold_boot_init_with_options_policy(
+            voltage_mv,
+            skip_warmup_loop,
+            DSPIC_CANCELLABLE_WAIT_QUANTUM,
+            is_cancelled,
+        )
+    }
+
+    fn cold_boot_init_with_options_policy(
+        &mut self,
+        voltage_mv: u16,
+        skip_warmup_loop: bool,
+        wait_quantum: std::time::Duration,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
         ensure_dspic_voltage_command_allowed(
             self.address,
             self.firmware,
             "service cold_boot_init",
         )?;
+        require_dspic_boot_active(self.address, &mut is_cancelled, "controller initialization")?;
+        let mut sleep = std::thread::sleep;
 
         let voltage_v = voltage_mv as f64 / 1000.0;
         tracing::info!(
@@ -3129,6 +3465,11 @@ impl DspicService {
                 // framed). enable_voltage() selects the form from
                 // use_bare_protocol (framed here) — wire bytes UNCHANGED vs every
                 // other path.
+                require_dspic_boot_active(
+                    self.address,
+                    &mut is_cancelled,
+                    "bosminer-minimal voltage enable",
+                )?;
                 self.enable_voltage()?;
                 // Post-ENABLE only (rail now energized + chip in app mode): the
                 // same 1 s settle + single bus-alive heartbeat the legacy path
@@ -3136,7 +3477,19 @@ impl DspicService {
                 // and matches bosminer (which reads sensors after ENABLE); a
                 // `0x16` on an already-energized app-mode chip is the legitimate
                 // watchdog refresh, not a fault. NON-FATAL.
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+                wait_dspic_boot_active(
+                    self.address,
+                    std::time::Duration::from_millis(1000),
+                    wait_quantum,
+                    "post-enable stabilization",
+                    &mut is_cancelled,
+                    &mut sleep,
+                )?;
+                require_dspic_boot_active(
+                    self.address,
+                    &mut is_cancelled,
+                    "post-enable heartbeat",
+                )?;
                 if let Err(e) = self.send_heartbeat() {
                     tracing::warn!(
                         addr = format_args!("0x{:02X}", self.address),
@@ -3158,11 +3511,24 @@ impl DspicService {
             );
         }
 
+        require_dspic_boot_active(self.address, &mut is_cancelled, "parser flush")?;
         self.flush_parser();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        wait_dspic_boot_active(
+            self.address,
+            std::time::Duration::from_millis(10),
+            wait_quantum,
+            "post-flush stabilization",
+            &mut is_cancelled,
+            &mut sleep,
+        )?;
 
         if self.firmware != DspicFirmware::Unknown {
             self.use_bare_protocol = self.firmware.protocol() == DspicProtocol::Bare;
+            require_dspic_boot_active(
+                self.address,
+                &mut is_cancelled,
+                "firmware-selected heartbeat",
+            )?;
             if let Err(e) = self.send_heartbeat() {
                 tracing::warn!(
                     addr = format_args!("0x{:02X}", self.address),
@@ -3174,8 +3540,18 @@ impl DspicService {
             }
         } else {
             self.use_bare_protocol = false;
+            require_dspic_boot_active(
+                self.address,
+                &mut is_cancelled,
+                "framed protocol heartbeat",
+            )?;
             if let Err(framed_err) = self.send_heartbeat() {
                 self.use_bare_protocol = true;
+                require_dspic_boot_active(
+                    self.address,
+                    &mut is_cancelled,
+                    "bare protocol heartbeat fallback",
+                )?;
                 if let Err(bare_err) = self.send_heartbeat() {
                     self.use_bare_protocol = false;
                     tracing::warn!(
@@ -3229,6 +3605,11 @@ impl DspicService {
             let mut sanity_ok = false;
             let mut last_hb_err: Option<crate::AsicError> = None;
             for attempt in 1..=4u8 {
+                require_dspic_boot_active(
+                    self.address,
+                    &mut is_cancelled,
+                    "external-warmup sanity heartbeat",
+                )?;
                 match self.send_heartbeat() {
                     Ok(()) => {
                         sanity_ok = true;
@@ -3243,7 +3624,14 @@ impl DspicService {
                              settling 1100ms for the rate-limited I2C bus fd-reopen, then retrying",
                         );
                         last_hb_err = Some(e);
-                        std::thread::sleep(std::time::Duration::from_millis(1100));
+                        wait_dspic_boot_active(
+                            self.address,
+                            std::time::Duration::from_millis(1100),
+                            wait_quantum,
+                            "I2C reopen stabilization",
+                            &mut is_cancelled,
+                            &mut sleep,
+                        )?;
                     }
                 }
             }
@@ -3260,42 +3648,21 @@ impl DspicService {
                 });
             }
         } else {
-            let mut stable_heartbeats = 0u8;
-            for tick in 1..=5 {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-                match self.send_heartbeat() {
-                    Ok(()) => {
-                        stable_heartbeats += 1;
-                        tracing::info!(
-                            addr = format_args!("0x{:02X}", self.address),
-                            tick,
-                            stable_heartbeats,
-                            bare = self.use_bare_protocol,
-                            "dsPIC service pre-voltage heartbeat tick",
-                        );
-                    }
-                    Err(e) => {
-                        stable_heartbeats = 0;
-                        tracing::warn!(
-                            addr = format_args!("0x{:02X}", self.address),
-                            tick,
-                            error = %e,
-                            "dsPIC service pre-voltage heartbeat failed",
-                        );
-                    }
-                }
-            }
-
-            if stable_heartbeats < 5 {
-                return Err(crate::AsicError::Pic {
-                    addr: self.address,
-                    detail: format!(
-                        "dsPIC service did not complete 5 stable pre-voltage heartbeats (stable={})",
-                        stable_heartbeats
-                    ),
-                });
-            }
+            run_dspic_pre_voltage_warmup(
+                self.address,
+                self.use_bare_protocol,
+                wait_quantum,
+                &mut is_cancelled,
+                &mut sleep,
+                &mut || self.send_heartbeat(),
+            )?;
         }
+
+        require_dspic_boot_active(
+            self.address,
+            &mut is_cancelled,
+            "post-warmup controller sequence",
+        )?;
 
         // Post-JUMP heartbeat keep-alive (2026-06-07, `a lab unit` standalone
         // cold-engage) — START of the continuous bounded keep-alive: the
@@ -3306,7 +3673,9 @@ impl DspicService {
         // interleaved; sleeps are chunked) so it never drifts back to fw=0x82
         // bootloader. No-op unless caller-gated (env + `a lab unit` fingerprint) AND
         // framed; default-OFF ⇒ byte-identical.
+        require_dspic_boot_active(self.address, &mut is_cancelled, "post-warmup keepalive")?;
         self.postjump_keepalive_tick("post-warmup");
+        require_dspic_boot_active(self.address, &mut is_cancelled, "LM75A observation")?;
 
         // P1.7 LM75A WIRING READ — 3-corpus RE consensus 2026-04-26
         // (bosminer.log, VNish 1.2.7 cgminer, Bitmain stock CV bmminer).
@@ -3353,9 +3722,11 @@ impl DspicService {
                 "dsPIC service LM75A pre-voltage wiring read complete (4x passthrough at 0x48-0x4B)"
             );
         }
+        require_dspic_boot_active(self.address, &mut is_cancelled, "post-LM75A settle")?;
         // Keep-alive (default-OFF): byte-identical `thread::sleep(50ms)` unless
         // active, in which case the settle is chunked with keep-alive ticks.
         self.keepalive_sleep(50, "post-lm75-settle");
+        require_dspic_boot_active(self.address, &mut is_cancelled, "post-LM75A rail decision")?;
 
         // Ghidra-RE PART A (2026-05-29, DCENT_AM2_DSPIC_SENSOR_ONLY) — skip
         // the dsPIC SetVoltage (0x10) + ENABLE_VOLTAGE (0x15) writes entirely.
@@ -3386,6 +3757,11 @@ impl DspicService {
             // Issue one heartbeat so we still confirm the bus is alive on this
             // dsPIC after the (sensor-only) cold-boot init — matches the
             // post-enable heartbeat the non-skip path issues below.
+            require_dspic_boot_active(
+                self.address,
+                &mut is_cancelled,
+                "sensor-only completion heartbeat",
+            )?;
             if let Err(e) = self.send_heartbeat() {
                 tracing::warn!(
                     addr = format_args!("0x{:02X}", self.address),
@@ -3406,6 +3782,7 @@ impl DspicService {
         // app-mode watchdog immediately BEFORE SetVoltage (0x10), closing the
         // LM75A-read-to-SetVoltage gap so the chip is still in app mode when
         // the DAC program lands. No-op unless caller-gated + framed.
+        require_dspic_boot_active(self.address, &mut is_cancelled, "pre-voltage keepalive")?;
         self.postjump_keepalive_tick("pre-setvoltage");
         // Re-JUMP-before-ENABLE (2026-06-07, `a lab unit` standalone cold-engage) —
         // the LIVE-confirmed SOLE remaining blocker fix. Immediately before
@@ -3420,7 +3797,13 @@ impl DspicService {
         // framed; default-OFF ⇒ byte-identical (no extra GET_VERSION/JUMP). The
         // re-JUMP preserves self.firmware/use_bare_protocol so the SetVoltage /
         // ENABLE wire bytes are unchanged.
+        require_dspic_boot_active(
+            self.address,
+            &mut is_cancelled,
+            "pre-voltage app-mode check",
+        )?;
         self.rejump_to_app_mode_if_drifted();
+        require_dspic_boot_active(self.address, &mut is_cancelled, "voltage set")?;
         #[allow(clippy::nonminimal_bool)]
         if !(self.skip_setvoltage_keep_enable && !self.use_bare_protocol) {
             match self.set_voltage(voltage_mv) {
@@ -3474,15 +3857,25 @@ impl DspicService {
         // active, in which case the SetVoltage→ENABLE settle is chunked with
         // keep-alive ticks so the chip stays in app mode right up to ENABLE.
         self.keepalive_sleep(50, "post-setvoltage-settle");
+        require_dspic_boot_active(self.address, &mut is_cancelled, "pre-enable keepalive")?;
         // Post-JUMP heartbeat keep-alive tick 3 of 3: refresh the fw=0x89
         // app-mode watchdog immediately BEFORE ENABLE (0x15). This is the
         // load-bearing one — LIVE on `a lab unit` the ENABLE returned ack_cmd=0x82
         // (drifted back to bootloader) because the chip went unserviced
         // between GET_VERSION and ENABLE. No-op unless caller-gated + framed.
         self.postjump_keepalive_tick("pre-enable");
+        require_dspic_boot_active(self.address, &mut is_cancelled, "voltage enable")?;
         self.enable_voltage()?;
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        wait_dspic_boot_active(
+            self.address,
+            std::time::Duration::from_millis(1000),
+            wait_quantum,
+            "post-enable stabilization",
+            &mut is_cancelled,
+            &mut sleep,
+        )?;
 
+        require_dspic_boot_active(self.address, &mut is_cancelled, "post-enable heartbeat")?;
         if let Err(e) = self.send_heartbeat() {
             tracing::warn!(
                 addr = format_args!("0x{:02X}", self.address),
@@ -4001,7 +4394,11 @@ impl DspicService {
             });
         }
 
-        let cmd = [DSPIC_PREAMBLE[0], DSPIC_PREAMBLE[1], CMD_GET_VOLTAGE];
+        let cmd = [
+            DSPIC_PREAMBLE[0],
+            DSPIC_PREAMBLE[1],
+            CMD_LM75_PASSTHROUGH_WRITE,
+        ];
         let buf = self.write_read_command(&cmd, 4)?;
 
         if buf[0] == 0xFF && buf[1] == 0xFF {
@@ -4018,7 +4415,7 @@ impl DspicService {
         // Offset-correct framed decode pends a raw fw=0x89 reply capture — do NOT guess.
         let voltage_mv = dcentrald_common::dspic_decode::decode_bare_voltage_reply(
             buf[0],
-            CMD_GET_VOLTAGE,
+            CMD_LM75_PASSTHROUGH_WRITE,
             buf[2],
             buf[3],
             DSPIC_MAX_VOLTAGE_MV,
@@ -4249,12 +4646,16 @@ impl DspicService {
             self.use_bare_protocol,
             data,
         )?;
-        self.i2c
-            .write_bytes_mutating(label, self.address, data)
-            .map_err(|e| crate::AsicError::Pic {
-                addr: self.address,
-                detail: format!("svc write: {}", e),
-            })
+        // UB-19: default-OFF ePIC bounded retry (DESK EVIDENCE). Flag unset
+        // ⇒ exactly one attempt, identical to the pre-UB-19 transport.
+        let opcode = epic_pacing::wire_frame_opcode(data, self.use_bare_protocol);
+        epic_pacing::run_with_bounded_retry(opcode, || {
+            self.i2c.write_bytes_mutating(label, self.address, data)
+        })
+        .map_err(|e| crate::AsicError::Pic {
+            addr: self.address,
+            detail: format!("svc write: {}", e),
+        })
     }
 
     fn write_read(&self, write_data: &[u8], read_len: usize) -> Result<Vec<u8>> {
@@ -4264,17 +4665,23 @@ impl DspicService {
             self.use_bare_protocol,
             write_data,
         )?;
-        self.i2c
-            .write_read_mutating(
+        // UB-19: default-OFF ePIC bounded retry (DESK EVIDENCE). The opcode
+        // extraction returns None for non-preamble byte strings, which the
+        // executor treats as never-retryable (fail-closed). 0x3B/0x3C are
+        // excluded even when the flag is ON.
+        let opcode = epic_pacing::wire_frame_opcode(write_data, self.use_bare_protocol);
+        epic_pacing::run_with_bounded_retry(opcode, || {
+            self.i2c.write_read_mutating(
                 I2cMutationLabel::QueryPrelude,
                 self.address,
                 write_data,
                 read_len,
             )
-            .map_err(|e| crate::AsicError::Pic {
-                addr: self.address,
-                detail: format!("svc write_read: {}", e),
-            })
+        })
+        .map_err(|e| crate::AsicError::Pic {
+            addr: self.address,
+            detail: format!("svc write_read: {}", e),
+        })
     }
 
     fn write_read_command(&self, write_data: &[u8], read_len: usize) -> Result<Vec<u8>> {
@@ -4315,13 +4722,20 @@ impl DspicService {
 
         let steps = dspic_bytewise_write_then_read_steps(frame, read_len, delay_ms);
 
-        let reads = self
-            .i2c
-            .transaction_mutating(mutation_label, self.address, steps)
-            .map_err(|e| crate::AsicError::Pic {
-                addr: self.address,
-                detail: format!("{} bytewise transaction: {}", label, e),
-            })?;
+        // UB-19: default-OFF ePIC bounded retry (DESK EVIDENCE). This is the
+        // transport the LM75 passthrough pair (0x3B/0x3C) rides — those
+        // opcodes are excluded from retry even when the flag is ON, exactly
+        // per ePIC's pic_driver.ko (a retry corrupts the passthrough
+        // sequence).
+        let opcode = epic_pacing::wire_frame_opcode(frame, self.use_bare_protocol);
+        let reads = epic_pacing::run_with_bounded_retry(opcode, || {
+            self.i2c
+                .transaction_mutating(mutation_label, self.address, steps.clone())
+        })
+        .map_err(|e| crate::AsicError::Pic {
+            addr: self.address,
+            detail: format!("{} bytewise transaction: {}", label, e),
+        })?;
         let reply = collect_single_byte_i2c_reads(reads);
         if reply.len() != read_len {
             return Err(crate::AsicError::Pic {
@@ -4866,6 +5280,17 @@ impl Pic0x89Service {
         self.inner.cold_boot_init(voltage_mv)
     }
 
+    /// Initialize with cancellation checked throughout the internal warmup
+    /// and immediately before SetVoltage/Enable rail mutations.
+    pub fn cold_boot_init_cancellable(
+        &mut self,
+        voltage_mv: u16,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<()> {
+        self.inner
+            .cold_boot_init_cancellable(voltage_mv, is_cancelled)
+    }
+
     /// Initialize the voltage controller in cold-boot mode, opting out of
     /// the internal 5×1s pre-voltage heartbeat warmup loop when the caller
     /// already ran an external warmup pass (Layer 3 of the 2026-05-22
@@ -4970,7 +5395,11 @@ impl Pic0x89Service {
     /// the read was incomplete — the partial bytes are then in the warn log).
     pub fn dump_voltage_raw(&mut self, read_len: usize) -> Vec<u8> {
         self.inner.dump_framed_telemetry_raw(
-            &[DSPIC_PREAMBLE[0], DSPIC_PREAMBLE[1], CMD_GET_VOLTAGE],
+            &[
+                DSPIC_PREAMBLE[0],
+                DSPIC_PREAMBLE[1],
+                CMD_LM75_PASSTHROUGH_WRITE,
+            ],
             read_len,
         )
     }
@@ -5070,16 +5499,40 @@ pub fn ensure_jump_allowed(variant: PicVariant) -> std::result::Result<(), &'sta
 // future S17-specific tweaks (e.g. clamp/CRAB voltage telemetry, dsPIC
 // firmware update via `update_app_program`) a single place to land.
 //
-// XXX: confirm against live S17 — the current S17 path ships untested.
-// Specifically:
-//   * I²C addresses on S17 boards are believed to be 0x20/0x21/0x22 (per
-//     the S19 RE corpus), but the S17 RE document references 0x88/0x89/
-//     0xB9/0xFE as firmware-version IDs. Live S17 i2cdetect needed.
-//   * Bare-vs-framed protocol mode: S17 dsPIC33EP fw is expected to be
-//     framed (matches S19j 0x89 family), but live verification needed
-//     before voltage commands ship.
-//   * Default voltage envelope (`DEFAULT_VOLTAGE_MV` 13.80 V) is the S19
-//     value; S17 may use a different rail target.
+// PARTIALLY FIRMWARE-GROUNDED (S17 BHB07601 single-board-test RE, 2026-07-24;
+// corpus /
+// single-board-test.dec/`). What the jig RE now CONFIRMS (no longer "confirm
+// against live"):
+//   * FRAMED protocol CONFIRMED — the S17 dsPIC33EP16GS202 speaks the SAME
+//     `[0x55 0xAA LEN CMD payload… CKSUM_hi CKSUM_lo]` envelope as the S19j
+//     0x89 family. Byte-exact from `set_dsPIC33EP16GS202_voltage@23D40`,
+//     `set_dsPIC33EP16GS202_threshold_voltage@23E30`,
+//     `enable_dsPIC33EP16GS202_clamping_voltage@24090`,
+//     `dsPIC33EP16GS202_read_out_4_voltage@24394`. It is NOT the BARE 3-byte
+//     path. So the framed `DspicController` / `Pic0x89Service` transport is
+//     the correct byte-level layer for S17 voltage commands.
+//   * Command set (firmware-grounded): SET_VOLTAGE CMD=0x10 LEN=0x07 ACK=[0x10,0x01];
+//     SET_THRESHOLD_VOLTAGE CMD=0x33 LEN=0x0E ACK=[0x33,0x01]; ENABLE_CLAMPING
+//     CMD=0x31 LEN=0x05 ACK=[0x31,0x01]; READ_OUT_4_VOLTAGE CMD=0x28 LEN=0x04
+//     ACK=[0x28,0x01]+4×u16-BE ADC. Checksum = 16-bit sum of [LEN,CMD,payload…]
+//     transmitted big-endian (verified: SET_VOLTAGE cksum = voltage+0x17 =
+//     voltage+LEN+CMD; ENABLE cksum = enable+0x36 = enable+LEN+CMD).
+//   * The SET_VOLTAGE payload byte is a DAC N-value (index), NOT millivolts —
+//     the mV→N mapping is the APW8/APW9 `power_calculate_voltage` curve, and
+//     the chain-rail target is a per-fixture `Conf.Voltage1..9` table, not a
+//     single hardcoded envelope.
+//
+// STILL GENUINELY NEEDS A LIVE S17 (the jig does not settle these):
+//   * dsPIC I²C slave address. The single-board-test reaches the dsPIC through
+//     an FPGA-bridged I²C command register (`which_i2c<<26 | which_chain<<16 |
+//     0x400000`), so the physical 7-bit address is NOT visible in the jig.
+//     The 0x20/0x21/0x22 assumption is inherited from the AM2 S19 path and is
+//     architecturally suspect on S17 (kernel FPGA-driver Zynq, not the AM2
+//     `/dev/i2c-0` direct-address bus). Live `i2cdetect` / bus-topology needed
+//     before any voltage write ships. PROBE_ADDRS stays unverified below.
+//   * Absolute chain-rail envelope (`DEFAULT_VOLTAGE_MV` 13.80 V is the S19
+//     value). RE-derived DAC formula governs, but the S17-correct default
+//     target + ceiling need a live rail measurement (fail-closed until then).
 
 /// Convenience constructors for S17 hash boards using the dsPIC33EP16GS202
 /// voltage controller.
@@ -5094,8 +5547,11 @@ pub struct Dspic33Ep16Gs202;
 
 impl Dspic33Ep16Gs202 {
     /// I²C address probe order for S17 dsPIC33EP16GS202 boards.
-    /// Same physical addresses as the S19 family (0x20..=0x22).
-    /// XXX: confirm against live S17.
+    /// Inherited from the S19 family (0x20..=0x22). STILL NEEDS LIVE S17:
+    /// the S17 BHB07601 jig addresses the dsPIC through an FPGA I²C bridge,
+    /// so the physical 7-bit slave address is not recoverable from the RE
+    /// corpus (see the family-alias header above). Live `i2cdetect` required
+    /// before this probe order can be trusted on an S17.
     pub const PROBE_ADDRS: [u8; 3] = DSPIC_PROBE_ADDRS;
 
     /// Build a raw-bus `DspicController` for an S17 hash board.
@@ -5143,6 +5599,93 @@ mod pic0x89_tests {
     /// as dcentrald/tests/cold_boot_init_with_options_skip_warmup.rs but kept
     /// host-runnable inside the asic crate).
     const MOD_SRC: &str = include_str!("mod.rs");
+
+    #[test]
+    fn observed_dspic_endpoint_session_rejects_unknown_and_unmodeled_firmware() {
+        for firmware in [DspicFirmware::Unknown, DspicFirmware::Other(0x88)] {
+            assert!(ensure_dspic_runtime_protocol_is_proven(
+                0x20,
+                firmware,
+                "endpoint firmware observation"
+            )
+            .is_err());
+        }
+
+        let observe = MOD_SRC
+            .split("    pub fn observe_firmware(self)")
+            .nth(1)
+            .expect("consuming endpoint firmware observation")
+            .split("/// Move-only topology")
+            .next()
+            .expect("bounded endpoint observation");
+        assert!(observe.contains("controller.preflight()?"));
+        assert!(observe.contains("ensure_dspic_runtime_protocol_is_proven("));
+    }
+
+    #[test]
+    fn observed_dspic_endpoint_session_preserves_bound_address_and_firmware_for_all_views() {
+        let owner = MOD_SRC
+            .split("pub struct ObservedDspicEndpointSession")
+            .nth(1)
+            .expect("observed endpoint owner")
+            .split("impl DspicService")
+            .next()
+            .expect("bounded observed endpoint owner");
+        assert!(owner.contains("controller: DspicService"));
+        assert!(owner.contains("address: u8"));
+        assert!(owner.contains("firmware: DspicFirmware"));
+        assert!(owner.contains("pub fn controller_mut(&mut self)"));
+        assert!(owner.contains("DspicService::new_legacy_parts_with_firmware("));
+        assert!(owner.contains("self.address"));
+        assert!(owner.contains("self.firmware"));
+        assert!(!owner.contains("pub address:"));
+        assert!(!owner.contains("pub firmware:"));
+    }
+
+    #[test]
+    fn cancellable_dspic_warmup_never_reaches_set_voltage_or_enable_after_cancel() {
+        let cancelled = std::cell::Cell::new(false);
+        let mut operations = Vec::new();
+        let warmup = run_dspic_pre_voltage_warmup(
+            0x20,
+            true,
+            DSPIC_CANCELLABLE_WAIT_QUANTUM,
+            &mut || cancelled.get(),
+            &mut |_| cancelled.set(true),
+            &mut || {
+                operations.push("heartbeat");
+                Ok(())
+            },
+        );
+        if warmup.is_ok() {
+            operations.push("set-voltage");
+            operations.push("enable");
+        }
+
+        assert!(warmup.unwrap_err().to_string().contains("cancelled"));
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn legacy_dspic_warmup_preserves_five_single_second_sleeps() {
+        let mut sleeps = Vec::new();
+        let mut heartbeats = 0u8;
+        run_dspic_pre_voltage_warmup(
+            0x20,
+            true,
+            std::time::Duration::MAX,
+            &mut || false,
+            &mut |duration| sleeps.push(duration),
+            &mut || {
+                heartbeats += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sleeps, vec![std::time::Duration::from_secs(1); 5]);
+        assert_eq!(heartbeats, 5);
+    }
 
     /// Corpus-pin (2026-07-02 firmware-corpus mining): the dsPIC framed
     /// command opcodes + preamble are RE-confirmed byte-exact against multiple
@@ -5399,10 +5942,24 @@ mod pic0x89_tests {
             call_idx < setv_idx,
             "the re-JUMP must be invoked BEFORE SetVoltage"
         );
+        let between = &MOD_SRC[call_idx + "self.rejump_to_app_mode_if_drifted();".len()..setv_idx];
         assert!(
-            setv_idx - call_idx < 200,
-            "the re-JUMP must be invoked IMMEDIATELY before SetVoltage (no long read/sleep between)"
+            between.contains("require_dspic_boot_active"),
+            "cancellation must be rechecked after re-JUMP and before SetVoltage"
         );
+        for forbidden in [
+            "sleep(",
+            "read_",
+            "send_",
+            "get_version(",
+            "enable_voltage(",
+            "set_voltage(",
+        ] {
+            assert!(
+                !between.contains(forbidden),
+                "the re-JUMP→SetVoltage window contains forbidden long/I/O operation {forbidden}"
+            );
+        }
     }
 
     /// Skip-SetVoltage-keep-ENABLE (2026-06-07, `a lab unit` standalone cold-engage):
@@ -6594,6 +7151,104 @@ mod pic0x89_tests {
     }
 
     #[test]
+    fn ub11_lm75_passthrough_constants_match_live_proven_bosminer_warmup_pair() {
+        // UB-11: the renamed canonical constants must stay byte-equal to the
+        // live-proven `a lab unit` passthrough pair in bosminer_warmup, and 0x3B must
+        // never be presented as a rail-voltage opcode again (rail readback is
+        // 0x3A ADC / 0x18 DAC).
+        assert_eq!(
+            CMD_LM75_PASSTHROUGH_WRITE,
+            bosminer_warmup::LM75_PT_OPCODE_WRITE
+        );
+        assert_eq!(
+            CMD_LM75_PASSTHROUGH_READ,
+            bosminer_warmup::LM75_PT_OPCODE_READ
+        );
+        assert_ne!(CMD_LM75_PASSTHROUGH_WRITE, CMD_MEASURE_VOLTAGE);
+        assert_ne!(CMD_LM75_PASSTHROUGH_WRITE, CMD_GET_VOLTAGE_DAC);
+        // The deprecated compatibility alias must keep the same wire byte.
+        #[allow(deprecated)]
+        {
+            assert_eq!(CMD_GET_VOLTAGE, CMD_LM75_PASSTHROUGH_WRITE);
+        }
+    }
+
+    #[test]
+    fn ub10_length_prefixed_reply_parser_validates_dot25_bosminer_get_version() {
+        // Desk anchor (WAVE46-EEPROM-BUS-WARMUP.md): bosminer's framed
+        // GET_VERSION reply on `a lab unit` logged as `[17 89 00 A5]` — the full wire
+        // reply is `[05 17 89 00 A5]` (bosminer's per-byte reader consumed the
+        // LEN byte first). Checksum only closes with LEN in the sum:
+        //   0x05 + 0x17 + 0x89 + 0x00 = 0xA5  (BE16 pair [0x00, 0xA5]).
+        let payload =
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0x05, 0x17, 0x89, 0x00, 0xA5])
+                .expect("length-prefixed .25 GET_VERSION reply must validate");
+        assert_eq!(payload, [0x89], "BE16 reading: fw byte only");
+
+        // The historical no-length-prefix reading `[17 89 00 A5]` does NOT
+        // checksum under any model (0x17+0x89+0x00 = 0xA0 ≠ 0xA5) — the
+        // length prefix is load-bearing.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0x17, 0x89, 0x00, 0xA5]),
+            None
+        );
+
+        // parse_get_version_reply already accepts the length-prefixed shape
+        // (the "VNish/re-derived framed reply" arm) — pin the agreement.
+        assert_eq!(
+            parse_get_version_reply(&[0x05, 0x17, 0x89, 0x00, 0xA5]),
+            Some(0x89)
+        );
+    }
+
+    #[test]
+    fn ub10_length_prefixed_reply_parser_rejects_wrong_len_cmd_and_noise() {
+        // Wrong length prefix.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0x06, 0x17, 0x89, 0x00, 0xA5]),
+            None
+        );
+        // Wrong command echo.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_HEARTBEAT, &[0x05, 0x17, 0x89, 0x00, 0xA5]),
+            None
+        );
+        // Bad checksum.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0x05, 0x17, 0x89, 0x00, 0xA6]),
+            None
+        );
+        // Bus noise.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None
+        );
+
+        // Honest 0x45 verdict (UB-10): the `a lab unit` bootloader-mode single byte
+        // 0x45 ('E') does NOT resolve as a length prefix (it would claim a
+        // 69-byte reply) — it stays a fw=0x82 bootloader-sync artifact, per
+        // the  BARE-protocol resolution. Pin that this parser does not
+        // "explain" it.
+        assert_eq!(
+            parse_length_prefixed_framed_reply(CMD_GET_VERSION, &[0x45]),
+            None
+        );
+    }
+
+    #[test]
+    fn ub10_length_prefixed_reply_parser_accepts_am3_heartbeat_reply() {
+        // The live-proven AM3 heartbeat reply body `[06 16 01 00 00 1D]` is
+        // length-prefixed too: LEN=0x06, CMD=0x16, and the checksum closes as
+        // BE16 (0x06+0x16+0x01+0x00 = 0x001D → [0x00, 0x1D]).
+        let payload = parse_length_prefixed_framed_reply(
+            CMD_HEARTBEAT,
+            &[0x06, 0x16, 0x01, 0x00, 0x00, 0x1D],
+        )
+        .expect("AM3 heartbeat reply must validate");
+        assert_eq!(payload, [0x01, 0x00], "BE16 reading");
+    }
+
+    #[test]
     fn dspic_framed_checksum_is_sum_not_xor() {
         // Heartbeat framed: [55 AA 04 16 00 1A] — CKSUM = (0x04+0x16+0x00)&0xFF = 0x1A
         // SetVoltage framed: [55 AA 04 10 06 1A] — CKSUM = (0x04+0x10+0x06)&0xFF = 0x1A
@@ -6687,12 +7342,12 @@ mod pic0x89_tests {
     #[test]
     fn measure_voltage_0x3a_frame_is_byte_exact_and_distinct_from_get_voltage() {
         // CMD_MEASURE_VOLTAGE (0x3A) is the Ghidra-proven fw=0x89 ADC rail read and
-        // is distinct from legacy/residual CMD_GET_VOLTAGE (0x3B). measure_voltage()
+        // is distinct from LM75-passthrough CMD_LM75_PASSTHROUGH_WRITE (0x3B, ex-CMD_GET_VOLTAGE). measure_voltage()
         // passes a [0x00] payload so the framed wire form is byte-exact to
         // dspic-protocol-bible §2: [55 AA 04 3A 00 3E] (cgminer literal 0x94888,
         // also pinned in dcentrald-api-types::dspic_frame verified-frames table).
         assert_eq!(CMD_MEASURE_VOLTAGE, 0x3A);
-        assert_ne!(CMD_MEASURE_VOLTAGE, CMD_GET_VOLTAGE);
+        assert_ne!(CMD_MEASURE_VOLTAGE, CMD_LM75_PASSTHROUGH_WRITE);
 
         // Reconstruct the framed frame the way encode_command_frame builds it for
         // the [55 AA 3A 00] command (1-byte payload): LEN = payload+3 = 0x04,

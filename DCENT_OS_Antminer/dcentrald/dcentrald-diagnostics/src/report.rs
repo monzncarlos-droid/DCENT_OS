@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::board_health::BoardHealthResult;
 use crate::chip_health::{ChipHealthSnapshot, ChipMap};
 use crate::evidence::{DiagnosticEvidence, EvidenceKind};
-use crate::hashreport::HashReport;
+use crate::hashreport::{calculate_board_grade, canonicalize_hashreport, HashReport};
 
 /// Default report storage directory.
 pub const REPORT_DIR: &str = "/data/reports";
@@ -338,10 +338,24 @@ impl ReportGenerator {
     /// - Unit grade with explanation
     /// - Warnings and recommendations
     pub fn render_hashreport(&self, report: &HashReport) -> crate::Result<String> {
+        let mut canonical_report = report.clone();
+        canonicalize_hashreport(&mut canonical_report);
+        let report = &canonical_report;
+        let unit_grade = report.unit_grade;
         let mut board_sections = String::new();
         for board in &report.boards {
+            let board_grade = calculate_board_grade(board);
+            let chip_count_evidence =
+                evidence_label(&board.chip_count_evidence, &board.chips_responding);
             let voltage_evidence = evidence_label(&board.voltage_evidence, &board.voltage_v);
+            let temperature_evidence = evidence_label(&board.temperature_evidence, &board.temp_c);
             let crc_evidence = evidence_label(&board.crc_evidence, &board.crc_errors);
+            let crc_window_evidence =
+                evidence_label(&board.crc_window_evidence, &board.crc_commands_sent);
+            let eeprom_presence_evidence =
+                evidence_label(&board.eeprom_presence_evidence, &board.eeprom_present);
+            let eeprom_validity_evidence =
+                evidence_label(&board.eeprom_evidence, &board.eeprom_valid);
             let chip_rows = board
                 .chips
                 .iter()
@@ -355,27 +369,35 @@ impl ReportGenerator {
                 .collect::<Vec<_>>()
                 .join("");
             board_sections.push_str(&format!(
-                "<section class=\"card\"><h3>Chain {}</h3><p>Grade <strong style=\"color:{}\">{}</strong> | {}/{} chips responding | {:.2} TH/s | {:.1} C | {:.2} V ({}) | CRC {} ({})</p><table><thead><tr><th>Chip</th><th>Addr</th><th>Score</th><th>MHz</th><th>Grade</th></tr></thead><tbody>{}</tbody></table></section>",
+                "<section class=\"card\"><h3>Chain {}</h3><p>Grade <strong style=\"color:{}\">{}</strong> | {}/{} chips responding ({}) | {:.2} TH/s | {:.1} C ({}) | {:.2} V ({}) | CRC {}/{} errors/commands (errors: {}; window: {}) | EEPROM present={} valid={} (presence: {}; validity: {})</p><table><thead><tr><th>Chip</th><th>Addr</th><th>Score</th><th>MHz</th><th>Grade</th></tr></thead><tbody>{}</tbody></table></section>",
                 board.chain_id,
-                grade_color(board.grade),
-                board.grade,
+                grade_color(board_grade),
+                board_grade,
                 board.chips_responding,
                 board.chips_expected,
+                chip_count_evidence,
                 board.hashrate_ghs as f64 / 1000.0,
                 board.temp_c,
+                temperature_evidence,
                 board.voltage_v,
                 voltage_evidence,
                 board.crc_errors,
+                board.crc_commands_sent,
                 crc_evidence,
+                crc_window_evidence,
+                board.eeprom_present,
+                board.eeprom_valid,
+                eeprom_presence_evidence,
+                eeprom_validity_evidence,
                 chip_rows
             ));
         }
 
         Ok(format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>D-Central HashReport Snapshot</title><style>body{{font-family:Arial,sans-serif;margin:24px;background:#0b1020;color:#e5e7eb}}h1,h2,h3{{margin:0 0 12px}}.card{{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #1f2937;text-align:left}}.badge{{display:inline-block;padding:6px 10px;border-radius:999px;background:{};color:#fff;font-weight:bold}}ul{{margin:8px 0 0 20px}}</style></head><body><h1>D-Central HashReport Snapshot</h1><p>This report is a <strong>{}</strong> built from current miner runtime data. It is not a timed diagnostic drive.</p><section class=\"card\"><h2>Summary</h2><p><span class=\"badge\">Unit Grade {}</span></p><p>{}</p><p>Generated: {} | Firmware: {} | Source: {} | Duration represented: {} s</p></section><section class=\"card\"><h2>System</h2><p>Serial: {} | MAC: {} | Model: {} | Control board: {} | Chip type: {} ({}) | Boards: {} | Total chips: {}</p><p>Fan PWM: {} | Fan RPM: {} | Temps: {:?} | Voltages: {:?}</p></section><section class=\"card\"><h2>Warnings</h2>{}</section><section class=\"card\"><h2>Recommendations</h2>{}</section>{}</body></html>",
-            grade_color(report.unit_grade),
+            grade_color(unit_grade),
             escape_html(&report.report_kind),
-            report.unit_grade,
+            unit_grade,
             escape_html(&report.unit_grade_explanation),
             escape_html(&report.generated_at),
             escape_html(&report.firmware_version),
@@ -494,27 +516,37 @@ impl ReportGenerator {
 
     /// Render persisted board-health snapshot results to HTML.
     pub fn render_board_health(&self, results: &[BoardHealthResult]) -> crate::Result<String> {
-        let rows = results
+        let validated_results = results
+            .iter()
+            .cloned()
+            .map(|mut result| {
+                result.calculate_grade();
+                result
+            })
+            .collect::<Vec<_>>();
+        let rows = validated_results
             .iter()
             .map(|result| {
                 format!(
-                    "<tr><td>Chain {}</td><td><strong style=\"color:{}\">{}</strong></td><td>{}</td><td>{}/{}</td><td>{:.2} V ({})</td><td>{:.1} C</td><td>{}</td></tr>",
+                    "<tr><td>Chain {}</td><td><strong style=\"color:{}\">{}</strong></td><td>{}</td><td>{}/{} ({})</td><td>{:.2} V ({})</td><td>{:.1} C ({})</td><td>{}</td></tr>",
                     result.chain_id,
                     grade_color(result.grade),
                     result.grade,
                     escape_html(&result.data_source),
                     result.chips_responding,
                     result.chips_expected,
+                    evidence_label(&result.chip_count_evidence, &result.chips_responding),
                     result.voltage_readback_v,
                     evidence_label(&result.voltage_evidence, &result.voltage_readback_v),
                     result.temperature_c,
+                    evidence_label(&result.temperature_evidence, &result.temperature_c),
                     escape_html(&result.status),
                 )
             })
             .collect::<Vec<_>>()
             .join("");
 
-        let sections = results
+        let sections = validated_results
             .iter()
             .map(|result| {
                 let dead_addresses = if result.dead_chip_addresses.is_empty() {
@@ -563,7 +595,7 @@ impl ReportGenerator {
                     )
                 };
                 format!(
-                    "<section class=\"card\"><h3>Chain {}</h3><p>Grade <strong style=\"color:{}\">{}</strong> | {} | Source: {} | Measurement: {} | Status: {} | Estimated hashrate: {:.2} TH/s</p><table><tbody><tr><th>Chip Enumeration</th><td>{}/{} responding</td></tr><tr><th>Dead Chip Addresses</th><td>{}</td></tr><tr><th>Voltage</th><td>{}</td></tr><tr><th>CRC</th><td>{} commands, {} errors, {:.2}% rate, {}</td></tr><tr><th>Temperature</th><td>{:.1} C, {}</td></tr><tr><th>EEPROM</th><td>present={} valid={} evidence={} model={} serial={}</td></tr></tbody></table><h4>Notes</h4>{}</section>",
+                    "<section class=\"card\"><h3>Chain {}</h3><p>Grade <strong style=\"color:{}\">{}</strong> | {}</p><p><strong>Producer context (unverified):</strong> source={} | measurement label={} | status={} | estimated hashrate={:.2} TH/s</p><table><tbody><tr><th>Chip Enumeration</th><td>{}/{} responding &middot; evidence: {}</td></tr><tr><th>Dead Chip Addresses</th><td>{}</td></tr><tr><th>Voltage</th><td>{}</td></tr><tr><th>CRC</th><td>{} commands, {} errors, {:.2}% rate, {} &middot; window evidence: {} &middot; error evidence: {}</td></tr><tr><th>Temperature</th><td>{:.1} C, {} &middot; evidence: {}</td></tr><tr><th>EEPROM</th><td>present={} valid={} presence evidence={} validity evidence={} model={} serial={}</td></tr></tbody></table><h4>Producer notes (unverified)</h4>{}</section>",
                     result.chain_id,
                     grade_color(result.grade),
                     result.grade,
@@ -574,16 +606,31 @@ impl ReportGenerator {
                     result.estimated_hashrate_ghs / 1000.0,
                     result.chips_responding,
                     result.chips_expected,
+                    evidence_label(&result.chip_count_evidence, &result.chips_responding),
                     dead_addresses,
                     voltage_cell,
                     result.crc_commands_sent,
                     result.crc_errors_received,
                     result.crc_error_rate_pct,
-                    if result.crc_ok && result.crc_evidence.is_measured_for(&result.crc_errors_received) { "OK (measured)" } else if result.crc_ok { "NOT MEASURED" } else { "CHECK" },
+                    if result.crc_ok
+                        && result.crc_commands_sent > 0
+                        && result.crc_window_evidence.is_measured_for(&result.crc_commands_sent)
+                        && result.crc_evidence.is_measured_for(&result.crc_errors_received)
+                    {
+                        "OK (measured)"
+                    } else if result.crc_ok {
+                        "NOT MEASURED"
+                    } else {
+                        "CHECK"
+                    },
+                    evidence_label(&result.crc_window_evidence, &result.crc_commands_sent),
+                    evidence_label(&result.crc_evidence, &result.crc_errors_received),
                     result.temperature_c,
                     if result.temperature_ok { "OK" } else { "CHECK" },
+                    evidence_label(&result.temperature_evidence, &result.temperature_c),
                     result.eeprom_present,
                     result.eeprom_valid,
+                    evidence_label(&result.eeprom_presence_evidence, &result.eeprom_present),
                     evidence_label(&result.eeprom_evidence, &result.eeprom_valid),
                     escape_html(result.eeprom_model.as_deref().unwrap_or("unknown")),
                     escape_html(result.eeprom_serial.as_deref().unwrap_or("unknown")),
@@ -594,7 +641,7 @@ impl ReportGenerator {
             .join("");
 
         Ok(format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>D-Central Board Health Snapshot</title><style>{}</style></head><body><h1>D-Central Board Health Snapshot</h1><p>This report is a <strong>persisted snapshot</strong> derived from current miner runtime values. No dedicated board stress sequence was launched.</p><section class=\"card\"><h2>Board Summary</h2><table><thead><tr><th>Chain</th><th>Grade</th><th>Source</th><th>Responding</th><th>Voltage</th><th>Temp</th><th>Status</th></tr></thead><tbody>{}</tbody></table></section>{}</body></html>",
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>D-Central Board Health Snapshot</title><style>{}</style></head><body><h1>D-Central Board Health Snapshot</h1><p>This report is a <strong>persisted snapshot</strong> derived from current miner runtime values. No dedicated board stress sequence was launched.</p><p><strong>Producer context is unverified:</strong> source, measurement label, status, estimated hashrate, and notes are explanatory strings and are not grading evidence.</p><section class=\"card\"><h2>Board Summary</h2><table><thead><tr><th>Chain</th><th>Grade</th><th>Producer source (unverified)</th><th>Responding</th><th>Voltage</th><th>Temp</th><th>Producer status (unverified)</th></tr></thead><tbody>{}</tbody></table></section>{}</body></html>",
             shared_report_css(),
             rows,
             sections,
@@ -618,11 +665,18 @@ impl ReportGenerator {
         let _storage_guard = lock_report_storage();
         std::fs::create_dir_all(&self.report_dir).map_err(crate::DiagnosticError::Io)?;
 
+        let canonical_json =
+            canonicalize_known_report(json_data)?.unwrap_or_else(|| json_data.clone());
+        validate_stored_report_id(&canonical_json, test_id)?;
+        let canonical_html = self
+            .render_known_report(&canonical_json)?
+            .or_else(|| html.map(str::to_owned));
         let json_path = self.report_dir.join(format!("{}.json", test_id));
         let html_path = self.report_dir.join(format!("{}.html", test_id));
-        let json_bytes = serialize_json_bounded(&json_path, json_data, MAX_REPORT_JSON_BYTES)?;
+        let json_bytes =
+            serialize_json_bounded(&json_path, &canonical_json, MAX_REPORT_JSON_BYTES)?;
         ensure_report_size(&json_path, json_bytes.len(), MAX_REPORT_JSON_BYTES)?;
-        if let Some(html) = html {
+        if let Some(html) = canonical_html.as_deref() {
             ensure_report_size(&html_path, html.len(), MAX_REPORT_HTML_BYTES)?;
         }
 
@@ -639,7 +693,7 @@ impl ReportGenerator {
         require_uncommitted_report_target(&json_path)?;
         require_uncommitted_report_target(&html_path)?;
 
-        let html_size_bytes = if let Some(html) = html {
+        let html_size_bytes = if let Some(html) = canonical_html.as_deref() {
             atomic_write_report(&html_path, html.as_bytes(), MAX_REPORT_HTML_BYTES)?;
             html.len() as u64
         } else {
@@ -656,12 +710,12 @@ impl ReportGenerator {
 
         Ok(ReportMetadata {
             report_id: *test_id,
-            test_type: infer_test_type(json_data),
-            generated_at: infer_generated_at(json_data),
-            firmware_version: infer_firmware_version(json_data),
+            test_type: infer_test_type(&canonical_json),
+            generated_at: infer_generated_at(&canonical_json),
+            firmware_version: infer_firmware_version(&canonical_json),
             html_size_bytes,
             json_size_bytes: json_bytes.len() as u64,
-            grade: infer_grade(json_data),
+            grade: infer_grade(&canonical_json),
         })
     }
 
@@ -670,11 +724,16 @@ impl ReportGenerator {
         let _storage_guard = lock_report_storage();
         let json_path = self.report_dir.join(format!("{}.json", test_id));
         let commit = read_bounded_report(&json_path, MAX_REPORT_JSON_BYTES)?;
-        serde_json::from_slice::<serde_json::Value>(&commit).map_err(|error| {
+        let commit = serde_json::from_slice::<serde_json::Value>(&commit).map_err(|error| {
             crate::DiagnosticError::ReportGeneration(format!(
                 "JSON commit marker parse error: {error}"
             ))
         })?;
+        let canonical = canonicalize_known_report(&commit)?.unwrap_or(commit);
+        validate_stored_report_id(&canonical, test_id)?;
+        if let Some(rendered) = self.render_known_report(&canonical)? {
+            return Ok(rendered);
+        }
         let path = self.report_dir.join(format!("{}.html", test_id));
         let bytes = read_bounded_report(&path, MAX_REPORT_HTML_BYTES)?;
         String::from_utf8(bytes).map_err(|error| {
@@ -687,9 +746,35 @@ impl ReportGenerator {
         let _storage_guard = lock_report_storage();
         let path = self.report_dir.join(format!("{}.json", test_id));
         let data = read_bounded_report(&path, MAX_REPORT_JSON_BYTES)?;
-        serde_json::from_slice(&data).map_err(|e| {
+        let parsed = serde_json::from_slice(&data).map_err(|e| {
             crate::DiagnosticError::ReportGeneration(format!("JSON parse error: {}", e))
-        })
+        })?;
+        let canonical = canonicalize_known_report(&parsed)?.unwrap_or(parsed);
+        validate_stored_report_id(&canonical, test_id)?;
+        Ok(canonical)
+    }
+
+    fn render_known_report(&self, json_data: &serde_json::Value) -> crate::Result<Option<String>> {
+        if looks_like_hashreport(json_data) {
+            let report =
+                serde_json::from_value::<HashReport>(json_data.clone()).map_err(|error| {
+                    crate::DiagnosticError::ReportGeneration(format!(
+                        "invalid HashReport schema: {error}"
+                    ))
+                })?;
+            validate_hashreport_version(&report)?;
+            return self.render_hashreport(&report).map(Some);
+        }
+        if json_data.is_array() {
+            let results = serde_json::from_value::<Vec<BoardHealthResult>>(json_data.clone())
+                .map_err(|error| {
+                    crate::DiagnosticError::ReportGeneration(format!(
+                        "invalid BoardHealth report schema: {error}"
+                    ))
+                })?;
+            return self.render_board_health(&results).map(Some);
+        }
+        Ok(None)
     }
 
     /// List all stored report metadata.
@@ -719,6 +804,8 @@ impl ReportGenerator {
                 serde_json::from_slice(&json_bytes).map_err(|e| {
                     crate::DiagnosticError::ReportGeneration(format!("JSON parse error: {e}"))
                 })?;
+            let json_value = canonicalize_known_report(&json_value)?.unwrap_or(json_value);
+            validate_stored_report_id(&json_value, &report_id)?;
 
             let html_path = self.report_dir.join(format!("{}.html", report_id));
             let html_size_bytes = regular_file_size_or_absent(&html_path, MAX_REPORT_HTML_BYTES)?;
@@ -869,12 +956,33 @@ fn grade_color(grade: char) -> &'static str {
 }
 
 fn evidence_label<T: PartialEq>(evidence: &DiagnosticEvidence<T>, value: &T) -> String {
+    let source = escape_html(evidence.source());
+    let observed = evidence
+        .observed_at_epoch_s()
+        .map(|timestamp| format!(" at epoch {timestamp}"))
+        .unwrap_or_else(|| " at unrecorded time".to_string());
     if evidence.is_measured_for(value) {
-        "measured".to_string()
+        format!(
+            "measured/{} from {}{}",
+            evidence.quality().as_str(),
+            source,
+            observed
+        )
     } else if evidence.kind() == EvidenceKind::Measured {
-        "invalid measured claim; not eligible".to_string()
+        format!(
+            "invalid measured/{} claim from {}; not eligible{}",
+            evidence.quality().as_str(),
+            source,
+            observed
+        )
     } else {
-        format!("{}; not measured", evidence.kind().as_str())
+        format!(
+            "{}/{} from {}; not measured{}",
+            evidence.kind().as_str(),
+            evidence.quality().as_str(),
+            source,
+            observed
+        )
     }
 }
 
@@ -939,14 +1047,110 @@ fn infer_firmware_version(json_data: &serde_json::Value) -> String {
 }
 
 fn infer_grade(json_data: &serde_json::Value) -> Option<String> {
-    json_data
+    let canonical = match canonicalize_known_report(json_data) {
+        Ok(Some(canonical)) => canonical,
+        Ok(None) => json_data.clone(),
+        Err(_) => return None,
+    };
+    if let Some(results) = canonical.as_array() {
+        return results
+            .iter()
+            .filter_map(|result| result.get("grade").and_then(|grade| grade.as_str()))
+            .filter(|grade| matches!(*grade, "A" | "B" | "C" | "D" | "F"))
+            .max()
+            .map(str::to_owned);
+    }
+    canonical
         .get("unit_grade")
-        .or_else(|| json_data.get("grade"))
+        .or_else(|| canonical.get("grade"))
         .and_then(|value| match value {
             serde_json::Value::String(text) => Some(text.clone()),
             serde_json::Value::Number(number) => Some(number.to_string()),
             _ => None,
         })
+}
+
+fn looks_like_hashreport(json_data: &serde_json::Value) -> bool {
+    json_data.get("report_version").is_some()
+        || json_data
+            .get("report_type")
+            .and_then(|value| value.as_str())
+            == Some("hashreport")
+}
+
+fn validate_stored_report_id(
+    json_data: &serde_json::Value,
+    expected_report_id: &Uuid,
+) -> crate::Result<()> {
+    if !looks_like_hashreport(json_data) {
+        return Ok(());
+    }
+    let actual = json_data
+        .get("report_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| {
+            crate::DiagnosticError::ReportGeneration(
+                "HashReport report_id is missing or invalid".to_string(),
+            )
+        })?;
+    if &actual != expected_report_id {
+        return Err(crate::DiagnosticError::ReportGeneration(format!(
+            "HashReport report_id {actual} does not match storage key {expected_report_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hashreport_version(report: &HashReport) -> crate::Result<()> {
+    if matches!(
+        report.report_version.as_str(),
+        "snapshot-v1" | "timed-v1" | "snapshot-v2" | "timed-v2"
+    ) {
+        Ok(())
+    } else {
+        Err(crate::DiagnosticError::ReportGeneration(format!(
+            "unsupported HashReport version: {}",
+            report.report_version
+        )))
+    }
+}
+
+fn canonicalize_known_report(
+    json_data: &serde_json::Value,
+) -> crate::Result<Option<serde_json::Value>> {
+    if looks_like_hashreport(json_data) {
+        let mut report =
+            serde_json::from_value::<HashReport>(json_data.clone()).map_err(|error| {
+                crate::DiagnosticError::ReportGeneration(format!(
+                    "invalid HashReport schema: {error}"
+                ))
+            })?;
+        validate_hashreport_version(&report)?;
+        canonicalize_hashreport(&mut report);
+        return serde_json::to_value(report).map(Some).map_err(|error| {
+            crate::DiagnosticError::ReportGeneration(format!(
+                "canonical HashReport serialization failed: {error}"
+            ))
+        });
+    }
+    if json_data.is_array() {
+        let mut results = serde_json::from_value::<Vec<BoardHealthResult>>(json_data.clone())
+            .map_err(|error| {
+                crate::DiagnosticError::ReportGeneration(format!(
+                    "invalid BoardHealth report schema: {error}"
+                ))
+            })?;
+        for result in &mut results {
+            result.calculate_grade();
+        }
+        return serde_json::to_value(results).map(Some).map_err(|error| {
+            crate::DiagnosticError::ReportGeneration(format!(
+                "canonical BoardHealth serialization failed: {error}"
+            ))
+        });
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -956,7 +1160,10 @@ mod evidence_rendering_tests {
     #[test]
     fn report_labels_commanded_values_as_not_measured() {
         let evidence = DiagnosticEvidence::commanded(13.7f32, "runtime_setpoint", None);
-        assert_eq!(evidence_label(&evidence, &13.7), "commanded; not measured");
+        assert_eq!(
+            evidence_label(&evidence, &13.7),
+            "commanded/observed from runtime_setpoint; not measured at unrecorded time"
+        );
     }
 
     #[test]
@@ -970,8 +1177,131 @@ mod evidence_rendering_tests {
         .unwrap();
         assert_eq!(
             evidence_label(&evidence, &0),
-            "invalid measured claim; not eligible"
+            "invalid measured/observed claim from ; not eligible at unrecorded time"
         );
+    }
+
+    #[test]
+    fn persisted_board_health_is_regraded_before_metadata_or_rendering() {
+        let raw = serde_json::json!([{
+            "chain_id": 0,
+            "data_source": "imported",
+            "measurement_type": "dedicated_test",
+            "status": "claimed_ok",
+            "estimated_hashrate_ghs": 1000.0,
+            "notes": [],
+            "chips_expected": 0,
+            "chips_responding": 0,
+            "dead_chip_addresses": [],
+            "voltage_setpoint_v": 0.0,
+            "voltage_readback_v": 0.0,
+            "voltage_deviation_pct": 0.0,
+            "voltage_ok": true,
+            "crc_commands_sent": 0,
+            "crc_errors_received": 999,
+            "crc_error_rate_pct": 0.0,
+            "crc_ok": true,
+            "temperature_c": 200.0,
+            "temperature_ok": true,
+            "eeprom_present": false,
+            "eeprom_valid": false,
+            "eeprom_model": null,
+            "eeprom_serial": null,
+            "required_evidence_measured": true,
+            "grade": "A",
+            "grade_explanation": "trusted serialized pass"
+        }]);
+
+        let canonical = canonicalize_known_report(&raw)
+            .expect("valid board-health shape")
+            .expect("known board-health shape");
+        assert_eq!(canonical[0]["grade"], "F");
+        assert_eq!(canonical[0]["voltage_ok"], false);
+        assert_eq!(canonical[0]["crc_ok"], false);
+        assert_eq!(canonical[0]["temperature_ok"], false);
+        assert_eq!(canonical[0]["producer_context_trust"], "unverified");
+        assert_eq!(infer_grade(&raw).as_deref(), Some("F"));
+
+        let results: Vec<BoardHealthResult> = serde_json::from_value(raw).unwrap();
+        let rendered = ReportGenerator::new()
+            .render_board_health(&results)
+            .unwrap();
+        assert!(rendered.contains(">F</strong>"));
+        assert!(!rendered.contains(">A</strong>"));
+        assert!(rendered.contains("Producer context is unverified:"));
+        assert!(rendered.contains("Producer context (unverified):"));
+        assert!(rendered.contains("Producer notes (unverified)"));
+        assert!(!rendered.contains("| Source: imported"));
+    }
+
+    #[test]
+    fn malformed_known_reports_have_no_grade_or_canonical_fallback() {
+        let malformed_hashreport = serde_json::json!({
+            "report_version": "snapshot-v2",
+            "unit_grade": "A",
+            "unit_grade_explanation": "caller-controlled pass"
+        });
+        assert!(canonicalize_known_report(&malformed_hashreport).is_err());
+        assert_eq!(infer_grade(&malformed_hashreport), None);
+
+        let malformed_board_health = serde_json::json!([{
+            "grade": "A",
+            "voltage_ok": true
+        }]);
+        assert!(canonicalize_known_report(&malformed_board_health).is_err());
+        assert_eq!(infer_grade(&malformed_board_health), None);
+    }
+
+    #[test]
+    fn unknown_hashreport_version_is_not_interpreted_as_current_schema() {
+        let unknown = serde_json::json!({
+            "report_id": Uuid::nil(),
+            "report_version": "snapshot-v999",
+            "generated_at": "test",
+            "duration_seconds": 0,
+            "report_kind": "snapshot",
+            "source": "test",
+            "firmware_version": "test",
+            "system": {
+                "serial": "test", "mac": "test", "model": "test",
+                "chip_type": "test", "chip_id": "test", "fpga_version": "test",
+                "board_count": 0, "total_chips": 0, "control_board": "test"
+            },
+            "baseline": {
+                "temperatures_c": [], "fan_rpm": 0, "fan_pwm": 0,
+                "voltages_v": [], "crc_baseline": []
+            },
+            "windows": [],
+            "boards": [],
+            "unit_grade": "A",
+            "unit_grade_explanation": "caller-controlled pass",
+            "warnings": [],
+            "recommendations": []
+        });
+
+        let error = canonicalize_known_report(&unknown).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported HashReport version: snapshot-v999"));
+        assert_eq!(infer_grade(&unknown), None);
+    }
+
+    #[test]
+    fn hashreport_identity_must_match_the_storage_key() {
+        let storage_id = Uuid::new_v4();
+        let payload_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "report_version": "snapshot-v2",
+            "report_id": payload_id,
+        });
+        let error = validate_stored_report_id(&payload, &storage_id).unwrap_err();
+        assert!(error.to_string().contains("does not match storage key"));
+
+        let matching = serde_json::json!({
+            "report_version": "snapshot-v2",
+            "report_id": storage_id,
+        });
+        validate_stored_report_id(&matching, &storage_id).unwrap();
     }
 }
 
@@ -996,6 +1326,26 @@ mod report_storage_tests {
             "firmware_version": "test",
             "grade": "C"
         })
+    }
+
+    #[test]
+    fn malformed_known_report_is_refused_before_publication() {
+        let dir = scratch_dir();
+        let generator = ReportGenerator::with_dir(dir.clone());
+        let id = Uuid::new_v4();
+        let malformed = serde_json::json!({
+            "report_version": "snapshot-v2",
+            "unit_grade": "A",
+            "unit_grade_explanation": "caller-controlled pass"
+        });
+
+        let error = generator
+            .save_report(&id, Some("caller-controlled html"), &malformed)
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid HashReport schema"));
+        assert!(!dir.join(format!("{id}.json")).exists());
+        assert!(!dir.join(format!("{id}.html")).exists());
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

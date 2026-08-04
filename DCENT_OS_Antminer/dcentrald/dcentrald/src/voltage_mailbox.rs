@@ -629,10 +629,14 @@ mod tests {
             command,
             VoltageCommand::DisableVoltage { pic_addr: 0x22, .. }
         ));
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(matches!(
             off_rx.await.unwrap(),
-            Ok(VoltageCommandReply::Disabled)
+            Ok(VoltageCommandReply::Disabled { .. })
         ));
         assert!(ordinary_rx
             .await
@@ -656,14 +660,18 @@ mod tests {
             VoltageCommand::DisableVoltage { pic_addr: 0x20, .. }
         ));
         assert_eq!(rx.try_recv().err(), Some(VoltageTryRecvError::Empty));
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(matches!(
             first_rx.await.unwrap(),
-            Ok(VoltageCommandReply::Disabled)
+            Ok(VoltageCommandReply::Disabled { .. })
         ));
         assert!(matches!(
             second_rx.await.unwrap(),
-            Ok(VoltageCommandReply::Disabled)
+            Ok(VoltageCommandReply::Disabled { .. })
         ));
     }
 
@@ -687,7 +695,11 @@ mod tests {
         };
         assert_ne!(first_chip, second_chip);
         first_completion.complete(Err("first protocol failed".to_string()));
-        second_completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        second_completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(bm1397_rx.await.unwrap().is_err());
         assert!(bm1362_rx.await.unwrap().is_ok());
     }
@@ -721,7 +733,11 @@ mod tests {
         assert!(racing_rx.await.unwrap().unwrap_err().contains("pending"));
 
         let (_, completion) = rx.try_recv().unwrap().into_parts();
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(off_rx.await.unwrap().is_ok());
         assert!(!rx.permits_ordinary_generation(0x1397, 0x20, 0));
         let (later_set, _) = set(0x20);
@@ -743,7 +759,11 @@ mod tests {
         let (off, off_rx) = disable(0x20);
         tx.try_send(off).unwrap();
         let (_, completion) = rx.try_recv().unwrap().into_parts();
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(off_rx.await.unwrap().is_ok());
     }
 
@@ -753,7 +773,11 @@ mod tests {
         let (first_off, first_off_rx) = disable(0x20);
         tx.try_send(first_off).unwrap();
         let (_, first_completion) = rx.try_recv().unwrap().into_parts();
-        first_completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        first_completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(first_off_rx.await.unwrap().is_ok());
 
         let captured = tx.capture_generation(0x1397, 0x20).unwrap();
@@ -764,7 +788,11 @@ mod tests {
         tx.try_send(second_off).unwrap();
         assert!(!rx.permits_ordinary_generation(0x1397, 0x20, captured));
         let (_, second_completion) = rx.try_recv().unwrap().into_parts();
-        second_completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        second_completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(second_off_rx.await.unwrap().is_ok());
         assert!(!rx.permits_ordinary_generation(0x1397, 0x20, captured));
     }
@@ -780,7 +808,11 @@ mod tests {
         ));
 
         let (_, completion) = rx.try_recv().unwrap().into_parts();
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(off_rx.await.unwrap().is_ok());
         assert!(tx.capture_generation(0x1397, 0x20).is_ok());
     }
@@ -807,7 +839,11 @@ mod tests {
         );
         assert!(endpoint_full_rx.await.unwrap().is_err());
         let (_, completion) = rx.try_recv().unwrap().into_parts();
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(first_rx.await.unwrap().is_ok());
     }
 
@@ -821,7 +857,11 @@ mod tests {
         let (replacement, replacement_rx) = disable(0x20);
         tx.try_send(replacement).unwrap();
         let (_, completion) = rx.try_recv().unwrap().into_parts();
-        completion.complete(Ok(VoltageCommandReply::Disabled));
+        let now = std::time::Instant::now();
+        completion.complete(Ok(VoltageCommandReply::Disabled {
+            operation_started_at: now,
+            operation_completed_at: now,
+        }));
         assert!(replacement_rx.await.unwrap().is_ok());
     }
 

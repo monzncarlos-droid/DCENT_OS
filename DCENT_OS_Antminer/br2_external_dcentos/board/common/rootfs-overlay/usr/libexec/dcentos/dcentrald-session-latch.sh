@@ -18,6 +18,7 @@ MOUNTS_FILE=/proc/mounts
 MOUNTINFO_FILE=/proc/self/mountinfo
 UBI_SYSFS_ROOT=/sys/class/ubi
 UPDATE_LOCK_DIR=/run/dcentos-sysupgrade.lock
+PARENT_DEATH_HELPER=/usr/libexec/dcentos/dcentos-deploy-lock
 
 log() {
     printf 'dcentrald-session-latch: %s\n' "$*" >&2
@@ -353,6 +354,31 @@ terminate_unpublished_child() {
     return 1
 }
 
+contain_unpublished_child_failure() {
+    FAILED_CHILD_PID=$1
+    FAILED_SAFETY_SCRIPT=$2
+    FAILED_REASON=$3
+
+    if ! terminate_unpublished_child "$FAILED_CHILD_PID"; then
+        FAILED_REASON=${FAILED_REASON}-owner-death-unverified
+        promote_unresolved_locked "$FAILED_REASON" >/dev/null 2>&1 || true
+        release_lock || true
+        log "daemon PID $FAILED_CHILD_PID remains live; competing safe-off mutation suppressed"
+        return 1
+    fi
+
+    if "$FAILED_SAFETY_SCRIPT" safety >> "$LOGFILE" 2>&1; then
+        log 'unpublished owner terminated; emergency command/readback evidence recorded' \
+            >> "$LOGFILE"
+    else
+        FAILED_REASON=${FAILED_REASON}-safeoff-failed
+        log 'unpublished owner terminated but emergency safe-off failed' >> "$LOGFILE"
+    fi
+    promote_unresolved_locked "$FAILED_REASON" >/dev/null 2>&1 || true
+    release_lock || true
+    return 1
+}
+
 prepare_session() {
     update_transaction_is_absent || return 1
     prepare_state_dir || return 1
@@ -393,6 +419,15 @@ supervise_session() {
     CHILD_PIDFILE=$4
     EXPECTFILE=$5
     shift 5
+    DEPLOY_LOCK_READY_FD=${DCENTOS_DEPLOY_LOCK_READY_FD:-}
+    DEPLOY_LOCK_FD=${DCENTOS_DEPLOY_LOCK_FD:-}
+    SUPERVISOR_PID=$$
+    case "$DEPLOY_LOCK_READY_FD" in
+        ''|*[!0-9]*) DEPLOY_LOCK_READY_FD= ;;
+    esac
+    case "$DEPLOY_LOCK_FD" in
+        ''|*[!0-9]*) DEPLOY_LOCK_FD= ;;
+    esac
 
     if ! lock_matches "$ADMISSION_TOKEN"; then
         log 'refusing daemon launch without ownership of the persistent admission lock'
@@ -409,36 +444,103 @@ supervise_session() {
         log 'refusing empty daemon command'
         return 1
     fi
+    if [ -n "$PARENT_DEATH_HELPER" ] && [ ! -x "$PARENT_DEATH_HELPER" ]; then
+        promote_unresolved_locked parent-death-helper-missing >/dev/null 2>&1 || true
+        release_lock || true
+        log 'refusing daemon launch without the compiled parent-death boundary'
+        return 1
+    fi
+    SESSION_WRAPPER_PIDFILE=${DCENTOS_SESSION_WRAPPER_PIDFILE:-}
+    if [ -n "$SESSION_WRAPPER_PIDFILE" ]; then
+        case "$SESSION_WRAPPER_PIDFILE" in
+            /*) ;;
+            *)
+                promote_unresolved_locked wrapper-pidfile-invalid >/dev/null 2>&1 || true
+                release_lock || true
+                return 1
+                ;;
+        esac
+        SESSION_WRAPPER_PIDFILE_TMP="$SESSION_WRAPPER_PIDFILE.$$"
+        rm -f "$SESSION_WRAPPER_PIDFILE_TMP" || return 1
+        [ ! -e "$SESSION_WRAPPER_PIDFILE" ] \
+            && [ ! -L "$SESSION_WRAPPER_PIDFILE" ] || return 1
+        umask 077
+        printf '%s\n' "$$" >"$SESSION_WRAPPER_PIDFILE_TMP" || return 1
+        chmod 600 "$SESSION_WRAPPER_PIDFILE_TMP" || return 1
+        mv "$SESSION_WRAPPER_PIDFILE_TMP" "$SESSION_WRAPPER_PIDFILE" || return 1
+        unset DCENTOS_SESSION_WRAPPER_PIDFILE
+    fi
 
-    "$@" >> "$LOGFILE" 2>&1 &
+    if [ -n "$DEPLOY_LOCK_READY_FD" ]; then
+        (
+            eval "exec ${DEPLOY_LOCK_READY_FD}>&-"
+            [ -z "$DEPLOY_LOCK_FD" ] || eval "exec ${DEPLOY_LOCK_FD}>&-"
+            unset DCENTOS_DEPLOY_LOCK_READY_FD DCENTOS_DEPLOY_LOCK_FD
+            if [ -n "$PARENT_DEATH_HELPER" ]; then
+                exec "$PARENT_DEATH_HELPER" --parent-death-signal \
+                    "$SUPERVISOR_PID" -- "$@"
+            fi
+            exec "$@"
+        ) >> "$LOGFILE" 2>&1 &
+    elif [ -n "$PARENT_DEATH_HELPER" ]; then
+        "$PARENT_DEATH_HELPER" --parent-death-signal \
+            "$SUPERVISOR_PID" -- "$@" \
+            >> "$LOGFILE" 2>&1 &
+    else
+        "$@" >> "$LOGFILE" 2>&1 &
+    fi
     CHILD_PID=$!
     CHILD_START_TICKS=$(awk '{print $22}' "/proc/$CHILD_PID/stat" 2>/dev/null) || {
-        terminate_unpublished_child "$CHILD_PID" || \
-            log "daemon PID $CHILD_PID remained live after bounded identity-failure termination"
-        "$SAFETY_SCRIPT" safety >> "$LOGFILE" 2>&1 || true
-        promote_unresolved_locked child-identity-unavailable >/dev/null 2>&1 || true
-        release_lock || true
+        contain_unpublished_child_failure "$CHILD_PID" "$SAFETY_SCRIPT" \
+            child-identity-unavailable || true
         log 'daemon launched but /proc start-time identity is unavailable'
         return 1
     }
+    CHILD_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || {
+        contain_unpublished_child_failure "$CHILD_PID" "$SAFETY_SCRIPT" \
+            child-boot-identity-unavailable || true
+        log 'daemon launched but kernel boot identity is unavailable'
+        return 1
+    }
+    case "$ADMISSION_TOKEN:$CHILD_BOOT_ID" in
+        *[!A-Za-z0-9._:-]*|:*|*:)
+            contain_unpublished_child_failure "$CHILD_PID" "$SAFETY_SCRIPT" \
+                child-session-identity-invalid || true
+            log 'daemon launched but session/boot identity is invalid'
+            return 1
+            ;;
+    esac
     umask 077
-    printf '%s %s\n' "$CHILD_PID" "$CHILD_START_TICKS" > "$CHILD_PIDFILE" || {
-        terminate_unpublished_child "$CHILD_PID" || \
-            log "daemon PID $CHILD_PID remained live after bounded publication-failure termination"
-        "$SAFETY_SCRIPT" safety >> "$LOGFILE" 2>&1 || true
-        promote_unresolved_locked child-identity-publication-failed >/dev/null 2>&1 || true
-        release_lock || true
+    printf '%s %s %s %s\n' "$CHILD_PID" "$CHILD_START_TICKS" \
+        "$ADMISSION_TOKEN" "$CHILD_BOOT_ID" > "$CHILD_PIDFILE" || {
+        contain_unpublished_child_failure "$CHILD_PID" "$SAFETY_SCRIPT" \
+            child-identity-publication-failed || true
         log 'daemon launched but child identity publication failed'
         return 1
     }
+    # The daemon child closed the admission descriptors before exec. Its
+    # compiled launch boundary also armed PR_SET_PDEATHSIG(SIGKILL), so loss of
+    # this supervisor cannot leave a stalled hardware owner alive. The already-
+    # durable unresolved marker keeps every later admission fail-closed; normal
+    # supervised stops still use dcentrald's graceful safe-off path.
     if ! release_lock; then
         log 'daemon launched but admission lock release failed; future admission remains blocked'
     fi
     wait "$CHILD_PID"
     EXIT_CODE=$?
-    EXPECTED_PID=$(cat "$EXPECTFILE" 2>/dev/null || true)
+    EXPECTED_RECORD=$(cat "$EXPECTFILE" 2>/dev/null || true)
+    EXPECTED_PID=$(printf '%s\n' "$EXPECTED_RECORD" | awk 'NR == 1 {print $1}')
+    EXPECTED_STOP_REASON=$(printf '%s\n' "$EXPECTED_RECORD" | awk 'NR == 1 {print $2}')
+    case "$EXPECTED_STOP_REASON" in
+        ''|requested-stop|forced-stop-timeout) ;;
+        *) EXPECTED_STOP_REASON=invalid-stop-reason ;;
+    esac
 
-    if [ "$EXPECTED_PID" = "$CHILD_PID" ] && [ "$EXIT_CODE" -eq 0 ]; then
+    if [ "$EXPECTED_PID" = "$CHILD_PID" ] \
+        && [ "$EXPECTED_STOP_REASON" = forced-stop-timeout ]; then
+        REASON=forced-stop-timeout-exit-$EXIT_CODE
+        log "forced-stop timeout for PID $CHILD_PID ended with status $EXIT_CODE; hardware disposition is unresolved" >> "$LOGFILE"
+    elif [ "$EXPECTED_PID" = "$CHILD_PID" ] && [ "$EXIT_CODE" -eq 0 ]; then
         REASON=expected-zero-awaiting-typed-disposition
         log "expected zero-status exit for PID $CHILD_PID remains unresolved" >> "$LOGFILE"
     elif [ "$EXPECTED_PID" = "$CHILD_PID" ]; then
@@ -467,7 +569,11 @@ supervise_session() {
         log 'post-exit emergency safety action failed; power disposition remains unknown' >> "$LOGFILE"
     fi
 
-    if ! promote_unresolved "$REASON" >> "$LOGFILE" 2>&1; then
+    # Bind the terminal marker to the admission token and exact child identity
+    # so stop consumers cannot mistake a stale crash latch for this helper's
+    # safety completion receipt.
+    TERMINAL_REASON="session-$ADMISSION_TOKEN-boot-$CHILD_BOOT_ID-pid-$CHILD_PID-start-$CHILD_START_TICKS-$REASON"
+    if ! promote_unresolved "$TERMINAL_REASON" >> "$LOGFILE" 2>&1; then
         log 'could not promote the unresolved marker; admission remains blocked by unresolved state' >> "$LOGFILE"
     fi
     log 'no exit status is a hardware SafeOff receipt; operator resolution is required before another start' >> "$LOGFILE"
@@ -514,6 +620,11 @@ show_status() {
 self_test() {
     TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dcentrald-session-latch.XXXXXX") || return 1
     TEST_FAILURES=0
+    SELF_TEST_SAFETY_SCRIPT=${DCENT_TEST_SAFETY_SCRIPT:-/bin/true}
+    SELF_TEST_EXPECT_SAFEOFF=${DCENT_TEST_EXPECT_SAFEOFF:-default}
+    # The compiled parent-death boundary has its own native lifecycle test.
+    # Keep this pure shell state-machine fixture independent of the target rootfs.
+    PARENT_DEATH_HELPER=
     # Production call sites retain the global sync barrier above. The offline
     # transition fixture uses private ephemeral state and must not flush every
     # Docker Desktop bind mount for each marker transition.
@@ -571,18 +682,84 @@ self_test() {
     fi
     path_exists "$CRASH_LATCH_FILE" && TEST_FAILURES=$((TEST_FAILURES + 1))
 
-    if supervise_session "$TOKEN" /bin/true "$TEST_ROOT/supervisor.log" \
+    if supervise_session "$TOKEN" "$SELF_TEST_SAFETY_SCRIPT" "$TEST_ROOT/supervisor.log" \
         "$TEST_ROOT/child.pid" "$TEST_ROOT/expected.pid" /bin/true \
         >/dev/null 2>&1; then
         TEST_FAILURES=$((TEST_FAILURES + 1))
     fi
     path_exists "$CRASH_LATCH_FILE" || TEST_FAILURES=$((TEST_FAILURES + 1))
+    case "$SELF_TEST_EXPECT_SAFEOFF" in
+        success)
+            grep -Fq 'safeoff-failed' "$CRASH_LATCH_FILE" \
+                && TEST_FAILURES=$((TEST_FAILURES + 1))
+            ;;
+        failure)
+            grep -Fq 'safeoff-failed' "$CRASH_LATCH_FILE" \
+                || TEST_FAILURES=$((TEST_FAILURES + 1))
+            ;;
+        default) ;;
+        *) TEST_FAILURES=$((TEST_FAILURES + 1)) ;;
+    esac
 
     rm -f "$UNRESOLVED_FILE" "$CRASH_LATCH_FILE"
     rm -rf "$LOCK_DIR"
     TOKEN=$(prepare_session 2>/dev/null) || TEST_FAILURES=$((TEST_FAILURES + 1))
     abandon_session "$TOKEN" supervisor-launch-failed >/dev/null 2>&1 || TEST_FAILURES=$((TEST_FAILURES + 1))
     path_exists "$CRASH_LATCH_FILE" || TEST_FAILURES=$((TEST_FAILURES + 1))
+
+    # Adversarially exercise the two pre-publication failure branches through
+    # their common containment primitive. A live/unverified owner must suppress
+    # every safety invocation; once death is observed, safety status must be
+    # reflected in the durable reason exactly like the normal wait path.
+    TEST_SAFETY_SCRIPT=$TEST_ROOT/test-safety.sh
+    TEST_SAFETY_COUNT_FILE=$TEST_ROOT/test-safety.count
+    DCENT_TEST_SAFETY_COUNT_FILE=$TEST_SAFETY_COUNT_FILE
+    printf '%s\n' '#!/bin/sh' \
+        'printf "invoked\\n" >> "$DCENT_TEST_SAFETY_COUNT_FILE"' \
+        'exit "${DCENT_TEST_SAFETY_RC:-0}"' > "$TEST_SAFETY_SCRIPT"
+    chmod +x "$TEST_SAFETY_SCRIPT"
+    export DCENT_TEST_SAFETY_COUNT_FILE TEST_TERMINATION_RESULT DCENT_TEST_SAFETY_RC
+    terminate_unpublished_child() {
+        [ "${TEST_TERMINATION_RESULT:-failure}" = success ]
+    }
+
+    for TEST_CASE in safety-success safety-failure owner-live; do
+        rm -f "$UNRESOLVED_FILE" "$CRASH_LATCH_FILE" "$TEST_SAFETY_COUNT_FILE"
+        rm -rf "$LOCK_DIR"
+        TOKEN=$(prepare_session 2>/dev/null) || TEST_FAILURES=$((TEST_FAILURES + 1))
+        case "$TEST_CASE" in
+            safety-success)
+                TEST_TERMINATION_RESULT=success
+                DCENT_TEST_SAFETY_RC=0
+                EXPECTED_REASON=child-identity-publication-failed
+                EXPECTED_INVOCATIONS=1
+                ;;
+            safety-failure)
+                TEST_TERMINATION_RESULT=success
+                DCENT_TEST_SAFETY_RC=1
+                EXPECTED_REASON=child-identity-publication-failed-safeoff-failed
+                EXPECTED_INVOCATIONS=1
+                ;;
+            owner-live)
+                TEST_TERMINATION_RESULT=failure
+                DCENT_TEST_SAFETY_RC=0
+                EXPECTED_REASON=child-identity-publication-failed-owner-death-unverified
+                EXPECTED_INVOCATIONS=0
+                ;;
+        esac
+        export TEST_TERMINATION_RESULT DCENT_TEST_SAFETY_RC
+        contain_unpublished_child_failure 424242 "$TEST_SAFETY_SCRIPT" \
+            child-identity-publication-failed >/dev/null 2>&1 || true
+        grep -Fq "crash-latched:$EXPECTED_REASON" "$CRASH_LATCH_FILE" \
+            || TEST_FAILURES=$((TEST_FAILURES + 1))
+        if [ -f "$TEST_SAFETY_COUNT_FILE" ]; then
+            ACTUAL_INVOCATIONS=$(wc -l < "$TEST_SAFETY_COUNT_FILE")
+        else
+            ACTUAL_INVOCATIONS=0
+        fi
+        [ "$ACTUAL_INVOCATIONS" -eq "$EXPECTED_INVOCATIONS" ] \
+            || TEST_FAILURES=$((TEST_FAILURES + 1))
+    done
 
     rm -f "$UNRESOLVED_FILE" "$CRASH_LATCH_FILE"
     rm -rf "$LOCK_DIR"

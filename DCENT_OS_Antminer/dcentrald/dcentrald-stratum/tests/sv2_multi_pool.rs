@@ -371,6 +371,7 @@ async fn ocean_style_pool_accepts_submitted_share() {
     //    produces; the pool decodes them off the encrypted transport and
     //    echoes them back in MockPoolOutcome::ShareAccepted.
     let share = ValidShare {
+        work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
         worker_name: "test.miner".into(),
         job_id: "101".into(), // matches the OCEAN standard NewMiningJob id
         extranonce2: "00000000".into(),
@@ -478,6 +479,7 @@ async fn ocean_style_pool_applies_mid_session_set_target_before_share_ack() {
     }
 
     let share = ValidShare {
+        work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
         worker_name: "test.miner".into(),
         job_id: "101".into(),
         extranonce2: "00000000".into(),
@@ -561,6 +563,7 @@ async fn ocean_style_pool_rejects_submitted_share() {
     assert_eq!(job.version, 0x2000_0000, "OCEAN mock job version mismatch");
 
     let share = ValidShare {
+        work_generation: dcentrald_stratum::WorkGeneration::UNTRACKED,
         worker_name: "test.miner".into(),
         job_id: "101".into(),
         extranonce2: "00000000".into(),

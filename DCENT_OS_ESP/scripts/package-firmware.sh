@@ -42,9 +42,26 @@ device_model_for_board_target() {
         nerdaxe) printf '%s\n' "nerdaxe" ;;
         nerdqaxe-plus) printf '%s\n' "nerdqaxeplus" ;;
         nerdqaxe-pp) printf '%s\n' "nerdqaxepp" ;;
+        nerdoctaxe-plus) printf '%s\n' "nerdoctaxeplus" ;;
+        nerdoctaxe-gamma) printf '%s\n' "nerdoctaxegamma" ;;
         dcent-axe-bm1397) printf '%s\n' "dcentaxe_bm1397" ;;
         dcent-axe-quad-bm1397) printf '%s\n' "dcentaxe_quad_bm1397" ;;
         dcent-axe-hex-bm1397) printf '%s\n' "dcentaxe_hex_bm1397" ;;
+        hammer-bc01) printf '%s\n' "hammer_bc01" ;;
+        hammer-bc01-pro) printf '%s\n' "hammer_bc01_pro" ;;
+        hammer-bc02) printf '%s\n' "hammer_bc02" ;;
+        hammer-bc04) printf '%s\n' "hammer_bc04" ;;
+        hammer-dc02) printf '%s\n' "hammer_dc02" ;;
+        hammer-dc04) printf '%s\n' "hammer_dc04" ;;
+        hammer-dc06) printf '%s\n' "hammer_dc06" ;;
+        # Lucky Miner LVxx (EXPERIMENTAL — no live hardware; host-tested only).
+        # These strings MUST byte-match BitAxeModel::canonical_key() in
+        # dcentaxe-hal/src/board.rs: the device_model is bound into the OTA
+        # schema-2 signed message, so a mismatch produces an artifact the
+        # device correctly refuses.
+        lucky-lv06) printf '%s\n' "lv06" ;;
+        lucky-lv07) printf '%s\n' "lv07" ;;
+        lucky-lv08) printf '%s\n' "lv08" ;;
         *)
             printf '%s\n' "Unknown BOARD_TARGET '$1'" >&2
             exit 1

@@ -93,6 +93,17 @@ pub struct ChainRailVoltage {
     pub source: RailVoltageSource,
 }
 
+impl ChainRailVoltage {
+    /// Lift into the universal [`crate::measurement::Measurement`] form (P2-3).
+    pub fn as_measurement(self) -> crate::measurement::Measurement<u16> {
+        crate::measurement::Measurement {
+            value: self.mv,
+            provenance: crate::measurement::MeasurementProvenance::from_rail_source(self.source),
+            age_ms: None,
+        }
+    }
+}
+
 /// Plausibility gate for a rail-voltage millivolt value.
 ///
 /// Rejects `0` (a dead/unread rail is not a usable rail voltage for the power
@@ -342,6 +353,30 @@ mod tests {
     }
 
     // -- wire-contract pins ---------------------------------------------------
+
+    #[test]
+    fn as_measurement_preserves_rail_provenance() {
+        let measured = ChainRailVoltage {
+            chain_id: 1,
+            mv: 12_500,
+            source: RailVoltageSource::Measured,
+        }
+        .as_measurement();
+        assert_eq!(measured.value, 12_500);
+        assert!(measured.provenance.is_measured());
+        assert_eq!(
+            measured.provenance.as_str(),
+            RailVoltageSource::Measured.as_str()
+        );
+
+        let commanded = ChainRailVoltage {
+            chain_id: 2,
+            mv: 13_700,
+            source: RailVoltageSource::CommandedNotMeasured,
+        }
+        .as_measurement();
+        assert_eq!(commanded.provenance.as_str(), "commanded_not_measured");
+    }
 
     #[test]
     fn source_tags_match_the_api_voltage_source_contract() {

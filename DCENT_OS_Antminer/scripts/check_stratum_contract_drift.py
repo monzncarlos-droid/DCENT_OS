@@ -148,6 +148,15 @@ def main() -> int:
             "version_mask",
             "merkle_root",
             "pool_difficulty",
+            # Work-domain allocation (acknowledged 2026-08-02). Both fields are
+            # deliberate and doc-commented at their definitions in
+            # dcentrald-stratum/src/types.rs: ``work_generation`` stamps the
+            # generation a template belongs to, and ``v1_work_domain`` is the
+            # single shared finite allocator for Stratum V1 jobs that every
+            # clone and every parallel chain draws from. They are pinned here
+            # so a LATER change to this shape still trips the gate.
+            "work_generation",
+            "v1_work_domain",
         },
     )
     require_set(
@@ -175,6 +184,11 @@ def main() -> int:
             "version_bits",
             "version",
             "achieved_difficulty",
+            # Work-domain allocation (acknowledged 2026-08-02): a share carries
+            # the generation of the template it was mined against, so a stale
+            # generation can be rejected instead of submitted. Same deliberate
+            # change as JobTemplate.work_generation above.
+            "work_generation",
         },
     )
 
@@ -191,15 +205,39 @@ def main() -> int:
         "merkle_root",
         "prev_block_hash",
     }
+    # ESP-only extension, deliberately NOT shared with the Antminer daemon.
+    #
+    # `algorithm` (PowAlgorithm: Sha256d | Scrypt1024) exists because DCENT_OS-for-ESP
+    # gained a second proof-of-work family for the Hammer DC0x boards, which are Scrypt
+    # (Litecoin + Dogecoin merged) rather than SHA-256. The Antminer daemon has no Scrypt
+    # path, so mirroring the field there would add a permanently-Sha256d dead field.
+    #
+    # This is an ENUMERATED allowance, not a relaxation: any field other than these still
+    # fails the gate on either side, and the Antminer side stays exactly the shared set.
+    esp_only_work_fields = {"algorithm"}
+    # Antminer-only extension, deliberately NOT mirrored into the ESP crate
+    # (acknowledged 2026-08-02).
+    #
+    # `work_generation` belongs to the Stratum V1 work-domain allocator: work
+    # carries the generation of the template it derives from so a stale
+    # generation can be refused rather than submitted. The ESP firmware has no
+    # V1WorkDomain and no parallel-chain allocator to guard, so mirroring the
+    # field there would add a permanently-zero dead field.
+    #
+    # Same discipline as `esp_only_work_fields`: an ENUMERATED allowance, not a
+    # relaxation. Any field other than these still fails the gate on either
+    # side, and each side stays exactly the shared set plus its own listed
+    # extension.
+    antminer_only_work_fields = {"work_generation"}
     require_set(
         "ESP/Avalon MiningWork fields",
         struct_fields(esp_work, "MiningWork"),
-        shared_work_fields,
+        shared_work_fields | esp_only_work_fields,
     )
     require_set(
         "Antminer MiningWork fields",
         struct_fields(ant_work, "MiningWork"),
-        shared_work_fields,
+        shared_work_fields | antminer_only_work_fields,
     )
 
     wm_cargo = read("DCENT_OS_WhatsMiner/dcentrald/dcentrald/Cargo.toml")
@@ -227,7 +265,7 @@ def main() -> int:
     print(
         "STRATUM_CONTRACT_DRIFT_OK "
         "esp_events=7 esp_mining_events=1 "
-        "shared_work_fields=11 "
+        "shared_work_fields=11 esp_only_work_fields=1 "
         "whatsminer=dcentrald-stratum avalon=dcentaxe-stratum"
     )
     return 0

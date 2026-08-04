@@ -21,27 +21,33 @@ use tracing::{error, info, warn};
 
 use dcentrald_asic::chain::{
     chain_meets_min_fraction, driver_for_chain_with_policy, Chain, ChainDriverDecision,
-    DivergentChipPolicy,
+    DivergentChipPolicy, EnumerationCommandDialect,
 };
 use dcentrald_asic::drivers::{
-    ChipDriverAdmission, ChipDriverExecutionPolicy, ChipRegistry, MinerProfile, PicType,
+    ChipDriverAdmission, ChipDriverExecutionPolicy, ChipRecognition, ChipRegistry, MinerProfile,
+    PicType,
 };
 use dcentrald_asic::dspic::DspicService;
 use dcentrald_asic::pic::{Pic16EndpointSession, PicController, PicFirmware, PicServiceController};
 use dcentrald_hal::fan::FanController;
 use dcentrald_hal::fpga_chain::FpgaChain;
 use dcentrald_hal::gpio::GpioController;
+use dcentrald_hal::i2c::TerminalSafeOffTransition;
 use dcentrald_hal::led::{LedCommand, LedEngine, LedEngineConfig, LedPattern};
-use dcentrald_hal::platform::FanAccess;
+use dcentrald_hal::platform::{
+    FanAccess, HardwareMutationBarrierReceipt, HardwareMutationCommitFenceReceipt,
+};
 use dcentrald_hal::watchdog::Watchdog;
 use dcentrald_hal::xadc::Xadc;
 use dcentrald_thermal::controller::{ThermalAction, ThermalController};
 use dcentrald_thermal::profiles::ThermalProfile;
 
 use crate::asic_identity_publication::{
-    DispatcherCompositionAuthority, EnumeratedMiningChainReceipt, ExpectedMiningChain,
+    CompositionInvalidationReceipt, DispatcherCompositionAuthority, EnumeratedMiningChainReceipt,
+    ExpectedMiningChain,
 };
 use crate::config::DcentraldConfig;
+use crate::hardware_mutation_fence::wait_revoked_hardware_mutation_commit_fence;
 use crate::history::{self, HistoryBuffer};
 use crate::model;
 use crate::runtime::efficiency::{
@@ -55,12 +61,39 @@ use crate::runtime::notifications::{
     spawn_notification_stack, AlertEvent, RuntimeNotificationConfig, RuntimeWebhookConfig,
     NOTIFICATION_RELOAD_INTERVAL,
 };
-use crate::runtime::task_guard::RuntimeTaskGuard;
+use crate::runtime::safety_watchdog::{
+    StandardMiningActorExpectation, StandardUnitCloseoutExpectation, StandardUnitCloseoutIssuer,
+    StandardWatchdogDisarmPermit, StandardWatchdogRunAdmission, WatchdogRunScope,
+};
+use crate::runtime::task_guard::{
+    RuntimeTaskGuard, StandardMiningActorQuiescenceReceipt, StandardMiningActorSlot,
+    StandardMiningTaskGuard,
+};
+use crate::runtime::teardown_budget::{
+    TeardownBudgetIssuer, TeardownBudgetPolicy, TeardownBudgetView, TeardownDisarmAuthority,
+    TeardownStage,
+};
 use crate::runtime::thread_guard::{
     join_thread_bounded, sleep_until_cancelled, RuntimeThreadGuard, ThreadStopOutcome,
 };
+use crate::runtime::watchdog_feed_gate::{
+    WatchdogFeedGate, WatchdogFeedGateOwner, WatchdogFeedOutcome,
+};
 use crate::voltage_mailbox::{voltage_command_mailbox, VoltageCommandSender, VoltageTrySendError};
 use crate::work_dispatcher::{VoltageCommand, VoltageCommandReply};
+
+use dcentrald_common::thermal_lockout::{
+    evaluate_thermal_lockout_release, load_thermal_lockout, persist_thermal_lockout,
+    prearmed_thermal_generation, remove_thermal_lockout, TerminalThermalLockout,
+    ThermalLockoutReleaseDecision, ThermalLockoutSource, REQUIRED_RELEASE_SAMPLES,
+};
+use dcentrald_common::{
+    map_watchdog_safety_state, measured_startup_thermal_state,
+    should_revoke_work_dispatch_for_controller_health, ControllerHeartbeatObservation,
+    DispatchRevocationCause, HeartbeatRequirement, ThermalSafetyState, WatchdogSafetyState,
+    WorkDispatchAdmissionPublication, WorkDispatchAdmissionReceipt, WorkDispatchLifecycle,
+    WorkDispatchSafetyError, WorkDispatchSafetyInputs,
+};
 
 const FAN_PWM_MAX: u8 = dcentrald_hal::fan::PWM_MAX;
 const FAN_PWM_QUIET_BOOT: u8 = dcentrald_hal::fan::PWM_QUIET_BOOT;
@@ -68,17 +101,352 @@ const FAN_PWM_SAFETY_MAX: u8 = dcentrald_hal::fan::PWM_SAFETY_MAX;
 const COOLING_SPINUP_DWELL: Duration = Duration::from_secs(3);
 const COOLING_SPINUP_SAMPLES: usize = 3;
 const COOLING_SPINUP_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const THERMAL_LOCKOUT_RELEASE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const TERMINAL_THERMAL_LOCKOUT_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PSU_WATCHDOG_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const MINING_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const WATCHDOG_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-/// Covers the standard path's explicit 26.5 s worst-case bounded waits while
-/// still turning a wedged shutdown into a hardware reset. Unbounded transport
-/// calls remain protected because feeding stops at this absolute deadline.
-const WATCHDOG_TEARDOWN_GRACE: Duration = Duration::from_secs(30);
+const API_HARDWARE_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Persisted PH-3 state has four scalar/optional fields and is normally under
 /// 128 bytes. A 1 KiB ceiling leaves ample schema-evolution room while refusing
 /// accidental/unbounded diagnostic payloads on the small `/data` filesystem.
 const RECOVERY_LADDER_STATE_MAX_BYTES: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// Work-dispatch safety (shared pure policy → standard-daemon adapter)
+// ---------------------------------------------------------------------------
+//
+// Continuous-audit residual (2026-07-22): refuse standard WorkDispatcher
+// construction until SoC watchdog + controller heartbeat pillars + thermal
+// readiness are green. Pure matrix lives in `dcentrald_common::work_dispatch_safety`;
+// this section is the daemon-path adapter (stock/serial/hybrid peers already
+// ship the same pattern).
+
+/// Map standard-daemon bring-up observations into the shared
+/// [`WorkDispatchSafetyInputs`] matrix.
+///
+/// Pure and host-testable: engines must not invent a second admission matrix.
+/// When `controllers` is empty (NoPic / no voltage PIC ownership), heartbeat
+/// requirement is [`HeartbeatRequirement::NoneRequired`]; otherwise every
+/// initialized PIC must report same-cycle OK.
+pub(crate) fn daemon_standard_work_dispatch_inputs(
+    soc_watchdog: WatchdogSafetyState,
+    controller_heartbeats: &[ControllerHeartbeatObservation],
+    thermal: ThermalSafetyState,
+) -> WorkDispatchSafetyInputs {
+    let heartbeat_requirement = if controller_heartbeats.is_empty() {
+        HeartbeatRequirement::NoneRequired
+    } else {
+        HeartbeatRequirement::AllControllersSameCycle
+    };
+    WorkDispatchSafetyInputs {
+        watchdog: soc_watchdog,
+        heartbeat_requirement,
+        controllers: controller_heartbeats.to_vec(),
+        thermal,
+        // Lifecycle latch owns the terminal revoke bit; never smuggle clear here.
+        previously_revoked: false,
+    }
+}
+
+/// Standard-path SoC watchdog contribution from config + feed-owner presence.
+///
+/// Thin wrapper over [`map_watchdog_safety_state`] so daemon tests pin the
+/// same interpretation as stock/serial/hybrid.
+pub(crate) fn daemon_watchdog_safety_state(
+    config_enabled: bool,
+    feed_owner_present: bool,
+) -> WatchdogSafetyState {
+    map_watchdog_safety_state(config_enabled, feed_owner_present)
+}
+
+/// Bind a fresh generation's measured startup proof to its process-local
+/// emergency latch. A new unlatched process can never fabricate `Ready`.
+pub(crate) fn daemon_thermal_safety_state(
+    thermal_emergency_latched: bool,
+    measured_startup_state: ThermalSafetyState,
+) -> ThermalSafetyState {
+    if thermal_emergency_latched {
+        ThermalSafetyState::Emergency
+    } else {
+        measured_startup_state
+    }
+}
+
+/// Build same-cycle heartbeat observations from initialized PIC addresses.
+///
+/// Init already proved these addresses responded; admission treats them as
+/// green for cycle `cycle_id` unless a caller overrides individual `ok` bits.
+pub(crate) fn daemon_controller_heartbeats_from_initialized_pics(
+    pic_addrs: &[u8],
+    cycle_id: u64,
+    all_ok: bool,
+) -> Vec<ControllerHeartbeatObservation> {
+    pic_addrs
+        .iter()
+        .map(|&controller_id| ControllerHeartbeatObservation {
+            controller_id,
+            heartbeat_ok: all_ok,
+            cycle_id,
+        })
+        .collect()
+}
+
+/// Admit standard work dispatch on the daemon lifecycle latch.
+///
+/// Call **before** [`crate::work_dispatcher::WorkDispatcher::new`].
+pub(crate) fn daemon_admit_standard_work_dispatch<'a>(
+    life: &'a mut WorkDispatchLifecycle,
+    inputs: &WorkDispatchSafetyInputs,
+) -> Result<&'a WorkDispatchAdmissionReceipt, WorkDispatchSafetyError> {
+    life.admit(inputs)
+}
+
+/// Terminal revoke for the standard-daemon lifecycle.
+pub(crate) fn daemon_revoke_work_dispatch(
+    life: &mut WorkDispatchLifecycle,
+    cause: DispatchRevocationCause,
+    profile_max_pwm: u8,
+) -> (dcentrald_common::SafetyAction, bool) {
+    life.revoke(cause, profile_max_pwm)
+}
+
+#[cfg(test)]
+mod work_dispatch_admission_tests {
+    //! Drive the **shipped** standard-daemon admission adapters
+    //! (`daemon_standard_work_dispatch_inputs`, `daemon_watchdog_safety_state`,
+    //! `daemon_admit_standard_work_dispatch`, `daemon_revoke_work_dispatch`)
+    //! through the real `WorkDispatchLifecycle` path — not a reimplementation.
+
+    use super::*;
+    use dcentrald_common::{power_precedes_fan_raise, SafetyStep, HOME_FAN_PWM_SAFETY_MAX};
+
+    fn green_heartbeats(addrs: &[u8]) -> Vec<ControllerHeartbeatObservation> {
+        daemon_controller_heartbeats_from_initialized_pics(addrs, 1, true)
+    }
+
+    #[test]
+    fn daemon_watchdog_state_maps_config_and_feed_owner() {
+        assert_eq!(
+            daemon_watchdog_safety_state(false, false),
+            WatchdogSafetyState::DisabledByConfiguration
+        );
+        assert_eq!(
+            daemon_watchdog_safety_state(false, true),
+            WatchdogSafetyState::DisabledByConfiguration
+        );
+        assert_eq!(
+            daemon_watchdog_safety_state(true, true),
+            WatchdogSafetyState::Armed
+        );
+        assert_eq!(
+            daemon_watchdog_safety_state(true, false),
+            WatchdogSafetyState::Unavailable
+        );
+    }
+
+    #[test]
+    fn daemon_thermal_requires_measured_startup_and_latch_dominates() {
+        assert_eq!(
+            daemon_thermal_safety_state(false, ThermalSafetyState::Ready),
+            ThermalSafetyState::Ready
+        );
+        assert_eq!(
+            daemon_thermal_safety_state(false, ThermalSafetyState::NotReady),
+            ThermalSafetyState::NotReady
+        );
+        assert_eq!(
+            daemon_thermal_safety_state(true, ThermalSafetyState::Ready),
+            ThermalSafetyState::Emergency
+        );
+    }
+
+    #[test]
+    fn daemon_admit_green_succeeds_with_initialized_pics() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[0x55, 0x56, 0x57]);
+        let inputs = daemon_standard_work_dispatch_inputs(
+            daemon_watchdog_safety_state(true, true),
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let (controller_count, cycle) = {
+            let receipt = daemon_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+            (receipt.controller_count, receipt.heartbeat_cycle_id)
+        };
+        assert!(life.is_admitted());
+        assert_eq!(controller_count, 3);
+        assert_eq!(cycle, Some(1));
+    }
+
+    #[test]
+    fn daemon_nopic_empty_controllers_uses_none_required() {
+        let mut life = WorkDispatchLifecycle::new();
+        let inputs = daemon_standard_work_dispatch_inputs(
+            WatchdogSafetyState::DisabledByConfiguration,
+            &[],
+            ThermalSafetyState::Ready,
+        );
+        assert_eq!(
+            inputs.heartbeat_requirement,
+            HeartbeatRequirement::NoneRequired
+        );
+        let receipt = daemon_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+        assert_eq!(receipt.controller_count, 0);
+        assert_eq!(receipt.heartbeat_cycle_id, None);
+    }
+
+    #[test]
+    fn daemon_admit_refuses_failed_pic_heartbeat() {
+        let mut life = WorkDispatchLifecycle::new();
+        let mut hbs = green_heartbeats(&[0x55, 0x56]);
+        hbs[1].heartbeat_ok = false;
+        let inputs = daemon_standard_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let err = daemon_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::HeartbeatFailed {
+                controller_id: 0x56,
+                ..
+            }
+        ));
+        assert!(!life.is_admitted());
+    }
+
+    #[test]
+    fn daemon_admit_refuses_when_soc_watchdog_enabled_but_feed_owner_missing() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[0x55]);
+        let inputs = daemon_standard_work_dispatch_inputs(
+            daemon_watchdog_safety_state(true, false),
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        let err = daemon_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::WatchdogNotAdmitted {
+                state: WatchdogSafetyState::Unavailable
+            }
+        ));
+    }
+
+    #[test]
+    fn daemon_admit_refuses_thermal_emergency() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[0x55]);
+        let inputs = daemon_standard_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            &hbs,
+            daemon_thermal_safety_state(true, ThermalSafetyState::Ready),
+        );
+        let err = daemon_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkDispatchSafetyError::ThermalNotReady {
+                state: ThermalSafetyState::Emergency
+            }
+        ));
+    }
+
+    #[test]
+    fn daemon_terminal_revoke_blocks_re_admit_and_cuts_hash_first() {
+        let mut life = WorkDispatchLifecycle::new();
+        let hbs = green_heartbeats(&[0x55, 0x56]);
+        let inputs = daemon_standard_work_dispatch_inputs(
+            WatchdogSafetyState::Armed,
+            &hbs,
+            ThermalSafetyState::Ready,
+        );
+        daemon_admit_standard_work_dispatch(&mut life, &inputs).expect("admit");
+
+        let (action, stop_feed) =
+            daemon_revoke_work_dispatch(&mut life, DispatchRevocationCause::HeartbeatFailure, 100);
+        assert!(stop_feed, "heartbeat revoke must stop SoC WDT feed");
+        assert!(!life.is_admitted());
+        assert!(life.is_terminally_revoked());
+        assert!(
+            power_precedes_fan_raise(&action.steps()),
+            "cut-hash-before-noise must hold on daemon revoke"
+        );
+        match &action.steps()[1] {
+            SafetyStep::CommandFans(fan) => {
+                assert!(fan.effective_pwm() <= HOME_FAN_PWM_SAFETY_MAX);
+            }
+            other => panic!("expected fan park second, got {other:?}"),
+        }
+
+        let err = daemon_admit_standard_work_dispatch(&mut life, &inputs).unwrap_err();
+        assert_eq!(err, WorkDispatchSafetyError::TerminallyRevoked);
+    }
+
+    /// Structural pin: `run_lifecycle` must own the lifecycle and call the
+    /// shipped admit adapter **before** WorkDispatcher construction, and must
+    /// establish SoC watchdog feed ownership before that admit.
+    #[test]
+    fn daemon_run_owns_lifecycle_and_admits_before_work_dispatcher() {
+        let src = include_str!("daemon.rs");
+        assert!(
+            src.contains("WorkDispatchLifecycle::new()"),
+            "run_lifecycle must own a WorkDispatchLifecycle"
+        );
+        assert!(
+            src.contains("fn daemon_admit_standard_work_dispatch"),
+            "daemon must ship the admit adapter"
+        );
+        assert!(
+            src.contains("fn daemon_revoke_work_dispatch"),
+            "daemon must ship the revoke adapter for mid-run/terminal wires"
+        );
+        // rfind: this test itself quotes substrings of the live block; the live
+        // site is the last occurrence of the residual phrase in daemon.rs.
+        let section = src
+            .rfind("Continuous-audit NO-SHIP residual: refuse WorkDispatcher construction")
+            .expect("NO-SHIP residual comment");
+        let after = &src[section..];
+        assert!(after.contains("owned_watchdog_kicker("));
+        assert!(after.contains("self.watchdog_feed_owner = Some(watchdog_feed_owner);"));
+        assert!(after.contains("daemon_admit_standard_work_dispatch"));
+        let latch_rel = after.find("_dispatch_life_admitted").expect("latch");
+        let disp_rel = after[latch_rel..]
+            .find("WorkDispatcher::new(")
+            .map(|j| latch_rel + j)
+            .expect("WorkDispatcher::new after latch");
+        let admit_rel = after
+            .find("daemon_admit_standard_work_dispatch")
+            .expect("admit");
+        assert!(
+            admit_rel < latch_rel && latch_rel < disp_rel,
+            "section order: admit → latch → WorkDispatcher::new"
+        );
+        assert!(
+            after.contains("work-dispatch admission OK")
+                && after.contains("WorkDispatcher construction allowed")
+        );
+        assert!(
+            after.contains("work-dispatch admission REFUSED")
+                && after.contains("no WorkDispatcher construction")
+        );
+        assert!(after.contains("WorkDispatchAdmissionPublication"));
+        assert!(after.contains("sync_publication"));
+        let dispatcher = include_str!("work_dispatcher.rs");
+        assert!(
+            dispatcher.contains("allow_work_commit()"),
+            "WorkDispatcher mid-run gate must call allow_work_commit"
+        );
+        assert!(
+            src.contains("should_revoke_work_dispatch_for_controller_health"),
+            "HB path must use pure controller-health revoke policy"
+        );
+        assert!(
+            src.contains("mark_thermal_emergency_and_revoke_work_dispatch"),
+            "thermal emergency must revoke work-dispatch admission"
+        );
+    }
+}
 
 fn pic16_service_for_endpoint(
     sessions: &[Pic16EndpointSession],
@@ -181,6 +549,7 @@ mod initialized_pic_addrs_tests {
         let config: DcentraldConfig = toml::from_str("").unwrap();
         let identity = PlatformIdentitySnapshot {
             declared_board_target: Some("am3-s19xp".into()),
+            observed_board_target: None,
             board_desc: None,
             declared_platform_marker: None,
             declared_subtype: None,
@@ -396,11 +765,13 @@ mod recovery_state_persistence_tests {
 /// no bound means `run_lifecycle` never reaches `start_api_servers` → the
 /// :8080 dashboard / :4028 CGMiner API NEVER come up and there is no recovery
 /// (the live `.100`-class symptom: restart-to-mine took the API down 4+ min).
-/// Bounding `init()` converts an infinite hang into a clean error that falls
-/// back to management-only with the API reachable. Nominal cold boot is
-/// ~16-25 s with retries; 90 s leaves generous headroom for a slow-but-healthy
-/// unit while still guaranteeing the management plane recovers. Override for
-/// lab bring-up of a very slow/cold unit via `DCENT_INIT_TIMEOUT_SECS`.
+/// Bounding `init()` converts an infinite hang into a clean error that enters
+/// terminal safe-off. Management-only and its API are admitted only after that
+/// safe-off succeeds; otherwise the daemon exits for the external supervisor's
+/// independent emergency-safety path. Nominal cold boot is ~16-25 s with
+/// retries; 90 s leaves generous headroom while guaranteeing that control
+/// returns to a bounded recovery policy. Override for lab bring-up of a very
+/// slow/cold unit via `DCENT_INIT_TIMEOUT_SECS`.
 const DEFAULT_INIT_TIMEOUT_SECS: u64 = 90;
 const ENV_INIT_TIMEOUT_SECS: &str = "DCENT_INIT_TIMEOUT_SECS";
 
@@ -578,6 +949,65 @@ fn read_first_trimmed(paths: &[&str]) -> String {
 
 struct SystemPlatformIdentitySource;
 
+fn observed_am3_bb_board_target(
+    board_target_file: Option<&str>,
+    compatible: &[u8],
+    model: &[u8],
+) -> Option<String> {
+    // A present image-owned marker is authoritative, including an empty or
+    // malformed file. Never let device-tree evidence rescue contradictory
+    // package metadata. The normal declared-target path handles valid files.
+    if board_target_file.is_some() {
+        return None;
+    }
+
+    matches!(
+        dcentrald_hal::platform::beaglebone::authorize_am3_bb_identity(None, compatible, model,),
+        Ok(dcentrald_hal::platform::beaglebone::Am3BbIdentityEvidence::ExactDeviceTree)
+    )
+    .then(|| dcentrald_hal::platform::beaglebone::DEFAULT_BOARD_TARGET_V2_0.to_string())
+}
+
+#[cfg(test)]
+mod observed_am3_bb_board_target_tests {
+    use super::observed_am3_bb_board_target;
+
+    const COMPATIBLE: &[u8] = b"ti,am335x-bone-black\0ti,am33xx\0";
+    const MODEL: &[u8] = b"BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0\0";
+
+    #[test]
+    fn exact_device_tree_infers_target_only_when_marker_is_absent() {
+        assert_eq!(
+            observed_am3_bb_board_target(None, COMPATIBLE, MODEL).as_deref(),
+            Some("am3-bb-s19jpro")
+        );
+        assert_eq!(
+            observed_am3_bb_board_target(Some(""), COMPATIBLE, MODEL),
+            None
+        );
+        assert_eq!(
+            observed_am3_bb_board_target(Some("wrong-target"), COMPATIBLE, MODEL),
+            None
+        );
+    }
+
+    #[test]
+    fn device_tree_inference_requires_exact_nul_delimited_tuple() {
+        assert_eq!(
+            observed_am3_bb_board_target(None, b"vendor,ti,am335x-bone-black-lookalike\0", MODEL,),
+            None
+        );
+        assert_eq!(
+            observed_am3_bb_board_target(
+                None,
+                COMPATIBLE,
+                b"BeagleBone_Black_v2.1 on S19J_IO_BOARD_V2_0 clone\0",
+            ),
+            None
+        );
+    }
+}
+
 impl crate::daemon_lifecycle::PlatformIdentitySource for SystemPlatformIdentitySource {
     fn capture_identity(&self) -> Result<crate::daemon_lifecycle::PlatformIdentitySnapshot> {
         let optional_declared = |paths: &[&str]| {
@@ -585,13 +1015,27 @@ impl crate::daemon_lifecycle::PlatformIdentitySource for SystemPlatformIdentityS
             (!value.is_empty()).then_some(value)
         };
 
-        let declared_board_target = optional_declared(&["/etc/dcentos/board_target"]);
+        let board_target_file = std::fs::read_to_string("/etc/dcentos/board_target").ok();
+        let declared_board_target = board_target_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let compatible = std::fs::read("/proc/device-tree/compatible").unwrap_or_default();
+        let device_tree_model = std::fs::read("/proc/device-tree/model").unwrap_or_default();
+        let observed_board_target = observed_am3_bb_board_target(
+            board_target_file.as_deref(),
+            &compatible,
+            &device_tree_model,
+        );
         let board_desc = declared_board_target
             .as_deref()
+            .or(observed_board_target.as_deref())
             .and_then(dcentrald_common::BoardDesc::lookup);
 
         Ok(crate::daemon_lifecycle::PlatformIdentitySnapshot {
             declared_board_target,
+            observed_board_target,
             board_desc,
             declared_platform_marker: optional_declared(&[
                 "/etc/bos_platform",
@@ -673,20 +1117,18 @@ mod divergent_chip_policy_tests {
 /// path (unbind xiic-i2c + AXI-IIC recovery + an I2C service WITHOUT the
 /// hashboard-EEPROM write denylist).
 ///
-/// AUTHORITATIVE-FIRST: a non-empty `/etc/dcentos/board_target` (written by every
-/// Buildroot post-build) is definitive — only an `am1-s9*` target is S9; any
-/// `am2-*`/`am3-*` target fails CLOSED to the safe (xiic-bound, EEPROM-denylisted)
-/// path even if the control-board UIO-count heuristic momentarily disagrees. That
-/// heuristic (`detect_control_board`: uio_count<=14 => "Zynq am1-s9") misclassifies
-/// a boot-race am2 (S19-family) that enumerates <=14 UIO devices as am1-s9, which
-/// would then devmem-write `[55 AA 16]` heartbeats to 0x55-0x57 — the am2 AT24C
-/// identity EEPROMs in the protected 0x50-0x57 range — and corrupt them.
+/// COMPOSITION-FIRST: the installed `/etc/dcentos/board_target` must declare an
+/// `am1-s9*` image and the passive live UIO-role census must independently prove
+/// the complete S9 chain6/7/8 fabric. Either signal alone is insufficient: a
+/// cross-flashed target marker must not devmem-write `[55 AA 16]` heartbeats to
+/// the AM2 AT24C identity EEPROMs at 0x55-0x57, while an incomplete boot-race UIO
+/// census must not be interpreted as S9 by device count.
 ///
 /// Missing board_target is not identity evidence. The UIO-count-derived
 /// control-board string remains useful telemetry but cannot authorize a raw
 /// devmem transport or removal of the EEPROM write denylist.
-fn is_am1_s9_from_evidence(board_target: &str, _control_board: &str) -> bool {
-    board_target.trim().starts_with("am1-s9")
+fn is_am1_s9_from_evidence(board_target: &str, control_board: &str) -> bool {
+    board_target.trim().starts_with("am1-s9") && control_board.trim() == "Zynq am1-s9"
 }
 
 /// Existing single-owner I2C constructor selected from one identity snapshot.
@@ -702,29 +1144,61 @@ enum StandardI2cTransport {
     KernelProtected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StandardHardwareOwnership {
-    ColdBringup,
-    AdoptedHandoff,
-}
-
-/// Complete, sealed execution plan for the legacy standard-daemon route.
+/// Complete, sealed discovery plan for the legacy standard-daemon route.
 ///
 /// This is intentionally distinct from safe-direction cleanup authority.  It
 /// binds the authoritative board target, model topology, voltage-controller
-/// class, serialized bus transport, work engine, ownership origin, and exact
-/// executable ASIC-driver admission before the route opens I2C, fan, GPIO, or
-/// FPGA hardware.  Fields are private so no other runtime can mint one from a
-/// chip ID alone.
-#[derive(Debug, Clone)]
+/// class, serialized bus transport, and inert ASIC identity constraint before
+/// the route opens I2C, fan, GPIO, or FPGA hardware. Executable driver authority
+/// is minted separately from current-generation GetAddress receipts. Fields are
+/// private so no other runtime can mint either boundary from a chip ID alone.
+#[derive(Debug)]
 struct StandardHardwareCompositionAdmission {
     board_target: String,
     profile: &'static MinerProfile,
     pic_type: PicType,
     pic_addrs: Vec<u8>,
     i2c_transport: StandardI2cTransport,
-    ownership: StandardHardwareOwnership,
-    asic: ChipDriverAdmission,
+    /// Declared, inert identity constraint. Executable driver authority is
+    /// minted separately only after GetAddress receipts agree with this value.
+    asic: ChipRecognition,
+}
+
+/// Move-only authority minted after GetAddress evidence seals the standard
+/// driver's exact executable identity for Phase 7 only.
+#[derive(Debug)]
+struct StandardPhase7DriverAdmission {
+    driver: ChipDriverAdmission,
+}
+
+impl StandardPhase7DriverAdmission {
+    fn chip_id(&self) -> u16 {
+        self.driver.chip_id()
+    }
+
+    fn complete(self) -> StandardDispatcherDriverAdmission {
+        StandardDispatcherDriverAdmission {
+            driver: self.driver,
+        }
+    }
+}
+
+/// Move-only successor minted only after the complete Phase 7 initialization
+/// proof succeeds. WorkDispatcher construction consumes this value exactly
+/// once; no raw chip ID or reconstructible policy can substitute for it.
+#[derive(Debug)]
+struct StandardDispatcherDriverAdmission {
+    driver: ChipDriverAdmission,
+}
+
+impl StandardDispatcherDriverAdmission {
+    fn chip_id(&self) -> u16 {
+        self.driver.chip_id()
+    }
+
+    fn into_driver(self) -> ChipDriverAdmission {
+        self.driver
+    }
 }
 
 impl StandardHardwareCompositionAdmission {
@@ -742,6 +1216,11 @@ fn admit_standard_hardware_composition(
     passthrough: bool,
     registry: &ChipRegistry,
 ) -> Result<StandardHardwareCompositionAdmission> {
+    if passthrough {
+        anyhow::bail!(
+            "standard passthrough requires a fresh typed hardware-handoff receipt; a configuration boolean and model hint cannot authorize unmeasured ASIC execution"
+        );
+    }
     let is_am1_s9 = board_target.trim().starts_with("am1-s9");
     validate_profile_platform_authority(board_target, is_am1_s9, profile)?;
     validate_standard_daemon_topology(profile, pic_type, pic_addrs)?;
@@ -762,28 +1241,23 @@ fn admit_standard_hardware_composition(
             profile.chip_id
         )
     })?;
-    let asic = registry.admit(profile.chip_id).ok_or_else(|| {
-        anyhow::anyhow!(
+    if registry.admit(profile.chip_id).is_none() {
+        anyhow::bail!(
             "{} / {} recognizes {} (0x{:04X}) as {:?}, but the active policy does not admit its executable driver",
             board_target,
             profile.name,
             recognition.chip_name(),
             recognition.chip_id(),
             recognition.maturity(),
-        )
-    })?;
+        );
+    }
     Ok(StandardHardwareCompositionAdmission {
         board_target: board_target.to_string(),
         profile,
         pic_type,
         pic_addrs: pic_addrs.to_vec(),
         i2c_transport,
-        ownership: if passthrough {
-            StandardHardwareOwnership::AdoptedHandoff
-        } else {
-            StandardHardwareOwnership::ColdBringup
-        },
-        asic,
+        asic: recognition,
     })
 }
 
@@ -1056,6 +1530,7 @@ mod is_am1_s9_evidence_tests {
     fn identity(board_target: Option<&str>, control_board: &str) -> PlatformIdentitySnapshot {
         PlatformIdentitySnapshot {
             declared_board_target: board_target.map(str::to_string),
+            observed_board_target: None,
             board_desc: board_target.and_then(dcentrald_common::BoardDesc::lookup),
             declared_platform_marker: None,
             declared_subtype: None,
@@ -1065,18 +1540,14 @@ mod is_am1_s9_evidence_tests {
     }
 
     #[test]
-    fn board_target_overrides_the_control_board_heuristic() {
-        // The bug: a boot-race am2 (S19-family) that momentarily enumerates <=14
-        // UIO devices makes detect_control_board() return "Zynq am1-s9". The
-        // authoritative board_target says am2, so we must NOT take the S9
-        // devmem/no-EEPROM-denylist path (which would write to the am2 0x55-0x57
-        // identity EEPROMs).
+    fn target_and_exact_live_fabric_must_both_identify_s9() {
         assert!(!is_am1_s9_from_evidence("am2-s19jpro-zynq", "Zynq am1-s9"));
         assert!(!is_am1_s9_from_evidence("am2-s17p", "Zynq am1-s9"));
         assert!(!is_am1_s9_from_evidence("am3-s21", "Zynq am1-s9"));
-        // A genuine am1-s9 target takes the S9 path even if the heuristic disagrees.
-        assert!(is_am1_s9_from_evidence("am1-s9", "Zynq am2-s17"));
-        assert!(is_am1_s9_from_evidence("am1-s9", ""));
+        assert!(is_am1_s9_from_evidence("am1-s9", "Zynq am1-s9"));
+        assert!(!is_am1_s9_from_evidence("am1-s9", "Zynq am2"));
+        assert!(!is_am1_s9_from_evidence("am1-s9", "Zynq ambiguous"));
+        assert!(!is_am1_s9_from_evidence("am1-s9", ""));
     }
 
     #[test]
@@ -1099,10 +1570,13 @@ mod is_am1_s9_evidence_tests {
 
     #[test]
     fn platform_identity_snapshot_selects_the_existing_single_owner_i2c_transport() {
-        let s9 = identity(Some("am1-s9"), "Zynq am2-s17");
+        let s9 = identity(Some("am1-s9"), "Zynq am1-s9");
         assert_eq!(
-            standard_i2c_transport(&s9, is_am1_s9_from_evidence(s9.board_target(), "ignored"))
-                .unwrap(),
+            standard_i2c_transport(
+                &s9,
+                is_am1_s9_from_evidence(s9.board_target(), s9.observed_control_board.as_str())
+            )
+            .unwrap(),
             StandardI2cTransport::Am1S9Devmem
         );
 
@@ -1375,7 +1849,7 @@ mod identified_miner_profile_tests {
     use super::{
         admit_standard_hardware_composition, identified_miner_profile, passthrough_miner_profile,
         pre_enumeration_topology_profile, validate_profile_platform_authority,
-        validate_standard_daemon_topology, StandardHardwareOwnership, StandardI2cTransport,
+        validate_standard_daemon_topology, StandardI2cTransport,
     };
     use dcentrald_asic::drivers::{
         ChipDriverExecutionPolicy, ChipDriverMaturity, ChipRegistry, PicType,
@@ -1445,7 +1919,7 @@ mod identified_miner_profile_tests {
     }
 
     #[test]
-    fn sealed_standard_composition_binds_every_execution_facet() {
+    fn sealed_standard_composition_binds_every_discovery_facet() {
         let s9 = identified_miner_profile(0x1387).unwrap();
         let registry = ChipRegistry::production();
         let admission = admit_standard_hardware_composition(
@@ -1459,12 +1933,8 @@ mod identified_miner_profile_tests {
         )
         .unwrap();
         assert_eq!(admission.board_target, "am1-s9");
-        assert_eq!(admission.ownership, StandardHardwareOwnership::ColdBringup);
         assert_eq!(admission.asic.chip_id(), 0x1387);
-        assert_eq!(
-            admission.asic.recognition().maturity(),
-            ChipDriverMaturity::Production
-        );
+        assert_eq!(admission.asic.maturity(), ChipDriverMaturity::Production);
         assert!(admission.admits_chip(0x1387));
         assert!(!admission.admits_chip(0x1398));
 
@@ -1481,7 +1951,7 @@ mod identified_miner_profile_tests {
     }
 
     #[test]
-    fn experimental_driver_authority_is_exact_and_adopted_handoff_is_explicit() {
+    fn standard_passthrough_requires_a_typed_handoff_even_for_an_exact_experimental_driver() {
         let s19 = identified_miner_profile(0x1398).unwrap();
         assert!(admit_standard_hardware_composition(
             "am2-s19pro",
@@ -1496,7 +1966,7 @@ mod identified_miner_profile_tests {
 
         let policy = ChipDriverExecutionPolicy::with_experimental_chip(0x1398);
         let registry = ChipRegistry::with_execution_policy(policy);
-        let admission = admit_standard_hardware_composition(
+        let error = admit_standard_hardware_composition(
             "am2-s19pro",
             s19,
             PicType::DsPic33EP,
@@ -1505,16 +1975,9 @@ mod identified_miner_profile_tests {
             true,
             &registry,
         )
-        .unwrap();
-        assert_eq!(
-            admission.ownership,
-            StandardHardwareOwnership::AdoptedHandoff
-        );
-        assert_eq!(
-            admission.asic.recognition().maturity(),
-            ChipDriverMaturity::Experimental
-        );
-        assert!(admission.admits_chip(0x1398));
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("typed hardware-handoff receipt"));
     }
 }
 
@@ -1723,6 +2186,24 @@ mod hardware_preflight_policy_tests {
 
     #[test]
     fn init_denial_cannot_turn_an_empty_disable_set_into_safe_off_proof() {
+        let lifecycle_signature =
+            ["    async fn run_", "lifecycle(&mut self) -> Result<()> {"].concat();
+        let lifecycle = DAEMON_SOURCE
+            .find(&lifecycle_signature)
+            .expect("standard lifecycle body");
+        let composition = DAEMON_SOURCE[lifecycle..]
+            .find("self.admit_standard_composition_before_bootstrap(&platform_identity)")
+            .map(|offset| lifecycle + offset)
+            .expect("pre-bootstrap standard composition admission");
+        let init_call = DAEMON_SOURCE[lifecycle..]
+            .find("initialize_or_recover(")
+            .map(|offset| lifecycle + offset)
+            .expect("platform initialization boundary");
+        assert!(
+            composition < init_call,
+            "composition denial must occur before the hardware lifecycle starts"
+        );
+
         let init_signature = ["async fn in", "it("].concat();
         let init = DAEMON_SOURCE
             .find(&init_signature)
@@ -1731,18 +2212,14 @@ mod hardware_preflight_policy_tests {
             .find("self.preflight_hardware_state_unknown = true;")
             .map(|offset| init + offset)
             .expect("init entry must conservatively mark rail state unknown");
-        let composition = DAEMON_SOURCE[init..]
-            .find("let composition_admission = admit_standard_hardware_composition(")
-            .map(|offset| init + offset)
-            .expect("standard composition admission");
-        let complete = DAEMON_SOURCE[composition..]
+        let complete = DAEMON_SOURCE[unknown..]
             .find("self.preflight_hardware_state_unknown = false;")
-            .map(|offset| composition + offset)
+            .map(|offset| unknown + offset)
             .expect("successful init completion receipt");
 
         assert!(
-            unknown < composition && composition < complete,
-            "composition denial must retain unknown rail state until complete init succeeds"
+            unknown < complete,
+            "partial initialization must retain unknown rail state until complete init succeeds"
         );
         let shutdown = DAEMON_SOURCE
             .rfind("let mut software_disable_failed =")
@@ -1751,9 +2228,25 @@ mod hardware_preflight_policy_tests {
             .split_once(';')
             .map(|(statement, _)| statement.split_whitespace().collect::<Vec<_>>().join(" "))
             .expect("shutdown safe-off evidence statement");
-        assert_eq!(
-            disable_fold,
-            "let mut software_disable_failed = self.preflight_hardware_state_unknown || mining_quiescence_failed"
+        assert!(disable_fold.contains("self.preflight_hardware_state_unknown"));
+        assert!(disable_fold.contains("mining_quiescence_failed"));
+        assert!(disable_fold.contains("api_mutation_barrier_failed"));
+        assert!(
+            DAEMON_SOURCE.contains("if !watchdog_disarm_allowed {"),
+            "incomplete shutdown evidence must refuse terminal closeout even when no watchdog disarm sender exists"
+        );
+        // Split so this negative contract cannot match its own literal: DAEMON_SOURCE
+        // is `include_str!("daemon.rs")`, i.e. this very file, so a contiguous literal
+        // here would make the assertion unsatisfiable by construction.
+        let fail_open_disarm_guard = [
+            "if self.watchdog_disarm_tx.is_some()",
+            " && !watchdog_disarm_allowed",
+        ]
+        .concat();
+        assert!(
+            !DAEMON_SOURCE.contains(&fail_open_disarm_guard),
+            "the historical disarm guard was fail-open: with no disarm sender the \
+             incomplete-evidence refusal was skipped and terminal closeout proceeded"
         );
     }
 
@@ -1832,12 +2325,134 @@ const fn thermal_disable_round_ok(channel_present: bool, all_addrs_acked: bool) 
     channel_present && all_addrs_acked
 }
 
+fn terminal_thermal_lockout_path() -> std::path::PathBuf {
+    crate::runtime_policy::persistence_path(
+        std::path::Path::new("/data/dcent/dcentrald-thermal-lockout-v1"),
+        std::path::Path::new("/tmp/dcent/dcentrald-thermal-lockout-v1"),
+    )
+}
+
+fn current_unix_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn temperature_milli_c(temp_c: f32) -> Option<i32> {
+    if !temp_c.is_finite() || !(-100.0..=250.0).contains(&temp_c) {
+        return None;
+    }
+    Some((temp_c * 1_000.0).round() as i32)
+}
+
+fn persist_terminal_thermal_generation(
+    path: &std::path::Path,
+    lockout: TerminalThermalLockout,
+) -> Result<dcentrald_common::atomic_file::AtomicWriteOutcome> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating terminal thermal lockout directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    persist_thermal_lockout(path, lockout).map_err(anyhow::Error::new)
+}
+
+/// Run crash-durable lockout publication away from the async worker and bound
+/// how long that worker waits. Callers must own one of two fail-closed states:
+/// either pre-energize admission where no heartbeat/rail/feed exists yet, or a
+/// terminal generation whose feed is closed and typed closeout already
+/// requested. A stuck filesystem is evidence for the pre-launch session latch,
+/// never permission to energize or keep a live generation watchdog-feedable.
+async fn persist_terminal_thermal_generation_bounded(
+    path: &std::path::Path,
+    lockout: TerminalThermalLockout,
+) -> Result<dcentrald_common::atomic_file::AtomicWriteOutcome> {
+    let owned_path = path.to_path_buf();
+    let persistence = tokio::task::spawn_blocking(move || {
+        persist_terminal_thermal_generation(&owned_path, lockout)
+    });
+    match tokio::time::timeout(TERMINAL_THERMAL_LOCKOUT_PERSIST_TIMEOUT, persistence).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => Err(anyhow::anyhow!(
+            "terminal thermal lockout persistence worker failed: {join_error}"
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "terminal thermal lockout persistence exceeded the {:?} fail-closed bound; the detached blocking operation may still complete, but its durability is not admitted",
+            TERMINAL_THERMAL_LOCKOUT_PERSIST_TIMEOUT
+        )),
+    }
+}
+
 fn mark_thermal_emergency_active(latch: &AtomicBool) {
     latch.store(true, Ordering::Release);
 }
 
-fn clear_thermal_emergency_active(latch: &AtomicBool) {
-    latch.store(false, Ordering::Release);
+/// Preserve the irreversible safety boundary for the current mining
+/// generation. This is idempotent: a heartbeat or thermal path may already
+/// have revoked admission, but cooldown must never reopen work or watchdog
+/// feeding in that same generation.
+fn preserve_terminal_thermal_generation(
+    latch: &AtomicBool,
+    admission: &WorkDispatchAdmissionPublication,
+    feed_stop: Option<&crate::runtime::watchdog_feed_gate::WatchdogFeedStopSignal>,
+) {
+    mark_thermal_emergency_active(latch);
+    admission.publish_revoked();
+    if let Some(signal) = feed_stop {
+        signal.close_terminal_lock_free();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThermalCloseoutDisposition {
+    FreshDaemonLifecycleRequired,
+}
+
+/// Hand a terminal thermal generation to `run_lifecycle`'s one typed closeout
+/// owner immediately. Waiting for cooldown after stopping WDT feed lets the
+/// watchdog reset preempt software teardown; cooldown is instead enforced on a
+/// later generation by finite pre-energize temperature admission.
+fn request_typed_closeout_for_terminal_thermal_generation(
+    latch: &AtomicBool,
+    admission: &WorkDispatchAdmissionPublication,
+    feed_stop: Option<&crate::runtime::watchdog_feed_gate::WatchdogFeedStopSignal>,
+    lifecycle_shutdown: &CancellationToken,
+) -> ThermalCloseoutDisposition {
+    preserve_terminal_thermal_generation(latch, admission, feed_stop);
+    lifecycle_shutdown.cancel();
+    ThermalCloseoutDisposition::FreshDaemonLifecycleRequired
+}
+
+/// Latch thermal emergency and terminally revoke shared work-dispatch admission
+/// before attempting the direct rail cut. Watchdog feed remains available only
+/// for that bounded cut attempt; the typed-closeout handoff closes it
+/// irreversibly once the attempt finishes.
+fn mark_thermal_emergency_and_revoke_work_dispatch(
+    latch: &AtomicBool,
+    admission: &WorkDispatchAdmissionPublication,
+    home_pwm: u8,
+) {
+    let was_admitted = admission.is_admitted();
+    mark_thermal_emergency_active(latch);
+    admission.publish_revoked();
+    if !was_admitted {
+        return;
+    }
+    let (action, stop_feed) =
+        dcentrald_common::revoke_work_dispatch(DispatchRevocationCause::ThermalCutoff, home_pwm);
+    error!(
+        stop_watchdog_feed_at_closeout = stop_feed,
+        steps = action.steps().len(),
+        "standard daemon work-dispatch TERMINALLY REVOKED — thermal cut attempt owns the bounded interval before typed closeout"
+    );
+    debug_assert!(
+        stop_feed,
+        "thermal cutoff must stop watchdog feeding at typed closeout"
+    );
 }
 
 fn thermal_emergency_active(latch: &AtomicBool) -> bool {
@@ -1854,11 +2469,28 @@ pub(crate) fn watchdog_interval_secs(kick_interval_s: u64) -> u64 {
     kick_interval_s.max(1)
 }
 
-fn watchdog_teardown_kick_allowed(
-    deadline: tokio::time::Instant,
-    now: tokio::time::Instant,
-) -> bool {
+fn watchdog_teardown_kick_allowed(deadline: Instant, now: Instant) -> bool {
     now < deadline
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardWatchdogDisarmAdmission {
+    Admitted,
+    TeardownNotObserved,
+    TeardownDeadlineExpired,
+}
+
+fn standard_watchdog_disarm_admission(
+    intent: WatchdogIntent,
+    now: Instant,
+) -> StandardWatchdogDisarmAdmission {
+    match intent {
+        WatchdogIntent::Mining => StandardWatchdogDisarmAdmission::TeardownNotObserved,
+        WatchdogIntent::Teardown { deadline } if now < deadline => {
+            StandardWatchdogDisarmAdmission::Admitted
+        }
+        WatchdogIntent::Teardown { .. } => StandardWatchdogDisarmAdmission::TeardownDeadlineExpired,
+    }
 }
 
 fn watchdog_stall_limit(
@@ -1953,6 +2585,68 @@ pub(crate) fn sanitize_webhook_url(url: &str) -> String {
 #[cfg(test)]
 mod watchdog_interval_tests {
     use super::{thermal_pid_interval_secs, watchdog_interval_secs};
+    use std::time::{Duration, Instant};
+
+    const DAEMON_RS: &str = include_str!("daemon.rs");
+
+    fn source_between(start: &str, end: &str) -> &'static str {
+        // This contract's own marker strings occur before the production
+        // functions in this file, so select the last start marker.
+        let start = DAEMON_RS
+            .rfind(start)
+            .expect("production source start marker missing");
+        let end = DAEMON_RS[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("source end marker missing");
+        &DAEMON_RS[start..end]
+    }
+
+    #[test]
+    fn watchdog_selects_prioritize_terminal_control_before_kick_ticks() {
+        let legacy = source_between("fn watchdog_kicker_loop(", "fn owned_watchdog_kicker(");
+        let standard = source_between(
+            "fn owned_watchdog_kicker(",
+            "pub(crate) fn spawn_watchdog_kicker(",
+        );
+
+        for (name, body, control_branches) in [
+            ("legacy", legacy, &["_ = shutdown.cancelled()"] as &[&str]),
+            (
+                "standard",
+                standard,
+                &[
+                    "_ = owner_shutdown.cancelled()",
+                    "changed = intent_rx.changed()",
+                    "permit = &mut disarm_rx",
+                ],
+            ),
+        ] {
+            let select = body
+                .find("tokio::select!")
+                .unwrap_or_else(|| panic!("{name} watchdog select missing"));
+            let body = &body[select..];
+            let biased = body
+                .find("biased;")
+                .unwrap_or_else(|| panic!("{name} watchdog select is not biased"));
+            let tick = body
+                .find("_ = interval.tick()")
+                .unwrap_or_else(|| panic!("{name} watchdog tick branch missing"));
+            assert!(
+                biased < tick,
+                "{name} watchdog must declare biased selection before the kick branch"
+            );
+            for control in control_branches {
+                let control = body.find(control).unwrap_or_else(|| {
+                    panic!("{name} watchdog terminal-control branch `{control}` missing")
+                });
+                assert!(
+                    biased < control && control < tick,
+                    "{name} watchdog terminal-control branch must win a coincident kick tick"
+                );
+            }
+        }
+    }
 
     #[test]
     fn watchdog_interval_secs_is_never_zero() {
@@ -2087,8 +2781,8 @@ mod watchdog_interval_tests {
 
     #[test]
     fn watchdog_teardown_grace_is_absolute_and_expires_fail_closed() {
-        let now = tokio::time::Instant::now();
-        let deadline = now + super::WATCHDOG_TEARDOWN_GRACE;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
 
         assert!(super::watchdog_teardown_kick_allowed(deadline, now));
         assert!(super::watchdog_teardown_kick_allowed(
@@ -2100,6 +2794,38 @@ mod watchdog_interval_tests {
             deadline,
             deadline + std::time::Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn standard_watchdog_disarm_is_owner_admitted_only_inside_teardown_deadline() {
+        use super::{
+            standard_watchdog_disarm_admission, StandardWatchdogDisarmAdmission, WatchdogIntent,
+        };
+
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_secs(1);
+        assert_eq!(
+            standard_watchdog_disarm_admission(WatchdogIntent::Mining, now),
+            StandardWatchdogDisarmAdmission::TeardownNotObserved
+        );
+        assert_eq!(
+            standard_watchdog_disarm_admission(
+                WatchdogIntent::Teardown { deadline },
+                deadline - std::time::Duration::from_nanos(1),
+            ),
+            StandardWatchdogDisarmAdmission::Admitted
+        );
+        assert_eq!(
+            standard_watchdog_disarm_admission(WatchdogIntent::Teardown { deadline }, deadline,),
+            StandardWatchdogDisarmAdmission::TeardownDeadlineExpired
+        );
+        assert_eq!(
+            standard_watchdog_disarm_admission(
+                WatchdogIntent::Teardown { deadline },
+                deadline + std::time::Duration::from_nanos(1),
+            ),
+            StandardWatchdogDisarmAdmission::TeardownDeadlineExpired
+        );
     }
 
     #[test]
@@ -2156,6 +2882,7 @@ struct WatchdogKickerSetup {
     watchdog: Watchdog,
     kick_secs: u64,
     stall_limit: u64,
+    feed_gate: WatchdogFeedGate,
 }
 
 type WatchdogDisarmResult = std::result::Result<(), String>;
@@ -2163,20 +2890,22 @@ type WatchdogDisarmResult = std::result::Result<(), String>;
 fn prepare_watchdog_kicker(
     watchdog: &crate::config::WatchdogConfig,
     expected_liveness_interval: Option<Duration>,
+    feed_gate: WatchdogFeedGate,
 ) -> Option<WatchdogKickerSetup> {
     if !watchdog.enabled {
         return None;
     }
     // NEW-4 (2026-06-10 adversarial pass): open the watchdog HERE (after init).
-    // Open + set_timeout + an immediate kick + the kicker loop all happen
-    // together, so the DTB-10s window can never fire during the slow hardware init.
+    // Defer watchdog acquisition until after slow hardware initialization, then
+    // attempt timeout configuration and an initial feed before starting the
+    // kicker. Kernel/device action remains target-specific and unmeasured here.
     let wd = match Watchdog::open() {
         Ok(wd) => {
-            info!("Watchdog opened at /dev/watchdog — SoC will auto-reboot if dcentrald crashes");
+            info!("Watchdog device opened at /dev/watchdog; timeout configuration, feed admission, and target reset action are verified separately");
             wd
         }
         Err(e) => {
-            warn!(error = %e, "Watchdog not available — miner will not auto-recover from crashes (this is OK for development)");
+            warn!(error = %e, "Watchdog device unavailable; no kernel-watchdog recovery action is claimed");
             return None;
         }
     };
@@ -2199,16 +2928,24 @@ fn prepare_watchdog_kicker(
             watchdog.timeout_s
         }
     };
-    // NEW-4: immediate kick so the freshly-opened WDT starts from a full timeout
-    // (the kicker's first interval tick is one kick_interval away).
+    // Attempt an immediate feed before the kicker's first interval. A withheld
+    // or failed feed remains explicit negative evidence; it does not prove the
+    // hardware timer was refreshed.
     #[cfg(unix)]
-    let _ = wd.kick();
+    match feed_gate.try_kick(|| wd.kick()) {
+        Ok(WatchdogFeedOutcome::Kicked) => {}
+        Ok(outcome) => warn!(
+            ?outcome,
+            "Initial watchdog kick was withheld by the terminal feed gate"
+        ),
+        Err(error) => warn!(%error, "Initial watchdog kick failed"),
+    }
     let kick_interval = watchdog.kick_interval_s as u64;
     info!(
         kick_interval_s = kick_interval,
         requested_timeout_s = watchdog.timeout_s,
         effective_timeout_s,
-        "Watchdog armed (requested timeout={}s, effective timeout={}s, kick={}s) — hardware will auto-reboot if dcentrald stops responding",
+        "Watchdog feed owner configured (requested timeout={}s, reported-or-conservative timeout={}s, kick={}s); feed loss requests the target watchdog action, whose physical reset effect is unmeasured",
         watchdog.timeout_s, effective_timeout_s, kick_interval,
     );
     // Expert review fix: Use the owned Watchdog struct with persistent fd.
@@ -2218,8 +2955,9 @@ fn prepare_watchdog_kicker(
     // WDT while the supervised runtime loop is making progress. On the standard
     // path this is the thermal control loop; on Daemon::run-bypassing paths it is
     // the path-local thermal/runtime housekeeping loop. A deadlocked / livelocked
-    // loop then STOPS feeding the WDT, so the SoC reboots instead of leaving
-    // energized boards unsupervised. `stall_limit` is sized to ~half the WDT
+    // loop then STOPS feeding the WDT and leaves the configured target watchdog
+    // action pending; reset and rail effects remain unmeasured. `stall_limit` is
+    // sized to ~half the WDT
     // window (above the normal tick cadence) so scheduler jitter can't trip it; a
     // fresh (0) counter is "not yet started" and does not gate.
     let kick_secs = watchdog_interval_secs(kick_interval);
@@ -2232,6 +2970,7 @@ fn prepare_watchdog_kicker(
         watchdog: wd,
         kick_secs,
         stall_limit,
+        feed_gate,
     })
 }
 
@@ -2245,6 +2984,7 @@ async fn watchdog_kicker_loop(
         watchdog: wd,
         kick_secs,
         stall_limit,
+        feed_gate,
     } = setup;
     let mut last_live: u64 = 0;
     let mut stalls: u64 = 0;
@@ -2255,16 +2995,22 @@ async fn watchdog_kicker_loop(
     let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => {
-                info!("Watchdog kicker stopping — sending magic close to disarm");
-                let disarm_result = wd.close_magic().map_err(|error| error.to_string());
-                match &disarm_result {
-                    Ok(()) => info!("Watchdog magic close completed"),
-                    Err(error) => error!(error, "Watchdog magic close failed; hardware watchdog remains armed"),
-                }
+                feed_gate.close_terminal();
+                warn!("Legacy watchdog cancellation has no typed mutation-barrier, actor-quiescence, or safe-off authority; withholding future kicks and intentionally retaining /dev/watchdog without magic close so reset remains fail-closed");
                 if let Some(disarm_tx) = disarm_tx {
-                    let _ = disarm_tx.send(disarm_result);
+                    let _ = disarm_tx.send(Err(
+                        "legacy watchdog cancellation cannot authorize magic close"
+                            .to_string(),
+                    ));
                 }
+                // Do not close the descriptor here. Depending on kernel
+                // watchdog features and nowayout policy, an ordinary fd
+                // close can disable supervision even without the magic
+                // byte. This deliberately leaks one process-lifetime fd:
+                // the timer remains armed and receives no further kicks.
+                std::mem::forget(wd);
                 return;
             }
             _ = interval.tick() => {
@@ -2284,8 +3030,16 @@ async fn watchdog_kicker_loop(
                         continue; // do NOT kick — let the WDT fire
                     }
                 }
-                if let Err(e) = wd.kick() {
-                    error!(error = %e, "Watchdog kick failed — if this persists, the SoC may reboot!");
+                match feed_gate.try_kick(|| wd.kick()) {
+                    Ok(WatchdogFeedOutcome::Kicked) => {}
+                    Ok(outcome) => {
+                        warn!(?outcome, "Legacy watchdog feed gate withheld a scheduled kick");
+                        std::mem::forget(wd);
+                        return;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Watchdog kick failed — if this persists, the SoC may reboot!");
+                    }
                 }
             }
         }
@@ -2295,28 +3049,493 @@ async fn watchdog_kicker_loop(
 #[derive(Debug, Clone, Copy)]
 enum WatchdogIntent {
     Mining,
-    Teardown { deadline: tokio::time::Instant },
-    Disarm,
+    Teardown { deadline: Instant },
 }
 
 #[derive(Debug)]
 enum WatchdogTaskReceipt {
     NotOpenedByDaemon,
-    MagicCloseWriteCompleted,
+    DisarmNotAttemptedBeforeTeardown,
+    DisarmNotAttemptedDeadlineExpired,
+    MagicCloseWriteCompleted { completed_at: Instant },
     MagicCloseWriteFailed(String),
 }
 
+#[derive(Debug)]
+struct StandardPsuFeederCloseoutReceipt {
+    run_scope: WatchdogRunScope,
+    issuer: Arc<()>,
+}
+
+#[derive(Debug)]
+struct StandardHeartbeatCloseoutReceipt {
+    run_scope: WatchdogRunScope,
+    issuer: Arc<()>,
+}
+
+#[derive(Debug)]
+struct StandardSoftwareSafeOffReceipt {
+    run_scope: WatchdogRunScope,
+    issuer: Arc<()>,
+    teardown_budget: TeardownBudgetView,
+}
+
+/// Worker-observed first-cut timing retained until every remaining shutdown
+/// domain is closed. Both bounds are checked against the one watchdog-issued
+/// schedule, so async queue latency cannot masquerade as physical progress.
+struct StandardTeardownProgress {
+    teardown_budget: TeardownBudgetView,
+}
+
+struct StandardTeardownReceipt {
+    teardown_budget: TeardownBudgetView,
+}
+
+impl StandardTeardownProgress {
+    fn after_checked_cut(
+        teardown_budget: TeardownBudgetView,
+        operation_started_at: Instant,
+        operation_completed_at: Instant,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            operation_started_at >= teardown_budget.started_at(),
+            "standard voltage cutoff began before this teardown budget"
+        );
+        anyhow::ensure!(
+            operation_completed_at >= operation_started_at,
+            "standard voltage cutoff completion preceded its start"
+        );
+        teardown_budget.require_completed_at(TeardownStage::CutoffStart, operation_started_at)?;
+        teardown_budget
+            .require_completed_at(TeardownStage::CutoffComplete, operation_completed_at)?;
+        Ok(Self { teardown_budget })
+    }
+
+    fn complete(self, completed_at: Instant) -> Result<StandardTeardownReceipt> {
+        self.teardown_budget
+            .require_completed_at(TeardownStage::CleanupComplete, completed_at)?;
+        Ok(StandardTeardownReceipt {
+            teardown_budget: self.teardown_budget,
+        })
+    }
+}
+
+fn remaining_standard_cleanup(
+    teardown_budget: &TeardownBudgetView,
+    requested: Duration,
+) -> Duration {
+    teardown_budget
+        .remaining_capped_at(TeardownStage::CleanupComplete, requested, Instant::now())
+        .unwrap_or(Duration::ZERO)
+}
+
+async fn sleep_within_standard_cleanup(teardown_budget: &TeardownBudgetView, requested: Duration) {
+    let remaining = remaining_standard_cleanup(teardown_budget, requested);
+    if !remaining.is_zero() {
+        tokio::time::sleep(remaining).await;
+    }
+}
+
+/// One-shot owner set for standard-daemon non-actor shutdown domains. Each
+/// receipt can be issued only after its concrete shutdown stage succeeds, and
+/// every receipt remains bound to both this watchdog run and the admission's
+/// private issuer identity.
+pub(crate) struct StandardUnitCloseoutOwners {
+    run_scope: WatchdogRunScope,
+    issuer: Arc<()>,
+    psu_feeders_open: bool,
+    heartbeat_open: bool,
+    safe_off_open: bool,
+}
+
+impl StandardUnitCloseoutOwners {
+    pub(crate) fn new(run_scope: WatchdogRunScope, issuer: StandardUnitCloseoutIssuer) -> Self {
+        Self {
+            run_scope,
+            issuer: issuer.into_identity(),
+            psu_feeders_open: true,
+            heartbeat_open: true,
+            safe_off_open: true,
+        }
+    }
+
+    fn close_psu_feeders(&mut self) -> Result<StandardPsuFeederCloseoutReceipt> {
+        anyhow::ensure!(
+            std::mem::replace(&mut self.psu_feeders_open, false),
+            "standard PSU-feeder closeout was already issued"
+        );
+        Ok(StandardPsuFeederCloseoutReceipt {
+            run_scope: self.run_scope.clone(),
+            issuer: Arc::clone(&self.issuer),
+        })
+    }
+
+    fn close_heartbeat_owners(&mut self) -> Result<StandardHeartbeatCloseoutReceipt> {
+        anyhow::ensure!(
+            std::mem::replace(&mut self.heartbeat_open, false),
+            "standard heartbeat closeout was already issued"
+        );
+        Ok(StandardHeartbeatCloseoutReceipt {
+            run_scope: self.run_scope.clone(),
+            issuer: Arc::clone(&self.issuer),
+        })
+    }
+
+    fn close_software_safe_off(
+        &mut self,
+        teardown_budget: TeardownBudgetView,
+    ) -> Result<StandardSoftwareSafeOffReceipt> {
+        anyhow::ensure!(
+            std::mem::replace(&mut self.safe_off_open, false),
+            "standard software-safe-off closeout was already issued"
+        );
+        Ok(StandardSoftwareSafeOffReceipt {
+            run_scope: self.run_scope.clone(),
+            issuer: Arc::clone(&self.issuer),
+            teardown_budget,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(
+        mut self,
+        teardown_budget: TeardownBudgetView,
+    ) -> Result<StandardUnitCloseoutIdentity> {
+        let psu_feeders = self.close_psu_feeders()?;
+        let heartbeat = self.close_heartbeat_owners()?;
+        let safe_off = self.close_software_safe_off(teardown_budget)?;
+        StandardUnitCloseoutIdentity::from_receipts(
+            &self.run_scope,
+            psu_feeders,
+            heartbeat,
+            safe_off,
+        )
+    }
+}
+
+/// Validated standard unit-closeout identity retained by the move-only Disarm
+/// permit. Construction requires all three named owner receipts to agree on
+/// both run and issuer; the watchdog then checks the admission-side expectation.
+#[derive(Debug)]
+pub(crate) struct StandardUnitCloseoutIdentity {
+    run_scope: WatchdogRunScope,
+    issuer: Arc<()>,
+}
+
+impl StandardUnitCloseoutIdentity {
+    fn from_receipts(
+        run_scope: &WatchdogRunScope,
+        psu_feeders: StandardPsuFeederCloseoutReceipt,
+        heartbeat: StandardHeartbeatCloseoutReceipt,
+        safe_off: StandardSoftwareSafeOffReceipt,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            psu_feeders.run_scope.same_run(run_scope)
+                && heartbeat.run_scope.same_run(run_scope)
+                && safe_off.run_scope.same_run(run_scope),
+            "standard unit closeout contains a receipt from another watchdog run"
+        );
+        anyhow::ensure!(
+            Arc::ptr_eq(&psu_feeders.issuer, &heartbeat.issuer)
+                && Arc::ptr_eq(&psu_feeders.issuer, &safe_off.issuer),
+            "standard unit closeout combines receipts from different issuers"
+        );
+        Ok(Self {
+            run_scope: psu_feeders.run_scope,
+            issuer: psu_feeders.issuer,
+        })
+    }
+
+    pub(crate) fn authorizes(
+        &self,
+        run_scope: &WatchdogRunScope,
+        expectation: &StandardUnitCloseoutExpectation,
+    ) -> bool {
+        self.run_scope.same_run(run_scope) && expectation.matches_identity(&self.issuer)
+    }
+}
+
+#[cfg(test)]
+mod standard_closeout_tests {
+    use super::{
+        StandardTeardownProgress, StandardUnitCloseoutIdentity, StandardUnitCloseoutOwners,
+    };
+    use crate::runtime::safety_watchdog::{StandardWatchdogRunAdmission, WatchdogRunScope};
+    use crate::runtime::teardown_budget::{
+        TeardownBudgetPolicy, TeardownBudgetView, TeardownStage,
+    };
+    use std::time::Instant;
+
+    fn budget_view(scope: WatchdogRunScope) -> TeardownBudgetView {
+        let (_, _, _, _, _, mut issuer, _) =
+            StandardWatchdogRunAdmission::for_scope_for_test(scope).into_parts();
+        issuer
+            .issue_at(Instant::now(), TeardownBudgetPolicy::watchdog_default())
+            .unwrap()
+            .view()
+    }
+
+    #[test]
+    fn standard_unit_closeout_receipts_are_one_shot_run_and_issuer_bound() {
+        let (scope, _, _, issuer, expectation, _, _) =
+            StandardWatchdogRunAdmission::new().into_parts();
+        let same_run = scope.clone();
+        let other_run = WatchdogRunScope::new();
+        let mut owners = StandardUnitCloseoutOwners::new(scope.clone(), issuer);
+
+        let psu = owners.close_psu_feeders().unwrap();
+        assert!(owners.close_psu_feeders().is_err());
+        let heartbeat = owners.close_heartbeat_owners().unwrap();
+        assert!(owners.close_heartbeat_owners().is_err());
+        let safe_off = owners
+            .close_software_safe_off(budget_view(scope.clone()))
+            .unwrap();
+        assert!(owners
+            .close_software_safe_off(budget_view(scope.clone()))
+            .is_err());
+        let identity =
+            StandardUnitCloseoutIdentity::from_receipts(&scope, psu, heartbeat, safe_off).unwrap();
+
+        assert!(identity.authorizes(&same_run, &expectation));
+        assert!(!identity.authorizes(&other_run, &expectation));
+
+        let (_, _, _, foreign_issuer, foreign_expectation, _, _) =
+            StandardWatchdogRunAdmission::for_scope_for_test(scope.clone()).into_parts();
+        let _foreign_owners = StandardUnitCloseoutOwners::new(scope, foreign_issuer);
+        assert!(!identity.authorizes(&same_run, &foreign_expectation));
+    }
+
+    #[test]
+    fn standard_unit_closeout_rejects_cross_run_and_mixed_issuer_receipts() {
+        let (scope, _, _, issuer_a, _, _, _) = StandardWatchdogRunAdmission::new().into_parts();
+        let (_, _, _, issuer_b, _, _, _) =
+            StandardWatchdogRunAdmission::for_scope_for_test(scope.clone()).into_parts();
+        let mut owners_a = StandardUnitCloseoutOwners::new(scope.clone(), issuer_a);
+        let mut owners_b = StandardUnitCloseoutOwners::new(scope.clone(), issuer_b);
+        let mixed = StandardUnitCloseoutIdentity::from_receipts(
+            &scope,
+            owners_a.close_psu_feeders().unwrap(),
+            owners_b.close_heartbeat_owners().unwrap(),
+            owners_a
+                .close_software_safe_off(budget_view(scope.clone()))
+                .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mixed.contains("different issuers"));
+
+        let (other_scope, _, _, other_issuer, _, _, _) =
+            StandardWatchdogRunAdmission::new().into_parts();
+        let (_, _, _, same_run_issuer, _, _, _) =
+            StandardWatchdogRunAdmission::for_scope_for_test(scope.clone()).into_parts();
+        let mut same_run = StandardUnitCloseoutOwners::new(scope.clone(), same_run_issuer);
+        let mut other_run = StandardUnitCloseoutOwners::new(other_scope, other_issuer);
+        let cross_run = StandardUnitCloseoutIdentity::from_receipts(
+            &scope,
+            same_run.close_psu_feeders().unwrap(),
+            same_run.close_heartbeat_owners().unwrap(),
+            other_run
+                .close_software_safe_off(budget_view(WatchdogRunScope::new()))
+                .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(cross_run.contains("another watchdog run"));
+    }
+
+    #[test]
+    fn standard_teardown_timing_is_strict_and_uses_worker_boundaries() {
+        let (_, _, _, _, _, mut issuer, _) = StandardWatchdogRunAdmission::new().into_parts();
+        let started_at = Instant::now();
+        let budget = issuer
+            .issue_at(started_at, TeardownBudgetPolicy::watchdog_default())
+            .unwrap();
+        let view = budget.view();
+
+        assert!(StandardTeardownProgress::after_checked_cut(
+            view.clone(),
+            started_at - std::time::Duration::from_nanos(1),
+            started_at,
+        )
+        .is_err());
+        assert!(StandardTeardownProgress::after_checked_cut(
+            view.clone(),
+            view.deadline(TeardownStage::CutoffStart),
+            view.deadline(TeardownStage::CutoffStart),
+        )
+        .is_err());
+        assert!(StandardTeardownProgress::after_checked_cut(
+            view.clone(),
+            started_at + std::time::Duration::from_nanos(1),
+            view.deadline(TeardownStage::CutoffComplete),
+        )
+        .is_err());
+
+        let progress = StandardTeardownProgress::after_checked_cut(
+            view.clone(),
+            started_at + std::time::Duration::from_nanos(1),
+            started_at + std::time::Duration::from_nanos(2),
+        )
+        .unwrap();
+        assert!(progress
+            .complete(view.deadline(TeardownStage::CleanupComplete))
+            .is_err());
+    }
+
+    #[test]
+    fn standard_shutdown_source_has_no_remintable_unit_closeout_markers() {
+        let source = include_str!("daemon.rs");
+        for forbidden in [
+            ["struct StandardPsuFeeder", "CloseoutReceipt;"].concat(),
+            ["struct StandardHeartbeat", "CloseoutReceipt;"].concat(),
+            ["struct StandardSoftwareSafeOff", "CloseoutReceipt;"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden marker: {forbidden}"
+            );
+        }
+        assert!(source.contains("run_scope: WatchdogRunScope"));
+        assert!(source.contains("issuer: Arc<()>"));
+        assert!(source.contains("unit_closeout_owners.close_psu_feeders()?"));
+        assert!(source.contains("unit_closeout_owners.close_heartbeat_owners()?"));
+        assert!(source.contains(".close_software_safe_off(teardown_budget_view.clone())?"));
+        assert!(source.contains("StandardTeardownProgress::after_checked_cut("));
+        assert!(source.contains("operation_started_at: Instant"));
+        assert!(source.contains("TeardownStage::TerminalReceipt"));
+        assert!(source.contains("TeardownStage::WorkerJoin"));
+        let legacy_relative_grace = ["WATCHDOG_TEARDOWN", "_GRACE"].concat();
+        assert!(!source.contains(&legacy_relative_grace));
+    }
+}
+
+/// Exact, move-only standard-daemon closeout roster. Named fields prevent one
+/// mutation domain from being duplicated in place of another, while `scope`
+/// couples the manifest to the watchdog owner created for this mining run.
+pub(crate) struct StandardDaemonShutdownEvidence {
+    scope: WatchdogRunScope,
+    _api_drain: HardwareMutationBarrierReceipt,
+    api_final_commit: HardwareMutationCommitFenceReceipt,
+    execution: CompositionInvalidationReceipt,
+    terminal_controller: TerminalSafeOffTransition,
+    mining_actors: StandardMiningActorQuiescenceReceipt,
+    _psu_feeders: StandardPsuFeederCloseoutReceipt,
+    _heartbeat: StandardHeartbeatCloseoutReceipt,
+    _safe_off: StandardSoftwareSafeOffReceipt,
+    teardown: StandardTeardownReceipt,
+    teardown_disarm: TeardownDisarmAuthority,
+}
+
+impl StandardDaemonShutdownEvidence {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        scope: WatchdogRunScope,
+        api_drain: HardwareMutationBarrierReceipt,
+        api_final_commit: HardwareMutationCommitFenceReceipt,
+        execution: CompositionInvalidationReceipt,
+        terminal_controller: TerminalSafeOffTransition,
+        mining_actors: StandardMiningActorQuiescenceReceipt,
+        psu_feeders: StandardPsuFeederCloseoutReceipt,
+        heartbeat: StandardHeartbeatCloseoutReceipt,
+        safe_off: StandardSoftwareSafeOffReceipt,
+        teardown: StandardTeardownReceipt,
+        teardown_disarm: TeardownDisarmAuthority,
+    ) -> Self {
+        Self {
+            scope,
+            _api_drain: api_drain,
+            api_final_commit,
+            execution,
+            terminal_controller,
+            mining_actors,
+            _psu_feeders: psu_feeders,
+            _heartbeat: heartbeat,
+            _safe_off: safe_off,
+            teardown,
+            teardown_disarm,
+        }
+    }
+
+    pub(crate) fn into_validated_parts(
+        self,
+    ) -> Result<(
+        WatchdogRunScope,
+        CompositionInvalidationReceipt,
+        StandardMiningActorQuiescenceReceipt,
+        StandardUnitCloseoutIdentity,
+        TeardownDisarmAuthority,
+    )> {
+        if self.api_final_commit.fence_poisoned() {
+            anyhow::bail!("standard watchdog disarm evidence contains a poisoned API commit fence");
+        }
+        if !self
+            .terminal_controller
+            .no_controller_mutation_stage_in_flight()
+        {
+            anyhow::bail!(
+                "standard watchdog disarm evidence retained an in-flight controller mutation"
+            );
+        }
+        if !self.mining_actors.same_run(&self.scope) {
+            anyhow::bail!(
+                "standard watchdog disarm evidence contains mining actors from another run"
+            );
+        }
+        anyhow::ensure!(
+            self._safe_off
+                .teardown_budget
+                .same_view(&self.teardown.teardown_budget),
+            "standard software-safe-off evidence belongs to another teardown budget"
+        );
+        anyhow::ensure!(
+            self.teardown
+                .teardown_budget
+                .same_budget(&self.teardown_disarm),
+            "standard cleanup evidence belongs to another teardown budget"
+        );
+        let unit_closeout = StandardUnitCloseoutIdentity::from_receipts(
+            &self.scope,
+            self._psu_feeders,
+            self._heartbeat,
+            self._safe_off,
+        )?;
+        Ok((
+            self.scope,
+            self.execution,
+            self.mining_actors,
+            unit_closeout,
+            self.teardown_disarm,
+        ))
+    }
+}
+
+// clippy::mem_forget: these `std::mem::forget(wd)` calls are the DELIBERATE
+// "leave the hardware watchdog armed" invariant — if the owner disappears without
+// an explicit Disarm, the watchdog must stay armed rather than be disarmed by a
+// drop. Clippy is right that the value has no `Drop`; that is the structural
+// guarantee (armed descriptors are ManuallyDrop / RetainedArmedWatchdog by
+// design, and the consuming HAL close API was removed). The call is retained as a
+// visible restatement of that invariant at each early-return, so a future type
+// change cannot quietly reintroduce a disarming drop here unnoticed.
+#[allow(clippy::forget_non_drop)]
 async fn owned_watchdog_kicker(
     config: crate::config::WatchdogConfig,
     expected_liveness_interval: Duration,
     owner_shutdown: CancellationToken,
+    feed_gate: WatchdogFeedGate,
     mut intent_rx: watch::Receiver<WatchdogIntent>,
+    mut disarm_rx: oneshot::Receiver<StandardWatchdogDisarmPermit>,
+    watchdog_scope: WatchdogRunScope,
+    mining_actor_expectation: StandardMiningActorExpectation,
+    unit_closeout_expectation: StandardUnitCloseoutExpectation,
+    teardown_budget_expectation: crate::runtime::teardown_budget::TeardownBudgetExpectation,
     safety_liveness: Arc<AtomicU64>,
     receipt_tx: oneshot::Sender<WatchdogTaskReceipt>,
 ) {
     // Open only after RuntimeTaskGuard has accepted and spawned this future.
     // Registration refusal therefore cannot leave an armed, unowned fd.
-    let Some(setup) = prepare_watchdog_kicker(&config, Some(expected_liveness_interval)) else {
+    let Some(setup) = prepare_watchdog_kicker(&config, Some(expected_liveness_interval), feed_gate)
+    else {
         let _ = receipt_tx.send(WatchdogTaskReceipt::NotOpenedByDaemon);
         return;
     };
@@ -2324,7 +3543,14 @@ async fn owned_watchdog_kicker(
         watchdog: wd,
         kick_secs,
         stall_limit,
+        feed_gate,
     } = setup;
+    // The task may be aborted by RuntimeTaskGuard or by Tokio runtime
+    // teardown at any await point. An ordinary future drop must never
+    // close an armed watchdog descriptor, because Linux drivers differ on
+    // whether that remains fail-closed. Only the successful magic-close
+    // branch explicitly recovers and closes this value.
+    let mut wd = std::mem::ManuallyDrop::new(wd);
     let mut last_live = 0_u64;
     let mut stalls = 0_u64;
     let mut interval = tokio::time::interval(Duration::from_secs(kick_secs));
@@ -2332,26 +3558,130 @@ async fn owned_watchdog_kicker(
 
     loop {
         tokio::select! {
+            biased;
             _ = owner_shutdown.cancelled() => {
+                feed_gate.close_terminal();
                 warn!("Watchdog task owner cancelled without explicit Disarm; leaving hardware watchdog armed");
+                std::mem::forget(wd);
                 return;
             }
             changed = intent_rx.changed() => {
                 if changed.is_err() {
+                    feed_gate.close_terminal();
                     warn!("Watchdog intent owner disappeared without explicit Disarm; leaving hardware watchdog armed");
+                    std::mem::forget(wd);
                     return;
                 }
-                if matches!(*intent_rx.borrow_and_update(), WatchdogIntent::Disarm) {
-                    info!("Watchdog received explicit Disarm after bounded hardware teardown");
-                    let receipt = match wd.close_magic() {
-                        Ok(()) => WatchdogTaskReceipt::MagicCloseWriteCompleted,
-                        Err(error) => WatchdogTaskReceipt::MagicCloseWriteFailed(error.to_string()),
-                    };
-                    if let Some(receipt_tx) = receipt_tx.take() {
-                        let _ = receipt_tx.send(receipt);
+                let _ = intent_rx.borrow_and_update();
+            }
+            permit = &mut disarm_rx => {
+                let Ok(permit) = permit else {
+                    feed_gate.close_terminal();
+                    warn!("Watchdog disarm authority owner disappeared; leaving hardware watchdog armed");
+                    std::mem::forget(wd);
+                    return;
+                };
+                if !permit.authorizes(
+                    &watchdog_scope,
+                    &mining_actor_expectation,
+                    &unit_closeout_expectation,
+                    &teardown_budget_expectation,
+                ) {
+                    feed_gate.close_terminal();
+                    error!("Watchdog rejected a disarm permit from another standard-daemon run, mining-actor issuer, or unit-closeout issuer; leaving hardware watchdog armed");
+                    std::mem::forget(wd);
+                    return;
+                }
+                match standard_watchdog_disarm_admission(
+                    *intent_rx.borrow(),
+                    Instant::now(),
+                ) {
+                    StandardWatchdogDisarmAdmission::Admitted => {}
+                    StandardWatchdogDisarmAdmission::TeardownNotObserved => {
+                        feed_gate.close_terminal();
+                        error!("Watchdog rejected Disarm before observing same-run teardown admission; leaving hardware watchdog armed");
+                        if let Some(receipt_tx) = receipt_tx.take() {
+                            let _ = receipt_tx.send(WatchdogTaskReceipt::DisarmNotAttemptedBeforeTeardown);
+                        }
+                        std::mem::forget(wd);
+                        return;
                     }
+                    StandardWatchdogDisarmAdmission::TeardownDeadlineExpired => {
+                        feed_gate.close_terminal();
+                        error!("Watchdog rejected late Disarm after the teardown deadline; leaking the descriptor with feed authority closed; the configured reset action remains intended but unobserved");
+                        if let Some(receipt_tx) = receipt_tx.take() {
+                            let _ = receipt_tx.send(WatchdogTaskReceipt::DisarmNotAttemptedDeadlineExpired);
+                        }
+                        std::mem::forget(wd);
+                        return;
+                    }
+                }
+                let observed_feed_deadline = match *intent_rx.borrow() {
+                    WatchdogIntent::Teardown { deadline } => deadline,
+                    WatchdogIntent::Mining => unreachable!("teardown admission checked above"),
+                };
+                if permit.deadline(TeardownStage::FeedDeadline) != observed_feed_deadline {
+                    feed_gate.close_terminal();
+                    error!("Watchdog rejected a standard Disarm whose absolute feed deadline differs from the observed teardown intent; leaving hardware watchdog armed");
+                    std::mem::forget(wd);
                     return;
                 }
+                let disarm_started_at = Instant::now();
+                if let Err(error) = permit.require_disarm_command_started_at(disarm_started_at) {
+                    feed_gate.close_terminal();
+                    error!(%error, "Watchdog rejected standard Disarm at the physical magic-close boundary; leaving hardware watchdog armed");
+                    if let Some(receipt_tx) = receipt_tx.take() {
+                        let _ = receipt_tx.send(WatchdogTaskReceipt::DisarmNotAttemptedDeadlineExpired);
+                    }
+                    std::mem::forget(wd);
+                    return;
+                }
+                // Terminal feed closure and every physical kick share the
+                // same mutex. Once this returns, magic close cannot race a
+                // late timer-selected kick.
+                feed_gate.close_terminal();
+                info!("Watchdog received same-run evidence-gated Disarm after bounded hardware teardown");
+                let close_attempt = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| wd.try_close_magic()),
+                );
+                let receipt = match close_attempt {
+                    Ok(Ok(())) => {
+                        let completed_at = Instant::now();
+                        if let Err(error) = permit
+                            .require_completed_at(TeardownStage::TerminalReceipt, completed_at)
+                        {
+                            error!(
+                                %error,
+                                "Watchdog magic-close write returned after the terminal-receipt deadline"
+                            );
+                        }
+                        WatchdogTaskReceipt::MagicCloseWriteCompleted { completed_at }
+                    }
+                    Ok(Err(error)) => {
+                        let receipt = WatchdogTaskReceipt::MagicCloseWriteFailed(error.to_string());
+                        std::mem::forget(wd);
+                        if let Some(receipt_tx) = receipt_tx.take() {
+                            let _ = receipt_tx.send(receipt);
+                        }
+                        return;
+                    }
+                    Err(payload) => {
+                        // A future HAL/backend implementation may panic
+                        // before completing the magic-close byte. Do not
+                        // let unwinding implicitly close an armed fd: that
+                        // is not a portable fail-closed watchdog action.
+                        std::mem::forget(wd);
+                        std::panic::resume_unwind(payload);
+                    }
+                };
+                // The magic-close byte completed successfully. Recovering
+                // the value is now safe and makes worker exit include the
+                // ordinary fd close instead of leaking a disarmed device.
+                drop(std::mem::ManuallyDrop::into_inner(wd));
+                if let Some(receipt_tx) = receipt_tx.take() {
+                    let _ = receipt_tx.send(receipt);
+                }
+                return;
             }
             _ = interval.tick() => {
                 let should_kick = match *intent_rx.borrow() {
@@ -2366,37 +3696,75 @@ async fn owned_watchdog_kicker(
                     WatchdogIntent::Teardown { deadline } => {
                         if watchdog_teardown_kick_allowed(
                             deadline,
-                            tokio::time::Instant::now(),
+                            Instant::now(),
                         ) {
                             true
                         } else {
                             error!(
-                                grace_s = WATCHDOG_TEARDOWN_GRACE.as_secs(),
-                                "Watchdog teardown deadline expired; WITHHOLDING kick so a wedged shutdown resets the SoC"
+                                "Watchdog teardown deadline expired; WITHHOLDING kick so the target watchdog action can expire (reset effect unmeasured)"
                             );
                             false
                         }
                     }
-                    WatchdogIntent::Disarm => false,
                 };
                 if should_kick {
-                    if let Err(error) = wd.kick() {
-                        error!(error = %error, "Watchdog kick failed — if this persists, the SoC may reboot");
+                    match feed_gate.try_kick(|| wd.kick()) {
+                        Ok(WatchdogFeedOutcome::Kicked) => {}
+                        Ok(outcome) => {
+                            warn!(?outcome, "Standard watchdog feed gate withheld a scheduled kick");
+                        }
+                        Err(error) => {
+                            error!(error = %error, "Watchdog kick failed — if this persists, the SoC may reboot");
+                        }
                     }
+                } else {
+                    feed_gate.close_terminal();
                 }
             }
         }
     }
 }
 
+pub(crate) struct LegacyWatchdogFeedOwner {
+    feed_owner: WatchdogFeedGateOwner,
+    worker_shutdown: CancellationToken,
+}
+
+impl LegacyWatchdogFeedOwner {
+    pub(crate) fn close_terminal(&mut self) {
+        // Gate closure linearizes before cancellation publication, so a timer
+        // tick already selected by the worker cannot kick afterward.
+        self.feed_owner.close_terminal();
+        self.worker_shutdown.cancel();
+    }
+}
+
+impl Drop for LegacyWatchdogFeedOwner {
+    fn drop(&mut self) {
+        self.close_terminal();
+    }
+}
+
 pub(crate) fn spawn_watchdog_kicker(
     watchdog: &crate::config::WatchdogConfig,
-    shutdown: CancellationToken,
     safety_liveness: Option<Arc<AtomicU64>>,
-) {
-    if let Some(setup) = prepare_watchdog_kicker(watchdog, None) {
-        tokio::spawn(watchdog_kicker_loop(setup, shutdown, safety_liveness, None));
-    }
+) -> Option<LegacyWatchdogFeedOwner> {
+    // Legacy compatibility only. Cancellation is fail-closed and never writes
+    // magic close; routes needing a clean stop must migrate to
+    // SafetyWatchdogOwner plus exact shutdown evidence.
+    let feed_owner = WatchdogFeedGateOwner::new();
+    let setup = prepare_watchdog_kicker(watchdog, None, feed_owner.gate())?;
+    let worker_shutdown = CancellationToken::new();
+    tokio::spawn(watchdog_kicker_loop(
+        setup,
+        worker_shutdown.clone(),
+        safety_liveness,
+        None,
+    ));
+    Some(LegacyWatchdogFeedOwner {
+        feed_owner,
+        worker_shutdown,
+    })
 }
 
 /// THERMAL-8 pure tick (non-XADC / Amlogic twin of THERMAL-7): update the
@@ -2886,7 +4254,8 @@ const STANDARD_DAEMON_BOARD_SLOTS: usize = 3;
 //
 // SAFETY: back-off only changes WHEN we bother to poke a NACKing PIC; it never
 // suppresses the voltage-cut safety response. A PIC declared Dead has already
-// failed continuously — its hardware watchdog has long since cut its own rail,
+// failed continuously — its hardware watchdog may have requested a cutoff,
+// but this process has no independent rail measurement,
 // and the daemon's separate thermal/heartbeat-stability gates still apply. We
 // keep reprobing forever (just at a slow cadence) so a board that is re-seated
 // or re-powered is automatically picked back up.
@@ -3187,6 +4556,99 @@ mod init_heartbeat_ownership_tests {
     }
 }
 
+/// Opaque successor authority minted only after the standard daemon's entire
+/// shutdown sequence completes, including terminal watchdog observation and
+/// worker join. Callers can move this value but cannot manufacture one.
+#[derive(Debug)]
+pub(crate) struct StandardDaemonTerminalCloseout {
+    _watchdog: StandardDaemonWatchdogCloseout,
+}
+
+#[derive(Debug)]
+enum StandardDaemonWatchdogCloseout {
+    MagicCloseWriteCompleted,
+    NotOpenedByDaemon,
+    NotStarted,
+}
+
+/// Failure classification exported to the process-level lifecycle owner.
+/// `TerminalSafeOffClosed` proves the owned hardware lifecycle and watchdog
+/// handles closed. It does not prove that the process-global API, MQTT, gRPC,
+/// or accepted CGMiner task graph can be safely rebound in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandardDaemonFailureDisposition {
+    NeverEnergized,
+    TerminalSafeOffClosed,
+    ResetPending,
+}
+
+#[derive(Debug)]
+pub(crate) enum StandardDaemonFailureCloseout {
+    TerminalSafeOff(StandardDaemonTerminalCloseout),
+}
+
+#[derive(Debug)]
+pub(crate) struct StandardDaemonLifecycleError {
+    disposition: StandardDaemonFailureDisposition,
+    source: anyhow::Error,
+    closeout: Option<StandardDaemonFailureCloseout>,
+}
+
+impl StandardDaemonLifecycleError {
+    fn never_energized(source: anyhow::Error) -> Self {
+        Self {
+            disposition: StandardDaemonFailureDisposition::NeverEnergized,
+            source,
+            closeout: None,
+        }
+    }
+
+    fn terminal_safe_off_closed(
+        source: anyhow::Error,
+        closeout: StandardDaemonTerminalCloseout,
+    ) -> Self {
+        Self {
+            disposition: StandardDaemonFailureDisposition::TerminalSafeOffClosed,
+            source,
+            closeout: Some(StandardDaemonFailureCloseout::TerminalSafeOff(closeout)),
+        }
+    }
+
+    fn reset_pending(source: anyhow::Error) -> Self {
+        Self {
+            disposition: StandardDaemonFailureDisposition::ResetPending,
+            source,
+            closeout: None,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        StandardDaemonFailureDisposition,
+        anyhow::Error,
+        Option<StandardDaemonFailureCloseout>,
+    ) {
+        (self.disposition, self.source, self.closeout)
+    }
+
+    fn into_source(self) -> anyhow::Error {
+        self.source
+    }
+}
+
+impl std::fmt::Display for StandardDaemonLifecycleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for StandardDaemonLifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Top-level daemon state machine.
 pub struct Daemon {
     config: DcentraldConfig,
@@ -3198,16 +4660,28 @@ pub struct Daemon {
     /// Sole owner of asynchronous mining hardware tasks. Its standalone token
     /// stops work dispatch and thermal actuation only after the watchdog enters
     /// teardown grace; the management API token remains independent.
-    mining_tasks: RuntimeTaskGuard,
+    mining_tasks: StandardMiningTaskGuard,
     /// Independent fail-closed owner for the standard-path SoC watchdog. Owner
     /// cancellation never means magic close; only an explicit Disarm intent
     /// after bounded hardware teardown may produce a positive receipt.
     watchdog_tasks: RuntimeTaskGuard,
+    watchdog_feed_owner: Option<WatchdogFeedGateOwner>,
     watchdog_intent_tx: Option<watch::Sender<WatchdogIntent>>,
+    watchdog_disarm_tx: Option<oneshot::Sender<StandardWatchdogDisarmPermit>>,
+    watchdog_run_scope: Option<WatchdogRunScope>,
+    watchdog_mining_actor_expectation: Option<StandardMiningActorExpectation>,
+    watchdog_unit_closeout_expectation: Option<StandardUnitCloseoutExpectation>,
+    watchdog_teardown_budget_issuer: Option<TeardownBudgetIssuer>,
+    watchdog_teardown_budget_expectation:
+        Option<crate::runtime::teardown_budget::TeardownBudgetExpectation>,
+    standard_unit_closeout_owners: Option<StandardUnitCloseoutOwners>,
     watchdog_receipt_rx: Option<oneshot::Receiver<WatchdogTaskReceipt>>,
     /// Shutdown consumes hardware ownership and is not retry-safe. In
     /// particular, a retry must not extend the watchdog teardown deadline.
     shutdown_attempted: bool,
+    /// API task ownership remains attached to the standard lifecycle instead
+    /// of being accidentally discarded during the mining run.
+    standard_api_tasks: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
     /// Active mining chains (initialized during init phase, moved to WorkDispatcher in run).
     chains: Vec<Chain>,
     /// Fan controller (initialized during init phase, shared via Arc).
@@ -3237,9 +4711,18 @@ pub struct Daemon {
     standard_composition_admission: Option<StandardHardwareCompositionAdmission>,
     /// Exact driver-execution policy carried into Phase 7 and WorkDispatcher.
     asic_driver_execution_policy: ChipDriverExecutionPolicy,
+    /// Driver authority for Phase 7, minted only after current-generation
+    /// GetAddress receipts prove the declared composition's exact ASIC identity.
+    standard_phase7_driver_admission: Option<StandardPhase7DriverAdmission>,
+    /// Successor authority minted only after Phase 7 completes without error.
+    standard_dispatcher_driver_admission: Option<StandardDispatcherDriverAdmission>,
+    /// One mutation-admission domain shared by the standard runtime and API.
+    /// Shutdown closes and drains this gate before latching terminal controller
+    /// state, preventing an admitted control-plane call from racing safe-off.
+    api_hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate,
     /// Separate token for heartbeat thread shutdown. This is NOT the same as shutdown_token.
     /// The heartbeat thread must keep running DURING graceful shutdown (while voltage is
-    /// being disabled) and only stop AFTER voltage is safely off. The mining owner
+    /// being disabled) and only stop AFTER software disable attempts complete. The mining owner
     /// is cancelled explicitly during shutdown; this heartbeat token is cancelled
     /// later, after disable_voltage.
     heartbeat_shutdown_token: CancellationToken,
@@ -3274,6 +4757,25 @@ pub struct Daemon {
     /// Shutdown must therefore report watchdog/fallback reliance even when no
     /// positively detected slots are available for addressed software disable.
     preflight_hardware_state_unknown: bool,
+    /// Finite, pre-energize XADC observation for this process generation.
+    /// `NotReady` is the constructor default and remains fail-closed if init
+    /// never obtains a current measurement below the controller's recovery
+    /// boundary.
+    startup_thermal_safety: ThermalSafetyState,
+    /// Sealed experimental policy for releasing a board-sensor lockout through
+    /// conservative dwell plus repeated XADC proxy observations. False is the
+    /// production default; the proxy is never described as same-domain proof.
+    experimental_thermal_board_proxy_release: bool,
+    /// Durable thermal restart authority is pre-armed as Unknown before any
+    /// watchdog, heartbeat, or rail enable. This flag becomes true only after
+    /// that atomic publication completes and allows shutdown to remove the
+    /// marker solely after positive nonthermal terminal closeout.
+    thermal_generation_prearmed: bool,
+    /// Process-generation thermal terminal state shared with the heartbeat,
+    /// thermal controller, and typed shutdown owner. A thermal trip sets this
+    /// before cutoff so even failed source refinement retains the pre-armed
+    /// Unknown marker.
+    terminal_thermal_generation_latch: Arc<AtomicBool>,
     /// Runtime voltage command sender serviced by the heartbeat/I2C thread.
     /// Shutdown and thermal safety use this to avoid opening a second /dev/i2c-0 fd.
     // SAFETY (wave 8, 2026-04-28): bounded sync_channel (capacity 64). Previously
@@ -3299,6 +4801,7 @@ pub struct Daemon {
 /// executable with simulated platforms and clocks.
 struct StandardPlatformLifecycle<'a> {
     daemon: &'a mut Daemon,
+    terminal_closeout: Option<StandardDaemonTerminalCloseout>,
 }
 
 struct BootProgressRecoveryPublisher {
@@ -3318,11 +4821,23 @@ impl crate::daemon_lifecycle::PlatformLifecycle for StandardPlatformLifecycle<'_
     }
 
     async fn safe_off_partial_platform(&mut self) -> Result<()> {
-        self.daemon.shutdown().await
+        let closeout = self.daemon.shutdown().await?;
+        anyhow::ensure!(
+            self.terminal_closeout.replace(closeout).is_none(),
+            "standard initialization recovery produced terminal closeout evidence twice"
+        );
+        Ok(())
     }
 
     async fn run_management_only(&mut self) -> Result<()> {
-        self.daemon.run_api_only().await
+        let _closeout = self.terminal_closeout.take().context(
+            "standard initialization recovery cannot enter management-only without matching terminal closeout evidence",
+        )?;
+        self.daemon
+            .run_api_only_with_hardware_mutation_gate(
+                dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+            )
+            .await
     }
 }
 
@@ -3347,7 +4862,24 @@ impl Daemon {
         // bounded teardown grace, then explicitly stop these tasks. A child
         // token would propagate SIGTERM early and freeze thermal liveness before
         // the watchdog knows teardown is intentional.
-        let mining_tasks = RuntimeTaskGuard::new(CancellationToken::new());
+        let (
+            watchdog_run_scope,
+            watchdog_mining_actor_issuer,
+            watchdog_mining_actor_expectation,
+            watchdog_unit_closeout_issuer,
+            watchdog_unit_closeout_expectation,
+            watchdog_teardown_budget_issuer,
+            watchdog_teardown_budget_expectation,
+        ) = StandardWatchdogRunAdmission::new().into_parts();
+        let mining_tasks = StandardMiningTaskGuard::new(
+            CancellationToken::new(),
+            watchdog_run_scope.clone(),
+            watchdog_mining_actor_issuer,
+        );
+        let standard_unit_closeout_owners = StandardUnitCloseoutOwners::new(
+            watchdog_run_scope.clone(),
+            watchdog_unit_closeout_issuer,
+        );
         let watchdog_tasks = RuntimeTaskGuard::new(CancellationToken::new());
         Self {
             config,
@@ -3356,9 +4888,18 @@ impl Daemon {
             shutdown_token,
             mining_tasks,
             watchdog_tasks,
+            watchdog_feed_owner: None,
             watchdog_intent_tx: None,
+            watchdog_disarm_tx: None,
+            watchdog_run_scope: Some(watchdog_run_scope),
+            watchdog_mining_actor_expectation: Some(watchdog_mining_actor_expectation),
+            watchdog_unit_closeout_expectation: Some(watchdog_unit_closeout_expectation),
+            watchdog_teardown_budget_issuer: Some(watchdog_teardown_budget_issuer),
+            watchdog_teardown_budget_expectation: Some(watchdog_teardown_budget_expectation),
+            standard_unit_closeout_owners: Some(standard_unit_closeout_owners),
             watchdog_receipt_rx: None,
             shutdown_attempted: false,
+            standard_api_tasks: None,
             chains: Vec::new(),
             fan: None,
             gpio: None,
@@ -3371,6 +4912,9 @@ impl Daemon {
             miner_profile: None,
             standard_composition_admission: None,
             asic_driver_execution_policy: ChipDriverExecutionPolicy::production_only(),
+            standard_phase7_driver_admission: None,
+            standard_dispatcher_driver_admission: None,
+            api_hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
             heartbeat_shutdown_token: CancellationToken::new(),
             i2c_service: None,
             bootstrap_eeprom_fingerprints: Vec::new(),
@@ -3382,6 +4926,10 @@ impl Daemon {
             runtime_heartbeat_handle: None,
             psu_watchdog_threads: RuntimeThreadGuard::new(CancellationToken::new()),
             preflight_hardware_state_unknown: false,
+            startup_thermal_safety: ThermalSafetyState::NotReady,
+            experimental_thermal_board_proxy_release: false,
+            thermal_generation_prearmed: false,
+            terminal_thermal_generation_latch: Arc::new(AtomicBool::new(false)),
             voltage_cmd_tx: None,
             dispatcher_composition_authority: DispatcherCompositionAuthority::default(),
             asic_enumeration_receipts: Vec::new(),
@@ -3401,6 +4949,21 @@ impl Daemon {
     }
 
     async fn run_api_only(&mut self) -> Result<()> {
+        self.run_api_only_with_hardware_mutation_gate(
+            dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+        )
+        .await
+    }
+
+    /// Start the idle management plane with an explicit hardware-mutation
+    /// posture. Every management-only path passes a closed gate so a reachable
+    /// dashboard cannot upgrade an unproven composition into a new hardware
+    /// owner. Safe-direction controls need their own separately admitted
+    /// capability rather than a generic open mutation domain.
+    async fn run_api_only_with_hardware_mutation_gate(
+        &mut self,
+        hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate,
+    ) -> Result<()> {
         info!(
             "Mining auto-start disabled — skipping hardware bring-up and starting dashboard/API in idle-first mode"
         );
@@ -3524,6 +5087,7 @@ impl Daemon {
             metrics_require_auth: self.config.api.metrics_require_auth,
             // W13.D1: dev-mode boot-timeline gate. See ApiConfig docs.
             expose_boot_timeline: self.config.api.expose_boot_timeline,
+            observer_only: crate::runtime_policy::ephemeral_runtime_enabled(),
         };
 
         let hardware_info = Arc::new(std::sync::Mutex::new(dcentrald_api::HardwareInfo {
@@ -3579,7 +5143,7 @@ impl Daemon {
             power_rx,
             power_calibration,
             psu_lock,
-            hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
+            hardware_mutation_gate,
             autotuner_status_rx,
             autotuner_efficiency_rx,
             autotuner_chip_health_rx,
@@ -3767,13 +5331,22 @@ impl Daemon {
     /// `pic_type` → S9 default chain, exactly as before. Before runtime
     /// I2C ownership begins, `capture_bootstrap_i2c_observations` applies the
     /// default-off `DCENT_AM2_EEPROM_PIC_DETECT` gate and caches the result.
-    /// The chain EEPROM preamble is then the AUTHORITATIVE physical signal:
-    /// a clear NoPic preamble (BHB56902 / `0x05 0x11`) forces
-    /// `PicType::NoPic` so a NoPic board is never driven as a dsPIC
-    /// (SET_VOLTAGE to a non-existent controller). This getter never performs
-    /// I2C or sysfs I/O. With the gate off, the cached result is byte-identical
-    /// to the declarative result. The EEPROM authority never overrides toward dsPIC on a
-    /// weak/absent signal — see
+    /// The chain EEPROM preamble is then a physical signal that is
+    /// authoritative for THIS question and no other: a clear NoPic preamble
+    /// (`0x05 0x11`) forces `PicType::NoPic` so a NoPic board is never driven
+    /// as a dsPIC (SET_VOLTAGE to a non-existent controller).
+    ///
+    /// That inference is sound even though the same two bytes cannot name a
+    /// SKU. `0x05 0x11` is the `edf_v5_xxtea` family and spans BHB56xxx
+    /// (BM1366), BHB68xxx (BM1368/BM1370) and A3HB7xxxx (BM1370) — and every
+    /// member of that family is a NoPic board. Presence-of-a-controller is a
+    /// family-level property; silicon identity is not. Do NOT widen this to
+    /// select a voltage table, a PLL table, or a work codec from the preamble;
+    /// those need the exact SKU from the decoded 256-byte page.
+    ///
+    /// This getter never performs I2C or sysfs I/O. With the gate off, the
+    /// cached result is byte-identical to the declarative result. The EEPROM
+    /// signal never overrides toward dsPIC on a weak/absent reading — see
     /// [`crate::runtime::hardware_info::resolve_pic_type`].
     fn pic_type(&self) -> Result<PicType> {
         let declarative = if let Some(pic_type) = self.configured_model_pic_type_override() {
@@ -3882,53 +5455,285 @@ impl Daemon {
     /// Run the daemon through its full lifecycle.
     ///
     /// This method does not return until shutdown is requested (via signal or API)
-    /// or a fatal error occurs.
+    /// or a fatal error occurs. It is retained for the generic runtime trait and
+    /// deliberately erases lifecycle evidence; its `Err` must never authorize a
+    /// management-only transition. Process-level owners must call
+    /// `run_with_lifecycle_disposition()` instead.
     pub async fn run(&mut self) -> Result<()> {
+        self.run_with_lifecycle_disposition()
+            .await
+            .map_err(StandardDaemonLifecycleError::into_source)
+    }
+
+    /// Run the standard lifecycle while retaining the terminal disposition and
+    /// its matching move-only closeout evidence for the process-level owner.
+    pub(crate) async fn run_with_lifecycle_disposition(
+        &mut self,
+    ) -> std::result::Result<(), StandardDaemonLifecycleError> {
         // NO-BRICK CONTRACT (gap-swarm daemon-startup #6): guarantee a graceful
-        // hardware-safe-off teardown on EVERY error exit of the mining lifecycle.
+        // typed software-closeout teardown on EVERY error exit of the mining lifecycle.
         //
         // `init()` (Phase 1-7, inside run_lifecycle) energizes the chip rail,
         // after which any `?` in the long body can return Err WITHOUT reaching
         // the graceful teardown at the end — that would leave the hash boards
         // energized and the SoC watchdog armed while the process exits and the
         // in-process :8080 API dies (the F1 unmanageable-brick class; only the
-        // ~5-64s PIC heartbeat watchdog would eventually cut power). Run
+        // ~5-64s PIC heartbeat watchdog is intended to request controller cutoff
+        // after its target-specific timeout; physical cutoff remains unmeasured).
+        // Run
         // shutdown() (disable voltage while heartbeats still flow -> stop
         // heartbeat -> fan cool-down -> watchdog magic-close) before propagating.
         //
-        // shutdown() is fully defensive — every subsystem is Option-guarded and
-        // best-effort — so it is safe on partial-init state. It is NOT run on the
-        // lifecycle's own error exits today (only on the normal cancelled-token Ok
-        // path at the end), so there is no double-teardown on success. The
-        // api-only path (!mining_start_enabled) energizes no hardware, so its
-        // errors skip the teardown.
+        // shutdown() is one-shot and fail-closed. A successful call mints opaque
+        // terminal evidence; an error (including a shutdown error already
+        // propagated by run_lifecycle) remains reset-pending and cannot authorize
+        // management-only operation. The api-only path energizes no hardware, so
+        // its errors retain a distinct never-energized disposition.
         let mining = self.config.mining_start_enabled();
         match self.run_lifecycle().await {
             Ok(()) => Ok(()),
             Err(e) if mining => {
+                if self.shutdown_attempted {
+                    error!(
+                        error = %e,
+                        "mining lifecycle failed during or after its one-shot shutdown; \
+                         closeout remains unproven and watchdog reset is pending"
+                    );
+                    return Err(StandardDaemonLifecycleError::reset_pending(e.context(
+                        "standard daemon shutdown was already attempted without producing terminal closeout evidence",
+                    )));
+                }
                 error!(
                     error = %e,
                     "mining lifecycle errored after hardware init — running graceful \
-                     hardware-safe-off teardown (voltage cut, fans to idle, explicit \
+                     software-closeout teardown (voltage-disable commands, fans to idle, explicit \
                      watchdog close attempt) before reporting the error (no-brick #6)"
                 );
-                if let Err(te) = self.shutdown().await {
-                    error!(
-                        teardown_error = %te,
-                        "graceful teardown after lifecycle error also errored — the PIC \
-                         heartbeat watchdog (~5-64s) remains the hardware safety net"
-                    );
+                match self.shutdown().await {
+                    Ok(closeout) => Err(StandardDaemonLifecycleError::terminal_safe_off_closed(
+                        e, closeout,
+                    )),
+                    Err(te) => {
+                        error!(
+                            teardown_error = %te,
+                            "graceful teardown after lifecycle error also errored — closeout \
+                             is unproven and watchdog reset remains the hardware safety path"
+                        );
+                        Err(StandardDaemonLifecycleError::reset_pending(te.context(
+                            format!("standard daemon lifecycle first failed: {e:#}"),
+                        )))
+                    }
                 }
-                Err(e)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(StandardDaemonLifecycleError::never_energized(e)),
         }
+    }
+
+    /// Resolve and seal the standard runtime's complete composition before any
+    /// bootstrap EEPROM or PSU query can issue an I2C transaction.
+    ///
+    /// `collect_hardware_info()` is not purely filesystem observation: its
+    /// EEPROM reads write an address pointer and its PSU probe transmits framed
+    /// query commands.  Those operations therefore belong after this boundary,
+    /// even though they do not intentionally energize a rail.  The resulting
+    /// admission is reused by `init()`; re-reading the experimental policy or
+    /// reminting from mutable configuration after bootstrap I/O would create a
+    /// TOCTOU between the admitted and executed compositions.
+    fn admit_standard_composition_before_bootstrap(
+        &mut self,
+        identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    ) -> Result<()> {
+        if self.standard_composition_admission.is_some()
+            || self.i2c_service.is_some()
+            || !self.chains.is_empty()
+        {
+            anyhow::bail!(
+                "standard hardware composition can be admitted only once before hardware actors exist"
+            );
+        }
+
+        // A bootstrap query can itself mutate an inherited bus transaction
+        // state. Until the complete lifecycle succeeds, safe-off reporting must
+        // conservatively retain the unknown/hot-hardware disposition.
+        self.preflight_hardware_state_unknown = true;
+
+        if let Some(refusal) = self.td003_destructive_write_refusal(identity) {
+            anyhow::bail!(
+                "TD-003 destructive-write gate refused hardware admission for {} from {} \
+                 (Experimental feature / In development; exact promotion gates incomplete)",
+                refusal.model_name,
+                refusal.source
+            );
+        }
+
+        let control_board = identity.observed_control_board.as_str();
+        let board_target = identity.board_target();
+        if board_target.is_empty() {
+            anyhow::bail!(
+                "authoritative board_target identity is missing; refusing bootstrap hardware queries"
+            );
+        }
+        let is_am1_s9 = is_am1_s9_from_evidence(board_target, control_board);
+
+        self.miner_profile = Some(
+            if let Some(configured_chip_id) = self.config.mining.model_chip_id() {
+                identified_miner_profile(configured_chip_id)?
+            } else {
+                pre_enumeration_topology_profile(is_am1_s9)?
+            },
+        );
+        let admitted_profile = self.required_topology_profile()?;
+        let admitted_pic_type = self
+            .configured_model_pic_type_override()
+            .unwrap_or(admitted_profile.pic_type);
+        let admitted_pic_addrs = self
+            .configured_model_pic_addrs_override()
+            .unwrap_or(admitted_profile.pic_addrs);
+
+        validate_profile_platform_authority(board_target, is_am1_s9, admitted_profile)?;
+        validate_standard_daemon_topology(admitted_profile, admitted_pic_type, admitted_pic_addrs)?;
+
+        let experimental_config = crate::experimental::ExperimentalConfig::load();
+        self.experimental_thermal_board_proxy_release =
+            experimental_config.allow_thermal_board_proxy_release_after_dwell;
+        self.asic_driver_execution_policy = if experimental_config
+            .executable_asic_chip_ids
+            .contains(&admitted_profile.chip_id)
+        {
+            ChipDriverExecutionPolicy::with_experimental_chip(admitted_profile.chip_id)
+        } else {
+            ChipDriverExecutionPolicy::production_only()
+        };
+        let i2c_transport = standard_i2c_transport(identity, is_am1_s9)?;
+        let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
+        let composition_admission = admit_standard_hardware_composition(
+            board_target,
+            admitted_profile,
+            admitted_pic_type,
+            admitted_pic_addrs,
+            i2c_transport,
+            self.config.mining.passthrough,
+            &registry,
+        )?;
+
+        info!(
+            board_target = %board_target,
+            profile = admitted_profile.name,
+            profile_chip_id = format_args!("0x{:04X}", admitted_profile.chip_id),
+            source = if self.config.mining.model_chip_id().is_some() {
+                "configured-supported-model"
+            } else {
+                "authoritative-am1-s9-topology-only"
+            },
+            driver_maturity = ?composition_admission.asic.maturity(),
+            i2c_transport = ?composition_admission.i2c_transport,
+            pic_type = ?composition_admission.pic_type,
+            pic_addrs = ?composition_admission.pic_addrs,
+            "Complete standard hardware composition admitted before bootstrap hardware queries"
+        );
+        self.standard_composition_admission = Some(composition_admission);
+        Ok(())
+    }
+
+    /// Convert passive/declared discovery authority into executable ASIC-driver
+    /// authority only after current-generation GetAddress receipts agree with
+    /// the exact standard composition and live chain state.
+    fn seal_standard_phase7_driver_admission(&mut self) -> Result<()> {
+        if self.standard_phase7_driver_admission.is_some()
+            || self.standard_dispatcher_driver_admission.is_some()
+        {
+            anyhow::bail!("standard driver authority was already sealed");
+        }
+        let declared_chip_id = self
+            .standard_composition_admission
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("standard discovery composition is missing"))?
+            .asic
+            .chip_id();
+        if self.asic_enumeration_receipts.is_empty() {
+            anyhow::bail!(
+                "no measured GetAddress receipt exists; refusing ASIC-driver execution authority"
+            );
+        }
+
+        for receipt in &self.asic_enumeration_receipts {
+            if receipt.chip_id() != declared_chip_id {
+                anyhow::bail!(
+                    "chain {} measured ASIC 0x{:04X}, contradicting declared standard composition 0x{:04X}",
+                    receipt.chain_id(),
+                    receipt.chip_id(),
+                    declared_chip_id,
+                );
+            }
+            let chain = self
+                .chains
+                .iter()
+                .find(|chain| chain.chain_id == receipt.chain_id())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "GetAddress receipt names absent chain {}",
+                        receipt.chain_id()
+                    )
+                })?;
+            if chain.chip_id != receipt.chip_id() || chain.chip_count != receipt.chip_count() {
+                anyhow::bail!(
+                    "chain {} live identity/count 0x{:04X}/{} disagrees with GetAddress receipt 0x{:04X}/{}",
+                    chain.chain_id,
+                    chain.chip_id,
+                    chain.chip_count,
+                    receipt.chip_id(),
+                    receipt.chip_count(),
+                );
+            }
+        }
+        for chain in self.chains.iter().filter(|chain| chain.chip_id != 0) {
+            if !self
+                .asic_enumeration_receipts
+                .iter()
+                .any(|receipt| receipt.chain_id() == chain.chain_id)
+            {
+                anyhow::bail!(
+                    "chain {} has a nonzero ASIC identity without a current-generation GetAddress receipt",
+                    chain.chain_id
+                );
+            }
+        }
+
+        let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
+        let admission = registry.admit(declared_chip_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "measured ASIC 0x{declared_chip_id:04X} is not executable under the sealed driver policy"
+            )
+        })?;
+        info!(
+            chip_id = format_args!("0x{declared_chip_id:04X}"),
+            measured_chains = self.asic_enumeration_receipts.len(),
+            "Sealed standard mining-driver authority from current GetAddress evidence"
+        );
+        self.standard_phase7_driver_admission =
+            Some(StandardPhase7DriverAdmission { driver: admission });
+        Ok(())
+    }
+
+    /// Consume the Phase-7-only authority and mint its dispatcher successor.
+    /// This is deliberately called only after the last fallible initialization
+    /// operation, so an early Phase 7 exit can never leave dispatch authority.
+    fn complete_standard_phase7_driver_admission(&mut self) -> Result<()> {
+        if self.standard_dispatcher_driver_admission.is_some() {
+            anyhow::bail!("standard dispatcher driver authority was already completed");
+        }
+        let phase7_admission = self
+            .standard_phase7_driver_admission
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Phase 7 driver authority is missing"))?;
+        self.standard_dispatcher_driver_admission = Some(phase7_admission.complete());
+        Ok(())
     }
 
     /// The full daemon lifecycle: management-only short-circuit, then Phases 1-7
     /// init -> spawn all async tasks -> wait for the shutdown signal -> graceful
     /// teardown. Wrapped by `run()` so an early `?` error after `init()` energized
-    /// the rail still runs the hardware-safe-off teardown (no-brick #6). Call
+    /// the rail still runs the typed software-closeout teardown (no-brick #6). Call
     /// `run()`, never this directly, so the teardown guarantee is never bypassed.
     async fn run_lifecycle(&mut self) -> Result<()> {
         let mining_enabled = self.config.mining_start_enabled();
@@ -3946,7 +5751,23 @@ impl Daemon {
                 config_model = ?self.config.mining.model,
                 "TD-003 destructive-write gate: platform is an Experimental feature / In development or lacks exact board identity; parking management-only before I2C, fan, FPGA, voltage, ASIC init, or hash dispatch"
             );
-            return self.run_api_only().await;
+            return self
+                .run_api_only_with_hardware_mutation_gate(
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                )
+                .await;
+        }
+
+        if let Err(error) = self.admit_standard_composition_before_bootstrap(&platform_identity) {
+            warn!(
+                error = %error,
+                "Standard composition admission failed before bootstrap hardware queries; starting a read-only management plane"
+            );
+            return self
+                .run_api_only_with_hardware_mutation_gate(
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                )
+                .await;
         }
 
         // Capture I2C-backed identity and policy observations before runtime
@@ -3994,24 +5815,27 @@ impl Daemon {
         //
         //   (A) BOUND THE HANG: race `init()` against `resolve_init_timeout()` so
         //       an infinite wedge becomes a clean error in bounded time.
-        //   (B) FALL BACK TO MANAGEMENT-ONLY *WITH THE API UP*: on timeout OR
-        //       error, run the defensive hardware-safe-off teardown
-        //       (`shutdown()` — Option-guarded, safe on partial-init state), then
-        //       hand off to `run_api_only()`, which builds a clean management
-        //       AppState, SPAWNS THE :8080/:4028 API, and parks until SIGTERM.
-        //       The dashboard/wizard/toolbox-detector stay reachable and the
-        //       bring-up error is reported, instead of a hung or exited daemon.
+        //   (B) CONDITIONALLY RECOVER: on timeout or error, run defensive
+        //       typed software-closeout teardown. Management-only is admitted only if
+        //       shutdown returns positive terminal closeout evidence. The current
+        //       production adapter deliberately marks every started init as
+        //       hardware-state-unknown; incomplete partial-init evidence therefore
+        //       remains ResetPending and exits for external safety handling.
         //
         // This is the standard-daemon (S9/am1 + am2-s17) analogue of the
         // hybrid/serial/proxy/am3-bb arms, which already spawn the API BEFORE the
-        // mining loop. Here the API lives further down inside this function, so
-        // an init failure must route through `run_api_only()` to bring it up.
+        // mining loop. The coordinator retains a tested management-only path for
+        // a future positive partial-bringup safety ledger; it is not a claim that
+        // every production init failure can currently keep the API reachable.
         let init_timeout = resolve_init_timeout();
         let disposition = {
             let mut recovery_publisher = BootProgressRecoveryPublisher {
                 boot_progress: Arc::clone(&boot_progress),
             };
-            let mut platform = StandardPlatformLifecycle { daemon: self };
+            let mut platform = StandardPlatformLifecycle {
+                daemon: self,
+                terminal_closeout: None,
+            };
             crate::daemon_lifecycle::initialize_or_recover(
                 &mut platform,
                 &platform_identity,
@@ -4503,6 +6327,7 @@ impl Daemon {
             metrics_require_auth: self.config.api.metrics_require_auth,
             // W13.D1: dev-mode boot-timeline gate. See ApiConfig docs.
             expose_boot_timeline: self.config.api.expose_boot_timeline,
+            observer_only: crate::runtime_policy::ephemeral_runtime_enabled(),
         };
 
         // ---- Publish the pre-initialization hardware snapshot ----
@@ -4575,15 +6400,28 @@ impl Daemon {
                 );
 
                 let adc_config = offgrid_cfg.adc.clone();
+                // These describe what was CONFIGURED, and they are published only
+                // on fault paths where the backend never initialized and no
+                // device was ever identified. `has_current` is therefore always
+                // false here: an ADC that failed to come up has measured
+                // nothing, and deriving current capability from config alone is
+                // a fabricated-as-measured surface — the previous code reported
+                // source "INA226" with has_current=true after an init failure,
+                // on a rail where no INA226 need be present at all.
+                //
+                // The success path below deliberately does NOT use these: it
+                // reads `adc.source_name()` / `adc.has_current()`, which report
+                // the part that actually answered, including a TI die that is
+                // not an INA226.
                 let (configured_source_name, configured_has_current) = match adc_config.as_ref() {
                     Some(dcentrald_hal::adc::AdcBackendConfig::Ina226 { .. }) => {
-                        ("INA226".to_string(), true)
+                        ("INA226 (configured, not detected)".to_string(), false)
                     }
                     Some(dcentrald_hal::adc::AdcBackendConfig::Sysfs { .. }) => {
-                        ("Sysfs ADC".to_string(), false)
+                        ("Sysfs ADC (configured, not detected)".to_string(), false)
                     }
                     Some(dcentrald_hal::adc::AdcBackendConfig::Simulated { .. }) => {
-                        ("Simulated".to_string(), true)
+                        ("Simulated (configured, not initialized)".to_string(), false)
                     }
                     None => ("Unconfigured".to_string(), false),
                 };
@@ -5282,7 +7120,7 @@ impl Daemon {
             power_rx: power_rx.clone(),
             power_calibration: power_calibration.clone(),
             psu_lock: psu_lock.clone(),
-            hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
+            hardware_mutation_gate: self.api_hardware_mutation_gate.clone(),
             autotuner_status_rx: autotuner_status_rx.clone(),
             autotuner_efficiency_rx: autotuner_efficiency_rx.clone(),
             autotuner_chip_health_rx: autotuner_chip_health_rx.clone(),
@@ -5385,23 +7223,22 @@ impl Daemon {
         // never bind reliably under heavy mining-loop runtime pressure on
         // S19j Pro `a lab unit` (DCENT_CE 2026-04-24 finding). Storing them here also
         // lets a future shutdown path call `abort()` cleanly.
-        let _api_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> =
-            match dcentrald_api::start_api_servers(app_state).await {
-                Ok((cgminer_handle, http_handle)) => {
-                    info!(
+        self.standard_api_tasks = match dcentrald_api::start_api_servers(app_state).await {
+            Ok((cgminer_handle, http_handle)) => {
+                info!(
                         cgminer_port = self.config.api.cgminer_port,
                         http_port = self.config.api.http_port,
                         "API servers online — dashboard at http://<miner-ip>:{}, CGMiner API on port {} (pyasic/hass-miner compatible)",
                         self.config.api.http_port,
                         self.config.api.cgminer_port,
                     );
-                    Some((cgminer_handle, http_handle))
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to start API servers — miner will run but dashboard/monitoring won't be available");
-                    None
-                }
-            };
+                Some((cgminer_handle, http_handle))
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to start API servers — miner will run but dashboard/monitoring won't be available");
+                None
+            }
+        };
 
         let _metrics_csv_handle = crate::metrics_export::spawn_metrics_csv_task(
             shutdown.clone(),
@@ -5622,7 +7459,14 @@ impl Daemon {
                 protocol = ?self.config.pool.protocol,
                 "Connecting to mining pool — this is where your hashpower earns bitcoin"
             );
-            let stratum_config = crate::config::build_stratum_config(
+            // P2-9: post-enum total chips (init completed above) seed SV2 nominal.
+            let enumerated_total_chips: u32 = self
+                .chains
+                .iter()
+                .filter(|c| c.mining)
+                .map(|c| u32::from(c.chip_count))
+                .sum();
+            let stratum_config = crate::config::build_stratum_config_with_enumerated_chips(
                 &self.config,
                 crate::config::stratum_donation_config(&self.config.donation),
                 self.config.mining.version_rolling,
@@ -5631,6 +7475,7 @@ impl Daemon {
                     .channel_type
                     .eq_ignore_ascii_case("extended")
                     || self.config.job_declaration.enabled,
+                (enumerated_total_chips > 0).then_some(enumerated_total_chips),
             );
 
             let stratum_router = dcentrald_stratum::StratumRouter::new(stratum_config)
@@ -6227,9 +8072,38 @@ impl Daemon {
                 );
             }
         }
+        let standard_driver_admission =
+            self.standard_dispatcher_driver_admission
+                .take()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                    "completed standard dispatcher-driver authority is missing before dispatcher construction"
+                )
+                })?;
+        let admitted_dispatch_chip_id = standard_driver_admission.chip_id();
+        if self.chip_id != admitted_dispatch_chip_id {
+            anyhow::bail!(
+                "latched runtime ASIC 0x{:04X} contradicts measured driver authority 0x{:04X}",
+                self.chip_id,
+                admitted_dispatch_chip_id,
+            );
+        }
+
+        // Retain PIC address→chain-index map for dsPIC board-temp publication
+        // BEFORE moving chains into the work dispatcher. Building after
+        // mem::take reads an empty Vec and silently drops multi-chain temp
+        // attribution (continuous-audit residual 2026-07-22).
+        let hb_pic_chain_map: std::collections::HashMap<u8, usize> =
+            dcentrald_common::dspic_heartbeat::build_pic_temp_chain_map(
+                self.chains.iter().map(|c| c.pic_address),
+            );
+        info!(
+            pic_temp_chain_map_len = hb_pic_chain_map.len(),
+            chain_count = self.chains.len(),
+            "standard mining: retained PIC board-temp chain map before dispatch move"
+        );
         // Move chains from daemon into work dispatcher (it's the sole FPGA consumer)
         let dispatch_chains = std::mem::take(&mut self.chains);
-        let dispatch_chip_id = self.chip_id;
         let dispatch_shutdown = self.mining_tasks.cancellation_token();
         let dispatch_state_tx = state_tx.clone();
         let autotune_state_rx = dispatch_state_tx.subscribe();
@@ -6265,7 +8139,9 @@ impl Daemon {
         // Gap 2: Shared XADC temperature for autotuner snapshots.
         // Thermal loop writes die temp, work dispatcher reads it into snapshots.
         let shared_xadc_temp = Arc::new(AtomicU32::new(0));
-        let thermal_emergency_latch = Arc::new(AtomicBool::new(false));
+        self.terminal_thermal_generation_latch
+            .store(false, Ordering::Release);
+        let thermal_emergency_latch = Arc::clone(&self.terminal_thermal_generation_latch);
 
         // Collect chain info before moving chains to dispatcher (autotuner needs this)
         let autotuner_pic_fw_byte = match self.pic_firmware {
@@ -6303,7 +8179,9 @@ impl Daemon {
             dcentrald_silicon_profiles::bm1362::Bm1362HashboardSku,
         > = std::collections::HashMap::new();
         if matches!(self.pic_type()?, PicType::NoPic) {
-            // `slot` indexes several per-slot maps (preambles, chains), not just one.
+            // clippy::needless_range_loop: `slot` indexes TWO parallel
+            // collections (`dispatch_chains` and `bootstrap_eeprom_preambles`),
+            // so iterating one of them directly would lose the shared index.
             #[allow(clippy::needless_range_loop)]
             for slot in 0..dispatch_chains.len() {
                 match self.bootstrap_eeprom_preambles.get(slot).copied().flatten() {
@@ -6501,20 +8379,150 @@ impl Daemon {
                     .any(|chain| chain.mining && chain.chain_id == receipt.chain_id())
             })
             .collect();
-        let identity_publication_port = match self.dispatcher_composition_authority.activate(
-            expected_dispatcher_composition,
-            dispatcher_enumeration_receipts,
-            Arc::clone(&hardware_info),
-        ) {
-            Ok(port) => Some(port),
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Measured ASIC identity publication is not armed for this dispatcher composition"
+        let dispatcher_execution_admission = self
+            .dispatcher_composition_authority
+            .activate_execution(
+                standard_driver_admission.into_driver(),
+                expected_dispatcher_composition,
+                dispatcher_enumeration_receipts,
+                Arc::clone(&hardware_info),
+            )
+            .context(
+                "refusing WorkDispatcher construction without a complete measured ASIC composition session",
+            )?;
+        let runtime_execution_commit_port =
+            dispatcher_execution_admission.runtime_execution_commit_port();
+
+        // ---- Work-dispatch safety admission (shared pure latch) ----
+        // Continuous-audit NO-SHIP residual: refuse WorkDispatcher construction
+        // until SoC watchdog feed ownership is established and PIC heartbeat
+        // pillars from init are green. Peer engines (stock/serial/hybrid) already
+        // own one WorkDispatchLifecycle; daemon standard path must match.
+        //
+        // Hoist SoC watchdog kicker *before* dispatch so the watchdog pillar is
+        // honest (Armed when enabled + owned, not Unavailable-then-lie).
+        let thermal_liveness = Arc::new(AtomicU64::new(0));
+        let (watchdog_intent_tx, watchdog_intent_rx) = watch::channel(WatchdogIntent::Mining);
+        let (watchdog_disarm_tx, watchdog_disarm_rx) = oneshot::channel();
+        let (watchdog_receipt_tx, watchdog_receipt_rx) = oneshot::channel();
+        let watchdog_run_scope = self
+            .watchdog_run_scope
+            .as_ref()
+            .context("standard watchdog run scope disappeared before owner start")?
+            .clone();
+        let watchdog_mining_actor_expectation = self
+            .watchdog_mining_actor_expectation
+            .take()
+            .context("standard mining actor issuer disappeared before watchdog owner start")?;
+        let watchdog_unit_closeout_expectation = self
+            .watchdog_unit_closeout_expectation
+            .take()
+            .context("standard unit-closeout issuer disappeared before watchdog owner start")?;
+        let watchdog_teardown_budget_expectation =
+            self.watchdog_teardown_budget_expectation.take().context(
+                "standard teardown-budget expectation disappeared before watchdog owner start",
+            )?;
+        let watchdog_owner_shutdown = self.watchdog_tasks.cancellation_token();
+        let watchdog_feed_owner = WatchdogFeedGateOwner::new();
+        let watchdog_feed_gate = watchdog_feed_owner.gate();
+        let watchdog_liveness_interval = Duration::from_secs_f32(thermal_pid_interval_secs(
+            self.config.thermal.pid_interval_s,
+        ));
+        let watchdog_future = owned_watchdog_kicker(
+            self.config.watchdog.clone(),
+            watchdog_liveness_interval,
+            watchdog_owner_shutdown,
+            watchdog_feed_gate,
+            watchdog_intent_rx,
+            watchdog_disarm_rx,
+            watchdog_run_scope.clone(),
+            watchdog_mining_actor_expectation,
+            watchdog_unit_closeout_expectation,
+            watchdog_teardown_budget_expectation,
+            thermal_liveness.clone(),
+            watchdog_receipt_tx,
+        );
+        if !self
+            .watchdog_tasks
+            .spawn("soc-watchdog-kicker", watchdog_future)
+        {
+            anyhow::bail!(
+                "SoC watchdog task ownership is unavailable; refusing unowned watchdog supervision"
+            );
+        }
+        self.watchdog_feed_owner = Some(watchdog_feed_owner);
+        self.watchdog_intent_tx = Some(watchdog_intent_tx);
+        self.watchdog_disarm_tx = Some(watchdog_disarm_tx);
+        self.watchdog_receipt_rx = Some(watchdog_receipt_rx);
+
+        let mut dispatch_life = WorkDispatchLifecycle::new();
+        let admission_cycle_id = 1u64;
+        let controller_heartbeats = daemon_controller_heartbeats_from_initialized_pics(
+            &self.initialized_pic_addrs_final,
+            admission_cycle_id,
+            true,
+        );
+        let wd_state = daemon_watchdog_safety_state(
+            self.config.watchdog.enabled,
+            self.watchdog_feed_owner.is_some(),
+        );
+        // Bind dispatch to the finite pre-energize XADC observation captured
+        // before Phase 1. A reboot-created latch starts clear, so latch absence
+        // alone can never mint Ready for a still-hot fresh generation.
+        let thermal_state = daemon_thermal_safety_state(false, self.startup_thermal_safety);
+        let dispatch_inputs =
+            daemon_standard_work_dispatch_inputs(wd_state, &controller_heartbeats, thermal_state);
+        // Shared lock-free publication for WorkDispatcher mid-run gate + HB/thermal
+        // terminal revoke (cross-task; lifecycle stays on this task).
+        let work_dispatch_admission = std::sync::Arc::new(WorkDispatchAdmissionPublication::new());
+        let controllers_required_at_admit = controller_heartbeats.len();
+        match daemon_admit_standard_work_dispatch(&mut dispatch_life, &dispatch_inputs) {
+            Ok(receipt) => {
+                // Copy the receipt fields first so the `&mut dispatch_life`
+                // reborrow held by `receipt` ends before `sync_publication`
+                // takes its shared borrow (pure reads; publication still
+                // precedes the admission log line).
+                let (watchdog, thermal, controller_count, heartbeat_cycle_id) = (
+                    receipt.watchdog,
+                    receipt.thermal,
+                    receipt.controller_count,
+                    receipt.heartbeat_cycle_id,
                 );
-                None
+                dispatch_life.sync_publication(&work_dispatch_admission);
+                info!(
+                    watchdog = ?watchdog,
+                    thermal = ?thermal,
+                    controller_count = controller_count,
+                    heartbeat_cycle_id = ?heartbeat_cycle_id,
+                    "standard daemon work-dispatch admission OK — WorkDispatcher construction allowed"
+                );
             }
-        };
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "standard daemon work-dispatch admission REFUSED — no WorkDispatcher construction"
+                );
+                if let Some(owner) = self.watchdog_feed_owner.as_mut() {
+                    owner.close_terminal();
+                }
+                return Err(anyhow::anyhow!(
+                    "standard daemon work-dispatch admission refused: {err}"
+                ));
+            }
+        }
+        // Lifecycle is local-admit SSOT; mid-run consumers (WorkDispatcher + HB
+        // + thermal) share the lock-free publication only. A recovered heartbeat
+        // cannot re-admit without a new publication generation.
+        let _dispatch_life_admitted = dispatch_life;
+        let work_dispatch_admission_for_dispatcher =
+            std::sync::Arc::clone(&work_dispatch_admission);
+        let work_dispatch_admission_for_thermal = std::sync::Arc::clone(&work_dispatch_admission);
+        let wdt_feed_stop_for_thermal = self.watchdog_feed_owner.as_ref().map(|o| o.stop_signal());
+        let home_pwm_for_revoke = self
+            .config
+            .thermal
+            .fan_max_pwm
+            .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
 
         let mut dispatcher = crate::work_dispatcher::WorkDispatcher::new(
             job_rx,
@@ -6524,8 +8532,8 @@ impl Daemon {
             dispatch_shutdown,
             worker_name,
             dispatch_chains,
-            dispatch_chip_id,
-            self.asic_driver_execution_policy,
+            dispatcher_execution_admission,
+            work_dispatch_admission_for_dispatcher,
             hw_difficulty,
             autotune_stats_tx,
             Some(freq_cmd_rx),
@@ -6542,8 +8550,8 @@ impl Daemon {
             power_calibration.clone(),
             curtailment_sleeping.clone(),
             self.config.mining.skip_board_temp,
-        );
-        dispatcher.set_asic_identity_publication_port(identity_publication_port);
+        )
+        .context("measured dispatcher bundle contradicted its live chain ownership")?;
         let circuit_capacity = if dc_source_profile {
             None
         } else {
@@ -6557,9 +8565,12 @@ impl Daemon {
         // Default 4 (= 64-cycle threshold for BM1387's 8-bit ring) per
         // the analysis in
         dispatcher.set_stale_age_divisor(self.config.mining.stale_age_divisor);
-        if !self.mining_tasks.spawn("work-dispatcher", async move {
-            dispatcher.run().await;
-        }) {
+        if !self
+            .mining_tasks
+            .spawn(StandardMiningActorSlot::WorkDispatcher, async move {
+                dispatcher.run().await;
+            })
+        {
             anyhow::bail!(
                 "work dispatcher task ownership already exists; refusing detached replacement"
             );
@@ -7550,47 +9561,11 @@ impl Daemon {
             });
         }
 
-        // ---- Start watchdog kicker task ----
-        // The hardware watchdog reboots the miner if dcentrald crashes. We "kick" it
-        // periodically to prove we're alive. If we stop kicking (crash), the SoC
-        // reboots automatically — this prevents a bricked miner from sitting idle.
-        // NEW-4 (2026-06-10 adversarial pass): open the watchdog HERE (after init),
-        // not in init Phase 1 (see the deferral note there). Open + set_timeout +
-        // an immediate kick + the kicker loop all happen together, so the DTB-10s
-        // window can never fire during the slow hardware init. Shared with the
-        // hybrid / serial / am3-bb mining entry paths via `spawn_watchdog_kicker`
-        // (one implementation; config-gated; inert on `a lab unit` where it is disabled).
-        // Thermal-liveness clock for the WDT kicker: the thermal control loop
-        // below increments this every tick, and the kicker withholds the WDT kick
-        // if it stops advancing — so a hung thermal loop (the case where boards
-        // stay energized with NO thermal supervision) triggers a SoC reboot rather
-        // than being fed forever. The other mining modes retain path-local
-        // liveness counters but still need migration to this owned lifecycle.
-        let thermal_liveness = Arc::new(AtomicU64::new(0));
-        let (watchdog_intent_tx, watchdog_intent_rx) = watch::channel(WatchdogIntent::Mining);
-        let (watchdog_receipt_tx, watchdog_receipt_rx) = oneshot::channel();
-        let watchdog_owner_shutdown = self.watchdog_tasks.cancellation_token();
-        let watchdog_liveness_interval = Duration::from_secs_f32(thermal_pid_interval_secs(
-            self.config.thermal.pid_interval_s,
-        ));
-        let watchdog_future = owned_watchdog_kicker(
-            self.config.watchdog.clone(),
-            watchdog_liveness_interval,
-            watchdog_owner_shutdown,
-            watchdog_intent_rx,
-            thermal_liveness.clone(),
-            watchdog_receipt_tx,
-        );
-        if !self
-            .watchdog_tasks
-            .spawn("soc-watchdog-kicker", watchdog_future)
-        {
-            anyhow::bail!(
-                "SoC watchdog task ownership is unavailable; refusing unowned watchdog supervision"
-            );
-        }
-        self.watchdog_intent_tx = Some(watchdog_intent_tx);
-        self.watchdog_receipt_rx = Some(watchdog_receipt_rx);
+        // ---- SoC watchdog kicker ----
+        // Started *before* WorkDispatcher construction (work-dispatch safety
+        // admission). `thermal_liveness` Arc is owned from that earlier site and
+        // still drives the thermal-loop increment below. Do not re-open the
+        // watchdog here — double ownership would refuse on spawn.
 
         // v0.12.0: ZERO devmem AXI IIC register writes. Kernel driver is sole owner.
         //
@@ -7610,12 +9585,12 @@ impl Daemon {
         })?;
 
         // ---- Start PIC heartbeat task (CRITICAL for voltage safety) ----
-        // Each hash board has a PIC microcontroller that controls voltage. The PIC
-        // has an internal watchdog — if it doesn't receive a heartbeat every ~5
-        // seconds (stock Bitmain PIC) or ~10 seconds (BraiinsOS PIC), it cuts
-        // power to the hash board. This is an intentional hardware safety feature
-        // that prevents a crashed miner from overheating hash boards.
-        // We MUST send heartbeats every 1 second to keep voltage flowing.
+        // Each hash board has a PIC microcontroller that controls voltage. Its
+        // protocol watchdog is configured to request a power cutoff if heartbeat
+        // service stops for roughly 5 seconds (stock Bitmain PIC) or 10 seconds
+        // (BraiinsOS PIC). Those are controller-programming expectations, not
+        // measured rail effects. Send heartbeats every second while voltage
+        // ownership is intended to remain active.
         // GRACEFUL SHUTDOWN FIX: The heartbeat thread uses a SEPARATE shutdown token
         // (heartbeat_shutdown_token) that is cancelled AFTER voltage is disabled in
         // shutdown(). Previously it used the global shutdown_token, which caused heartbeats
@@ -7651,12 +9626,7 @@ impl Daemon {
             let hb_board_temps = board_temps_heartbeat;
             let hb_board_temp_seen_at = board_temp_seen_at_heartbeat;
             let hb_board_temp_time_base = board_temp_time_base_heartbeat;
-            let hb_pic_chain_map: std::collections::HashMap<u8, usize> = self
-                .chains
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, chain)| chain.pic_address.map(|addr| (addr, idx)))
-                .collect();
+            // hb_pic_chain_map retained before dispatch_chains mem::take (above).
             let hb_i2c_fw = match hb_pic_firmware {
                 PicFirmware::BraiinsOs => dcentrald_hal::i2c::I2cPicFirmware::BraiinsOs,
                 PicFirmware::Stock(_) => dcentrald_hal::i2c::I2cPicFirmware::Stock,
@@ -7665,7 +9635,12 @@ impl Daemon {
             let hb_pic_type = self.pic_type()?;
             let hb_chip_id = self.chip_id;
             let hb_i2c_active = i2c_active_for_heartbeat;
+            let hb_runtime_execution_commit_port = runtime_execution_commit_port.clone();
             let hb_thermal_emergency_latch = thermal_emergency_latch.clone();
+            let hb_work_dispatch_admission = std::sync::Arc::clone(&work_dispatch_admission);
+            let hb_controllers_required = controllers_required_at_admit;
+            let hb_wdt_feed_stop = self.watchdog_feed_owner.as_ref().map(|o| o.stop_signal());
+            let hb_home_pwm = home_pwm_for_revoke;
             let hb_deferred_target_mv = self.config.mining.voltage_mv;
             let hb_deferred_targets = deferred_voltage_targets.clone();
             let (runtime_ready_tx, runtime_ready_rx) = tokio::sync::oneshot::channel();
@@ -7692,7 +9667,7 @@ impl Daemon {
 
                     loop {
                         if hb_shutdown_flag.is_cancelled() {
-                            info!("PIC heartbeat stopping — voltage controllers will auto-shutdown via their hardware watchdog (~5-64s, controller-dependent)");
+                            info!("PIC heartbeat stopping; controller watchdog expiry is expected in ~5-64s from protocol evidence, while controller action and physical rail state remain unmeasured");
                             break;
                         }
 
@@ -7748,20 +9723,28 @@ impl Daemon {
                                             .unwrap_or(hb_pic_type);
                                         let result = match pic_type {
                                             PicType::Pic16F1704 => {
-                                                let pic_val = PicController::voltage_to_pic(target_mv as f64 / 1000.0);
-                                                hb_i2c_svc
-                                                    .set_voltage(pic_addr, hb_i2c_fw, pic_val)
+                                                // P1-2: pure PIC16 mV→DAC SSOT (not a second formula).
+                                                let pic_val =
+                                                    dcentrald_common::pic16_mv_to_dac(target_mv);
+                                                hb_runtime_execution_commit_port
+                                                    .commit("runtime PIC16 voltage set", || {
+                                                        hb_i2c_svc.set_voltage(
+                                                            pic_addr,
+                                                            hb_i2c_fw,
+                                                            pic_val,
+                                                        )
+                                                    })
                                                     .map(|_| {
                                                         info!(
                                                             chain_id = ?chain_id,
                                                             pic_addr = format_args!("0x{:02X}", pic_addr),
                                                             target_mv,
                                                             pic_val,
-                                                            "Runtime voltage apply: PIC16 target committed"
+                                                            "Runtime voltage apply: PIC16 target committed (pic16_mv_to_dac)"
                                                         );
                                                         VoltageCommandReply::Applied(target_mv)
                                                     })
-                                                    .map_err(|e: dcentrald_hal::HalError| e.to_string())
+                                                    .map_err(|e| e.to_string())
                                             }
                                             _ => Err("Runtime heartbeat service is in PIC16 mode; non-PIC16 voltage apply is unsupported on this path".to_string()),
                                         };
@@ -7769,6 +9752,7 @@ impl Daemon {
                                         }
                                     }
                                     VoltageCommand::DisableVoltage { chain_id, chip_id, pic_addr, reply_tx } => {
+                                        let operation_started_at = Instant::now();
                                         let pic_type = MinerProfile::for_chip(chip_id)
                                             .map(|profile| profile.pic_type)
                                             .unwrap_or(hb_pic_type);
@@ -7782,7 +9766,10 @@ impl Daemon {
                                                             pic_addr = format_args!("0x{:02X}", pic_addr),
                                                             "Runtime voltage disable: PIC16 output disabled"
                                                         );
-                                                        VoltageCommandReply::Disabled
+                                                        VoltageCommandReply::Disabled {
+                                                            operation_started_at,
+                                                            operation_completed_at: Instant::now(),
+                                                        }
                                                     })
                                                     .map_err(|e: dcentrald_hal::HalError| e.to_string())
                                             }
@@ -7884,6 +9871,43 @@ impl Daemon {
                                 }
                             }
 
+                            // Mid-run work-dispatch revoke: when admission required
+                            // controllers and zero remain Active (all BackingOff/Dead
+                            // after PIC_BACKOFF_FAIL_THRESHOLD), terminally refuse
+                            // WORK_TX. Transient consecutive fails while still Active
+                            // must NOT revoke — the backoff machine owns that hysteresis.
+                            let controllers_still_active = hb_pic_addrs
+                                .iter()
+                                .filter(|a| match pic_backoff.get(a) {
+                                    Some(b) => b.state() == PicHbState::Active,
+                                    // No backoff entry yet → treat as still Active.
+                                    None => true,
+                                })
+                                .count();
+                            if should_revoke_work_dispatch_for_controller_health(
+                                hb_controllers_required,
+                                controllers_still_active,
+                            ) && hb_work_dispatch_admission.is_admitted()
+                            {
+                                let (action, stop_feed) = dcentrald_common::revoke_work_dispatch(
+                                    DispatchRevocationCause::HeartbeatFailure,
+                                    hb_home_pwm,
+                                );
+                                hb_work_dispatch_admission.publish_revoked();
+                                error!(
+                                    controllers_required = hb_controllers_required,
+                                    controllers_still_active,
+                                    stop_watchdog_feed = stop_feed,
+                                    steps = action.steps().len(),
+                                    "standard daemon work-dispatch TERMINALLY REVOKED — all required PIC heartbeats lost"
+                                );
+                                if stop_feed {
+                                    if let Some(ref sig) = hb_wdt_feed_stop {
+                                        sig.close_terminal_lock_free();
+                                    }
+                                }
+                            }
+
                             // Stability gate for deferred voltage: only Active PICs
                             // must be answering. A PIC the back-off machine has
                             // declared BackingOff/Dead is excluded (it can never be
@@ -7946,10 +9970,12 @@ impl Daemon {
                                         );
                                         continue;
                                     }
-                                    let pic_val = PicController::voltage_to_pic(
-                                        hb_deferred_target_mv as f64 / 1000.0
-                                    );
-                                    match hb_i2c_svc.set_voltage(pic_addr, hb_i2c_fw, pic_val) {
+                                    let pic_val =
+                                        dcentrald_common::pic16_mv_to_dac(hb_deferred_target_mv);
+                                    match hb_runtime_execution_commit_port.commit(
+                                        "deferred PIC16 voltage set",
+                                        || hb_i2c_svc.set_voltage(pic_addr, hb_i2c_fw, pic_val),
+                                    ) {
                                         Ok(()) => info!(
                                             chain_id,
                                             pic_addr = format_args!("0x{:02X}", pic_addr),
@@ -8071,9 +10097,16 @@ impl Daemon {
                                         .unwrap_or(hb_pic_type);
                                     let result = match pic_type {
                                         PicType::Pic16F1704 => {
-                                            let pic_val = PicController::voltage_to_pic(target_mv as f64 / 1000.0);
-                                            hb_i2c_svc
-                                                .set_voltage(pic_addr, hb_i2c_fw, pic_val)
+                                            let pic_val =
+                                                dcentrald_common::pic16_mv_to_dac(target_mv);
+                                            hb_runtime_execution_commit_port
+                                                .commit("runtime PIC16 voltage set", || {
+                                                    hb_i2c_svc.set_voltage(
+                                                        pic_addr,
+                                                        hb_i2c_fw,
+                                                        pic_val,
+                                                    )
+                                                })
                                                 .map(|_| {
                                                     info!(
                                                         chain_id = ?chain_id,
@@ -8084,11 +10117,14 @@ impl Daemon {
                                                     );
                                                     VoltageCommandReply::Applied(target_mv)
                                                 })
-                                                .map_err(|e: dcentrald_hal::HalError| e.to_string())
+                                                .map_err(|e| e.to_string())
                                         }
                                         PicType::DsPic33EP => {
                                             let mut dspic = DspicService::new(hb_i2c_svc.clone(), pic_addr);
-                                            dspic.cold_boot_init(target_mv)
+                                            hb_runtime_execution_commit_port
+                                                .commit("runtime dsPIC voltage set and enable", || {
+                                                    dspic.cold_boot_init(target_mv)
+                                                })
                                                 .map(|_| {
                                                     info!(
                                                         chain_id = ?chain_id,
@@ -8106,6 +10142,7 @@ impl Daemon {
                                     }
                                 }
                                 VoltageCommand::DisableVoltage { chain_id, chip_id, pic_addr, reply_tx } => {
+                                    let operation_started_at = Instant::now();
                                     let pic_type = MinerProfile::for_chip(chip_id)
                                         .map(|profile| profile.pic_type)
                                         .unwrap_or(hb_pic_type);
@@ -8119,7 +10156,10 @@ impl Daemon {
                                                         pic_addr = format_args!("0x{:02X}", pic_addr),
                                                         "Runtime voltage disable: PIC16 output disabled"
                                                     );
-                                                    VoltageCommandReply::Disabled
+                                                    VoltageCommandReply::Disabled {
+                                                        operation_started_at,
+                                                        operation_completed_at: Instant::now(),
+                                                    }
                                                 })
                                                 .map_err(|e: dcentrald_hal::HalError| e.to_string())
                                         }
@@ -8132,7 +10172,10 @@ impl Daemon {
                                                         pic_addr = format_args!("0x{:02X}", pic_addr),
                                                         "Runtime voltage disable: dsPIC output disabled"
                                                     );
-                                                    VoltageCommandReply::Disabled
+                                                    VoltageCommandReply::Disabled {
+                                                        operation_started_at,
+                                                        operation_completed_at: Instant::now(),
+                                                    }
                                                 })
                                                 .map_err(|e| e.to_string())
                                         }
@@ -8386,10 +10429,10 @@ impl Daemon {
                                 }
                             }
                             Err(std::sync::TryLockError::WouldBlock) => tracing::warn!(
-                                "PSU watchdog feed skipped because another owner holds the bus-1 transport lock; the hardware watchdog remains fail-safe"
+                                "PSU watchdog feed skipped because another owner holds the bus-1 transport lock; watchdog expiry/action and physical output remain unmeasured"
                             ),
                             Err(std::sync::TryLockError::Poisoned(_)) => {
-                                tracing::error!("PSU watchdog transport lock is poisoned; stopping feeds so the hardware watchdog can cut power");
+                                tracing::error!("PSU watchdog transport lock is poisoned; stopping feeds and leaving the hardware watchdog armed; physical output is unmeasured");
                                 break;
                             }
                         }
@@ -8421,6 +10464,7 @@ impl Daemon {
         //   4. Throttles frequency or shuts down if temps get dangerous
         // This keeps your chips alive and your house from burning down.
         let thermal_shutdown = self.mining_tasks.cancellation_token();
+        let thermal_lifecycle_shutdown = self.shutdown_token.clone();
         // pid_interval_s captured as f32 for Duration::from_secs_f32 below (interval
         // is constructed inside the spawned task, after config is moved).
         let thermal_pid_interval_s = thermal_pid_interval_secs(self.config.thermal.pid_interval_s);
@@ -8476,6 +10520,12 @@ impl Daemon {
         let thermal_chip_id = self.chip_id;
         let thermal_pic_type = self.pic_type()?;
         let thermal_emergency_latch = thermal_emergency_latch.clone();
+        let thermal_work_dispatch_admission = work_dispatch_admission_for_thermal;
+        let thermal_wdt_feed_stop = wdt_feed_stop_for_thermal;
+        let thermal_home_pwm_for_revoke = home_pwm_for_revoke;
+        let thermal_lockout_path = terminal_thermal_lockout_path();
+        let thermal_dangerous_temp_c = self.config.thermal.dangerous_temp_c;
+        let thermal_hysteresis_c = self.config.thermal.hysteresis_c;
         let thermal_skip_board_temp = self.config.mining.skip_board_temp;
         let thermal_has_xadc = !self
             .platform_identity
@@ -8660,7 +10710,9 @@ impl Daemon {
         }
 
         let thermal_liveness_loop = thermal_liveness.clone();
-        if !self.mining_tasks.spawn("thermal-controller", async move {
+        if !self
+            .mining_tasks
+            .spawn(StandardMiningActorSlot::ThermalController, async move {
             let mut controller = ThermalController::new(thermal_profile);
             // W8 parity: arm immersion / hydro mode (default-OFF → no-op).
             // `enable_immersion` is fail-closed: on an air-cooled-looking
@@ -8947,7 +10999,7 @@ impl Daemon {
                                                 }
 
                                                 match tokio::time::timeout(Duration::from_secs(3), reply_rx).await {
-                                                    Ok(Ok(Ok(VoltageCommandReply::Disabled))) => {}
+                                                    Ok(Ok(Ok(VoltageCommandReply::Disabled { .. }))) => {}
                                                     Ok(Ok(Ok(other))) => {
                                                         warn!(pic_addr = format_args!("0x{:02X}", addr), reply = ?other, "Curtailment sleep: unexpected voltage reply");
                                                         all_ok = false;
@@ -9120,6 +11172,7 @@ impl Daemon {
                         // The WorkDispatcher reads these every 5s via the FPGA CMD FIFO
                         // and stores f32 bits in shared atomics. We read them here.
                         let mut max_board_temp: Option<f32> = None;
+                        let mut max_board_observation: Option<(usize, f32)> = None;
                         let mut per_chain_board_temps: Vec<Option<f32>> = vec![None; thermal_board_temps.len()];
                         let now_s = board_temp_time_base_thermal.elapsed().as_secs() as u32;
                         for (i, (board_temp_atomic, board_temp_seen_at_atomic)) in thermal_board_temps
@@ -9138,6 +11191,7 @@ impl Daemon {
                                 per_chain_board_temps[i] = Some(board_temp);
                                 if max_board_temp.is_none_or(|current| board_temp > current) {
                                     max_board_temp = Some(board_temp);
+                                    max_board_observation = Some((i, board_temp));
                                 }
                                 if let Some(state) = board_temp_stuck_states.get_mut(i) {
                                     if update_stuck_board_temp_sensor(
@@ -9830,6 +11884,22 @@ impl Daemon {
                                     }
                                 }
 
+                                // P1-6: FanOnly SafetyAction — home-cap effective PWM from plan.
+                                let safety = ThermalAction::SetFanPwm(pwm)
+                                    .as_safety_action(cfg_fan_max_pwm)
+                                    .expect("SetFanPwm maps to FanOnly SafetyAction");
+                                let mut plan_fan_pwm: Option<u8> = None;
+                                let _ = dcentrald_common::apply_safety_action(
+                                    safety,
+                                    |_cut| {
+                                        Err("SetFanPwm must not request PowerCut")
+                                    },
+                                    |p| {
+                                        plan_fan_pwm = Some(p);
+                                        Ok::<(), &str>(())
+                                    },
+                                );
+                                let pwm = plan_fan_pwm.unwrap_or(pwm);
                                 // W8 immersion: SKIP the HAL fan write on an
                                 // immersion / hydro rig (no chassis fans — the
                                 // controller already returns pwm:0; this gate
@@ -9869,6 +11939,23 @@ impl Daemon {
                             }
                             ThermalAction::ThrottleAndFan { pwm, freq_reduction_pct } => {
                                 let pwm = pwm.clamp(cfg_fan_min_pwm, cfg_fan_max_pwm);
+                                // P1-6: FanOnly SafetyAction for throttle fan step (home-capped).
+                                let safety = ThermalAction::ThrottleAndFan {
+                                    pwm,
+                                    freq_reduction_pct,
+                                }
+                                .as_safety_action(cfg_fan_max_pwm)
+                                .expect("ThrottleAndFan maps to FanOnly SafetyAction");
+                                let mut plan_fan_pwm: Option<u8> = None;
+                                let _ = dcentrald_common::apply_safety_action(
+                                    safety,
+                                    |_cut| Err("ThrottleAndFan must not request PowerCut"),
+                                    |p| {
+                                        plan_fan_pwm = Some(p);
+                                        Ok::<(), &str>(())
+                                    },
+                                );
+                                let pwm = plan_fan_pwm.unwrap_or(pwm);
                                 warn!(
                                     temp_c = format_args!("{:.1}", die_temp),
                                     fan_pwm = pwm,
@@ -9935,291 +12022,437 @@ impl Daemon {
                                 }
                             }
                             ThermalAction::EmergencyShutdown => {
-                                mark_thermal_emergency_active(&thermal_emergency_latch);
+                                mark_thermal_emergency_and_revoke_work_dispatch(
+                                    &thermal_emergency_latch,
+                                    &thermal_work_dispatch_admission,
+                                    thermal_home_pwm_for_revoke,
+                                );
                                 error!(
                                     temp_c = format_args!("{:.1}", die_temp),
-                                    "EMERGENCY THERMAL SHUTDOWN — disabling all hash boards. The miner will cool down and attempt to restart."
+                                    "EMERGENCY THERMAL SHUTDOWN — disabling all hash boards. Typed lifecycle closeout follows the bounded cut attempt; only a fresh, thermally admitted daemon generation may energize again."
                                 );
                                 if let Some(ref led) = thermal_led_tx {
                                     let _ = led.try_send(LedCommand::SetPattern(LedPattern::Error));
                                 }
-                                match thermal_pic_type {
-                                    PicType::NoPic => {
-                                        match dcentrald_hal::platform::amlogic::disable_psu() {
-                                            Ok(()) => warn!("Thermal emergency: NoPic PSU disabled"),
-                                            Err(e) => error!(error = %e, "Thermal emergency: failed to disable NoPic PSU"),
-                                        }
-                                    }
-                                    _ => {
-                                        // Disable all hash board voltages via the runtime voltage thread.
-                                        // Uses platform-aware controller commands instead of S9-only DAC magic.
-                                        // Retry up to 3 times — I2C bus may be stuck on first attempt.
-                                        let mut all_disabled = false;
-                                        for retry in 0..3u8 {
-                                            let mut round_ok = true;
-                                            if let Some(ref tx) = thermal_voltage_tx {
-                                                for &addr in &thermal_pic_addrs {
-                                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                                    if let Err(e) = tx.try_send(VoltageCommand::DisableVoltage {
-                                                        chain_id: None,
-                                                        chip_id: thermal_chip_id,
-                                                        pic_addr: addr,
-                                                        reply_tx: Some(reply_tx),
-                                                    }) {
-                                                        match &e {
-                                                            VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (thermal emergency)"),
-                                                            VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal emergency)"),
-                                                            other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (thermal emergency)"),
-                                                        }
-                                                        round_ok = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), error = %e, "Thermal emergency: failed to queue voltage disable");
-                                                        continue;
-                                                    }
-                                                    match tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await {
-                                                        Ok(Ok(Ok(VoltageCommandReply::Disabled))) => {}
-                                                        Ok(Ok(Ok(other))) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), reply = ?other, "Thermal emergency: unexpected voltage-disable reply");
-                                                        }
-                                                        Ok(Ok(Err(detail))) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), error = %detail, "Thermal emergency: voltage disable failed");
-                                                        }
-                                                        Ok(Err(_)) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), "Thermal emergency: voltage disable acknowledgement dropped");
-                                                        }
-                                                        Err(_) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), "Thermal emergency: voltage disable timed out");
-                                                        }
-                                                    }
+                                // P1-6: pure SafetyAction plan (cut-hash-before-noise) then execute.
+                                let safety = ThermalAction::EmergencyShutdown
+                                    .as_safety_action(cfg_fan_max_pwm)
+                                    .expect("EmergencyShutdown maps to SafetyAction");
+                                debug_assert!(dcentrald_common::power_precedes_fan_raise(
+                                    &safety.steps()
+                                ));
+                                let mut plan_cut = false;
+                                let mut plan_fan_pwm: Option<u8> = None;
+                                let _plan = dcentrald_common::apply_safety_action(
+                                    safety,
+                                    |_cut| {
+                                        plan_cut = true;
+                                        Ok::<(), ()>(())
+                                    },
+                                    |pwm| {
+                                        plan_fan_pwm = Some(pwm);
+                                        Ok(())
+                                    },
+                                );
+                                if plan_cut {
+                                    match thermal_pic_type {
+                                        PicType::NoPic => {
+                                            match dcentrald_hal::platform::amlogic::disable_psu() {
+                                                Ok(()) => {
+                                                    warn!("Thermal emergency: NoPic PSU disabled")
                                                 }
-                                            } else {
-                                                // THERM-3 (fail-closed): with no runtime
-                                                // voltage channel, no DisableVoltage can be
-                                                // sent — this round did NOT power the boards
-                                                // down, so it must not count as success.
-                                                // Latent on the S9 gating path (the channel is
-                                                // always Some); see `thermal_disable_round_ok`.
-                                                error!("Thermal emergency: runtime voltage channel unavailable — cannot disable hash boards (fail-closed)");
-                                            }
-                                            let round_ok = thermal_disable_round_ok(
-                                                thermal_voltage_tx.is_some(),
-                                                round_ok,
-                                            );
-                                            if round_ok {
-                                                all_disabled = true;
-                                                break;
-                                            }
-                                            if retry < 2 {
-                                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                                warn!(retry, "Thermal emergency: retrying voltage disable");
+                                                Err(e) => error!(error = %e, "Thermal emergency: failed to disable NoPic PSU"),
                                             }
                                         }
-                                        if !all_disabled {
-                                            error!("Thermal emergency: one or more controllers may still be energized after retries");
+                                        _ => {
+                                            // Disable all hash board voltages via the runtime voltage thread.
+                                            // Retry up to 3 times — I2C bus may be stuck on first attempt.
+                                            let mut all_disabled = false;
+                                            for retry in 0..3u8 {
+                                                let mut round_ok = true;
+                                                if let Some(ref tx) = thermal_voltage_tx {
+                                                    for &addr in &thermal_pic_addrs {
+                                                        let (reply_tx, reply_rx) =
+                                                            tokio::sync::oneshot::channel();
+                                                        if let Err(e) = tx.try_send(
+                                                            VoltageCommand::DisableVoltage {
+                                                                chain_id: None,
+                                                                chip_id: thermal_chip_id,
+                                                                pic_addr: addr,
+                                                                reply_tx: Some(reply_tx),
+                                                            },
+                                                        ) {
+                                                            match &e {
+                                                                VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (thermal emergency)"),
+                                                                VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal emergency)"),
+                                                                other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (thermal emergency)"),
+                                                            }
+                                                            round_ok = false;
+                                                            error!(addr = format_args!("0x{:02X}", addr), error = %e, "Thermal emergency: failed to queue voltage disable");
+                                                            continue;
+                                                        }
+                                                        match tokio::time::timeout(
+                                                            std::time::Duration::from_secs(2),
+                                                            reply_rx,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(Ok(
+                                                                VoltageCommandReply::Disabled {
+                                                                    ..
+                                                                },
+                                                            ))) => {}
+                                                            Ok(Ok(Ok(other))) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), reply = ?other, "Thermal emergency: unexpected voltage-disable reply");
+                                                            }
+                                                            Ok(Ok(Err(detail))) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), error = %detail, "Thermal emergency: voltage disable failed");
+                                                            }
+                                                            Ok(Err(_)) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), "Thermal emergency: voltage disable acknowledgement dropped");
+                                                            }
+                                                            Err(_) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), "Thermal emergency: voltage disable timed out");
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    // THERM-3 (fail-closed): with no runtime
+                                                    // voltage channel, no DisableVoltage can be
+                                                    // sent — this round did NOT power the boards
+                                                    // down, so it must not count as success.
+                                                    error!("Thermal emergency: runtime voltage channel unavailable — cannot disable hash boards (fail-closed)");
+                                                }
+                                                let round_ok = thermal_disable_round_ok(
+                                                    thermal_voltage_tx.is_some(),
+                                                    round_ok,
+                                                );
+                                                if round_ok {
+                                                    all_disabled = true;
+                                                    break;
+                                                }
+                                                if retry < 2 {
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(200),
+                                                    )
+                                                    .await;
+                                                    warn!(
+                                                        retry,
+                                                        "Thermal emergency: retrying voltage disable"
+                                                    );
+                                                }
+                                            }
+                                            if !all_disabled {
+                                                error!("Thermal emergency: one or more controllers may still be energized after retries");
+                                            }
                                         }
                                     }
                                 }
-                                if let Some(ref fan) = thermal_fan {
-                                    fan.set_speed(
-                                        dcentrald_common::FanCommand::emergency_cap(cfg_fan_max_pwm)
-                                            .effective_pwm(),
+                                // The direct cut attempt is complete. Consume watchdog-feed
+                                // authority and request the one typed closeout owner BEFORE
+                                // fan telemetry, alerts, or any filesystem operation. A
+                                // blocked lockout fsync must never keep this generation alive.
+                                let disposition =
+                                    request_typed_closeout_for_terminal_thermal_generation(
+                                        &thermal_emergency_latch,
+                                        &thermal_work_dispatch_admission,
+                                        thermal_wdt_feed_stop.as_ref(),
+                                        &thermal_lifecycle_shutdown,
                                     );
+                                // Fan step after cut (home emergency cap from SafetyAction plan).
+                                if let (Some(fan), Some(pwm)) =
+                                    (thermal_fan.as_ref(), plan_fan_pwm)
+                                {
+                                    fan.set_speed(pwm);
                                 }
                                 // Fire webhook alert — non-blocking try_send so thermal loop is never stalled
                                 let _ = thermal_alert_tx.try_send(AlertEvent::EmergencyShutdown {
                                     temp_c: max_board_temp,
                                     chain_id: 0, // all chains affected
                                 });
-                                warn!("Thermal loop continues monitoring after EmergencyShutdown — hash boards should be disabled, waiting for cooldown");
-                                continue; // DO NOT break — keep monitoring so controller can detect cooldown and trigger RestartInit
+                                let (lockout_source, lockout_temp_c) =
+                                    if let Some((board_index, board_temp_c)) =
+                                        max_board_observation
+                                    {
+                                        match thermal_chain_ids.get(board_index).copied() {
+                                            Some(chain_id) => (
+                                                ThermalLockoutSource::BoardSensor { chain_id },
+                                                Some(board_temp_c),
+                                            ),
+                                            None => (
+                                                ThermalLockoutSource::Unknown,
+                                                Some(board_temp_c),
+                                            ),
+                                        }
+                                    } else if xadc_failed {
+                                        (ThermalLockoutSource::SensorBlind, None)
+                                    } else if die_temp.is_finite() {
+                                        (ThermalLockoutSource::SocDie, Some(die_temp))
+                                    } else {
+                                        (ThermalLockoutSource::Unknown, None)
+                                    };
+                                let lockout = TerminalThermalLockout {
+                                    observed_unix_s: current_unix_s(),
+                                    source: lockout_source,
+                                    trigger_temp_milli_c: lockout_temp_c
+                                        .and_then(temperature_milli_c),
+                                    dangerous_temp_c: thermal_dangerous_temp_c,
+                                    hysteresis_c: thermal_hysteresis_c,
+                                };
+                                match persist_terminal_thermal_generation_bounded(
+                                    &thermal_lockout_path,
+                                    lockout,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => info!(
+                                        ?lockout,
+                                        path = %thermal_lockout_path.display(),
+                                        bytes_written = outcome.bytes_written,
+                                        replaced_existing = outcome.replaced_existing,
+                                        "Terminal thermal domain lockout durably published after watchdog-feed closure and typed-closeout request"
+                                    ),
+                                    Err(persist_error) => error!(
+                                        ?lockout,
+                                        path = %thermal_lockout_path.display(),
+                                        error = %persist_error,
+                                        "CRITICAL: bounded source-aware lockout persistence was not proven after watchdog-feed closure; typed closeout is already requested, the pre-launch hardware-session latch must remain unresolved, and operator clearance must not authorize a warm restart"
+                                    ),
+                                }
+                                warn!(
+                                    ?disposition,
+                                    "Emergency thermal cut attempt finished; transferred the terminal generation immediately to typed lifecycle closeout before watchdog expiry"
+                                );
+                                break;
                             }
                             ThermalAction::FanFailure => {
-                                mark_thermal_emergency_active(&thermal_emergency_latch);
+                                mark_thermal_emergency_and_revoke_work_dispatch(
+                                    &thermal_emergency_latch,
+                                    &thermal_work_dispatch_admission,
+                                    thermal_home_pwm_for_revoke,
+                                );
                                 error!("FAN FAILURE DETECTED — fan RPM reads zero but PWM is set! Shutting down hash boards. Check: fan connector, fan power, fan blades obstructed.");
                                 if let Some(ref led) = thermal_led_tx {
                                     let _ = led.try_send(LedCommand::SetPattern(LedPattern::FanFailure));
                                 }
-                                match thermal_pic_type {
-                                    PicType::NoPic => {
-                                        match dcentrald_hal::platform::amlogic::disable_psu() {
-                                            Ok(()) => warn!("Fan failure: NoPic PSU disabled"),
-                                            Err(e) => error!(error = %e, "Fan failure: failed to disable NoPic PSU"),
+                                // P1-6: pure SafetyAction plan (cut-hash-before-noise) then execute.
+                                let safety = ThermalAction::FanFailure
+                                    .as_safety_action(cfg_fan_max_pwm)
+                                    .expect("FanFailure maps to SafetyAction");
+                                debug_assert!(dcentrald_common::power_precedes_fan_raise(
+                                    &safety.steps()
+                                ));
+                                let mut plan_cut = false;
+                                let mut plan_fan_pwm: Option<u8> = None;
+                                let _plan = dcentrald_common::apply_safety_action(
+                                    safety,
+                                    |_cut| {
+                                        plan_cut = true;
+                                        Ok::<(), ()>(())
+                                    },
+                                    |pwm| {
+                                        plan_fan_pwm = Some(pwm);
+                                        Ok(())
+                                    },
+                                );
+                                if plan_cut {
+                                    match thermal_pic_type {
+                                        PicType::NoPic => {
+                                            match dcentrald_hal::platform::amlogic::disable_psu() {
+                                                Ok(()) => warn!("Fan failure: NoPic PSU disabled"),
+                                                Err(e) => error!(error = %e, "Fan failure: failed to disable NoPic PSU"),
+                                            }
                                         }
-                                    }
-                                    _ => {
-                                        // Then disable hash board voltages via the runtime voltage thread.
-                                        // Retry up to 3 times — I2C bus may be stuck on first attempt.
-                                        let mut all_disabled = false;
-                                        for retry in 0..3u8 {
-                                            let mut round_ok = true;
-                                            if let Some(ref tx) = thermal_voltage_tx {
-                                                for &addr in &thermal_pic_addrs {
-                                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                                    if let Err(e) = tx.try_send(VoltageCommand::DisableVoltage {
-                                                        chain_id: None,
-                                                        chip_id: thermal_chip_id,
-                                                        pic_addr: addr,
-                                                        reply_tx: Some(reply_tx),
-                                                    }) {
-                                                        match &e {
-                                                            VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (fan failure)"),
-                                                            VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (fan failure)"),
-                                                            other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (fan failure)"),
+                                        _ => {
+                                            // Disable hash board voltages via the runtime voltage thread.
+                                            let mut all_disabled = false;
+                                            for retry in 0..3u8 {
+                                                let mut round_ok = true;
+                                                if let Some(ref tx) = thermal_voltage_tx {
+                                                    for &addr in &thermal_pic_addrs {
+                                                        let (reply_tx, reply_rx) =
+                                                            tokio::sync::oneshot::channel();
+                                                        if let Err(e) = tx.try_send(
+                                                            VoltageCommand::DisableVoltage {
+                                                                chain_id: None,
+                                                                chip_id: thermal_chip_id,
+                                                                pic_addr: addr,
+                                                                reply_tx: Some(reply_tx),
+                                                            },
+                                                        ) {
+                                                            match &e {
+                                                                VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting DisableVoltage (fan failure)"),
+                                                                VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (fan failure)"),
+                                                                other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected DisableVoltage (fan failure)"),
+                                                            }
+                                                            round_ok = false;
+                                                            error!(addr = format_args!("0x{:02X}", addr), error = %e, "Fan failure: failed to queue voltage disable");
+                                                            continue;
                                                         }
-                                                        round_ok = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), error = %e, "Fan failure: failed to queue voltage disable");
-                                                        continue;
+                                                        match tokio::time::timeout(
+                                                            std::time::Duration::from_secs(2),
+                                                            reply_rx,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(Ok(
+                                                                VoltageCommandReply::Disabled {
+                                                                    ..
+                                                                },
+                                                            ))) => {}
+                                                            Ok(Ok(Ok(other))) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), reply = ?other, "Fan failure: unexpected voltage-disable reply");
+                                                            }
+                                                            Ok(Ok(Err(detail))) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), error = %detail, "Fan failure: voltage disable failed");
+                                                            }
+                                                            Ok(Err(_)) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), "Fan failure: voltage disable acknowledgement dropped");
+                                                            }
+                                                            Err(_) => {
+                                                                round_ok = false;
+                                                                error!(addr = format_args!("0x{:02X}", addr), "Fan failure: voltage disable timed out");
+                                                            }
+                                                        }
                                                     }
-                                                    match tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await {
-                                                        Ok(Ok(Ok(VoltageCommandReply::Disabled))) => {}
-                                                        Ok(Ok(Ok(other))) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), reply = ?other, "Fan failure: unexpected voltage-disable reply");
-                                                        }
-                                                        Ok(Ok(Err(detail))) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), error = %detail, "Fan failure: voltage disable failed");
-                                                        }
-                                                        Ok(Err(_)) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), "Fan failure: voltage disable acknowledgement dropped");
-                                                        }
-                                                        Err(_) => {
-                                                            round_ok = false;
-                                                            error!(addr = format_args!("0x{:02X}", addr), "Fan failure: voltage disable timed out");
-                                                        }
-                                                    }
+                                                } else {
+                                                    error!("Fan failure: runtime voltage channel unavailable — cannot disable hash boards (fail-closed)");
                                                 }
-                                            } else {
-                                                // THERM-3 (fail-closed): with no runtime
-                                                // voltage channel, no DisableVoltage can be
-                                                // sent — this round did NOT power the boards
-                                                // down, so it must not count as success.
-                                                // Latent on the S9 gating path (the channel is
-                                                // always Some); see `thermal_disable_round_ok`.
-                                                error!("Fan failure: runtime voltage channel unavailable — cannot disable hash boards (fail-closed)");
+                                                let round_ok = thermal_disable_round_ok(
+                                                    thermal_voltage_tx.is_some(),
+                                                    round_ok,
+                                                );
+                                                if round_ok {
+                                                    all_disabled = true;
+                                                    break;
+                                                }
+                                                if retry < 2 {
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(200),
+                                                    )
+                                                    .await;
+                                                    warn!(
+                                                        retry,
+                                                        "Fan failure: retrying voltage disable"
+                                                    );
+                                                }
                                             }
-                                            let round_ok = thermal_disable_round_ok(
-                                                thermal_voltage_tx.is_some(),
-                                                round_ok,
-                                            );
-                                            if round_ok {
-                                                all_disabled = true;
-                                                break;
+                                            if !all_disabled {
+                                                error!("Fan failure: one or more controllers may still be energized after retries");
                                             }
-                                            if retry < 2 {
-                                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                                warn!(retry, "Fan failure: retrying voltage disable");
-                                            }
-                                        }
-                                        if !all_disabled {
-                                            error!("Fan failure: one or more controllers may still be energized after retries");
                                         }
                                     }
                                 }
-                                if let Some(ref fan) = thermal_fan {
-                                    fan.set_speed(
-                                        dcentrald_common::FanCommand::emergency_cap(cfg_fan_max_pwm)
-                                            .effective_pwm(),
+                                // As in EmergencyShutdown, the bounded direct cut owns the
+                                // last feedable interval. Close feeding and request typed
+                                // closeout before any potentially blocking persistence.
+                                let disposition =
+                                    request_typed_closeout_for_terminal_thermal_generation(
+                                        &thermal_emergency_latch,
+                                        &thermal_work_dispatch_admission,
+                                        thermal_wdt_feed_stop.as_ref(),
+                                        &thermal_lifecycle_shutdown,
                                     );
+                                if let (Some(fan), Some(pwm)) =
+                                    (thermal_fan.as_ref(), plan_fan_pwm)
+                                {
+                                    fan.set_speed(pwm);
                                 }
                                 // Fire webhook alert — non-blocking try_send
                                 let _ = thermal_alert_tx.try_send(AlertEvent::FanFailure {
                                     rpm: fan_rpm,
                                 });
-                                warn!("Thermal loop continues monitoring after FanFailure — boards disabled, monitoring for recovery");
-                                continue; // DO NOT break — keep monitoring for fan recovery and cooldown
+                                let lockout_temp_c = max_board_observation
+                                    .map(|(_, temp_c)| temp_c)
+                                    .or_else(|| die_temp.is_finite().then_some(die_temp));
+                                let lockout = TerminalThermalLockout {
+                                    observed_unix_s: current_unix_s(),
+                                    source: ThermalLockoutSource::FanFailure,
+                                    trigger_temp_milli_c: lockout_temp_c
+                                        .and_then(temperature_milli_c),
+                                    dangerous_temp_c: thermal_dangerous_temp_c,
+                                    hysteresis_c: thermal_hysteresis_c,
+                                };
+                                match persist_terminal_thermal_generation_bounded(
+                                    &thermal_lockout_path,
+                                    lockout,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => info!(
+                                        ?lockout,
+                                        path = %thermal_lockout_path.display(),
+                                        bytes_written = outcome.bytes_written,
+                                        replaced_existing = outcome.replaced_existing,
+                                        "Terminal fan-failure lockout durably published after watchdog-feed closure and typed-closeout request"
+                                    ),
+                                    Err(persist_error) => error!(
+                                        ?lockout,
+                                        path = %thermal_lockout_path.display(),
+                                        error = %persist_error,
+                                        "CRITICAL: bounded fan-failure lockout persistence was not proven after watchdog-feed closure; typed closeout is already requested, the pre-launch hardware-session latch must remain unresolved, and operator clearance must not authorize a warm restart"
+                                    ),
+                                }
+                                warn!(
+                                    ?disposition,
+                                    "Fan-failure cut attempt finished; transferred the terminal generation immediately to typed lifecycle closeout before watchdog expiry"
+                                );
+                                break;
                             }
                             ThermalAction::RestartInit => {
-                                // BUG FIX (2026-04-11): Was log-only — boards stayed powered
-                                // down after emergency cooldown. Now re-enables voltage and
-                                // restores LED. The thermal controller already transitioned
-                                // to ColdStart, so subsequent ticks return normal PID actions.
-                                // PIC heartbeats kept running during shutdown, so the bus is healthy.
-                                clear_thermal_emergency_active(&thermal_emergency_latch);
-                                info!(
-                                    restart_voltage_mv = thermal_restart_voltage_mv,
-                                    "Thermal: Temperature cooled to safe levels — restarting mining. Re-enabling voltage to the platform-safe restart target."
-                                );
-                                match thermal_pic_type {
-                                    PicType::NoPic => {
-                                        warn!(
-                                            "Thermal recovery requires a new NoPic hardware session; automatic process replacement is suspended until typed disposition receipts exist"
-                                        );
-                                        let _ = thermal_alert_tx.try_send(AlertEvent::ThermalRestart);
-                                        let _ = crate::restart::schedule_daemon_restart(
-                                            "thermal_nopic_restart",
-                                            Duration::from_secs(1),
-                                        );
-                                        break;
-                                    }
-                                    _ => {
-                                        // Re-enable voltage on all controllers at a platform-safe restart target.
-                                        if let Some(ref tx) = thermal_voltage_tx {
-                                            let mut all_reenabled = true;
-                                            for &addr in &thermal_pic_addrs {
-                                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                                if let Err(e) = tx.try_send(VoltageCommand::SetVoltage {
-                                                    chain_id: None,
-                                                    chip_id: thermal_chip_id,
-                                                    pic_addr: addr,
-                                                    target_mv: thermal_restart_voltage_mv,
-                                                    reply_tx: Some(reply_tx),
-                                                }) {
-                                                    match &e {
-                                                        VoltageTrySendError::Full(_) => warn!(addr = format_args!("0x{:02X}", addr), "voltage mailbox full, rejecting SetVoltage (thermal restart)"),
-                                                        VoltageTrySendError::Disconnected => error!(addr = format_args!("0x{:02X}", addr), "voltage worker thread dead — daemon shutdown imminent (thermal restart)"),
-                                                        other => warn!(addr = format_args!("0x{:02X}", addr), error = %other, "voltage mailbox rejected SetVoltage (thermal restart)"),
-                                                    }
-                                                    all_reenabled = false;
-                                                    error!(addr = format_args!("0x{:02X}", addr), error = %e, "Thermal restart: failed to queue voltage re-enable");
-                                                    continue;
-                                                }
-                                                match tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await {
-                                                    Ok(Ok(Ok(VoltageCommandReply::Applied(actual_mv)))) => {
-                                                        info!(addr = format_args!("0x{:02X}", addr), actual_mv, "Thermal restart: controller re-enabled at safe restart voltage");
-                                                    }
-                                                    Ok(Ok(Ok(other))) => {
-                                                        all_reenabled = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), reply = ?other, "Thermal restart: unexpected voltage-apply reply");
-                                                    }
-                                                    Ok(Ok(Err(detail))) => {
-                                                        all_reenabled = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), error = %detail, "Thermal restart: voltage re-enable failed");
-                                                    }
-                                                    Ok(Err(_)) => {
-                                                        all_reenabled = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), "Thermal restart: voltage apply acknowledgement dropped");
-                                                    }
-                                                    Err(_) => {
-                                                        all_reenabled = false;
-                                                        error!(addr = format_args!("0x{:02X}", addr), "Thermal restart: voltage re-enable timed out");
-                                                    }
-                                                }
-                                            }
-                                            if !all_reenabled {
-                                                error!("Thermal restart: one or more controllers failed to re-enable at the safe restart voltage");
-                                            }
+                                match load_thermal_lockout(&thermal_lockout_path) {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => {
+                                        let defensive_lockout = TerminalThermalLockout {
+                                            observed_unix_s: current_unix_s(),
+                                            source: ThermalLockoutSource::Unknown,
+                                            trigger_temp_milli_c: None,
+                                            dangerous_temp_c: thermal_dangerous_temp_c,
+                                            hysteresis_c: thermal_hysteresis_c,
+                                        };
+                                        if let Err(persist_error) =
+                                            persist_terminal_thermal_generation(
+                                                &thermal_lockout_path,
+                                                defensive_lockout,
+                                            )
+                                        {
+                                            error!(
+                                                error = %persist_error,
+                                                "Defensive RestartInit could not publish its unknown-source lockout; persistent session admission must remain unresolved"
+                                            );
                                         }
                                     }
+                                    Err(load_error) => error!(
+                                        error = %load_error,
+                                        "Defensive RestartInit observed an unreadable lockout; leaving it fail-closed"
+                                    ),
                                 }
-                                // LED: back to normal mining pattern
-                                if let Some(ref led) = thermal_led_tx {
-                                    let _ = led.try_send(LedCommand::SetPattern(LedPattern::Mining));
-                                }
-                                // Fire webhook for restart event
-                                let _ = thermal_alert_tx.try_send(AlertEvent::ThermalRestart);
-                                info!("Thermal restart complete — hash boards re-enabled, \
-                                       work dispatcher will resume on next pool job");
+                                let disposition =
+                                    request_typed_closeout_for_terminal_thermal_generation(
+                                        &thermal_emergency_latch,
+                                        &thermal_work_dispatch_admission,
+                                        thermal_wdt_feed_stop.as_ref(),
+                                        &thermal_lifecycle_shutdown,
+                                    );
+                                warn!(
+                                    ?disposition,
+                                    "Defensive RestartInit replay observed after terminal thermal handoff; current generation remains revoked and typed lifecycle closeout stays requested."
+                                );
+                                break;
                             }
                         }
                     }
                 }
             }
-        }) {
+        })
+        {
             anyhow::bail!(
                 "thermal controller task ownership is unavailable; refusing unowned hardware control"
             );
@@ -10252,8 +12485,10 @@ impl Daemon {
         // PH-3 auto-recovery ladder inputs (default-OFF; captured into the task).
         let publisher_recovery_config = self.config.mining.recovery_ladder.clone();
         let publisher_recovery_sleeping = curtailment_sleeping.clone();
-        let publisher_recovery_state_path =
-            std::path::PathBuf::from("/data/dcentrald-recovery-ladder.json");
+        let publisher_recovery_state_path = crate::runtime_policy::persistence_path(
+            std::path::Path::new("/data/dcentrald-recovery-ladder.json"),
+            std::path::Path::new("/tmp/dcent/dcentrald-recovery-ladder.json"),
+        );
         // The platform allowlist is fixed at runtime — resolve it once. Only
         // platforms where a daemon restart is PROVEN to recover mining (am1-s9)
         // arm the ladder; every other platform stays alert-only.
@@ -10516,7 +12751,7 @@ impl Daemon {
         }
 
         // Graceful shutdown sequence
-        self.shutdown().await?;
+        let _closeout = self.shutdown().await?;
 
         Ok(())
     }
@@ -10546,12 +12781,12 @@ impl Daemon {
         // Revoke the preceding engine lease before touching discovery state so
         // management-only recovery can never retain an earlier dispatcher's
         // Measured/High identity authorization.
-        if let Err(error) = self.dispatcher_composition_authority.invalidate_active() {
-            warn!(
-                error = %error,
-                "Could not revoke the preceding dispatcher composition at initialization start"
-            );
-        }
+        self.dispatcher_composition_authority
+            .invalidate_active_bounded(MINING_TASK_STOP_TIMEOUT)
+            .await
+            .context(
+                "preceding dispatcher composition did not quiesce before initialization restart",
+            )?;
         // An init retry is a new discovery and serialized-transport lifetime.
         // Stop the preceding heartbeat owner and terminal-close the old worker
         // before any address or generation-zero state can be reused. A detached
@@ -10572,13 +12807,13 @@ impl Daemon {
                         warn!(
                             address = format_args!("0x{address:02X}"),
                             error = %error,
-                            "Previous PIC16 rail SafeOff was not proven before init-lifetime revocation; refusing in-process transport replacement and relying on watchdog cutoff"
+                            "Previous PIC16 rail SafeOff was not proven before init-lifetime revocation; refusing in-process transport replacement and leaving the watchdog armed with physical rail state unmeasured"
                         );
                     }
                 } else {
                     warn!(
                         address = format_args!("0x{address:02X}"),
-                        "Previous controller is not a PIC16 safe-off target; refusing in-process transport replacement and relying on protocol-specific teardown/watchdog cutoff"
+                        "Previous controller is not a PIC16 safe-off target; refusing in-process transport replacement and leaving protocol-specific teardown/watchdog safety authority active"
                     );
                 }
             }
@@ -10594,6 +12829,8 @@ impl Daemon {
 
         // Never let successful receipts or address-only compatibility state
         // from an earlier, partially completed attempt survive this boundary.
+        self.standard_phase7_driver_admission = None;
+        self.standard_dispatcher_driver_admission = None;
         self.asic_enumeration_receipts.clear();
         self.initialized_pic_addrs_final.clear();
         self.pic_firmware = PicFirmware::Unknown;
@@ -10602,18 +12839,6 @@ impl Daemon {
                 "previous serialized I2C service lifetime was revoked; in-process replacement is refused until worker shutdown/join can be proven (restart the daemon lifecycle after hardware watchdog reconciliation)"
             );
         }
-        self.standard_composition_admission = None;
-        self.asic_driver_execution_policy = ChipDriverExecutionPolicy::production_only();
-
-        if let Some(refusal) = self.td003_destructive_write_refusal(identity) {
-            anyhow::bail!(
-                "TD-003 destructive-write gate refused hardware init for {} from {} \
-                 (Experimental feature / In development; exact promotion gates incomplete)",
-                refusal.model_name,
-                refusal.source
-            );
-        }
-
         // I2C MIGRATION PLAN: PIC16 and dsPIC bring-up, heartbeat, voltage,
         // readback, and shutdown paths now use i2c_svc. AM2 must not open a
         // second raw /dev/i2c-0 owner after this service starts.
@@ -10626,11 +12851,9 @@ impl Daemon {
         // zero nonces), so recovery is gated to the `is_am1_s9` allowlist below and
         // must NOT be re-enabled broadly..
         let control_board = identity.observed_control_board.as_str();
-        // AUTHORITATIVE-FIRST detection: /etc/dcentos/board_target decides the
-        // S9-only devmem I2C path, NOT detect_control_board()'s fragile
-        // uio_count<=14 heuristic (which misclassifies a boot-race am2 as am1-s9
-        // and would corrupt the am2 hashboard EEPROMs at 0x55-0x57). See
-        // is_am1_s9_from_evidence.
+        // COMPOSITION-FIRST detection: the installed target and the passive,
+        // exact live UIO-role topology must agree before the S9-only devmem I2C
+        // path can be selected. See is_am1_s9_from_evidence.
         let board_target_for_i2c = identity.board_target();
         if board_target_for_i2c.is_empty() {
             self.preflight_hardware_state_unknown = true;
@@ -10643,76 +12866,50 @@ impl Daemon {
                 "Authoritative /etc/dcentos/board_target is missing; refusing transport selection, endpoint keepalives, rail bring-up, and mining"
             );
             anyhow::bail!(
-                "authoritative board_target identity is missing; management-only fallback required"
+                "authoritative board_target identity is missing; conditional recovery required"
             );
         }
         let is_am1_s9 = is_am1_s9_from_evidence(board_target_for_i2c, control_board);
 
-        // Lifecycle topology admission. This must complete before bus recovery,
-        // transport startup, GPIO reads, endpoint keepalives, or UIO mapping.
-        // A configured supported model may provide a profile. With no such
-        // profile, only the exact authoritative am1-s9 board target is strong
-        // enough to seed pre-enumeration wiring. Seeding S9 topology here does
-        // NOT set `chip_id`; silicon identity remains unknown until enumeration.
-        if let Some(configured_chip_id) = self.config.mining.model_chip_id() {
-            self.miner_profile = Some(identified_miner_profile(configured_chip_id)?);
-        } else {
-            self.miner_profile = Some(pre_enumeration_topology_profile(is_am1_s9)?);
-        }
-        let admitted_profile = self.required_topology_profile()?;
-        let admitted_pic_type = self
-            .configured_model_pic_type_override()
-            .unwrap_or(admitted_profile.pic_type);
-        let admitted_pic_addrs = self
-            .configured_model_pic_addrs_override()
-            .unwrap_or(admitted_profile.pic_addrs);
-        validate_profile_platform_authority(board_target_for_i2c, is_am1_s9, admitted_profile)?;
-        validate_standard_daemon_topology(admitted_profile, admitted_pic_type, admitted_pic_addrs)?;
-
-        // Executable maturity is not inferred from recognition or a product
-        // name.  Experimental authority is an explicit, exact chip-ID opt-in;
-        // an opt-in for one family cannot authorize another.  This policy is
-        // then bound into the complete standard-route composition before any
-        // new-generation I2C, fan, GPIO, reset, rail, or FPGA access.
-        let experimental_config = crate::experimental::ExperimentalConfig::load();
-        self.asic_driver_execution_policy = if experimental_config
-            .executable_asic_chip_ids
-            .contains(&admitted_profile.chip_id)
-        {
-            ChipDriverExecutionPolicy::with_experimental_chip(admitted_profile.chip_id)
-        } else {
-            ChipDriverExecutionPolicy::production_only()
+        // The complete composition was minted before `collect_hardware_info`
+        // could issue any bootstrap I2C transaction. Reuse that exact proof;
+        // never re-read mutable experimental/config state after hardware access.
+        let (i2c_transport, admitted_profile, admitted_pic_type, admitted_pic_addrs) = {
+            let admission = self
+                .standard_composition_admission
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "standard hardware init reached transport selection without pre-bootstrap composition admission"
+                    )
+                })?;
+            if admission.board_target != board_target_for_i2c {
+                anyhow::bail!(
+                    "pre-bootstrap composition target {} contradicts init target {}",
+                    admission.board_target,
+                    board_target_for_i2c
+                );
+            }
+            (
+                admission.i2c_transport,
+                admission.profile,
+                admission.pic_type,
+                admission.pic_addrs.clone(),
+            )
         };
-        let i2c_transport = standard_i2c_transport(identity, is_am1_s9)?;
-        let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
-        let composition_admission = admit_standard_hardware_composition(
-            board_target_for_i2c,
+        validate_profile_platform_authority(board_target_for_i2c, is_am1_s9, admitted_profile)?;
+        validate_standard_daemon_topology(
             admitted_profile,
             admitted_pic_type,
-            admitted_pic_addrs,
-            i2c_transport,
-            self.config.mining.passthrough,
-            &registry,
+            &admitted_pic_addrs,
         )?;
-        info!(
-            board_target = %board_target_for_i2c,
-            profile = admitted_profile.name,
-            profile_chip_id = format_args!("0x{:04X}", admitted_profile.chip_id),
-            discovered_chip_id = format_args!("0x{:04X}", self.chip_id),
-            source = if self.config.mining.model_chip_id().is_some() {
-                "configured-supported-model"
-            } else {
-                "authoritative-am1-s9-topology-only"
-            },
-            driver_maturity = ?composition_admission.asic.recognition().maturity(),
-            admitted_board_target = %composition_admission.board_target,
-            ownership = ?composition_admission.ownership,
-            i2c_transport = ?composition_admission.i2c_transport,
-            pic_type = ?composition_admission.pic_type,
-            pic_addrs = ?composition_admission.pic_addrs,
-            "Complete standard hardware composition admitted before hardware access"
-        );
-        self.standard_composition_admission = Some(composition_admission);
+        let enumeration_dialect = EnumerationCommandDialect::for_chip_id(admitted_profile.chip_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "admitted ASIC 0x{:04X} has no exact GetAddress command dialect",
+                    admitted_profile.chip_id
+                )
+            })?;
 
         self.capture_bootstrap_i2c_observations()?;
 
@@ -10872,7 +13069,7 @@ impl Daemon {
                         error!(
                             error = %error,
                             board_target,
-                            "Cooling preflight failed and the proven AM2-S17 transport-independent hard cut also failed"
+                            "Cooling preflight failed and the platform-qualified AM2-S17 transport-independent GPIO LOW write also failed"
                         );
                         false
                     }
@@ -10883,14 +13080,14 @@ impl Daemon {
                 detected_slots_known = false,
                 board_target,
                 safety_generation = transition.generation(),
-                hard_cut_allowed,
-                hard_cut_asserted,
-                rail_state_unknown = !hard_cut_asserted,
+                gpio_low_operation_allowed = hard_cut_allowed,
+                gpio_low_write_completed = hard_cut_asserted,
+                rail_state_unknown = true,
                 controller_watchdog_state = "unknown; no new heartbeat was sent",
-                "Cooling preflight failed closed before any heartbeat, board detection, rail enable, or mining; entering management-only fallback"
+                "Cooling preflight failed closed before any heartbeat, board detection, rail enable, or mining; requesting conditional recovery"
             );
             anyhow::bail!(
-                "cooling preflight unavailable: fan-control/tach readiness not proven; management-only fallback required"
+                "cooling preflight unavailable: fan-control/tach readiness not proven; conditional recovery required"
             );
         }
 
@@ -10915,15 +13112,206 @@ impl Daemon {
             .unwrap_or_else(|_| "unknown".to_string());
         info!(version = %version.trim(), "DCENTos firmware version (from /etc/dcentos-version)");
 
-        // Read XADC die temperature for startup check
-        // XADC is the Xilinx Analog-to-Digital Converter built into the Zynq SoC.
-        // It gives us the control board die temperature without any external sensors.
-        match Xadc::read_temp() {
+        // Read any source-aware lockout before obtaining fresh startup
+        // observations. Corruption, symlinks, and I/O failures are lockout
+        // evidence, never permission to pretend the marker was absent.
+        let thermal_lockout_path = terminal_thermal_lockout_path();
+        let persisted_thermal_lockout = match load_thermal_lockout(&thermal_lockout_path) {
+            Ok(lockout) => lockout,
+            Err(lockout_error) => {
+                self.preflight_hardware_state_unknown = true;
+                let transition = i2c_svc.latch_terminal_safe_off();
+                self.signal_init_heartbeat_stop();
+                self.heartbeat_shutdown_token.cancel();
+                error!(
+                    path = %thermal_lockout_path.display(),
+                    error = %lockout_error,
+                    safety_generation = transition.generation(),
+                    "Terminal thermal lockout is unreadable or corrupt; refusing all rail enable and mining"
+                );
+                anyhow::bail!("terminal thermal lockout cannot be proven clear: {lockout_error}");
+            }
+        };
+
+        // XADC is the Xilinx Analog-to-Digital Converter built into the Zynq
+        // SoC. It is explicitly a control-board measurement. A persisted
+        // board-domain lockout is never released by this proxy in production.
+        let startup_temp_result = Xadc::read_temp();
+        match &startup_temp_result {
             Ok(temp) => info!(
                 die_temp_c = format_args!("{:.1}", temp),
                 "Zynq SoC die temperature — this is the control board temp, not the ASIC chip temp (that comes from I2C sensors on each hash board)"
             ),
             Err(e) => tracing::debug!(error = %e, "XADC temperature sensor not available — this is normal on non-Zynq boards"),
+        }
+        let mut startup_xadc_samples: Vec<f32> = startup_temp_result
+            .as_ref()
+            .ok()
+            .copied()
+            .into_iter()
+            .collect();
+
+        // A lockout release uses repeated fresh observations, not one
+        // potentially glitched read. Fans remain under the P0 readiness command
+        // while these samples are collected and no heartbeat/rail enable has
+        // happened.
+        if persisted_thermal_lockout.is_some() {
+            for sample_index in 1..REQUIRED_RELEASE_SAMPLES {
+                tokio::time::sleep(THERMAL_LOCKOUT_RELEASE_SAMPLE_INTERVAL).await;
+                match Xadc::read_temp() {
+                    Ok(temp) => {
+                        info!(
+                            sample = sample_index + 1,
+                            samples = REQUIRED_RELEASE_SAMPLES,
+                            die_temp_c = format_args!("{:.1}", temp),
+                            "Terminal thermal lockout release XADC sample"
+                        );
+                        startup_xadc_samples.push(temp);
+                    }
+                    Err(error) => warn!(
+                        sample = sample_index + 1,
+                        samples = REQUIRED_RELEASE_SAMPLES,
+                        error = %error,
+                        "Terminal thermal lockout release sample unavailable"
+                    ),
+                }
+            }
+        }
+
+        if let Some(lockout) = persisted_thermal_lockout {
+            let release = evaluate_thermal_lockout_release(
+                lockout,
+                current_unix_s(),
+                &startup_xadc_samples,
+                self.config.thermal.dangerous_temp_c,
+                self.config.thermal.hysteresis_c,
+                matches!(&cooling_readiness, CoolingReadiness::Ready { .. }),
+                self.experimental_thermal_board_proxy_release,
+            );
+            if !release.may_remove_lockout() {
+                self.preflight_hardware_state_unknown = true;
+                let transition = i2c_svc.latch_terminal_safe_off();
+                self.signal_init_heartbeat_stop();
+                self.heartbeat_shutdown_token.cancel();
+                error!(
+                    ?lockout,
+                    ?release,
+                    xadc_samples_c = ?startup_xadc_samples,
+                    path = %thermal_lockout_path.display(),
+                    safety_generation = transition.generation(),
+                    "Persisted terminal thermal domain has not produced admissible fresh recovery evidence; no heartbeat, rail enable, or mining may follow"
+                );
+                anyhow::bail!("persisted terminal thermal lockout remains active: {release:?}");
+            }
+            if let Err(remove_error) = remove_thermal_lockout(&thermal_lockout_path) {
+                self.preflight_hardware_state_unknown = true;
+                let transition = i2c_svc.latch_terminal_safe_off();
+                self.signal_init_heartbeat_stop();
+                self.heartbeat_shutdown_token.cancel();
+                error!(
+                    ?lockout,
+                    ?release,
+                    error = %remove_error,
+                    removal_stage = %remove_error.stage(),
+                    deletion_durability_uncertain = remove_error.deletion_durability_uncertain(),
+                    safety_generation = transition.generation(),
+                    "Thermal recovery evidence was accepted but durable lockout removal failed; remaining fail-closed"
+                );
+                anyhow::bail!(
+                    "terminal thermal lockout removal was not durably proven: {remove_error}"
+                );
+            }
+            if release == ThermalLockoutReleaseDecision::ReleaseExperimentalBoardProxy {
+                warn!(
+                    ?lockout,
+                    xadc_samples_c = ?startup_xadc_samples,
+                    "EXPERIMENTAL thermal lockout release: conservative dwell plus repeated non-warming XADC proxy admitted; this is NOT same-domain hash-board temperature equivalence and requires hardware beta validation"
+                );
+            } else {
+                info!(
+                    ?lockout,
+                    xadc_samples_c = ?startup_xadc_samples,
+                    "Terminal thermal lockout released by fresh same-domain/fan-readiness evidence"
+                );
+            }
+        }
+
+        // A watchdog reset recreates the process-local latch. Only a finite
+        // pre-energize observation below the thermal controller's own
+        // dangerous-hysteresis recovery boundary may mint Ready for this fresh
+        // generation. The standard daemon is the Zynq BraiinsOS-FPGA path;
+        // non-Zynq boards are routed to their own engines before construction.
+        self.startup_thermal_safety = measured_startup_thermal_state(
+            startup_xadc_samples.last().copied(),
+            self.config.thermal.dangerous_temp_c,
+            self.config.thermal.hysteresis_c,
+        );
+        if self.startup_thermal_safety != ThermalSafetyState::Ready {
+            self.preflight_hardware_state_unknown = true;
+            let transition = i2c_svc.latch_terminal_safe_off();
+            self.signal_init_heartbeat_stop();
+            self.heartbeat_shutdown_token.cancel();
+            error!(
+                thermal_state = ?self.startup_thermal_safety,
+                measured_temp_c = ?startup_xadc_samples.last(),
+                read_error = ?startup_temp_result.as_ref().err(),
+                recovery_boundary_c = self.config.thermal.dangerous_temp_c as i16
+                    - self.config.thermal.hysteresis_c as i16,
+                safety_generation = transition.generation(),
+                "Fresh-generation pre-energize thermal admission REFUSED; no heartbeat, rail enable, or mining may follow"
+            );
+            anyhow::bail!(
+                "pre-energize thermal readiness was not measured below the recovery boundary"
+            );
+        }
+        info!(
+            thermal_state = ?self.startup_thermal_safety,
+            recovery_boundary_c = self.config.thermal.dangerous_temp_c as i16
+                - self.config.thermal.hysteresis_c as i16,
+            "Fresh-generation pre-energize thermal admission READY"
+        );
+
+        // Pre-arm this admitted generation before Phase 1 can create watchdog,
+        // heartbeat, rail, or mining authority. A crash or reset anywhere after
+        // this point leaves Unknown, so interrupted source refinement can never
+        // degrade to an absent marker and a cool control-board-only restart.
+        let prearmed_lockout = prearmed_thermal_generation(
+            current_unix_s(),
+            startup_xadc_samples
+                .last()
+                .copied()
+                .and_then(temperature_milli_c),
+            self.config.thermal.dangerous_temp_c,
+            self.config.thermal.hysteresis_c,
+        );
+        match persist_terminal_thermal_generation_bounded(&thermal_lockout_path, prearmed_lockout)
+            .await
+        {
+            Ok(outcome) => {
+                self.thermal_generation_prearmed = true;
+                info!(
+                    ?prearmed_lockout,
+                    path = %thermal_lockout_path.display(),
+                    bytes_written = outcome.bytes_written,
+                    replaced_existing = outcome.replaced_existing,
+                    "Thermal generation durably pre-armed as Unknown before watchdog, heartbeat, rail enable, or mining authority"
+                );
+            }
+            Err(prearm_error) => {
+                self.preflight_hardware_state_unknown = true;
+                let transition = i2c_svc.latch_terminal_safe_off();
+                self.signal_init_heartbeat_stop();
+                self.heartbeat_shutdown_token.cancel();
+                error!(
+                    path = %thermal_lockout_path.display(),
+                    error = %prearm_error,
+                    safety_generation = transition.generation(),
+                    "Thermal generation pre-arm was not durably proven; refusing watchdog, heartbeat, rail enable, and mining"
+                );
+                anyhow::bail!(
+                    "terminal thermal generation could not be durably pre-armed: {prearm_error}"
+                );
+            }
         }
 
         // ---- Phase 1: Watchdog ----
@@ -10936,7 +13324,7 @@ impl Daemon {
             // (PIC warm ~7s + enum + PLL + open-core; far longer on a cold reflash)
             // completes and BEFORE the kicker task arms (it only starts after init()
             // returns). That reboot-loops a perfectly healthy miner every boot and
-            // defeats the 90s init-timeout management-only fallback. The watchdog is
+            // defeats the 90s bounded init failure path. The watchdog is
             // now opened + set_timeout + kicked together just before the kicker task
             // (after init). During init, the daemon's own init-timeout/fallback guards.
             info!("Watchdog enabled — deferred: armed after hardware init completes (avoids the DTB 10s timeout rebooting mid-init)");
@@ -11136,7 +13524,7 @@ impl Daemon {
                         error!(
                             error = %error,
                             board_target,
-                            "Board-presence preflight denied bring-up and the proven AM2-S17 transport-independent hard cut also failed"
+                            "Board-presence preflight denied bring-up and the platform-qualified AM2-S17 transport-independent GPIO LOW write also failed"
                         );
                         false
                     }
@@ -11147,14 +13535,14 @@ impl Daemon {
                 passthrough = self.config.mining.passthrough,
                 board_target,
                 safety_generation = transition.generation(),
-                hard_cut_allowed,
-                hard_cut_asserted,
-                rail_state_unknown = !hard_cut_asserted,
+                gpio_low_operation_allowed = hard_cut_allowed,
+                gpio_low_write_completed = hard_cut_asserted,
+                rail_state_unknown = true,
                 controller_watchdog_state = "no endpoint keepalive was sent; expiry timing and prior rail state are not proven",
-                "No positively present hash-board slot is eligible for bring-up; entering management-only fallback"
+                "No positively present hash-board slot is eligible for bring-up; requesting conditional recovery"
             );
             anyhow::bail!(
-                "hash-board presence not positively established for any slot; management-only fallback required"
+                "hash-board presence not positively established for any slot; conditional recovery required"
             );
         }
 
@@ -11304,12 +13692,13 @@ impl Daemon {
                     );
 
                     if !version_ok {
-                        warn!(
+                        error!(
                             chain_id,
                             expected = format_args!("0x{:08X}", 0x00901002u32),
                             actual = format_args!("0x{:08X}", version),
-                            "FPGA version mismatch — expected s9io v1.0.2"
+                            "FPGA ABI mismatch — refusing this chain before any CTRL, FIFO, baud, or work-register mutation"
                         );
+                        continue;
                     }
 
                     let mut chain = Chain::new(fpga, chain_id);
@@ -11429,13 +13818,13 @@ impl Daemon {
             let fpga_midstate_cnt = (ctrl >> dcentrald_hal::fpga_chain::CTRL_MIDSTATE_SHIFT) & 0x03;
             chain.fpga_midstate_cnt = fpga_midstate_cnt as u8;
 
-            // Passthrough has already proven a supported model above. Cold boot may
-            // remain unidentified here; enumeration must supply its identity before
-            // any model-specific driver is selected.
-            chain.chip_count = assumed_chips;
-            chain.chip_id = assumed_chip_id;
-
+            // A cold chain remains explicitly unidentified until GetAddress
+            // returns measured silicon. Standard passthrough is denied at
+            // composition admission until a typed handoff receipt exists; keep
+            // this branch defensive for any future receipt-backed implementation.
             if self.config.mining.passthrough && assumed_chip_id != 0 && assumed_chips != 0 {
+                chain.chip_count = assumed_chips;
+                chain.chip_id = assumed_chip_id;
                 chain
                     .admit_address_assignment_for_current_identity()
                     .with_context(|| {
@@ -11444,9 +13833,12 @@ impl Daemon {
                             chain.chain_id
                         )
                     })?;
+            } else {
+                chain.chip_count = 0;
+                chain.chip_id = 0;
             }
 
-            // AM2 model detection: cold boot vs passthrough.
+            // Cold boot versus adopted passthrough ownership.
             //
             // v0.19.1: passthrough=true IS supported on am2 (S19 Pro) when bosminer
             // has already initialized the hash chains. The previous "9 passthrough tests
@@ -11456,10 +13848,16 @@ impl Daemon {
             //
             // passthrough=false: FULL COLD BOOT (BREAK + init_chain)
             // passthrough=true:  HOT START (preserve bosminer's CTRL/BAUD/WORK_TIME)
-            if self.config.mining.model.is_some() && !self.config.mining.passthrough {
+            //
+            // This branch must cover the topology-seeded S9 path where no model
+            // string is configured. The cold indices were already populated
+            // above; falling through used to re-enable CTRL, reset FIFOs, and
+            // sanitize WORK_TIME with a BM1398 helper before BM1387 enumeration.
+            // Cold ownership permits none of those inherited-state mutations.
+            if !self.config.mining.passthrough {
                 info!(
                     chain_id = chain.chain_id,
-                    "AM2 FULL COLD BOOT: pushing chain to cold boot path (BREAK + init_chain)",
+                    "FULL COLD BOOT: preserving FPGA state until the admitted cold-init sequence",
                 );
                 if !cold_chain_indices.contains(&chain_idx) {
                     cold_chain_indices.push(chain_idx);
@@ -11602,12 +14000,47 @@ impl Daemon {
 
             // CRITICAL: Sanitize WORK_TIME. If bosminer was killed during init
             // (before mining started), WORK_TIME may be 0xFFFFFFFF (43s per item).
-            // Replace with a sane value for the target frequency.
+            // Replace it only through the exact chip identity sealed into this
+            // composition. A generic BM1398 fallback here previously wrote a
+            // foreign-family timing value on admitted BM1387/S9 passthrough.
             if wtime == 0xFFFFFFFF || wtime == 0 {
-                let sane_wtime = dcentrald_asic::drivers::bm1398::Bm1398Driver::calculate_work_time(
-                    self.config.mining.frequency_mhz,
-                    1u32 << fpga_midstate_cnt, // 4 or 8 midstates
-                );
+                let frequency_mhz = self.config.mining.frequency_mhz;
+                let midstate_count = 1u32 << fpga_midstate_cnt;
+                let sane_wtime = match admitted_profile.chip_id {
+                    0x1362 => {
+                        dcentrald_asic::drivers::bm1362::Bm1362Driver::calculate_work_time_for(
+                            chain.chip_count,
+                            frequency_mhz,
+                        )
+                    }
+                    0x1366 => dcentrald_asic::drivers::bm1366::Bm1366Driver::calculate_work_time(
+                        frequency_mhz,
+                        midstate_count,
+                    ),
+                    0x1368 => dcentrald_asic::drivers::bm1368::Bm1368Driver::calculate_work_time(
+                        frequency_mhz,
+                        chain.chip_count,
+                    ),
+                    0x1370 => dcentrald_asic::drivers::bm1370::Bm1370Driver::calculate_work_time(
+                        frequency_mhz,
+                        chain.chip_count,
+                    ),
+                    0x1387 => dcentrald_asic::drivers::bm1387::Bm1387Driver::calculate_work_time(
+                        frequency_mhz,
+                        midstate_count,
+                    ),
+                    0x1397 => dcentrald_asic::drivers::bm1397::Bm1397Driver::calculate_work_time(
+                        frequency_mhz,
+                        midstate_count,
+                    ),
+                    0x1398 => dcentrald_asic::drivers::bm1398::Bm1398Driver::calculate_work_time(
+                        frequency_mhz,
+                        midstate_count,
+                    ),
+                    chip_id => anyhow::bail!(
+                        "admitted chip 0x{chip_id:04X} has no exact FPGA WORK_TIME calculation"
+                    ),
+                };
                 chain
                     .fpga
                     .common
@@ -11616,9 +14049,10 @@ impl Daemon {
                     chain_id = chain.chain_id,
                     old_wtime = format_args!("0x{:08X}", wtime),
                     new_wtime = format_args!("0x{:08X}", sane_wtime),
-                    freq_mhz = self.config.mining.frequency_mhz,
+                    admitted_chip_id = format_args!("0x{:04X}", admitted_profile.chip_id),
+                    freq_mhz = frequency_mhz,
                     "Hot start: sanitized stale WORK_TIME (was 0x{:08X}, set to 0x{:08X} for {} MHz)",
-                    wtime, sane_wtime, self.config.mining.frequency_mhz,
+                    wtime, sane_wtime, frequency_mhz,
                 );
             }
 
@@ -11758,7 +14192,7 @@ impl Daemon {
             // refuses to spawn the init-heartbeat thread (resource exhaustion), do NOT
             // panic — panic=abort would skip every Drop guard. Log it and proceed
             // WITHOUT the init HB: a degraded but SAFE state, since the cold chains then
-            // rely on the PIC watchdog (which cuts voltage if unfed = safe direction)
+            // leave the PIC watchdog unfed as the independent safe-direction path
             // rather than leaving an unsupervised energized rail behind an aborted process.
             match Self::start_init_heartbeat_thread(
                 initialized_pic_addrs.clone(),
@@ -11779,7 +14213,7 @@ impl Daemon {
                     error!(
                         error = %e,
                         "Failed to spawn init heartbeat thread — proceeding WITHOUT it (degraded). \
-                         Cold-chain PICs will rely on the PIC watchdog (cuts voltage if unfed) instead \
+                         Cold-chain PICs will leave the PIC watchdog unfed as the independent safety path instead \
                          of the 500ms init heartbeat; NOT panicking, so shutdown guards still run."
                     );
                     None
@@ -12619,8 +15053,9 @@ impl Daemon {
             //
             // v0.14.0: GPIO was already set HIGH in Step 5.2 (for PIC I2C access).
             // Now we need to reset the ASICs: assert LOW briefly, then release HIGH.
-            // This gives ASICs a clean hardware reset while PICs stay alive (PIC
-            // watchdog is ~64s, the pulse is only 100ms).
+            // This was intended to request an ASIC reset while PICs stayed alive
+            // (PIC watchdog is ~64s, the pulse was only 100ms); rail/reset effects
+            // were not measured by the daemon.
             //
             // BraiinsOS exit_reset() does: GPIO HIGH + enable_ip_core().
             // We match this by asserting LOW (100ms pulse) then releasing HIGH.
@@ -12944,7 +15379,7 @@ impl Daemon {
                     let enum_default_chips = self.default_chips_per_chain()?;
                     let enum_min_chip_fraction = self.config.mining.min_chip_fraction;
                     let chain = &mut self.chains[chain_idx];
-                    match chain.enumerate_chips() {
+                    match chain.enumerate_chips(enumeration_dialect) {
                         Ok(report) => {
                             let count = report.chip_count();
                             let chip_id = report.chip_id();
@@ -13163,6 +15598,11 @@ impl Daemon {
             }
         } // end cold boot block (if !cold_chain_indices.is_empty())
 
+        // Discovery power/reset authority ends here. Address assignment, PLL,
+        // ticket-mask, relay, and work-capable driver operations require a new
+        // authority sealed from measured GetAddress receipts.
+        self.seal_standard_phase7_driver_admission()?;
+
         // ---- Phase 7: Chip configuration ----
         // Now we configure each ASIC chip for mining:
         //   1. Assign unique addresses to each chip on the daisy chain
@@ -13179,14 +15619,13 @@ impl Daemon {
 
         let registry = ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
         let admitted_execution_chip_id = self
-            .standard_composition_admission
+            .standard_phase7_driver_admission
             .as_ref()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "standard hardware composition authority disappeared before Phase 7"
+                    "measured standard mining-driver authority disappeared before Phase 7"
                 )
             })?
-            .asic
             .chip_id();
 
         // Collect PIC addresses for heartbeat keepalive during Phase 7.
@@ -13242,30 +15681,18 @@ impl Daemon {
                 );
                 continue;
             }
-            // For am2 passthrough: if enumeration failed but model hint is set,
-            // use assumed chip_id instead of skipping. Bosminer already configured
-            // the ASICs — we just need to mark them as mining.
+            // A configuration hint is not silicon evidence and a passthrough
+            // boolean is not an ownership receipt. Until the outgoing runtime
+            // provides a typed, fresh handoff binding chain identity and board
+            // state, an unenumerated chain must remain disabled.
             if chain.chip_id == 0 {
-                if self.config.mining.model.is_some() && assumed_chip_id != 0 {
-                    chain.chip_id = assumed_chip_id;
-                    chain.chip_count = assumed_chips;
-                    chain
-                        .admit_address_assignment_for_current_identity()
-                        .with_context(|| {
-                            format!(
-                                "Phase 7 model-hint chain {} lacks an admitted address composition",
-                                chain.chain_id
-                            )
-                        })?;
-                    tracing::info!(
-                        chain_id = chain.chain_id,
-                        chip_id = format_args!("0x{:04X}", chain.chip_id),
-                        chips = chain.chip_count,
-                        "Phase 7: using model hint for unenumerated chain during passthrough handoff"
-                    );
-                } else {
-                    continue;
-                }
+                chain.mining = false;
+                error!(
+                    chain_id = chain.chain_id,
+                    passthrough = self.config.mining.passthrough,
+                    "Phase 7: refusing an unmeasured ASIC identity; a model hint or passthrough flag is not execution authority"
+                );
+                continue;
             }
 
             if chain.chip_id != admitted_execution_chip_id {
@@ -13756,6 +16183,10 @@ impl Daemon {
             self.initialized_pic_addrs_final.len(),
         );
 
+        // This is the explicit typestate boundary between initialization and
+        // runtime dispatch. No fallible hardware work may follow it.
+        self.complete_standard_phase7_driver_admission()?;
+
         info!("=== HARDWARE INIT COMPLETE ===");
         info!(
             active_chains,
@@ -13916,7 +16347,7 @@ impl Daemon {
             })?; // G46: propagate the spawn error instead of panic!(...). A panic
                  // under panic=abort skips every Drop guard; the single caller
                  // handles Err by proceeding without the init HB (degraded but safe
-                 // — PIC watchdog cuts voltage if unfed) so shutdown guards still run.
+                 // — the PIC watchdog remains armed when unfed) so shutdown guards still run.
 
         Ok((stop, pause, handle))
     }
@@ -13926,7 +16357,8 @@ impl Daemon {
     /// This is deliberately called before partial-init teardown after an
     /// initialization error or timeout. If teardown itself wedges on the same
     /// I2C service, the init thread must not keep feeding the PIC indefinitely;
-    /// stopping heartbeats lets the hardware watchdog cut the rail.
+    /// stopping heartbeats leaves the hardware watchdog armed as an independent
+    /// safety path. Physical rail state remains unmeasured.
     fn signal_init_heartbeat_stop(&self) {
         if let Some(ref stop) = self.init_heartbeat_stop {
             stop.store(true, std::sync::atomic::Ordering::Release);
@@ -13938,29 +16370,32 @@ impl Daemon {
     /// after the bound expires its join handle is detached, but the stop flag
     /// remains asserted so it cannot emit another heartbeat if the call returns.
     async fn stop_init_heartbeat_bounded(&mut self) -> bool {
+        self.stop_init_heartbeat_with_timeout(Duration::from_secs(2))
+            .await
+    }
+
+    async fn stop_init_heartbeat_with_timeout(&mut self, timeout: Duration) -> bool {
         let stop = self.init_heartbeat_stop.take();
         let handle = self.init_heartbeat_handle.take();
         match (stop, handle) {
-            (Some(stop), Some(handle)) => {
-                match stop_thread_bounded(stop, handle, Duration::from_secs(2)).await {
-                    ThreadStopOutcome::Joined => {
-                        info!("Initialization heartbeat thread stopped and joined");
-                        true
-                    }
-                    ThreadStopOutcome::Panicked => {
-                        error!("Initialization heartbeat thread panicked while stopping");
-                        true
-                    }
-                    ThreadStopOutcome::TimedOut => {
-                        warn!(
-                            "Initialization heartbeat thread did not exit within 2s; \
+            (Some(stop), Some(handle)) => match stop_thread_bounded(stop, handle, timeout).await {
+                ThreadStopOutcome::Joined => {
+                    info!("Initialization heartbeat thread stopped and joined");
+                    true
+                }
+                ThreadStopOutcome::Panicked => {
+                    error!("Initialization heartbeat thread panicked while stopping");
+                    true
+                }
+                ThreadStopOutcome::TimedOut => {
+                    warn!(
+                        "Initialization heartbeat thread did not exit within 2s; \
                              stop remains asserted and the handle was detached so shutdown \
                              can continue toward the hardware-watchdog safety path"
-                        );
-                        false
-                    }
+                    );
+                    false
                 }
-            }
+            },
             (Some(stop), None) => {
                 stop.store(true, std::sync::atomic::Ordering::Release);
                 true
@@ -13983,7 +16418,7 @@ impl Daemon {
     /// During normal runtime shutdown, heartbeats keep running until the voltage
     /// disable attempt completes. During partial-init failure, the initialization
     /// heartbeat is deliberately stopped before teardown so the hardware watchdog
-    /// can cut power even if the same I2C service wedges the safe-off request.
+    /// remains armed even if the same I2C service wedges the safe-off request.
     ///
     /// Sequence:
     /// 1. Cancel all Tokio tasks via CancellationToken (heartbeat thread still runs)
@@ -13991,35 +16426,49 @@ impl Daemon {
     /// 3. Wait 500ms for in-flight nonces
     /// 4. Submit any remaining valid shares
     /// 5a. Disable hash board voltages (PIC ENABLE_VOLTAGE = 0)
-    /// 5b. Stop heartbeat thread (voltage is off, PIC watchdog no longer matters)
-    /// 6. Wait 2 seconds for power discharge
+    /// 5b. Stop heartbeat thread after software disable attempts
+    /// 6. Wait 2 seconds for the documented discharge interval (not a rail measurement)
     /// 7. Ramp fans to the configured cool-down envelope
     /// 8. Wait 5 seconds
     /// 9. Set fans to minimum
     /// 10. Close watchdog (write "V" then close fd)
     /// 11. Log "dcentrald stopped cleanly"
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&mut self) -> Result<StandardDaemonTerminalCloseout> {
         if std::mem::replace(&mut self.shutdown_attempted, true) {
             anyhow::bail!(
                 "shutdown was already attempted; refusing to consume hardware ownership or extend watchdog teardown grace twice"
             );
         }
-        // Identity authorization ends at shutdown admission, before any
-        // potentially slow or degraded hardware teardown. The dispatcher's
-        // owned session may still be unwinding; its later stale-token Drop is
-        // deliberately a no-op.
-        if let Err(error) = self.dispatcher_composition_authority.invalidate_active() {
-            warn!(
-                error = %error,
-                "Could not revoke the active dispatcher composition at shutdown start"
-            );
-        }
+        let mut unit_closeout_owners = self
+            .standard_unit_closeout_owners
+            .take()
+            .context("standard unit-closeout owners disappeared before shutdown")?;
+        let mut teardown_budget_issuer = self
+            .watchdog_teardown_budget_issuer
+            .take()
+            .context("standard teardown-budget issuer disappeared before shutdown")?;
+        let teardown_budget = teardown_budget_issuer
+            .issue_at(Instant::now(), TeardownBudgetPolicy::watchdog_default())?;
+        let teardown_budget_view = teardown_budget.view();
+        // Close public hardware-mutation admission before publishing any
+        // watchdog transition or awaiting another subsystem. The move-only
+        // observer below later proves whether an already-entered final commit
+        // returned within its own bounded wait.
+        let revoked_api_commit_fence = self.api_hardware_mutation_gate.revoke_commit_fence();
+        let composition_invalidation = self.dispatcher_composition_authority.begin_invalidation();
+        info!("Closed internal mining execution admission; retaining the exact boundary until final commit evidence is complete");
         // Thermal liveness will intentionally stop below. Move the independent
         // watchdog into an absolute-deadline teardown grace first, so a healthy
-        // bounded safe-off keeps receiving kicks while a wedged safe-off still
-        // ends in a hardware reset. This is not disarm authority.
+        // bounded safe-off keeps receiving kicks while a wedged safe-off leaves
+        // the configured target watchdog action pending. Reset and rail effects
+        // remain unmeasured. This is not disarm authority.
         if let Some(intent_tx) = self.watchdog_intent_tx.as_ref() {
-            let deadline = tokio::time::Instant::now() + WATCHDOG_TEARDOWN_GRACE;
+            let deadline = teardown_budget_view.deadline(TeardownStage::FeedDeadline);
+            self.watchdog_feed_owner
+                .as_ref()
+                .context("standard watchdog feed owner disappeared before teardown")?
+                .publish_deadline(deadline)
+                .map_err(anyhow::Error::msg)?;
             if intent_tx
                 .send(WatchdogIntent::Teardown { deadline })
                 .is_err()
@@ -14027,42 +16476,235 @@ impl Daemon {
                 warn!("SoC watchdog task was unavailable at teardown admission; final receipt will determine whether it was never armed or failed closed");
             }
         }
-        self.mining_tasks.request_stop();
-        // Close mutation admission after requesting mining-task cancellation.
-        // A delayed or later-aborted dispatcher/thermal task cannot enqueue
-        // another SetVoltage while shutdown waits for task termination.
+        // Close every known software energization lane before waiting for actor
+        // cleanup. SafeOff remains admitted by both barriers, so a prioritized
+        // voltage cut can execute while stale ordinary work is rejected.
         if let Some(i2c_service) = self.i2c_service.as_ref() {
             let transition = i2c_service.latch_terminal_safe_off();
             info!(
                 safety_generation = transition.generation(),
                 no_controller_mutation_stage_in_flight =
                     transition.no_controller_mutation_stage_in_flight(),
-                "Latched terminal I2C safe-off barrier; this is software-stage evidence, not physical rail-off evidence"
+                "Latched terminal I2C safe-off barrier before first voltage cutoff"
             );
         }
         if let Some(voltage_mailbox) = self.voltage_cmd_tx.as_ref() {
             voltage_mailbox.latch_terminal();
         }
+        self.mining_tasks.request_stop();
+        let cutoff_mailbox = self.voltage_cmd_tx.clone();
+        let cutoff_endpoints = self
+            .detected_board_indices
+            .iter()
+            .map(|&board_index| {
+                Ok((
+                    self.chain_id_for_board(board_index)?,
+                    self.pic_addr_for_board(board_index)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>();
+        let cutoff_budget_view = teardown_budget_view.clone();
+        let cutoff_chip_id = self.chip_id;
+        let standard_teardown_progress_result: Result<StandardTeardownProgress> = async move {
+            let tx = cutoff_mailbox.context(
+                "standard first-stage voltage cutoff requires the runtime voltage mailbox",
+            )?;
+            let endpoints = cutoff_endpoints?;
+            anyhow::ensure!(
+                !endpoints.is_empty(),
+                "standard first-stage voltage cutoff has no discovered board endpoints"
+            );
+            let mut first_started_at: Option<Instant> = None;
+            let mut last_completed_at: Option<Instant> = None;
+            for (chain_id, pic_addr) in endpoints {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.try_send(VoltageCommand::DisableVoltage {
+                    chain_id: Some(chain_id),
+                    chip_id: cutoff_chip_id,
+                    pic_addr,
+                    reply_tx: Some(reply_tx),
+                })
+                .with_context(|| {
+                    format!(
+                        "standard first-stage voltage cutoff could not queue chain {chain_id}"
+                    )
+                })?;
+                let remaining = cutoff_budget_view
+                    .remaining_at(TeardownStage::CutoffComplete, Instant::now())?;
+                let reply = tokio::time::timeout(remaining, reply_rx)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "standard first-stage voltage cutoff timed out on chain {chain_id}"
+                        )
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "standard first-stage voltage cutoff worker dropped chain {chain_id} reply"
+                        )
+                    })?
+                    .map_err(anyhow::Error::msg)?;
+                let VoltageCommandReply::Disabled {
+                    operation_started_at,
+                    operation_completed_at,
+                } = reply
+                else {
+                    anyhow::bail!(
+                        "standard first-stage voltage cutoff received an unexpected reply on chain {chain_id}"
+                    );
+                };
+                first_started_at = Some(
+                    first_started_at
+                        .map_or(operation_started_at, |current| current.min(operation_started_at)),
+                );
+                last_completed_at = Some(
+                    last_completed_at.map_or(operation_completed_at, |current| {
+                        current.max(operation_completed_at)
+                    }),
+                );
+            }
+            StandardTeardownProgress::after_checked_cut(
+                cutoff_budget_view,
+                first_started_at.context("standard cutoff did not observe an operation start")?,
+                last_completed_at
+                    .context("standard cutoff did not observe an operation completion")?,
+            )
+        }
+        .await;
+        if let Err(error) = &standard_teardown_progress_result {
+            error!(
+                %error,
+                watchdog_fallback = true,
+                "Standard first-stage voltage cutoff missed its absolute schedule; continuing cleanup with watchdog disarm forbidden"
+            );
+        }
+        // Close and drain the same mutation domain held by AppState before
+        // latching any terminal controller state. The lease drain is bounded
+        // and retains explicit negative evidence on timeout. The separate final
+        // commit fence below is authoritative: a stale lease that outlives the
+        // drain timeout cannot enter another physical write after safe-off.
+        let api_gate_for_drain = self.api_hardware_mutation_gate.clone();
+        let api_mutation_drain_timeout =
+            remaining_standard_cleanup(&teardown_budget_view, API_HARDWARE_MUTATION_DRAIN_TIMEOUT);
+        let api_mutation_barrier_result = match tokio::task::spawn_blocking(move || {
+            api_gate_for_drain.close_and_drain(api_mutation_drain_timeout)
+        })
+        .await
+        {
+            Ok(Ok(barrier)) => {
+                info!(
+                        timeout_ms = api_mutation_drain_timeout.as_millis(),
+                        "Closed and drained standard API hardware-mutation admission before controller safe-off"
+                    );
+                Ok(barrier)
+            }
+            Ok(Err(error)) => {
+                error!(
+                    error = %error,
+                    timeout_ms = api_mutation_drain_timeout.as_millis(),
+                    "Standard API hardware-mutation admission did not drain before controller safe-off"
+                );
+                Err(anyhow::anyhow!(
+                    "standard API hardware-mutation admission did not drain: {error}"
+                ))
+            }
+            Err(join_error) => {
+                error!(
+                    error = %join_error,
+                    "Standard API hardware-mutation barrier task failed before controller safe-off"
+                );
+                Err(anyhow::anyhow!(
+                    "standard API hardware-mutation barrier task failed: {join_error}"
+                ))
+            }
+        };
+        let api_mutation_barrier_failed = api_mutation_barrier_result.is_err();
+        let api_commit_started = tokio::time::Instant::now();
+        let api_commit_deadline = tokio::time::Instant::from_std(
+            teardown_budget_view.deadline(TeardownStage::CleanupComplete),
+        );
+        let api_commit_fence_result = match wait_revoked_hardware_mutation_commit_fence(
+            revoked_api_commit_fence,
+            api_commit_started,
+            api_commit_deadline,
+            "standard daemon API shutdown",
+        )
+        .await
+        {
+            Ok(receipt) => {
+                info!(
+                    closed_generation = receipt.closed_generation(),
+                    fence_poisoned = receipt.fence_poisoned(),
+                    "Fenced every entered standard API hardware commit before controller safe-off"
+                );
+                Ok(receipt)
+            }
+            Err(error) => {
+                error!(
+                    %error,
+                    "Standard API final-commit fence lacked timely quiescence evidence; continuing cancellation and safe-off with clean shutdown forbidden"
+                );
+                Err(error)
+            }
+        };
+        let api_commit_fence_failed = api_commit_fence_result.is_err();
         // Quiesce every asynchronous mining hardware owner before voltage or
         // controller teardown. This uses a standalone mining-only token, so
         // global signal cancellation cannot preempt watchdog teardown admission
         // and the API remains available for recovery. The watchdog kicker
-        // remains outside this group so stalled liveness still causes reboot.
-        let mining_stop = self
-            .mining_tasks
-            .stop_and_join(MINING_TASK_STOP_TIMEOUT)
-            .await;
-        let mining_quiescence_failed = mining_stop.any_timed_out();
-        if mining_quiescence_failed {
+        // remains outside this group so stalled liveness still withholds kicks;
+        // the configured reset action is not physically observed here.
+        let mining_stop_timeout =
+            remaining_standard_cleanup(&teardown_budget_view, MINING_TASK_STOP_TIMEOUT);
+        let mining_stop = self.mining_tasks.stop_and_join(mining_stop_timeout).await;
+        let mining_timed_out = mining_stop.any_timed_out();
+        let mining_panicked = mining_stop.any_panicked();
+        let mining_actor_receipt = mining_stop.into_receipt();
+        let mining_quiescence_failed = mining_actor_receipt.is_none();
+        if mining_timed_out {
             error!(
-                timeout_ms = MINING_TASK_STOP_TIMEOUT.as_millis(),
+                timeout_ms = mining_stop_timeout.as_millis(),
                 "Mining hardware task did not terminate after cancellation and abort; continuing fail-safe voltage teardown"
             );
-        } else if mining_stop.any_panicked() {
-            warn!(
-                "Mining hardware task panicked; task ownership was reclaimed before hardware teardown"
+        } else if mining_panicked {
+            error!(
+                "Mining hardware task panicked; top-level ownership was reclaimed, but clean actor-graph quiescence is unproven and watchdog Disarm is forbidden"
             );
         }
+        let composition_fence_timeout =
+            remaining_standard_cleanup(&teardown_budget_view, MINING_TASK_STOP_TIMEOUT);
+        let composition_fence_result = match composition_invalidation
+            .complete_bounded(composition_fence_timeout)
+            .await
+        {
+            Ok(receipt) => {
+                info!("Fenced internal mining execution and cleared measured composition identity");
+                Ok(receipt)
+            }
+            Err(error) => {
+                error!(
+                    %error,
+                    "Internal execution fence lacked timely quiescence evidence; continuing terminal safe-off with clean shutdown forbidden"
+                );
+                Err(error)
+            }
+        };
+        let composition_fence_failed = composition_fence_result.is_err();
+        // Re-observe controller-stage quiescence after task reclamation. The
+        // terminal barrier was already latched before the first voltage cut;
+        // this second receipt cannot reopen it or mint a new generation.
+        let terminal_i2c_transition = if let Some(i2c_service) = self.i2c_service.as_ref() {
+            let transition = i2c_service.latch_terminal_safe_off();
+            info!(
+                safety_generation = transition.generation(),
+                no_controller_mutation_stage_in_flight =
+                    transition.no_controller_mutation_stage_in_flight(),
+                "Re-observed terminal I2C safe-off barrier after actor cleanup; this is software-stage evidence, not physical rail-off evidence"
+            );
+            Some(transition)
+        } else {
+            None
+        };
         // The legacy smart-PSU feeder owns a raw bus-1 transport. Reclaim it
         // before latching terminal state or touching any shared shutdown
         // hardware. A timed-out feeder may still be inside an ioctl while
@@ -14072,9 +16714,11 @@ impl Daemon {
         // the already-armed PSU watchdog as the transport-independent fallback.
         let mut psu_quiescence_failed = false;
         if self.psu_watchdog_threads.contains("psu-watchdog") {
+            let psu_stop_timeout =
+                remaining_standard_cleanup(&teardown_budget_view, PSU_WATCHDOG_THREAD_STOP_TIMEOUT);
             let psu_stop = self
                 .psu_watchdog_threads
-                .stop_and_join(PSU_WATCHDOG_THREAD_STOP_TIMEOUT)
+                .stop_and_join(psu_stop_timeout)
                 .await;
             if psu_stop.any_timed_out() {
                 psu_quiescence_failed = true;
@@ -14085,23 +16729,36 @@ impl Daemon {
                     board_target,
                     false,
                 ) {
-                    match dcentrald_hal::platform::zynq::disable_psu_output() {
-                        Ok(()) => error!(
+                    match tokio::task::spawn_blocking(
+                        dcentrald_hal::platform::zynq::disable_psu_output,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => error!(
                             control_board,
                             board_target,
                             feeder_timed_out = true,
-                            hard_cut_asserted = true,
+                            gpio_low_write_completed = true,
                             watchdog_fallback = true,
-                            "PSU watchdog feeder did not quiesce; asserted the proven am2-s17 GPIO output hard cut without re-entering its transport"
+                            "PSU watchdog feeder did not quiesce; completed the am2-s17 GPIO LOW write without re-entering its transport; rail state remains unmeasured"
                         ),
-                        Err(cut_error) => error!(
+                        Ok(Err(cut_error)) => error!(
                             control_board,
                             board_target,
                             error = %cut_error,
                             feeder_timed_out = true,
-                            hard_cut_asserted = false,
+                            gpio_low_write_completed = false,
                             watchdog_fallback = true,
-                            "PSU watchdog feeder did not quiesce and the proven GPIO hard cut failed; the armed PSU watchdog is the remaining power-cut fallback"
+                            "PSU watchdog feeder did not quiesce and the GPIO LOW write failed; the armed PSU watchdog remains the intended fallback, with physical output unmeasured"
+                        ),
+                        Err(join_error) => error!(
+                            control_board,
+                            board_target,
+                            error = %join_error,
+                            feeder_timed_out = true,
+                            gpio_low_write_completed = false,
+                            watchdog_fallback = true,
+                            "PSU watchdog feeder did not quiesce and the GPIO LOW worker failed; the armed PSU watchdog remains the intended fallback, with physical output unmeasured"
                         ),
                     }
                 } else {
@@ -14109,22 +16766,27 @@ impl Daemon {
                         control_board,
                         board_target,
                         feeder_timed_out = true,
-                        hard_cut_available = false,
+                        gpio_low_operation_available = false,
                         watchdog_fallback = true,
-                        "PSU watchdog feeder did not quiesce; no platform-proven transport-independent hard cut exists, so shutdown will not re-enter the possibly held PSU transport"
+                        "PSU watchdog feeder did not quiesce; no platform-qualified transport-independent GPIO LOW operation exists, so shutdown will not re-enter the possibly held PSU transport"
                     );
                 }
             } else if psu_stop.any_panicked() {
                 warn!(
                     watchdog_fallback = true,
-                    "PSU watchdog feeder panicked before shutdown; its transport is quiescent and the armed watchdog remains the fallback"
+                    "PSU watchdog feeder panicked before shutdown; its transport is quiescent and the armed watchdog remains the intended fallback, with physical output unmeasured"
                 );
             }
         }
+        let psu_feeder_closeout_receipt = if psu_quiescence_failed {
+            None
+        } else {
+            Some(unit_closeout_owners.close_psu_feeders()?)
+        };
 
         info!("=== GRACEFUL SHUTDOWN SEQUENCE ===");
         info!(
-            "Attempting software safe-off; the PIC/dsPIC watchdog remains the independent power-cut safety net"
+            "Attempting software safe-off; the PIC/dsPIC watchdog remains armed as the independent safety path"
         );
 
         // prod-readiness hunt #1 (log-honesty): track whether SOFTWARE actually
@@ -14132,8 +16794,12 @@ impl Daemon {
         // evidence, not measured rail-off evidence. Every Step-5a/5b failure
         // branch sets this true so the final log distinguishes a completed write
         // from exclusive reliance on the ~5-64 s PIC/dsPIC watchdog.
-        let mut software_disable_failed =
-            self.preflight_hardware_state_unknown || mining_quiescence_failed;
+        let mut software_disable_failed = self.preflight_hardware_state_unknown
+            || mining_quiescence_failed
+            || api_mutation_barrier_failed
+            || api_commit_fence_failed
+            || composition_fence_failed
+            || standard_teardown_progress_result.is_err();
         if self.preflight_hardware_state_unknown {
             warn!(
                 "Preflight terminated hardware bring-up before controller/slot state was fully discovered; shutdown cannot attest that all rails were de-energized by software"
@@ -14145,16 +16811,16 @@ impl Daemon {
         // On partial-init failure, the init heartbeat may already be stopping so
         // the controller watchdog can expire if this teardown wedges.
         info!("Step 1-2: Stopping work submission — no new jobs will be sent to ASICs");
-        info!("  (runtime heartbeat remains active when available; init-failure teardown may already rely on controller watchdog cutoff)");
+        info!("  (runtime heartbeat remains active when available; init-failure teardown may already have left the controller watchdog armed)");
 
         // Step 3: Wait for in-flight nonces to arrive
         info!("Step 3: Waiting 500ms for any in-flight nonces to arrive from FPGA FIFOs...");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        sleep_within_standard_cleanup(&teardown_budget_view, Duration::from_millis(500)).await;
 
         // Step 5a: Disable hash board voltages via PIC
         // This is a bounded best-effort command. A stopped init heartbeat is an
         // intentional fail-safe: if the command cannot execute, watchdog expiry
-        // still removes hash power.
+        // requests the controller's configured cutoff action; rail state is unmeasured.
         info!(
             "Step 5a: Disabling hash board voltages — telling each PIC to cut power to ASIC chips"
         );
@@ -14211,12 +16877,23 @@ impl Daemon {
                     continue;
                 }
 
-                match tokio::time::timeout(Duration::from_secs(3), reply_rx).await {
-                    Ok(Ok(Ok(_))) => {
+                let voltage_reply_timeout =
+                    remaining_standard_cleanup(&teardown_budget_view, Duration::from_secs(3));
+                match tokio::time::timeout(voltage_reply_timeout, reply_rx).await {
+                    Ok(Ok(Ok(VoltageCommandReply::Disabled { .. }))) => {
                         info!(
                             chain_id,
                             "Chain {} voltage-disable command completed (physical rail-off is not independently measured)", chain_id,
                         );
+                    }
+                    Ok(Ok(Ok(other))) => {
+                        warn!(
+                            chain_id,
+                            pic_addr = format_args!("0x{:02X}", pic_addr),
+                            reply = ?other,
+                            "Shutdown voltage disable returned an unexpected runtime reply"
+                        );
+                        software_disable_failed = true;
                     }
                     Ok(Ok(Err(detail))) => {
                         warn!(
@@ -14275,23 +16952,53 @@ impl Daemon {
                 if let Some(i2c_svc) = shutdown_i2c_service.as_ref() {
                     match pic_type {
                         PicType::DsPic33EP => {
-                            let mut dspic = DspicService::new(i2c_svc.clone(), pic_addr);
-                            let _ = dspic.send_heartbeat();
-                            if let Err(e) = dspic.disable_voltage() {
-                                warn!(
-                                    chain_id,
-                                    pic_addr = format_args!("0x{:02X}", pic_addr),
-                                    error = %e,
-                                    "dsPIC failed to disable voltage on chain {} — watchdog will cut power anyway (hardware safety)",
-                                    chain_id,
-                                );
-                                software_disable_failed = true;
-                            } else {
-                                info!(
+                            let shutdown_service = i2c_svc.clone();
+                            let disable_timeout = remaining_standard_cleanup(
+                                &teardown_budget_view,
+                                Duration::from_secs(3),
+                            );
+                            match tokio::time::timeout(
+                                disable_timeout,
+                                tokio::task::spawn_blocking(move || {
+                                    let mut dspic = DspicService::new(shutdown_service, pic_addr);
+                                    let _ = dspic.send_heartbeat();
+                                    dspic.disable_voltage()
+                                }),
+                            )
+                            .await
+                            {
+                                Ok(Ok(Ok(()))) => info!(
                                     chain_id,
                                     "Chain {} dsPIC voltage-disable command completed (physical rail-off is not independently measured)",
                                     chain_id,
-                                );
+                                ),
+                                Ok(Ok(Err(e))) => {
+                                    warn!(
+                                        chain_id,
+                                        pic_addr = format_args!("0x{:02X}", pic_addr),
+                                        error = %e,
+                                        "dsPIC failed to disable voltage on chain {} — watchdog remains armed as the independent safety path; physical rail state is unmeasured",
+                                        chain_id,
+                                    );
+                                    software_disable_failed = true;
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        chain_id,
+                                        pic_addr = format_args!("0x{:02X}", pic_addr),
+                                        error = %e,
+                                        "dsPIC shutdown worker failed — watchdog remains armed as the independent safety path; physical rail state is unmeasured"
+                                    );
+                                    software_disable_failed = true;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        chain_id,
+                                        pic_addr = format_args!("0x{:02X}", pic_addr),
+                                        "dsPIC shutdown worker exceeded the shared cleanup deadline; watchdog remains armed"
+                                    );
+                                    software_disable_failed = true;
+                                }
                             }
                         }
                         _ => {
@@ -14304,7 +17011,7 @@ impl Daemon {
                                     chain_id,
                                     pic_addr = format_args!("0x{:02X}", pic_addr),
                                     error = %e,
-                                    "Failed to disable voltage on chain {} — PIC heartbeat will timeout and cut power in ~5s (stock) / ~10s (BraiinsOS) anyway (hardware safety)",
+                                    "Failed to disable voltage on chain {} — PIC heartbeat will expire in ~5s (stock) / ~10s (BraiinsOS); the intended controller cutoff and physical rail state are unmeasured",
                                     chain_id,
                                 );
                                 software_disable_failed = true;
@@ -14321,7 +17028,7 @@ impl Daemon {
                     error!(
                         chain_id,
                         pic_addr = format_args!("0x{:02X}", pic_addr),
-                        "I2C service missing during shutdown — PIC watchdog will cut voltage in ~64s (hardware safety net)",
+                        "I2C service missing during shutdown — PIC watchdog remains armed with an expected ~64s expiry; physical rail state is unmeasured",
                     );
                     software_disable_failed = true;
                     // Continue shutdown — PIC watchdog provides hardware safety net
@@ -14330,10 +17037,11 @@ impl Daemon {
         }
 
         // Step 5b: Stop heartbeat ownership. If software safe-off was not
-        // confirmed, this is what permits the hardware watchdog to cut voltage.
+        // confirmed, this stops software feeds and leaves the hardware watchdog
+        // armed; it does not prove the controller or physical rail outcome.
         if software_disable_failed {
             warn!(
-                "Step 5b: Stopping PIC heartbeat thread — voltage was NOT confirmed off; controller watchdog cutoff is now the safety path"
+                "Step 5b: Stopping PIC heartbeat thread — voltage was NOT confirmed off; controller watchdog remains the independent safety path"
             );
         } else {
             info!(
@@ -14343,7 +17051,9 @@ impl Daemon {
         self.heartbeat_shutdown_token.cancel();
         let mut heartbeat_owners_quiesced = true;
         if let Some(handle) = self.runtime_heartbeat_handle.take() {
-            match join_thread_bounded(handle, Duration::from_secs(3)).await {
+            let runtime_heartbeat_timeout =
+                remaining_standard_cleanup(&teardown_budget_view, Duration::from_secs(3));
+            match join_thread_bounded(handle, runtime_heartbeat_timeout).await {
                 ThreadStopOutcome::Joined => info!("Runtime heartbeat thread stopped and joined"),
                 ThreadStopOutcome::Panicked => {
                     error!("Runtime heartbeat thread panicked while stopping")
@@ -14356,35 +17066,103 @@ impl Daemon {
                 }
             }
         }
-        heartbeat_owners_quiesced &= self.stop_init_heartbeat_bounded().await;
+        let init_heartbeat_timeout =
+            remaining_standard_cleanup(&teardown_budget_view, Duration::from_secs(2));
+        heartbeat_owners_quiesced &= self
+            .stop_init_heartbeat_with_timeout(init_heartbeat_timeout)
+            .await;
+        let heartbeat_closeout_receipt = if heartbeat_owners_quiesced {
+            Some(unit_closeout_owners.close_heartbeat_owners()?)
+        } else {
+            None
+        };
 
-        // Step 6: Wait for power discharge
-        info!("Step 6: Waiting 2s for hash board capacitors to discharge...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Step 6: Wait for the documented discharge interval; this is not a
+        // physical rail measurement.
+        info!("Step 6: Waiting the documented 2s discharge interval; capacitor and rail state are not measured");
+        sleep_within_standard_cleanup(&teardown_budget_view, Duration::from_secs(2)).await;
 
         // Step 7: Ramp fans to configured max for cool-down
         // Chips were just mining and are still hot. Run at max configured speed
         // (not hardcoded 50%) to evacuate residual heat safely.
-        if let Some(ref fan) = self.fan {
+        if let Some(fan) = self.fan.clone() {
             let cooldown_pwm =
                 clamp_fan_pwm(self.config.thermal.fan_max_pwm.max(FAN_PWM_SAFETY_MAX));
-            fan.set_speed(cooldown_pwm);
-            info!(
-                "Step 7: Fans set to PWM {} for post-mining cool-down",
-                cooldown_pwm
-            );
+            let fan_timeout =
+                remaining_standard_cleanup(&teardown_budget_view, Duration::from_secs(2));
+            match tokio::time::timeout(
+                fan_timeout,
+                tokio::task::spawn_blocking(move || fan.set_speed(cooldown_pwm)),
+            )
+            .await
+            {
+                Ok(Ok(())) => info!(
+                    "Step 7: Fans set to PWM {} for post-mining cool-down",
+                    cooldown_pwm
+                ),
+                Ok(Err(join_error)) => {
+                    software_disable_failed = true;
+                    error!(
+                        error = %join_error,
+                        "Step 7: Fan cool-down command worker failed; watchdog disarm is forbidden"
+                    );
+                }
+                Err(_) => {
+                    software_disable_failed = true;
+                    error!(
+                        "Step 7: Fan cool-down command exceeded the shared cleanup deadline; watchdog disarm is forbidden"
+                    );
+                }
+            }
         }
 
         // Step 8: Wait for cool-down
         info!("Step 8: Cooling down for 5 seconds before reducing fan speed...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        sleep_within_standard_cleanup(&teardown_budget_view, Duration::from_secs(5)).await;
 
         // Step 9: Command fans back to the home idle minimum.
-        if let Some(ref fan) = self.fan {
-            fan.set_speed(FAN_PWM_QUIET_BOOT);
-            info!(
-                "Step 9: Fans commanded back to home idle PWM {}; cool-down complete",
-                FAN_PWM_QUIET_BOOT
+        if let Some(fan) = self.fan.clone() {
+            let fan_timeout =
+                remaining_standard_cleanup(&teardown_budget_view, Duration::from_secs(2));
+            match tokio::time::timeout(
+                fan_timeout,
+                tokio::task::spawn_blocking(move || fan.set_speed(FAN_PWM_QUIET_BOOT)),
+            )
+            .await
+            {
+                Ok(Ok(())) => info!(
+                    "Step 9: Fans commanded back to home idle PWM {}; cool-down complete",
+                    FAN_PWM_QUIET_BOOT
+                ),
+                Ok(Err(join_error)) => {
+                    software_disable_failed = true;
+                    error!(
+                        error = %join_error,
+                        "Step 9: Fan idle command worker failed; watchdog disarm is forbidden"
+                    );
+                }
+                Err(_) => {
+                    software_disable_failed = true;
+                    error!(
+                        "Step 9: Fan idle command exceeded the shared cleanup deadline; watchdog disarm is forbidden"
+                    );
+                }
+            }
+        }
+
+        let software_safe_off_receipt = if software_disable_failed {
+            None
+        } else {
+            Some(unit_closeout_owners.close_software_safe_off(teardown_budget_view.clone())?)
+        };
+        let standard_teardown_receipt_result = standard_teardown_progress_result
+            .and_then(|progress| progress.complete(Instant::now()));
+        if let Err(error) = &standard_teardown_receipt_result {
+            software_disable_failed = true;
+            error!(
+                %error,
+                watchdog_fallback = true,
+                "Standard cleanup did not complete inside the shared absolute teardown schedule"
             );
         }
 
@@ -14395,7 +17173,9 @@ impl Daemon {
         let watchdog_disarm_allowed = !software_disable_failed
             && !mining_quiescence_failed
             && !psu_quiescence_failed
-            && heartbeat_owners_quiesced;
+            && heartbeat_owners_quiesced
+            && standard_teardown_receipt_result.is_ok();
+        let watchdog_intent_owner = self.watchdog_intent_tx.take();
         if !watchdog_disarm_allowed {
             error!(
                 software_disable_failed,
@@ -14405,18 +17185,68 @@ impl Daemon {
                 "Step 10: Refusing SoC watchdog disarm because shutdown safety evidence is incomplete"
             );
             return Err(anyhow::anyhow!(
-                "shutdown safety evidence is incomplete; SoC watchdog remains armed"
+                "shutdown safety evidence is incomplete; terminal closeout is unproven and any opened SoC watchdog remains armed"
             ));
         }
 
-        if let Some(intent_tx) = self.watchdog_intent_tx.take() {
-            // A receiver may already have exited with NotOpenedByDaemon; the receipt,
-            // rather than send success alone, is the authoritative outcome.
-            let _ = intent_tx.send(WatchdogIntent::Disarm);
+        if let Some(disarm_tx) = self.watchdog_disarm_tx.take() {
+            let teardown_receipt = standard_teardown_receipt_result.context(
+                "standard watchdog disarm requires software-cutoff and cleanup timing evidence",
+            )?;
+            let teardown_disarm = teardown_budget.begin_disarm_at(Instant::now())?;
+            let evidence = StandardDaemonShutdownEvidence::new(
+                self.watchdog_run_scope
+                    .take()
+                    .context("standard watchdog run scope disappeared before disarm")?,
+                api_mutation_barrier_result
+                    .context("standard watchdog disarm requires the exact API drain receipt")?,
+                api_commit_fence_result.context(
+                    "standard watchdog disarm requires the exact API final-commit receipt",
+                )?,
+                composition_fence_result.context(
+                    "standard watchdog disarm requires exact composition closeout evidence",
+                )?,
+                terminal_i2c_transition.context(
+                    "standard watchdog disarm requires the terminal controller transition",
+                )?,
+                mining_actor_receipt.context(
+                    "standard watchdog disarm requires exact terminal mining-actor roster evidence",
+                )?,
+                psu_feeder_closeout_receipt.context(
+                    "standard watchdog disarm requires owner-issued PSU-feeder closeout evidence",
+                )?,
+                heartbeat_closeout_receipt.context(
+                    "standard watchdog disarm requires owner-issued heartbeat closeout evidence",
+                )?,
+                software_safe_off_receipt.context(
+                    "standard watchdog disarm requires owner-issued software-safe-off evidence",
+                )?,
+                teardown_receipt,
+                teardown_disarm,
+            );
+            let permit = StandardWatchdogDisarmPermit::from_evidence(evidence)?;
+            self.watchdog_feed_owner
+                .as_ref()
+                .context("standard watchdog feed owner disappeared before Disarm")?
+                .close_terminal();
+            if disarm_tx.send(permit).is_err() {
+                warn!(
+                    "SoC watchdog did not consume disarm authority; the terminal receipt will distinguish NotOpenedByDaemon from an ownership failure"
+                );
+            }
+        } else {
+            self.watchdog_run_scope.take();
         }
         let watchdog_receipt = match self.watchdog_receipt_rx.take() {
             Some(receipt_rx) => {
-                match tokio::time::timeout(WATCHDOG_TASK_STOP_TIMEOUT, receipt_rx).await {
+                let receipt_deadline =
+                    teardown_budget_view.deadline(TeardownStage::TerminalReceipt);
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(receipt_deadline),
+                    receipt_rx,
+                )
+                .await
+                {
                     Ok(Ok(receipt)) => Some(receipt),
                     Ok(Err(_)) => {
                         return Err(anyhow::anyhow!(
@@ -14432,15 +17262,28 @@ impl Daemon {
             }
             None => None,
         };
+        drop(watchdog_intent_owner);
 
-        let magic_close_write_completed = match watchdog_receipt {
-            Some(WatchdogTaskReceipt::MagicCloseWriteCompleted) => {
+        let watchdog_closeout = match watchdog_receipt {
+            Some(WatchdogTaskReceipt::MagicCloseWriteCompleted { completed_at }) => {
+                teardown_budget_view
+                    .require_completed_at(TeardownStage::TerminalReceipt, completed_at)?;
                 info!("Step 10: Watchdog magic-close byte write completed and task exit will be observed; kernel timer state remains unmeasured");
-                true
+                StandardDaemonWatchdogCloseout::MagicCloseWriteCompleted
             }
             Some(WatchdogTaskReceipt::NotOpenedByDaemon) => {
                 info!("Step 10: This daemon did not open the hardware watchdog (disabled, unavailable, or busy); pre-existing kernel watchdog state is unmeasured");
-                false
+                StandardDaemonWatchdogCloseout::NotOpenedByDaemon
+            }
+            Some(WatchdogTaskReceipt::DisarmNotAttemptedBeforeTeardown) => {
+                return Err(anyhow::anyhow!(
+                    "SoC watchdog rejected Disarm before teardown admission; watchdog remains armed"
+                ));
+            }
+            Some(WatchdogTaskReceipt::DisarmNotAttemptedDeadlineExpired) => {
+                return Err(anyhow::anyhow!(
+                    "SoC watchdog rejected Disarm after the teardown deadline; watchdog remains armed"
+                ));
             }
             Some(WatchdogTaskReceipt::MagicCloseWriteFailed(error)) => {
                 return Err(anyhow::anyhow!(
@@ -14449,31 +17292,39 @@ impl Daemon {
             }
             None => {
                 info!("Step 10: Standard-path hardware watchdog was never started");
-                false
+                StandardDaemonWatchdogCloseout::NotStarted
             }
         };
 
+        let magic_close_write_completed = matches!(
+            &watchdog_closeout,
+            StandardDaemonWatchdogCloseout::MagicCloseWriteCompleted
+        );
+
+        let watchdog_join_deadline = teardown_budget_view.deadline(TeardownStage::WorkerJoin);
         let watchdog_stop = self
             .watchdog_tasks
-            .stop_and_join(WATCHDOG_TASK_STOP_TIMEOUT)
+            .stop_and_join_until(watchdog_join_deadline)
             .await;
         if watchdog_stop.any_timed_out() || watchdog_stop.any_panicked() {
             return Err(anyhow::anyhow!(
                 "SoC watchdog task termination was not cleanly observed"
             ));
         }
+        self.watchdog_feed_owner.take();
 
         info!("=== SHUTDOWN COMPLETE ===");
         // prod-readiness hunt #1: only attest "Safe to unplug or restart" when
         // SOFTWARE completed every disable command. If any disable branch failed
-        // (or the I2C service was missing), the rail is relying
-        // solely on the ~5-64 s PIC/dsPIC watchdog — do NOT prompt a warm restart.
+        // (or the I2C service was missing), only the armed ~5-64 s PIC/dsPIC
+        // watchdog remains as cutoff intent — do NOT prompt a warm restart.
         if software_disable_failed {
             warn!(
                 "Shutdown finished but one or more chains were NOT confirmed \
                  de-energized by software — the PIC/dsPIC hardware watchdog (~5-64 s) \
-                 is now the only thing cutting voltage. Do NOT warm-restart until \
-                 power is confirmed off (wait out the watchdog or AC-cycle)."
+                 remains the independent safety path, but its controller action and the \
+                 physical rail state are unmeasured. Do NOT warm-restart until power is \
+                 confirmed off (wait out the watchdog or AC-cycle)."
             );
         } else if magic_close_write_completed {
             info!(
@@ -14484,7 +17335,54 @@ impl Daemon {
                 "All hash-board voltage-disable commands completed and fans were commanded to idle. This daemon performed no SoC watchdog magic-close write; pre-existing kernel watchdog state and physical rail-off remain unmeasured."
             );
         }
-        Ok(())
+
+        if self.thermal_generation_prearmed {
+            if thermal_emergency_active(&self.terminal_thermal_generation_latch) {
+                warn!(
+                    path = %terminal_thermal_lockout_path().display(),
+                    "Retaining the terminal thermal marker after typed closeout because this generation ended through thermal authority"
+                );
+            } else {
+                let thermal_lockout_path = terminal_thermal_lockout_path();
+                let current_marker =
+                    load_thermal_lockout(&thermal_lockout_path).with_context(|| {
+                        format!(
+                            "re-reading pre-armed thermal generation before nonthermal closeout cleanup at {}",
+                            thermal_lockout_path.display()
+                        )
+                    })?;
+                let current_marker = current_marker.with_context(|| {
+                    format!(
+                        "pre-armed thermal generation disappeared before nonthermal closeout cleanup at {}",
+                        thermal_lockout_path.display()
+                    )
+                })?;
+                if current_marker.source != ThermalLockoutSource::Unknown {
+                    warn!(
+                        ?current_marker,
+                        path = %thermal_lockout_path.display(),
+                        "Retaining a refined terminal thermal marker even though the process-local thermal latch was not observed"
+                    );
+                    return Ok(StandardDaemonTerminalCloseout {
+                        _watchdog: watchdog_closeout,
+                    });
+                }
+                remove_thermal_lockout(&thermal_lockout_path).with_context(|| {
+                    format!(
+                        "removing pre-armed thermal generation only after positive nonthermal terminal closeout at {}",
+                        thermal_lockout_path.display()
+                    )
+                })?;
+                self.thermal_generation_prearmed = false;
+                info!(
+                    path = %thermal_lockout_path.display(),
+                    "Removed pre-armed Unknown thermal marker after positive nonthermal terminal closeout"
+                );
+            }
+        }
+        Ok(StandardDaemonTerminalCloseout {
+            _watchdog: watchdog_closeout,
+        })
     }
 }
 // Hardware-info free functions moved to crate::runtime::hardware_info
@@ -14976,10 +17874,17 @@ mod td003_destructive_write_guard_tests {
 
     #[test]
     fn td003_run_lifecycle_guard_precedes_hardware_init() {
+        let lifecycle_signature =
+            ["    async fn run_", "lifecycle(&mut self) -> Result<()> {"].concat();
         let start = DAEMON_RS
-            .find("async fn run_lifecycle(&mut self)")
+            .find(&lifecycle_signature)
             .expect("run_lifecycle missing");
         let guard = offset_after(DAEMON_RS, start, "self.td003_destructive_write_refusal(");
+        let composition_admission = offset_after(
+            DAEMON_RS,
+            start,
+            "self.admit_standard_composition_before_bootstrap(&platform_identity)",
+        );
         let hardware_snapshot =
             offset_after(DAEMON_RS, start, "collect_hardware_info(&self.config)");
         let boot_progress = offset_after(DAEMON_RS, start, "let boot_progress");
@@ -14993,23 +17898,42 @@ mod td003_destructive_write_guard_tests {
             "TD-003 guard must run before the injected platform lifecycle"
         );
         assert!(
-            guard < hardware_snapshot && hardware_snapshot < init_call,
-            "hardware-info probing must run after TD-003 refusal but before runtime fabric reservation"
+            guard < composition_admission
+                && composition_admission < hardware_snapshot
+                && hardware_snapshot < init_call,
+            "composition admission must precede mutating hardware-info queries and runtime fabric reservation"
         );
 
         let guard_body = &DAEMON_RS[guard..boot_progress];
         assert!(
-            guard_body.contains("return self.run_api_only().await"),
-            "run_lifecycle TD-003 refusal must park API-only, not exit or continue"
+            guard_body.contains("run_api_only_with_hardware_mutation_gate(")
+                && guard_body.contains("HardwareMutationGate::new_closed()"),
+            "run_lifecycle TD-003 refusal must park with a closed-gate API, not exit or continue"
         );
     }
 
     #[test]
     fn bootstrap_i2c_policy_capture_follows_topology_admission_and_precedes_service() {
+        let lifecycle_signature =
+            ["    async fn run_", "lifecycle(&mut self) -> Result<()> {"].concat();
+        let lifecycle_start = DAEMON_RS
+            .find(&lifecycle_signature)
+            .expect("run_lifecycle missing");
+        let lifecycle_admission = offset_after(
+            DAEMON_RS,
+            lifecycle_start,
+            "self.admit_standard_composition_before_bootstrap(&platform_identity)",
+        );
+        let mutating_snapshot = offset_after(
+            DAEMON_RS,
+            lifecycle_start,
+            "collect_hardware_info(&self.config)",
+        );
         let init_start = DAEMON_RS
             .find("async fn init(")
             .expect("init definition missing");
-        let profile_admission = offset_after(DAEMON_RS, init_start, "self.miner_profile = Some(");
+        let retained_admission =
+            offset_after(DAEMON_RS, init_start, "standard_composition_admission");
         let capture = offset_after(
             DAEMON_RS,
             init_start,
@@ -15021,21 +17945,22 @@ mod td003_destructive_write_guard_tests {
             "ProductionSerializedI2cFactory.open_serialized_i2c",
         );
         assert!(
-            profile_admission < capture && capture < service,
-            "bootstrap sysfs I2C reads require admitted topology and must finish before service reservation"
+            lifecycle_admission < mutating_snapshot,
+            "the mutating hardware-info snapshot requires pre-bootstrap composition admission"
+        );
+        assert!(
+            retained_admission < capture && capture < service,
+            "bootstrap sysfs I2C reads must reuse the retained composition and finish before service reservation"
         );
     }
 
     #[test]
-    fn td003_init_guard_precedes_every_destructive_hardware_open() {
+    fn retained_composition_precedes_every_destructive_hardware_open() {
         let init_start = DAEMON_RS
             .find("async fn init(")
             .expect("init definition missing");
-        let guard = offset_after(
-            DAEMON_RS,
-            init_start,
-            "self.td003_destructive_write_refusal(",
-        );
+        let retained_admission =
+            offset_after(DAEMON_RS, init_start, "standard_composition_admission");
         for marker in [
             "ProductionSerializedI2cFactory.open_serialized_i2c",
             "FanController::open_discovered",
@@ -15046,8 +17971,138 @@ mod td003_destructive_write_guard_tests {
             "init_with_driver",
         ] {
             let pos = offset_after(DAEMON_RS, init_start, marker);
-            assert!(guard < pos, "TD-003 init guard must precede {marker}");
+            assert!(
+                retained_admission < pos,
+                "retained standard composition must precede {marker}"
+            );
         }
+    }
+
+    #[test]
+    fn management_only_and_runtime_teardown_share_fail_closed_mutation_posture() {
+        let api_only_start = DAEMON_RS
+            .find("async fn run_api_only(&mut self)")
+            .expect("run_api_only missing");
+        let api_only_end = offset_after(
+            DAEMON_RS,
+            api_only_start,
+            "async fn run_api_only_with_hardware_mutation_gate(",
+        );
+        assert!(
+            DAEMON_RS[api_only_start..api_only_end].contains("HardwareMutationGate::new_closed()"),
+            "idle management must never mint an open generic mutation domain"
+        );
+
+        assert!(
+            DAEMON_RS.contains("hardware_mutation_gate: self.api_hardware_mutation_gate.clone()"),
+            "the full AppState must share the daemon-owned mutation gate"
+        );
+
+        let shutdown_start = DAEMON_RS
+            .find("async fn shutdown(&mut self)")
+            .expect("shutdown missing");
+        let drain = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            ".close_and_drain(api_mutation_drain_timeout)",
+        );
+        let commit_fence = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            "wait_revoked_hardware_mutation_commit_fence(",
+        );
+        let terminal_latch = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            "i2c_service.latch_terminal_safe_off()",
+        );
+        assert!(
+            terminal_latch < drain && drain < commit_fence,
+            "terminal controller admission must close before bounded API drain and final-commit observation"
+        );
+    }
+
+    #[test]
+    fn phase7_never_substitutes_a_model_hint_for_measured_silicon() {
+        let phase7 = DAEMON_RS
+            .find("--- Phase 7: ASIC Chip Configuration ---")
+            .expect("Phase 7 missing");
+        let identity_guard = offset_after(DAEMON_RS, phase7, "if chain.chip_id == 0 {");
+        let sealed_identity_check = offset_after(
+            DAEMON_RS,
+            identity_guard,
+            "if chain.chip_id != admitted_execution_chip_id",
+        );
+        let guard_body = &DAEMON_RS[identity_guard..sealed_identity_check];
+        assert!(guard_body.contains("chain.mining = false;"));
+        assert!(guard_body.contains("a model hint or passthrough flag is not execution authority"));
+        assert!(
+            !guard_body.contains("chain.chip_id = assumed_chip_id"),
+            "configuration must not fabricate a measured ASIC identity"
+        );
+    }
+
+    #[test]
+    fn measured_driver_and_publication_sessions_are_mandatory_before_execution() {
+        let init_start = DAEMON_RS
+            .find("async fn init(")
+            .expect("init definition missing");
+        let seal = offset_after(
+            DAEMON_RS,
+            init_start,
+            "self.seal_standard_phase7_driver_admission()?",
+        );
+        let phase7 = offset_after(
+            DAEMON_RS,
+            init_start,
+            "--- Phase 7: ASIC Chip Configuration ---",
+        );
+        assert!(
+            seal < phase7,
+            "GetAddress-backed driver authority must precede Phase 7 mutations"
+        );
+        let phase7_completion = offset_after(
+            DAEMON_RS,
+            phase7,
+            "self.complete_standard_phase7_driver_admission()?",
+        );
+        let init_success = offset_after(DAEMON_RS, phase7_completion, "Ok(())");
+        assert!(
+            phase7 < phase7_completion && phase7_completion < init_success,
+            "dispatcher authority must be minted only after complete Phase 7 success"
+        );
+
+        let lifecycle_signature =
+            ["    async fn run_", "lifecycle(&mut self) -> Result<()> {"].concat();
+        let lifecycle_start = DAEMON_RS
+            .find(&lifecycle_signature)
+            .expect("run_lifecycle missing");
+        let dispatcher = offset_after(
+            DAEMON_RS,
+            lifecycle_start,
+            "crate::work_dispatcher::WorkDispatcher::new(",
+        );
+        let publication = offset_after(
+            DAEMON_RS,
+            lifecycle_start,
+            "let dispatcher_execution_admission = self",
+        );
+        assert!(
+            publication < dispatcher,
+            "measured composition publication must succeed before dispatcher construction"
+        );
+        let publication_body = &DAEMON_RS[publication..dispatcher];
+        assert!(publication_body.contains(".activate_execution("));
+        assert!(publication_body.contains("standard_driver_admission.into_driver()"));
+
+        let driver_handoff = offset_after(
+            DAEMON_RS,
+            lifecycle_start,
+            "self.standard_dispatcher_driver_admission",
+        );
+        let driver_handoff_body = &DAEMON_RS[driver_handoff..dispatcher];
+        assert!(driver_handoff_body.contains(".take()"));
+        assert!(!driver_handoff_body.contains(".asic_driver_execution_policy,"));
     }
 
     #[test]
@@ -15098,6 +18153,156 @@ mod td003_destructive_write_guard_tests {
         }
         let worker_recovery = ["i2c_svc.recover_", "unmanaged_bus()"].concat();
         assert!(DAEMON_RS.contains(&worker_recovery));
+    }
+
+    #[test]
+    fn shutdown_fences_internal_execution_before_identity_revocation_and_safe_off() {
+        let shutdown_start = DAEMON_RS
+            .find("async fn shutdown(&mut self)")
+            .expect("shutdown missing");
+        let execution_revoke = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            "self.dispatcher_composition_authority.begin_invalidation()",
+        );
+        let mining_stop_request = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            "self.mining_tasks.request_stop()",
+        );
+        let watchdog_teardown = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            ".send(WatchdogIntent::Teardown { deadline })",
+        );
+        let mining_join = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            ".stop_and_join(mining_stop_timeout)",
+        );
+        let execution_fence = offset_after(
+            DAEMON_RS,
+            mining_join,
+            ".complete_bounded(composition_fence_timeout)",
+        );
+        let terminal_i2c = offset_after(
+            DAEMON_RS,
+            shutdown_start,
+            "i2c_service.latch_terminal_safe_off()",
+        );
+        let first_cut = offset_after(
+            DAEMON_RS,
+            terminal_i2c,
+            "StandardTeardownProgress::after_checked_cut(",
+        );
+        let terminal_i2c_reobserved = offset_after(
+            DAEMON_RS,
+            terminal_i2c + 1,
+            "i2c_service.latch_terminal_safe_off()",
+        );
+
+        assert!(
+            execution_revoke < mining_stop_request
+                && execution_revoke < watchdog_teardown
+                && watchdog_teardown < terminal_i2c
+                && terminal_i2c < mining_stop_request
+                && mining_stop_request < first_cut
+                && first_cut < mining_join
+                && mining_join < execution_fence
+                && execution_fence < terminal_i2c_reobserved,
+            "execution admission and terminal I2C must close before the checked first cut; bounded cleanup must then precede controller-stage re-observation"
+        );
+    }
+
+    #[test]
+    fn terminal_sync_transport_and_fan_io_runs_on_blocking_workers() {
+        let shutdown = DAEMON_RS
+            .split("async fn shutdown(&mut self)")
+            .nth(1)
+            .expect("shutdown body");
+        let dspic = shutdown
+            .split("if let Some(i2c_svc) = shutdown_i2c_service.as_ref()")
+            .nth(1)
+            .expect("fallback shutdown I2C branch");
+        let dspic = dspic
+            .split("PicType::DsPic33EP => {")
+            .nth(1)
+            .expect("shutdown dsPIC branch");
+        let dspic = dspic
+            .split("_ => {")
+            .next()
+            .expect("bounded shutdown dsPIC branch");
+        assert!(dspic.contains("tokio::task::spawn_blocking(move ||"));
+        assert!(dspic.contains("dspic.send_heartbeat()"));
+        assert!(dspic.contains("dspic.disable_voltage()"));
+        assert!(dspic.contains(".await"));
+        assert!(shutdown.contains(
+            "tokio::task::spawn_blocking(\n                        dcentrald_hal::platform::zynq::disable_psu_output,"
+        ));
+        assert_eq!(
+            shutdown
+                .matches("tokio::task::spawn_blocking(move || fan.set_speed(")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn runtime_voltage_energizing_commits_are_fenced_but_disable_remains_available() {
+        let worker_start = DAEMON_RS
+            .find("let runtime_heartbeat_handle")
+            .expect("runtime heartbeat worker missing");
+        let worker_end = offset_after(
+            DAEMON_RS,
+            worker_start,
+            "failed to spawn PIC heartbeat thread",
+        );
+        let worker = &DAEMON_RS[worker_start..worker_end];
+
+        let set_positions: Vec<_> = worker.match_indices("hb_i2c_svc.set_voltage").collect();
+        assert_eq!(
+            set_positions.len(),
+            3,
+            "unexpected runtime PIC voltage-set surface"
+        );
+        for (position, _) in set_positions {
+            let prefix = &worker[position.saturating_sub(500)..position];
+            assert!(
+                prefix.contains("hb_runtime_execution_commit_port") && prefix.contains(".commit("),
+                "every runtime PIC voltage set must be inside the measured execution commit port"
+            );
+        }
+
+        let dspic_positions: Vec<_> = worker
+            .match_indices("dspic.cold_boot_init(target_mv)")
+            .collect();
+        assert_eq!(
+            dspic_positions.len(),
+            1,
+            "unexpected runtime dsPIC energize surface"
+        );
+        let dspic_position = dspic_positions[0].0;
+        assert!(worker[dspic_position.saturating_sub(500)..dspic_position]
+            .contains("hb_runtime_execution_commit_port"));
+
+        let mut disable_branches = 0;
+        let mut remainder = worker;
+        while let Some(disable) = remainder.find("VoltageCommand::DisableVoltage") {
+            let branch = &remainder[disable..];
+            let verify = branch
+                .find("VoltageCommand::VerifyVoltage")
+                .expect("disable branch must be followed by verification branch");
+            assert!(
+                !branch[..verify].contains("runtime_execution_commit_port"),
+                "safe-direction DisableVoltage must not require open mining execution authority"
+            );
+            disable_branches += 1;
+            remainder = &branch[verify..];
+        }
+        assert_eq!(
+            disable_branches, 2,
+            "both PIC16 and dsPIC workers need safe disable lanes"
+        );
     }
 }
 
@@ -15629,22 +18834,171 @@ mod sw02_perf004_wiring_tests {
         assert!(!thermal_disable_round_ok(true, false));
     }
 
-    // ----- SAF-4: thermal-emergency voltage re-enable interlock -----
+    // ----- SAF-4: thermal cutoff consumes the current generation -----
     //
-    // Runtime SetVoltage is refused while this latch is set. The thermal loop
-    // sets it when hash is cut for EmergencyShutdown/FanFailure and clears it
-    // only when the controller emits RestartInit after cooldown.
+    // Cooldown does not recreate work-dispatch, watchdog-feed, or voltage
+    // authority. Emergency/FanFailure hand off immediately to typed closeout;
+    // RestartInit is only a defensive idempotent replay. Only a fresh daemon
+    // lifecycle with measured startup thermal readiness can admit a generation.
 
     #[test]
-    fn saf4_thermal_emergency_latch_blocks_voltage_until_restart_clears() {
+    fn saf4_terminal_thermal_handoff_preserves_generation_and_requests_closeout() {
         let latch = AtomicBool::new(false);
-        assert!(!thermal_emergency_active(&latch));
+        let admission = WorkDispatchAdmissionPublication::new();
+        admission.publish_admitted();
+        let feed_owner = WatchdogFeedGateOwner::new();
+        let feed_stop = feed_owner.stop_signal();
+        let lifecycle_shutdown = CancellationToken::new();
 
-        mark_thermal_emergency_active(&latch);
+        assert!(!thermal_emergency_active(&latch));
+        assert!(admission.allow_work_commit());
+        assert!(!feed_owner.is_terminally_closed());
+        assert!(!lifecycle_shutdown.is_cancelled());
+
+        let disposition = request_typed_closeout_for_terminal_thermal_generation(
+            &latch,
+            &admission,
+            Some(&feed_stop),
+            &lifecycle_shutdown,
+        );
+
+        assert_eq!(
+            disposition,
+            ThermalCloseoutDisposition::FreshDaemonLifecycleRequired
+        );
         assert!(thermal_emergency_active(&latch));
+        assert!(admission.is_terminally_revoked());
+        assert!(!admission.allow_work_commit());
+        assert!(feed_owner.is_terminally_closed());
+        assert!(lifecycle_shutdown.is_cancelled());
 
-        clear_thermal_emergency_active(&latch);
-        assert!(!thermal_emergency_active(&latch));
+        // Neither a later green publication nor a replayed handoff may reopen
+        // any authority in this generation.
+        admission.publish_admitted();
+        let replay = request_typed_closeout_for_terminal_thermal_generation(
+            &latch,
+            &admission,
+            Some(&feed_stop),
+            &lifecycle_shutdown,
+        );
+        assert_eq!(replay, disposition);
+        assert!(thermal_emergency_active(&latch));
+        assert!(admission.is_terminally_revoked());
+        assert!(!admission.allow_work_commit());
+        assert!(feed_owner.is_terminally_closed());
+        assert!(lifecycle_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn saf4_watchdog_feed_spans_bounded_cut_then_closes_at_typed_handoff() {
+        let latch = AtomicBool::new(false);
+        let admission = WorkDispatchAdmissionPublication::new();
+        admission.publish_admitted();
+        let feed_owner = WatchdogFeedGateOwner::new();
+        let feed_stop = feed_owner.stop_signal();
+        let lifecycle_shutdown = CancellationToken::new();
+
+        mark_thermal_emergency_and_revoke_work_dispatch(&latch, &admission, 100);
+
+        assert!(thermal_emergency_active(&latch));
+        assert!(admission.is_terminally_revoked());
+        assert!(
+            !feed_owner.is_terminally_closed(),
+            "watchdog must remain serviceable while the bounded direct-cut attempt owns progress"
+        );
+        assert!(!lifecycle_shutdown.is_cancelled());
+
+        let disposition = request_typed_closeout_for_terminal_thermal_generation(
+            &latch,
+            &admission,
+            Some(&feed_stop),
+            &lifecycle_shutdown,
+        );
+
+        assert_eq!(
+            disposition,
+            ThermalCloseoutDisposition::FreshDaemonLifecycleRequired
+        );
+        assert!(feed_owner.is_terminally_closed());
+        assert!(lifecycle_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn saf4_emergency_and_fan_failure_handoff_before_watchdog_expiry() {
+        let source = include_str!("daemon.rs");
+        let emergency_start = source
+            .find("ThermalAction::EmergencyShutdown => {")
+            .expect("EmergencyShutdown arm");
+        let fan_start = source[emergency_start..]
+            .find("ThermalAction::FanFailure => {")
+            .map(|offset| emergency_start + offset)
+            .expect("FanFailure arm");
+        let restart_start = source[fan_start..]
+            .find("ThermalAction::RestartInit => {")
+            .map(|offset| fan_start + offset)
+            .expect("RestartInit arm");
+
+        for (name, arm) in [
+            ("EmergencyShutdown", &source[emergency_start..fan_start]),
+            ("FanFailure", &source[fan_start..restart_start]),
+        ] {
+            let handoff = arm
+                .rfind("request_typed_closeout_for_terminal_thermal_generation")
+                .unwrap_or_else(|| panic!("{name} must transfer directly to typed shutdown"));
+            let post_handoff = &arm[handoff..];
+            assert!(
+                post_handoff.contains("break;"),
+                "{name} must exit thermal ownership after the handoff"
+            );
+            assert!(
+                !post_handoff.contains("continue;"),
+                "{name} must not resume thermal monitoring after stopping watchdog feed"
+            );
+            assert!(
+                !post_handoff.contains("sleep("),
+                "{name} must not delay typed closeout after stopping watchdog feed"
+            );
+            assert!(
+                !arm.contains("waiting for cooldown") && !arm.contains("After cooldown"),
+                "{name} must not defer typed closeout to an in-generation cooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn saf4_restart_init_arm_cannot_reenergize_the_consumed_generation() {
+        let source = include_str!("daemon.rs");
+        let start = source
+            .find("ThermalAction::RestartInit => {")
+            .expect("RestartInit match arm must remain present");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n                            }\n                        }\n")
+            .expect("RestartInit match arm must retain its explicit boundary");
+        let arm = &tail[..end];
+
+        assert!(
+            arm.contains("request_typed_closeout_for_terminal_thermal_generation"),
+            "RestartInit must preserve terminal authority and request typed closeout"
+        );
+        assert!(
+            arm.contains("break;"),
+            "thermal supervision task must exit after requesting lifecycle closeout"
+        );
+        for forbidden in [
+            "clear_thermal_emergency",
+            "publish_admitted",
+            "VoltageCommand::SetVoltage",
+            "enable_psu",
+            "LedPattern::Mining",
+            "ThermalRestart",
+            "schedule_daemon_restart",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "RestartInit must not regain consumed authority via {forbidden}"
+            );
+        }
     }
 
     // THERMAL-8: the non-XADC (Amlogic) fail-closed escalation. The decision math

@@ -1,4 +1,70 @@
 #![recursion_limit = "512"]
+#[cfg(all(
+    feature = "lora",
+    any(feature = "pins-hammer-bc", feature = "pins-hammer-dc")
+))]
+compile_error!(
+    "Hammer SKUs cannot enable LoRa: GPIO6/7/8/15 collide with the ST7789/panel-power nets"
+);
+#[cfg(all(
+    feature = "eth-w5500",
+    any(feature = "pins-hammer-bc", feature = "pins-hammer-dc")
+))]
+compile_error!(
+    "Hammer SKUs cannot enable the BAP W5500 add-on: GPIO39/40/41/42 are ST7789 data lines"
+);
+// The BitForge Nano's status LED is GPIO9, which is also the LoRa SX1262 RXEN.
+// Unlike the two guards above — which describe boards that merely SHOULD NOT
+// enable a radio — this one is what makes the `cfg(not(lora))` on the
+// `(1, -1, 9)` GPIO-binder arm safe. That arm is gated out of LoRa builds
+// because the binder `match` is on runtime values and therefore compiles every
+// arm into every image, so an ungated arm moved `gpio9` a second time and broke
+// the build of every `--features lora` image on every board. Without this
+// guard, gating the arm would instead let a `bitforge-nano,lora` image compile
+// and then fall through to the binder's `panic!` at boot (panic=abort => boot
+// loop). Refuse the pairing at build time instead: on this board the collision
+// is real hardware, not a compilation artifact.
+#[cfg(all(feature = "bitforge-nano", feature = "lora"))]
+compile_error!(
+    "bitforge-nano cannot enable LoRa: its status LED is GPIO9, which is the \
+     SX1262 RXEN line — the two cannot share the pin"
+);
+// A board whose thermal sensor sits behind an I2C bus multiplexer has NO
+// reachable temperature source without the mux driver, so
+// `select_thermal_mux_channel` falls back to a hard refusal and the board can
+// never mine. That is the correct fail-closed behaviour, but it would be a
+// silent, image-only regression — nothing in the host gate can observe which
+// side of the cfg was compiled. Catch it at build time instead.
+#[cfg(all(feature = "bitforge-nano", not(feature = "i2c-mux-pca9544")))]
+compile_error!(
+    "bitforge-nano must enable i2c-mux-pca9544: its two EMC2101s are reachable \
+     only through the PCA9544A, so without the driver the board has no trusted \
+     temperature and mining stays disabled"
+);
+// The TMP451 diode mux claims TWO GPIOs for its select lines, and on the Nerd
+// boards that declare one, A0 is GPIO2 — the SX1262 TXEN line. The LoRa bus
+// takes `gpio2` unconditionally near the top of `main`, so enabling both would
+// move it twice. This is the same trap that broke every `--features lora`
+// image (see the `bitforge-nano` guard above), and it is caught here rather
+// than as a bare E0382 hundreds of lines away.
+//
+// Unlike the LED collision above there is no cfg-gated fallback arm to write:
+// a board cannot read half its dies. The pairing is simply refused.
+#[cfg(all(feature = "temp-tmp451", feature = "lora"))]
+compile_error!(
+    "temp-tmp451 cannot be combined with lora: the TMP451 mux select line A0 is \
+     GPIO2, which is the SX1262 TXEN line — the two cannot share the pin"
+);
+// The plug-sense binder moves `gpio12` inside a RUNTIME match arm, which
+// compiles into every `pins-bitaxe` image regardless of which board is running.
+// GPIO12 is also the TMP451 mux A1 line, so the two feature sets cannot
+// coexist. No board in the registry selects both (every muxed board is
+// `pins-nerd`), and this guard is what keeps that true.
+#[cfg(all(feature = "temp-tmp451", feature = "pins-bitaxe"))]
+compile_error!(
+    "temp-tmp451 cannot be combined with pins-bitaxe: the TMP451 mux select \
+     line A1 is GPIO12, which the pins-bitaxe plug-sense binder already claims"
+);
 // DCENT_axe — Clean-room BitAxe mining firmware
 // Copyright (C) 2026 D-Central Technologies
 // License: GPL-3.0
@@ -144,6 +210,131 @@ const PROP_FAN_MAX_PCT: u8 = 70;
 #[cfg(feature = "stratum-v2")]
 const STRATUM_STATUS_EVENT_LIMIT: usize = 64;
 
+/// Connect the channel carrying this board's thermal sensor, and verify it.
+///
+/// Fails closed. A board that declares a [`ThermalI2cMux`] has NO reachable
+/// temperature source until this succeeds, so the caller disables mining on
+/// any error rather than proceeding to read whatever the bus happens to
+/// expose.
+///
+/// [`ThermalI2cMux`]: dcentaxe_hal::board::ThermalI2cMux
+#[cfg(feature = "i2c-mux-pca9544")]
+fn select_thermal_mux_channel(
+    i2c: &mut I2cBus,
+    cfg: dcentaxe_hal::board::ThermalI2cMux,
+) -> Result<(), String> {
+    use dcentaxe_hal::pca9544::Pca9544;
+    let mut mux = Pca9544::new(i2c, cfg.addr).map_err(|e| e.to_string())?;
+    // `select` writes, settles, reads the control register back and compares
+    // it against what was asked for — a write that the part did not latch, or
+    // a different channel being live, is an error here rather than a wrong
+    // temperature later.
+    mux.select(i2c, cfg.channel).map_err(|e| e.to_string())
+}
+
+/// Fallback for images built without the multiplexer driver.
+///
+/// A board declaring a mux in a build that cannot drive one is a build
+/// misconfiguration, not a runtime condition to work around — refuse, so the
+/// caller disables mining instead of reading an unselected bus.
+#[cfg(not(feature = "i2c-mux-pca9544"))]
+fn select_thermal_mux_channel(
+    _i2c: &mut I2cBus,
+    cfg: dcentaxe_hal::board::ThermalI2cMux,
+) -> Result<(), String> {
+    Err(format!(
+        "board declares a thermal I2C mux at 0x{:02X} channel {} but this image \
+         was built without the i2c-mux-pca9544 driver",
+        cfg.addr, cfg.channel
+    ))
+}
+
+/// One board's TMP451 diode mux, resolved from the board row into live hardware.
+///
+/// Holds the shared select lines plus every sensor hanging off them. The
+/// NerdOCTAXE-γ's two TMP451s share ONE pair of GPIOs, which is why the select
+/// is owned here rather than by each sensor: two sensors cannot each own the
+/// same pin.
+#[cfg(feature = "temp-tmp451")]
+struct DiodeMuxSweep<'d> {
+    select: dcentaxe_hal::tmp451::MuxSelect<'d>,
+    /// `(sensor, first_asic, channels)` — the row's channel→ASIC map, already
+    /// validated as a bijection by `board.rs`'s declaration tests.
+    sensors: Vec<(dcentaxe_hal::tmp451::Tmp451, u8, u8)>,
+    /// ASIC count from the board row. Coverage is counted against THIS.
+    expected_asics: u8,
+}
+
+#[cfg(feature = "temp-tmp451")]
+impl DiodeMuxSweep<'_> {
+    /// Read every declared die once, and report how many actually answered.
+    ///
+    /// Iterates channel-outer / sensor-inner on purpose: the analog path is
+    /// shared, so selecting a channel once and reading both sensors through it
+    /// pays the 50 ms mux settle and the discarded conversion ONCE per channel
+    /// instead of once per sensor.
+    ///
+    /// Never returns early on an error. A dead sensor must not hide the dies
+    /// that are still readable — and, more importantly, a partial sweep is
+    /// reported as partial rather than as a smaller complete one.
+    fn sweep(&mut self, i2c: &mut I2cBus) -> thermal_safety::MuxedDieFold {
+        // Split the borrow: `read_muxed_channel` takes `&self` on the sensor and
+        // `&mut` on the select, which a single `self` borrow cannot provide.
+        let Self {
+            select,
+            sensors,
+            expected_asics,
+        } = self;
+
+        let mut readings: Vec<Option<f32>> = vec![None; *expected_asics as usize];
+        let channels = sensors.iter().map(|(_, _, c)| *c).max().unwrap_or(0);
+
+        for channel in 0..channels {
+            for (sensor, first_asic, sensor_channels) in sensors.iter() {
+                if channel >= *sensor_channels {
+                    continue;
+                }
+                let asic = usize::from(*first_asic) + usize::from(channel);
+                let Some(slot) = readings.get_mut(asic) else {
+                    // The row's map points past the declared ASIC count. The
+                    // fold treats the missing die as uncovered and the board
+                    // goes blind, which is the right answer for a board whose
+                    // own description is inconsistent.
+                    warn!(
+                        "TMP451 0x{:02X} channel {} maps to ASIC {} but the board declares only {} \
+                         — reading discarded",
+                        sensor.addr(),
+                        channel,
+                        asic,
+                        expected_asics
+                    );
+                    continue;
+                };
+                match sensor.read_muxed_channel(i2c, select, channel) {
+                    // `conservative_c` (not `corrected_c`): a safety cut must not
+                    // be fooled by a downward per-board correction.
+                    Ok(Some(reading)) => *slot = Some(reading.conservative_c()),
+                    Ok(None) => warn!(
+                        "TMP451 0x{:02X} channel {} (ASIC {}): diode reads open-circuit",
+                        sensor.addr(),
+                        channel,
+                        asic
+                    ),
+                    Err(e) => warn!(
+                        "TMP451 0x{:02X} channel {} (ASIC {}) read failed: {}",
+                        sensor.addr(),
+                        channel,
+                        asic,
+                        e
+                    ),
+                }
+            }
+        }
+
+        thermal_safety::fold_muxed_die_readings(&readings, *expected_asics)
+    }
+}
+
 fn unsafe_lab_safety_bypass_enabled() -> bool {
     // XPSAFE-4: the lab-safety bypass is COMPILE-TIME ONLY. The prior runtime
     // process-environment arm was dead on ESP32 (no process env at runtime) and
@@ -167,9 +358,11 @@ fn unsafe_lab_safety_bypass_enabled() -> bool {
 // target defaults to panic=abort; see the workspace `Cargo.toml`
 // `[profile.release]`). The closure is `Fn + Send + Sync + 'static` and captures
 // no HAL handles, so the raw bits it needs are published through these atomics.
-// Sentinels (-1 GPIO / 0 fan addr) keep the hook a SAFE NO-OP until the HAL arms
-// it in two phases — buck right after the enable GPIO is built (still OFF) and
-// fan inside each controller boot block — both well before `enable_buck(true)`.
+// Sentinels (-1 GPIO / 0 fan addr / 0 PMBus addr) keep the hook a SAFE NO-OP
+// until the HAL arms it in three phases — buck right after the enable GPIO is
+// built (still OFF), fan inside each controller boot block, and (XPSAFE-5) the
+// PMBus rail cut right after the regulator is probed on boards that have no
+// enable GPIO — all well before the rail is raised.
 static PANIC_BUCK_GPIO: AtomicI32 = AtomicI32::new(-1);
 static PANIC_BUCK_ACTIVE_LOW: AtomicBool = AtomicBool::new(false);
 static PANIC_FAN_PORT: AtomicI32 = AtomicI32::new(-1);
@@ -178,6 +371,80 @@ static PANIC_FAN_REG0: AtomicU8 = AtomicU8::new(0);
 static PANIC_FAN_REG1: AtomicU8 = AtomicU8::new(0);
 static PANIC_FAN_REG_COUNT: AtomicU8 = AtomicU8::new(0);
 static PANIC_FAN_VAL: AtomicU8 = AtomicU8::new(0);
+
+/// XPSAFE-1 I2C budget for the hook, in FreeRTOS ticks (~20 ms at
+/// `FREERTOS_HZ=1000`). Every I2C write the hook performs is bounded by this so
+/// a driver mutex held by the panicking task can never stall the abort path.
+const PANIC_I2C_TICKS: u32 = 20;
+
+/// Settle time after raising the ASIC LDO bank, before the core rail is
+/// configured. Upstream `NerdQaxePlus::initAsics` waits exactly this long
+/// between `LDO_enable()` and `m_tps->init()`.
+const LDO_SETTLE_MS: u64 = 100;
+
+/// Settle time between cutting the core rail and dropping the ASIC LDO on the
+/// normal fail-closed path. Upstream `NerdQaxePlus::shutdown` waits this long
+/// after `setVoltage(0.0)` before `LDO_disable()`.
+///
+/// This is also the reason the XPSAFE-1 panic hook does NOT drop the LDO: it
+/// has no budget to wait, and dropping the IO supply on top of a still-
+/// collapsing core rail inverts the sequence upstream deliberately observes.
+/// Leaving the LDO up while the buck is cut is precisely the state upstream
+/// holds for this window, so the hook's omission is the correct action rather
+/// than a missing one.
+const LDO_SHUTDOWN_SETTLE_MS: u64 = 500;
+
+// XPSAFE-5 — panic-time rail cut for boards with NO enable GPIO.
+//
+// The GPIO cut above is the guaranteed action, but it only exists on
+// `RailBringup::EnableGpio` boards. A `RailBringup::RegulatorOnly` board has no
+// discrete enable at all: its rail is raised by a PMBus `OPERATION_ON` and cut
+// by `OPERATION_OFF`, so `PANIC_BUCK_GPIO` stays at the -1 sentinel and the hook
+// had NO actuator for it. That gap is why letting those boards mine used to
+// read as a trade ("mining at the cost of the panic cut") — it is not one, and
+// this closes it with the mechanism the fan write already proves out: one
+// bounded, alloc-free `i2c_master_write_to_device`.
+//
+// Honest about the difference: a GPIO cut is a lock-free register write and
+// cannot fail; a PMBus cut needs the I2C peripheral and can time out. It is
+// best-effort-but-bounded, which is strictly more than nothing and strictly
+// less than the GPIO path. It is armed ONLY where the GPIO cut is absent, so
+// the panic path of every field-proven enable-GPIO board stays byte-identical.
+static PANIC_PMBUS_PORT: AtomicI32 = AtomicI32::new(-1);
+static PANIC_PMBUS_ADDR: AtomicU8 = AtomicU8::new(0);
+
+// XPSAFE-5d — panic-time rail cut for boards whose enable is an I2C EXPANDER
+// pin (Q1370/Q1373, FXL6408 at 0x43). Neither of the two arms above reaches
+// them: `PANIC_BUCK_GPIO` stays at its sentinel because there is no ESP pin, and
+// the PMBus arm is useless because their TPS5364x ignores `OPERATION`.
+//
+// Deliberately a SECOND NAMED ARM rather than folding both into one generic
+// (addr, reg, value) write. The generic shape is tidier and strictly more
+// dangerous: it would let the hook be armed to write any byte to any register
+// at any address, and the comment on `arm_panic_pmbus_rail_cut` already warns
+// what a guessed address costs. Two arms with fixed, test-pinned registers
+// cannot be aimed somewhere unintended.
+static PANIC_EXPANDER_PORT: AtomicI32 = AtomicI32::new(-1);
+static PANIC_EXPANDER_ADDR: AtomicU8 = AtomicU8::new(0);
+
+/// FXL6408 `OUTPUT_STATE` register. Mirrors `fxl6408_convert::reg::OUTPUT_STATE`
+/// and is pinned equal to it by `expander_panic_constants_match_the_hal`.
+const PANIC_EXPANDER_OUTPUT_STATE: u8 = 0x05;
+/// Every expander output LOW: ASIC reset asserted, VREG off, LDO off.
+///
+/// One byte, and it needs no knowledge of the driver's shadow registers — which
+/// matters because the hook cannot read them. It is also exactly the state
+/// `Q1370B::initBoard` establishes before anything is allowed to energize, so
+/// it is a known-good target rather than a computed one.
+const PANIC_EXPANDER_ALL_LOW: u8 = 0x00;
+
+/// PMBus `OPERATION` command. Mirrors the private `power::pmbus::OPERATION`;
+/// pinned equal to it by `pmbus_panic_constants_match_the_hal` so the hook and
+/// the driver can never disagree about which register turns the rail off.
+const PANIC_PMBUS_OPERATION: u8 = 0x01;
+/// PMBus `OPERATION` payload that turns the output OFF. Mirrors the private
+/// `power::pmbus::OPERATION_OFF`; pinned by the same test.
+const PANIC_PMBUS_OPERATION_OFF: u8 = 0x00;
 
 /// Arm the panic hook's best-effort fan-cooling write for a confirmed fan
 /// controller. `addr` is published LAST (it is the hook's "fan armed" gate) so
@@ -193,6 +460,30 @@ fn arm_panic_fan(port: i32, addr: u8, reg0: u8, reg1: u8, reg_count: u8, val: u8
     PANIC_FAN_ADDR.store(addr, Ordering::Release);
 }
 
+/// XPSAFE-5: arm the panic hook's PMBus rail cut for a board whose rail has no
+/// enable GPIO. `addr` is published LAST (it is the hook's "armed" gate) so the
+/// hook never observes a half-written pair, exactly as `arm_panic_fan` does.
+///
+/// Call this ONLY after the regulator has been probed and confirmed, and ONLY
+/// for `RailBringup::RegulatorOnly` boards — arming it with a guessed address
+/// would make the hook write `OPERATION_OFF` at whatever device answers 0x24.
+fn arm_panic_pmbus_rail_cut(port: i32, addr: u8) {
+    PANIC_PMBUS_PORT.store(port, Ordering::Release);
+    PANIC_PMBUS_ADDR.store(addr, Ordering::Release);
+}
+
+/// XPSAFE-5d: arm the panic hook's expander rail cut. `addr` is published LAST
+/// (the hook's "armed" gate), exactly as the two arms above do.
+///
+/// Call this ONLY after the expander has answered its device code and its
+/// outputs are configured — arming it earlier would have the hook write
+/// `OUTPUT_STATE` into a part that is still in high-Z, or into whatever else
+/// happens to answer 0x43.
+fn arm_panic_expander_rail_cut(port: i32, addr: u8) {
+    PANIC_EXPANDER_PORT.store(port, Ordering::Release);
+    PANIC_EXPANDER_ADDR.store(addr, Ordering::Release);
+}
+
 /// XPSAFE-1: install the fail-closed panic hook (see banner above).
 ///
 /// The `Box` allocation happens HERE at install time, never inside the hook. The
@@ -201,8 +492,11 @@ fn arm_panic_fan(port: i32, addr: u8, reg0: u8, reg1: u8, reg_count: u8, val: u8
 /// `esp_restart()`: under panic=abort the runtime already reboots, and an
 /// explicit restart here would SKIP the coredump that `/api/system/coredump`
 /// depends on. The buck-cut (a lock-free atomic register write) is the
-/// guaranteed-safe action and runs FIRST; the fan write is best-effort with a
-/// short I2C timeout so a held driver mutex can never wedge the abort path.
+/// guaranteed-safe action and runs FIRST; the XPSAFE-5 PMBus rail cut (armed
+/// only where no enable GPIO exists) and the fan write are best-effort, each
+/// with a short I2C timeout so a held driver mutex can never wedge the abort
+/// path. Power removal is ordered ahead of cooling: a rail that is off needs no
+/// airflow, but airflow cannot save a rail that stays on.
 fn install_fail_closed_panic_hook() {
     std::panic::set_hook(Box::new(|_panic_info| {
         // 1. LOAD-BEARING: cut the buck rail. `gpio_set_level` is a lock-free
@@ -215,11 +509,55 @@ fn install_fail_closed_panic_hook() {
                 sys::gpio_set_level(buck_gpio, off_level);
             }
         }
-        // 2. BEST-EFFORT: command max cooling. Short timeout (~20 ms at
+        // 2. XPSAFE-5: cut the rail over PMBus for boards that have no enable
+        //    GPIO to drive. Armed only when step 1 has no actuator, so this is
+        //    a no-op on every enable-GPIO board. Runs BEFORE the fan write
+        //    because removing power outranks adding airflow, and both share the
+        //    same bounded I2C budget.
+        let pmbus_addr = PANIC_PMBUS_ADDR.load(Ordering::Acquire);
+        if pmbus_addr != 0 {
+            let pmbus_port = PANIC_PMBUS_PORT.load(Ordering::Acquire);
+            if pmbus_port >= 0 {
+                let buf = [PANIC_PMBUS_OPERATION, PANIC_PMBUS_OPERATION_OFF];
+                unsafe {
+                    sys::i2c_master_write_to_device(
+                        pmbus_port as u32,
+                        pmbus_addr,
+                        buf.as_ptr(),
+                        buf.len(),
+                        PANIC_I2C_TICKS,
+                    );
+                }
+            }
+        }
+        // 3. XPSAFE-5d: cut the rail at the I2C port expander, for boards whose
+        //    enable is neither an ESP GPIO nor a PMBus-switchable regulator.
+        //    One write of 0x00 to OUTPUT_STATE drops ASIC reset, VREG and LDO
+        //    together — the state `Q1370B::initBoard` establishes before
+        //    anything may energize. Armed only where the two arms above have no
+        //    actuator, so every other board's panic path stays byte-identical.
+        //
+        //    Still ahead of the fan: removing power outranks adding airflow.
+        let exp_addr = PANIC_EXPANDER_ADDR.load(Ordering::Acquire);
+        if exp_addr != 0 {
+            let exp_port = PANIC_EXPANDER_PORT.load(Ordering::Acquire);
+            if exp_port >= 0 {
+                let buf = [PANIC_EXPANDER_OUTPUT_STATE, PANIC_EXPANDER_ALL_LOW];
+                unsafe {
+                    sys::i2c_master_write_to_device(
+                        exp_port as u32,
+                        exp_addr,
+                        buf.as_ptr(),
+                        buf.len(),
+                        PANIC_I2C_TICKS,
+                    );
+                }
+            }
+        }
+        // 4. BEST-EFFORT: command max cooling. Short timeout (~20 ms at
         //    FREERTOS_HZ=1000) so a held I2C driver mutex cannot stall the abort.
         let fan_addr = PANIC_FAN_ADDR.load(Ordering::Acquire);
         if fan_addr != 0 {
-            const PANIC_I2C_TICKS: u32 = 20;
             let port = PANIC_FAN_PORT.load(Ordering::Acquire);
             if port < 0 {
                 return;
@@ -294,6 +632,61 @@ fn fail_closed_power_off(
             "Buck GPIO disable failed during fail-closed shutdown: {}",
             e
         );
+    }
+    // XPSAFE-5d: cut an EXPANDER rail. Without this a Q-series board would
+    // survive a POWER FAULT with its rail up: `enable_buck(false)` errors (no
+    // ESP pin) and `PowerManager::disable` returns `RequiresBuckCut` because a
+    // TPS5364x cannot switch its own output. Neither of the two steps above
+    // touches the only actuator the board has.
+    //
+    // The address comes from the panic-arm atomic rather than a driver handle,
+    // for two reasons. It is the same verified value — published only after the
+    // part answered its device code and its outputs were configured — and it
+    // needs no `Fxl6408` in this signature, which would not compile when the
+    // feature is off since the module would not exist.
+    //
+    // The write goes through `I2cBus`, NOT the raw `sys::` call the panic hook
+    // uses, so it takes the driver mutex and cannot corrupt an in-flight
+    // transaction. Writing all-zero also makes the driver's shadow drift
+    // harmless: 0x00 is exactly the output byte `PortState::after_reset()`
+    // holds, and no rail write happens after this point in any case — the
+    // expander is only driven during bring-up.
+    let expander_addr = PANIC_EXPANDER_ADDR.load(Ordering::Acquire);
+    if expander_addr != 0 {
+        match i2c.write_reg_u8(
+            expander_addr,
+            PANIC_EXPANDER_OUTPUT_STATE,
+            PANIC_EXPANDER_ALL_LOW,
+        ) {
+            Ok(()) => info!(
+                "Expander rail cut: 0x{:02X} OUTPUT_STATE=0x00 (ASIC reset + VREG + LDO low)",
+                expander_addr
+            ),
+            Err(e) => error!(
+                "Expander rail cut FAILED during fail-closed shutdown (0x{:02X}): {}",
+                expander_addr, e
+            ),
+        }
+    }
+    // The ASIC LDO bank comes down LAST, and only after the core rail has had
+    // time to collapse — upstream `NerdQaxePlus::shutdown` sequences
+    // `setVoltage(0.0)` -> 500 ms -> `LDO_disable()`. Dropping the IO supply
+    // first, or simultaneously, would leave the dies' IO rail below their core
+    // rail while the core is still discharging.
+    //
+    // Guarded on `ldo_is_enabled()`, not merely `has_ldo()`, and the difference
+    // is the settle. This helper is reachable from the supervisor LOOP (POWER
+    // FAULT, INA260 over-current), so an unconditional 500 ms here would be
+    // re-spent every tick against the task-WDT budget on a rail that is already
+    // down. Reading the pin's real output state makes the drop idempotent: the
+    // first fail-closed pays the settle, every later one is a no-op. It also
+    // covers the board-has-no-LDO case, so `enable_ldo`'s topology `Err` is
+    // never reached from here.
+    if gpio_ctrl.ldo_is_enabled() {
+        std::thread::sleep(std::time::Duration::from_millis(LDO_SHUTDOWN_SETTLE_MS));
+        if let Err(e) = gpio_ctrl.enable_ldo(false) {
+            error!("ASIC LDO disable failed during fail-closed shutdown: {}", e);
+        }
     }
 }
 
@@ -458,6 +851,13 @@ fn expected_hashrate_ghs(
         dcentaxe_asic::AsicModel::BM1366 => 894,
         dcentaxe_asic::AsicModel::BM1368 => 1276,
         dcentaxe_asic::AsicModel::BM1370 | dcentaxe_asic::AsicModel::BM1373 => 2040,
+        // MSBT0501 is a SCRYPT chip: a "small core" runs ~10^4 clocks per hash
+        // because of the 128 KiB ROMix, so the SHA-256 `freq x cores` model is
+        // ~4 orders of magnitude wrong for it (150-450 MH/s, not GH/s). There
+        // is no honest small-core figure to put here, and the caller returns
+        // GH/s, so report 0 rather than a number that is off by 10^4.
+        // A unit-aware hashrate estimator is a follow-up (design §4.6).
+        dcentaxe_asic::AsicModel::Lt0051 => 0,
     };
     frequency_mhz * small_cores_per_chip as f32 * asic_count.max(1) as f32 / 1000.0
 }
@@ -1212,8 +1612,8 @@ fn main() {
     // ======================================================================
     // Step 3: Early I2C + display init
     // ======================================================================
-    // I2C pins selected at compile time by board feature (pins-bitaxe vs pins-nerd)
-    // I2C pins: BitAxe=47/48, Nerd (TTGO T-Display S3)=18/17
+    // I2C pins selected at compile time by board feature.
+    // BitAxe=47/48, Nerd=18/17, Hammer=44/43 (SDA/SCL).
     #[cfg(feature = "pins-bitaxe")]
     let mut i2c = I2cBus::new_default(
         peripherals.i2c0,
@@ -1226,6 +1626,13 @@ fn main() {
         peripherals.i2c0,
         peripherals.pins.gpio18,
         peripherals.pins.gpio17,
+    )
+    .expect("I2C init failed");
+    #[cfg(any(feature = "pins-hammer-bc", feature = "pins-hammer-dc"))]
+    let mut i2c = I2cBus::new_default(
+        peripherals.i2c0,
+        peripherals.pins.gpio44,
+        peripherals.pins.gpio43,
     )
     .expect("I2C init failed");
 
@@ -1344,14 +1751,75 @@ fn main() {
     };
 
     config.canonicalize_identity();
+
+    // ══ Lucky-enablement SPEC §3 — fail-closed boot identity gate ═══════════
+    // Runs HERE because this is the earliest point with everything it needs
+    // and the latest point that is still provably safe:
+    //  * AFTER config load + canonicalize_identity (the stored identity tuple
+    //    — board_version / board_model / miner_model — is final), and after
+    //    I2C init (Step 3), so the AMBIGUOUS branch can run the READ-ONLY
+    //    PMBus 0x7F/0x14 LV08 probe;
+    //  * BEFORE `validate_safety` (which checks `identity_refusal` FIRST) and
+    //    therefore before `mining_permitted` is computed, before
+    //    `gpio_ctrl.enable_buck(true)`, before `PowerManager::new`, and before
+    //    any `set_voltage` — the core rail is still OFF, so a refusal here
+    //    means the rail is NEVER energized under a misidentified profile
+    //    (the 302→Hex-Ultra 3.6 V trap).
+    // The probe closure is only invoked from the gate's AMBIGUOUS branch
+    // (structural contract in `config::resolve_identity_gate`); a genuine
+    // BitAxe Hex Ultra with a missing/garbled devicemodel reaches that branch
+    // and is SAVED by the probe answering NoSecondaryRegulators — never
+    // refused on strings alone.
+    match config.run_identity_gate(|| {
+        Some(dcentaxe_hal::power::probe_lucky_lv08_secondary_regulators(&mut i2c).verdict)
+    }) {
+        crate::config::IdentityGateOutcome::Proceed => {}
+        crate::config::IdentityGateOutcome::AdoptProfile(row) => {
+            info!(
+                "Identity gate: stored identity (bv='{}', dm='{}', mm='{}') resolves to \
+                 canonical board {} ({}) — adopting and persisting",
+                config.board_version,
+                config.board_model,
+                config.miner_model,
+                row.board_version,
+                row.device_model,
+            );
+            config.apply_identity_profile(row);
+            if let Err(e) = nvs_config::save_config(&mut nvs_handle, &config) {
+                // Non-fatal: the gate re-resolves identically on every boot.
+                warn!("Identity gate: failed to persist adopted identity: {e}");
+            }
+        }
+        crate::config::IdentityGateOutcome::RefuseToEnergize { reason } => {
+            error!("Identity gate REFUSED TO ENERGIZE: {reason}");
+            config.identity_refusal = Some(reason);
+        }
+    }
+
+    // Hammer DC rows are already resolved by the string gate above, so their
+    // TMP75 address strap is a separate verification step. The config layer
+    // model-gates the closure before any address is touched: 0x48/0x4C are not
+    // globally unique. The HAL primitive performs only zero-byte ACK probes.
+    match config.run_identity_strap_gate(|expected_addr| {
+        Some(
+            dcentaxe_hal::hammer_strap_probe::probe_hammer_identity_strap(&mut i2c, expected_addr)
+                .verdict,
+        )
+    }) {
+        crate::config::IdentityStrapGateOutcome::Proceed => {}
+        crate::config::IdentityStrapGateOutcome::RefuseToEnergize { reason } => {
+            error!("Hammer identity-strap gate REFUSED TO ENERGIZE: {reason}");
+            if config.identity_refusal.is_none() {
+                config.identity_refusal = Some(reason);
+            }
+        }
+    }
+
     let unsafe_lab_safety_bypass = unsafe_lab_safety_bypass_enabled();
     if unsafe_lab_safety_bypass {
         warn!("UNSAFE LAB SAFETY BYPASS ENABLED: thermal/custom-board safety gates may be relaxed");
     }
-    let config_safety_error = config.validate_safety(unsafe_lab_safety_bypass).err();
-    if let Some(ref e) = config_safety_error {
-        error!("Config safety validation failed: {}", e);
-    }
+    let mut config_safety_error = config.validate_safety(unsafe_lab_safety_bypass).err();
     if let Err(e) = nvs_config::update_ota_floor_if_newer(&mut nvs_handle, VERSION) {
         warn!("Failed to seed OTA rollback floor: {}", e);
     }
@@ -1360,7 +1828,17 @@ fn main() {
         config.target_voltage_mv,
         crate::config::ControlSurface::BootRestore,
     );
-    if qualified_boot_point.clamped {
+    if qualified_boot_point.refused {
+        let reason = format!(
+            "boot-restored voltage {}mV is outside the registered board envelope; \
+             preserving stored evidence and refusing mining",
+            config.target_voltage_mv
+        );
+        error!("{reason}");
+        if config_safety_error.is_none() {
+            config_safety_error = Some(reason);
+        }
+    } else if qualified_boot_point.clamped {
         warn!(
             "Boot config clamped to qualified envelope: {:.2}MHz/{}mV -> {:.2}MHz/{}mV",
             config.target_frequency,
@@ -1373,6 +1851,9 @@ fn main() {
         if let Err(e) = nvs_config::save_config(&mut nvs_handle, &config) {
             warn!("Failed to persist qualified boot config: {}", e);
         }
+    }
+    if let Some(ref e) = config_safety_error {
+        error!("Config safety validation failed: {}", e);
     }
 
     let board_config = config.board_config();
@@ -1392,6 +1873,11 @@ fn main() {
             dcentaxe_asic::AsicModel::BM1368 => 500.0,
             dcentaxe_asic::AsicModel::BM1366 => 400.0,
             dcentaxe_asic::AsicModel::BM1397 => 300.0,
+            // Scrypt achievement thresholds are on a different scale entirely
+            // (MH/s, and a different diff-1 constant). f64::INFINITY keeps the
+            // badge unreachable rather than trivially granted by a SHA-256
+            // threshold applied to Scrypt difficulty numbers.
+            dcentaxe_asic::AsicModel::Lt0051 => f64::INFINITY,
         };
         per_chip * asic_count as f64
     };
@@ -1720,24 +2206,73 @@ fn main() {
     // Step 6: HAL init
     // ======================================================================
 
-    // GPIO — buck enable pin depends on board model
+    // GPIO — buck enable pin depends on board model.
+    //
+    // The LDO enable is part of the KEY, not an afterthought applied to a
+    // matched controller. A board that declares one and reaches an arm that
+    // does not bind it would boot with a perfectly configured core rail and a
+    // chain that never answers — the exact silent failure `LdoEnable` was
+    // written to make impossible. Keeping it in the tuple means such a board
+    // hits the `pins` fallback instead.
     let mut gpio_ctrl = match (
         board_config.asic_reset_pin,
         board_config.buck_enable_pin,
         board_config.led_pin,
+        board_config.ldo_enable_pin,
     ) {
-        (1, 10, 4) => GpioController::new(
+        // The multi-phase Nerd line: TPS5364x EN on GPIO10 plus the LDO bank on
+        // GPIO13. Both rails feed the dies; see `board::LdoEnable`.
+        (1, 10, 4, 13) => GpioController::new_with_ldo(
+            peripherals.pins.gpio1,
+            peripherals.pins.gpio10,
+            peripherals.pins.gpio4,
+            peripherals.pins.gpio13,
+            board_config.buck_enable_active_low,
+        ),
+        (1, 10, 4, -1) => GpioController::new(
             peripherals.pins.gpio1,
             peripherals.pins.gpio10,
             peripherals.pins.gpio4,
             board_config.buck_enable_active_low,
         ),
-        (1, 46, 4) => GpioController::new(
+        (1, 46, 4, -1) => GpioController::new(
             peripherals.pins.gpio1,
             peripherals.pins.gpio46,
             peripherals.pins.gpio4,
             board_config.buck_enable_active_low,
         ),
+        // Hammer BC01/BC01-Pro/BC02/BC04 + DC04/DC06. GPIO46 is ST7789 D5,
+        // so these models deliberately bind no discrete buck-enable output.
+        (1, -1, 4, -1) => {
+            GpioController::new_without_buck(peripherals.pins.gpio1, peripherals.pins.gpio4)
+        }
+        // Hammer DC02: reset is GPIO3 and no discrete buck-enable is verified.
+        // GPIO 1 is its fan TACH input; GPIO46 is ST7789 panel D5.
+        (3, -1, 4, -1) => {
+            GpioController::new_without_buck(peripherals.pins.gpio3, peripherals.pins.gpio4)
+        }
+        // BitForge Nano: the LED is GPIO9, NOT the stock BitAxe GPIO4 — GPIO4
+        // on this board is `/TMP_10K_A2`, the ASIC-2 NTC divider node, so
+        // binding it as an LED output would drive a thermistor divider. Both
+        // the netlist and forge-os (`self_test.c:49` `BLINK_GPIO_1 9`) agree.
+        // No discrete buck-enable: `GPIO_ASIC_ENABLE` is defined in three
+        // vendor files and never driven; the rail is TPS546A24 PMBus only.
+        //
+        // ⚠ `cfg(not(lora))` is LOAD-BEARING, and not because this board has an
+        // opinion about LoRa. This `match` is on RUNTIME values, so every arm is
+        // compiled into every image — a runtime match cannot make two pin moves
+        // mutually exclusive the way `#[cfg]` can. The LoRa bus takes
+        // `gpio9` (RXEN) unconditionally near the top of `main`, so leaving this
+        // arm ungated made `peripherals.pins.gpio9` move twice and broke the
+        // build of EVERY `--features lora` image, on every board, not just this
+        // one. The paired `compile_error!` at the top of this file is what keeps
+        // gating the arm honest: it forbids `bitforge-nano` + `lora` outright, so
+        // the arm can never be missing in a build that would actually need it
+        // (a missing arm falls to the `panic!` below = panic=abort = boot loop).
+        #[cfg(not(feature = "lora"))]
+        (1, -1, 9, -1) => {
+            GpioController::new_without_buck(peripherals.pins.gpio1, peripherals.pins.gpio9)
+        }
         pins => panic!("Unsupported board GPIO mapping: {:?}", pins),
     }
     .expect("GPIO init failed");
@@ -1802,6 +2337,143 @@ fn main() {
     let mut fan_is_emc2103 = false;
     let mut emc2103: Option<Emc2103> = None;
     let mut fan_emc2302: Option<Emc2302> = None;
+
+    // Boards whose thermal sensor sits behind an I2C BUS multiplexer cannot be
+    // read at all until a channel is connected, so this runs BEFORE any sensor
+    // or fan-controller transaction below. Declared per board by
+    // `BitAxeModel::thermal_i2c_mux`, not branched on model here.
+    //
+    // The channel is selected once and left connected: nothing else on these
+    // boards lives downstream of the mux, and our model drives ONE controller
+    // at one duty (which is what the vendor firmware does too). A mux that
+    // later drops its selection makes subsequent reads NAK — a loud failure
+    // that the existing fail-closed thermal path already handles — rather than
+    // silently returning the other ASIC's die temperature.
+    if let Some(mux_cfg) = board_config.model.thermal_i2c_mux() {
+        match select_thermal_mux_channel(&mut i2c, mux_cfg) {
+            Ok(()) => info!(
+                "Thermal I2C mux 0x{:02X}: channel {} connected",
+                mux_cfg.addr, mux_cfg.channel
+            ),
+            Err(e) => {
+                mining_permitted = false;
+                mining_block_reason = Some(format!("Thermal I2C mux channel select failed: {}", e));
+                error!(
+                    "Thermal I2C mux 0x{:02X} channel {} select failed: {} — mining disabled \
+                     (no trusted temperature is reachable on this board without it)",
+                    mux_cfg.addr, mux_cfg.channel, e
+                );
+            }
+        }
+    }
+
+    // ── TMP451 per-ASIC diode mux ──────────────────────────────────────────
+    // Declared by `BitAxeModel::tmp451_diode_mux()`. On a board that declares
+    // one, these ARE the die sensors: the row's own `temp_sensor` (a TMP1075)
+    // measures airflow, ~10-20 C below a junction. So a failure to bring the
+    // mux up is not a degraded mode, it is thermal blindness, and it disables
+    // mining exactly like the bus-mux failure above.
+    #[cfg(feature = "temp-tmp451")]
+    let mut diode_mux: Option<DiodeMuxSweep> = None;
+    #[cfg(feature = "temp-tmp451")]
+    if let Some(decl) = board_config.model.tmp451_diode_mux() {
+        use dcentaxe_hal::board::Tmp451SelectLines;
+        use dcentaxe_hal::tmp451::{MuxSelect, Tmp451};
+
+        // The declared pin NUMBERS are data; the pin MOVE is a compile-time
+        // fact. A `match` cannot make two moves exclusive (every arm compiles
+        // into every image), so exactly one arm here binds pins and the rest
+        // refuse. A board declaring different select lines therefore fails
+        // closed and loudly, instead of being silently driven on the wrong two
+        // GPIOs. Wiring such a board means adding its arm AND proving the pins
+        // are free in every feature combination — see the `compile_error!`
+        // pair at the top of this file.
+        // `evaluate_thermal_muxed` carries no `gt_temp2` slot, because the die
+        // readings arrive as a counted sweep rather than as two fixed sensors.
+        // On a board that had BOTH, that second die reading would be silently
+        // dropped from the fold — a hot die vanishing from `max_temp`. No board
+        // in the registry pairs them; this refuses the pairing loudly instead of
+        // letting a future row discover it as a missing overtemp cut.
+        let selected =
+            if board_config.fan_controller == dcentaxe_hal::board::FanControllerKind::Emc2103 {
+                Err(
+                "board declares a TMP451 diode mux AND an EMC2103, whose second die reading has \
+                 no slot in the muxed thermal fold"
+                    .to_string(),
+            )
+            } else {
+                match decl.select {
+                    Tmp451SelectLines::Gpio { a0: 2, a1: 12 } => MuxSelect::new(
+                        peripherals.pins.gpio2.into(),
+                        peripherals.pins.gpio12.into(),
+                        decl.active_high,
+                    )
+                    .map_err(|e| e.to_string()),
+                    Tmp451SelectLines::Gpio { a0, a1 } => Err(format!(
+                "board declares TMP451 mux select lines GPIO{}/GPIO{}, which this image has no \
+                 binding for (only GPIO2/GPIO12 are bound)",
+                a0, a1
+            )),
+                    Tmp451SelectLines::Expander { addr, a0, a1 } => Err(format!(
+                "board declares TMP451 mux select lines on an FXL6408 expander at 0x{:02X} \
+                 (pins {}/{}), and the expander transport is not implemented",
+                addr, a0, a1
+            )),
+                }
+            };
+
+        match selected {
+            Ok(select) => {
+                let mut sensors = Vec::new();
+                let mut failed: Vec<String> = Vec::new();
+                for declared in decl.sensors {
+                    match Tmp451::new(&mut i2c, declared.addr, decl.calibration) {
+                        Ok(sensor) => {
+                            info!(
+                                "TMP451 0x{:02X}: {} channels covering ASICs {}..{}",
+                                declared.addr,
+                                declared.channels,
+                                declared.first_asic,
+                                declared.first_asic + declared.channels - 1
+                            );
+                            sensors.push((sensor, declared.first_asic, declared.channels));
+                        }
+                        Err(e) => failed.push(format!("0x{:02X}: {}", declared.addr, e)),
+                    }
+                }
+
+                // Partial sensor bring-up is refused for the same reason a
+                // partial sweep is blind: the dies behind the missing sensor
+                // are unmeasured, and they share this board's rail and fan.
+                if failed.is_empty() {
+                    diode_mux = Some(DiodeMuxSweep {
+                        select,
+                        sensors,
+                        expected_asics: board_config.asic_count,
+                    });
+                } else {
+                    mining_permitted = false;
+                    mining_block_reason = Some(format!(
+                        "TMP451 diode mux: sensor init failed ({})",
+                        failed.join("; ")
+                    ));
+                    error!(
+                        "TMP451 diode mux: {} of {} sensors failed to initialize ({}) — mining \
+                         disabled (these ARE this board's die sensors; the TMP1075 is an airflow \
+                         proxy and cannot stand in for a junction temperature)",
+                        failed.len(),
+                        decl.sensors.len(),
+                        failed.join("; ")
+                    );
+                }
+            }
+            Err(e) => {
+                mining_permitted = false;
+                mining_block_reason = Some(format!("TMP451 diode mux unavailable: {}", e));
+                error!("TMP451 diode mux unavailable: {} — mining disabled", e);
+            }
+        }
+    }
 
     match board_config.fan_controller {
         dcentaxe_hal::board::FanControllerKind::Emc2302 => match Emc2302::new_default(&mut i2c) {
@@ -2171,18 +2843,231 @@ fn main() {
         }
     }
 
+    // XPSAFE-5 — energize the rail the way THIS board's topology allows.
+    //
+    // The previous shape called `enable_buck(true)` unconditionally and treated
+    // its `Err` as a failure. On a board with no enable GPIO that `Err` is not a
+    // failure at all, it is the board reporting its own topology — and because
+    // `mining_permitted` only ever ratchets false, the conflation left
+    // NerdAxe-gamma, the BitForge Nano and the BitAxe Naja booting, identifying,
+    // serving the dashboard, and permanently unable to mine. `RailBringup` was
+    // written to name that distinction; this is the consumer it never had.
+    // XPSAFE-5e — bring up the I2C port expander, for boards whose rail lives
+    // on one. This must happen BEFORE the LDO step below, because on these
+    // boards the LDO enable is an expander pin too.
+    //
+    // Order inside this block is the safety property: probe and reset the part,
+    // drive ASIC reset / VREG / LDO to output-LOW (upstream `Q1370B::initBoard`),
+    // and only THEN arm the panic cut. Arming earlier would point the hook at a
+    // part still in high-Z; arming later would leave a window where the rail
+    // could be raised with no panic actuator behind it.
+    #[cfg(feature = "io-expander-fxl6408")]
+    let mut rail_expander: Option<dcentaxe_hal::fxl6408::Fxl6408> = None;
+    #[cfg(feature = "io-expander-fxl6408")]
     if mining_permitted {
-        if let Err(e) = gpio_ctrl.enable_buck(true) {
-            mining_permitted = false;
-            mining_block_reason = Some(format!("Buck enable failed: {}", e));
-            fail_closed_power_off(
-                "Buck enable failed",
-                &state,
-                None,
-                None,
-                &mut i2c,
-                &mut gpio_ctrl,
-            );
+        if let dcentaxe_hal::board::RailBringup::ExpanderGpio { addr, .. } =
+            board_config.rail_bringup()
+        {
+            match dcentaxe_hal::fxl6408::Fxl6408::new(&mut i2c, addr) {
+                Ok(mut exp) => match exp.configure_power_sequence_outputs(&mut i2c) {
+                    Ok(()) => {
+                        arm_panic_expander_rail_cut(0, addr);
+                        info!(
+                            "XPSAFE-5d: panic-hook expander rail cut armed (I2C0 0x{:02X}) — \
+                             this board's enable is neither an ESP GPIO nor a switchable \
+                             regulator",
+                            addr
+                        );
+                        rail_expander = Some(exp);
+                    }
+                    Err(e) => {
+                        mining_permitted = false;
+                        mining_block_reason =
+                            Some(format!("Expander power-sequence setup failed: {}", e));
+                        fail_closed_power_off(
+                            "Expander power-sequence setup failed",
+                            &state,
+                            None,
+                            None,
+                            &mut i2c,
+                            &mut gpio_ctrl,
+                        );
+                    }
+                },
+                Err(e) => {
+                    mining_permitted = false;
+                    mining_block_reason =
+                        Some(format!("Rail expander not found at 0x{:02X}: {}", addr, e));
+                    fail_closed_power_off(
+                        "Rail expander not found",
+                        &state,
+                        None,
+                        None,
+                        &mut i2c,
+                        &mut gpio_ctrl,
+                    );
+                }
+            }
+        }
+    }
+
+    // XPSAFE-5c — raise the ASIC LDO bank BEFORE the core rail is configured.
+    //
+    // On the multi-phase Nerd line the dies are fed by two supplies, and
+    // upstream's `initAsics` is explicit about the order: LDO_enable(), 100 ms,
+    // then the TPS init, then VOUT. Doing it the other way round leaves the
+    // chain silent on a rail that looks perfect from the regulator's side —
+    // which is how this shipped, with GPIO13 referenced nowhere in the tree.
+    //
+    // `has_ldo()` is asked FIRST rather than calling `enable_ldo` and reading
+    // its Err, because that Err means "this board has no LDO", not "the LDO
+    // failed" — the distinction that cost three boards their ability to mine
+    // in Wave 21. A board that HAS one and cannot raise it fails closed.
+    // The LDO is asked for by ROLE, not by pin — `asic_ldo_enable()` carries
+    // the transport, so a board whose LDO is an expander pin runs the same
+    // sequence at the same point with the same settle. Adding the second
+    // transport added no second sequence, which is the whole reason the
+    // declaration is typed rather than an `i32`.
+    #[cfg(feature = "io-expander-fxl6408")]
+    if mining_permitted {
+        if let Some(dcentaxe_hal::board::LdoEnable::Expander { pin, .. }) =
+            board_config.model.asic_ldo_enable()
+        {
+            let raised = match rail_expander.as_mut() {
+                Some(exp) => exp
+                    .write_pin(&mut i2c, pin, true)
+                    .map_err(|e| e.to_string()),
+                // Unreachable in practice: the same `ExpanderGpio` classification
+                // gates both this and the construction above. Stated as a hard
+                // refusal anyway, because "the handle is missing" must never
+                // degrade into "skip raising the LDO and mine anyway".
+                None => Err("rail expander was never constructed".to_string()),
+            };
+            match raised {
+                Ok(()) => {
+                    info!(
+                        "Rail bring-up: ASIC LDO enabled on expander pin {} — settling {} ms \
+                         before the core rail is configured",
+                        pin, LDO_SETTLE_MS
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(LDO_SETTLE_MS));
+                }
+                Err(e) => {
+                    mining_permitted = false;
+                    mining_block_reason = Some(format!("Expander ASIC LDO enable failed: {}", e));
+                    fail_closed_power_off(
+                        "Expander ASIC LDO enable failed",
+                        &state,
+                        None,
+                        None,
+                        &mut i2c,
+                        &mut gpio_ctrl,
+                    );
+                }
+            }
+        }
+    }
+    if mining_permitted && gpio_ctrl.has_ldo() {
+        match gpio_ctrl.enable_ldo(true) {
+            Ok(()) => {
+                info!(
+                    "Rail bring-up: ASIC LDO enabled on GPIO{} — settling {} ms before the \
+                     core rail is configured",
+                    board_config.ldo_enable_pin, LDO_SETTLE_MS
+                );
+                std::thread::sleep(std::time::Duration::from_millis(LDO_SETTLE_MS));
+            }
+            Err(e) => {
+                mining_permitted = false;
+                mining_block_reason = Some(format!("ASIC LDO enable failed: {}", e));
+                fail_closed_power_off(
+                    "ASIC LDO enable failed",
+                    &state,
+                    None,
+                    None,
+                    &mut i2c,
+                    &mut gpio_ctrl,
+                );
+            }
+        }
+    }
+    if mining_permitted {
+        match board_config.rail_bringup() {
+            // A discrete GPIO asserts the enable. Unchanged, byte for byte:
+            // an Err here really is a failure to actuate a pin that exists.
+            dcentaxe_hal::board::RailBringup::EnableGpio
+                if board_config.rail_enable_order()
+                    == dcentaxe_hal::board::RailEnableOrder::RegulatorBeforeGpio =>
+            {
+                // Deferred on purpose — see `RailEnableOrder`. Asserting EN here
+                // would energize a TPS5364x at whatever VOUT its NVM holds,
+                // because that part ignores OPERATION and follows EN alone.
+                // The assertion happens after `PowerManager::new` below.
+                info!(
+                    "Rail bring-up: {} defers its enable GPIO until the regulator is configured",
+                    board_config.model.name()
+                );
+            }
+            dcentaxe_hal::board::RailBringup::EnableGpio => {
+                if let Err(e) = gpio_ctrl.enable_buck(true) {
+                    mining_permitted = false;
+                    mining_block_reason = Some(format!("Buck enable failed: {}", e));
+                    fail_closed_power_off(
+                        "Buck enable failed",
+                        &state,
+                        None,
+                        None,
+                        &mut i2c,
+                        &mut gpio_ctrl,
+                    );
+                }
+            }
+            // EXPERIMENTAL: no enable pin exists; the regulator IS the rail
+            // actuator. `PowerManager::new` leaves the TPS546 at OPERATION_OFF,
+            // and the `set_voltage` below sends VOUT_COMMAND + OPERATION_ON —
+            // so the rail comes up there, in order (rail -> reset -> UART), not
+            // here. Nothing to drive at this step is the correct outcome, not a
+            // fault. The regulator's identity is verified after probing, below.
+            dcentaxe_hal::board::RailBringup::RegulatorOnly => {
+                info!(
+                    "Rail bring-up: {} has no enable GPIO — the regulator commands the rail \
+                     (EXPERIMENTAL). Rail rises at set_voltage(); cuts run over PMBus.",
+                    board_config.model.name()
+                );
+            }
+            // EXPERIMENTAL: the enable is an expander pin. Like the
+            // `RegulatorBeforeGpio` case above this is deliberately deferred —
+            // the part behind it is a TPS5364x, whose EN must not be asserted
+            // until `VOUT_COMMAND` has been written. The expander itself was
+            // already brought up and its panic cut armed (XPSAFE-5e), so the
+            // rail has an actuator before it can possibly rise.
+            dcentaxe_hal::board::RailBringup::ExpanderGpio { addr, pin } => {
+                info!(
+                    "Rail bring-up: {} drives its enable through an I2C expander at \
+                     0x{:02X} pin {} (EXPERIMENTAL) — deferred until the regulator is \
+                     configured",
+                    board_config.model.name(),
+                    addr,
+                    pin
+                );
+            }
+            // Neither an enable pin nor commandable voltage. Nothing in firmware
+            // can raise or lower this rail, so nothing can cut it either.
+            dcentaxe_hal::board::RailBringup::NoActuator => {
+                mining_permitted = false;
+                mining_block_reason = Some(
+                    "Board has no rail actuator: no enable GPIO and no commandable regulator"
+                        .to_string(),
+                );
+                fail_closed_power_off(
+                    "No rail actuator (no enable GPIO, no commandable regulator)",
+                    &state,
+                    None,
+                    None,
+                    &mut i2c,
+                    &mut gpio_ctrl,
+                );
+            }
         }
     }
 
@@ -2247,6 +3132,114 @@ fn main() {
     } else {
         PowerManager::null()
     };
+    // XPSAFE-5b: the deferred enable. A board whose regulator must be configured
+    // before EN is asserted gets its GPIO driven HERE, after `PowerManager::new`
+    // has identified the part and programmed its phase count, current-sense full
+    // scale and over-temperature limits — and before `set_voltage` below.
+    if mining_permitted
+        && board_config.rail_enable_order()
+            == dcentaxe_hal::board::RailEnableOrder::RegulatorBeforeGpio
+        && board_config.rail_bringup() == dcentaxe_hal::board::RailBringup::EnableGpio
+    {
+        match gpio_ctrl.enable_buck(true) {
+            Ok(()) => info!(
+                "Rail bring-up: enable GPIO asserted after regulator configuration ({:?})",
+                power_mgr.regulator_type()
+            ),
+            Err(e) => {
+                mining_permitted = false;
+                mining_block_reason = Some(format!("Deferred buck enable failed: {}", e));
+                fail_closed_power_off(
+                    "Deferred buck enable failed",
+                    &state,
+                    None,
+                    Some(&mut power_mgr),
+                    &mut i2c,
+                    &mut gpio_ctrl,
+                );
+            }
+        }
+    }
+    // XPSAFE-5b (expander) — the deferred enable for a board whose EN is an
+    // expander pin. Same window, same reason as the GPIO case directly above:
+    // after `PowerManager::new` has identified the TPS5364x and programmed its
+    // phase count, current-sense full scale and over-temperature limits, and
+    // before `set_voltage` raises the output.
+    #[cfg(feature = "io-expander-fxl6408")]
+    if mining_permitted {
+        if let dcentaxe_hal::board::RailBringup::ExpanderGpio { addr, pin } =
+            board_config.rail_bringup()
+        {
+            let asserted = match rail_expander.as_mut() {
+                Some(exp) => exp
+                    .write_pin(&mut i2c, pin, true)
+                    .map_err(|e| e.to_string()),
+                None => Err("rail expander was never constructed".to_string()),
+            };
+            match asserted {
+                Ok(()) => info!(
+                    "Rail bring-up: expander VREG enable asserted at 0x{:02X} pin {} after \
+                     regulator configuration ({:?})",
+                    addr,
+                    pin,
+                    power_mgr.regulator_type()
+                ),
+                Err(e) => {
+                    mining_permitted = false;
+                    mining_block_reason = Some(format!("Deferred expander enable failed: {}", e));
+                    fail_closed_power_off(
+                        "Deferred expander enable failed",
+                        &state,
+                        None,
+                        Some(&mut power_mgr),
+                        &mut i2c,
+                        &mut gpio_ctrl,
+                    );
+                }
+            }
+        }
+    }
+    // XPSAFE-5 — a board with no enable GPIO may only mine if its regulator can
+    // actually CUT the rail, and the panic hook must be armed before the rail
+    // is ever raised (the `set_voltage` below is what raises it).
+    //
+    // The capability check is not ceremony, and it is deliberately not a
+    // part-name comparison. `PowerManager::new` PROBES: a board whose 0x24
+    // stays silent while a DS4432U answers 0x48 resolves to `Ds4432u`, whose
+    // `disable()` returns `RequiresBuckCut`. A TPS5364x is the subtler case —
+    // it speaks PMBus fluently but ignores OPERATION, so it cannot switch its
+    // own output either. Both are rails nothing could bring down. Refuse them.
+    if mining_permitted
+        && board_config.rail_bringup() == dcentaxe_hal::board::RailBringup::RegulatorOnly
+    {
+        if power_mgr.regulator_type().can_cut_rail_over_i2c() {
+            // Single regulator at 0x24. Multi-regulator stacks (the Lucky LV08's
+            // [0x24, 0x7F, 0x14]) are NOT RegulatorOnly boards — they carry an
+            // enable GPIO — so one address is the whole set here. If a
+            // multi-regulator board ever classifies RegulatorOnly, this must
+            // arm every address or it would cut one phase and leave the others.
+            arm_panic_pmbus_rail_cut(0, dcentaxe_hal::power::TPS546_ADDR);
+            info!(
+                "XPSAFE-5: panic-hook PMBus rail cut armed (I2C0 0x{:02x}) — this board has \
+                 no enable GPIO for the hook to drive",
+                dcentaxe_hal::power::TPS546_ADDR
+            );
+        } else {
+            mining_permitted = false;
+            mining_block_reason = Some(format!(
+                "Board has no enable GPIO and its regulator ({:?}) cannot cut the rail over I2C",
+                power_mgr.regulator_type()
+            ));
+            fail_closed_power_off(
+                "No enable GPIO and no I2C-cuttable regulator",
+                &state,
+                None,
+                Some(&mut power_mgr),
+                &mut i2c,
+                &mut gpio_ctrl,
+            );
+        }
+    }
     if mining_permitted && board_config.model.has_voltage_control() {
         if let Err(e) = power_mgr.set_voltage(&mut i2c, config.target_voltage_mv) {
             mining_permitted = false;
@@ -2291,36 +3284,70 @@ fn main() {
         );
     }
 
-    let (mut tmp_primary, tmp_secondary) =
-        if board_config.temp_sensor == dcentaxe_hal::board::TempSensorKind::Tmp1075 {
-            // TMP1075 init with retry — 0x4A may need extra time after power-up
-            let mut primary = Tmp1075::new_primary(&mut i2c).ok();
-            if primary.is_none() {
-                std::thread::sleep(Duration::from_millis(200));
-                primary = Tmp1075::new_primary(&mut i2c).ok();
-                if primary.is_some() {
-                    info!("TMP1075 primary (0x4A) detected on retry");
-                }
-            }
-            let secondary = Tmp1075::new_secondary(&mut i2c).ok();
-            if primary.is_some() {
-                info!("TMP1075 primary (0x4A) detected");
-            } else {
-                error!("TMP1075 primary (0x4A) missing on TMP1075 board — mining disabled");
-            }
-            if secondary.is_some() {
-                info!("TMP1075 secondary (0x4B) detected");
-            } else {
-                error!("TMP1075 secondary (0x4B) missing on TMP1075 board — mining disabled");
-            }
-            if primary.is_none() || secondary.is_none() {
-                mining_permitted = false;
-                mining_block_reason = Some("TMP1075 sensor init failed".to_string());
-            }
-            (primary, secondary)
+    let (mut tmp_primary, tmp_secondary) = if board_config.temp_sensor
+        == dcentaxe_hal::board::TempSensorKind::Tmp1075
+    {
+        // Which two devices to open depends on the board family. BitAxe Hex
+        // straps its pair at 0x4A/0x4B; the Nerd multi-ASIC boards strap
+        // from 0x48 and reserve 0x49 for the VOLTAGE REGULATOR, so the Hex
+        // pair addresses the wrong devices there — it would miss the first
+        // ASIC sensor entirely. `new_nerd_asic` maps logical ASIC sensors
+        // past the VR device (0 -> 0x48, 1 -> 0x4A); see
+        // `dcentaxe_hal::tmp1075_convert` for the topology.
+        //
+        // The question here is about the HARDWARE, not the brand: the Q-series
+        // carries the same TPS53647 rail and the same TMP1075 strapping as the
+        // Nerd multi-ASIC boards (`Q1370B::initBoard` calls the very same
+        // `detectNumTempSensors`), so it must take the same branch.
+        // `has_multiphase_vrm` is the predicate that says so.
+        let nerd = board_config.model.has_multiphase_vrm();
+        let (primary_addr, secondary_addr) = if nerd {
+            ("0x48", "0x4A")
         } else {
-            (None, None)
+            ("0x4A", "0x4B")
         };
+        let open_primary = |i2c: &mut _| {
+            if nerd {
+                Tmp1075::new_nerd_asic(i2c, 0, "asic0").ok()
+            } else {
+                Tmp1075::new_primary(i2c).ok()
+            }
+        };
+
+        // TMP1075 init with retry — the primary may need extra time after power-up
+        let mut primary = open_primary(&mut i2c);
+        if primary.is_none() {
+            std::thread::sleep(Duration::from_millis(200));
+            primary = open_primary(&mut i2c);
+            if primary.is_some() {
+                info!("TMP1075 primary ({primary_addr}) detected on retry");
+            }
+        }
+        let secondary = if nerd {
+            Tmp1075::new_nerd_asic(&mut i2c, 1, "asic1").ok()
+        } else {
+            Tmp1075::new_secondary(&mut i2c).ok()
+        };
+        if primary.is_some() {
+            info!("TMP1075 primary ({primary_addr}) detected");
+        } else {
+            error!("TMP1075 primary ({primary_addr}) missing on TMP1075 board — mining disabled");
+        }
+        if secondary.is_some() {
+            info!("TMP1075 secondary ({secondary_addr}) detected");
+        } else {
+            error!(
+                "TMP1075 secondary ({secondary_addr}) missing on TMP1075 board — mining disabled"
+            );
+        }
+        if primary.is_none() || secondary.is_none() {
+            mining_permitted = false;
+            mining_block_reason = Some("TMP1075 sensor init failed".to_string());
+        }
+        (primary, secondary)
+    } else {
+        (None, None)
+    };
 
     if board_config.temp_sensor != dcentaxe_hal::board::TempSensorKind::Tmp1075 {
         tmp_primary = None;
@@ -2384,8 +3411,58 @@ fn main() {
     // Step 7: UART + ASIC driver
     // ======================================================================
     let uart_config = UartConfig::new().baudrate(esp_idf_svc::hal::units::Hertz(115200));
-    // UART pins: BitAxe=17tx/18rx, Nerd (TTGO T-Display S3)=43tx/44rx
+    // UART pins: BitAxe=17/18, Nerd=43/44. Hammer polarity is SKU-specific.
     #[cfg(feature = "pins-bitaxe")]
+    let uart_driver = UartDriver::new(
+        peripherals.uart1,
+        peripherals.pins.gpio17,
+        peripherals.pins.gpio18,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        &uart_config,
+    )
+    .expect("UART init failed");
+    #[cfg(all(
+        feature = "pins-hammer-bc",
+        any(
+            feature = "hammer-bc01",
+            feature = "hammer-bc01-pro",
+            feature = "hammer-bc02"
+        )
+    ))]
+    let uart_driver = UartDriver::new(
+        peripherals.uart1,
+        peripherals.pins.gpio18,
+        peripherals.pins.gpio17,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        &uart_config,
+    )
+    .expect("UART init failed");
+    #[cfg(all(feature = "pins-hammer-bc", feature = "hammer-bc04"))]
+    let uart_driver = UartDriver::new(
+        peripherals.uart1,
+        peripherals.pins.gpio17,
+        peripherals.pins.gpio18,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        &uart_config,
+    )
+    .expect("UART init failed");
+    #[cfg(all(feature = "pins-hammer-dc", feature = "hammer-dc02"))]
+    let uart_driver = UartDriver::new(
+        peripherals.uart1,
+        peripherals.pins.gpio18,
+        peripherals.pins.gpio17,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        Option::<gpio::AnyIOPin<'_>>::None,
+        &uart_config,
+    )
+    .expect("UART init failed");
+    #[cfg(all(
+        feature = "pins-hammer-dc",
+        any(feature = "hammer-dc04", feature = "hammer-dc06")
+    ))]
     let uart_driver = UartDriver::new(
         peripherals.uart1,
         peripherals.pins.gpio17,
@@ -2643,6 +3720,16 @@ fn main() {
                     }
                     dcentaxe_asic::AsicModel::BM1373 => {
                         DispatcherConfig::for_bm1370(target_freq, asic_count)
+                    }
+                    // MSBT0501 (Scrypt): cadence from MEASURED MH/s, never the
+                    // SHA-256 core-count formula. Until live telemetry exists we
+                    // seed it with the model's rated aggregate rate
+                    // (DC02 150 / DC04 300 / DC06 450 MH/s). The driver refuses
+                    // to init, so this config is not reachable in production —
+                    // it exists so bring-up starts from the right model.
+                    dcentaxe_asic::AsicModel::Lt0051 => {
+                        let rated_mhs = 75.0 * asic_count.max(1) as f32;
+                        DispatcherConfig::for_lt0051(rated_mhs, asic_count)
                     }
                     #[cfg(feature = "asic-kf1950")]
                     dcentaxe_asic::AsicModel::KF1950 => {
@@ -2931,6 +4018,30 @@ fn main() {
         let gt_temp2 = emc2103
             .as_ref()
             .and_then(|e| e.read_secondary_temp(&mut i2c));
+        // Per-ASIC die sweep on boards that declare a TMP451 diode mux. Costs
+        // one mux settle + one discarded conversion per CHANNEL (not per
+        // sensor) — worst case ~3.7 s for the OCTAXE-γ's 4 channels x 2
+        // sensors, inside a 5 s loop whose WDT was fed at the top and has a
+        // 15 s budget. Duration is logged so a slow bus is visible rather than
+        // inferred from a reset.
+        #[cfg(feature = "temp-tmp451")]
+        let die_fold = diode_mux.as_mut().map(|mux| {
+            let started = std::time::Instant::now();
+            let fold = mux.sweep(&mut i2c);
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_secs(2) {
+                warn!(
+                    "TMP451 die sweep took {} ms ({} of {} dies covered) — check the I2C bus",
+                    elapsed.as_millis(),
+                    fold.covered,
+                    fold.expected
+                );
+            }
+            fold
+        });
+        #[cfg(not(feature = "temp-tmp451"))]
+        let die_fold: Option<thermal_safety::MuxedDieFold> = None;
+
         let apply_temp_offset =
             |temp: Option<f32>| temp.map(|t| t + board_config.temp_offset_c as f32);
         let chip_temp = if let Some(ref mut emc) = temp_emc {
@@ -2957,6 +4068,18 @@ fn main() {
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             })
+        };
+        // On a muxed board the TMP451 sweep IS the die reading. The branch above
+        // fell through to this board's TMP1075s, which measure AIRFLOW — they
+        // stay in the fold as inlet/outlet proxies below, but they must not
+        // masquerade as a junction temperature once real diodes are readable.
+        //
+        // No `apply_temp_offset` here on purpose: the die readings already
+        // carry the board's declared TMP451 `Calibration`, and stacking the
+        // row's proxy offset on top would correct them twice.
+        let chip_temp = match die_fold {
+            Some(fold) => fold.hottest,
+            None => chip_temp,
         };
         // board_temp: EMC2101 internal on single-chip, or TMP1075 secondary on Hex (for temp2)
         let board_temp = apply_temp_offset(
@@ -3003,15 +4126,32 @@ fn main() {
         // is NORMAL and must never be treated as blind.
         let chip_die_expected =
             board_config.temp_sensor != dcentaxe_hal::board::TempSensorKind::None || fan_is_emc2103;
-        let thermal = thermal_safety::evaluate_thermal(
-            chip_temp,
-            gt_temp2,
-            board_temp,
-            inlet_temp,
-            outlet_temp,
-            vreg_temp,
-            chip_die_expected,
-        );
+        //
+        // On a muxed board the same decision runs through
+        // `evaluate_thermal_muxed`, which adds one rule: INCOMPLETE COVERAGE IS
+        // BLINDNESS. Seven of eight dies reading a comfortable 65 C is not a
+        // sighted board — the eighth shares the rail and the fan and could be
+        // anywhere. (Upstream folds the same sweep with a bare `max` and reports
+        // it as healthy; see `MuxedDieFold`.)
+        let thermal = match die_fold {
+            Some(fold) => thermal_safety::evaluate_thermal_muxed(
+                fold,
+                board_temp,
+                inlet_temp,
+                outlet_temp,
+                vreg_temp,
+                chip_die_expected,
+            ),
+            None => thermal_safety::evaluate_thermal(
+                chip_temp,
+                gt_temp2,
+                board_temp,
+                inlet_temp,
+                outlet_temp,
+                vreg_temp,
+                chip_die_expected,
+            ),
+        };
         let max_temp = thermal.max_temp;
         let runtime_mining_active = mining_enabled && !mining_kill.load(Ordering::Relaxed);
         let thermal_clamp_active = max_temp > WARNING_TEMP_C;
@@ -3461,11 +4601,15 @@ fn main() {
             // Single-chip boards (Gamma/Ultra/Supra/Max) get one entry so the
             // dashboard ASIC Chips card always appears with live telemetry.
             if asic_count >= 1 {
-                // MAINAPI-1: per_chip is a fixed [PerChipStats; MAX_CHIPS] (=6). An
-                // asic_count > MAX_CHIPS would panic on an unchecked index = miner
-                // down. Bound the loop to MAX_CHIPS and use .get() as a
-                // belt-and-suspenders degrade so a bad asic_count can never index
-                // out of bounds.
+                // MAINAPI-1: per_chip is a fixed [PerChipStats; MAX_CHIPS] (=16
+                // since the Lucky LV08 9-chip scaling wave — 9×28=252 keeps raw
+                // nonce bytes 252-255 decoding to asic_nr 9, one past a 9-element
+                // array, so the array is oversized to 16). An asic_count >
+                // MAX_CHIPS would panic on an unchecked index = miner down. Bound
+                // the loop to MAX_CHIPS and use .get() as a belt-and-suspenders
+                // degrade so a bad asic_count can never index out of bounds.
+                // The `.min(MAX_CHIPS)` clamp is pinned by a dcentaxe-core
+                // source contract — do NOT remove it.
                 let chip_count = (asic_count as usize).min(dcentaxe_mining::stats::MAX_CHIPS);
                 let mut chips = Vec::with_capacity(chip_count);
                 for i in 0..chip_count {

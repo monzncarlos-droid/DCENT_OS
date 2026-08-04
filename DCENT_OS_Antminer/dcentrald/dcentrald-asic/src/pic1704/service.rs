@@ -93,7 +93,7 @@ pub mod platforms {
     pub struct Am335xBbS19jPro;
     /// Amlogic S19j Pro variants. Subtype = `AMLCtrl_BHB42XXX`.
     /// **NOT** S19k Pro (`AMLCtrl_BHB56xxx`) or S21 NoPic — those stay
-    /// on the existing dsPIC / NoPic paths.
+    /// NoPic and cannot authorize a PIC1704 or dsPIC controller path.
     pub struct AmlogicS19jPro;
     /// Antminer S19 (Standard) on Cvitek CV183x. PIC1704 at I²C 0x20 per
     /// chain. Subtype mirrors the S19j Pro pattern (`CVCtrl_BHB42XXX`)

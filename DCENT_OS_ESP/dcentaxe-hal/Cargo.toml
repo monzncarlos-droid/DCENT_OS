@@ -17,7 +17,9 @@ default = []
 tps546-fault-limit-guard = []
 # Pin families (I2C GPIO assignments)
 pins-bitaxe = []       # I2C SDA=47, SCL=48
-pins-nerd = []         # I2C SDA=43, SCL=44
+pins-nerd = []         # I2C SDA=18, SCL=17; UART1 TX=43, RX=44
+pins-hammer-bc = []    # I2C SDA=44, SCL=43; UART is SKU-specific
+pins-hammer-dc = []    # I2C SDA=44, SCL=43; UART is SKU-specific
 # LoRa/SX1262 radio pin map (dedicated SPI3/HSPI — NEVER the BAP/J4 UART bus).
 # Additive + orthogonal to the pins-bitaxe/pins-nerd family selector: enabling it
 # only compiles in the `lora_pins` GPIO map + the esp-idf `open_lora_bus` builder.
@@ -41,13 +43,52 @@ display-none = []      # Headless (NerdNOS, or web-dashboard-only)
 power-tps546 = []      # TPS546 PMBus DC-DC
 power-ds4432u = []     # DS4432U I2C DAC (BitAxe Max)
 power-fixed = []       # Fixed voltage regulator, no I2C control (NerdNOS)
+# TPS53647/TPS53667 multi-phase PMBus VRM — the Nerd family's multi-ASIC boards
+# (NerdQAxe+, NerdQAxe++ pre-rev7, NerdOCTAXE+, NerdOCTAXE-γ) carry one of these
+# instead of a TPS546. The two parts share a register map but differ in device
+# code, minimum output voltage and init sequence, so they are ONE driver with a
+# runtime-detected variant — never one profile with a parameter. The decision
+# half (`tps5364x_convert`) is host-pure and always compiled; this feature gates
+# the espidf SMBus shim.
+power-tps5364x = []
 # Fan controller
 fan-emc2101 = []       # EMC2101 I2C fan+temp
 fan-emc2103 = []       # EMC2103 I2C fan (BitAxe GT)
 fan-emc2302 = []       # EMC2302 I2C dual fan (Hex boards)
 fan-none = []          # No fan controller (NerdNOS)
+# Temperature sensor
+# TMP451 / ADT7461-family remote-diode sensor, optionally behind a 2-bit analog
+# mux that fans one sensor across four ASIC diodes (NerdOCTAXE-γ carries two such
+# sensors at 0x4C/0x4E sharing one pair of select lines). This is the ONLY
+# per-ASIC thermal source on those boards, so without it they have no trusted
+# temperature and must not be permitted to mine. The decision half
+# (`tmp451_convert`) is host-pure and always compiled; this feature gates the
+# espidf I2C+GPIO shim so a board that has no TMP451 pays zero bytes.
+temp-tmp451 = []
+# PCA9544A 4-channel I2C BUS multiplexer. The BitForge Nano carries two EMC2101s
+# at the same hard-wired address, so neither thermal sensor is reachable without
+# selecting a channel first — which makes the mux part of the THERMAL path, not
+# the bus plumbing. The decision half (`pca9544_convert`) is host-pure and always
+# compiled; this feature gates the espidf I2C shim so a board with a flat bus
+# pays zero bytes. Distinct from the TMP451's *analog* mux (`temp-tmp451`),
+# which multiplexes one sensor's diode inputs rather than the bus itself.
+i2c-mux-pca9544 = []
+
+# FXL6408 8-bit I2C GPIO port expander (Q1370/Q1373). The decision half
+# (`fxl6408_convert`) is host-pure and always compiled; this gates the espidf
+# transport. Unlike every other optional driver here, what this enables is not a
+# sensor or a convenience — it is the board's ONLY rail actuator. Its ASIC
+# reset, VREG enable and LDO enable are all pins on this part, so without the
+# transport those boards have no way to raise a rail and no way to cut one.
+io-expander-fxl6408 = []
 
 [dependencies]
+# PowAlgorithm (P1 Scrypt seam) — the board profile's `pow_algorithm` field is
+# the shared enum rooted in dcentaxe-asic::common (docs/SCRYPT_STACK_DESIGN.md
+# §4.2/§4.5). dcentaxe-asic is a leaf crate (no workspace deps → no cycle) and
+# its host build is pure Rust, so the host `board` test gate is unaffected.
+dcentaxe-asic = { path = "../dcentaxe-asic" }
+
 # Logging
 log = "0.4"
 

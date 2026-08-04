@@ -12,6 +12,8 @@ pub mod client;
 pub mod gateway_solo;
 pub mod mask;
 pub mod mesh_solo;
+pub mod pool_agreement;
+pub mod scrypt;
 pub mod solo;
 pub mod types;
 pub mod work;
@@ -27,6 +29,8 @@ pub use mesh_solo::{
     MeshSoloController, MeshSoloError, MeshSoloMetrics, MeshSoloMode, SoloBlockCandidate,
     SoloWorkEpoch, TipAdmit,
 };
+pub use pool_agreement::{PoolAgreement, PoolAgreementMonitor};
+pub use scrypt::{ltc_pow_hash, ScryptError, LTC_SCRATCH_LEN};
 pub use solo::{
     assemble_coinbase_full, assemble_coinbase_nonwitness, assemble_solo_block, block_subsidy_sats,
     block_subsidy_sats_with_interval, coinbase_txid, compact_target_be, header_from_work,
@@ -36,6 +40,16 @@ pub use solo::{
 };
 pub use types::*;
 pub use work::{
-    difficulty_to_target, double_sha256, parse_coinbase, CoinbaseDecoded, CoinbaseOutput,
+    difficulty_to_target, difficulty_to_target_for, difficulty_to_target_generic, double_sha256,
+    full_header_difficulty_and_target_for, parse_coinbase, CoinbaseDecoded, CoinbaseOutput,
     MiningWork, WorkBuilder,
+};
+
+// P1 Scrypt seam: the algorithm enum is rooted in `dcentaxe_asic::common`
+// (design §4.2); re-exported here so `dcentaxe-mining` and the binary crate
+// reach it through their existing dependency edge. P2 adds the per-algorithm
+// diff-1 constants alongside it.
+pub use dcentaxe_asic::common::{
+    HashrateUnit, PowAlgorithm, SCRYPT_DIFF1_SCALE_VS_BITCOIN, SCRYPT_MIN_POOL_DIFFICULTY,
+    SCRYPT_PDIFF1_TARGET,
 };

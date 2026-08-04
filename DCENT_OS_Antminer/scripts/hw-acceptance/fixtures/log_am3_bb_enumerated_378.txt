@@ -1,0 +1,1 @@
+2026-07-19T15:42:18.771Z INFO am3-bb: chip enumeration and address assignment complete total_chips=378 chains=3 chips_per_chain=126

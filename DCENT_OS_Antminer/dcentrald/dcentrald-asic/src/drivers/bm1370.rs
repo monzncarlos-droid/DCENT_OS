@@ -85,37 +85,19 @@ const JOB_ID_MOD: u8 = 128;
 const WORK_WORDS: usize = 21;
 
 /// Crystal oscillator reference frequency (MHz).
-const FREQ_MULT: f64 = 25.0;
+const FREQ_MULT: f64 = dcentrald_common::BM1370_CLKI_MHZ;
 
-/// BM1370 FB_DIV minimum.
-const FB_DIV_MIN: u16 = 160;
+/// G29: pure SSOT FBDIV envelope (`dcentrald_common::BM1370_FB_DIV_*`).
+const FB_DIV_MIN: u16 = dcentrald_common::BM1370_FB_DIV_MIN;
+const FB_DIV_MAX: u16 = dcentrald_common::BM1370_FB_DIV_MAX;
 
-/// BM1370 FB_DIV maximum.
-const FB_DIV_MAX: u16 = 239;
-
-/// BM1370 PLL VCO lock-range bounds — **Bitmain-canonical, from the unstripped
-/// S21 Pro jig** `single_board_test.dec/get_pllparam_divider@CB644` (RE 2026-06-02):
-/// the jig accepts a PLL config only when `2000 ≤ VCO ≤ 3200` MHz, additionally
-/// `VCO ≤ 3125` when `REFDIV == 1`. (`VCO = 25 MHz × FBDIV / REFDIV`.)
+/// Bitmain S21 Pro jig VCO bounds — pure SSOT (`BM1370_JIG_VCO_*`).
 ///
-/// dcentrald's [`compute_pll_params`] (ESP-Miner-derived) does NOT clamp VCO,
-/// but its "lowest VCO" tie-break already lands every operating-range frequency
-/// on a `REFDIV=2` / VCO 2000–2600 config — i.e. **inside this jig range**
-/// (verified 0/13 out-of-range across 400–700 MHz; pinned by
-/// `bm1370_pll_stays_within_bitmain_jig_vco_range`). These constants make that
-/// cross-confirmation an explicit, regression-guarded contract: if a future edit
-/// to the search (FBDIV range, tie-break) starts selecting an out-of-VCO-range
-/// config that wouldn't lock on real BM1370 silicon, the test fails. No
-/// behaviour change today — the algorithm is unchanged (it's proven on BitAxe
-/// BM1370 via ESP-Miner); this is verification + a guard, not a re-tune.
-// VCO encoder note (GhidraMCP goldmine 2026-06-10, decoded from
-// S21pro/single_board_test `set_pllparameter@0xCADF8`): the stock PLL-parameter
-// ENCODER accepts VCO ≥ 1600 MHz (with a bit28 band-select around 2400 MHz),
-// but the validated lock FLOOR enforced here stays 2000 MHz. S21pro and S21xp
-// may differ — do NOT lower this clamp without a live A/B on the live S21 .135.
-const PLL_VCO_MIN_MHZ: f64 = 2000.0;
-const PLL_VCO_MAX_MHZ: f64 = 3200.0;
-const PLL_VCO_MAX_REFDIV1_MHZ: f64 = 3125.0;
+/// Default search is **unclamped** EspMinerFull (66/301 of 400–700 MHz land
+/// outside jig VCO — pinned in pure). Opt-in clamp: `DCENT_BM1370_JIG_VCO_CLAMP=1`.
+const PLL_VCO_MIN_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MIN_MHZ;
+const PLL_VCO_MAX_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MAX_MHZ;
+const PLL_VCO_MAX_REFDIV1_MHZ: f64 = dcentrald_common::BM1370_JIG_VCO_MAX_REFDIV1_MHZ;
 
 /// Frequency ramp step size (MHz) — from ESP-Miner.
 const FREQ_RAMP_STEP: f64 = 6.25;
@@ -275,9 +257,8 @@ pub mod domain_voltage {
 // BM1370 register init values (from ESP-Miner bm1370.c + ASIC Register Bible)
 // ---------------------------------------------------------------------------
 
-/// Version rolling mask: 0x9000FFFF -> enable + full 16-bit rolling range.
-/// Register 0xA4 value: prefix 0x9000, mask 0xFFFF (version_mask >> 13).
-const VERSION_MASK_VALUE: u32 = 0x9000_FFFF;
+/// G28 pure SSOT: BIP-320 mask → reg 0xA4 (`version_rolling_reg_value`).
+const VERSION_MASK_VALUE: u32 = dcentrald_common::VERSION_ROLLING_REG_BIP320_DEFAULT;
 
 /// Reg_A8 broadcast init value.
 const REG_A8_BCAST: u32 = 0x0007_0000;
@@ -333,97 +314,42 @@ const DEFAULT_TICKET_DIFFICULTY: u32 = 256;
 
 /// Compute PLL parameters for a target frequency (MHz).
 ///
-/// BM1370 PLL register encoding (register 0x08):
-///   Byte 0: VDO_SCALE (0x40 if VCO < 2400 MHz, 0x50 if >= 2400 MHz)
-///   Byte 1: FBDIV (feedback divider, range 160-239)
-///   Byte 2: REFDIV (reference divider, typically 1 or 2)
-///   Byte 3: POSTDIV = ((POSTDIV1-1) & 0x0F) << 4 | ((POSTDIV2-1) & 0x0F)
-///
-/// Frequency formula: freq = 25 MHz * FBDIV / (REFDIV * POSTDIV1 * POSTDIV2)
-///
-/// Uses brute-force search from ESP-Miner pll_get_parameters():
-///   refdiv: 1 or 2
-///   postdiv1: 1..7, postdiv2: 1..7, postdiv1 > postdiv2
-///   Priority: closest freq, then lowest VCO, then lowest postdiv product
+/// G29: thin-wrap pure `dcentrald_common::resolve_bm1370_pll_mhz` (ESP-Miner
+/// EspMinerFull ranking). Optional Bitmain-jig VCO clamp is **EXPERIMENTAL**
+/// and env-gated default-OFF via [`JIG_VCO_CLAMP_ENV`].
 fn compute_pll_params(target_mhz: f64) -> (u8, u8, u8, u8, u8) {
-    // Default path: unclamped, byte-identical to ESP-Miner (proven on BitAxe
-    // BM1370). The optional Bitmain-jig VCO clamp is gated; see
-    // `compute_pll_params_inner` + `JIG_VCO_CLAMP_ENV`.
     let clamp = std::env::var(JIG_VCO_CLAMP_ENV).as_deref() == Ok("1");
     compute_pll_params_inner(target_mhz, clamp)
 }
 
 /// Env gate: constrain the BM1370 PLL search to the **Bitmain S21 Pro jig**
-/// VCO lock range ([`PLL_VCO_MIN_MHZ`]..=[`PLL_VCO_MAX_MHZ`], ≤
-/// [`PLL_VCO_MAX_REFDIV1_MHZ`] at REFDIV=1).
+/// VCO lock range (pure `Bm1370VcoPolicy::BitmainJigClamp`).
 ///
-/// **Default OFF.** Off = byte-identical to ESP-Miner (proven on BitAxe BM1370,
-/// VCO unconstrained). For the **operating range (≈400–700 MHz) the clamp is a
-/// no-op** — the "lowest VCO" tie-break already lands those on REFDIV=2 / VCO
-/// 2000–2600 (in jig range). It ONLY changes the **low-frequency ramp steps**
-/// (≈56–150 MHz): unclamped, the search prefers a REFDIV=1 / VCO 4000–5975
-/// config (strictly closer to target) that is OUTSIDE the BM1370's jig-specified
-/// VCO lock range — which, if the jig's range is the true silicon limit, would
-/// fail to lock mid-ramp. ESP-Miner/BitAxe apparently tolerates the higher VCO;
-/// the S21 Pro jig constrains tighter. Set `=1` for an S21-Pro live A/B if the
-/// ramp shows PLL-lock issues. Resolving which range is the true BM1370 limit
-/// needs that live test — RE-ASK-BM1370-RAMP-VCO.
+/// **Default OFF.** Off = pure EspMinerUnclamped (BitAxe-proven). Set `=1` for
+/// S21-Pro live A/B if ramp shows PLL-lock issues (RE-ASK-BM1370-RAMP-VCO).
 const JIG_VCO_CLAMP_ENV: &str = "DCENT_BM1370_JIG_VCO_CLAMP";
 
-/// `true` iff `vco` is inside the Bitmain S21 Pro jig's accepted VCO range for
-/// the given `refdiv` (jig `get_pllparam_divider`).
+/// Pure SSOT for jig VCO membership (G29).
+#[inline]
 fn vco_in_jig_range(vco: f64, refdiv: u8) -> bool {
-    let cap = if refdiv == 1 {
-        PLL_VCO_MAX_REFDIV1_MHZ
-    } else {
-        PLL_VCO_MAX_MHZ
-    };
-    (PLL_VCO_MIN_MHZ..=PLL_VCO_MAX_MHZ).contains(&vco) && vco <= cap
+    dcentrald_common::bm1370_vco_in_jig_range(vco, refdiv)
 }
 
+/// G29: pure search + policy (no open-coded FB_DIV loop).
 fn compute_pll_params_inner(target_mhz: f64, clamp_vco: bool) -> (u8, u8, u8, u8, u8) {
-    let mut best_fb: u8 = FB_DIV_MIN as u8;
-    let mut best_ref: u8 = 1;
-    let mut best_pd1: u8 = 1;
-    let mut best_pd2: u8 = 1;
-    let mut best_diff: f64 = f64::MAX;
-    let mut best_vco: f64 = f64::MAX;
-
-    for refdiv in 1u8..=2 {
-        for postdiv1 in 1u8..=7 {
-            for postdiv2 in 1u8..=postdiv1 {
-                // postdiv1 must be >= postdiv2 (ESP-Miner constraint: postdiv1 > postdiv2,
-                // but we allow equal for the case where both are 1)
-                if postdiv1 < postdiv2 {
-                    continue;
-                }
-                for fb_div in FB_DIV_MIN..=FB_DIV_MAX {
-                    let freq = FREQ_MULT * fb_div as f64
-                        / (refdiv as f64 * postdiv1 as f64 * postdiv2 as f64);
-                    let diff = (freq - target_mhz).abs();
-                    let vco = FREQ_MULT * fb_div as f64 / refdiv as f64;
-
-                    // Bitmain-jig VCO clamp (opt-in): never select a config the
-                    // jig would reject as out-of-VCO-lock-range.
-                    if clamp_vco && !vco_in_jig_range(vco, refdiv) {
-                        continue;
-                    }
-
-                    if diff < best_diff || (diff == best_diff && vco < best_vco) {
-                        best_diff = diff;
-                        best_vco = vco;
-                        best_fb = fb_div as u8;
-                        best_ref = refdiv;
-                        best_pd1 = postdiv1;
-                        best_pd2 = postdiv2;
-                    }
-                }
-            }
-        }
-    }
-
-    let vdo_scale: u8 = if best_vco >= 2400.0 { 0x50 } else { 0x40 };
-    (vdo_scale, best_fb, best_ref, best_pd1, best_pd2)
+    let policy = if clamp_vco {
+        dcentrald_common::Bm1370VcoPolicy::BitmainJigClamp
+    } else {
+        dcentrald_common::Bm1370VcoPolicy::EspMinerUnclamped
+    };
+    let (_sol, d) = dcentrald_common::resolve_bm1370_pll_mhz(target_mhz, policy);
+    (
+        d.vco_scale,
+        d.fb_div as u8,
+        d.ref_div,
+        d.post_div1,
+        d.post_div2,
+    )
 }
 
 /// Encode PLL parameters into a 32-bit register value (big-endian on wire).
@@ -484,6 +410,40 @@ impl Bm1370Driver {
         chain.write_cmd(w1);
     }
 
+    /// G20: ESP-Miner-faithful MiscCtrl **single** broadcast (pure SSOT).
+    /// S21 Pro dump uses one write of 0xF000_C100 — not the BM1362 triple.
+    fn misc_ctrl_single_write_broadcast(chain: &mut FpgaChain, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_broadcast(value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
+    }
+
+    /// G20: ESP-Miner-faithful MiscCtrl **single** per-chip (pure SSOT).
+    fn misc_ctrl_single_write_chip(chain: &mut FpgaChain, chip_addr: u8, value: u32) {
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_misc_ctrl_single_write_chip(chip_addr, value) {
+            if let dcentrald_common::TransportOp::SendWriteRegBm1397Plus {
+                chip_addr: addr,
+                reg,
+                value,
+            } = op
+            {
+                Self::write_reg_single(chain, addr, reg, value);
+            }
+        }
+    }
+
     /// Run the BM1370-specific init sequence after enumeration and address assignment.
     ///
     /// This implements the 14-step init sequence documented in ESP-Miner bm1370.c
@@ -491,11 +451,8 @@ impl Bm1370Driver {
     fn run_init_sequence(chain: &mut FpgaChain, chip_count: u8, freq_mhz: u16) -> Result<()> {
         use std::time::Duration;
 
-        let addr_interval = if chip_count > 0 {
-            256u16 / chip_count as u16
-        } else {
-            256
-        };
+        // P1-3: full-population stride SSOT (not open-coded 256/N).
+        let addr_interval = dcentrald_common::bm1397plus_addr_interval(chip_count);
 
         // ── Rank 50 (goldmine ranks-40-50, 2026-06-10) — jig "Stage-1" SRST release,
         // VERIFIED + DEFERRED to DCENT_EE (NOT implemented here). The S21pro jig
@@ -515,15 +472,40 @@ impl Bm1370Driver {
         // up. Source: goldmine `deliverables/RANKS_40_50_DESK_RE.md` (rank 50 / B08).
 
         // Step 1: Set version mask (3 times) — primes the version rolling hardware.
-        for i in 0..3 {
-            Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, VERSION_MASK_VALUE);
-            std::thread::sleep(Duration::from_millis(10));
-            tracing::debug!("Version mask write {}/3", i + 1);
+        // G21 pure SSOT (ESP-Miner BM1370 ×3; 10 ms inter-write dwell is engine residual).
+        debug_assert_eq!(
+            regs::VERSION_ROLLING,
+            dcentrald_common::VERSION_ROLLING_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_version_rolling_broadcast_writes(
+            VERSION_MASK_VALUE,
+            dcentrald_common::VERSION_ROLLING_TRIPLE_COUNT,
+            10,
+        ) {
+            match op {
+                dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                    Self::write_reg_broadcast(chain, reg, value);
+                }
+                dcentrald_common::TransportOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(Duration::from_millis(u64::from(ms)));
+                    }
+                }
+                _ => {}
+            }
         }
+        tracing::debug!("Version mask write 3/3 (pure plan)");
 
         // Step 2: Read chip IDs is done by the caller (enumerate phase).
-        // Step 3: Version mask (one more time, 4th total).
-        Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, VERSION_MASK_VALUE);
+        // Step 3: Version mask (one more time, 4th total — ESP-Miner single; G23 pure).
+        for op in dcentrald_common::plan_version_rolling_single_write_broadcast(VERSION_MASK_VALUE)
+        {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
         std::thread::sleep(Duration::from_millis(10));
         tracing::debug!("Version mask write 4/4");
 
@@ -536,7 +518,8 @@ impl Bm1370Driver {
         );
 
         // Step 5: Misc Control (broadcast) — S21 Pro value.
-        Self::write_reg_broadcast(chain, regs::MISC_CONTROL, MISC_CTRL_BCAST);
+        // G20 pure single-write (ESP-Miner S21 Pro; not BM1362 triple cadence).
+        Self::misc_ctrl_single_write_broadcast(chain, MISC_CTRL_BCAST);
         std::thread::sleep(Duration::from_millis(10));
         tracing::debug!(
             value = format_args!("0x{:08X}", MISC_CTRL_BCAST),
@@ -586,13 +569,11 @@ impl Bm1370Driver {
             chip_count,
             addr_interval,
         );
-        for i in 0..chip_count {
-            let addr = (i as u16 * addr_interval) as u8;
-
+        for addr in dcentrald_common::linear_chip_addresses(chip_count, addr_interval) {
             // a) Reg_A8
             Self::write_reg_single(chain, addr, regs::REG_A8, REG_A8_PER_CHIP);
             // b) Misc Control
-            Self::write_reg_single(chain, addr, regs::MISC_CONTROL, MISC_CTRL_PER_CHIP);
+            Self::misc_ctrl_single_write_chip(chain, addr, MISC_CTRL_PER_CHIP);
             // c) Core Register Control #1
             Self::write_reg_single(chain, addr, regs::CORE_REG_CTRL, CORE_REG_1);
             // d) Core Register Control #2 (BM1370: 0x800C)
@@ -688,8 +669,15 @@ impl Bm1370Driver {
             "Hash Counting Number set (S21 Pro stock default)",
         );
 
-        // Final: Set version mask one more time to ensure it's active.
-        Self::write_reg_broadcast(chain, regs::VERSION_ROLLING, VERSION_MASK_VALUE);
+        // Final: Set version mask one more time to ensure it's active (G23 pure single).
+        for op in dcentrald_common::plan_version_rolling_single_write_broadcast(VERSION_MASK_VALUE)
+        {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
         std::thread::sleep(Duration::from_millis(10));
         tracing::debug!("Final version mask set");
 
@@ -775,8 +763,12 @@ impl ChipDriver for Bm1370Driver {
         );
 
         // Step 2: Switch FPGA baud to match.
-        // FPGA baud for 1 Mbps: FPGA_CLK / (16 * baud) - 1 = 200M / (16 * 1M) - 1 = 11.5 -> 11
-        let fpga_baud_1m = (fpga_chain::FPGA_CLK_HZ / (16 * 1_000_000)) - 1;
+        // FPGA baud for 1 Mbps: fabric / (16 * baud) - 1 = 200M / (16 * 1M) - 1 = 11
+        // W8 CLK-1: route through the parameterized helper (same value, pinned
+        // by `test_baud_reg`) instead of re-inlining the S9-scoped constant's
+        // math. `FPGA_CLK_HZ` is the S9 bitstream fabric — a non-S9 FIFO
+        // carrier must thread its own declared fabric here (CARRIER_FIFO_FABRIC).
+        let fpga_baud_1m = self.baud_reg_value(1_000_000, fpga_chain::FPGA_CLK_HZ);
         chain.set_baud(fpga_baud_1m);
         std::thread::sleep(std::time::Duration::from_millis(100));
         tracing::info!(
@@ -861,17 +853,16 @@ impl ChipDriver for Bm1370Driver {
     }
 
     fn set_voltage(&self, _pic: &mut PicController, _voltage_mv: u16) -> Result<()> {
-        // S21 Pro uses NoPic/LDO voltage control — NO PIC microcontroller.
-        // Voltage is controlled via TAS5782M audio DACs repurposed as voltage
-        // controllers, accessed over I2C. The PicController is not used.
-        //
-        // TODO: Implement TAS5782M I2C DAC voltage control.
-        tracing::warn!(
-            "BM1370: set_voltage() not yet implemented — S21 Pro uses TAS5782M DAC, not PIC",
-        );
-        Err(crate::AsicError::InvalidParameter(
-            "BM1370/S21 Pro uses TAS5782M DAC for voltage control, not PIC".into(),
-        ))
+        // S21 Pro uses NoPic/LDO (TAS5782M) — not PicController ChipDriver.
+        // ADR-0010 / P1-2 pure SSOT refuses this path; TAS5782M VoltageRail
+        // adapter remains the EXPERIMENTAL follow-up (not silent Ok).
+        dcentrald_common::chip_driver_set_voltage_admission(
+            dcentrald_common::AsicProtocolIdentity::Bm1370,
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "BM1370::set_voltage refused by VoltageOwnership SSOT");
+            crate::AsicError::InvalidParameter(e.to_string())
+        })
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -1029,9 +1020,11 @@ impl ChipDriver for Bm1370Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BM1370 uses simple (difficulty - 1) encoding (same as BM1366/BM1368).
-        // The bit-reversal used by BM1387 is NOT needed for BM1366+ chips.
-        difficulty.saturating_sub(1)
+        // G24 pure SSOT: industrial plain (diff-1); not BM1387 bit-reverse.
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

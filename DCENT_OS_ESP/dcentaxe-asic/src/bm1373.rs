@@ -20,7 +20,14 @@
 // freq constant value.
 #![allow(dead_code, unused_imports, unused_variables)]
 //
-// Chip ID: 0x1373 (projected)
+// Chip ID: 0x1372 OR 0x1373 — PROVEN from the Hammer vendor corpus 2026-07-27
+//: real BM1373 silicon reports
+// 0x1372, not the part number. `Thor-BC04.img` v1.0.0 hardcodes 0x1373 only;
+// `bc04-3.0.1.img` (built 12 days later) carries 0x1372 only; `bc01-miner`
+// carries 0x1370 and 0x1372 adjacent in its chip table. The vendor started from
+// the part number, found the silicon disagreed, and widened its accept logic to
+// a range test admitting both. We do the same: enumeration must accept BOTH ids
+// via `chip_id_accepted()` — never a single hardcode.
 // Response length: 11 bytes (same as BM1370)
 // Job packet: 82-byte payload (same as BM1366/BM1368/BM1370)
 // Job ID increment: TBD (BM1370 uses +16, BM1368 uses +24 via FPGA, +8 via serial)
@@ -41,8 +48,25 @@ use crate::crc::{crc16_false, crc5};
 use crate::pll::{self, FREQ_MULT};
 use crate::serial::SerialPort;
 
-const CHIP_ID: u16 = 0x1373;
+/// Chip id real BM1373 silicon reports in register 0x00 (PROVEN — see the
+/// evidence block in the file header; `bc04-3.0.1` + `bc01-miner` corpus).
+const CHIP_ID_SILICON: u16 = 0x1372;
+/// Part-number chip id the vendor's first firmware assumed (`Thor-BC04` v1.0.0
+/// hardcoded this before the silicon corrected them). Kept accepted in case a
+/// stepping ever does report the part number.
+const CHIP_ID_PART_NUMBER: u16 = 0x1373;
 const CHIP_ID_RESPONSE_LENGTH: usize = 11;
+
+/// Chip-id accept test for BM1373 enumeration.
+///
+/// Mirrors the vendor's own fix: `bc01-miner`/`bc04-3.0.1` widened their accept
+/// logic to a range test admitting both 0x1372 (what the silicon actually
+/// reports) and 0x1373 (the part number). Any future enumeration code in this
+/// scaffold MUST route chip-id comparison through this function — do not
+/// reintroduce a single `== CHIP_ID` hardcode.
+pub(crate) const fn chip_id_accepted(id: u16) -> bool {
+    matches!(id, CHIP_ID_SILICON | CHIP_ID_PART_NUMBER)
+}
 
 /// Register map for BM1373 (PROJECTED from BM1370 — verify on hardware)
 fn register_type_for(addr: u8) -> RegisterType {
@@ -226,5 +250,43 @@ impl crate::AsicDriver for BM1373 {
     fn set_max_baud(&mut self) -> Result<u32, AsicError> {
         log::warn!("BM1373 set_max_baud: SCAFFOLD — not yet implemented");
         Err(scaffold_disabled("set_max_baud"))
+    }
+}
+
+#[cfg(test)]
+mod chip_id_evidence {
+    use super::*;
+
+    // ── PROVEN chip identity (BM1373_DOSSIER.md, 2026-07-27): real silicon
+    // reports 0x1372; the part number is 0x1373; the vendor's own firmware
+    // widened its accept logic to admit BOTH after the silicon disagreed with
+    // the Thor-BC04 v1.0.0 assumption. Pin the accept set exactly so neither
+    // a "swap back to one hardcode" regression nor an accidental widening to
+    // unrelated chips (0x1370 is a DIFFERENT chip) can land silently. ──
+    #[test]
+    fn bm1373_accepts_both_silicon_and_part_number_chip_ids() {
+        assert!(
+            chip_id_accepted(0x1372),
+            "real BM1373 silicon reports 0x1372 (bc04-3.0.1 / bc01-miner) — must be accepted"
+        );
+        assert!(
+            chip_id_accepted(0x1373),
+            "part-number id 0x1373 (Thor-BC04 v1.0.0 assumption) — must stay accepted"
+        );
+        assert_eq!(CHIP_ID_SILICON, 0x1372);
+        assert_eq!(CHIP_ID_PART_NUMBER, 0x1373);
+    }
+
+    #[test]
+    fn bm1373_rejects_other_chip_ids() {
+        for other in [
+            0x0000u16, 0x1366, 0x1368, 0x1370, 0x1371, 0x1374, 0x1397, 0xFFFF,
+        ] {
+            assert!(
+                !chip_id_accepted(other),
+                "chip id {other:#06x} must NOT be accepted by the BM1373 driver \
+                 (0x1370 in particular is a different chip)"
+            );
+        }
     }
 }

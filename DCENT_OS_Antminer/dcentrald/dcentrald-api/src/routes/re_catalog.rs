@@ -637,6 +637,7 @@ async fn get_eeprom_bhb_skus() -> Json<serde_json::Value> {
         "BHB42831",
         "BHB56902",
         "BHB68xxx",
+        "A3HB40601",
         "A3HB7xxxx",
     ]
     .iter()
@@ -665,9 +666,19 @@ async fn get_eeprom_bhb_skus() -> Json<serde_json::Value> {
                 "families": "BHB42xxx, including BHB426xx and BHB428xx",
             },
             {
+                // Format 5 is XXTEA (closed byte-exact), NOT AES. The
+                // "x21_aes" token is a legacy dispatch name only.
                 "bytes": [0x05u8, 0x11],
-                "variant": "x21_aes",
-                "families": "BHB56xxx, BHB68xxx, A3HB7xxxx",
+                "variant": "edf_v5_xxtea",
+                "families": "BHB56xxx, BHB68xxx",
+            },
+            {
+                // A3HB-prefixed S21 Pro/XP boards (BM1370) are format 1, NOT
+                // format 5. 0x41 is board_name[0] ('A'), not a key selector.
+                // Not dispatched by eeprom_record::dispatch() (separate item).
+                "bytes": [0x01u8, 0x41],
+                "variant": "format1_plaintext_name",
+                "families": "A3HB4xxxx, A3HB7xxxx",
             },
             {
                 "bytes": [b'B', b'r'],
@@ -1141,6 +1152,36 @@ mod tests {
             .expect("BHB42801 example");
 
         assert_eq!(bhb42801["chip_family"].as_str(), Some("BM1366"));
+    }
+
+    #[tokio::test]
+    async fn eeprom_catalog_a3hb_is_format1_not_edf_v5() {
+        let Json(body) = get_eeprom_bhb_skus().await;
+
+        // A3HB40601 was silently unresolved before the A3HB4 catalog row.
+        let examples = body["lookup_examples"]
+            .as_array()
+            .expect("lookup examples array");
+        let a3hb40601 = examples
+            .iter()
+            .find(|entry| entry["sku"] == "A3HB40601")
+            .expect("A3HB40601 example");
+        assert_eq!(a3hb40601["chip_family"].as_str(), Some("BM1370"));
+        assert_eq!(a3hb40601["recognized"].as_bool(), Some(true));
+
+        // The 0x05 (format 5) families must no longer claim A3HB7xxxx; A3HB is
+        // format 1 (0x01 0x41).
+        let preambles = body["preambles"].as_array().expect("preambles array");
+        let fmt5 = preambles
+            .iter()
+            .find(|p| p["bytes"][0].as_u64() == Some(0x05))
+            .expect("format 5 preamble");
+        assert!(!fmt5["families"].as_str().unwrap().contains("A3HB"));
+        let fmt1 = preambles
+            .iter()
+            .find(|p| p["bytes"][0].as_u64() == Some(0x01))
+            .expect("format 1 preamble");
+        assert!(fmt1["families"].as_str().unwrap().contains("A3HB"));
     }
 
     #[tokio::test]

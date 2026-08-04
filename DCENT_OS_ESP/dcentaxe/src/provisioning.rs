@@ -548,6 +548,13 @@ fn build_submission(
         board_model: resolved_model.canonical_key().to_string(),
         board_version: resolved_profile.board_version.to_string(),
         asic_model: resolved_profile.asic_model.to_string(),
+        // Provisioning is operator-driven: the model was chosen explicitly and
+        // already validated, so there is no vendor `minermodel` signal to carry
+        // and no unresolved identity to refuse on.
+        miner_model: String::new(),
+        // Both derived during canonicalization.
+        anonymous_subscribe: false,
+        identity_refusal: None,
         hostname: String::new(),
         target_frequency: resolved_board.default_frequency,
         target_voltage_mv: resolved_board.default_voltage_mv,

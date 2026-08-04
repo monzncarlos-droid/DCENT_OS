@@ -16,9 +16,14 @@
 //! sequence as a pure list of `(chain_id, delay_ms)` pairs that the runtime
 //! adapter executes via the platform's GPIO/PMBus HAL.
 //!
-//! This module is **pure logic, no HAL**: it produces a schedule, never
-//! actually waits or asserts GPIOs. Tests pin the schedule shape against
-//! the bosminer-observed cadence.
+//! # SSOT (Constitution offline cycle 2026-07-22)
+//!
+//! Absolute schedule math, production refuse, and inter-step deltas live in
+//! [`dcentrald_common::powerup_schedule`]. This module is a **serde-bearing
+//! façade** so profile/export call sites keep `Serialize` steps without
+//! forking the brownout policy. Prefer
+//! [`dcentrald_common::plan_production_powerup`] or
+//! [`plan_production_powerup`] at energize call sites.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +52,26 @@ pub struct StaggerConfig {
 impl Default for StaggerConfig {
     fn default() -> Self {
         Self {
-            stagger_ms: 250,
+            stagger_ms: dcentrald_common::DEFAULT_CHAIN_STAGGER_MS,
             psu_warmup_ms: 0,
+        }
+    }
+}
+
+impl From<StaggerConfig> for dcentrald_common::StaggerConfig {
+    fn from(c: StaggerConfig) -> Self {
+        Self {
+            stagger_ms: c.stagger_ms,
+            psu_warmup_ms: c.psu_warmup_ms,
+        }
+    }
+}
+
+impl From<dcentrald_common::PowerUpStep> for PowerUpStep {
+    fn from(s: dcentrald_common::PowerUpStep) -> Self {
+        Self {
+            at_ms: s.at_ms,
+            chain_id: s.chain_id,
         }
     }
 }
@@ -59,49 +82,45 @@ impl Default for StaggerConfig {
 /// first at `psu_warmup_ms`, chain 1 at `psu_warmup_ms + stagger_ms`, etc.
 ///
 /// `chain_count` of 0 returns an empty schedule. `stagger_ms = 0` collapses
-/// to a single-step burst (all chains at `psu_warmup_ms`).
+/// to a single-step burst (all chains at `psu_warmup_ms`). Production paths
+/// must not use zero stagger for multi-chain — use [`plan_production_powerup`].
 pub fn plan_powerup(chain_count: u8, config: StaggerConfig) -> Vec<PowerUpStep> {
-    if chain_count == 0 {
-        return Vec::new();
-    }
-    (0..chain_count)
-        .map(|chain_id| PowerUpStep {
-            at_ms: config
-                .psu_warmup_ms
-                .saturating_add(config.stagger_ms.saturating_mul(chain_id as u32)),
-            chain_id,
-        })
+    dcentrald_common::plan_powerup(chain_count, config.into())
+        .into_iter()
+        .map(PowerUpStep::from)
         .collect()
 }
 
 /// Total schedule duration including the last chain's settling time
 /// (defaults to one extra `stagger_ms` past the last enable).
 pub fn schedule_duration_ms(chain_count: u8, config: StaggerConfig) -> u32 {
-    if chain_count == 0 {
-        return 0;
-    }
-    config
-        .psu_warmup_ms
-        .saturating_add(config.stagger_ms.saturating_mul(chain_count as u32))
+    dcentrald_common::schedule_duration_ms(chain_count, config.into())
 }
 
 /// Verify that two consecutive steps' delta meets a minimum spacing
 /// requirement. Caller can use this as a pre-flight assertion when
 /// loading a schedule from config.
 pub fn validate_minimum_spacing(steps: &[PowerUpStep], min_gap_ms: u32) -> Result<(), String> {
-    if steps.len() < 2 {
-        return Ok(());
-    }
-    for window in steps.windows(2) {
-        let gap = window[1].at_ms.saturating_sub(window[0].at_ms);
-        if gap < min_gap_ms {
-            return Err(format!(
-                "stagger gap between chain {} and chain {} is {}ms, below minimum {}ms",
-                window[0].chain_id, window[1].chain_id, gap, min_gap_ms
-            ));
-        }
-    }
-    Ok(())
+    let common_steps: Vec<dcentrald_common::PowerUpStep> = steps
+        .iter()
+        .map(|s| dcentrald_common::PowerUpStep {
+            at_ms: s.at_ms,
+            chain_id: s.chain_id,
+        })
+        .collect();
+    dcentrald_common::validate_schedule_gaps(&common_steps, min_gap_ms).map_err(|e| e.to_string())
+}
+
+/// Production multi-chain plan: refuse simultaneous burst, return sleep/enable deltas.
+///
+/// Thin façade over [`dcentrald_common::plan_production_powerup`] so engines that
+/// already depend on silicon-profiles get the fail-closed gate without a second
+/// import path forking policy.
+pub fn plan_production_powerup(
+    chain_count: u8,
+    config: StaggerConfig,
+) -> Result<Vec<(u8, u32)>, dcentrald_common::PowerUpPolicyError> {
+    dcentrald_common::plan_production_powerup(chain_count, config.into())
 }
 
 #[cfg(test)]
@@ -113,6 +132,7 @@ mod tests {
         // Phase 13D RE: 250 ms stagger between chains.
         let cfg = StaggerConfig::default();
         assert_eq!(cfg.stagger_ms, 250);
+        assert_eq!(cfg.stagger_ms, dcentrald_common::DEFAULT_CHAIN_STAGGER_MS);
     }
 
     #[test]
@@ -199,8 +219,23 @@ mod tests {
             },
         );
         let err = validate_minimum_spacing(&steps, 200).unwrap_err();
-        assert!(err.contains("100ms"));
-        assert!(err.contains("below minimum 200ms"));
+        // Exact text, not an `|| contains("100")` escape hatch. A weakened OR
+        // arm is unconditionally satisfied by the first arm's own substring and
+        // would silently accept a reworded brownout error.
+        //
+        // The two substrings asserted below ARE preserved across delegation to
+        // `dcentrald_common::PowerUpPolicyError::InsufficientGap`, but the full
+        // message is NOT byte-identical to the pre-delegation one: the literal
+        // `chain ` before the second id was dropped
+        // (`powerup_schedule.rs:95` renders `...between chain 0 and 1 is...`,
+        // where the old local format produced `...between chain 0 and chain 1
+        // is...`). So do NOT tighten this to `assert_eq!` on the whole message
+        // or add a `contains("and chain ")` arm — either would fail.
+        assert!(err.contains("100ms"), "unexpected gap error text: {err}");
+        assert!(
+            err.contains("below minimum 200ms"),
+            "unexpected minimum text: {err}"
+        );
     }
 
     #[test]
@@ -227,5 +262,26 @@ mod tests {
         assert_eq!(steps[0].at_ms, u32::MAX);
         assert_eq!(steps[1].at_ms, u32::MAX);
         assert_eq!(steps[2].at_ms, u32::MAX);
+    }
+
+    #[test]
+    fn production_facade_refuses_burst_and_matches_common() {
+        assert!(plan_production_powerup(
+            2,
+            StaggerConfig {
+                stagger_ms: 0,
+                psu_warmup_ms: 0
+            }
+        )
+        .is_err());
+        let delays = plan_production_powerup(3, StaggerConfig::default()).unwrap();
+        assert_eq!(
+            delays,
+            dcentrald_common::plan_production_powerup(
+                3,
+                dcentrald_common::StaggerConfig::default()
+            )
+            .unwrap()
+        );
     }
 }

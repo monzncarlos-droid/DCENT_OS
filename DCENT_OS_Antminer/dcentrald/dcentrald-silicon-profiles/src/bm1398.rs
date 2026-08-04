@@ -122,9 +122,8 @@ pub const BM1398_MISCCTRL_BAUD_VALUE: u32 = 0x0000_6031;
 // repair jig: 25 MHz reference; refdiv order 2 then 1; fbdiv 16..=250;
 // postdivs 1..=7 with postdiv1 >= postdiv2; VCO 2000..=3200 MHz and a
 // refdiv-1 ceiling of 3125 MHz. The family stores raw post-divider values in
-// register 0x08. The canonical host-safe resolver lives in
-// `dcentrald_api_types::bm13xx_pll`; this module keeps the silicon-profile
-// compatibility surface while delegating its search there.
+// register 0x08. G19 pure SSOT lives in `dcentrald_common::resolve_bm1398_pll`
+// (25 MHz stock crystal); this module keeps the silicon-profile surface.
 // ===========================================================================
 
 /// Reference clock for the BM1398 PLL, in MHz. Stock S19 / S19 Pro
@@ -282,6 +281,17 @@ impl PllParams {
 pub fn pll_compute(target_mhz: u32, ref_mhz: u32) -> Option<PllParams> {
     let target_mhz = u16::try_from(target_mhz).ok()?;
     let ref_mhz = u16::try_from(ref_mhz).ok()?;
+    // G19: stock 25 MHz crystal uses common pure SSOT (no forked search).
+    if ref_mhz == dcentrald_common::BM1398_CLKI_MHZ {
+        let (_, div) = dcentrald_common::resolve_bm1398_pll(target_mhz)?;
+        return Some(PllParams {
+            refdiv: div.ref_div,
+            fbdiv: div.fb_div,
+            postdiv1: div.post_div1,
+            postdiv2: div.post_div2,
+        });
+    }
+    // Lab non-25 MHz crystal only: documented envelope with alternate ref.
     let resolved = dcentrald_api_types::bm1398_protocol::BM1398_PLL_SEARCH_SPEC
         .with_reference_mhz(ref_mhz)
         .resolve(target_mhz)?;

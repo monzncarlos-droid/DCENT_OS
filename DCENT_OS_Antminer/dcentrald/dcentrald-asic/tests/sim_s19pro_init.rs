@@ -1,19 +1,23 @@
 #![cfg(feature = "sim-hal")]
 
-use dcentrald_asic::drivers::ChipRegistry;
+use dcentrald_asic::drivers::{ChipDriverMaturity, ChipRegistry};
 use dcentrald_hal::fpga_chain::{FpgaChain, BAUD_REG_115200};
 use dcentrald_hal::platform::sim::{SimModel, TraceEvent};
 
 /// First real-driver simulator proof on the staged path to T2.
 ///
-/// This is intentionally not called a golden/T3 test: it proves the production
-/// registry's BM1398 driver can execute its full init sequence against a
+/// This is intentionally not called a golden/T3 test: it proves the explicitly
+/// admitted Experimental BM1398 driver can execute its full init sequence against a
 /// device-free `FpgaChain`, but it does not yet compare against a provenance
 /// vector or submit a share through MockV1Pool.
 #[test]
-fn production_bm1398_driver_completes_s19pro_init_on_simulated_fpga() {
-    let registry = ChipRegistry::production();
-    let driver = registry.detect(0x1398).expect("production BM1398 driver");
+fn experimental_bm1398_driver_completes_s19pro_init_on_simulated_fpga() {
+    let registry = ChipRegistry::with_experimental_driver(0x1398);
+    let recognition = registry.recognize(0x1398).expect("known BM1398 identity");
+    assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
+    let driver = registry
+        .detect(0x1398)
+        .expect("explicitly admitted Experimental BM1398 driver");
     let mut chain =
         FpgaChain::open_sim_for_model(1, SimModel::S19Pro).expect("device-free S19 Pro FPGA chain");
 

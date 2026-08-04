@@ -272,20 +272,37 @@ impl SelfTestRunner {
         // invisible to the `actual < expected` check. Requiring real nonces makes
         // the PASS evidence-gated: it means every expected chip is genuinely
         // hashing, not merely on the bus.
+        //
+        // LV08 9-chip scaling (SPEC §5): `per_chip` is a fixed `MAX_CHIPS`-wide
+        // CAPACITY array, not a chip count. It used to be 6 slots wide, so on a
+        // 9-chip board `healthy` could never reach `expected = 9` and this step
+        // reported a permanent false FAIL on perfectly healthy hardware.
+        // `MAX_CHIPS` is now 16, but the array is still WIDER than any real
+        // chain — so the scan must be bounded to `expected` slots. Counting all
+        // 16 would let a phantom slot (the one-past `asic_nr = 9` decode the
+        // 28-address interval produces for raw nonce bytes 252..=255) stand in
+        // for a genuinely dark chip and turn a deficit into a false PASS.
         {
             let (expected, healthy, error_only) = {
                 let cfg = state.config.lock();
                 let expected = cfg.as_ref().map(|c| c.asic_count).unwrap_or(1) as u32;
+                let scan = asic_chain_scan_width(expected);
                 let (healthy, error_only) = state
                     .stats
                     .lock()
                     .map(|s| {
-                        let healthy = s.per_chip.iter().filter(|c| c.nonces > 0).count() as u32;
+                        let healthy = s
+                            .per_chip
+                            .iter()
+                            .take(scan)
+                            .filter(|c| c.nonces > 0)
+                            .count() as u32;
                         // Chips on the bus that have ONLY produced errors so far —
                         // surfaced in the detail so a half-broken chain is visible.
                         let error_only = s
                             .per_chip
                             .iter()
+                            .take(scan)
                             .filter(|c| c.nonces == 0 && c.errors > 0)
                             .count() as u32;
                         (healthy, error_only)
@@ -461,6 +478,26 @@ pub(crate) fn asic_chain_is_healthy(expected: u32, healthy_chips: u32) -> bool {
     healthy_chips > 0 && healthy_chips >= expected
 }
 
+/// LV08 9-chip scaling (SPEC §5): how many `stats.per_chip` slots the ASIC-chain
+/// step may scan for a board declaring `expected` chips.
+///
+/// `per_chip` is a fixed `MAX_CHIPS`-wide CAPACITY array (16), always at least
+/// one slot WIDER than any real chain. Two failure modes this bounds:
+///
+/// * **too narrow** — the pre-LV08 6-slot array meant `healthy` could never
+///   reach `expected = 9`, so `asic_chain` reported a permanent false FAIL on a
+///   perfectly healthy LV08. Fixed by `MAX_CHIPS = 16`.
+/// * **too wide** — scanning all 16 slots would count the one-past `asic_nr`
+///   the 28-address interval yields for raw nonce bytes 252..=255 as a real
+///   chip, letting a phantom stand in for a dark chip (false PASS). Fixed by
+///   bounding the scan to `expected`.
+///
+/// Clamped to `MAX_CHIPS` so a bogus `asic_count` can never over-read, and to at
+/// least 1 so a zero/absent count still scans the first slot.
+pub(crate) fn asic_chain_scan_width(expected: u32) -> usize {
+    (expected.max(1) as usize).min(dcentaxe_mining::stats::MAX_CHIPS)
+}
+
 #[cfg(test)]
 mod liveness_contract {
     use super::*;
@@ -493,5 +530,65 @@ mod liveness_contract {
         // Some chips dark (healthy < expected) → NOT healthy.
         assert!(!asic_chain_is_healthy(6, 5));
         assert!(!asic_chain_is_healthy(2, 1));
+    }
+
+    // ── LV08 9-chip scaling (SPEC §5) ────────────────────────────────────────
+
+    /// The HARD BREAK this wave fixes: a fully healthy 9-chip LV08 must PASS.
+    /// Before `MAX_CHIPS` was raised the scan could only ever see 6 slots, so
+    /// `healthy >= expected` was false forever and `asic_chain` was a permanent
+    /// false FAIL on good hardware.
+    #[test]
+    fn nine_chip_board_with_nine_live_chips_passes() {
+        let scan = asic_chain_scan_width(9);
+        assert_eq!(scan, 9, "a 9-chip board must be able to scan 9 slots");
+        // Simulate the production count: 9 populated slots inside a 16-wide array.
+        let mut per_chip = [0u32; dcentaxe_mining::stats::MAX_CHIPS];
+        for slot in per_chip.iter_mut().take(9) {
+            *slot = 1; // one nonce each
+        }
+        let healthy = per_chip.iter().take(scan).filter(|n| **n > 0).count() as u32;
+        assert_eq!(healthy, 9);
+        assert!(
+            asic_chain_is_healthy(9, healthy),
+            "a fully healthy 9-chip LV08 must PASS the asic_chain step"
+        );
+    }
+
+    /// A dark chip on a 9-chip board still FAILS — and a phantom hit in the
+    /// one-past decode slot (`asic_nr = 9`, raw nonce bytes 252..=255 at the
+    /// 28-address interval) must NOT paper over it.
+    #[test]
+    fn phantom_one_past_slot_cannot_mask_a_dark_chip_on_nine() {
+        let scan = asic_chain_scan_width(9);
+        let mut per_chip = [0u32; dcentaxe_mining::stats::MAX_CHIPS];
+        for slot in per_chip.iter_mut().take(9) {
+            *slot = 1;
+        }
+        per_chip[3] = 0; // chip 3 is dark
+        per_chip[9] = 7; // phantom one-past decodes landed here
+        let healthy = per_chip.iter().take(scan).filter(|n| **n > 0).count() as u32;
+        assert_eq!(healthy, 8, "the phantom slot must not be counted");
+        assert!(
+            !asic_chain_is_healthy(9, healthy),
+            "a dark chip must still FAIL even with phantom one-past hits"
+        );
+    }
+
+    /// Scan width is bounded on both ends and unchanged for shipping boards.
+    #[test]
+    fn asic_chain_scan_width_is_bounded() {
+        assert_eq!(asic_chain_scan_width(1), 1); // Ultra/Supra/Gamma/Max
+        assert_eq!(asic_chain_scan_width(2), 2); // Duo/GT/LV07/BC02
+        assert_eq!(asic_chain_scan_width(6), 6); // Hex boards — unchanged
+        assert_eq!(asic_chain_scan_width(9), 9); // LV08
+
+        // Zero/absent count still scans one slot rather than none.
+        assert_eq!(asic_chain_scan_width(0), 1);
+        // A bogus count can never over-read the fixed array.
+        assert_eq!(
+            asic_chain_scan_width(250),
+            dcentaxe_mining::stats::MAX_CHIPS
+        );
     }
 }

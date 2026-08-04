@@ -1,5 +1,9 @@
 //! `Bm1397PlusChainBackend` — chain transport abstraction for BM1362-family chips.
 //!
+//! Pure twin (no HAL): `dcentrald_common::chain_transport::{TransportOp,ChainTransport}`
+//! — host-testable op language + recording adapter. Live execute-from-ops strangler
+//! is residual; do not invent a second method matrix here.
+//!
 //!  (2026-05-23) added a transport abstraction while investigating
 //! `a lab unit` chain-enum-0. Later live evidence corrected the FIFO hypothesis:
 //! `a lab unit` command/init traffic is on PL UARTs (`/dev/ttyS1` + `/dev/ttyS3`),

@@ -155,9 +155,13 @@ impl SimBoardProfile {
             S11 | S15 | T15 => (BoardType::Zynq, 0x1391, None, 9, 115_200),
             S17 | S17Pro => (BoardType::Zynq, 0x1397, Some(48), 9, 115_740),
             T17 => (BoardType::Zynq, 0x1397, Some(30), 9, 115_740),
-            S17Plus => (BoardType::Zynq, 0x1396, Some(65), 9, 115_740),
-            T17Plus => (BoardType::Zynq, 0x1396, Some(44), 9, 115_740),
-            S17e => (BoardType::Zynq, 0x1397, None, 9, 115_740),
+            // 2026-08-03 mapping correction (W8-G): the "+" variants carry
+            // BM1397 (0x1397); the "e" variants carry BM1396 (0x1396). The
+            // reversed pairing came from PR-056, now retracted. Chip COUNTS
+            // (S17+ 65/chain, T17+ 44/chain) are a separate fact and unchanged.
+            S17Plus => (BoardType::Zynq, 0x1397, Some(65), 9, 115_740),
+            T17Plus => (BoardType::Zynq, 0x1397, Some(44), 9, 115_740),
+            S17e => (BoardType::Zynq, 0x1396, None, 9, 115_740),
             // Plain-S19 geometry remains intentionally unknown: held sources
             // disagree on the 76-vs-114 chip hashboard hint.
             S19 => (BoardType::Zynq, 0x1398, None, 9, 115_740),

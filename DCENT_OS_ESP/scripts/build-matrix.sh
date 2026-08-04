@@ -41,9 +41,40 @@ if [ "$INCLUDE_INTERNAL_TARGETS" = "1" ]; then
     build_one bitaxe-gt-touch bitaxe-gt-touch
     build_one nerdnos nerdnos
     build_one nerdaxe nerdaxe
+    build_one nerdaxe-gamma nerdaxe-gamma
     build_one nerdqaxe-plus nerdqaxe-plus
     build_one nerdqaxe-pp nerdqaxe-pp
+    build_one nerdoctaxe-plus nerdoctaxe-plus
+    build_one nerdoctaxe-gamma nerdoctaxe-gamma
+    build_one nerdqx nerdqx
+    build_one nerdhaxe-gamma nerdhaxe-gamma
+    build_one nerdeko nerdeko
+    build_one q1370 q1370
+    build_one q1373 q1373
     build_one dcent-axe-bm1397 dcent-axe-bm1397
     build_one dcent-axe-quad-bm1397 dcent-axe-quad-bm1397
     build_one dcent-axe-hex-bm1397 dcent-axe-hex-bm1397
+    # 16 MB (N16R8) flash targets — Hammer BC0x/DC0x and Lucky LVxx all use the
+    # shared 16 MB layout (partitions-16mb.csv), so they build under one loop.
+    # Subshell keeps the sdkconfig override from leaking to other targets;
+    # cargo's .cargo/config.toml [env] entry does not override a variable
+    # already present in the environment, so the export below wins.
+    # PARTITIONS_CSV must be exported too: package-firmware.sh reads it to
+    # compute ota.slotSize / updateFitsSlot, and defaulting to the 8 MB
+    # partitions.csv would publish a manifest that lies about the slot.
+    #
+    # Lucky LVxx is EXPERIMENTAL — no Lucky hardware exists on any bench; these
+    # images are host-built and have never been flashed to a Lucky unit.
+    for flash16_target in \
+        hammer-bc01 hammer-bc01-pro hammer-bc02 hammer-bc04 \
+        hammer-dc02 hammer-dc04 hammer-dc06 \
+        lucky-lv06 lucky-lv07 lucky-lv08 \
+        bitforge-nano bitaxe-naja
+    do
+        (
+            export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.16mb"
+            export PARTITIONS_CSV="$ROOT_DIR/partitions-16mb.csv"
+            build_one "$flash16_target" "$flash16_target"
+        )
+    done
 fi

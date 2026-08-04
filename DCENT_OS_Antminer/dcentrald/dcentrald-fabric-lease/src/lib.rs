@@ -22,19 +22,33 @@
 //! constrain a privileged program that deliberately ignores the protocol, and
 //! it does not prove that power rails are safe after an owner crashes.
 
-use std::ffi::{CStr, CString};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::Path;
+
+#[cfg(unix)]
 const RUNTIME_ROOT: &str = "/run";
+#[cfg(unix)]
 const DCENTOS_RUNTIME_DIR: &CStr = c"dcentos";
+#[cfg(unix)]
 const HARDWARE_LOCK_DIR: &CStr = c"hardware-locks";
+#[cfg(unix)]
 const PRIVATE_DIRECTORY_MODE: libc::mode_t = 0o700;
+#[cfg(unix)]
 const LOCK_FILE_MODE: libc::mode_t = 0o600;
 const OWNER_RECORD_LIMIT: usize = 512;
 
@@ -156,6 +170,11 @@ pub enum FabricLeaseError {
         creator_pid: u32,
         current_pid: u32,
     },
+    /// Host-side / non-Linux builds cannot take a production flock lease.
+    /// Fail closed — never pretend exclusive fabric ownership on Windows CI.
+    UnsupportedPlatform {
+        detail: &'static str,
+    },
 }
 
 impl FabricLeaseError {
@@ -166,7 +185,9 @@ impl FabricLeaseError {
     pub fn io_kind(&self) -> io::ErrorKind {
         match self {
             Self::Busy { .. } => io::ErrorKind::AlreadyExists,
-            Self::UnsafePath { .. } | Self::ForkedProcess { .. } => io::ErrorKind::PermissionDenied,
+            Self::UnsafePath { .. }
+            | Self::ForkedProcess { .. }
+            | Self::UnsupportedPlatform { .. } => io::ErrorKind::PermissionDenied,
             Self::Io { source, .. } => source.kind(),
         }
     }
@@ -209,6 +230,9 @@ impl fmt::Display for FabricLeaseError {
                 formatter,
                 "hardware lease belongs to process {creator_pid}, not forked process {current_pid}"
             ),
+            Self::UnsupportedPlatform { detail } => {
+                write!(formatter, "fabric lease unsupported on this host: {detail}")
+            }
         }
     }
 }
@@ -226,8 +250,13 @@ impl std::error::Error for FabricLeaseError {
 ///
 /// Dropping this value closes the descriptor; there is intentionally no
 /// explicit unlock and no lock-file deletion operation.
+///
+/// On non-Unix hosts the type exists so HAL/API surfaces compile for offline
+/// tests, but [`OsI2cFabricLease::acquire`] always returns
+/// [`FabricLeaseError::UnsupportedPlatform`] (fail-closed).
 #[derive(Debug)]
 pub struct OsI2cFabricLease {
+    #[cfg(unix)]
     _file: File,
     fabric: PhysicalI2cFabricId,
     creator_pid: u32,
@@ -241,7 +270,17 @@ impl OsI2cFabricLease {
         fabric: PhysicalI2cFabricId,
         purpose: I2cLeasePurpose,
     ) -> Result<Self, FabricLeaseError> {
-        acquire_at(Path::new(RUNTIME_ROOT), fabric, purpose)
+        #[cfg(unix)]
+        {
+            acquire_at(Path::new(RUNTIME_ROOT), fabric, purpose)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (fabric, purpose);
+            Err(FabricLeaseError::UnsupportedPlatform {
+                detail: "Linux flock fabric lease is unavailable on this host OS",
+            })
+        }
     }
 
     pub const fn fabric(&self) -> PhysicalI2cFabricId {
@@ -268,6 +307,7 @@ impl OsI2cFabricLease {
     }
 }
 
+#[cfg(unix)]
 fn acquire_at(
     runtime_root: &Path,
     fabric: PhysicalI2cFabricId,
@@ -360,6 +400,7 @@ fn acquire_at(
     })
 }
 
+#[cfg(unix)]
 fn open_directory_path(path: &Path, stage: &'static str) -> Result<OwnedFd, FabricLeaseError> {
     let path_c = path_to_cstring(path)?;
     let raw_fd = unsafe {
@@ -375,6 +416,7 @@ fn open_directory_path(path: &Path, stage: &'static str) -> Result<OwnedFd, Fabr
     }
 }
 
+#[cfg(unix)]
 fn open_or_create_private_directory(
     parent_fd: libc::c_int,
     name: &CStr,
@@ -407,6 +449,7 @@ fn open_or_create_private_directory(
     Ok(fd)
 }
 
+#[cfg(unix)]
 fn validate_directory(
     fd: libc::c_int,
     path: &Path,
@@ -449,6 +492,7 @@ fn validate_directory(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_lock_file(fd: libc::c_int, path: &Path) -> Result<(), FabricLeaseError> {
     let stat = fstat(fd, path)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
@@ -483,6 +527,7 @@ fn validate_lock_file(fd: libc::c_int, path: &Path) -> Result<(), FabricLeaseErr
     Ok(())
 }
 
+#[cfg(unix)]
 fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, FabricLeaseError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let result = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
@@ -493,6 +538,7 @@ fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, FabricLeaseError> {
     }
 }
 
+#[cfg(unix)]
 fn path_to_cstring(path: &Path) -> Result<CString, FabricLeaseError> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| FabricLeaseError::UnsafePath {
         path: path.to_path_buf(),
@@ -500,6 +546,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, FabricLeaseError> {
     })
 }
 
+#[cfg(unix)]
 fn io_failure(stage: &'static str, path: &Path) -> FabricLeaseError {
     FabricLeaseError::Io {
         stage,
@@ -508,6 +555,7 @@ fn io_failure(stage: &'static str, path: &Path) -> FabricLeaseError {
     }
 }
 
+#[cfg(unix)]
 fn owner_record(
     fabric: PhysicalI2cFabricId,
     purpose: I2cLeasePurpose,
@@ -526,12 +574,14 @@ fn owner_record(
     )
 }
 
+#[cfg(unix)]
 fn process_start_ticks() -> Option<String> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let after_name = stat.rsplit_once(") ")?.1;
     after_name.split_whitespace().nth(19).map(str::to_owned)
 }
 
+#[cfg(unix)]
 fn bounded_single_line(value: String, limit: usize) -> String {
     value
         .chars()
@@ -540,6 +590,7 @@ fn bounded_single_line(value: String, limit: usize) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn read_owner_record(file: &File) -> Option<String> {
     let mut buffer = [0_u8; OWNER_RECORD_LIMIT];
     let count = unsafe {
@@ -570,7 +621,33 @@ fn read_owner_record(file: &File) -> Option<String> {
     (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(unix)))]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn host_acquire_is_unsupported_not_silent_success() {
+        let err = OsI2cFabricLease::acquire(
+            PhysicalI2cFabricId::linux_adapter(0),
+            I2cLeasePurpose::Diagnostics,
+        )
+        .expect_err("non-Unix hosts must not claim fabric ownership");
+        assert!(matches!(err, FabricLeaseError::UnsupportedPlatform { .. }));
+        assert_eq!(err.io_kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn topology_registry_still_hosts_named_fabrics() {
+        assert!(!topology::NAMED_PHYSICAL_I2C_FABRICS.is_empty());
+        assert_eq!(topology::NAMED_PHYSICAL_I2C_FABRICS[0].0, "am2-psu-gpio");
+        assert_eq!(
+            topology::NAMED_PHYSICAL_I2C_FABRICS[0].1,
+            topology::AM2_PSU_GPIO
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     #![allow(
         clippy::expect_used,

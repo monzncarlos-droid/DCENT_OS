@@ -1,0 +1,7 @@
+config BR2_PACKAGE_DCENTOS_DEPLOY_PATH
+	bool "dcentos-deploy-path"
+	help
+	  Exact-path filesystem helper for persistent deployment recovery.
+	  It provides atomic retirement into a private transaction directory,
+	  no-clobber hard-link restoration, and an on-filesystem capability probe
+	  compatible with the Linux 4.4 Zynq baseline.

@@ -117,12 +117,13 @@ pub use programmer_v2::{
 // `crate::pic1704::Pic1704Service` / `crate::pic1704::Pic1704State`
 // without reaching into the sub-modules.
 pub use protocol::{
-    classify_version, decode_le_word, enable_dc_dc_steps, heartbeat_steps, is_application_version,
-    read_register_steps, start_app_steps, write_register_steps, Pic1704State, BL_CMD_JUMP,
-    BL_MAGIC, CTRL_DC_DC_OFF, CTRL_DC_DC_ON, CTRL_HEARTBEAT, CTRL_RESET, HEARTBEAT_INTERVAL_MS,
-    PIC1704_I2C_ADDR, POLL_INTERVAL_MS, REG_CONTROL, REG_CURRENT_H, REG_CURRENT_L, REG_STATUS,
-    REG_TEMP, REG_TEMP_ALT, REG_VERSION, REG_VOLTAGE_H, REG_VOLTAGE_L, STATUS_APP_RUNNING,
-    STATUS_DC_DC_ON, STATUS_FAULT, STATUS_OTP, VER_APPLICATION, VER_BOOTLOADER, VER_REV_A,
-    VER_REV_B, WAIT_APP_TIMEOUT_MS,
+    admit_short_form_set_mv, classify_version, decode_le_word, enable_dc_dc_steps, heartbeat_steps,
+    is_application_version, read_register_steps, register_access,
+    short_form_has_writable_voltage_setpoint, start_app_steps, write_register_steps,
+    Pic1704RegisterAccess, Pic1704State, BL_CMD_JUMP, BL_MAGIC, CTRL_DC_DC_OFF, CTRL_DC_DC_ON,
+    CTRL_HEARTBEAT, CTRL_RESET, HEARTBEAT_INTERVAL_MS, PIC1704_I2C_ADDR, POLL_INTERVAL_MS,
+    REG_CONTROL, REG_CURRENT_H, REG_CURRENT_L, REG_STATUS, REG_TEMP, REG_TEMP_ALT, REG_VERSION,
+    REG_VOLTAGE_H, REG_VOLTAGE_L, STATUS_APP_RUNNING, STATUS_DC_DC_ON, STATUS_FAULT, STATUS_OTP,
+    VER_APPLICATION, VER_BOOTLOADER, VER_REV_A, VER_REV_B, WAIT_APP_TIMEOUT_MS,
 };
 pub use service::{Pic1704Authorized, Pic1704Service};

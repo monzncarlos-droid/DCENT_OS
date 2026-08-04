@@ -56,8 +56,12 @@ REST_ROUTES = ROOT / "dcentrald/dcentrald-api/src/rest.rs"
 HAL_I2C = ROOT / "dcentrald/dcentrald-hal/src/i2c.rs"
 HARDWARE_INFO = ROOT / "dcentrald/dcentrald/src/runtime/hardware_info.rs"
 S19J_HYBRID = ROOT / "dcentrald/dcentrald/src/s19j_hybrid_mining.rs"
+AM3_BB = ROOT / "dcentrald/dcentrald/src/am3_bb_mining.rs"
 AMLOGIC_HAL = ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
 SERIAL_MINING = ROOT / "dcentrald/dcentrald/src/serial_mining.rs"
+SAFETY_WATCHDOG = ROOT / "dcentrald/dcentrald/src/runtime/safety_watchdog.rs"
+WATCHDOG_FEED_GATE = ROOT / "dcentrald/dcentrald/src/runtime/watchdog_feed_gate.rs"
+TASK_GUARD = ROOT / "dcentrald/dcentrald/src/runtime/task_guard.rs"
 DAEMON = ROOT / "dcentrald/dcentrald/src/daemon.rs"
 
 
@@ -99,13 +103,19 @@ def rust_function(source: str, name: str) -> tuple[str, int, int]:
 class RuntimeHardwareOwnershipTests(unittest.TestCase):
     def test_amlogic_power_and_thermal_share_one_retained_bus1_owner(self) -> None:
         hal = read(AMLOGIC_HAL)
-        serial = read(SERIAL_MINING)
+        serial = read(SERIAL_MINING).split("\n#[cfg(test)]\nmod tests {", 1)[0]
+        safety_watchdog = read(SAFETY_WATCHDOG)
+        watchdog_feed_gate = read(WATCHDOG_FEED_GATE)
+        task_guard = read(TASK_GUARD)
+        thread_guard = read(ROOT / "dcentrald/dcentrald/src/runtime/thread_guard.rs")
+        hybrid = read(S19J_HYBRID)
+        am3_bb = read(AM3_BB)
         daemon = read(DAEMON)
         rest = read(REST_LATE)
 
         self.assertIn("pub struct AmlogicPowerThermalService", hal)
         self.assertIn(
-            "spawn_i2c_service_no_register_touch_with_denylist_and_reserved_preparation",
+            "spawn_owned_i2c_service_no_register_touch_with_denylist_and_reserved_preparation",
             hal,
         )
         self.assertIn("read_lm75_temperature_register_at", hal)
@@ -122,22 +132,246 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
         self.assertIsNone(re.search(r"(?m)^pub fn spawn\(\) -> Result<Self>", hal))
 
         admission = serial.index("AmlogicNoPicAdmission::detect(")
-        bm1366_refusal = serial.index("native BM1366 NoPic mining is refused")
-        service = serial.index(".spawn_power_thermal_service()")
-        fan = serial.index(".open_fan_controller()")
-        watchdog = serial.index("SafetyWatchdogOwner::start_before_energizing")
+        bm1398_refusal = serial.index("if is_bm1398 && !passthrough")
+        bm1366_refusal = serial.index("if is_bm1366 && !passthrough")
+        optional_hardware_observation = serial.index("let nopic = is_nopic(&self.config)")
+        service = serial.index(".spawn_power_thermal_service()", admission)
+        fan = serial.index(".open_fan_controller()", service)
+        lifecycle_owner = serial.index(".take_lifecycle_owner()", service)
+        enable_operation = serial.index(".take_psu_enable_operation()", lifecycle_owner)
+        watchdog = serial.index("SafetyWatchdogOwner::start_before_energizing", enable_operation)
         enable = serial.index(
-            "tokio::task::spawn_blocking(move || power_enable_owner.enable_psu())"
+            "tokio::task::spawn_blocking(move || psu_enable_operation.enable_psu())",
+            watchdog,
         )
-        self.assertLess(bm1366_refusal, admission)
+        self.assertLess(bm1398_refusal, optional_hardware_observation)
+        self.assertLess(bm1366_refusal, optional_hardware_observation)
+        self.assertLess(optional_hardware_observation, admission)
         self.assertLess(admission, service)
+        self.assertLess(service, lifecycle_owner)
+        self.assertLess(lifecycle_owner, enable_operation)
         self.assertLess(service, fan)
         self.assertLess(fan, watchdog)
+        self.assertLess(enable_operation, watchdog)
         self.assertLess(watchdog, enable)
-        self.assertIn("power_thermal.terminal_fence()", serial)
-        self.assertIn("power_receipt.management_fabric()", serial)
-        self.assertIn("WatchdogDisarmPermit::from_evidence_set", serial)
-        self.assertIn("fence.latch_terminal_safe_off();", serial)
+        self.assertIn("power_thermal.thermal_port()", serial)
+        self.assertNotIn("power_thermal.terminal_fence()", serial)
+        self.assertIn(
+            "management_fabric: dcentrald_hal::i2c::I2cServiceCloseReceipt",
+            serial,
+        )
+        self.assertIn("NoPicWatchdogShutdownManifest::new", serial)
+        self.assertIn("WatchdogDisarmPermit::from_nopic_manifest", serial)
+        self.assertIn("mod serial_route_domains", serial)
+        self.assertIn("SerialRouteDomains::claim", serial)
+        self.assertIn(".begin_closeout()", serial)
+        self.assertIn("composition: Option<WatchdogComposition>", safety_watchdog)
+        self.assertIn("fn claim_composition(", safety_watchdog)
+        self.assertIn("claim_hybrid_route_scope", safety_watchdog)
+        self.assertIn("claim_am3_bb_route_scope", safety_watchdog)
+        self.assertIn("self.composition != Some(permit.composition)", safety_watchdog)
+        self.assertIn("issue_am2_never_energized", safety_watchdog)
+        self.assertIn("evidence.run_scope.same_run(&self.run_scope)", safety_watchdog)
+        self.assertNotIn("fn run_scope(&self) -> &WatchdogRunScope", safety_watchdog)
+        self.assertIn("pub(crate) struct TaskReapSummary", task_guard)
+        self.assertIn(
+            "pub(crate) async fn reap_finished(&mut self) -> TaskReapSummary",
+            task_guard,
+        )
+        self.assertIn("pub(crate) struct StandardMiningTaskGuard", task_guard)
+        self.assertIn(
+            "pub(crate) struct StandardMiningActorQuiescenceReceipt", task_guard
+        )
+        self.assertIn("pub(crate) struct StandardWatchdogRunAdmission", safety_watchdog)
+        self.assertIn("pub(crate) struct StandardMiningActorIssuer", safety_watchdog)
+        self.assertIn("issuer: StandardMiningActorIssuer", task_guard)
+        self.assertIn("issuer.into_identity()", task_guard)
+        self.assertNotIn("let issuer = Arc::new(())", task_guard)
+        self.assertIn(
+            "self.started[StandardMiningActorSlot::WorkDispatcher.index()]",
+            task_guard,
+        )
+        self.assertIn(
+            "report.outcome == TaskStopOutcome::Completed", task_guard
+        )
+        self.assertIn("pub(crate) trait FixedThreadSlot", thread_guard)
+        self.assertIn("pub(crate) fn reserve(&mut self, slot: S)", thread_guard)
+        self.assertIn("ThreadSlotState::StartFailed", thread_guard)
+        self.assertIn(".take_actor_owner()", hybrid)
+        self.assertIn("actor_owner.activate(self.shutdown.clone())", hybrid)
+        self.assertIn("HybridThreadSlot::PsuHeartbeat", hybrid)
+        self.assertIn("HybridThreadSlot::PicHeartbeat", hybrid)
+        self.assertIn("let actor_receipt = feeder_stop.into_receipt()", hybrid)
+        hybrid_manifest = safety_watchdog.split(
+            "pub(crate) struct HybridWatchdogShutdownManifest", 1
+        )[1].split("/// Exact move-only AM3-BB closeout roster", 1)[0]
+        self.assertIn(
+            "actors: ThreadRosterQuiescenceReceipt<HybridThreadSlot>",
+            hybrid_manifest,
+        )
+        self.assertNotIn("actors: ThreadStopSummary", hybrid_manifest)
+        self.assertIn("actor_owner.activate(worker_stop)", am3_bb)
+        self.assertIn(
+            "threads.reserve(Am3BbThreadSlot::DspicHeartbeat)", am3_bb
+        )
+        am3_manifest = safety_watchdog.split(
+            "pub(crate) struct Am3BbWatchdogShutdownManifest", 1
+        )[1].split("/// Move-only standard-daemon authority", 1)[0]
+        self.assertIn(
+            "actors: ThreadRosterQuiescenceReceipt<Am3BbThreadSlot>",
+            am3_manifest,
+        )
+        self.assertNotIn("actors: ThreadStopSummary", am3_manifest)
+        self.assertIn(
+            "api_final_commit: dcentrald_hal::platform::HardwareMutationCommitFenceReceipt",
+            am3_manifest,
+        )
+        self.assertIn("WatchdogDisarmPermit::from_am3_bb_manifest", am3_bb)
+
+        am3_guard = am3_bb.split("impl Am3BbRunSafetyGuard", 1)[1].split(
+            "impl Drop for Am3BbRunSafetyGuard", 1
+        )[0]
+        self.assertLess(
+            am3_guard.index("am3_bb_prepare_board_cutoff_set("),
+            am3_guard.index(".open_fan()"),
+        )
+        self.assertIn('writer.write_all(b"low")', am3_bb)
+        self.assertIn('.write_all(b"1")', am3_bb)
+        self.assertNotIn("write_level_checked", am3_bb)
+
+        am3_run, _, _ = rust_function(am3_bb, "run_am3_bb_blocking")
+        teardown_request = am3_run.index(".request_teardown_budget()")
+        retained_cut = am3_run.index(
+            ".cut_board_enable_checked(teardown_view.clone())"
+        )
+        teardown_ack = am3_run.index("watchdog.observe_teardown_admission(")
+        api_drain = am3_run.index(".close_and_drain_until(api_drain_deadline)")
+        self.assertLess(teardown_request, retained_cut)
+        self.assertLess(retained_cut, teardown_ack)
+        self.assertLess(teardown_ack, api_drain)
+
+        watchdog_request, _, _ = rust_function(
+            safety_watchdog, "request_teardown_budget"
+        )
+        self.assertIn("publish_deadline(deadline)", watchdog_request)
+        self.assertIn("WatchdogCommand::BeginTeardown", watchdog_request)
+        self.assertNotIn(".await", watchdog_request)
+        self.assertNotIn(".lock()", watchdog_request)
+        self.assertIn("deadline_request: Arc<OnceLock<Instant>>", watchdog_feed_gate)
+        self.assertIn("self.deadline_request.set(deadline)", watchdog_feed_gate)
+
+        panic_cut, _, _ = rust_function(
+            am3_bb, "am3_bb_panic_hook_best_effort_teardown"
+        )
+        self.assertLess(
+            panic_cut.index("watchdog_feed_stop.close_terminal_lock_free()"),
+            panic_cut.index("cut_raw_noalloc()"),
+        )
+        self.assertLess(
+            panic_cut.index("cut_raw_noalloc()"),
+            panic_cut.index("for &gpio in &params.reset_gpios"),
+        )
+        self.assertIn("StandardMiningActorSlot::WorkDispatcher", daemon)
+        self.assertIn("StandardMiningActorSlot::ThermalController", daemon)
+        standard_manifest = daemon.split(
+            "pub(crate) struct StandardDaemonShutdownEvidence", 1
+        )[1].split("impl StandardDaemonShutdownEvidence", 1)[0]
+        self.assertIn("StandardMiningActorQuiescenceReceipt", standard_manifest)
+        self.assertNotIn("TaskStopSummary", standard_manifest)
+        nopic_manifest = safety_watchdog.split(
+            "pub(crate) struct NoPicWatchdogShutdownManifest", 1
+        )[1].split("impl NoPicWatchdogShutdownManifest", 1)[0]
+        am2_manifest = safety_watchdog.split(
+            "pub(crate) struct Am2SerialWatchdogShutdownManifest", 1
+        )[1].split("impl Am2SerialWatchdogShutdownManifest", 1)[0]
+        self.assertIn(
+            "actors: ThreadRosterQuiescenceReceipt<NoPicSerialThreadSlot>",
+            nopic_manifest,
+        )
+        self.assertIn(
+            "actors: ThreadRosterQuiescenceReceipt<Am2SerialThreadSlot>",
+            am2_manifest,
+        )
+        for manifest in (nopic_manifest, am2_manifest):
+            self.assertIn("SerialExecutionDomainCloseout", manifest)
+            self.assertIn("ApiMutationDomainCloseout", manifest)
+            self.assertNotIn("actors: ThreadStopSummary", manifest)
+            self.assertNotIn("Option<", manifest)
+            self.assertNotIn("HardwareMutationBarrierReceipt", manifest)
+            self.assertNotIn("HardwareMutationCommitFenceReceipt", manifest)
+        self.assertIn("pub(crate) enum NoPicSerialThreadSlot", safety_watchdog)
+        self.assertIn("pub(crate) enum Am2SerialThreadSlot", safety_watchdog)
+        self.assertIn("pub(crate) enum SerialWatchdogRouteAdmission", safety_watchdog)
+        self.assertIn(
+            ".and_then(|owner| runtime_threads.activate_nopic(owner));", serial
+        )
+        self.assertIn(
+            ".and_then(|owner| runtime_threads.activate_am2(owner));", serial
+        )
+        self.assertIn("runtime_threads.spawn_pic_heartbeat(||", serial)
+        self.assertIn("SerialActorTopology::admit(", serial)
+        self.assertIn(
+            "exact direct-serial routes refuse the experimental uart_trans actor before hardware admission",
+            serial,
+        )
+        self.assertIn("failure_with_exact_serial_closeout(", serial)
+        self.assertNotIn(
+            'expect("BM1362 serial domain was revoked before first-stage cutoff")',
+            serial,
+        )
+        self.assertNotIn(
+            'expect("BM1362 route creates serial revocation evidence")',
+            serial,
+        )
+        self.assertIn(
+            "exact serial route reached terminal shutdown without retained watchdog ownership",
+            serial,
+        )
+        self.assertIn("runtime_threads.spawn_serial_io(thread_name", serial)
+        self.assertEqual(
+            serial.count(".reserve_am2(Am2SerialThreadSlot::ApwHeartbeat)?"),
+            2,
+        )
+        self.assertNotIn("runtime_threads.push(", serial)
+        self.assertIn("struct NoPicEmergencyCutReceipt", serial)
+        self.assertIn(
+            "fn first_stage_safe_off(&self) -> Result<NoPicEmergencyCutReceipt>",
+            serial,
+        )
+        self.assertIn(
+            "let mut early_safe_off_receipt: Option<NoPicEmergencyCutReceipt> = None;",
+            serial,
+        )
+        emergency_cut, _, _ = rust_function(
+            serial, "checked_nopic_emergency_safe_off"
+        )
+        self.assertIn("guard.first_stage_safe_off()", emergency_cut)
+        self.assertNotIn("guard.safe_off()", emergency_cut)
+        failure_closeout, _, _ = rust_function(
+            serial, "closeout_native_nopic_failure"
+        )
+        self.assertIn(
+            "prior_emergency_cut: Option<NoPicEmergencyCutReceipt>",
+            failure_closeout,
+        )
+        self.assertIn(
+            '"NoPic failure checked safe-off"', failure_closeout
+        )
+        self.assertNotIn("Some(receipt) => Ok(receipt)", failure_closeout)
+        shutdown = serial.split('info!("=== SHUTDOWN ===");', 1)[1]
+        prior_cut_discard = shutdown.index(
+            "let _prior_emergency_cut = early_safe_off_receipt.take();"
+        )
+        repeated_cut = shutdown.index(
+            '"NoPic operator-stop first-stage safe-off"'
+        )
+        timed_cut_validation = shutdown.index(
+            "ExactSerialTeardownProgress::after_nopic_checked_cut("
+        )
+        self.assertLess(prior_cut_discard, repeated_cut)
+        self.assertLess(repeated_cut, timed_cut_validation)
+        self.assertIn("owner.latch_terminal_safe_off();", serial)
+        self.assertIn(".close_and_join_until(management_fabric_deadline)", serial)
         self.assertNotIn("amlogic::read_board_temps(", serial)
         self.assertNotIn("amlogic::AmlogicPlatform::new()", serial)
 
@@ -146,7 +380,9 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
         recovery_psu, _, _ = rust_function(rest, "post_debug_psu_control_recovery")
         self.assertNotIn("platform::amlogic::enable_psu()", recovery_psu)
         self.assertNotIn("platform::amlogic::disable_psu()", recovery_psu)
-        self.assertIn("retained power/thermal owner", recovery_psu)
+        self.assertIn("retained, polarity-aware power owner", recovery_psu)
+        self.assertIn("terminal fence", recovery_psu)
+        self.assertIn('"hardware_access_attempted": false', recovery_psu)
 
     def test_hybrid_eeprom_gate_stays_inside_owned_i2c_service(self) -> None:
         hal = read(HAL_I2C)
@@ -157,9 +393,7 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
             hardware_info,
             "read_hashboard_eeprom_prefix_via_service_for_energize_gate",
         )
-        hal_reader, _, _ = rust_function(
-            hal, "read_protected_hashboard_eeprom_prefix"
-        )
+        hal_reader, _, _ = rust_function(hal, "read_protected_hashboard_eeprom_span")
         self.assertIn("0x50u8", service_reader)
         self.assertIn(
             "service.read_hashboard_eeprom_prefix_at(addr, deadline)", service_reader
@@ -195,9 +429,47 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
         )
 
         self.assertIn("pub fn read_hashboard_eeprom_prefix_at(", hal)
-        self.assertIn("I2cRequest::ReadHashboardEepromPrefix", hal)
-        self.assertIn("read_protected_hashboard_eeprom_prefix", hal)
+        self.assertIn("I2cRequest::ReadHashboardEepromSpan", hal)
+        self.assertIn("read_protected_hashboard_eeprom_span", hal)
         self.assertNotIn("WriteReadProtection", hal)
+
+        # The full-page read added for the deployed-EEPROM decoder must stay
+        # inside the same owned service, under the same admission, and must not
+        # become a caller-controlled length. `HashboardEepromSpan` is a closed
+        # two-value set: the worker derives the transfer size from the variant,
+        # so widening the read cannot widen the reachable surface.
+        self.assertIn("pub fn read_hashboard_eeprom_page_at(", hal)
+        self.assertIn("pub enum HashboardEepromSpan", hal)
+        self.assertIn("IdentityPrefix", hal)
+        self.assertIn("FullPage", hal)
+        # The page length is single-sourced from the decoder that consumes it.
+        # If these drift the transport still "succeeds" and only the decoder
+        # refuses, which is exactly how the missing full-page read stayed
+        # invisible in the first place.
+        self.assertIn(
+            "HASHBOARD_EEPROM_PAGE_LEN: usize = "
+            "dcentrald_api_types::deployed_eeprom::RAW_PAGE_LEN",
+            hal,
+        )
+        # The energize gate reads the 32-byte prefix; widening that constant
+        # would change a safety path rather than add a capability beside it.
+        self.assertIn("HASHBOARD_EEPROM_PREFIX_LEN: usize = 32", hal)
+
+        page_reader, _, _ = rust_function(hal, "read_hashboard_eeprom_span_at")
+        self.assertIn("I2cRequest::ReadHashboardEepromSpan", page_reader)
+        self.assertIn("I2cOperationIntent::ReadOnly", page_reader)
+        self.assertNotIn("std::fs", page_reader)
+        self.assertNotIn("/sys/bus/i2c", page_reader)
+
+        # Both public spans are thin delegations, so neither can acquire its own
+        # transport or skip the endpoint-range check in the shared submitter.
+        for public_reader in (
+            "read_hashboard_eeprom_prefix_at",
+            "read_hashboard_eeprom_page_at",
+        ):
+            body, _, _ = rust_function(hal, public_reader)
+            self.assertIn("self.read_hashboard_eeprom_span_at(", body)
+            self.assertNotIn("fs::File::open", body)
 
     def test_web_adapters_have_no_raw_hardware_command_path(self) -> None:
         for path in WEB_ADAPTERS:

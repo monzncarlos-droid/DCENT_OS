@@ -211,14 +211,29 @@ def validate_repository(root: Path, catalog_path: Path = DEFAULT_CATALOG) -> Lis
     for device in catalog["uart"]["devices"]:
         require_literal(hal, device, "HAL UART map", errors)
 
-    safe_contract = "for gpio in 49 60 27 22; do gpio_set_out \"$gpio\" 1 1 done gpio_set_out 59 0 0"
     boot = normalized(read_text(root, BOOT_SETUP, errors))
-    require_literal(boot, safe_contract, "S37 fail-safe GPIO contract", errors)
-    require_literal(boot, "echo 10000 > \"$pwm/duty_cycle\"", "S37 10% PWM default", errors)
+    require_literal(
+        boot,
+        '/bin/sh "$SAFETY_SCRIPT" boot-safety',
+        "S37 delegates to the checked boot-safety custodian",
+        errors,
+    )
+    require_literal(
+        boot,
+        '!= am3-bb-s19jpro',
+        "S37 exact image identity gate",
+        errors,
+    )
     daemon = normalized(read_text(root, DAEMON_INIT, errors))
-    daemon_contract = "for g in 49 60 27 22; do gpio_set_out \"$g\" 1 1 done"
-    require_literal(daemon, daemon_contract, "S82 reset safety override", errors)
-    require_literal(daemon, "gpio_set_out 59 0 0", "S82 board-enable safety override", errors)
+    daemon_contract = "for g in 49 60 27 22; do"
+    require_literal(daemon, daemon_contract, "S82 reset safety topology", errors)
+    require_literal(daemon, 'gpio_set_out "$g" 1 1', "S82 reset safety override", errors)
+    require_literal(daemon, "if ! gpio_set_out 59 0 0", "S82 board-enable safety override", errors)
+    require_literal(daemon, "AM3_BB_SAFE_FAN_DUTY=10000 fan_safety_override", "S82 checked 10% boot PWM", errors)
+    board_cut = daemon.find("if ! gpio_set_out 59 0 0")
+    reset_assertion = daemon.find(daemon_contract)
+    if board_cut < 0 or reset_assertion < 0 or board_cut > reset_assertion:
+        errors.append("S82 board-enable cut must precede secondary reset assertion")
 
     legacy = catalog["legacy_reference"]
     legacy_path = Path(legacy["path"])
@@ -303,19 +318,22 @@ def validate_repository(root: Path, catalog_path: Path = DEFAULT_CATALOG) -> Lis
         "--artifacts requires a carrier DTB",
         errors,
     )
-    docker_branch = helper.find("elif command -v docker")
-    docker_artifacts_guard = helper.find('if [ -n "$ARTIFACT_DIR" ]; then', docker_branch)
-    docker_invocation = helper.find('"$SCRIPT_DIR/build_in_docker.sh"', docker_branch)
-    if not (
-        docker_branch >= 0
-        and docker_artifacts_guard > docker_branch
-        and docker_invocation > docker_artifacts_guard
-    ):
-        errors.append("Docker --artifacts refusal must dominate the Docker build/early-exit path")
+    # Packaging is contained in the inner build_in_docker.sh driver, so this
+    # wrapper must not shell out to Docker itself. A Docker route here cannot
+    # honor the host --artifacts directory and would silently drop the carrier
+    # boot artifacts. The wrapper therefore carries no Docker invocation and
+    # explicitly disables the fallback — a strictly stronger guard than the
+    # former "refuse --artifacts inside the Docker branch".
+    reject_literal(
+        helper,
+        '"$SCRIPT_DIR/build_in_docker.sh"',
+        "no direct Docker packaging route in the AM3-BB wrapper",
+        errors,
+    )
     require_literal(
         helper,
-        "--artifacts is not supported by Docker packaging",
-        "Docker artifact refusal is explicit",
+        "Docker fallback is disabled because am3-bb-s19jpro has no authenticated capsule",
+        "Docker fallback is explicitly disabled",
         errors,
     )
     post_image = read_text(root, POST_IMAGE, errors)

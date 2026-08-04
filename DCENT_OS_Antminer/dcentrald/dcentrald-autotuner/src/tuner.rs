@@ -639,8 +639,10 @@ impl AutoTuner {
         changed
     }
 
+    /// Chip ID for PLL snaps / thermal tables. Unknown chip_type → 0
+    /// (empty PLL, P1-4 / G4 fail-closed) — never silent BM1387.
     fn profile_chip_id(profile: &TuningProfile) -> u16 {
-        crate::chip_id_from_type(&profile.chip_type).unwrap_or(0x1387)
+        crate::chip_id_for_pll_policy(&profile.chip_type)
     }
 
     fn chain_chip_id(&self, chain_id: u8) -> u16 {
@@ -1661,7 +1663,9 @@ impl AutoTuner {
         voltage_control: String,
         power_calibration: Arc<std::sync::RwLock<PowerCalibration>>,
     ) -> Self {
-        let chip_id = crate::chip_id_from_type(&chip_type).unwrap_or(0x1387);
+        // G4: unparseable chip_type must not invent BM1387 (empty-PLL id 0).
+        // Prefer explicit "BM####" / "0x####" labels from the daemon.
+        let chip_id = crate::chip_id_for_pll_policy(&chip_type);
         // PERF-006/011: honor the default-OFF `DCENT_AM2_VOLTAGE_AUTOTUNE` gate.
         // With the gate unset this returns the SAME conservative capability set
         // as `autotuner_capabilities_for_chip` (byte-identical behavior); when
@@ -3713,11 +3717,11 @@ impl AutoTuner {
             self.config.max_freq_mhz,
         );
 
-        let tuner = BinarySearchTuner::new_for_chip(
-            self.config.clone(),
-            self.nominal_mhz,
-            self.chain_chip_id(chain_id),
-        );
+        // P1-4: refuse unknown-chip PLL tables (no silent BM1387 fallback).
+        let chip_id = self.chain_chip_id(chain_id);
+        let tuner =
+            BinarySearchTuner::try_new_for_chip(self.config.clone(), self.nominal_mhz, chip_id)
+                .ok_or(crate::AutoTunerError::UnknownChipPll { chip_id })?;
         let max_iters = tuner.max_iterations();
         let mut states = tuner.init_search(chip_count);
         let mut iteration = 0u32;
@@ -4431,13 +4435,10 @@ impl AutoTuner {
 
             let mut current_ramp = RAMP_START_MHZ;
             while current_ramp < max_target {
-                // Snap to PLL
-                let ramp_freq = pll
-                    .iter()
-                    .rev()
-                    .find(|&&f| f <= current_ramp)
-                    .copied()
-                    .unwrap_or(RAMP_START_MHZ);
+                // Snap to PLL (P1-4 empty-safe)
+                let ramp_freq =
+                    dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, current_ramp)
+                        .unwrap_or(RAMP_START_MHZ);
 
                 // Set all chips to the ramp frequency (capped at their target)
                 let mut ramp_min_freq = ramp_freq;
@@ -4474,10 +4475,7 @@ impl AutoTuner {
             let fan_limit = if fan_factor < 0.99 {
                 let adj = (chip.operating_mhz as f64 * fan_factor) as u16;
                 Some(
-                    pll.iter()
-                        .rev()
-                        .find(|&&f| f <= adj)
-                        .copied()
+                    dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, adj)
                         .unwrap_or(self.config.min_freq_mhz),
                 )
             } else {
@@ -4567,10 +4565,7 @@ impl AutoTuner {
                 let fan_limit_mhz = if fan_factor < 0.99 {
                     let adjusted = (chip.operating_mhz as f64 * fan_factor) as u16;
                     Some(
-                        pll.iter()
-                            .rev()
-                            .find(|&&f| f <= adjusted)
-                            .copied()
+                        dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, adjusted)
                             .unwrap_or(self.config.min_freq_mhz),
                     )
                 } else {
@@ -5260,10 +5255,7 @@ impl AutoTuner {
                 );
                 let adjusted = (monitor.profile_freq_mhz as f64 * fan_factor) as u16;
                 Some(
-                    pll.iter()
-                        .rev()
-                        .find(|&&f| f <= adjusted)
-                        .copied()
+                    dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, adjusted)
                         .unwrap_or(self.config.min_freq_mhz),
                 )
             } else {
@@ -5722,13 +5714,13 @@ impl AutoTuner {
                         let pll = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(
                             monitor.chip_id,
                         );
-                        // Find next PLL entry above current frequency
-                        let boosted = pll
-                            .iter()
-                            .find(|&&f| f > monitor.desired_freq_mhz)
-                            .copied()
-                            .unwrap_or(monitor.desired_freq_mhz)
-                            .min(monitor.profile_freq_mhz);
+                        // Next PLL entry above current (P1-4 empty-safe)
+                        let boosted = dcentrald_asic::drivers::MinerProfile::snap_pll_next_above(
+                            pll,
+                            monitor.desired_freq_mhz,
+                        )
+                        .unwrap_or(monitor.desired_freq_mhz)
+                        .min(monitor.profile_freq_mhz);
 
                         if boosted > monitor.desired_freq_mhz {
                             // W6.3 + W6.4: gate the step-up on
@@ -7063,12 +7055,10 @@ impl AutoTuner {
                 {
                     let old_freq = chip.operating_mhz;
                     let target = old_freq.saturating_sub(backoff_step);
+                    let pll =
+                        dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(chip_id);
                     let new_freq =
-                        dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(chip_id)
-                            .iter()
-                            .rev()
-                            .find(|&&f| f <= target)
-                            .copied()
+                        dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, target)
                             .unwrap_or(min_freq);
                     if new_freq < old_freq {
                         chip.operating_mhz = new_freq;
@@ -7232,11 +7222,7 @@ impl AutoTuner {
         let target = current_mhz
             .saturating_sub(self.config.backoff_step_mhz)
             .max(self.config.min_freq_mhz);
-        freqs
-            .iter()
-            .rev()
-            .find(|&&f| f <= target)
-            .copied()
+        dcentrald_asic::drivers::MinerProfile::snap_pll_floor(freqs, target)
             .unwrap_or(self.config.min_freq_mhz)
     }
 
@@ -7271,11 +7257,18 @@ impl AutoTuner {
                 chip_count, chain_id,
             );
 
-            let tuner = BinarySearchTuner::new_for_chip(
-                self.config.clone(),
-                self.nominal_mhz,
-                self.chain_chip_id(*chain_id),
-            );
+            // P1-4: refuse unknown-chip PLL (skip re-char rather than crash/wrong table).
+            let chip_id = self.chain_chip_id(*chain_id);
+            let Some(tuner) =
+                BinarySearchTuner::try_new_for_chip(self.config.clone(), self.nominal_mhz, chip_id)
+            else {
+                warn!(
+                    chain_id = *chain_id,
+                    chip_id = format_args!("0x{chip_id:04X}"),
+                    "Re-characterization refused: no PLL table for chip (P1-4 fail-closed)"
+                );
+                continue;
+            };
             let max_iters = tuner.max_iterations();
             let mut states = tuner.init_search_for_chips(chip_indices);
             let mut iteration = 0u32;
@@ -7426,6 +7419,90 @@ mod tests {
     use crate::profile::{ChipGrade, ChipProfile, TuningProfile};
     use std::sync::Arc;
     use std::time::Instant;
+
+    /// SG-1 rank 24 (2026-08-02): a healthy BM1362 chip hashing at its TRUE
+    /// nonce rate must NOT trip `min_hashrate_ratio` once the corrected
+    /// slot count (514) is in force.
+    ///
+    /// This replicates the exact hashrate-deficit guard computation at
+    /// `tuner.rs` (`expected = expected_nps × window; ratio = nonces /
+    /// expected; ratio < config.min_hashrate_ratio → step_down_freq`) with
+    /// the production prediction formula
+    /// (`MinerProfile::expected_nps_with_correction`, which `expected_nps`
+    /// — the tuner's actual dependency via
+    /// `chip_geometry::expected_nps_for_chip` — delegates to).
+    ///
+    /// The TRUE nonce rate is derived from OUR OWN `ghs_per_mhz` (0.550 =
+    /// 104 TH/s / 378 chips / 500 MHz, `drivers/mod.rs`): a healthy chip's
+    /// hashrate is `freq × ghs_per_mhz` GH/s, so its nonce rate at pool
+    /// difficulty D is `freq × ghs_per_mhz × 1e9 / (D × 2^32)`. Both sides
+    /// use the same 4.294e9 divisor as production so constants cancel and
+    /// the ratio reduces to `ghs_per_mhz × 1000 / slots`:
+    ///
+    ///   corrected (514): 550.3 / 514 = 1.070 → healthy, no throttle
+    ///   legacy    (894): 550.3 / 894 = 0.615 → below 0.70 → PERMANENT
+    ///                     step_down_freq on healthy silicon (the SG-1 bug)
+    ///
+    /// MUTATION ANCHOR: reverting the SG-1 correction (514 → 894 in
+    /// `sg1_corrected_nonce_attribution_cores`) makes the first assertion
+    /// fail (0.615 < 0.70) — verified by mutation during W8 rank-24.
+    #[test]
+    fn healthy_bm1362_at_true_nonce_rate_does_not_trip_min_hashrate_ratio() {
+        let profile = dcentrald_asic::drivers::MinerProfile::for_chip(0x1362)
+            .expect("BM1362 profile should exist");
+        let freq_mhz: u16 = 500;
+        let difficulty: u32 = 256;
+        let window_s: f64 = 60.0;
+
+        // TRUE per-chip nonce production of a HEALTHY chip, from our own
+        // ghs_per_mhz. Same 4.294e9 divisor as MinerProfile::expected_nps.
+        let true_nps =
+            (freq_mhz as f64 * profile.ghs_per_mhz * 1e9) / (difficulty as f64 * 4.294e9);
+        let nonces = true_nps * window_s;
+
+        // The tuner's prediction with the SG-1 corrected slot count (the
+        // pure form of the production formula; env-independent).
+        let corrected_nps = profile.expected_nps_with_correction(freq_mhz, difficulty, true);
+        let corrected_ratio = nonces / (corrected_nps * window_s);
+
+        let default_bar = AutoTunerConfig::default().min_hashrate_ratio;
+        assert!(
+            (default_bar - 0.7).abs() < f64::EPSILON,
+            "min_hashrate_ratio default moved from 0.70 — re-derive this test's margins"
+        );
+        assert!(
+            corrected_ratio >= default_bar,
+            "healthy BM1362 at the true nonce rate must clear min_hashrate_ratio \
+             {default_bar} with the SG-1 corrected slot count, got ratio {corrected_ratio:.4}"
+        );
+        // Must also clear the strictest profile-raised bar (config.rs raises
+        // min_hashrate_ratio to at most 0.75 in quiet/eco profiles).
+        assert!(
+            corrected_ratio >= 0.75,
+            "healthy BM1362 must clear the strictest raised bar 0.75, got {corrected_ratio:.4}"
+        );
+        // Pin the expected value: 550.3/514 ≈ 1.0700 — a healthy chain sits
+        // slightly ABOVE prediction, which is the correct direction.
+        assert!(
+            (corrected_ratio - 1.0700).abs() < 0.005,
+            "corrected healthy-chip ratio drifted from ~1.070: {corrected_ratio:.4}"
+        );
+
+        // Document the defect the correction removes: under the legacy 894
+        // prediction the SAME healthy chip is judged permanently deficient.
+        let legacy_nps = profile.expected_nps_with_correction(freq_mhz, difficulty, false);
+        let legacy_ratio = nonces / (legacy_nps * window_s);
+        assert!(
+            legacy_ratio < default_bar,
+            "the legacy 894 prediction should judge a healthy chip deficient \
+             (that IS the SG-1 defect); got {legacy_ratio:.4} — if this now passes, \
+             the declared field changed and this test must be re-derived"
+        );
+        assert!(
+            (legacy_ratio - 0.6155).abs() < 0.005,
+            "legacy healthy-chip ratio drifted from ~0.615: {legacy_ratio:.4}"
+        );
+    }
 
     fn default_power_calibration() -> Arc<std::sync::RwLock<PowerCalibration>> {
         Arc::new(std::sync::RwLock::new(PowerCalibration::default()))

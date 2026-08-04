@@ -318,6 +318,14 @@ pub struct DcentaxeExt<'a> {
     pub creature_stage: &'a str,
     pub creature_mood: u8,
     pub mining_enabled: bool,
+    /// Lucky-enablement SPEC §3 step 5: when the boot identity gate refused to
+    /// energize (ambiguous board identity + inconclusive LV08 regulator
+    /// probe), this carries the exact reason so an operator can diagnose it
+    /// from the dashboard/API while the device sits in its fail-closed
+    /// boot-identify-serve-only state. Omitted (`None`) on every healthy boot
+    /// — additive, does not disturb the AxeOS-compat shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_refusal: Option<&'a str>,
     pub chips: ChipsView<'a>,
     pub voltage_domains: serde_json::Value,
     pub chip_health: serde_json::Value,

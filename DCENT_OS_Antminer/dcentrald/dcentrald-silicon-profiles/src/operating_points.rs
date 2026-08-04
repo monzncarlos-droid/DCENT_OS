@@ -200,7 +200,7 @@ pub enum Cooling {
 /// All harvested operating points + geometry for one Antminer MODEL.
 ///
 /// `chip_id` matches `dcentrald-asic::drivers::MinerProfile::chip_id` where a
-/// row exists; models with no MINER_PROFILES entry (S17+/T17+ BM1396, the
+/// row exists; models with no MINER_PROFILES entry (S17e/T17e BM1396, the
 /// air/hydro S19/S21 variants) still get a `chip_id` of their chip family so
 /// the autotuner can fall back to the family power model.
 #[derive(Debug, Clone, Copy)]
@@ -209,7 +209,7 @@ pub struct ModelPowerProfile {
     pub model: &'static str,
     /// Chip-family name (e.g. `"BM1362"`).
     pub chip_family: &'static str,
-    /// Chip ID (0x1387 … 0x1370). For BM1396 (S17+/T17+) this is `0x1396`
+    /// Chip ID (0x1387 … 0x1370). For BM1396 (S17e/T17e) this is `0x1396`
     /// even though no MINER_PROFILES row exists yet.
     pub chip_id: u16,
     /// Number of hashboards (chains) in the unit.
@@ -444,7 +444,7 @@ pub const T9_PLUS_POINTS: [OperatingPoint; 1] = [gap(
 )];
 
 // ===========================================================================
-// S17 / T17 family (BM1397 7nm + BM1396 7nm). The 56 LEGACY VNish profiles
+// S17 / T17 family (BM1397 7nm; the "e" variants are BM1396 7nm). The 56 LEGACY VNish profiles
 // (POWER_PROFILES_CATALOG §3.1-3.4) carry EXPLICIT freq+watt+hashrate — the
 // richest S17-family dataset. voltage_mv on the legacy rows is the fixed
 // cgminer.conf bitmain-voltage 1680 mV (CHIP-CORE, NOT chain rail). No live
@@ -494,15 +494,18 @@ pub const S17_PRO_POINTS: [OperatingPoint; 16] = [
     s17pro("profile_835_80T (max OC)", 835, 80.0, 3800, 47.5),
 ];
 
-/// S17+ (BM1396) legacy curve helper.
+/// S17+ (BM1397) legacy curve helper.
 ///
-/// PROVENANCE NOTE (review must-fix 2026-06-14): the cited source
-/// `POWER_PROFILES_CATALOG.md §3.2/§3.4` HEADERS label S17+/T17+ as "BM1397", but
-/// we deliberately attribute them to **BM1396** (chip_id 0x1396) per the
-/// corroborating corpus (root   / the
-/// `am2-s17pro-zynq` variant: S17+/T17+ carry BM1396, distinct from the S17/T17
-/// BM1397). The watt/hashrate/freq ROWS are byte-exact to the catalog; only the
-/// chip-family label intentionally overrides the source header.
+/// PROVENANCE NOTE (2026-06-14, CORRECTED 2026-08-03 by W8-G): the cited source
+/// `POWER_PROFILES_CATALOG.md §3.2/§3.4` HEADERS label S17+/T17+ as "BM1397".
+/// From 2026-06-14 to 2026-08-03 this crate deliberately OVERRODE that header to
+/// "BM1396" on the strength of the PR-056 corpus. That override was wrong and is
+/// now reverted: the vendor catalog header was right all along. Operator-confirmed
+/// mapping is S17+/T17+ = BM1397 (`0x1397`) and S17e/T17e = BM1396 (`0x1396`); see
+/// the correction banner in
+/// .
+/// The watt/hashrate/freq ROWS were always byte-exact to the catalog and are
+/// unchanged; only the chip-family label moves back to the source header.
 const fn s17plus(label: &'static str, freq: u32, th: f32, w: u32, j: f32) -> OperatingPoint {
     OperatingPoint {
         label,
@@ -514,11 +517,11 @@ const fn s17plus(label: &'static str, freq: u32, th: f32, w: u32, j: f32) -> Ope
         watts_per_unit: Some(w),
         j_per_th: Some(j),
         confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §3.2 (VNish legacy S17+; BM1396 data-only table; voltage 1680 mV chip-CORE)",
+        source: "POWER_PROFILES_CATALOG.md §3.2 (VNish legacy S17+; BM1397 per the catalog header; voltage 1680 mV chip-CORE)",
     }
 }
 
-/// Antminer S17+ (BM1396, 3×65 support-matrix scaffold). 16 VendorExtracted legacy points.
+/// Antminer S17+ (BM1397, 3×65 support-matrix scaffold). 16 VendorExtracted legacy points.
 pub const S17_PLUS_POINTS: [OperatingPoint; 16] = [
     s17plus(
         "profile_400_52T (eco / safe-default)",
@@ -580,7 +583,8 @@ pub const T17_POINTS: [OperatingPoint; 10] = [
     t17("profile_900_54T (max OC)", 900, 54.0, 2910, 53.9),
 ];
 
-/// T17+ (BM1396) legacy curve helper.
+/// T17+ (BM1397) legacy curve helper. See the s17plus() provenance note above
+/// for the 2026-08-03 BM1396->BM1397 correction.
 const fn t17plus(label: &'static str, freq: u32, th: f32, w: u32, j: f32) -> OperatingPoint {
     OperatingPoint {
         label,
@@ -592,11 +596,11 @@ const fn t17plus(label: &'static str, freq: u32, th: f32, w: u32, j: f32) -> Ope
         watts_per_unit: Some(w),
         j_per_th: Some(j),
         confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §3.4 (VNish legacy T17+; BM1396 data-only table; chips/board INFERRED ~44; voltage 1680 mV chip-CORE)",
+        source: "POWER_PROFILES_CATALOG.md §3.4 (VNish legacy T17+; BM1397 per the catalog header; chips/board INFERRED ~44; voltage 1680 mV chip-CORE)",
     }
 }
 
-/// Antminer T17+ (BM1396, 3×44 inferred). 14 VendorExtracted legacy points.
+/// Antminer T17+ (BM1397, 3×44 inferred). 14 VendorExtracted legacy points.
 pub const T17_PLUS_POINTS: [OperatingPoint; 14] = [
     t17plus("profile_400_35T (min / sweet spot)", 400, 35.0, 1150, 32.9),
     t17plus("profile_450_40T", 450, 40.0, 1350, 33.8),
@@ -1278,14 +1282,16 @@ pub const S17_PRO: ModelPowerProfile = ModelPowerProfile {
     points: &S17_PRO_POINTS,
 };
 
-/// Antminer S17+ (BM1396) — data-only silicon table; power data is VNish-only.
+/// Antminer S17+ (BM1397) — data-only silicon table; power data is VNish-only.
 pub const S17_PLUS: ModelPowerProfile = ModelPowerProfile {
     model: "Antminer S17+",
-    chip_family: "BM1396",
-    chip_id: 0x1396,
+    chip_family: "BM1397",
+    chip_id: 0x1397,
     hashboards: 3,
     chips_per_board: 65, // support-matrix scaffold; live enumerate still pending
-    cores_per_chip: 0,   // BM1396 cores unknown
+    // Held at 0 by W8-G: BM1397 is 672 cores/chip, but populating it here is a
+    // data addition beyond the 2026-08-03 mapping correction. Follow-up.
+    cores_per_chip: 0,
     cooling: Cooling::Air,
     points: &S17_PLUS_POINTS,
 };
@@ -1302,11 +1308,11 @@ pub const T17: ModelPowerProfile = ModelPowerProfile {
     points: &T17_POINTS,
 };
 
-/// Antminer T17+ (BM1396) — data-only silicon table; power data is VNish-only.
+/// Antminer T17+ (BM1397) — data-only silicon table; power data is VNish-only.
 pub const T17_PLUS: ModelPowerProfile = ModelPowerProfile {
     model: "Antminer T17+",
-    chip_family: "BM1396",
-    chip_id: 0x1396,
+    chip_family: "BM1397",
+    chip_id: 0x1397,
     hashboards: 3,
     chips_per_board: 44, // INFERRED
     cores_per_chip: 0,
@@ -1812,9 +1818,28 @@ mod tests {
         // Sanity: every mapped chip family is represented at least once.
         let families: Vec<&str> = ALL_MODELS.iter().map(|m| m.chip_family).collect();
         for fam in [
-            "BM1387", "BM1397", "BM1396", "BM1398", "BM1362", "BM1366", "BM1368", "BM1370",
+            "BM1387", "BM1397", "BM1398", "BM1362", "BM1366", "BM1368", "BM1370",
         ] {
             assert!(families.contains(&fam), "missing chip family {}", fam);
         }
+
+        // BM1396 is DELIBERATELY absent, and that absence is pinned rather than
+        // dropped. Until 2026-08-03 it was covered only because S17_PLUS/T17_PLUS
+        // were mis-attributed to it (the PR-056 reversal — see the s17plus()
+        // provenance note above). BM1396's real hosts are S17e / T17e, and we
+        // hold NO power curve for either: the only BM1396 evidence is the Bitmain
+        // AMTC maintenance guide (T17e = 78 chips, 13 domains x 6, 1.35 V/domain),
+        // which is not a freq/watt/hashrate ladder. Fabricating one would be worse
+        // than the gap.
+        //
+        // If you are here because you just added an S17e or T17e
+        // `ModelPowerProfile` from real evidence: delete this block and move
+        // "BM1396" back into the loop above.
+        assert!(
+            !families.contains(&"BM1396"),
+            "a BM1396 model row now exists -- move \"BM1396\" back into the \
+             required-families loop above and delete this negative pin. If the \
+             row is S17+ or T17+, it is MIS-ATTRIBUTED: those are BM1397."
+        );
     }
 }

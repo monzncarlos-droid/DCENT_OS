@@ -23,10 +23,12 @@
 )]
 
 mod am1_t15;
+mod am2_bm1362_serial_admission;
 mod am2_chain_plan;
 mod am3_bb_mining;
 mod asic_identity_publication;
 mod autotune;
+mod bounded_nonblocking_probe;
 mod bridge_glue;
 mod bringup;
 mod chain;
@@ -34,8 +36,10 @@ mod config;
 mod daemon;
 mod daemon_lifecycle;
 mod error;
+mod execution_fence;
 mod experimental;
 pub mod fpga;
+mod hardware_mutation_fence;
 pub mod history;
 mod logging;
 mod metrics_export;
@@ -43,6 +47,8 @@ mod model;
 mod persistent_log_ring;
 mod restart;
 mod runtime;
+mod runtime_execution;
+mod runtime_policy;
 mod s19j_hybrid_admission;
 mod s19j_hybrid_mining;
 mod s19j_tap_mining;
@@ -52,6 +58,7 @@ mod sim_runtime;
 mod solar;
 mod stock_mining;
 mod stratum_proxy;
+mod terminal_io_owner;
 mod voltage_mailbox;
 mod wave55a_recipe_guard;
 mod work_dispatcher;
@@ -81,6 +88,54 @@ const VERIFY_BUNDLE_CAPABILITY_BYTES: &[u8] = b"1\n";
 /// The sentinel is currently two bytes. Keep a small bounded envelope for a
 /// future version token without permitting accidental diagnostic payloads.
 const VERIFY_BUNDLE_CAPABILITY_MAX_BYTES: usize = 16;
+const FAN_CUSTODY_READY_PATH: &str = "/var/run/dcentrald-fanhold.ready";
+const FAN_CUSTODY_READY_MAX_BYTES: usize = 256;
+const FAN_CUSTODY_MAX_CONSECUTIVE_REFRESH_FAILURES: u8 = 3;
+
+fn fan_custody_refresh_should_exit(consecutive_failures: &mut u8, success: bool) -> bool {
+    if success {
+        *consecutive_failures = 0;
+        return false;
+    }
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    *consecutive_failures >= FAN_CUSTODY_MAX_CONSECUTIVE_REFRESH_FAILURES
+}
+
+fn proc_stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, after_comm) = stat.rsplit_once(") ")?;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn fan_custody_record(pid: u32, start_ticks: u64, boot_id: &str) -> Option<String> {
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty()
+        || !boot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("{pid} {start_ticks} fan-custodian {boot_id}\n"))
+}
+
+fn publish_fan_custody_ready(path: &std::path::Path) -> std::result::Result<(), String> {
+    let pid = std::process::id();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("cannot read exact process start ticks: {e}"))?;
+    let start_ticks = proc_stat_start_ticks(&stat)
+        .ok_or_else(|| "cannot parse exact process start ticks".to_string())?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|e| format!("cannot read boot identity: {e}"))?;
+    let record = fan_custody_record(pid, start_ticks, &boot_id)
+        .ok_or_else(|| "kernel boot identity has an invalid representation".to_string())?;
+    dcentrald_common::atomic_file::atomic_write(
+        path,
+        record.as_bytes(),
+        dcentrald_common::atomic_file::AtomicWriteOptions::state_file(FAN_CUSTODY_READY_MAX_BYTES),
+    )
+    .map_err(|e| format!("cannot atomically publish readiness: {e:?}"))?;
+    Ok(())
+}
 
 #[derive(Debug)]
 enum VerifyBundleCapabilityPublishError {
@@ -470,7 +525,13 @@ fn run_set_fan_oneshot(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
         return 1;
     };
 
-    match dcentrald_hal::fan::FanController::open_with_variant(uio, variant) {
+    let board_target = std::fs::read_to_string("/etc/dcentos/board_target").unwrap_or_default();
+    let mode_policy = am2_fan_mode_policy_for_board_target(&board_target);
+    match dcentrald_hal::fan::FanController::open_with_variant_and_mode_policy(
+        uio,
+        variant,
+        mode_policy,
+    ) {
         Ok(fan) => {
             fan.set_speed(pwm);
             let discovery = dcentrald_hal::fan::FanUioDiscovery {
@@ -511,7 +572,8 @@ fn run_set_fan_oneshot(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
 }
 
 /// `--hold-fan <PWM>` PERSISTENT fan custodian. Returns the process exit code
-/// (only on SIGTERM/SIGINT — this never returns on its own).
+/// on SIGTERM/SIGINT or after bounded periodic custody failures revoke its
+/// readiness receipt.
 ///
 /// WHY THIS EXISTS (home-safety, AM2):
 /// On AM2 (XIL Zynq) the fan PWM is held only while a process owns the uio16
@@ -520,17 +582,18 @@ fn run_set_fan_oneshot(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
 /// blasting a home unit (observed: `--set-fan 10` then minutes later PWM 100 /
 /// 6180 RPM). mmap-hold alone is NOT enough either: a daemon that wrote PWM once
 /// and only held the mmap still drifted; the ~5 s re-assert is the cure. This
-/// custodian parks the fan, then STAYS RESIDENT re-asserting the PWM (and, on
-/// AM2, re-enabling C52 fan mode via the FanController open path) every ~5 s
-/// until SIGTERM/SIGINT.
+/// custodian parks the fan, then STAYS RESIDENT re-asserting the PWM every ~5 s.
+/// Exact S19-family identity also reasserts the proven C52 mode; S17 and
+/// ambiguous AM2 identity preserve the existing board mode. The process holds
+/// custody until SIGTERM/SIGINT.
 /// and `park_management_only_until_shutdown` (the proven in-process park path
 /// this reuses).
 ///
 /// SAFETY: PWM is only ever driven DOWN — clamped to `PWM_SAFETY_MAX` (30)
 /// unless explicit `--allow-loud` (identical clamp to `--set-fan`), and even
 /// then never above the IP ceiling `PWM_MAX` (100). No PIC/PSU/ASIC/I2C/voltage
-/// access; fan-control UIO only. The 5 s re-assert (`force_am2_fans_to_quiet_idle`)
-/// re-clamps every tick, so the hold can never raise PWM. On non-AM2 variants
+/// access; fan-control UIO only. The 5 s re-assert uses the exact board-target
+/// mode policy and verifies both PWM-channel readbacks. On non-AM2 variants
 /// the board's fan registers/sysfs hold on their own, so the re-assert is
 /// harmless redundancy — kept uniform for simplicity (a single park + 5 s
 /// re-assert + SIGTERM-block path for all variants).
@@ -574,12 +637,18 @@ async fn run_hold_fan(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
     };
 
     let is_am2 = matches!(variant, dcentrald_hal::fan::FanVariant::Am2Uio16);
+    let board_target = std::fs::read_to_string("/etc/dcentos/board_target").unwrap_or_default();
+    let mode_policy = am2_fan_mode_policy_for_board_target(&board_target);
 
-    // Initial park (open → write → readback). On a clean open failure we exit 1
-    // (the caller — init script — treats that as a real failure). The C52 fan
-    // mode is re-enabled by `FanController::open_with_variant()` on every open,
-    // and `force_am2_fans_to_quiet_idle` re-clamps the PWM (only ever DOWN).
-    match dcentrald_hal::fan::FanController::open_with_variant(uio, variant) {
+    // Initial park (open → write → dual-channel readback). On a clean open
+    // failure we exit 1 (the caller — init script — treats that as a real
+    // failure). C52 is enabled only for exact S19-family board targets; S17 and
+    // unknown targets preserve the board's existing mode.
+    match dcentrald_hal::fan::FanController::open_with_variant_and_mode_policy(
+        uio,
+        variant,
+        mode_policy,
+    ) {
         Ok(fan) => {
             fan.set_speed(pwm);
             let discovery = dcentrald_hal::fan::FanUioDiscovery {
@@ -594,10 +663,17 @@ async fn run_hold_fan(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
                 Some(pwm),
                 false,
             );
-            // Drop `fan` here: the periodic re-assert reopens the controller via
-            // `force_am2_fans_to_quiet_idle`'s own open path each tick (which is
-            // what re-enables C52 + re-clamps), matching the proven
-            // `park_management_only_until_shutdown` refresh exactly.
+            let (commanded_pwm0, commanded_pwm1) = fan.get_speed_pwm_channels();
+            if commanded_pwm0 != pwm || commanded_pwm1 != pwm {
+                eprintln!(
+                    "dcentrald --hold-fan: initial PWM readback mismatch (requested={}, pwm0={}, pwm1={})",
+                    pwm, commanded_pwm0, commanded_pwm1
+                );
+                return 1;
+            }
+            // Drop `fan` here: the periodic re-assert reopens the controller
+            // with the same exact board-target policy, then re-clamps and
+            // verifies both PWM channels.
         }
         Err(e) => {
             eprintln!(
@@ -620,14 +696,21 @@ async fn run_hold_fan(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
     );
 
     // Persistent custodian: re-assert the PWM every ~5 s until SIGTERM/SIGINT.
-    // PWM is only ever driven DOWN (re-clamped inside `force_am2_fans_to_quiet_idle`
-    // on AM2 / the FanController setter on non-AM2). The 5 s cadence + SIGTERM
-    // race exactly mirror `park_management_only_until_shutdown`.
+    // PWM is only ever driven DOWN (the requested setpoint was already clamped).
+    // The 5 s cadence + SIGTERM race exactly mirror the proven management-only
+    // custodian, while bounded failures revoke readiness instead of preserving
+    // a stale claim of custody.
     const FAN_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
     let mut refresh = tokio::time::interval(FAN_REFRESH);
     // First tick fires immediately; skip-then-wait so we don't double the entry
     // park we just performed.
     refresh.tick().await;
+    let mut consecutive_refresh_failures = 0u8;
+
+    if let Err(e) = publish_fan_custody_ready(std::path::Path::new(FAN_CUSTODY_READY_PATH)) {
+        eprintln!("dcentrald --hold-fan: {e}");
+        return 1;
+    }
 
     let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
         Ok(s) => s,
@@ -640,9 +723,20 @@ async fn run_hold_fan(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
             loop {
                 tokio::select! {
                     _ = signal::ctrl_c() => break,
-                    _ = refresh.tick() => hold_fan_reassert(pwm, is_am2),
+                    _ = refresh.tick() => {
+                        let success = hold_fan_reassert(pwm, mode_policy);
+                        if fan_custody_refresh_should_exit(&mut consecutive_refresh_failures, success) {
+                            let _ = std::fs::remove_file(FAN_CUSTODY_READY_PATH);
+                            eprintln!(
+                                "dcentrald --hold-fan: persistent PWM custody failed {} consecutive refreshes; readiness revoked",
+                                consecutive_refresh_failures
+                            );
+                            return 1;
+                        }
+                    },
                 }
             }
+            let _ = std::fs::remove_file(FAN_CUSTODY_READY_PATH);
             info!("dcentrald --hold-fan: received SIGINT, releasing fan custodian (clean exit)");
             return 0;
         }
@@ -658,20 +752,30 @@ async fn run_hold_fan(pwm_arg: Option<&str>, allow_loud: bool) -> i32 {
                 info!("dcentrald --hold-fan: received SIGTERM, releasing fan custodian (clean exit)");
                 break;
             }
-            _ = refresh.tick() => hold_fan_reassert(pwm, is_am2),
+            _ = refresh.tick() => {
+                let success = hold_fan_reassert(pwm, mode_policy);
+                if fan_custody_refresh_should_exit(&mut consecutive_refresh_failures, success) {
+                    let _ = std::fs::remove_file(FAN_CUSTODY_READY_PATH);
+                    eprintln!(
+                        "dcentrald --hold-fan: persistent PWM custody failed {} consecutive refreshes; readiness revoked",
+                        consecutive_refresh_failures
+                    );
+                    return 1;
+                }
+            },
         }
     }
+    let _ = std::fs::remove_file(FAN_CUSTODY_READY_PATH);
     0
 }
 
-/// One periodic re-assert tick for `--hold-fan`. On AM2 this reuses the proven
-/// `force_am2_fans_to_quiet_idle` path (reopens the FanController → re-enables
-/// C52 fan mode → re-clamps + re-commands the PWM, only ever DOWN). On non-AM2
-/// the board fan registers/sysfs hold on their own; we still re-command for
-/// uniformity (a single FanController open + set, tolerant of open failure so
-/// the custodian never aborts on a transient device error). Logs at `debug`.
-fn hold_fan_reassert(pwm: u8, is_am2: bool) {
-    if is_am2 {
+/// One periodic re-assert tick for `--hold-fan`. Exact S19-family targets use
+/// the proven C52 + idle-clamp path; S17 and unknown targets preserve the
+/// board's existing fan mode. Every path verifies both PWM-channel readbacks.
+/// A failed tick is tolerated, but bounded consecutive failures cause the
+/// caller to revoke readiness and exit. Logs successful refreshes at `debug`.
+fn hold_fan_reassert(pwm: u8, mode_policy: dcentrald_hal::fan::Am2FanModePolicy) -> bool {
+    if matches!(mode_policy, dcentrald_hal::fan::Am2FanModePolicy::EnableC52) {
         tracing::debug!(
             pwm,
             "dcentrald --hold-fan: re-asserting AM2 fan PWM (C52 + idle re-clamp)"
@@ -679,33 +783,58 @@ fn hold_fan_reassert(pwm: u8, is_am2: bool) {
         // Pass `pwm` as both the idle and the cap so `compute_quiet_idle_pwm`
         // resolves to exactly `pwm` (already clamped ≤ 30 unless --allow-loud,
         // which raised the value before this point but never above PWM_MAX).
-        crate::s19j_hybrid_mining::force_am2_fans_to_quiet_idle(
-            pwm,
-            pwm,
-            "--hold-fan periodic custodian re-assert (am2)",
-        );
-        return;
+        return hold_fan_reassert_open(pwm, mode_policy);
     }
+    hold_fan_reassert_open(pwm, mode_policy)
+}
+
+fn hold_fan_reassert_open(pwm: u8, mode_policy: dcentrald_hal::fan::Am2FanModePolicy) -> bool {
     // Non-AM2: harmless redundant re-command (registers/sysfs already hold).
     match discover_fan_uio() {
         Some((uio, variant)) => {
-            match dcentrald_hal::fan::FanController::open_with_variant(uio, variant) {
+            match dcentrald_hal::fan::FanController::open_with_variant_and_mode_policy(
+                uio,
+                variant,
+                mode_policy,
+            ) {
                 Ok(fan) => {
                     fan.set_speed(pwm);
-                    tracing::debug!(pwm, uio, "dcentrald --hold-fan: re-asserted fan PWM (non-AM2)");
+                    let (pwm0, pwm1) = fan.get_speed_pwm_channels();
+                    tracing::debug!(
+                        pwm,
+                        uio,
+                        "dcentrald --hold-fan: re-asserted fan PWM (non-AM2)"
+                    );
+                    if pwm0 != pwm || pwm1 != pwm {
+                        tracing::warn!(
+                            requested_pwm = pwm,
+                            pwm0,
+                            pwm1,
+                            uio,
+                            "dcentrald --hold-fan: periodic PWM readback mismatch"
+                        );
+                        return false;
+                    }
+                    true
                 }
-                Err(e) => tracing::debug!(
-                    pwm,
-                    uio,
-                    error = %e,
+                Err(e) => {
+                    tracing::warn!(
+                        pwm,
+                        uio,
+                        error = %e,
                     "dcentrald --hold-fan: re-assert open failed (non-AM2) — custodian continues"
-                ),
+                    );
+                    false
+                }
             }
         }
-        None => tracing::debug!(
-            pwm,
+        None => {
+            tracing::warn!(
+                pwm,
             "dcentrald --hold-fan: re-assert found no fan-control UIO (non-AM2) — custodian continues"
-        ),
+            );
+            false
+        }
     }
 }
 
@@ -725,8 +854,6 @@ enum SafeOffCut {
     AmlogicDisablePsu,
     /// AM335x BeagleBone (am3-bb).
     BeagleboneDisablePsu,
-    /// CVitek CV1835.
-    CvitekDisablePsu,
     /// am1 S9 + other Zynq.
     ZynqDisablePsu,
     /// Unknown platform string — power is NOT cut (honest; never a false affordance).
@@ -745,11 +872,30 @@ fn safe_off_cut_for_platform(platform: &str) -> SafeOffCut {
     } else if p.starts_with("am3-bb") || p.contains("beaglebone") || p.contains("am335x") {
         SafeOffCut::BeagleboneDisablePsu
     } else if p.contains("cvitek") || p.contains("cv1835") {
-        SafeOffCut::CvitekDisablePsu
+        // CV1835 has no admitted runtime or verified power-control contract.
+        SafeOffCut::Unknown
     } else if p.starts_with("zynq") {
         SafeOffCut::ZynqDisablePsu
     } else {
         SafeOffCut::Unknown
+    }
+}
+
+/// Board-mode policy for the AM2 fan step of `--safe-off`.
+///
+/// Four-channel fan topology does not authorize the separate C49/C52
+/// board-control mutation. Only exact S19-family product identity opts into
+/// the held C52 behavior; S17 and missing/ambiguous identity preserve mode.
+fn am2_fan_mode_policy_for_board_target(
+    board_target: &str,
+) -> dcentrald_hal::fan::Am2FanModePolicy {
+    use dcentrald_hal::fan::Am2FanModePolicy;
+
+    match board_target.trim() {
+        "am2-s19" | "am2-s19j" | "am2-s19jpro" | "am2-s19jpro-zynq" | "am2-s19pro" | "am2-t19" => {
+            Am2FanModePolicy::EnableC52
+        }
+        _ => Am2FanModePolicy::Preserve,
     }
 }
 
@@ -762,6 +908,7 @@ fn safe_off_cut_for_platform(platform: &str) -> SafeOffCut {
 ///   0 = power cut + fans set quiet; 1 = a cut/fan step failed or platform unknown.
 fn run_safe_off_oneshot() -> i32 {
     let platform = std::fs::read_to_string("/etc/dcentos/platform").unwrap_or_default();
+    let board_target = std::fs::read_to_string("/etc/dcentos/board_target").unwrap_or_default();
     let cut = safe_off_cut_for_platform(&platform);
     let platform_disp = platform.trim();
     eprintln!(
@@ -816,12 +963,6 @@ fn run_safe_off_oneshot() -> i32 {
                 rc = 1;
             }
         }
-        SafeOffCut::CvitekDisablePsu => {
-            if let Err(e) = dcentrald_hal::platform::cvitek::disable_psu() {
-                eprintln!("dcentrald --safe-off: cvitek disable_psu failed: {}", e);
-                rc = 1;
-            }
-        }
         SafeOffCut::ZynqDisablePsu => {
             if let Err(e) = dcentrald_hal::platform::zynq::disable_psu_output() {
                 eprintln!(
@@ -841,13 +982,27 @@ fn run_safe_off_oneshot() -> i32 {
         }
     }
 
+    if rc != 0 {
+        eprintln!("dcentrald --safe-off: power cut was not proven; fans are left unchanged");
+        return rc;
+    }
+
     // 2. Fans -> safe quiet idle (chips are de-energized now; PWM is only ever
     //    driven DOWN, never above PWM_SAFETY_MAX). Best-effort: a fan-open
     //    failure does not abort — the power cut above is load-bearing.
     let quiet_pwm = SAFE_OFF_FAN_PWM.min(dcentrald_hal::fan::PWM_SAFETY_MAX);
     match discover_fan_uio() {
         Some((uio, variant)) => {
-            match dcentrald_hal::fan::FanController::open_with_variant(uio, variant) {
+            let mode_policy = if matches!(variant, dcentrald_hal::fan::FanVariant::Am2Uio16) {
+                am2_fan_mode_policy_for_board_target(&board_target)
+            } else {
+                dcentrald_hal::fan::Am2FanModePolicy::Preserve
+            };
+            match dcentrald_hal::fan::FanController::open_with_variant_and_mode_policy(
+                uio,
+                variant,
+                mode_policy,
+            ) {
                 Ok(fan) => {
                     fan.set_speed(quiet_pwm);
                     eprintln!(
@@ -1170,26 +1325,79 @@ impl RuntimeDispatchKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "runtime dispatch admission must be consumed by the selected runtime"]
+#[derive(Debug, PartialEq, Eq)]
 enum RuntimeDispatchAdmission {
     MiningInactive,
     ExternalHardwareOwner,
     Compatible {
+        dispatch: RuntimeDispatchKind,
+        board_target: &'static str,
         asic_protocol: Option<dcentrald_common::AsicProtocolAdmission>,
     },
+}
+
+/// Move-only BoardDesc/config authority for one direct-serial runtime.
+///
+/// This is declaration evidence, not observed silicon. `SerialMiner` must
+/// combine it with parser-validated response evidence before family-specific
+/// ASIC mutations on routes that support validated serial admission.
+#[must_use = "serial runtime dispatch admission must remain bound to its miner lifecycle"]
+#[derive(Debug, PartialEq, Eq)]
+struct SerialRuntimeDispatchAdmission {
+    board_target: &'static str,
+    asic_protocol: dcentrald_common::AsicProtocolAdmission,
+}
+
+impl SerialRuntimeDispatchAdmission {
+    fn board_target(&self) -> &'static str {
+        self.board_target
+    }
+
+    fn identity(&self) -> dcentrald_common::AsicProtocolIdentity {
+        self.asic_protocol.identity()
+    }
 }
 
 impl RuntimeDispatchAdmission {
     fn require_asic_protocol(
         self,
+        expected_dispatch: RuntimeDispatchKind,
+        expected_board_target: &str,
         expected: dcentrald_common::AsicProtocolIdentity,
     ) -> std::result::Result<dcentrald_common::AsicProtocolAdmission, String> {
         match self {
             Self::Compatible {
+                dispatch,
+                board_target,
                 asic_protocol: Some(admission),
-            } if admission.identity() == expected => Ok(admission),
+            } if dispatch == expected_dispatch
+                && board_target == expected_board_target
+                && admission.identity() == expected =>
+            {
+                Ok(admission)
+            }
             _ => Err(format!(
-                "runtime dispatch lacks exact {expected:?} ASIC protocol admission"
+                "runtime dispatch lacks exact {expected_dispatch:?}/{expected_board_target}/{expected:?} admission"
+            )),
+        }
+    }
+
+    fn require_serial_asic_protocol(
+        self,
+        expected: dcentrald_common::AsicProtocolIdentity,
+    ) -> std::result::Result<SerialRuntimeDispatchAdmission, String> {
+        match self {
+            Self::Compatible {
+                dispatch: RuntimeDispatchKind::Serial,
+                board_target,
+                asic_protocol: Some(asic_protocol),
+            } if asic_protocol.identity() == expected => Ok(SerialRuntimeDispatchAdmission {
+                board_target,
+                asic_protocol,
+            }),
+            _ => Err(format!(
+                "runtime dispatch lacks exact direct-serial/{expected:?} protocol admission"
             )),
         }
     }
@@ -1259,7 +1467,7 @@ fn admit_board_desc_runtime_dispatch(
     // its hardware-owning constructor. Bind that configured identity to the
     // complete BoardDesc here; a RuntimeDiscovered descriptor is not enough to
     // authorize pre-discovery mutations.
-    if dispatch == RuntimeDispatchKind::Serial {
+    let serial_asic_protocol_admission = if dispatch == RuntimeDispatchKind::Serial {
         let configured = configured_asic_protocol.ok_or_else(|| {
             format!(
                 "runtime dispatch {} requires an explicit ASIC identity before hardware construction",
@@ -1272,12 +1480,17 @@ fn admit_board_desc_runtime_dispatch(
                 board_desc.board_target
             ));
         }
-        board_desc.admit_asic_protocol(Some(configured), board_desc.asic_protocol)?;
-    }
+        Some(board_desc.admit_asic_protocol(Some(configured), board_desc.asic_protocol)?)
+    } else {
+        None
+    };
 
-    let asic_protocol_admission = required_asic_protocol
-        .map(|required| board_desc.admit_asic_protocol(configured_asic_protocol, required))
-        .transpose()?;
+    let asic_protocol_admission = match serial_asic_protocol_admission {
+        Some(admission) => Some(admission),
+        None => required_asic_protocol
+            .map(|required| board_desc.admit_asic_protocol(configured_asic_protocol, required))
+            .transpose()?,
+    };
 
     let (required_transport, required_work_engine) =
         if dispatch == RuntimeDispatchKind::StandardDaemon && board_desc.board_target == "am1-s9" {
@@ -1323,6 +1536,8 @@ fn admit_board_desc_runtime_dispatch(
         ))
     } else {
         Ok(RuntimeDispatchAdmission::Compatible {
+            dispatch,
+            board_target: board_desc.board_target,
             asic_protocol: asic_protocol_admission,
         })
     }
@@ -1368,6 +1583,11 @@ mod board_desc_runtime_dispatch_tests {
             },
             public_beta_install: false,
             mining_default_enabled: false,
+            // Fail-closed placeholder for fabricated future targets: nothing
+            // is captured, so nothing may claim a lane.
+            runtime_status: dcentrald_common::RuntimeStatus::CaptureFirst {
+                unconfirmed: &["test-only scaffold row; no datums captured"],
+            },
         }
     }
 
@@ -1518,6 +1738,8 @@ mod board_desc_runtime_dispatch_tests {
                         assert_eq!(
                             result.unwrap(),
                             RuntimeDispatchAdmission::Compatible {
+                                dispatch: RuntimeDispatchKind::StandardDaemon,
+                                board_target: "am1-s9",
                                 asic_protocol: None
                             }
                         )
@@ -1555,6 +1777,8 @@ mod board_desc_runtime_dispatch_tests {
             )
             .unwrap(),
             RuntimeDispatchAdmission::Compatible {
+                dispatch: RuntimeDispatchKind::StandardDaemon,
+                board_target: "am1-s9",
                 asic_protocol: None
             }
         );
@@ -1579,6 +1803,10 @@ mod board_desc_runtime_dispatch_tests {
             },
             public_beta_install: false,
             mining_default_enabled: false,
+            // Fail-closed placeholder for a fabricated future target.
+            runtime_status: dcentrald_common::RuntimeStatus::CaptureFirst {
+                unconfirmed: &["test-only scaffold row; no datums captured"],
+            },
         };
         assert!(admit_board_desc_runtime_dispatch(
             Some(&future_fpga),
@@ -1613,6 +1841,51 @@ mod board_desc_runtime_dispatch_tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn am3_dispatch_admission_is_move_only_and_consumed_by_the_exact_route() {
+        use dcentrald_common::{AsicProtocolIdentity, BoardDesc};
+
+        let source_start = MAIN_SOURCE
+            .find("enum RuntimeDispatchAdmission")
+            .expect("runtime dispatch admission enum");
+        let derive = MAIN_SOURCE[..source_start]
+            .lines()
+            .rev()
+            .find(|line| line.contains("derive"))
+            .expect("runtime dispatch admission derive");
+        assert!(!derive.contains("Clone") && !derive.contains("Copy"));
+
+        let exact = admit_board_desc_runtime_dispatch(
+            BoardDesc::lookup("am3-bb-s19jpro"),
+            RuntimeDispatchKind::Am3BeagleBone,
+            true,
+            Some(AsicProtocolIdentity::Bm1362),
+        )
+        .unwrap();
+        assert!(exact
+            .require_asic_protocol(
+                RuntimeDispatchKind::Am3BeagleBone,
+                "am3-bb-s19jpro",
+                AsicProtocolIdentity::Bm1362,
+            )
+            .is_ok());
+
+        let wrong_route = admit_board_desc_runtime_dispatch(
+            BoardDesc::lookup("am3-bb-s19jpro"),
+            RuntimeDispatchKind::Am3BeagleBone,
+            true,
+            Some(AsicProtocolIdentity::Bm1362),
+        )
+        .unwrap();
+        assert!(wrong_route
+            .require_asic_protocol(
+                RuntimeDispatchKind::S19jHybrid,
+                "am2-s19j",
+                AsicProtocolIdentity::Bm1362,
+            )
+            .is_err());
     }
 
     #[test]
@@ -1659,18 +1932,21 @@ mod board_desc_runtime_dispatch_tests {
             "serial carrier must remain unresolved"
         );
         assert_eq!(required_work, Some(WorkEngineKind::SerialWork));
-        assert_eq!(
-            admit_board_desc_runtime_dispatch(
-                Some(am2),
-                RuntimeDispatchKind::Serial,
-                true,
-                Some(dcentrald_common::AsicProtocolIdentity::Bm1362),
-            )
-            .unwrap(),
+        let admission = admit_board_desc_runtime_dispatch(
+            Some(am2),
+            RuntimeDispatchKind::Serial,
+            true,
+            Some(dcentrald_common::AsicProtocolIdentity::Bm1362),
+        )
+        .unwrap();
+        assert!(matches!(
+            admission,
             RuntimeDispatchAdmission::Compatible {
-                asic_protocol: None
-            }
-        );
+                dispatch: RuntimeDispatchKind::Serial,
+                board_target: "am2-s19j",
+                asic_protocol: Some(protocol),
+            } if protocol.identity() == dcentrald_common::AsicProtocolIdentity::Bm1362
+        ));
 
         assert!(MAIN_SOURCE.contains("DCENT_ALLOW_AM2_BM1362_SERIAL_WORK"));
     }
@@ -2054,14 +2330,14 @@ async fn run_main() -> Result<()> {
     // PWM is held only while a process owns the uio16 mmap AND keeps
     // re-commanding it (mmap-hold alone is NOT enough — a daemon that wrote PWM
     // once still drifted; the 5 s re-assert is the cure). It reuses the SAME
-    // in-process park path `park_management_only_until_shutdown` uses
-    // (FanController open + periodic `force_am2_fans_to_quiet_idle`), so it
-    // re-enables C52 fan mode + idle PWM each tick. Clamp is identical to
-    // `--set-fan` (≤ PWM_SAFETY_MAX home cap unless `--allow-loud`). Runs BEFORE
-    // config/logging/mode routing; it is a NEW opt-in subcommand and cannot
-    // alter the normal daemon path. SIGTERM-responsive (the init-script `stop`
-    // path kills it by pidfile). It never exits on its own (returns only on
-    // signal); rule: .
+    // in-process fan-control paths: exact S19-family targets enable C52 while
+    // S17 and unknown targets preserve their existing board mode. Clamp is
+    // identical to `--set-fan` (≤ PWM_SAFETY_MAX home cap unless
+    // `--allow-loud`). Runs BEFORE config/logging/mode routing; it is a NEW
+    // opt-in subcommand and cannot alter the normal daemon path. It is
+    // SIGTERM-responsive and also exits fail-closed after bounded consecutive
+    // refresh/readback failures, revoking its readiness receipt first; rule:
+    // .
     if let Some(pos) = args.iter().position(|a| a == "--hold-fan") {
         let pwm_arg = args.get(pos + 1).map(String::as_str);
         let allow_loud = args.iter().any(|a| a == "--allow-loud");
@@ -2138,10 +2414,10 @@ async fn run_main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
 
     // Load configuration. NO-BRICK CONTRACT (gap-swarm daemon-startup #1/#9):
-    // a config problem must NEVER `?`-crash here — the S82dcentrald wrapper treats
-    // a non-zero exit as a crash and, after MAX_CRASH_RESTARTS, permanently gives
-    // up, leaving a unit with no daemon / no :8080 API / no dashboard (the exact
-    // unmanageable-brick state F1/F5 management-only was built to prevent). And a
+    // a config problem must NEVER `?`-crash here — S82dcentrald records a durable
+    // unresolved hardware session and intentionally refuses automatic restart,
+    // leaving no daemon / no :8080 API / no dashboard until disposition is
+    // resolved. And a
     // PRESENT-BUT-CORRUPT primary config must NOT silently revert to the baked
     // /etc default (mining-enabled on some platforms). So:
     //   * primary loads          -> use it
@@ -2149,7 +2425,7 @@ async fn run_main() -> Result<()> {
     //   * primary present+INVALID -> fail CLOSED to management-only defaults
     //                                (do NOT revert to /etc)
     // management_only_default() forces mining.enabled=false => management-only.
-    let (config, resolved_config_path) = match DcentraldConfig::load(&config_path) {
+    let (mut config, resolved_config_path) = match DcentraldConfig::load(&config_path) {
         Ok(cfg) => (cfg, config_path.clone()),
         Err(primary_err) => {
             if std::path::Path::new(&config_path).exists() {
@@ -2184,11 +2460,20 @@ async fn run_main() -> Result<()> {
             }
         }
     };
+    // Runtime-only acceptance is a process policy. Redirect the operator's
+    // configured autotuner root as well as its default so no opted-in tuner can
+    // persist profiles beneath /data while the ephemeral launcher is active.
+    config.autotuner.profile_path = crate::runtime_policy::persistence_path(
+        std::path::Path::new(&config.autotuner.profile_path),
+        std::path::Path::new("/tmp/dcent/autotuner"),
+    )
+    .to_string_lossy()
+    .into_owned();
 
     // Initialize structured logging. No-brick: a logging-subsystem failure must
-    // NOT crash the daemon (the S82dcentrald wrapper treats a non-zero exit as a
-    // crash and, after MAX_CRASH_RESTARTS, gives up → permanent unmanageable
-    // brick). The safety/management plane (API/dashboard/management-only park,
+    // NOT crash the daemon (S82dcentrald intentionally refuses automatic restart
+    // while its durable hardware-session disposition remains unresolved). The
+    // safety/management plane (API/dashboard/management-only park,
     // re-flash detection) does not depend on structured logging — degrade
     // closed-but-alive instead of dying. (gap-swarm daemon-startup #3)
     if let Err(e) = init_logging(&config.general.log_level) {
@@ -2228,18 +2513,35 @@ async fn run_main() -> Result<()> {
     // OTA re-verify — resolving the probe-safety problem (invoking --verify-bundle
     // on a pre-verb binary could start the daemon). Best-effort: /data may be
     // read-only/absent on some platforms; failure is non-fatal and never blocks
-    // startup. Any run of THIS binary proves verb support, so dropping it on the
-    // daemon path is correct.
-    match publish_verify_bundle_capability(std::path::Path::new(VERIFY_BUNDLE_CAPABILITY_PATH)) {
-        Ok(_) => {}
-        Err(VerifyBundleCapabilityPublishError::CreateParent(error)) => tracing::debug!(
+    // startup. A persistent-install-capable run of THIS binary proves verb
+    // support; the external-media-only AM3-BB route is intentionally excluded.
+    let ephemeral_runtime = crate::runtime_policy::ephemeral_runtime_enabled();
+    let verify_bundle_publication = if am3_bb_mode || ephemeral_runtime {
+        // The AM3-BB acceptance route is explicitly external-media-only. Its
+        // temporary binary must not create `/data` capability state merely by
+        // starting on stock LuxOS. Persistent installers do not consume this
+        // route, so skipping the marker is both truthful and fail-closed.
+        info!(
+            target = VERIFY_BUNDLE_CAPABILITY_PATH,
+            ephemeral_runtime,
+            "skipping persistent verify-bundle capability publication for non-persistent runtime"
+        );
+        None
+    } else {
+        Some(publish_verify_bundle_capability(std::path::Path::new(
+            VERIFY_BUNDLE_CAPABILITY_PATH,
+        )))
+    };
+    match verify_bundle_publication {
+        None | Some(Ok(_)) => {}
+        Some(Err(VerifyBundleCapabilityPublishError::CreateParent(error))) => tracing::debug!(
             error = %error,
             persistence_stage = "create-parent",
             target_published = false,
             publication_durability_uncertain = false,
             "could not publish verify-bundle capability sentinel (non-fatal)"
         ),
-        Err(VerifyBundleCapabilityPublishError::Publish(error)) => tracing::debug!(
+        Some(Err(VerifyBundleCapabilityPublishError::Publish(error))) => tracing::debug!(
             error = %error,
             persistence_stage = %error.stage(),
             target_published = error.target_published(),
@@ -2323,35 +2625,27 @@ async fn run_main() -> Result<()> {
         }
     }
 
+    // Register both Unix shutdown signals synchronously before any route can
+    // enter hardware initialization. `tokio::spawn` is not a readiness barrier:
+    // constructing these streams here makes signal ownership a fail-closed
+    // startup prerequisite instead of racing standard-daemon bootstrap.
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT shutdown handler before hardware admission")?;
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM shutdown handler before hardware admission")?;
+
     // Create cancellation token for coordinated shutdown
     let shutdown_token = CancellationToken::new();
     let shutdown_token_signal = shutdown_token.clone();
 
-    // Spawn signal handler task
+    // The streams are already registered; this task only awaits delivery.
     tokio::spawn(async move {
-        let ctrl_c = signal::ctrl_c();
-        // No-brick: SIGTERM registration essentially never fails on Linux, but if
-        // it does, degrade to SIGINT-only rather than panicking — the release
-        // profile sets `panic = "abort"`, so an `.expect()` here would abort the
-        // whole daemon (the wrapper counts that as a crash). Mirrors the graceful
-        // SIGTERM-registration handling in run_hold_fan. (gap-swarm daemon-startup #4)
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = ctrl_c => {
-                        info!("Received SIGINT, initiating graceful shutdown");
-                    }
-                    _ = sigterm.recv() => {
-                        info!("Received SIGTERM, initiating graceful shutdown");
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "dcentrald: SIGTERM handler registration failed ({e}) — falling back to SIGINT-only shutdown"
-                );
-                let _ = ctrl_c.await;
+        tokio::select! {
+            _ = sigint.recv() => {
                 info!("Received SIGINT, initiating graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, initiating graceful shutdown");
             }
         }
 
@@ -2447,10 +2741,6 @@ async fn run_main() -> Result<()> {
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                // Admission failure proves neither rail-off nor an idle thermal
-                // state. Preserve the existing cooling command; lowering PWM
-                // here could leave a hot donor/passthrough board under-cooled.
-                None,
             )
             .await;
         }
@@ -2476,38 +2766,61 @@ async fn run_main() -> Result<()> {
         stock_fpga_mode,
     );
     let runtime_board_desc = platform_identity.board_desc;
-    let mut s19j_hybrid_route_admission = match configured_asic_protocol_identity(&config).and_then(
-        |configured_asic_protocol| {
-            let runtime_admission = admit_board_desc_runtime_dispatch(
-                runtime_board_desc,
+    let (
+        runtime_dispatch_admission,
+        mut s19j_hybrid_route_admission,
+        mut am2_bm1362_serial_route_admission,
+    ) = match configured_asic_protocol_identity(&config).and_then(|configured_asic_protocol| {
+        let runtime_admission = admit_board_desc_runtime_dispatch(
+            runtime_board_desc,
+            runtime_dispatch,
+            config.mining_start_enabled(),
+            configured_asic_protocol,
+        )?;
+        let hybrid_route_admission = if runtime_dispatch == RuntimeDispatchKind::S19jHybrid
+            && config.mining_start_enabled()
+        {
+            Some(s19j_hybrid_admission::admit_s19j_hybrid_route(
+                &platform_identity,
                 runtime_dispatch,
-                config.mining_start_enabled(),
                 configured_asic_protocol,
-            )?;
-            let hybrid_route_admission = if runtime_dispatch == RuntimeDispatchKind::S19jHybrid
-                && config.mining_start_enabled()
-            {
-                Some(s19j_hybrid_admission::admit_s19j_hybrid_route(
-                    &platform_identity,
-                    runtime_dispatch,
-                    configured_asic_protocol,
-                )?)
-            } else {
-                None
-            };
-            Ok((runtime_admission, hybrid_route_admission))
-        },
-    ) {
-        Ok((admission, hybrid_route_admission)) => {
+            )?)
+        } else {
+            None
+        };
+        let am2_bm1362_serial_route_admission = if runtime_dispatch == RuntimeDispatchKind::Serial
+            && config.mining_start_enabled()
+            && configured_asic_protocol == Some(dcentrald_common::AsicProtocolIdentity::Bm1362)
+        {
+            Some(am2_bm1362_serial_admission::admit_am2_bm1362_serial_route(
+                &platform_identity,
+                runtime_dispatch,
+                configured_asic_protocol,
+            )?)
+        } else {
+            None
+        };
+        Ok((
+            runtime_admission,
+            hybrid_route_admission,
+            am2_bm1362_serial_route_admission,
+        ))
+    }) {
+        Ok((admission, hybrid_route_admission, am2_bm1362_serial_route_admission)) => {
             info!(
                 board_target = %td003_board_target.trim(),
                 board_desc_registered = runtime_board_desc.is_some(),
                 dispatch = runtime_dispatch.label(),
                 admission = ?admission,
                 hybrid_route_admitted = hybrid_route_admission.is_some(),
+                am2_bm1362_serial_route_admitted = am2_bm1362_serial_route_admission.is_some(),
                 "BoardDesc runtime transport/work/ASIC-protocol admission evaluated"
             );
-            hybrid_route_admission
+            (
+                admission,
+                hybrid_route_admission,
+                am2_bm1362_serial_route_admission,
+            )
         }
         Err(reason) => {
             tracing::warn!(
@@ -2534,9 +2847,6 @@ async fn run_main() -> Result<()> {
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                // Rejection proves neither rail-off nor an idle thermal state.
-                // Preserve cooling on a possibly hot inherited composition.
-                None,
             )
             .await;
         }
@@ -2544,10 +2854,9 @@ async fn run_main() -> Result<()> {
 
     if am3_bb_mode {
         // Phase C: AM335x BeagleBone S19j Pro (S19J_IO_BOARD_V2_0) mining.
-        // Bring up the dashboard / CGMiner API first (same pattern as the
-        // other modes — closes the
-        // class), then run the cold-boot + transport-setup + (Phase-C stub)
-        // mining loop. See am3_bb_mining.rs.
+        // Start the dashboard / CGMiner API tasks first, then run the cold-boot
+        // + transport-setup + (Phase-C stub) mining loop. Listener health is
+        // observed separately. See am3_bb_mining.rs.
         info!(
             am3_bb_cli = am3_bb_cli,
             am3_bb_auto = am3_bb_auto,
@@ -2557,12 +2866,16 @@ async fn run_main() -> Result<()> {
             tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
                 dcentrald_api::RuntimeHealthMode::Native,
             ));
-
-        // R1: compute the am2 low-idle command tuple before `config` is moved into
-        // the miner. am3-bb is never `zynq-bm3-am2*` ⇒ this is None here (the
-        // am3-bb cold-boot guard handles its own fans), but threading it
-        // keeps the park-path signature uniform across all arms.
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
+        let mut initial_miner_state =
+            dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard);
+        initial_miner_state.pool.url = config.pool.url.clone();
+        initial_miner_state.pool.worker = config.pool.worker.clone();
+        initial_miner_state.pool.protocol = config
+            .pool
+            .protocol
+            .clone()
+            .unwrap_or_else(|| "sv1".to_string());
+        let (miner_state_tx, miner_state_rx) = tokio::sync::watch::channel(initial_miner_state);
 
         // F5: same fresh-unit gate as the s19j-hybrid arm. An unconfigured
         // am3-bb unit comes up management-only (API/dashboard/wizard
@@ -2570,10 +2883,11 @@ async fn run_main() -> Result<()> {
         // configures a pool and enables mining.
         if !config.mining_start_enabled() {
             let _api_handles =
-                crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+                crate::runtime::api::spawn_observer_only_api_with_state_and_hardware_mutation_gate(
                     config.clone(),
                     dcentrald_api::RuntimeHealthMode::Native,
-                    Some(runtime_health_rx),
+                    Some(runtime_health_rx.clone()),
+                    Some(miner_state_rx.clone()),
                     dcentrald_hal::platform::HardwareMutationGate::new_closed(),
                     shutdown_token.clone(),
                 )
@@ -2583,7 +2897,6 @@ async fn run_main() -> Result<()> {
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                am2_qi,
             )
             .await;
         }
@@ -2591,14 +2904,35 @@ async fn run_main() -> Result<()> {
         // The watchdog must report its initial kick before the API can admit a
         // hardware mutation and before the blocking engine can touch GPIO,
         // I2C, UART, power, or cooling state.
-        let safety_admission = match am3_bb_mining::Am3BbSafetyAdmission::start(&config).await {
+        let safety_admission = match am3_bb_mining::Am3BbSafetyAdmission::start(
+            &config,
+            &platform_identity,
+            runtime_dispatch_admission,
+        )
+        .await
+        {
             Ok(admission) => admission,
             Err(error) => {
+                let (disposition, error, closeout) = error.into_parts();
+                anyhow::ensure!(
+                    closeout.is_none(),
+                    "am3-bb watchdog admission returned contradictory never-energized closeout evidence"
+                );
+                if disposition != am3_bb_mining::Am3BbFailureDisposition::NoWatchdogOpened {
+                    error!(
+                        %error,
+                        "am3-bb watchdog admission is reset-pending; refusing stable management-only operation"
+                    );
+                    return Err(error.context(
+                        "am3-bb watchdog admission faulted/reset_pending before API startup",
+                    ));
+                }
                 let _api_handles =
-                    crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+                    crate::runtime::api::spawn_observer_only_api_with_state_and_hardware_mutation_gate(
                         config.clone(),
                         dcentrald_api::RuntimeHealthMode::Native,
-                        Some(runtime_health_rx),
+                        Some(runtime_health_rx.clone()),
+                        Some(miner_state_rx.clone()),
                         dcentrald_hal::platform::HardwareMutationGate::new_closed(),
                         shutdown_token.clone(),
                     )
@@ -2607,18 +2941,21 @@ async fn run_main() -> Result<()> {
                     "am3-bb-watchdog-admission",
                     error,
                     shutdown_token.clone(),
-                    am2_qi,
+                    None,
                 )
                 .await;
             }
         };
         let api_mutation_gate = safety_admission.hardware_mutation_gate();
+        let api_identity = safety_admission.api_identity();
         let _api_handles =
-            match crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+            match crate::runtime::api::spawn_proxy_mode_api_with_state_gate_and_identity(
                 config.clone(),
                 dcentrald_api::RuntimeHealthMode::Native,
                 Some(runtime_health_rx),
+                Some(miner_state_rx),
                 api_mutation_gate.clone(),
+                api_identity,
                 shutdown_token.clone(),
             )
             .await
@@ -2626,28 +2963,100 @@ async fn run_main() -> Result<()> {
                 Ok(handles) => handles,
                 Err(error) => {
                     let _ = api_mutation_gate.close_and_drain(std::time::Duration::ZERO);
+                    safety_admission.disarm_never_energized().await.context(
+                        "am3-bb: API startup failure could not close the never-energized watchdog run",
+                    )?;
                     return Err(error.context(
-                    "am3-bb: API failed after watchdog admission; mutation gate was closed and watchdog remains armed",
-                ));
+                        "am3-bb: API failed after watchdog admission; mutation gate and never-energized watchdog were closed",
+                    ));
                 }
             };
 
         let mining_shutdown = shutdown_token.child_token();
-        match am3_bb_mining::run_am3_bb_mining(config, mining_shutdown.clone(), safety_admission)
-            .await
+        match am3_bb_mining::run_am3_bb_mining(
+            config,
+            mining_shutdown.clone(),
+            safety_admission,
+            miner_state_tx,
+        )
+        .await
         {
             Ok(()) => {
                 info!("dcentrald (am3-bb) stopped cleanly");
                 Ok(())
             }
-            // F1: management-only instead of process exit (see
-            // `enter_management_only`). The am3-bb cold-boot path runs its
-            // own quiet fail-closed guard (fan PWM cap, dsPIC voltage
-            // disable, resets asserted, board-enable off) before any error
-            // propagates, so hardware is already safely off here.
-            Err(e) => {
+            // Stable management-only entry is authorized only by consuming the
+            // closeout evidence matching this exact AM3-BB disposition. A
+            // reset-pending fault retains no such evidence and must exit.
+            Err(lifecycle_error) => {
                 mining_shutdown.cancel();
-                enter_management_only("am3-bb", e, shutdown_token.clone(), am2_qi).await
+                let (disposition, error, closeout) = lifecycle_error.into_parts();
+                match disposition {
+                    am3_bb_mining::Am3BbFailureDisposition::NoWatchdogOpened => {
+                        anyhow::ensure!(
+                            closeout.is_none(),
+                            "am3-bb no-watchdog failure carried contradictory closeout evidence"
+                        );
+                        enter_management_only(
+                            "am3-bb-never-energized",
+                            error,
+                            shutdown_token.clone(),
+                            None,
+                        )
+                        .await
+                    }
+                    am3_bb_mining::Am3BbFailureDisposition::NeverEnergizedClosed => {
+                        let _closeout = match closeout {
+                            Some(am3_bb_mining::Am3BbFailureCloseout::NeverEnergized(
+                                closeout,
+                            )) => closeout,
+                            Some(am3_bb_mining::Am3BbFailureCloseout::TerminalSafeOff(_)) => {
+                                anyhow::bail!(
+                                    "am3-bb never-energized disposition carried terminal-safe-off closeout evidence"
+                                )
+                            }
+                            None => anyhow::bail!(
+                                "am3-bb never-energized disposition lacked its positive API/watchdog closeout receipts"
+                            ),
+                        };
+                        enter_management_only(
+                            "am3-bb-never-energized",
+                            error,
+                            shutdown_token.clone(),
+                            None,
+                        )
+                        .await
+                    }
+                    am3_bb_mining::Am3BbFailureDisposition::TerminalSafeOffClosed => {
+                        let _closeout = match closeout {
+                            Some(am3_bb_mining::Am3BbFailureCloseout::TerminalSafeOff(
+                                closeout,
+                            )) => closeout,
+                            Some(am3_bb_mining::Am3BbFailureCloseout::NeverEnergized(_)) => {
+                                anyhow::bail!(
+                                    "am3-bb terminal-safe-off disposition carried never-energized closeout evidence"
+                                )
+                            }
+                            None => anyhow::bail!(
+                                "am3-bb terminal-safe-off disposition lacked its positive watchdog closeout receipt"
+                            ),
+                        };
+                        enter_management_only("am3-bb", error, shutdown_token.clone(), None).await
+                    }
+                    am3_bb_mining::Am3BbFailureDisposition::ResetPending => {
+                        anyhow::ensure!(
+                            closeout.is_none(),
+                            "am3-bb reset-pending failure carried contradictory closeout evidence"
+                        );
+                        error!(
+                            %error,
+                            "am3-bb faulted after route admission; watchdog reset is pending"
+                        );
+                        Err(error.context(
+                            "am3-bb faulted/reset_pending; refusing to claim stable management-only operation",
+                        ))
+                    }
+                }
             }
         }
     } else if stratum_proxy_mode {
@@ -2682,11 +3091,6 @@ async fn run_main() -> Result<()> {
             runtime_health_tx,
             mining_shutdown.clone(),
         );
-        // R1: compute before `config` moves. Stratum-proxy never owns chain
-        // hardware (bosminer does); on an am2 unit a low-idle fan command here
-        // is still safe (PWM only ever driven DOWN) — but in practice this is
-        // None unless an am2 unit is run in proxy mode.
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
         match stratum_proxy::run(config, mining_shutdown.clone(), Some(stats)).await {
             Ok(()) => {
                 info!("dcentrald (stratum proxy) stopped cleanly");
@@ -2698,7 +3102,7 @@ async fn run_main() -> Result<()> {
             // keep the API/dashboard reachable.
             Err(e) => {
                 mining_shutdown.cancel();
-                enter_management_only("stratum-proxy", e, shutdown_token.clone(), am2_qi).await
+                enter_management_only("stratum-proxy", e, shutdown_token.clone(), None).await
             }
         }
     } else if tap_mode {
@@ -2706,11 +3110,6 @@ async fn run_main() -> Result<()> {
         // FPGA work. See DCENT_OS_Antminer/dcentrald/dcentrald/src/s19j_tap_mining.rs
         // for preconditions and the no-write invariant list.
         info!("Entering S19J TAP mining mode (--tap-mode) — bosminer owns hardware state");
-        // R1: compute before `config` moves. Tap mode never writes chain/PIC/
-        // PSU state (bosminer owns it); on an am2 unit a low-idle fan command
-        // on the failure park is still safe (PWM only ever driven DOWN).
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
-
         // F5 parity: tap mode still owns FPGA WORK_TX dispatch, so a fresh or
         // intentionally management-only unit must not construct/run the tap
         // miner unless mining is explicitly enabled with a configured pool.
@@ -2733,7 +3132,6 @@ async fn run_main() -> Result<()> {
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                am2_qi,
             )
             .await;
         }
@@ -2757,7 +3155,7 @@ async fn run_main() -> Result<()> {
             // hardware teardown to perform — keep the API/dashboard up.
             Err(e) => {
                 mining_shutdown.cancel();
-                enter_management_only("tap", e, shutdown_token.clone(), am2_qi).await
+                enter_management_only("tap", e, shutdown_token.clone(), None).await
             }
         }
     } else if s19j_hybrid_mode {
@@ -2783,38 +3181,29 @@ async fn run_main() -> Result<()> {
         let (miner_state_tx, miner_state_rx) = tokio::sync::watch::channel(
             dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard),
         );
-        let _api_handles = crate::runtime::api::spawn_proxy_mode_api_with_state(
-            config.clone(),
-            dcentrald_api::RuntimeHealthMode::Hybrid,
-            Some(runtime_health_rx),
-            Some(miner_state_rx),
-            shutdown_token.clone(),
-        )
-        .await?;
-
-        // R1: compute the am2 low-idle command tuple BEFORE `config` is moved into
-        // the miner. On the home `a lab unit` unit (`zynq-bm3-am2`,
-        // `[mining] enabled=false` baked default) this is
-        // `Some((fan_idle_pwm, fan_max_pwm))` and the F5 idle branch below is
-        // the EXACT path `a lab unit` takes — wiring the low-idle command there is
-        // the command-path fix for the parked-am2-fans-stay-at-default root cause
-        //.
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
-
         // F5: a fresh, unconfigured am2 unit must NOT attempt a hardware
-        // cold-boot / PIC preflight. The API is already up (spawned just
-        // above); if no pool is configured / mining is not enabled, park in
+        // cold-boot / PIC preflight. Spawn the API with a permanently closed
+        // mutation gate; if no pool is configured / mining is not enabled, park in
         // management-only mode so the onboarding wizard (complete OR W1-A
         // skip) is reachable. This is the production-correct first-boot
         // behavior and kills the `a lab unit`-class crash at the source — the
         // wrong-config-for-this-unit PIC preflight is never attempted.
         if !config.mining_start_enabled() {
+            let _api_handles =
+                crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                    config.clone(),
+                    dcentrald_api::RuntimeHealthMode::Hybrid,
+                    Some(runtime_health_rx),
+                    Some(miner_state_rx),
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                    shutdown_token.clone(),
+                )
+                .await?;
             return enter_management_only_idle(
                 "s19j-hybrid",
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                am2_qi,
             )
             .await;
         }
@@ -2827,7 +3216,54 @@ async fn run_main() -> Result<()> {
                 "s19j-hybrid reached hardware construction without one-shot route admission"
             )
         })?;
-        let mut miner = S19jHybridMiner::new(config, mining_shutdown.clone(), route_admission)?
+        let safety_admission = match s19j_hybrid_mining::S19jHybridSafetyAdmission::start(
+            &config,
+            runtime_dispatch_admission,
+            route_admission,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if crate::runtime::safety_watchdog::is_watchdog_reset_pending(&error) {
+                    error!(
+                        %error,
+                        "s19j-hybrid watchdog admission is reset-pending; refusing stable management-only operation"
+                    );
+                    return Err(error.context(
+                        "s19j-hybrid watchdog admission faulted/reset_pending before API startup",
+                    ));
+                }
+                let _api_handles = crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                        config.clone(),
+                        dcentrald_api::RuntimeHealthMode::Hybrid,
+                        Some(runtime_health_rx),
+                        Some(miner_state_rx),
+                        dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                        shutdown_token.clone(),
+                    )
+                    .await?;
+                return enter_management_only(
+                    "s19j-hybrid-watchdog-admission",
+                    error,
+                    shutdown_token.clone(),
+                    None,
+                )
+                .await;
+            }
+        };
+        let api_mutation_gate = safety_admission.hardware_mutation_gate();
+        let _api_handles =
+            crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                config.clone(),
+                dcentrald_api::RuntimeHealthMode::Hybrid,
+                Some(runtime_health_rx),
+                Some(miner_state_rx),
+                api_mutation_gate,
+                shutdown_token.clone(),
+            )
+            .await?;
+        let mut miner = S19jHybridMiner::new(config, mining_shutdown.clone(), safety_admission)?
             .with_state_tx(miner_state_tx);
 
         match miner.run().await {
@@ -2835,15 +3271,22 @@ async fn run_main() -> Result<()> {
                 info!("dcentrald (s19j hybrid) stopped cleanly");
                 Ok(())
             }
-            // F1: do NOT return Err (that would exit the process and kill the
-            // already-spawned :8080 API task). The s19j-hybrid path runs
-            // `force_am2_home_hard_stop` + power teardown BEFORE it bails
-            // (s19j_hybrid_mining.rs:4401-4406) — hardware is already safely
-            // off. Stay alive in management-only mode so the
-            // dashboard/wizard/toolbox-detector stay reachable.
+            // F1: do not exit after a matching software-closeout disposition.
+            // Keeping the process and already-spawned management tasks alive
+            // preserves their opportunity to serve; listener/network health
+            // remains separately observed. Physical rail state is unmeasured.
             Err(e) => {
                 mining_shutdown.cancel();
-                enter_management_only("s19j-hybrid", e, shutdown_token.clone(), am2_qi).await
+                if !s19j_hybrid_mining::is_terminal_safe_off_error(&e) {
+                    error!(
+                        %e,
+                        "s19j-hybrid run ended without positive terminal safe-off/watchdog closeout; refusing stable management-only operation"
+                    );
+                    return Err(
+                        e.context("s19j-hybrid terminal disposition is reset-pending or unproven")
+                    );
+                }
+                enter_management_only("s19j-hybrid", e, shutdown_token.clone(), None).await
             }
         }
     } else if serial_mining_mode {
@@ -2883,13 +3326,37 @@ async fn run_main() -> Result<()> {
         }
 
         info!("Entering SERIAL mining mode (--serial-mining)");
-        // R1: compute before `config` moves. The am2/BM1362 serial path is
-        // bailed above unless an explicit lab override is set; on the rare
-        // explicit am2 diagnostic run a low-idle fan command on the failure
-        // park is still safe (PWM only ever driven DOWN). None on S9/am1.
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
         let mining_shutdown = shutdown_token.child_token();
-        let mut miner = SerialMiner::new(config, mining_shutdown.clone());
+        let mut miner = match SerialMiner::new(
+            config.clone(),
+            mining_shutdown.clone(),
+            runtime_dispatch_admission,
+            am2_bm1362_serial_route_admission.take(),
+        ) {
+            Ok(miner) => miner,
+            Err(error) => {
+                let (_runtime_health_tx, runtime_health_rx) =
+                    tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
+                        dcentrald_api::RuntimeHealthMode::Native,
+                    ));
+                let _api_handles =
+                    crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+                        config.clone(),
+                        dcentrald_api::RuntimeHealthMode::Native,
+                        Some(runtime_health_rx),
+                        dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                        shutdown_token.clone(),
+                    )
+                    .await?;
+                return enter_management_only(
+                    "serial-admission",
+                    error,
+                    shutdown_token.clone(),
+                    None,
+                )
+                .await;
+            }
+        };
 
         match miner.run().await {
             Ok(()) => {
@@ -2902,7 +3369,39 @@ async fn run_main() -> Result<()> {
             // SerialMiner performs its own voltage-cut/teardown on failure.
             Err(e) => {
                 mining_shutdown.cancel();
-                enter_management_only("serial", e, shutdown_token.clone(), am2_qi).await
+                if crate::runtime::safety_watchdog::is_watchdog_reset_pending(&e) {
+                    error!(
+                        %e,
+                        "serial watchdog admission is reset-pending; refusing stable management-only operation"
+                    );
+                    return Err(e.context(
+                        "serial watchdog admission faulted/reset_pending; watchdog reset is required",
+                    ));
+                }
+                match serial_mining::failure_disposition(&e) {
+                    Some(serial_mining::SerialFailureDisposition::NeverEnergizedClosed) => {
+                        info!(
+                            %e,
+                            "serial run failed before the AM2 energizing boundary and closed with positive never-energized/watchdog evidence"
+                        );
+                    }
+                    Some(serial_mining::SerialFailureDisposition::TerminalSafeOffClosed) => {
+                        info!(
+                            %e,
+                            "serial run closed with positive terminal safe-off/watchdog evidence"
+                        );
+                    }
+                    None => {
+                        error!(
+                            %e,
+                            "serial run ended without a positive typed watchdog closeout; refusing stable management-only operation"
+                        );
+                        return Err(
+                            e.context("serial terminal disposition is reset-pending or unproven")
+                        );
+                    }
+                }
+                enter_management_only("serial", e, shutdown_token.clone(), None).await
             }
         }
     } else if stock_fpga_mode {
@@ -2936,7 +3435,6 @@ async fn run_main() -> Result<()> {
                 config.mining.enabled,
                 config.has_configured_pool(),
                 shutdown_token.clone(),
-                None,
             )
             .await;
         }
@@ -2955,26 +3453,12 @@ async fn run_main() -> Result<()> {
         }
     } else {
         // BraiinsOS FPGA mining path — uses UIO devices + per-chain FIFOs
-        // (S9/am1 + am2-s17 Zynq). F1 no-brick parity (gap-swarm daemon-startup
-        // #6): on a mining error this arm previously did `error!; Err(e)` →
-        // process exit → the in-process :8080 API task dies, the dashboard proxy
-        // loses its target, and persistent session admission refuses an
-        // unverified replacement (the F1 unmanageable-brick class). Every OTHER mining arm
-        // (serial / s19j-hybrid / stock-fpga / am3-bb) already routes its `Err`
-        // through `enter_management_only`; the standard daemon arm was the lone
-        // exception. Two-part fix:
-        //   (1) Daemon::run() now runs the graceful hardware-safe-off teardown on
-        //       ANY mining-lifecycle error before returning (the daemon.rs run()
-        //       wrapper) — so by the time control reaches here the boards are
-        //       de-energized, fans are idled, and the watchdog is disarmed
-        //       (enter_management_only's hardware-already-off contract is met);
-        //   (2) park in management-only instead of exiting, so the (detached,
-        //       still-running) API/dashboard/wizard/re-flash plane stays reachable
-        //       and the unit never loses its management plane to a refused replacement.
-        // am2_qi (Some only on am2; None on S9/am1) keeps the parked am2 fans at
-        // the idle setpoint via the periodic fan-hold refresh; computed BEFORE
-        // `config` is moved into Daemon::new.
-        let am2_qi = am2_quiet_idle_tuple(&detected_platform, &config);
+        // (S9/am1 + am2-s17 Zynq). The typed lifecycle returns an opaque
+        // terminal closeout only after its complete one-shot shutdown succeeds.
+        // That evidence closes the owned hardware lifecycle, but it does not
+        // retire the process-global gRPC/MQTT graph or accepted CGMiner children.
+        // Consume the matching closeout and exit explicitly; safe in-process
+        // observer rebinding requires a future atomically owned task graph.
         let mut daemon = Daemon::new(
             config,
             resolved_config_path,
@@ -2982,15 +3466,58 @@ async fn run_main() -> Result<()> {
             shutdown_token.clone(),
         );
 
-        match daemon.run().await {
+        match daemon.run_with_lifecycle_disposition().await {
             Ok(()) => {
-                info!("dcentrald stopped cleanly — all hardware safely powered down");
+                info!("dcentrald stopped cleanly after lifecycle software closeout; physical rail state was not measured");
                 Ok(())
             }
-            Err(e) => {
-                // Daemon::run() already ran the hardware-safe-off teardown (#6);
-                // keep the management plane alive instead of exiting.
-                enter_management_only("daemon", e, shutdown_token.clone(), am2_qi).await
+            Err(lifecycle_error) => {
+                let (disposition, e, closeout) = lifecycle_error.into_parts();
+                match disposition {
+                    crate::daemon::StandardDaemonFailureDisposition::TerminalSafeOffClosed => {
+                        let _closeout = match closeout {
+                            Some(crate::daemon::StandardDaemonFailureCloseout::TerminalSafeOff(
+                                closeout,
+                            )) => closeout,
+                            None => anyhow::bail!(
+                                "standard daemon terminal-safe-off disposition lacked matching positive closeout evidence"
+                            ),
+                        };
+                        error!(
+                            error = %e,
+                            "standard daemon closed its hardware lifecycle, but its process-global API/MQTT/gRPC task graph cannot yet be atomically retired and rebound; exiting instead of claiming observer-only availability"
+                        );
+                        Err(e.context(
+                            "standard daemon terminal closeout succeeded, but safe in-process observer rebinding is not implemented",
+                        ))
+                    }
+                    crate::daemon::StandardDaemonFailureDisposition::NeverEnergized => {
+                        anyhow::ensure!(
+                            closeout.is_none(),
+                            "standard daemon never-energized failure carried contradictory terminal closeout evidence"
+                        );
+                        error!(
+                            error = %e,
+                            "standard daemon failed without terminal closeout evidence; refusing management-only re-entry"
+                        );
+                        Err(e.context(
+                            "standard daemon failure was never-energized but did not carry terminal closeout authority",
+                        ))
+                    }
+                    crate::daemon::StandardDaemonFailureDisposition::ResetPending => {
+                        anyhow::ensure!(
+                            closeout.is_none(),
+                            "standard daemon reset-pending failure carried contradictory terminal closeout evidence"
+                        );
+                        error!(
+                            error = %e,
+                            "standard daemon shutdown is unproven/reset-pending; refusing stable management-only operation"
+                        );
+                        Err(e.context(
+                            "standard daemon faulted/reset_pending; refusing to claim stable management-only operation",
+                        ))
+                    }
+                }
             }
         }
     }
@@ -3002,74 +3529,17 @@ async fn run_main() -> Result<()> {
 // mining mode automatically gets the dashboard up and closes the
 //  regression class.
 
-/// F5 (2026-05-17): a fresh, unconfigured unit comes up MANAGEMENT-ONLY
-/// **by design** — no hardware mining cold-boot, no PIC preflight, no
-/// crash, no chicken-and-egg.
+/// Park a management-only process until SIGTERM/SIGINT. An optional AM2 fan
+/// hold may be supplied only by the post-failure helper after its caller has
+/// consumed typed software-closeout evidence. Config-gated and non-owning
+/// routes never receive that authority: skipping bring-up does not prove an
+/// inherited board is de-energized or cool, so those routes preserve the
+/// existing cooling command.
 ///
-/// `config.mining_start_enabled()` is `self.mining.enabled &&
-/// self.has_configured_pool()`. The `serial_mining` arm has honored this
-/// gate for a long time (spawn API, then `shutdown_token.cancelled().await`
-/// — the "serial idle/API-only" branch). F5 generalizes that same gate to
-/// the `s19j-hybrid` and `am3-bb` arms so the *designed* first-boot flow is:
-///
-///   fresh unit boots → dashboard + onboarding wizard reachable, mining
-///   idle, ZERO hardware risk → operator completes OR skips the wizard
-///   (W1-A) → operator configures a pool + enables mining → a restart
-///   flips `mining_start_enabled()` → mining bring-up runs.
-///
-/// This removes the crash *at the source* for the fresh-`a lab unit`/am2 case:
-/// the wrong-config-for-this-unit PIC preflight is never even attempted on
-/// an unconfigured unit. F1 remains the safety net for the case where
-/// mining IS enabled but bring-up fails for hardware reasons.
-///
-/// "Fresh unit does LESS, never MORE": an unconfigured unit performs no
-/// PIC/PSU/chain I/O at all — strictly safer than attempting a cold boot.
-///
-/// R1 (2026-05-17, ):
-/// `am2_quiet_idle` is `Some((fan_idle_pwm, fan_max_pwm))` ONLY on the am2
-/// platform (gated at the call site on
-/// `detected_platform.starts_with("zynq-bm3-am2")`). When present, we drive
-/// the uio16-mmap `FanController` to the (down-clamped) idle PWM BEFORE
-/// parking — this is the ONLY path that reliably lowers am2 fans on a parked,
-/// non-mining unit (the home `a lab unit` path takes exactly this branch with
-/// `[mining] enabled=false`; `enter_management_only_idle` previously did ZERO
-/// hardware I/O so the fans stayed at hardware default). `None` on S9/am1 +
-/// am3 → byte-identical no-op there (those paths use the init-script devmem
-/// which is correct on am1). The fan call only ever drives PWM DOWN and never
-/// above `PWM_SAFETY_MAX` (30). It is best-effort (a FanController open
-/// failure is logged, not fatal — the park must still proceed; no hardware is
-/// energized here).
-/// Park the (idle, non-mining) process until SIGTERM/SIGINT, RE-ASSERTING the
-/// am2 idle fan setpoint on a periodic interval so the AM2/XIL control board's
-/// fan IP cannot silently revert the fans to its full-speed default.
-///
-/// HOME-SAFETY BUG this fixes (live-confirmed 2026-05-29 on the `a lab unit` home
-/// unit): on AM2/XIL the fan PWM is asserted ONCE when the unit enters
-/// management-only mode (the `AM2 low-idle: parked … idle PWM` log), then the
-/// process idles on `shutdown_token.cancelled().await`. Nothing re-commands the
-/// PWM, so the AM2 board's fan controller drifts the fans back up to its
-/// full-speed default over time — the daemon stays alive while the fans end up
-/// blasting (observed: last fan log `idle PWM pwm=10` minutes earlier, fans
-/// actually at PWM 100 / 6180 RPM). The proven park call
-/// (`force_am2_fans_to_quiet_idle`) physically lowered the fans on entry
-/// (6180 → 2880 RPM); it just needs to repeat. The `--set-fan` one-shot CLI
-/// path is deliberately NOT used here — it does not lower the register
-/// reliably; we reuse the SAME in-process `FanController` park call that the
-/// management-only entry already used, which also re-asserts C52 fan mode via
-/// `FanController::open_with_variant()` on every refresh.
-///
-/// SCOPE: the periodic refresh is gated on `am2_quiet_idle == Some(..)`, which
-/// is `Some` ONLY on the am2/uio16 fan variant (the call sites set it from
-/// `am2_quiet_idle_tuple(..)` keyed on `detected_platform`). On S9/am1 + am3
-/// (`None`) this is byte-identical to the previous behavior: a single
-/// `shutdown_token.cancelled().await` with no fan I/O.
-///
-/// SIGTERM-RESPONSIVE: a `tokio::select!` races the 5 s interval tick against
-/// `shutdown_token.cancelled()`. A cancel is acted on immediately (the interval
-/// branch never blocks the signal branch), so shutdown latency is unchanged
-/// from the old direct-await. PWM is only ever driven DOWN (clamped inside
-/// `force_am2_fans_to_quiet_idle`); the refresh logs at `debug` to avoid spam,
-/// while the one-time entry log stays at `info` (kept by the callers).
+/// When a closeout-authorized hold is present, a `tokio::select!` races the
+/// five-second refresh against shutdown. This keeps termination responsive and
+/// prevents the controller from silently reverting a previously requested idle
+/// setpoint. It is command evidence only; physical rail state remains unmeasured.
 async fn park_management_only_until_shutdown(
     mode_label: &str,
     shutdown_token: CancellationToken,
@@ -3082,9 +3552,10 @@ async fn park_management_only_until_shutdown(
         return;
     };
 
-    // am2/XIL: re-assert the idle fan setpoint (+ C52 fan mode, via the
-    // FanController open path) every ~5 s until SIGTERM so the board's fan IP
-    // cannot drift back to its full-speed default while the daemon idles.
+    // am2/XIL: re-assert the idle fan setpoint every ~5 s until SIGTERM so the
+    // board's fan IP cannot drift back to its full-speed default while the
+    // daemon idles. Exact S19-family targets may also reassert C52; S17 and
+    // ambiguous identities preserve the current board mode.
     const FAN_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
     let mut refresh = tokio::time::interval(FAN_REFRESH);
     // The first tick fires immediately; skip-then-wait so we don't double the
@@ -3104,7 +3575,7 @@ async fn park_management_only_until_shutdown(
                 crate::s19j_hybrid_mining::force_am2_fans_to_quiet_idle(
                     fan_idle_pwm,
                     fan_max_pwm,
-                    "management-only periodic fan-hold refresh (am2, hardware off)",
+                    "management-only periodic fan-hold refresh (am2, software closeout)",
                 );
             }
         }
@@ -3116,7 +3587,6 @@ async fn enter_management_only_idle(
     mining_enabled: bool,
     pool_configured: bool,
     shutdown_token: CancellationToken,
-    am2_quiet_idle: Option<(u8, u8)>,
 ) -> Result<()> {
     info!(
         mode = mode_label,
@@ -3129,23 +3599,10 @@ async fn enter_management_only_idle(
          unconfigured unit. Mining starts after the operator configures a \
          pool and enables mining (then restarts the daemon)."
     );
-    // R1: am2-only low-idle command. Drive the parked, non-mining am2 unit's
-    // fans to the configured idle PWM via the proven uio16-mmap FanController
-    // BEFORE we park. This is a SEPARATE, LOWER setpoint than the hard-stop
-    // cap — it does not replace/reorder the hard-stop, and PWM is only ever
-    // driven DOWN (clamped ≤ fan_max_pwm and ≤ PWM_SAFETY_MAX inside the
-    // setter). No-op on S9/am1 + am3 (am2_quiet_idle is None there).
-    if let Some((fan_idle_pwm, fan_max_pwm)) = am2_quiet_idle {
-        crate::s19j_hybrid_mining::force_am2_fans_to_quiet_idle(
-            fan_idle_pwm,
-            fan_max_pwm,
-            "management-only-idle (fresh/unconfigured am2 unit, not mining)",
-        );
-    }
-    // Park until SIGTERM/SIGINT, periodically re-asserting the am2 idle fan
-    // setpoint so the board's fan IP cannot revert to full speed while we idle
-    // (no-op periodic refresh on S9/am1 + am3 where am2_quiet_idle is None).
-    park_management_only_until_shutdown(mode_label, shutdown_token, am2_quiet_idle).await;
+    // This gate proves only that this process skipped bring-up. It does not
+    // prove inherited rails or temperature, so the type carries no fan-lowering
+    // authority and the current cooling command is preserved.
+    park_management_only_until_shutdown(mode_label, shutdown_token, None).await;
     info!(
         mode = mode_label,
         "dcentrald ({mode_label} idle/API-only — unconfigured unit) stopped cleanly"
@@ -3165,7 +3622,8 @@ async fn enter_management_only_idle(
 /// the onboarding wizard (complete OR W1-A skip) is unreachable, and the
 /// toolbox detector returns `board_target=unknown` so the unit can't even
 /// be re-flashed. `S82dcentrald` must then refuse an unverified replacement.
-/// The management plane must NOT die with mining.
+/// The management plane should not die with mining after route-specific positive
+/// terminal closeout authorizes management-only operation.
 ///
 /// This is the EXACT pattern the codebase already endorses for the
 /// serial-mining *gated-off* case at `main.rs` (the
@@ -3174,29 +3632,30 @@ async fn enter_management_only_idle(
 /// exiting. F1 generalizes that proven precedent from "mining-init *gated*"
 /// to "mining-init *failed*", platform-wide.
 ///
-/// SAFETY (proven by call order — see the callers): every mining arm that
-/// can fail a hardware preflight has ALREADY run its hardware-safe-off
-/// teardown *before* returning `Err`. For the am2 s19j-hybrid PIC-preflight
-/// failure that triggered the `a lab unit` incident, that is
+/// SAFETY: each caller must independently establish that stable management-only
+/// parking is allowed: a non-owning route, a never-energized route, or a typed
+/// positive terminal closeout. A closeout proves software commands/readbacks,
+/// not physical rail state. For the am2 s19j-hybrid PIC-preflight failure that
+/// triggered the `a lab unit` incident, the closeout path is
 /// `force_am2_home_hard_stop(...)` (PWR_CONTROL low / voltage cut / fan →
 /// PWM 30 / resets asserted) + `teardown_am2_power_after_failed_pic_preflight(...)`
 /// at `s19j_hybrid_mining.rs:4401-4406`, executed strictly BEFORE the
-/// `anyhow::bail!` at :4407. By the time control reaches this function the
-/// hardware is already de-energized. This function does ZERO hardware
-/// access — it only parks the process so the (already-spawned) API stays
-/// reachable. No voltage is applied, no chain is re-attempted, no fan blast:
-/// the unit sits in management-only mode with hardware safely off until
-/// SIGTERM. The `DCENT_AM2_TRUST_RAIL_FALLBACK` default-off gate is
+/// `anyhow::bail!` at :4407. This function does ZERO hardware access — it only
+/// parks the process without performing voltage or chain I/O. It preserves the
+/// already-spawned management tasks, while listener/network reachability remains
+/// separately observed. A route
+/// whose terminal closeout is incomplete remains ResetPending and never reaches
+/// this function. The `DCENT_AM2_TRUST_RAIL_FALLBACK` default-off gate is
 /// untouched.
 ///
 /// R1 (2026-05-17, ):
 /// `am2_quiet_idle` is `Some((fan_idle_pwm, fan_max_pwm))` ONLY on the am2
-/// platform (gated at the call site). When present, AFTER the mode's pre-bail
-/// hardware-safe-off teardown has already run (proven by call order — the
-/// hard-stop sets fans to its `fan_max_pwm`/30 cap and cuts voltage BEFORE
-/// the Err that drives us here), we drive the now-de-energized am2 unit's
-/// fans DOWN further to the idle PWM via the uio16-mmap `FanController`. This
-/// is a low-PWM command on an already-safe-off unit, not acoustic proof: PWM is
+/// platform (gated at the call site). When present, AFTER the mode's typed
+/// terminal closeout has completed (the hard-stop commands fans to its
+/// `fan_max_pwm`/30 cap and requests voltage cutoff BEFORE the Err that drives
+/// us here), we drive the am2 unit's fans DOWN further to the idle PWM via the
+/// uio16-mmap `FanController`. This is a low-PWM command after positive software
+/// closeout, not acoustic or physical rail proof: PWM is
 /// only ever lowered, never raised, never above `PWM_SAFETY_MAX` (30); it
 /// does NOT replace or reorder the hard-stop. `None` on S9/am1 + am3 →
 /// byte-identical no-op. Best-effort: a FanController open failure is logged,
@@ -3211,31 +3670,33 @@ async fn enter_management_only(
         mode = mode_label,
         error = %err,
         "mining init failed — entering MANAGEMENT-ONLY mode. \
-         Hardware was already safely powered down by the mode's pre-bail \
-         teardown (voltage cut, fans ≤ PWM 30, resets asserted). The \
-         API/dashboard/onboarding wizard stay reachable so the operator can \
-         configure, skip, or re-flash the unit. Mining is disabled until \
-         operator action; the process will NOT exit and will NOT re-attempt \
-         hardware bring-up."
+         The caller established a stable non-owning, never-energized, or \
+         software-terminal-closeout disposition; physical rail state was not \
+         measured here. The \
+         management process/tasks remain alive, while listener and network \
+         reachability remain separately observed. This dcentrald route will \
+         NOT dispatch or re-attempt mining; external-owner mining state is \
+         unmeasured."
     );
-    // R1: am2-only low-idle command. The mode's pre-bail teardown already ran
-    // (hard-stop: PWR_CONTROL low / voltage cut / fans ≤ PWM 30 / resets
-    // asserted) BEFORE the Err that drove us here — proven by call order and
-    // the f1_* structural tests. Hardware is already de-energized; we now
-    // drive the am2 fans DOWN further to the idle setpoint (separate, lower
+    // R1: an am2-only low-idle capability is supplied only by an owning caller
+    // after its typed terminal closeout completed PWR_CONTROL/voltage/fan/reset
+    // commands and readbacks. Non-owning and never-energized callers pass None.
+    // Physical rail state remains unmeasured; the owning route may now drive
+    // fans DOWN further to the idle setpoint (separate, lower
     // than the hard-stop cap; only ever driven DOWN, never above
     // PWM_SAFETY_MAX). No-op on S9/am1 + am3.
     if let Some((fan_idle_pwm, fan_max_pwm)) = am2_quiet_idle {
         crate::s19j_hybrid_mining::force_am2_fans_to_quiet_idle(
             fan_idle_pwm,
             fan_max_pwm,
-            "management-only after mining-init failure (am2, hardware already off)",
+            "management-only after mining-init failure (am2 terminal closeout complete)",
         );
     }
     info!(
         mode = mode_label,
-        "dcentrald is alive in management-only mode (mining disabled, \
-         hardware off). Waiting for SIGTERM."
+        "dcentrald is alive in management-only mode (this route is not \
+         dispatching mining; external-owner state is unmeasured; stable caller \
+         disposition retained). Waiting for SIGTERM."
     );
     // Park until SIGTERM/SIGINT (the signal handler task cancels this token).
     // On am2/XIL the idle fan setpoint is RE-ASSERTED every ~5 s so the board's
@@ -3292,6 +3753,46 @@ mod tests {
     const SERIAL_MINING_RS: &str = include_str!("serial_mining.rs");
     const AM3_BB_RS: &str = include_str!("am3_bb_mining.rs");
     const STOCK_MINING_RS: &str = include_str!("stock_mining.rs");
+
+    #[test]
+    fn fan_custody_receipt_binds_exact_process_and_boot() {
+        assert_eq!(
+            super::proc_stat_start_ticks(
+                "123 (dcentrald) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765"
+            ),
+            Some(98765)
+        );
+        assert_eq!(
+            super::fan_custody_record(123, 98765, "boot-id\n").as_deref(),
+            Some("123 98765 fan-custodian boot-id\n")
+        );
+        assert!(super::fan_custody_record(123, 98765, "bad boot id").is_none());
+        assert!(super::fan_custody_record(123, 98765, "").is_none());
+    }
+
+    #[test]
+    fn fan_custody_readiness_is_revoked_after_bounded_refresh_failures() {
+        let mut failures = 0;
+        assert!(!super::fan_custody_refresh_should_exit(
+            &mut failures,
+            false
+        ));
+        assert_eq!(failures, 1);
+        assert!(!super::fan_custody_refresh_should_exit(
+            &mut failures,
+            false
+        ));
+        assert_eq!(failures, 2);
+        assert!(!super::fan_custody_refresh_should_exit(&mut failures, true));
+        assert_eq!(failures, 0, "a verified refresh resets the failure budget");
+        for _ in 1..super::FAN_CUSTODY_MAX_CONSECUTIVE_REFRESH_FAILURES {
+            assert!(!super::fan_custody_refresh_should_exit(
+                &mut failures,
+                false
+            ));
+        }
+        assert!(super::fan_custody_refresh_should_exit(&mut failures, false));
+    }
 
     fn first_function_end_offset(source: &str) -> usize {
         source
@@ -3460,24 +3961,21 @@ mod tests {
         }
     }
 
-    /// THE KEY SAFETY PROOF (F1): on a real am2 PIC-preflight failure the
-    /// hardware-safe-off teardown (`force_am2_home_hard_stop` +
+    /// F1 command-order regression: on an am2 PIC-preflight failure the
+    /// software safe-off sequence (`force_am2_home_hard_stop` +
     /// `teardown_am2_power_after_failed_pic_preflight`) executes STRICTLY
     /// BEFORE the `anyhow::bail!` that produces the `Err` — and
     /// `enter_management_only` only runs AFTER that `Err` propagates out of
-    /// `miner.run()`. Therefore management-only is reached only after
-    /// voltage is cut / fans ≤ PWM 30 / resets asserted. F1 changed ONLY
-    /// what happens to the `Err` (park instead of exit); it did not move,
-    /// weaken, or bypass the teardown.
+    /// `miner.run()`. This proves command ordering only: physical rails and
+    /// cooling remain bench-unqualified. F1 changed what happens to the `Err`
+    /// (park instead of exit); it did not reorder the software closeout.
     #[test]
     fn f1_hard_stop_precedes_bail_in_pic_preflight_failure() {
         let hard_stop = S19J_HYBRID_RS
             .find("force_am2_home_hard_stop(&self.config, \"pic-get-version-failed\")")
             .expect(
-                "F1 SAFETY REGRESSION: the am2 PIC-get-version-failed hard-stop \
-                 call disappeared from s19j_hybrid_mining.rs — voltage cut / \
-                 fan PWM 30 / resets MUST run before the daemon gives up the \
-                 mining path",
+                "F1 REGRESSION: the am2 PIC-get-version-failed software \
+                  closeout call disappeared from s19j_hybrid_mining.rs",
             );
         let bail = S19J_HYBRID_RS
             .find("\"PIC GET_VERSION failed at 0x")
@@ -3485,9 +3983,9 @@ mod tests {
 
         assert!(
             hard_stop < bail,
-            "F1 SAFETY VIOLATION: force_am2_home_hard_stop must lexically \
-             precede the PIC GET_VERSION bail! — hardware MUST be powered \
-             down before the Err that drives management-only"
+            "F1 ORDERING VIOLATION: force_am2_home_hard_stop must lexically \
+             precede the PIC GET_VERSION bail; this does not claim physical \
+             rail cutoff"
         );
         // The matching power teardown must live in the SAME failure block,
         // i.e. between the hard-stop and the bail (there are other,
@@ -3502,11 +4000,9 @@ mod tests {
         );
     }
 
-    /// F1: `enter_management_only(...)` is invoked ONLY from `Err(e) =>`
-    /// match arms — never on the success path and never before the miner
-    /// runs. An `Err` from `miner.run()` can only occur after the mode's
-    /// in-function teardown + bail, so reaching `enter_management_only`
-    /// structurally implies hardware was already safely off.
+    /// F1: `enter_management_only(...)` is invoked only from explicit failure
+    /// arms. Owning routes validate terminal software closeout first; non-owning
+    /// proxy/tap routes must carry no quiet-idle fan authority.
     #[test]
     fn f1_management_only_only_reached_via_err_arm() {
         // Each real call must appear inside an `Err(e)` arm. The arm may be a
@@ -3514,12 +4010,9 @@ mod tests {
         // the parent process token.
         for label in [
             "\"s19j-hybrid\"",
-            "\"am3-bb\"",
             "\"serial\"",
             "\"tap\"",
             "\"stratum-proxy\"",
-            // gap-swarm daemon-startup #6: the standard BraiinsOS-FPGA daemon arm.
-            "\"daemon\"",
         ] {
             let call = format!("enter_management_only({label}, e, shutdown_token.clone()");
             let call_idx = MAIN_RS
@@ -3535,23 +4028,85 @@ mod tests {
                  arm for that mining mode, not the success path"
             );
         }
+        assert!(MAIN_RS.contains(
+            "am3-bb faulted/reset_pending; refusing to claim stable management-only operation"
+        ));
+        assert!(!MAIN_RS.contains("enter_management_only(\"am3-bb\", e, shutdown_token.clone()"));
     }
 
-    /// F1 platform-wide: all SIX enumerated mining arms
-    /// (s19j-hybrid / am3-bb / serial / tap / stratum-proxy / daemon) route their
-    /// failure through `enter_management_only`, not `Err(e) => { … Err(e) }`.
-    /// The `daemon` arm (standard BraiinsOS-FPGA path, S9/am1 + am2-s17) was the
-    /// lone exception until gap-swarm daemon-startup #6 — pin that it never
-    /// regresses to a bare process-exit-on-error.
     #[test]
-    fn f1_all_six_arms_use_management_only_on_err() {
+    fn am3_bb_management_only_consumes_matching_terminal_closeout() {
+        let arm_start = MAIN_RS
+            .find("if am3_bb_mode {")
+            .expect("AM3-BB runtime arm");
+        let arm_end = MAIN_RS[arm_start..]
+            .find("} else if stratum_proxy_mode {")
+            .map(|offset| arm_start + offset)
+            .expect("AM3-BB runtime arm boundary");
+        let arm = &MAIN_RS[arm_start..arm_end];
+        let disposition = arm
+            .find("Am3BbFailureDisposition::TerminalSafeOffClosed =>")
+            .expect("AM3-BB terminal-safe-off disposition");
+        let matching_evidence = arm[disposition..]
+            .find("Some(am3_bb_mining::Am3BbFailureCloseout::TerminalSafeOff(")
+            .map(|offset| disposition + offset)
+            .expect("AM3-BB matching terminal-safe-off evidence");
+        let management_only = arm[matching_evidence..]
+            .find("enter_management_only(\"am3-bb\", error, shutdown_token.clone(), None)")
+            .map(|offset| matching_evidence + offset)
+            .expect("AM3-BB evidence-gated management-only entry");
+        let reset_pending = arm[management_only..]
+            .find("Am3BbFailureDisposition::ResetPending =>")
+            .map(|offset| management_only + offset)
+            .expect("AM3-BB reset-pending branch");
+
+        assert!(disposition < matching_evidence && matching_evidence < management_only);
+        assert!(!arm[reset_pending..].contains("enter_management_only(\"am3-bb\""));
+    }
+
+    #[test]
+    fn nonowning_proxy_and_tap_routes_never_receive_fan_lowering_authority() {
+        let proxy_start = MAIN_RS
+            .find("} else if stratum_proxy_mode {")
+            .expect("stratum-proxy runtime arm");
+        let tap_start = MAIN_RS[proxy_start..]
+            .find("} else if tap_mode {")
+            .map(|offset| proxy_start + offset)
+            .expect("tap runtime arm");
+        let hybrid_start = MAIN_RS[tap_start..]
+            .find("} else if s19j_hybrid_mode {")
+            .map(|offset| tap_start + offset)
+            .expect("s19j-hybrid runtime arm");
+
+        let proxy = &MAIN_RS[proxy_start..tap_start];
+        let tap = &MAIN_RS[tap_start..hybrid_start];
+        assert!(proxy
+            .contains("enter_management_only(\"stratum-proxy\", e, shutdown_token.clone(), None)"));
+        assert!(tap.contains("enter_management_only(\"tap\", e, shutdown_token.clone(), None)"));
+        for (label, arm) in [("stratum-proxy", proxy), ("tap", tap)] {
+            assert!(
+                !arm.contains("am2_quiet_idle_tuple")
+                    && !arm.contains("force_am2_fans_to_quiet_idle"),
+                "nonowning {label} route must not command a competing fan actor"
+            );
+        }
+    }
+
+    /// F1 platform-wide: routes whose complete control-plane task graph is
+    /// lifecycle-owned may park after positive closeout evidence. The standard
+    /// daemon is deliberately excluded: its process-global gRPC/MQTT state and
+    /// detached accepted CGMiner children cannot yet be atomically retired and
+    /// rebound without stale write or telemetry authority.
+    #[test]
+    fn f1_only_fully_owned_closeout_arms_use_management_only_on_err() {
+        assert!(MAIN_RS.contains("Am3BbFailureDisposition::TerminalSafeOffClosed =>"));
+        assert!(MAIN_RS
+            .contains("enter_management_only(\"am3-bb\", error, shutdown_token.clone(), None)"));
         for label in [
             "\"s19j-hybrid\"",
-            "\"am3-bb\"",
             "\"serial\"",
             "\"tap\"",
             "\"stratum-proxy\"",
-            "\"daemon\"",
         ] {
             assert!(
                 MAIN_RS.contains(&format!("enter_management_only({label}, e, shutdown_token")),
@@ -3560,31 +4115,54 @@ mod tests {
                  (`a lab unit` daemon exits → API dies) is not closed for this arm"
             );
         }
+        assert!(!MAIN_RS.contains("enter_management_only(\"daemon\""));
     }
 
-    /// no-brick #6 (the other half of the standard-daemon-arm fix): the
-    /// `Daemon::run()` wrapper runs the graceful hardware-safe-off teardown
-    /// (`self.shutdown()`) on a mining-lifecycle error BEFORE propagating it, so
-    /// the boards are de-energized / fans idled / watchdog disarmed by the time
-    /// `main.rs` routes the `Err` into `enter_management_only` (whose contract is
-    /// "hardware already off"). Pin (a) that `run()` delegates to the wrapped
-    /// `run_lifecycle()`, and (b) that the `Err(e) if mining =>` arm contains the
-    /// teardown call — while the api-only fall-through arm (`Err(e) => Err(e)`)
-    /// does NOT (no hardware was energized there).
+    #[test]
+    fn standard_terminal_error_refuses_unowned_observer_rebind() {
+        let branch_start = MAIN_RS
+            .find("StandardDaemonFailureDisposition::TerminalSafeOffClosed =>")
+            .expect("standard terminal-closeout branch");
+        let branch_end = MAIN_RS[branch_start..]
+            .find("StandardDaemonFailureDisposition::NeverEnergized =>")
+            .map(|offset| branch_start + offset)
+            .expect("standard terminal-closeout branch boundary");
+        let branch = &MAIN_RS[branch_start..branch_end];
+
+        let closeout = branch
+            .find("StandardDaemonFailureCloseout::TerminalSafeOff")
+            .expect("matching standard closeout evidence");
+        let refusal = branch
+            .find("safe in-process observer rebinding is not implemented")
+            .expect("standard observer-rebind refusal");
+        assert!(closeout < refusal);
+        assert!(!branch.contains("spawn_observer_only_api"));
+        assert!(!branch.contains("enter_management_only(\"daemon\""));
+        assert!(DAEMON_RS.contains("standard_api_tasks:"));
+        assert!(DAEMON_RS.contains(
+            "self.standard_api_tasks = match dcentrald_api::start_api_servers(app_state).await"
+        ));
+    }
+
+    /// no-brick #6: the typed standard lifecycle attempts its one-shot shutdown
+    /// before reporting a mining error. Only shutdown success carries opaque
+    /// terminal closeout; shutdown failure stays reset-pending, and a prior
+    /// shutdown attempt is never retried. The api-only fall-through remains
+    /// distinctly never-energized and does not invoke mining teardown.
     #[test]
     fn nobrick6_daemon_run_tears_down_hardware_on_mining_error() {
         assert!(
             DAEMON_RS.contains("self.run_lifecycle().await"),
             "no-brick #6: Daemon::run() must delegate to run_lifecycle() so the \
-             hardware-safe-off teardown wrapper is never bypassed"
+             typed software-closeout teardown wrapper is never bypassed"
         );
         let mining_arm = DAEMON_RS.find("Err(e) if mining =>").expect(
             "no-brick #6: the `Err(e) if mining =>` teardown arm is missing from Daemon::run()",
         );
         let fallthrough = DAEMON_RS[mining_arm..]
-            .find("Err(e) => Err(e)")
+            .find("Err(e) => Err(StandardDaemonLifecycleError::never_energized(e))")
             .map(|i| i + mining_arm)
-            .expect("no-brick #6: the api-only `Err(e) => Err(e)` fall-through arm is missing");
+            .expect("no-brick #6: the typed api-only never-energized fall-through arm is missing");
         assert!(
             mining_arm < fallthrough,
             "no-brick #6: the mining teardown arm must precede the api-only fall-through"
@@ -3593,9 +4171,27 @@ mod tests {
         assert!(
             mining_arm_body.contains("self.shutdown().await"),
             "no-brick #6 SAFETY VIOLATION: the mining-lifecycle Err arm of \
-             Daemon::run() must run the hardware-safe-off teardown \
+             Daemon::run() must run the typed software-closeout teardown \
              (self.shutdown()) before propagating — otherwise boards can stay \
              energized + watchdog armed on an error exit"
+        );
+        assert!(
+            mining_arm_body.contains(
+                "Ok(closeout) => Err(StandardDaemonLifecycleError::terminal_safe_off_closed("
+            ),
+            "standard daemon lifecycle may classify TerminalSafeOffClosed only after shutdown returns opaque terminal closeout evidence"
+        );
+        let teardown_error_arm = mining_arm_body
+            .find("Err(te) =>")
+            .expect("standard daemon lifecycle wrapper must classify shutdown failure");
+        assert!(
+            mining_arm_body[teardown_error_arm..]
+                .contains("StandardDaemonLifecycleError::reset_pending("),
+            "standard daemon shutdown failure must remain reset-pending"
+        );
+        assert!(
+            mining_arm_body.contains("if self.shutdown_attempted"),
+            "an already-attempted one-shot shutdown must not be retried or treated as closed"
         );
         // The api-only fall-through must NOT tear down (nothing was energized).
         let fallthrough_tail = &DAEMON_RS[fallthrough..fallthrough + 64];
@@ -3603,6 +4199,46 @@ mod tests {
             !fallthrough_tail.contains("shutdown"),
             "no-brick #6: the api-only `Err(e) => Err(e)` arm must NOT run the \
              mining teardown (no hardware was energized in api-only mode)"
+        );
+    }
+
+    #[test]
+    fn standard_daemon_terminal_closeout_refuses_unowned_management_rebind() {
+        let arm_start = MAIN_RS
+            .find("match daemon.run_with_lifecycle_disposition().await")
+            .expect("standard daemon main arm must retain typed lifecycle disposition");
+        let arm_end = MAIN_RS[arm_start..]
+            .find("// `spawn_proxy_mode_api`")
+            .map(|offset| arm_start + offset)
+            .expect("standard daemon main arm boundary missing");
+        let arm = &MAIN_RS[arm_start..arm_end];
+
+        let terminal = arm
+            .find("StandardDaemonFailureDisposition::TerminalSafeOffClosed =>")
+            .expect("standard daemon main arm must handle terminal-safe-off closeout");
+        let matching_closeout = arm[terminal..]
+            .find("Some(crate::daemon::StandardDaemonFailureCloseout::TerminalSafeOff(")
+            .map(|offset| terminal + offset)
+            .expect("standard daemon terminal disposition must consume matching closeout evidence");
+        let refusal = arm[matching_closeout..]
+            .find("safe in-process observer rebinding is not implemented")
+            .map(|offset| matching_closeout + offset)
+            .expect("standard daemon terminal closeout must refuse the unowned observer rebind");
+        assert!(terminal < matching_closeout);
+        assert!(matching_closeout < refusal);
+        assert!(
+            !arm.contains("enter_management_only(\"daemon\""),
+            "standard daemon must not retain a stale process-global writer graph"
+        );
+
+        let reset_pending = arm
+            .find("StandardDaemonFailureDisposition::ResetPending =>")
+            .expect("standard daemon main arm must handle reset-pending shutdown failure");
+        assert!(arm[reset_pending..].contains("closeout.is_none()"));
+        assert!(arm[reset_pending..].contains("Err(e.context("));
+        assert!(
+            !arm[reset_pending..].contains("enter_management_only(\"daemon\""),
+            "reset-pending standard shutdown must refuse stable management-only operation"
         );
     }
 
@@ -3638,8 +4274,9 @@ mod tests {
     /// WATCHDOG (2026-06-28): every mining entry path that bypasses
     /// `Daemon::run()` (`--s19j-hybrid`, `--serial-mining`, `--am3-bb-mining`,
     /// `--stock-fpga`) MUST
-    /// arm the hardware `/dev/watchdog`. Native serial NoPic and AM3-BB use the
-    /// stricter pre-energize `SafetyWatchdogOwner`; the remaining legacy modes
+    /// arm the hardware `/dev/watchdog`. Native serial NoPic, S19j hybrid, and
+    /// AM3-BB use the stricter pre-energize `SafetyWatchdogOwner`; legacy stock
+    /// mode
     /// use the shared `spawn_watchdog_kicker` helper after bring-up. The standard
     /// `Daemon::run` path uses its owned watchdog lifecycle. A CPU/runtime hang on
     /// an unarmed path leaves the hash boards energized & unsupervised. Source-order
@@ -3658,16 +4295,14 @@ mod tests {
             DAEMON_RS.contains("owned_watchdog_kicker(")
                 && DAEMON_RS.contains("watch::channel(WatchdogIntent::Mining)")
                 && DAEMON_RS.contains(".spawn(\"soc-watchdog-kicker\"")
-                && DAEMON_RS.contains("intent_tx.send(WatchdogIntent::Disarm)"),
-            "WATCHDOG: the standard path must use owned, explicit-intent watchdog supervision"
+                && DAEMON_RS.contains("StandardWatchdogDisarmPermit::from_evidence(evidence)")
+                && DAEMON_RS.contains("disarm_tx.send(permit)"),
+            "WATCHDOG: the standard path must use owned, same-run evidence-gated watchdog supervision"
         );
         // Each Daemon::run-bypassing mining entry path must arm via the helper
         // with a path-local liveness counter (SAF-5). Passing None here is a
         // regression: a live-locked runtime would keep petting `/dev/watchdog`.
-        for (src, name) in [
-            (S19J_HYBRID_RS, "s19j-hybrid"),
-            (STOCK_MINING_RS, "stock-fpga"),
-        ] {
+        for (src, name) in [(STOCK_MINING_RS, "stock-fpga")] {
             assert!(
                 src.contains("let watchdog_liveness = Arc::new(AtomicU64::new(0));")
                     && src.contains("Some(watchdog_liveness.clone())")
@@ -3684,24 +4319,130 @@ mod tests {
             );
         }
         assert!(
+            S19J_HYBRID_RS.contains("SafetyWatchdogOwner::start_before_energizing")
+                && S19J_HYBRID_RS.contains("admission.require_armed(\"s19j-hybrid\")")
+                && S19J_HYBRID_RS.contains("HardwareMutationGateOwner::new_pending()")
+                && S19J_HYBRID_RS.contains(".enter_mining()")
+                && S19J_HYBRID_RS.contains(".open()")
+                && S19J_HYBRID_RS.contains("watchdog_liveness.mark_progress()")
+                && S19J_HYBRID_RS.contains(".request_teardown_budget()")
+                && S19J_HYBRID_RS.contains("Am2TerminalSafeOffEvidence")
+                && S19J_HYBRID_RS.contains("close_am2_power_control_after_safe_off(")
+                && S19J_HYBRID_RS.contains("HybridWatchdogShutdownManifest::new(")
+                && S19J_HYBRID_RS.contains("WatchdogDisarmPermit::from_hybrid_manifest(")
+                && S19J_HYBRID_RS.contains(".disarm_and_join("),
+            "WATCHDOG: S19j hybrid must retain pre-energize ownership, API admission, safety liveness, terminal PWR_CONTROL closeout, and evidence-gated disarm"
+        );
+        assert!(
+            !S19J_HYBRID_RS.contains("spawn_watchdog_kicker"),
+            "WATCHDOG: S19j hybrid regressed to the detached legacy kicker"
+        );
+        let hybrid_admission = MAIN_RS
+            .find("S19jHybridSafetyAdmission::start(")
+            .expect("S19j hybrid pre-energize admission missing from main");
+        let hybrid_gate = MAIN_RS[hybrid_admission..]
+            .find("let api_mutation_gate = safety_admission.hardware_mutation_gate();")
+            .map(|offset| hybrid_admission + offset)
+            .expect("S19j hybrid admitted mutation gate extraction missing");
+        let hybrid_api = MAIN_RS[hybrid_gate..]
+            .find("spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(")
+            .map(|offset| hybrid_gate + offset)
+            .expect("S19j hybrid shared API gate spawn missing after admission");
+        let hybrid_miner = MAIN_RS[hybrid_api..]
+            .find("S19jHybridMiner::new(")
+            .map(|offset| hybrid_api + offset)
+            .expect("S19j hybrid miner construction missing");
+        assert!(
+            hybrid_admission < hybrid_gate && hybrid_gate < hybrid_api && hybrid_api < hybrid_miner,
+            "WATCHDOG: S19j hybrid admission must precede shared API admission and miner construction"
+        );
+        let hybrid_arm = MAIN_RS
+            .split("} else if s19j_hybrid_mode {")
+            .nth(1)
+            .expect("S19j hybrid main arm missing")
+            .split("} else if serial_mining_mode {")
+            .next()
+            .expect("bounded S19j hybrid main arm");
+        let idle = hybrid_arm
+            .split("if !config.mining_start_enabled() {")
+            .nth(1)
+            .expect("S19j hybrid idle branch missing")
+            .split("let mining_shutdown")
+            .next()
+            .expect("bounded S19j hybrid idle branch");
+        assert!(
+            idle.contains("HardwareMutationGate::new_closed()"),
+            "WATCHDOG: S19j hybrid idle API must receive a permanently closed mutation gate"
+        );
+        let admission_failure = hybrid_arm
+            .split("Err(error) => {")
+            .nth(1)
+            .expect("S19j hybrid admission-failure branch missing")
+            .split("let api_mutation_gate")
+            .next()
+            .expect("bounded S19j hybrid admission-failure branch");
+        assert!(
+            admission_failure.contains("HardwareMutationGate::new_closed()")
+                && admission_failure.contains("s19j-hybrid-watchdog-admission")
+                && admission_failure.contains("is_watchdog_reset_pending(&error)")
+                && admission_failure.contains(
+                    "s19j-hybrid watchdog admission faulted/reset_pending before API startup"
+                ),
+            "WATCHDOG: only proven pre-open hybrid failures may park behind a closed API gate; post-open failures must exit reset-pending"
+        );
+        // Passthrough policy is owned by `S19jHybridMiner::run()`, which branches on
+        // `self.config.mining.passthrough` across every Phase-0 branch (PSU, I2C service,
+        // hard-stop guard, open-core) and refuses to mint daemon-owned terminal safe-off
+        // evidence under passthrough. The route selector deliberately does NOT re-branch on
+        // it: a second copy of that policy here could drift from the engine's. What keeps a
+        // passthrough run safe is that `S19jHybridSafetyAdmission::start` above is
+        // unconditional, so passthrough is still watchdog-admitted before miner construction.
+        assert!(
+            hybrid_arm.contains("is_terminal_safe_off_error(&e)")
+                && hybrid_arm.contains("if !s19j_hybrid_mining::is_terminal_safe_off_error(&e)")
+                && hybrid_arm.contains("enter_management_only(\"s19j-hybrid\", e, shutdown_token.clone(), None)"),
+            "WATCHDOG: hybrid parking requires positive post-disarm evidence and never starts a management-only fan actor"
+        );
+        assert!(
             SERIAL_MINING_RS.contains("SafetyWatchdogOwner::start_before_energizing")
                 && SERIAL_MINING_RS.contains("nopic_watchdog_liveness.mark_progress()")
                 && SERIAL_MINING_RS.contains("if nopic_watchdog.is_none()")
-                && SERIAL_MINING_RS.contains("WatchdogDisarmPermit::from_evidence"),
-            "WATCHDOG: native serial NoPic must use pre-energize, evidence-gated watchdog ownership while non-NoPic serial retains the legacy helper temporarily"
+                && SERIAL_MINING_RS.contains("NoPicWatchdogShutdownManifest::new(")
+                && SERIAL_MINING_RS.contains("Am2SerialWatchdogShutdownManifest::new(")
+                && SERIAL_MINING_RS.contains("WatchdogDisarmPermit::from_nopic_manifest(")
+                && SERIAL_MINING_RS
+                    .contains("WatchdogDisarmPermit::from_am2_serial_manifest("),
+            "WATCHDOG: native serial NoPic and exact AM2 must use pre-energize ownership and exact evidence manifests while other serial routes retain the legacy helper temporarily"
+        );
+        assert!(
+            MAIN_RS.contains("is_watchdog_reset_pending(&e)")
+                && MAIN_RS.contains(
+                    "serial watchdog admission faulted/reset_pending; watchdog reset is required"
+                )
+                && MAIN_RS.contains("match serial_mining::failure_disposition(&e)")
+                && MAIN_RS.contains(
+                    "Some(serial_mining::SerialFailureDisposition::NeverEnergizedClosed)"
+                )
+                && MAIN_RS.contains(
+                    "Some(serial_mining::SerialFailureDisposition::TerminalSafeOffClosed)"
+                )
+                && MAIN_RS.contains("enter_management_only(\"serial\", e, shutdown_token.clone(), None)"),
+            "WATCHDOG: serial parking requires a positive typed never-energized or terminal-safe-off watchdog closeout and post-open failures remain reset-pending"
         );
         // AM3-BB admits the owner before API/hardware access, advances only
         // safety liveness, and can magic-close only from the complete evidence
         // set. Its enum-only stub must never counterfeit Mining liveness.
         assert!(
             AM3_BB_RS.contains("SafetyWatchdogOwner::start_before_energizing")
-                && AM3_BB_RS.contains("admission.require_armed(\"am3-bb\")")
+                && AM3_BB_RS.contains("WatchdogAdmission::Armed(receipt) => receipt")
                 && AM3_BB_RS.contains("HardwareMutationGateOwner::new_pending()")
                 && AM3_BB_RS.contains("watchdog.enter_mining()")
-                && AM3_BB_RS.contains("hardware_mutation_owner.open()")
+                && AM3_BB_RS.contains("let api_admission = hardware_mutation_owner\n        .open()")
                 && AM3_BB_RS.contains("watchdog_liveness.mark_progress()")
-                && AM3_BB_RS.contains("watchdog.begin_teardown(")
-                && AM3_BB_RS.contains("WatchdogDisarmPermit::from_evidence_set")
+                && AM3_BB_RS.contains("watchdog\n        .request_teardown_budget(")
+                && AM3_BB_RS.contains("watchdog.observe_teardown_admission(")
+                && AM3_BB_RS.contains("Am3BbWatchdogShutdownManifest::new(")
+                && AM3_BB_RS.contains("WatchdogDisarmPermit::from_am3_bb_manifest(")
                 && AM3_BB_RS.contains("watchdog.disarm_and_join("),
             "WATCHDOG: AM3-BB must retain pre-energize ownership, safety liveness, and evidence-gated closeout"
         );
@@ -3710,10 +4451,10 @@ mod tests {
             "WATCHDOG: AM3-BB regressed to the detached legacy kicker"
         );
         let admission = MAIN_RS
-            .find("Am3BbSafetyAdmission::start(&config)")
+            .find("Am3BbSafetyAdmission::start(")
             .expect("AM3-BB pre-energize admission missing from main");
         let api = MAIN_RS[admission..]
-            .find("spawn_proxy_mode_api_with_hardware_mutation_gate(")
+            .find("spawn_proxy_mode_api_with_state_gate_and_identity(")
             .map(|offset| admission + offset)
             .expect("AM3-BB shared API gate spawn missing");
         let mining = MAIN_RS[api..]
@@ -3724,6 +4465,61 @@ mod tests {
             admission < api && api < mining,
             "WATCHDOG: AM3-BB watchdog admission must precede shared API admission and mining"
         );
+    }
+
+    #[test]
+    fn am3_bb_api_is_route_identified_and_pool_acknowledgement_driven() {
+        let arm_start = MAIN_RS
+            .find("if am3_bb_mode {")
+            .expect("AM3-BB runtime arm missing");
+        let arm_end = MAIN_RS[arm_start..]
+            .find("} else if s19j_hybrid_mode {")
+            .map(|offset| arm_start + offset)
+            .expect("AM3-BB runtime arm boundary missing");
+        let arm = &MAIN_RS[arm_start..arm_end];
+
+        assert!(
+            arm.contains("spawn_proxy_mode_api_with_state_gate_and_identity(")
+                && arm.contains("let api_identity = safety_admission.api_identity();")
+                && arm.contains("api_identity,")
+                && arm.contains("Some(miner_state_rx)")
+                && arm.contains("miner_state_tx,"),
+            "AM3-BB API must receive exact carrier identity plus the matching live state channel"
+        );
+        assert!(
+            AM3_BB_RS.contains("control_board_label: \"BeagleBone am3-bb-s19jpro\"")
+                && AM3_BB_RS.contains("declared_asic_board_target(")
+                && AM3_BB_RS.contains("StratumStatus::ShareAccepted")
+                && AM3_BB_RS.contains("state.accepted = state.accepted.saturating_add(1)")
+                && AM3_BB_RS.contains("pool_target_difficulty")
+                && AM3_BB_RS.contains("chips: 0")
+                && AM3_BB_RS.contains("population_unproven"),
+            "AM3-BB API state must follow pool acknowledgements without publishing configured chips as measured population"
+        );
+    }
+
+    /// Legacy stock/generic-serial supervision has no exact closeout manifest.
+    /// Process cancellation must therefore stop feeds without granting itself
+    /// magic-close authority before route-specific safe-off even begins.
+    #[test]
+    fn legacy_watchdog_cancellation_never_magic_closes_before_safeoff() {
+        let legacy = DAEMON_RS
+            .rsplit_once("fn watchdog_kicker_loop(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split("#[derive(Debug, Clone, Copy)]").next())
+            .expect("bounded legacy watchdog implementation");
+        let cancellation = legacy
+            .split("shutdown.cancelled()")
+            .nth(1)
+            .and_then(|tail| tail.split("_ = interval.tick()").next())
+            .expect("bounded legacy watchdog cancellation branch");
+
+        assert!(!cancellation.contains("close_magic"));
+        assert!(cancellation.contains("std::mem::forget(wd)"));
+        assert!(cancellation.contains("withholding future kicks"));
+        assert_eq!(legacy.matches("close_magic").count(), 0);
+        assert!(SERIAL_MINING_RS.contains("crate::daemon::spawn_watchdog_kicker("));
+        assert!(STOCK_MINING_RS.contains("crate::daemon::spawn_watchdog_kicker("));
     }
 
     /// F5: the s19j-hybrid / am3-bb / tap arms gate on
@@ -3816,7 +4612,7 @@ mod tests {
             .map(|idx| guard_start + idx)
             .expect("TD-003 board-target runtime gate missing");
         let first_mining_arm = MAIN_RS
-            .find("if am3_bb_mode {")
+            .find("if am3_bb_mode {\n        // Phase C: AM335x BeagleBone S19j Pro")
             .expect("first mining arm missing");
         assert!(
             guard < first_mining_arm,
@@ -3876,7 +4672,6 @@ mod tests {
         for marker in [
             "stratum_proxy::run(config, mining_shutdown.clone(), Some(stats))",
             "S19jTapMiner::new(config, mining_shutdown.clone())",
-            "SerialMiner::new(config, mining_shutdown.clone())",
         ] {
             assert!(
                 MAIN_RS.contains(marker),
@@ -3885,6 +4680,13 @@ mod tests {
                  used by management-only parking."
             );
         }
+        let serial_call = MAIN_RS
+            .find("let mut miner = SerialMiner::new(")
+            .expect("F1-B: serial miner construction missing");
+        assert!(
+            MAIN_RS[serial_call..].contains("mining_shutdown.clone(),"),
+            "F1-B: SerialMiner must receive its mining child token"
+        );
         assert!(
             MAIN_RS
                 .contains("S19jHybridMiner::new(config, mining_shutdown.clone(), route_admission)"),
@@ -3922,8 +4724,9 @@ mod tests {
     /// re-assert the am2 idle fan setpoint, not command it once and idle — the
     /// AM2 board's fan IP reverts the fans to full speed if nothing re-commands
     /// the PWM. Pin the periodic-refresh + SIGTERM-responsiveness shape of the
-    /// shared park helper, and that BOTH management-only entries route through
-    /// it (so the fix can't be silently removed from one path).
+    /// shared park helper. Config-gated/non-owning parking must still route
+    /// through it with `None`, preserving cooling without receiving the
+    /// closeout-only fan-lowering capability.
     #[test]
     fn management_only_periodically_reasserts_am2_idle_fan() {
         let start = MAIN_RS
@@ -3958,15 +4761,35 @@ mod tests {
              Some(..) (am2/uio16 only); None = byte-identical single await"
         );
 
-        // Both management-only entry points must route through the shared helper.
+        // Split so this counting contract cannot match its own literal: MAIN_RS is
+        // `include_str!("main.rs")`, i.e. this very file, so a contiguous literal here
+        // would inflate the count by one and make `== 1` unsatisfiable by construction.
+        let fan_hold_forward = [
+            "park_management_only_until_shutdown(mode_label, shutdown_token, ",
+            "am2_quiet_idle)",
+        ]
+        .concat();
+        assert_eq!(
+            MAIN_RS.matches(&fan_hold_forward).count(),
+            1,
+            "only the typed post-closeout helper may forward fan-hold authority"
+        );
+        let idle_start = MAIN_RS
+            .find("async fn enter_management_only_idle(")
+            .expect("config-gated management-only helper missing");
+        let idle_tail = &MAIN_RS[idle_start..];
+        let idle_end = first_function_end_offset(idle_tail);
+        let idle_body = &idle_tail[..idle_end];
         assert!(
-            MAIN_RS
-                .matches("park_management_only_until_shutdown(mode_label, shutdown_token, am2_quiet_idle)")
-                .count()
-                >= 2,
-            "both enter_management_only_idle (F5) and enter_management_only (F1) \
-             must park via park_management_only_until_shutdown so neither path \
-             can silently let am2 fans revert to full speed"
+            idle_body
+                .contains("park_management_only_until_shutdown(mode_label, shutdown_token, None)"),
+            "config-gated routes must preserve inherited cooling"
+        );
+        assert!(
+            !idle_body.contains("Option<(u8, u8)>")
+                && !idle_body.contains("force_am2_fans_to_quiet_idle")
+                && !idle_body.contains("am2_quiet_idle_tuple"),
+            "config-gated helper must not carry or synthesize fan-lowering authority"
         );
     }
 
@@ -4006,7 +4829,7 @@ mod tests {
         );
         assert_eq!(
             safe_off_cut_for_platform("cvitek-cv1835"),
-            SafeOffCut::CvitekDisablePsu
+            SafeOffCut::Unknown
         );
         // generic zynq (S9 / am1) only AFTER the am2 fingerprint check
         assert_eq!(
@@ -4025,6 +4848,32 @@ mod tests {
         );
         // safe-off fan PWM is a quiet idle, never above the home safety cap
         assert!(super::SAFE_OFF_FAN_PWM <= dcentrald_hal::fan::PWM_SAFETY_MAX);
+    }
+
+    #[test]
+    fn am2_fan_mode_requires_exact_s19_product_identity() {
+        use super::am2_fan_mode_policy_for_board_target;
+        use dcentrald_hal::fan::Am2FanModePolicy;
+
+        for target in ["am2-s17", "am2-s17p", "am2-s17pro", "am2-s17plus", ""] {
+            assert_eq!(
+                am2_fan_mode_policy_for_board_target(target),
+                Am2FanModePolicy::Preserve,
+                "S17/ambiguous identity must not authorize C52: {target}"
+            );
+        }
+        assert_eq!(
+            am2_fan_mode_policy_for_board_target("unknown-am2"),
+            Am2FanModePolicy::Preserve
+        );
+        assert_eq!(
+            am2_fan_mode_policy_for_board_target("am2-s19pro"),
+            Am2FanModePolicy::EnableC52
+        );
+        assert_eq!(
+            am2_fan_mode_policy_for_board_target("am2-s19jpro-zynq\n"),
+            Am2FanModePolicy::EnableC52
+        );
     }
 
     /// Without `--allow-loud`, PWM is clamped to PWM_SAFETY_MAX (30) — only

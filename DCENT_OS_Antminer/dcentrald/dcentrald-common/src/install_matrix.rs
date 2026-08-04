@@ -203,21 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn am2_public_update_does_not_authorize_vendor_source_first_install() {
-        let row = install_matrix()
-            .into_iter()
-            .find(|row| row.board_target == "am2-s19j")
-            .expect("registered AM2 S19j row");
-        assert_eq!(
-            row.enablement.install_authorization,
-            InstallAuthorization::PublicBeta
-        );
-        assert!(row.persistent_update_allowed);
-        assert!(!row.public_beta_install);
-        assert!(!row.product_install_allowed);
-    }
-
-    #[test]
     fn cv1835_has_no_artifact_or_install_lane() {
         let row = install_matrix()
             .into_iter()
@@ -238,6 +223,21 @@ mod tests {
         );
         assert_eq!(row.enablement.artifact_kind, ArtifactKind::None);
         assert!(!row.persistent_update_allowed);
+        assert!(!row.product_install_allowed);
+    }
+
+    #[test]
+    fn am2_public_update_does_not_authorize_vendor_source_first_install() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "am2-s19j")
+            .expect("registered AM2 S19j row");
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::PublicBeta
+        );
+        assert!(row.persistent_update_allowed);
+        assert!(!row.public_beta_install);
         assert!(!row.product_install_allowed);
     }
 

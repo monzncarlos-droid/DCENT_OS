@@ -109,10 +109,11 @@ pub const DEFAULT_CHIPS_PER_CHAIN: u8 = 126;
 /// the rated hashrate from `bosminer_model.json`.
 pub const BM1362_BIG_CORES: u32 = 4;
 
-/// Address stride for BM1362 chain enumeration — 256 / 126 = 2.03 → 2.
+/// Address stride for default S19j Pro population — pure SSOT `floor(256/126)=2`.
 /// Matches bosminer `SET_ADDRESS (0x00, 0x02, 0x04, ... 0xFC)` in the am2
 /// initialization flow (`SUMMARY.md` step 9).
-pub const ADDRESS_INTERVAL: u8 = 2;
+pub const ADDRESS_INTERVAL: u8 =
+    dcentrald_common::bm1397plus_addr_interval(DEFAULT_CHIPS_PER_CHAIN);
 
 /// BM1362 response size (11 bytes: nonce + result + version bits).
 pub const RESPONSE_BYTES: usize = 11;
@@ -223,6 +224,7 @@ pub fn jig_pll1_reclock_regs(
     }
 }
 
+pub use dcentrald_common::BM1362_PLL_FREQUENCIES;
 /// BM1362 PLL frequency lookup table.
 ///
 /// PLL register encoding for BM1366/BM1368/BM1370/BM1362:
@@ -248,69 +250,50 @@ pub fn jig_pll1_reclock_regs(
 /// VCO_SCALE split at 2400, small postdividers), NOT high-VCO extrapolation. A
 /// proven sub-400 table must come from that low-VCO regime + live validation.
 ///
-/// Format: (freq_mhz, pll_reg_value)
-pub const BM1362_PLL_TABLE: &[(u16, u32)] = &[
-    // POSTDIV1=5, POSTDIV2=2, REFDIV=1:
-    //   encoded postdiv = ((5-1)<<4)|(2-1) = 0x41
-    //   freq = 25 * FBDIV / (1 * 5 * 2) = 2.5 * FBDIV
-    //   FB_DIV range 160-239 covers 400-597 MHz
-    //   VCO = 25*FBDIV = 4000-5975 MHz (all >= 2400, use VCO_SCALE=0x50)
-    (400, 0x50A0_0141), // fbdiv=160
-    (412, 0x50A5_0141), // fbdiv=165
-    (425, 0x50AA_0141), // fbdiv=170
-    (437, 0x50AF_0141), // fbdiv=175
-    (450, 0x50B4_0141), // fbdiv=180
-    (462, 0x50B9_0141), // fbdiv=185
-    (475, 0x50BE_0141), // fbdiv=190
-    (487, 0x50C3_0141), // fbdiv=195
-    (500, 0x50C8_0141), // fbdiv=200
-    (512, 0x50CD_0141), // fbdiv=205
-    (525, 0x50D2_0141), // fbdiv=210
-    (531, 0x50D4_0141), // fbdiv=212 — live autotuned on .139 chain 2
-    (537, 0x50D7_0141), // fbdiv=215
-    (545, 0x50DA_0141), // fbdiv=218 — RATED freq (S19j Pro default)
-    (550, 0x50DC_0141), // fbdiv=220
-    (556, 0x50DE_0141), // fbdiv=222.4 — live autotuned on .139 chain 3 (rounded)
-    (562, 0x50E1_0141), // fbdiv=225
-    (575, 0x50E6_0141), // fbdiv=230
-    (587, 0x50EB_0141), // fbdiv=235
-    (597, 0x50EF_0141), // fbdiv=239 (top of window)
-];
+/// G26: pure SSOT table lives in `dcentrald-common::pll_model` (rated 545 + live
+/// 531/556 included). ChipDriver re-exports — do not re-open a forked table here.
+pub use dcentrald_common::BM1362_PLL_TABLE;
+
+/// BM1362 hash-PLL reference clock (chip XIN), Hz — DECLARED 25 MHz.
+///
+/// Provenance: the PLL formula above (`freq = 25 MHz × FBDIV / (REFDIV·PD1·PD2)`),
+///  §BM1362, and `dcentrald-re-catalog::pll_bible`
+/// (`chip_id 0x1362, reference_clock_mhz: 25`).
+pub const BM1362_XIN_HZ: u32 = 25_000_000;
+
+// W8 CLK-4 enforcing pin: the SSOT PLL table this driver applies
+// (`dcentrald_common::pll_model`) is only valid on this XIN. If either
+// declaration ever changes independently, the build fails here — a PLL table
+// cannot be applied against a mismatched reference. For future boards whose
+// XIN arrives as runtime data, use
+// `dcentrald_common::pll_model::admit_pll_reference` /
+// `resolve_pll_for_protocol_on_reference` (fail-closed) instead of this
+// static pin.
+const _: () = assert!(BM1362_XIN_HZ == dcentrald_common::pll_model::PLL_REFERENCE_HZ);
 
 /// Look up the PLL register value for a target frequency.
 ///
 /// Returns (pll_reg_value, actual_frequency_mhz).
 /// If the exact frequency isn't in the table, the nearest entry is used.
+/// G26: thin-wrap pure `bm1362_pll_reg_and_actual`.
+#[inline]
 fn bm1362_pll_lookup(target_mhz: u16) -> (u32, u16) {
-    let target = target_mhz.clamp(400, 597);
-
-    let mut best = BM1362_PLL_TABLE[0];
-    let mut best_diff = (target as i32 - best.0 as i32).unsigned_abs();
-
-    for &entry in &BM1362_PLL_TABLE[1..] {
-        let diff = (target as i32 - entry.0 as i32).unsigned_abs();
-        if diff < best_diff {
-            best = entry;
-            best_diff = diff;
-        }
-    }
-
-    (best.1, best.0)
+    dcentrald_common::bm1362_pll_reg_and_actual(target_mhz)
 }
 
 /// Get the sorted list of discrete PLL frequencies the BM1362 can generate (MHz).
+/// G26: pure `bm1362_pll_frequencies` SSOT.
+#[inline]
 pub fn pll_frequencies() -> &'static [u16] {
-    &[
-        400, 412, 425, 437, 450, 462, 475, 487, 500, 512, 525, 531, 537, 545, 550, 556, 562, 575,
-        587, 597,
-    ]
+    dcentrald_common::bm1362_pll_frequencies()
 }
 
 /// Look up PLL register value + actual freq for a target frequency (public).
 ///
 /// Mirror of the private `bm1362_pll_lookup` so callers in
 /// `s19j_hybrid_mining.rs` can reuse the canonical BM1362 PLL table without
-/// keeping a duplicate copy. Same nearest-entry semantics.
+/// keeping a duplicate copy. Same nearest-entry semantics. G26 pure SSOT.
+#[inline]
 pub fn pll_lookup(target_mhz: u16) -> (u32, u16) {
     bm1362_pll_lookup(target_mhz)
 }
@@ -457,12 +440,14 @@ pub struct Bm1362InitPlan {
 /// Canonical BM1362 AM2 init plan. This is data-only so host tests can pin
 /// the plan without touching hardware.
 pub const BM1362_INIT_PLAN: Bm1362InitPlan = Bm1362InitPlan {
-    version_mask: 0x9000_FFFF,
+    // G28 pure SSOT: BIP-320 mask → reg 0xA4.
+    version_mask: dcentrald_common::VERSION_ROLLING_REG_BIP320_DEFAULT,
     init_control_register: regs::INIT_CONTROL,
     init_control_broadcast: 0x0007_0000,
     init_control_per_chip: 0x0007_01F0,
     misc_control_register: regs::MISC_CONTROL,
-    misc_control_pre_baud: 0xFF0F_C100,
+    // G34 pure SSOT: AM2 MiscCtrl pre-baud default (.109 / Default109).
+    misc_control_pre_baud: dcentrald_common::AM2_MISC_CTRL_PRE_BAUD_DEFAULT_109,
     misc_control_post_fast_baud: 0x00C1_00B0,
     misc_control_triple_writes: 3,
     fast_uart_register: regs::FAST_UART_CONFIG,
@@ -666,38 +651,70 @@ impl Bm1362Driver {
     /// Triple-write MiscCtrl with 5 ms spacing.
     ///
     /// Private helper — the ONLY legal way to touch register 0x18 from this
-    /// driver.: fire-and-forget
-    /// MiscCtrl writes on BM1387 cost the DCENT_OS S9 port 75 s of zero-nonce
-    /// stall. Readback verification of BM1362 register 0x18 is not possible
-    /// via the FPGA CMD path on am2 (CMD FIFO does not relay back-channel
-    /// answers —), so triple-write is
-    /// the only reliable approach.
+    /// driver. Cadence + reg address: pure `plan_misc_ctrl_triple_write_*`
+    /// (P1-1)..
     fn misc_ctrl_triple_write(chain: &mut FpgaChain, value: u32) {
-        for i in 0..3 {
-            Self::write_reg_broadcast(chain, regs::MISC_CONTROL, value);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            tracing::trace!(
-                chain_id = chain.chain_id,
-                attempt = i + 1,
-                "MiscCtrl triple-write {}/3 = 0x{:08X}",
-                i + 1,
-                value,
-            );
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        let mut write_n = 0u8;
+        for op in dcentrald_common::plan_misc_ctrl_triple_write_broadcast(value) {
+            match op {
+                dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                    Self::write_reg_broadcast(chain, reg, value);
+                    write_n += 1;
+                    tracing::trace!(
+                        chain_id = chain.chain_id,
+                        attempt = write_n,
+                        "MiscCtrl triple-write {}/3 = 0x{:08X}",
+                        write_n,
+                        value,
+                    );
+                }
+                dcentrald_common::TransportOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                    }
+                }
+                _ => {
+                    // Pure plan only emits broadcast write + delay.
+                }
+            }
         }
     }
 
     fn misc_ctrl_triple_write_single(chain: &mut FpgaChain, chip_addr: u8, value: u32) {
-        for i in 0..3 {
-            Self::write_reg_single(chain, chip_addr, regs::MISC_CONTROL, value);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            tracing::trace!(
-                chain_id = chain.chain_id,
-                chip_addr = format_args!("0x{:02X}", chip_addr),
-                attempt = i + 1,
-                "MiscCtrl per-chip triple-write {}/3 = 0x{:08X}",
-                i + 1,
-                value,
-            );
+        debug_assert_eq!(
+            regs::MISC_CONTROL,
+            dcentrald_common::MISC_CTRL_REG_BM1397PLUS
+        );
+        let mut write_n = 0u8;
+        for op in dcentrald_common::plan_misc_ctrl_triple_write_chip(chip_addr, value) {
+            match op {
+                dcentrald_common::TransportOp::SendWriteRegBm1397Plus {
+                    chip_addr: addr,
+                    reg,
+                    value,
+                } => {
+                    Self::write_reg_single(chain, addr, reg, value);
+                    write_n += 1;
+                    tracing::trace!(
+                        chain_id = chain.chain_id,
+                        chip_addr = format_args!("0x{:02X}", addr),
+                        attempt = write_n,
+                        "MiscCtrl per-chip triple-write {}/3 = 0x{:08X}",
+                        write_n,
+                        value,
+                    );
+                }
+                dcentrald_common::TransportOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -770,12 +787,26 @@ impl ChipDriver for Bm1362Driver {
         }
         chain.set_baud(fpga_chain::BAUD_REG_115200);
 
-        // === Step 1: Enable version rolling (3×). Register value is the
-        // default 0x1FFFE000 pool mask — callers that negotiate a different
-        // mask via Stratum must rewrite reg 0xA4 post-init.
-        for _ in 0..3 {
-            Self::write_reg_broadcast(chain, regs::VERSION_MASK, VERSION_MASK_VALUE);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        // === Step 1: Enable version rolling (3×). G21 pure SSOT.
+        // Register value is the default 0x1FFFE000 pool mask — callers that
+        // negotiate a different mask via Stratum must rewrite reg 0xA4 post-init.
+        debug_assert_eq!(
+            regs::VERSION_MASK,
+            dcentrald_common::VERSION_ROLLING_REG_BM1397PLUS
+        );
+        for op in dcentrald_common::plan_version_rolling_triple_write_broadcast(VERSION_MASK_VALUE)
+        {
+            match op {
+                dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } => {
+                    Self::write_reg_broadcast(chain, reg, value);
+                }
+                dcentrald_common::TransportOp::DelayMs { ms } => {
+                    if ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+                    }
+                }
+                _ => {}
+            }
         }
         tracing::info!(
             chain_id = chain.chain_id,
@@ -804,14 +835,8 @@ impl ChipDriver for Bm1362Driver {
         // daemon enumeration (see `serial_mining.rs` step 9).
 
         // === Step 7: Per-chip init registers.
-        // Address stride 2 means chip_addr = i * ADDRESS_INTERVAL.
-        let addr_interval = if chip_count == DEFAULT_CHIPS_PER_CHAIN {
-            ADDRESS_INTERVAL as u16
-        } else if chip_count > 0 {
-            256u16 / chip_count as u16
-        } else {
-            256
-        };
+        // P1-3: full-population stride SSOT (not open-coded 256/N).
+        let addr_interval = dcentrald_common::bm1397plus_addr_interval(chip_count);
 
         tracing::info!(
             chain_id = chain.chain_id,
@@ -820,8 +845,10 @@ impl ChipDriver for Bm1362Driver {
             addr_interval,
         );
 
-        for i in 0..chip_count {
-            let chip_addr = (i as u16 * addr_interval) as u8;
+        for (i, chip_addr) in dcentrald_common::linear_chip_addresses(chip_count, addr_interval)
+            .into_iter()
+            .enumerate()
+        {
             Self::write_reg_single(chain, chip_addr, regs::INIT_CONTROL, INIT_CONTROL_PER_CHIP);
             Self::misc_ctrl_triple_write_single(chain, chip_addr, MISC_CONTROL_PRE_BAUD);
             Self::write_reg_single(chain, chip_addr, regs::CORE_REG_CTRL, CORE_REG_HASH_CLK);
@@ -918,11 +945,16 @@ impl ChipDriver for Bm1362Driver {
             target_freq,
         );
 
-        // === Step 14: Belt-and-suspenders final version-mask write (matches
-        // bosminer am2 "Modifying MiscCtrl" … re-arm pattern on every chain
-        // init; also mirrors the `Ramping voltage 15.200 V -> 15.200 V (slow)`
-        // PSU re-arm the caller performs separately).
-        Self::write_reg_broadcast(chain, regs::VERSION_MASK, VERSION_MASK_VALUE);
+        // === Step 14: Belt-and-suspenders final version-mask write (G23 pure single).
+        // Matches bosminer am2 re-arm pattern; also mirrors PSU re-arm residual.
+        for op in dcentrald_common::plan_version_rolling_single_write_broadcast(VERSION_MASK_VALUE)
+        {
+            if let dcentrald_common::TransportOp::SendWriteRegBroadcastBm1397Plus { reg, value } =
+                op
+            {
+                Self::write_reg_broadcast(chain, reg, value);
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // === FPGA WORK_TIME.
@@ -1016,23 +1048,16 @@ impl ChipDriver for Bm1362Driver {
 
     fn set_voltage(&self, _pic: &mut PicController, _voltage_mv: u16) -> Result<()> {
         // S19j Pro voltage control lives in `DspicController::set_voltage(mv)`
-        // (dsPIC33 @ 0x20/0x21/0x22, FW byte 0x89, SUM-framed protocol — see
-        // ). The daemon routes voltage
-        // commands based on `MinerProfile.pic_type`; this function is only
-        // reached if the caller mistakenly treats BM1362 as a PIC16F1704 part.
-        //
-        // ADR-0010 / VoltageRail: MUST NOT return Ok(()) (silent success) —
-        // that pattern made callers believe voltage was applied. Fail closed
-        // with InvalidParameter so the routing bug is loud.
-        tracing::warn!(
-            "BM1362::set_voltage called — S19j Pro uses DspicController, not \
-             PicController. Route voltage through MinerProfile.pic_type."
-        );
-        Err(crate::AsicError::InvalidParameter(
-            "BM1362 voltage is DspicController (not PicController); \
-             route via MinerProfile.pic_type / VoltageRail"
-                .into(),
-        ))
+        // (dsPIC33 @ 0x20/0x21/0x22). ChipDriver::set_voltage is the wrong spine
+        // (ADR-0010 / P1-2). Pure SSOT: dcentrald_common::chip_driver_set_voltage_admission.
+        // MUST NOT return Ok(()) (silent success) — historical no-op bug.
+        dcentrald_common::chip_driver_set_voltage_admission(
+            dcentrald_common::AsicProtocolIdentity::Bm1362,
+        )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "BM1362::set_voltage refused by VoltageOwnership SSOT");
+            crate::AsicError::InvalidParameter(e.to_string())
+        })
     }
 
     fn send_work(&self, chain: &mut FpgaChain, work: &MiningWork) -> Result<u16> {
@@ -1105,11 +1130,7 @@ impl ChipDriver for Bm1362Driver {
 
         // Chip address encoded in nonce bits [24:17] (BM1397+ style).
         let chip_addr = ((nonce >> 17) & 0xFF) as u8;
-        let addr_interval = if DEFAULT_CHIPS_PER_CHAIN > 0 {
-            (256u16 / DEFAULT_CHIPS_PER_CHAIN as u16) as u8
-        } else {
-            1
-        };
+        let addr_interval = dcentrald_common::bm1397plus_addr_interval(DEFAULT_CHIPS_PER_CHAIN);
         let chip_index = if addr_interval > 0 {
             chip_addr / addr_interval
         } else {
@@ -1159,9 +1180,11 @@ impl ChipDriver for Bm1362Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // BM1397+ family: ticket mask is (difficulty - 1) with no bit-reverse.
-        // Default 256 → 0xFF.
-        difficulty.max(1).saturating_sub(1)
+        // G24 pure SSOT: industrial plain (diff-1). Default 256 → 0xFF.
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty.max(1),
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

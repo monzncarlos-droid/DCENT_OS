@@ -200,9 +200,9 @@ assert_matches 'shared matrix encodes no CV artifact' \
 assert_matches 'hardware enablement matrix uses schema 2 for the new wire values' \
     '^[[:space:]]*"schema":[[:space:]]*2,' "$MATRIX_JSON"
 assert_matches 'shared schema has a typed absent-artifact kind' \
-    '^[[:space:]]*None,$' "$SCHEMA_HARDWARE"
+    '^[[:space:]]*None,[[:space:]]*$' "$SCHEMA_HARDWARE"
 assert_matches 'shared schema has typed not-implemented artifact maturity' \
-    '^[[:space:]]*NotImplemented,$' "$SCHEMA_HARDWARE"
+    '^[[:space:]]*NotImplemented,[[:space:]]*$' "$SCHEMA_HARDWARE"
 assert_not_matches 'capability schema contains no CV deployment unlock' \
     'cv1835-emmc-proven|Cv1835EmmcProven' "$SCHEMA_CAPABILITY"
 
@@ -225,6 +225,20 @@ assert_matches 'safe-off leaves fans unchanged when power cut is unproven' \
     'if rc != 0 \{' "$DAEMON_MAIN"
 assert_matches 'safe-off failure returns before fan mutation' \
     'power cut was not proven; fans are left unchanged' "$DAEMON_MAIN"
+awk '
+    /^fn run_safe_off_oneshot\(\)/ { in_safe_off = 1 }
+    in_safe_off { print }
+    in_safe_off && /^fn run_verify_bundle_oneshot\(/ { exit }
+' "$DAEMON_MAIN" > "$WORK/safe-off-function.rs"
+safe_off_failure_guard_line=$(grep -nF 'if rc != 0 {' "$WORK/safe-off-function.rs" | head -n 1 | cut -d: -f1)
+safe_off_fan_mutation_line=$(grep -nF 'let quiet_pwm =' "$WORK/safe-off-function.rs" | head -n 1 | cut -d: -f1)
+if [ -n "$safe_off_failure_guard_line" ] &&
+   [ -n "$safe_off_fan_mutation_line" ] &&
+   [ "$safe_off_failure_guard_line" -lt "$safe_off_fan_mutation_line" ]; then
+    ok 'safe-off failure guard precedes every quiet-fan mutation'
+else
+    not_ok 'safe-off failure guard must precede every quiet-fan mutation'
+fi
 
 assert_absent 'speculative toolbox CV artifact classifier is absent' \
     "$TOOLBOX/core/cv1835_artifact_state.py"

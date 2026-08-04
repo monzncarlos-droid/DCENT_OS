@@ -159,9 +159,24 @@ function Resolve-DeviceModel {
         "nerdaxe" { return "nerdaxe" }
         "nerdqaxe-plus" { return "nerdqaxeplus" }
         "nerdqaxe-pp" { return "nerdqaxepp" }
+        "nerdoctaxe-plus" { return "nerdoctaxeplus" }
+        "nerdoctaxe-gamma" { return "nerdoctaxegamma" }
         "dcent-axe-bm1397" { return "dcentaxe_bm1397" }
         "dcent-axe-quad-bm1397" { return "dcentaxe_quad_bm1397" }
         "dcent-axe-hex-bm1397" { return "dcentaxe_hex_bm1397" }
+        "hammer-bc01" { return "hammer_bc01" }
+        "hammer-bc01-pro" { return "hammer_bc01_pro" }
+        "hammer-bc02" { return "hammer_bc02" }
+        "hammer-bc04" { return "hammer_bc04" }
+        "hammer-dc02" { return "hammer_dc02" }
+        "hammer-dc04" { return "hammer_dc04" }
+        "hammer-dc06" { return "hammer_dc06" }
+        # Lucky Miner LVxx (EXPERIMENTAL — no live hardware; host-tested only).
+        # Must byte-match BitAxeModel::canonical_key() and package-firmware.sh:
+        # device_model is bound into the OTA schema-2 signed message.
+        "lucky-lv06" { return "lv06" }
+        "lucky-lv07" { return "lv07" }
+        "lucky-lv08" { return "lv08" }
         default { throw "Unknown -BoardTarget '$BoardTarget'" }
     }
 }

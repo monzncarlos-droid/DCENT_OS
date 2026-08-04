@@ -89,8 +89,62 @@ const I2C_SLAVE_SAFE: u32 = 0x0703;
 /// 32 bytes bounds queue occupancy and prevents callers from turning a typed
 /// identity probe into arbitrary EEPROM access.
 const HASHBOARD_EEPROM_PREFIX_LEN: usize = 32;
+
+/// Full AT24C02 page length, single-sourced from the decoder that consumes it.
+///
+/// `dcentrald_api_types::deployed_eeprom::decode_deployed_eeprom` refuses any
+/// buffer whose length is not exactly `RAW_PAGE_LEN`, so binding this constant
+/// to that one keeps the transport and the decoder from drifting apart. Before
+/// this existed the service could only ever return 32 bytes, which made the
+/// entire XXTEA three-region decode unreachable from the daemon.
+const HASHBOARD_EEPROM_PAGE_LEN: usize = dcentrald_api_types::deployed_eeprom::RAW_PAGE_LEN;
+
 const HASHBOARD_EEPROM_FIRST_ADDR: u8 = 0x50;
 const HASHBOARD_EEPROM_LAST_ADDR: u8 = 0x57;
+
+/// Which fixed offset-zero AT24 region a service identity read returns.
+///
+/// This is a closed two-value set, deliberately NOT a caller-supplied length.
+/// The worker derives the transfer size from the variant, so admitting a
+/// second span cannot turn a typed identity probe into arbitrary EEPROM
+/// access: both spans start at offset zero, both are read-only, and no other
+/// size is representable. Queue occupancy stays bounded by the larger of the
+/// two rather than by whatever a caller asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashboardEepromSpan {
+    /// The 32-byte leading identity record. This is what hashboard admission
+    /// and controller binding consume, and it is the only span the energize
+    /// gate reads — its size must not change.
+    IdentityPrefix,
+    /// The complete 256-byte page required by the XXTEA three-region decode
+    /// (identity, SKU refinement, sensor discovery, factory binning, region
+    /// CRC). Read-only, like the prefix; the `0x50..=0x57` write denylist is
+    /// unaffected and still required for admission.
+    FullPage,
+}
+
+// clippy::len_without_is_empty: every variant is a FIXED, non-zero transfer
+// length, so `is_empty()` would be a constant `false` — an API that answers a
+// question this type cannot meaningfully be asked. `len()` here is a byte count,
+// not a container size.
+#[allow(clippy::len_without_is_empty)]
+impl HashboardEepromSpan {
+    /// Byte count this span transfers. Total function over the closed set.
+    pub const fn len(self) -> usize {
+        match self {
+            Self::IdentityPrefix => HASHBOARD_EEPROM_PREFIX_LEN,
+            Self::FullPage => HASHBOARD_EEPROM_PAGE_LEN,
+        }
+    }
+
+    /// Short label for tracing and stage names.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::IdentityPrefix => "identity-prefix",
+            Self::FullPage => "full-page",
+        }
+    }
+}
 const LM75_FIRST_ADDR: u8 = 0x48;
 const LM75_LAST_ADDR: u8 = 0x4f;
 
@@ -122,7 +176,7 @@ impl Lm75TemperatureRegister {
 fn map_at24_read_error(bus: u8, addr: u8, path: &str, error: std::io::Error) -> HalError {
     let is_linux_eio = error.raw_os_error() == Some(libc::EIO);
     let kind = error.kind();
-    let detail = format!("AT24 identity-prefix read from {path} failed: {error}");
+    let detail = format!("AT24 identity read from {path} failed: {error}");
     // Linux reports adapter NACK/I/O readiness failures as EIO. Rust maps
     // EIO to `Uncategorized` on supported toolchains, so match errno exactly
     // instead of widening every uncategorized failure into a retry.
@@ -558,7 +612,7 @@ fn read_eeprom_bytes_from_bus(
     i2c.set_slave(addr)?;
 
     // Set read pointer to `offset` on the EEPROM.
-    i2c.write(&[offset])?;
+    i2c.write_exact(&[offset], "EEPROM read-pointer write")?;
     std::thread::sleep(std::time::Duration::from_millis(5));
 
     let mut out = Vec::with_capacity(len);
@@ -745,6 +799,14 @@ impl I2cBus {
                 detail: format!("write failed: {}", e),
             })?;
         Ok(n)
+    }
+
+    /// Write one complete message or fail. Mutation callers must not treat a
+    /// positive but short kernel/simulator completion as protocol success.
+    pub(crate) fn write_exact(&self, data: &[u8], operation: &str) -> Result<()> {
+        let addr = self.current_addr.unwrap_or(0);
+        let written = self.write(data)?;
+        require_exact_i2c_write(self.bus, addr, operation, data.len(), written)
     }
 
     /// Write via I2C_RDWR ioctl (for addresses > 0x77 that I2C_SLAVE rejects).
@@ -1037,7 +1099,7 @@ impl I2cBus {
         )))
     }
 
-    /// Read one fixed AT24 identity prefix through a platform-admitted
+    /// Read one fixed offset-zero AT24 region through a platform-admitted
     /// protected endpoint.
     ///
     /// Production kernel services use the bound `at24` driver's sysfs file,
@@ -1046,28 +1108,37 @@ impl I2cBus {
     /// models the equivalent offset-zero transfer explicitly. The service's
     /// platform write-denylist is also the admission policy: an S9 or generic
     /// service with no AT24 policy cannot use this operation at PIC addresses.
-    fn read_protected_hashboard_eeprom_prefix(&self, addr: u8) -> Result<Vec<u8>> {
+    ///
+    /// `span` selects between the 32-byte identity prefix and the full 256-byte
+    /// page. Both are reads at offset zero under identical admission; the span
+    /// changes only how many bytes come back, never which endpoint is reachable
+    /// or whether a write is possible.
+    fn read_protected_hashboard_eeprom_span(
+        &self,
+        addr: u8,
+        span: HashboardEepromSpan,
+    ) -> Result<Vec<u8>> {
         self.validate_raw_fabric_owner()?;
         if !(HASHBOARD_EEPROM_FIRST_ADDR..=HASHBOARD_EEPROM_LAST_ADDR).contains(&addr) {
             return Err(HalError::I2cEndpointRefused {
                 bus: self.bus,
                 addr,
-                detail: "hashboard EEPROM prefix address must be within 0x50..=0x57".into(),
+                detail: "hashboard EEPROM address must be within 0x50..=0x57".into(),
             });
         }
         if !self.is_write_denied(addr) {
             return Err(HalError::I2cEndpointRefused {
                 bus: self.bus,
                 addr,
-                detail: "hashboard EEPROM prefix read refused: endpoint is not admitted by this service's protected-address policy".into(),
+                detail: "hashboard EEPROM read refused: endpoint is not admitted by this service's protected-address policy".into(),
             });
         }
 
-        let mut prefix = vec![0_u8; HASHBOARD_EEPROM_PREFIX_LEN];
+        let mut buf = vec![0_u8; span.len()];
         #[cfg(feature = "sim-hal")]
         if let Some(backend) = &self.sim_backend {
-            backend.write_read(self.bus, addr, &[0], &mut prefix)?;
-            return Ok(prefix);
+            backend.write_read(self.bus, addr, &[0], &mut buf)?;
+            return Ok(buf);
         }
 
         if self.devmem {
@@ -1082,9 +1153,9 @@ impl I2cBus {
         let path = format!("/sys/bus/i2c/devices/{}-{:04x}/eeprom", self.bus, addr);
         let mut file = fs::File::open(&path)
             .map_err(|error| map_at24_read_error(self.bus, addr, &path, error))?;
-        file.read_exact(&mut prefix)
+        file.read_exact(&mut buf)
             .map_err(|error| map_at24_read_error(self.bus, addr, &path, error))?;
-        Ok(prefix)
+        Ok(buf)
     }
 
     /// Send a PIC command to a specific chain's voltage controller.
@@ -1092,7 +1163,10 @@ impl I2cBus {
     /// PIC commands use preamble 0x55 0xAA followed by the command byte.
     pub fn pic_command(&mut self, addr: u8, cmd: u8) -> Result<()> {
         self.set_slave(addr)?;
-        self.write(&[pic_cmd::PREAMBLE[0], pic_cmd::PREAMBLE[1], cmd])?;
+        self.write_exact(
+            &[pic_cmd::PREAMBLE[0], pic_cmd::PREAMBLE[1], cmd],
+            "PIC command",
+        )?;
         Ok(())
     }
 
@@ -1101,7 +1175,7 @@ impl I2cBus {
         self.set_slave(addr)?;
         let mut buf = vec![pic_cmd::PREAMBLE[0], pic_cmd::PREAMBLE[1], cmd];
         buf.extend_from_slice(data);
-        self.write(&buf)?;
+        self.write_exact(&buf, "PIC command with data")?;
         Ok(())
     }
 
@@ -2757,6 +2831,35 @@ pub struct TerminalSafeOffTransition {
     no_controller_mutation_stage_in_flight: bool,
 }
 
+/// Move-only proof that a terminally fenced I2C worker drained its reserved
+/// SafeOff lane, released its fabric reservation, and was joined by its owner.
+/// This is process-lifecycle evidence, not physical rail evidence.
+#[derive(Debug)]
+pub struct I2cServiceCloseReceipt {
+    bus: u8,
+    terminal_transition: TerminalSafeOffTransition,
+    worker_exit_observed_at: Instant,
+}
+
+const I2C_WORKER_FINALIZATION_RUNNING: u8 = 0;
+const I2C_WORKER_FINALIZATION_CLEAN: u8 = 1;
+const I2C_WORKER_FINALIZATION_QUARANTINED: u8 = 2;
+const I2C_WORKER_FINALIZATION_REGISTRY_LOST: u8 = 3;
+
+impl I2cServiceCloseReceipt {
+    pub fn bus(&self) -> u8 {
+        self.bus
+    }
+
+    pub fn terminal_transition(&self) -> &TerminalSafeOffTransition {
+        &self.terminal_transition
+    }
+
+    pub fn worker_exit_observed_at(&self) -> Instant {
+        self.worker_exit_observed_at
+    }
+}
+
 impl TerminalSafeOffTransition {
     /// Safety-generation observed after terminal mutation admission closed.
     pub fn generation(&self) -> u64 {
@@ -2834,6 +2937,14 @@ struct I2cSafetyAuthority {
     terminal_safe_off: AtomicBool,
     in_flight_controller_stages: AtomicUsize,
     worker_alive: AtomicBool,
+    /// Explicit lifecycle close is independent from ordinary sender clones.
+    /// The worker polls this flag at the same bounded cadence as reserved
+    /// SafeOff work, then drains that lane before exiting.
+    close_requested: AtomicBool,
+    /// Published under the registry finalization critical section. Worker
+    /// death alone is insufficient close evidence because an unresolved
+    /// controller lifecycle deliberately leaves a quarantine reservation.
+    worker_finalization: AtomicU8,
     /// Set before a worker-owned PIC16 job enters the ordinary queue and
     /// cleared only after batch adoption or deterministic compensation.
     /// Atomic reservation ownership: zero is idle, a low-63-bit token is
@@ -2862,6 +2973,8 @@ impl Default for I2cSafetyAuthority {
             terminal_safe_off: AtomicBool::new(false),
             in_flight_controller_stages: AtomicUsize::new(0),
             worker_alive: AtomicBool::new(true),
+            close_requested: AtomicBool::new(false),
+            worker_finalization: AtomicU8::new(I2C_WORKER_FINALIZATION_RUNNING),
             pic16_admission_owner: AtomicU64::new(PIC16_ADMISSION_IDLE),
             pic16_admission_sequence: AtomicU64::new(0),
             pic16_active_batch_epoch: AtomicU64::new(0),
@@ -2876,6 +2989,9 @@ impl I2cSafetyAuthority {
     fn capture(&self, intent: I2cOperationIntent) -> std::result::Result<u64, &'static str> {
         loop {
             let before = self.generation.load(Ordering::SeqCst);
+            if self.close_requested.load(Ordering::SeqCst) {
+                return Err("I2C service lifecycle close is in progress");
+            }
             if intent.requires_current_safety_generation()
                 && (!self.worker_alive.load(Ordering::SeqCst)
                     || self.terminal_safe_off.load(Ordering::SeqCst))
@@ -3083,6 +3199,9 @@ impl I2cServiceWorkerLifetime {
     ) -> std::io::Result<Self> {
         if let Err(error) = registry.activate_for_worker() {
             registry.quarantine(I2cServiceQuarantineReason::RegistryInvariantLost);
+            authority
+                .worker_finalization
+                .store(I2C_WORKER_FINALIZATION_QUARANTINED, Ordering::SeqCst);
             authority.mark_worker_dead();
             return Err(error);
         }
@@ -3251,7 +3370,17 @@ impl I2cRawFabricLease {
     /// `O_CLOEXEC` handles exec, but a fork-only child shares the parent's
     /// open-file description and must never transact through inherited state.
     pub(crate) fn validate_current_process(&self) -> Result<()> {
-        let I2cFabricRegistryKey::PhysicalFabric(fabric) = self.key;
+        // The second arm is `#[cfg(feature = "sim-hal")]`, so in the default build
+        // this reads as a one-arm match. Rewriting to `let` would break the
+        // sim-hal build.
+        #[allow(clippy::infallible_destructuring_match)]
+        let fabric = match self.key {
+            I2cFabricRegistryKey::PhysicalFabric(fabric) => fabric,
+            #[cfg(feature = "sim-hal")]
+            I2cFabricRegistryKey::SimulatedBus { bus, .. } => {
+                PhysicalI2cFabricId::linux_adapter(bus)
+            }
+        };
         let current_pid = std::process::id();
         if current_pid != self.creator_pid {
             return Err(HalError::I2cFabricUnavailable {
@@ -3531,6 +3660,7 @@ impl I2cServiceRegistryLease {
             )
         });
         let mut removed = None;
+        let finalization;
         if owns_entry {
             let quarantine_reason = if std::thread::panicking() {
                 Some(I2cServiceQuarantineReason::WorkerPanicked)
@@ -3545,15 +3675,22 @@ impl I2cServiceRegistryLease {
                 {
                     *state = I2cServiceRegistryState::Quarantined(reason);
                 }
+                finalization = I2C_WORKER_FINALIZATION_QUARANTINED;
             } else {
                 removed = registry.remove(&self.key);
+                finalization = I2C_WORKER_FINALIZATION_CLEAN;
             }
+        } else {
+            finalization = I2C_WORKER_FINALIZATION_REGISTRY_LOST;
         }
 
         // Reservation finalization and worker-death publication share the
         // registry critical section. A replacement can therefore observe
         // only the old live reservation, the final quarantine tombstone, or
         // the fully removed clean reservation -- never a dead interim owner.
+        authority
+            .worker_finalization
+            .store(finalization, Ordering::SeqCst);
         authority.mark_worker_dead();
         self.worker_finalized = true;
         drop(registry);
@@ -4062,12 +4199,14 @@ pub(crate) enum I2cRequest {
         len: usize,
         reply_tx: mpsc::SyncSender<Result<Vec<u8>>>,
     },
-    /// Read the fixed offset-zero identity prefix from one hashboard AT24.
-    /// Platform topology resolves the address; no caller-controlled pointer,
-    /// payload, or length reaches the worker, and worker policy must admit the
-    /// resolved address as a protected endpoint before any I/O.
-    ReadHashboardEepromPrefix {
+    /// Read one fixed offset-zero region from one hashboard AT24. Platform
+    /// topology resolves the address; no caller-controlled pointer, payload, or
+    /// length reaches the worker — `span` is a closed two-value set, not a
+    /// size — and worker policy must admit the resolved address as a protected
+    /// endpoint before any I/O.
+    ReadHashboardEepromSpan {
         addr: u8,
+        span: HashboardEepromSpan,
         reply_tx: mpsc::SyncSender<Result<Vec<u8>>>,
     },
     /// Read exactly the signed two-byte LM75 temperature register through one
@@ -4120,6 +4259,183 @@ pub struct I2cServiceHandle {
     tx: I2cServiceSender,
     safety: Arc<I2cSafetyAuthority>,
     safe_off_mailbox: Option<Arc<I2cSafeOffMailbox>>,
+}
+
+/// Sender-free terminal capability. Keeping this separate from request
+/// handles prevents a teardown guard from accidentally extending ordinary
+/// command admission merely because it must retain the final safety barrier.
+#[derive(Clone)]
+pub(crate) struct I2cServiceTerminalFence {
+    safety: Arc<I2cSafetyAuthority>,
+}
+
+impl I2cServiceTerminalFence {
+    pub(crate) fn latch_terminal_safe_off(&self) -> TerminalSafeOffTransition {
+        self.safety.latch_terminal_safe_off()
+    }
+}
+
+/// Move-only lifecycle owner for one exact service worker. Generic request
+/// handles remain cloneable, but only this value can join the spawned worker
+/// and prove that its exact fabric allocation was released cleanly.
+pub(crate) struct I2cServiceOwner {
+    handle: I2cServiceHandle,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExitObservation {
+    Finished(Instant),
+    Pending(Instant),
+    DeadlineExpired,
+}
+
+/// Poll worker completion with a conservative timestamp sampled after the
+/// completion predicate. The second clock sample prevents scheduler delay
+/// between a pre-check and `is_finished` from backdating post-deadline proof.
+fn observe_worker_exit_before_deadline(
+    deadline: Instant,
+    mut is_finished: impl FnMut() -> bool,
+    mut now: impl FnMut() -> Instant,
+) -> WorkerExitObservation {
+    if now() >= deadline {
+        return WorkerExitObservation::DeadlineExpired;
+    }
+    let finished = is_finished();
+    let observed_at = now();
+    if observed_at >= deadline {
+        WorkerExitObservation::DeadlineExpired
+    } else if finished {
+        WorkerExitObservation::Finished(observed_at)
+    } else {
+        WorkerExitObservation::Pending(observed_at)
+    }
+}
+
+impl I2cServiceOwner {
+    pub(crate) fn request_handle(&self) -> I2cServiceHandle {
+        self.handle.clone()
+    }
+
+    pub(crate) fn terminal_fence(&self) -> I2cServiceTerminalFence {
+        I2cServiceTerminalFence {
+            safety: Arc::clone(&self.handle.safety),
+        }
+    }
+
+    /// Close admission and conservatively observe worker exit before the
+    /// caller's absolute deadline, then join that already-finished worker. A
+    /// timeout retains the JoinHandle so the same owner can retry; no receipt
+    /// is minted unless registry finalization published a clean release. The
+    /// caller remains responsible for its enclosing teardown deadline after
+    /// this worker-level receipt is returned.
+    pub(crate) fn close_and_join_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<I2cServiceCloseReceipt> {
+        let _ = self.handle.latch_terminal_safe_off();
+        let safe_off_mailbox =
+            self.handle
+                .safe_off_mailbox
+                .as_ref()
+                .ok_or_else(|| HalError::I2c {
+                    bus: self.handle.bus,
+                    addr: 0,
+                    detail: "I2C service has no reserved SafeOff lifecycle lane to close".into(),
+                })?;
+        safe_off_mailbox.begin_close();
+        self.handle
+            .safety
+            .close_requested
+            .store(true, Ordering::SeqCst);
+
+        let worker = self.worker.as_ref().ok_or_else(|| HalError::I2c {
+            bus: self.handle.bus,
+            addr: 0,
+            detail: "I2C service worker join ownership was already consumed".into(),
+        })?;
+        let worker_exit_observed_at = loop {
+            match observe_worker_exit_before_deadline(
+                deadline,
+                || worker.is_finished(),
+                Instant::now,
+            ) {
+                WorkerExitObservation::Finished(observed_at) => break observed_at,
+                WorkerExitObservation::Pending(observed_at) => {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(observed_at)
+                            .min(Duration::from_millis(5)),
+                    );
+                }
+                WorkerExitObservation::DeadlineExpired => {
+                    return Err(HalError::I2c {
+                        bus: self.handle.bus,
+                        addr: 0,
+                        detail:
+                            "I2C service worker was not observed exited before its close deadline"
+                                .into(),
+                    });
+                }
+            }
+        };
+
+        let worker = self.worker.take().expect("checked retained I2C worker");
+        worker.join().map_err(|_| HalError::I2c {
+            bus: self.handle.bus,
+            addr: 0,
+            detail: "I2C service worker panicked before terminal join".into(),
+        })?;
+        let finalization = self
+            .handle
+            .safety
+            .worker_finalization
+            .load(Ordering::SeqCst);
+        if finalization != I2C_WORKER_FINALIZATION_CLEAN {
+            let detail = match finalization {
+                I2C_WORKER_FINALIZATION_QUARANTINED => {
+                    "joined I2C worker retained a quarantined fabric reservation"
+                }
+                I2C_WORKER_FINALIZATION_REGISTRY_LOST => {
+                    "joined I2C worker lost its exact fabric registry allocation"
+                }
+                I2C_WORKER_FINALIZATION_RUNNING => {
+                    "joined I2C worker did not publish registry finalization"
+                }
+                _ => "joined I2C worker published an invalid registry finalization state",
+            };
+            return Err(HalError::I2c {
+                bus: self.handle.bus,
+                addr: 0,
+                detail: detail.into(),
+            });
+        }
+        let worker_alive = self.handle.safety.worker_alive.load(Ordering::SeqCst);
+        let in_flight_controller_stages = self
+            .handle
+            .safety
+            .in_flight_controller_stages
+            .load(Ordering::SeqCst);
+        let safe_off_worker_state = safe_off_mailbox.worker_state.load(Ordering::SeqCst);
+        if worker_alive
+            || in_flight_controller_stages != 0
+            || safe_off_worker_state != I2C_SAFE_OFF_WORKER_CLOSED
+        {
+            return Err(HalError::I2c {
+                bus: self.handle.bus,
+                addr: 0,
+                detail: format!(
+                    "joined I2C worker did not publish a fully closed lifecycle: worker_alive={worker_alive}, in_flight_controller_stages={in_flight_controller_stages}, safe_off_worker_state={safe_off_worker_state}"
+                ),
+            });
+        }
+        let terminal_transition = self.handle.latch_terminal_safe_off();
+        Ok(I2cServiceCloseReceipt {
+            bus: self.handle.bus,
+            terminal_transition,
+            worker_exit_observed_at,
+        })
+    }
 }
 
 /// Tokio-facing facade for the serialized I2C service.
@@ -4520,6 +4836,11 @@ impl I2cSafeOffMailbox {
         )
     }
 
+    // clippy::too_many_arguments: this is the serialized I2C worker enqueue path.
+    // Every parameter is an independent admission input (bus, addr, intent,
+    // deadline, ...); bundling them into a struct would let a caller construct a
+    // partially-populated request, which is exactly what the explicit signature
+    // prevents on a path that mutates hardware.
     #[allow(clippy::too_many_arguments)]
     fn enqueue_conditional_plan(
         &self,
@@ -4630,8 +4951,15 @@ impl I2cSafeOffMailbox {
     /// unwind guard can still fail anything the worker has not yet removed.
     fn begin_close(&self) {
         let _pending = self.lock_pending();
-        self.worker_state
-            .store(I2C_SAFE_OFF_WORKER_CLOSING, Ordering::SeqCst);
+        // Close is monotonic. In particular, a lifecycle-owner retry after a
+        // join timeout must never demote CLOSED back to CLOSING and thereby
+        // erase the worker's positive finalization evidence.
+        let _ = self.worker_state.compare_exchange(
+            I2C_SAFE_OFF_WORKER_ACCEPTING,
+            I2C_SAFE_OFF_WORKER_CLOSING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     fn mark_closed(&self) {
@@ -4918,7 +5246,7 @@ impl PendingI2cSafeOff {
                     .begin_stage(i2c.bus, self.addr, "reserved safe-off write")
                     .and_then(|_stage| {
                         i2c.set_slave(self.addr)?;
-                        i2c.write(data).map(|_| ())
+                        i2c.write_exact(data, "reserved safe-off write")
                     });
                 I2cSafeOffExecution::Unit(result)
             }
@@ -5222,6 +5550,14 @@ const I2C_EXECUTION_HEADROOM: Duration = Duration::from_secs(1);
 const I2C_MAX_EXECUTION_BUDGET: Duration = Duration::from_secs(60);
 const I2C_ASYNC_DISPATCH_BUDGET: Duration = Duration::from_secs(1);
 
+/// Conservative caller-side wall-clock bound for one normally scheduled
+/// service-backed keep-alive step. This covers PIC heartbeat requests plus the
+/// APW framed transaction and stale-buffer read used by its cancellable
+/// heartbeat. Queue admission is contained inside the one-second start
+/// deadline. Callers must check cancellation between steps, use a strictly
+/// larger join interval, and still treat a missed join as negative evidence.
+pub const I2C_HEARTBEAT_CALL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(4);
+
 const I2C_ASYNC_WAITING: u8 = 0;
 const I2C_ASYNC_STARTED: u8 = 1;
 const I2C_ASYNC_FINISHED: u8 = 2;
@@ -5340,7 +5676,7 @@ fn request_execution_budget(request: &I2cRequest) -> Duration {
         }
         I2cRequest::WriteBytes { .. }
         | I2cRequest::ReadBytes { .. }
-        | I2cRequest::ReadHashboardEepromPrefix { .. }
+        | I2cRequest::ReadHashboardEepromSpan { .. }
         | I2cRequest::ReadLm75TemperatureRegister { .. }
         | I2cRequest::WriteRead { .. } => I2C_DEFAULT_KERNEL_TIMEOUT,
         I2cRequest::WriteByteByte { data, .. } => duration_mul(byte_op, data.len()),
@@ -5396,7 +5732,7 @@ fn request_addr(request: &I2cRequest) -> u8 {
         | I2cRequest::WriteBytes { addr, .. }
         | I2cRequest::WriteByteByte { addr, .. }
         | I2cRequest::ReadBytes { addr, .. }
-        | I2cRequest::ReadHashboardEepromPrefix { addr, .. }
+        | I2cRequest::ReadHashboardEepromSpan { addr, .. }
         | I2cRequest::ReadLm75TemperatureRegister { addr, .. }
         | I2cRequest::WriteRead { addr, .. }
         | I2cRequest::Transaction { addr, .. }
@@ -5441,7 +5777,7 @@ fn reply_i2c_request_error(request: I2cRequest, bus: u8, detail: &str) {
             reply!(reply_tx, batch.addresses().first().copied().unwrap_or(0))
         }
         I2cRequest::ReadBytes { reply_tx, addr, .. }
-        | I2cRequest::ReadHashboardEepromPrefix { reply_tx, addr }
+        | I2cRequest::ReadHashboardEepromSpan { reply_tx, addr, .. }
         | I2cRequest::WriteRead { reply_tx, addr, .. } => reply!(reply_tx, addr),
         I2cRequest::ReadLm75TemperatureRegister { reply_tx, addr } => {
             reply!(reply_tx, addr)
@@ -5475,7 +5811,7 @@ fn reply_i2c_request_failure(request: I2cRequest, error: HalError) {
         I2cRequest::Pic16Admission { reply_tx, .. } => reply!(reply_tx),
         I2cRequest::Pic16HeartbeatRound { reply_tx, .. } => reply!(reply_tx),
         I2cRequest::ReadBytes { reply_tx, .. }
-        | I2cRequest::ReadHashboardEepromPrefix { reply_tx, .. }
+        | I2cRequest::ReadHashboardEepromSpan { reply_tx, .. }
         | I2cRequest::WriteRead { reply_tx, .. } => {
             reply!(reply_tx)
         }
@@ -5491,6 +5827,20 @@ fn reject_envelope_during_pic16_job(envelope: I2cServiceEnvelope, bus: u8) {
     };
     reply_i2c_request_busy(request, bus);
     state.store(I2C_REQUEST_FINISHED, Ordering::Release);
+}
+
+fn reject_envelope_for_service_close(envelope: I2cServiceEnvelope, bus: u8) {
+    let I2cServiceEnvelope { state, request, .. } = envelope;
+    state.store(I2C_REQUEST_CANCELLED, Ordering::Release);
+    let addr = request_addr(&request);
+    reply_i2c_request_failure(
+        request,
+        HalError::I2cSafetySuperseded {
+            bus,
+            addr,
+            detail: "I2C service lifecycle close rejected queued work before wire access".into(),
+        },
+    );
 }
 
 fn reply_i2c_request_busy(request: I2cRequest, bus: u8) {
@@ -5518,7 +5868,7 @@ fn reply_i2c_request_busy(request: I2cRequest, bus: u8) {
             busy!(reply_tx, batch.addresses().first().copied().unwrap_or(0))
         }
         I2cRequest::ReadBytes { reply_tx, addr, .. }
-        | I2cRequest::ReadHashboardEepromPrefix { reply_tx, addr }
+        | I2cRequest::ReadHashboardEepromSpan { reply_tx, addr, .. }
         | I2cRequest::WriteRead { reply_tx, addr, .. } => busy!(reply_tx, addr),
         I2cRequest::ReadLm75TemperatureRegister { reply_tx, addr } => busy!(reply_tx, addr),
         I2cRequest::SetTimeout { reply_tx, .. } | I2cRequest::RecoverUnmanagedBus { reply_tx } => {
@@ -5902,7 +6252,7 @@ impl I2cServiceHandle {
         } else {
             self.safety
                 .capture(intent)
-                .map_err(|detail| HalError::I2c {
+                .map_err(|detail| HalError::I2cSafetySuperseded {
                     bus: self.bus,
                     addr,
                     detail: format!("{:?} request was not admitted: {detail}", intent),
@@ -5923,7 +6273,14 @@ impl I2cServiceHandle {
             }));
         }
 
-        let I2cServiceSender::Deadline(tx) = &self.tx;
+        // The second arm is `#[cfg(test)]`, so this reads as a one-arm match in a
+        // non-test build only.
+        #[allow(clippy::infallible_destructuring_match)]
+        let tx = match &self.tx {
+            I2cServiceSender::Deadline(tx) => tx,
+            #[cfg(test)]
+            I2cServiceSender::Raw(_) => unreachable!("raw test sender returned above"),
+        };
         let submitted_at = Instant::now();
         let admission_deadline = submitted_at + budget.admission;
         let must_start_by = submitted_at + budget.start;
@@ -7034,15 +7391,43 @@ impl I2cServiceHandle {
     /// use the bound kernel driver's sysfs endpoint; generic raw write and
     /// write-read APIs remain denied.
     pub fn read_hashboard_eeprom_prefix_at(&self, addr: u8, deadline: Instant) -> Result<Vec<u8>> {
+        self.read_hashboard_eeprom_span_at(addr, HashboardEepromSpan::IdentityPrefix, deadline)
+    }
+
+    /// Read a hashboard AT24's complete 256-byte page through the sole service.
+    ///
+    /// Same endpoint policy, same worker, same read-only intent, and the same
+    /// kernel-bound `at24` sysfs endpoint as the identity-prefix read — only
+    /// the byte count differs. This is the transport the XXTEA three-region
+    /// decoder needs: `decode_deployed_eeprom` refuses anything that is not
+    /// exactly `RAW_PAGE_LEN`, so a 32-byte prefix can never feed it.
+    ///
+    /// Read-only. The `0x50..=0x57` write denylist stays in force and is in
+    /// fact a *precondition* here: an endpoint the service has not admitted as
+    /// write-protected is refused outright.
+    pub fn read_hashboard_eeprom_page_at(&self, addr: u8, deadline: Instant) -> Result<Vec<u8>> {
+        self.read_hashboard_eeprom_span_at(addr, HashboardEepromSpan::FullPage, deadline)
+    }
+
+    fn read_hashboard_eeprom_span_at(
+        &self,
+        addr: u8,
+        span: HashboardEepromSpan,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
         if !(HASHBOARD_EEPROM_FIRST_ADDR..=HASHBOARD_EEPROM_LAST_ADDR).contains(&addr) {
             return Err(HalError::I2cEndpointRefused {
                 bus: self.bus,
                 addr,
-                detail: "hashboard EEPROM prefix address must be within 0x50..=0x57".into(),
+                detail: "hashboard EEPROM address must be within 0x50..=0x57".into(),
             });
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let request = I2cRequest::ReadHashboardEepromPrefix { addr, reply_tx };
+        let request = I2cRequest::ReadHashboardEepromSpan {
+            addr,
+            span,
+            reply_tx,
+        };
         let Some(budget) = I2cRequestBudget::for_request_until(&request, deadline) else {
             return Err(HalError::I2cEndpointNotReady {
                 bus: self.bus,
@@ -7720,7 +8105,13 @@ mod i2c_service_deadline_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((bus, addr, write_data.to_vec(), read_buf.len()));
-            if write_data != [0] || read_buf.len() != HASHBOARD_EEPROM_PREFIX_LEN {
+            // Still strict, just over the closed span set rather than a single
+            // size: offset-zero selector, and a length that is exactly one of
+            // the two representable spans. An arbitrary length is still a
+            // refusal, so this cannot silently absorb a widened read.
+            let admitted_len = read_buf.len() == HashboardEepromSpan::IdentityPrefix.len()
+                || read_buf.len() == HashboardEepromSpan::FullPage.len();
+            if write_data != [0] || !admitted_len {
                 return Err(HalError::I2c {
                     bus,
                     addr,
@@ -7872,15 +8263,34 @@ mod i2c_service_deadline_tests {
             assert!(i2c_result_requires_transport_recovery(&result));
         }
 
+        // This file `include_str!`s itself, so every marker below is split
+        // across a `concat!` to keep the literal in this test from BEING the
+        // match. That is not hypothetical: the previous end marker was a
+        // doc-comment phrase that also appeared verbatim right here, so when
+        // that doc comment was reworded `find` silently slid ~7000 lines
+        // forward to this test's own copy and the slice swallowed unrelated
+        // PIC helpers -- which is how a passing contract would have started
+        // reporting `set_slave` in the LM75 transport. Split literals cannot
+        // self-match, so a renamed boundary now fails loudly on `expect`
+        // instead of quietly re-scoping the assertion.
         let source = include_str!("i2c.rs");
-        let typed_start = source
-            .find("fn read_lm75_temperature_register")
-            .expect("typed LM75 transport");
+        let start_marker = concat!("fn read_lm75_", "temperature_register(");
+        let end_marker = concat!("fn read_protected_hashboard_", "eeprom_span(");
+        let typed_start = source.find(start_marker).expect("typed LM75 transport");
         let typed_end = source[typed_start..]
-            .find("/// Read one fixed AT24")
+            .find(end_marker)
             .map(|offset| typed_start + offset)
             .expect("end of typed LM75 transport");
         let typed = &source[typed_start..typed_end];
+        // Guard the slice itself: the LM75 transport is a short function, so a
+        // boundary that silently widens shows up as an implausible span before
+        // it shows up as a confusing assertion failure.
+        assert!(
+            typed.len() < 4_000,
+            "LM75 transport slice widened to {} bytes -- the boundary markers \
+             have drifted and this contract is no longer scoped to one function",
+            typed.len(),
+        );
         assert!(typed.contains("write_read_at(addr, &[0x00], &mut bytes, true)"));
         assert!(!typed.contains("set_slave"));
     }
@@ -7953,6 +8363,82 @@ mod i2c_service_deadline_tests {
             HalError::I2cEndpointNotReady { .. }
         ));
         assert_eq!(backend.transfers().len(), 1);
+    }
+
+    /// The full-page span must transfer exactly what the decoder demands.
+    ///
+    /// `decode_deployed_eeprom` refuses any buffer whose length is not exactly
+    /// `RAW_PAGE_LEN`, so if these ever drift the entire XXTEA three-region
+    /// decode goes unreachable again — silently, because the transport would
+    /// still "succeed" and only the decoder would refuse.
+    #[test]
+    fn hashboard_eeprom_span_lengths_match_the_decoder_contract() {
+        assert_eq!(HashboardEepromSpan::IdentityPrefix.len(), 32);
+        assert_eq!(
+            HashboardEepromSpan::FullPage.len(),
+            dcentrald_api_types::deployed_eeprom::RAW_PAGE_LEN,
+        );
+        assert_eq!(HashboardEepromSpan::FullPage.len(), 256);
+        // The prefix is what the energize gate reads; widening it would change
+        // a safety-critical path rather than adding a capability beside it.
+        assert_eq!(
+            HashboardEepromSpan::IdentityPrefix.len(),
+            HASHBOARD_EEPROM_PREFIX_LEN,
+        );
+        assert_ne!(
+            HashboardEepromSpan::IdentityPrefix.len(),
+            HashboardEepromSpan::FullPage.len(),
+        );
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn typed_at24_full_page_read_uses_the_same_policy_as_the_identity_prefix() {
+        let backend = Arc::new(At24IdentityBackend::new());
+        let denylist = (HASHBOARD_EEPROM_FIRST_ADDR..=HASHBOARD_EEPROM_LAST_ADDR).collect();
+        let service = spawn_sim_i2c_service(25, backend.clone(), denylist).unwrap();
+
+        let page = service
+            .read_hashboard_eeprom_page_at(0x52, Instant::now() + Duration::from_secs(1))
+            .expect("admitted AT24 endpoint serves the full page");
+        assert_eq!(
+            page.len(),
+            dcentrald_api_types::deployed_eeprom::RAW_PAGE_LEN
+        );
+        // Offset-zero selector, full-page length — the transfer shape the
+        // kernel-bound at24 endpoint sees.
+        assert_eq!(
+            backend.transfers(),
+            vec![(
+                25,
+                0x52,
+                vec![0],
+                dcentrald_api_types::deployed_eeprom::RAW_PAGE_LEN
+            )]
+        );
+
+        // Out-of-range endpoints are refused before queue admission, exactly
+        // like the prefix read.
+        assert!(service
+            .read_hashboard_eeprom_page_at(0x58, Instant::now() + Duration::from_secs(1))
+            .is_err());
+        assert_eq!(backend.transfers().len(), 1);
+
+        // A service with no AT24 write-protection policy (S9) must not be able
+        // to reach a PIC address through the widened span. The denylist stays a
+        // precondition for the read, not something the full page bypasses.
+        let s9_backend = Arc::new(At24IdentityBackend::new());
+        let s9_service = spawn_sim_i2c_service(26, s9_backend.clone(), Vec::new()).unwrap();
+        let policy_error = s9_service
+            .read_hashboard_eeprom_page_at(0x55, Instant::now() + Duration::from_secs(1))
+            .expect_err("unadmitted endpoint must be refused");
+        assert!(policy_error
+            .to_string()
+            .contains("protected-address policy"));
+        assert!(
+            s9_backend.transfers().is_empty(),
+            "policy refusal must happen before an S9 PIC address reaches wire"
+        );
     }
 
     #[test]
@@ -8083,7 +8569,7 @@ mod i2c_service_deadline_tests {
         fn write(&self, _bus: u8, _addr: u8, data: &[u8]) -> Result<usize> {
             let ordinal = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
             if ordinal == 2 {
-                Ok(0)
+                Ok(data.len().saturating_sub(1))
             } else {
                 Ok(data.len())
             }
@@ -8122,6 +8608,24 @@ mod i2c_service_deadline_tests {
             2,
             "bytewise transport must stop at the first unproven byte"
         );
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn exact_message_write_rejects_short_backend_completion() {
+        let backend = Arc::new(ShortWriteBackend::default());
+        let mut bus = I2cBus::open_sim(0, backend.clone());
+        bus.set_slave(0x10).unwrap();
+
+        bus.write_exact(&[0x55], "first complete message").unwrap();
+        let error = bus
+            .write_exact(&[0x55, 0xAA, 0x04, 0x81, 0x01, 0x86], "APW frame")
+            .expect_err("a positive-but-short frame must not prove a PSU mutation");
+
+        assert!(matches!(error, HalError::I2c { .. }));
+        assert!(error.to_string().contains("short write"));
+        assert!(error.to_string().contains("expected 6 byte(s), wrote 5"));
+        assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -8874,6 +9378,39 @@ mod i2c_service_deadline_tests {
             rx.try_recv().is_err(),
             "oversized transaction plans must never enter the worker queue"
         );
+    }
+
+    #[test]
+    fn published_heartbeat_call_bound_covers_internal_service_deadline() {
+        let (heartbeat, _heartbeat_reply_rx) = heartbeat_request();
+        let (apw_tx, _apw_rx) = mpsc::sync_channel(1);
+        let apw_frame = I2cRequest::Transaction {
+            addr: 0x10,
+            steps: vec![
+                I2cTransactionStep::Write(vec![0x84]),
+                I2cTransactionStep::SleepMs(50),
+            ],
+            reply_tx: apw_tx,
+        };
+        let (flush_tx, _flush_rx) = mpsc::sync_channel(1);
+        let apw_flush_read = I2cRequest::ReadBytes {
+            addr: 0x10,
+            len: 32,
+            reply_tx: flush_tx,
+        };
+
+        for (label, request) in [
+            ("PIC heartbeat", heartbeat),
+            ("APW heartbeat frame", apw_frame),
+            ("APW retry-flush read", apw_flush_read),
+        ] {
+            let budget = I2cRequestBudget::for_request(&request).unwrap();
+            assert!(
+                budget.start.saturating_add(budget.execution)
+                    <= I2C_HEARTBEAT_CALL_WALL_CLOCK_BUDGET,
+                "{label} exceeds the published keep-alive step bound"
+            );
+        }
     }
 
     #[test]
@@ -10262,6 +10799,119 @@ mod i2c_service_deadline_tests {
 
     #[cfg(feature = "sim-hal")]
     #[test]
+    fn owned_service_close_joins_rejects_stale_handles_and_releases_exact_fabric() {
+        use crate::platform::sim::{SimControllerKind, SimI2cBackend};
+
+        let backend = Arc::new(SimI2cBackend::with_controller(SimControllerKind::Dspic));
+        let mut owner = spawn_owned_sim_i2c_service(31, backend.clone(), Vec::new()).unwrap();
+        let stale = owner.request_handle();
+
+        let receipt = owner
+            .close_and_join_until(Instant::now() + Duration::from_secs(1))
+            .expect("owned worker must close and release its exact simulated fabric");
+        assert_eq!(receipt.bus(), 31);
+        assert!(matches!(
+            stale.read_bytes(0x20, 1),
+            Err(HalError::I2cSafetySuperseded { .. })
+        ));
+
+        let mut replacement = spawn_owned_sim_i2c_service(31, backend, Vec::new())
+            .expect("clean close receipt must imply same-fabric reacquisition");
+        replacement
+            .close_and_join_until(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_exit_observation_cannot_backdate_a_slow_completion_predicate() {
+        let base = Instant::now();
+        let deadline = base + Duration::from_millis(10);
+        let predicate_called = std::cell::Cell::new(false);
+        let clock_call = std::cell::Cell::new(0_u8);
+
+        let observation = observe_worker_exit_before_deadline(
+            deadline,
+            || {
+                predicate_called.set(true);
+                true
+            },
+            || {
+                let call = clock_call.get();
+                clock_call.set(call + 1);
+                if call == 0 {
+                    base + Duration::from_millis(9)
+                } else {
+                    base + Duration::from_millis(11)
+                }
+            },
+        );
+
+        assert!(predicate_called.get());
+        assert_eq!(observation, WorkerExitObservation::DeadlineExpired);
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn owned_service_close_timeout_mints_no_receipt_and_remains_retryable() {
+        use crate::platform::sim::{SimControllerKind, SimI2cBackend};
+
+        let backend = Arc::new(SimI2cBackend::with_controller(SimControllerKind::Dspic));
+        let mut owner = spawn_owned_sim_i2c_service(32, backend.clone(), Vec::new()).unwrap();
+        let request_handle = owner.request_handle();
+        backend.arm_next_transfer_stall().unwrap();
+        let request = std::thread::spawn(move || request_handle.read_bytes(0x20, 1));
+        assert!(backend
+            .wait_for_transfer_stall(Duration::from_secs(1))
+            .unwrap());
+
+        let timeout = owner
+            .close_and_join_until(Instant::now() + Duration::from_millis(10))
+            .expect_err("a blocked worker must not mint a close receipt after its deadline");
+        assert!(timeout.to_string().contains("close deadline"));
+
+        backend.release_transfer_stall().unwrap();
+        let _ = request.join().unwrap();
+        owner
+            .close_and_join_until(Instant::now() + Duration::from_secs(1))
+            .expect("the retained worker JoinHandle must permit a clean close retry");
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
+    fn owned_service_close_rejects_expired_deadline_after_worker_exit() {
+        use crate::platform::sim::{SimControllerKind, SimI2cBackend};
+
+        let backend = Arc::new(SimI2cBackend::with_controller(SimControllerKind::Dspic));
+        let mut owner = spawn_owned_sim_i2c_service(30, backend, Vec::new()).unwrap();
+
+        owner
+            .close_and_join_until(Instant::now())
+            .expect_err("an expired deadline must never mint a close receipt");
+        let worker = owner
+            .worker
+            .as_ref()
+            .expect("deadline failure retains join ownership");
+        for _ in 0..100 {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker.is_finished(),
+            "closed worker must exit for boundary test"
+        );
+
+        owner
+            .close_and_join_until(Instant::now())
+            .expect_err("an already-finished worker still cannot satisfy an expired deadline");
+        owner
+            .close_and_join_until(Instant::now() + Duration::from_secs(1))
+            .expect("a future deadline must consume the retained clean worker");
+    }
+
+    #[cfg(feature = "sim-hal")]
+    #[test]
     fn live_raw_sim_handle_blocks_service_until_lease_release() {
         use crate::platform::sim::{SimControllerKind, SimI2cBackend};
 
@@ -10609,6 +11259,34 @@ where
     )
 }
 
+/// Owned form used by platform lifecycle composition. Unlike the compatibility
+/// constructors above, this retains the exact worker JoinHandle and therefore
+/// supports positive close-and-release evidence.
+pub(crate) fn spawn_owned_i2c_service_no_register_touch_with_denylist_and_reserved_preparation<F>(
+    bus: u8,
+    write_denylist: Vec<u8>,
+    prepare: F,
+) -> std::io::Result<I2cServiceOwner>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let (tx, rx) = mpsc::sync_channel::<I2cServiceEnvelope>(64);
+    let safety = Arc::new(I2cSafetyAuthority::default());
+    let mut registry =
+        I2cServiceRegistryLease::reserve(I2cFabricRegistryKey::linux_adapter(bus), &safety)?;
+    run_reserved_i2c_preparation(&mut registry, prepare)?;
+    spawn_reserved_i2c_service_with_policy_owned(
+        bus,
+        false,
+        false,
+        write_denylist,
+        tx,
+        rx,
+        safety,
+        registry,
+    )
+}
+
 /// Spawn the normal serialized service API over a host-only simulated bus.
 ///
 /// This is deliberately crate-private: SimPlatform is the only constructor,
@@ -10621,6 +11299,17 @@ pub(crate) fn spawn_sim_i2c_service(
     backend: std::sync::Arc<dyn I2cSimBackend>,
     write_denylist: Vec<u8>,
 ) -> std::io::Result<I2cServiceHandle> {
+    let I2cServiceOwner { handle, worker: _ } =
+        spawn_owned_sim_i2c_service(bus, backend, write_denylist)?;
+    Ok(handle)
+}
+
+#[cfg(feature = "sim-hal")]
+pub(crate) fn spawn_owned_sim_i2c_service(
+    bus: u8,
+    backend: std::sync::Arc<dyn I2cSimBackend>,
+    write_denylist: Vec<u8>,
+) -> std::io::Result<I2cServiceOwner> {
     let (tx, rx) = mpsc::sync_channel::<I2cServiceEnvelope>(64);
     let safety = Arc::new(I2cSafetyAuthority::default());
     let backend_identity = backend.service_identity().ok_or_else(|| {
@@ -10639,7 +11328,7 @@ pub(crate) fn spawn_sim_i2c_service(
     let worker_safety = Arc::clone(&safety);
     let safe_off_mailbox = Arc::new(I2cSafeOffMailbox::default());
     let worker_safe_off_mailbox = Arc::clone(&safe_off_mailbox);
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("sim-i2c-service".to_string())
         .spawn(move || {
             let worker_lifetime = match I2cServiceWorkerLifetime::new(worker_safety, registry) {
@@ -10676,6 +11365,35 @@ pub(crate) fn spawn_sim_i2c_service(
                     }
                     execute_pending_safe_off_with_unwind_boundary(pending, bus, &mut i2c);
                     continue;
+                }
+
+                if worker_lifetime
+                    .authority
+                    .close_requested
+                    .load(Ordering::SeqCst)
+                {
+                    worker_safe_off_mailbox.begin_close();
+                    if let Some(job) = pic16_job.as_ref() {
+                        job.request_cancel();
+                    } else {
+                        while let Some(pending) = worker_safe_off_mailbox.take_next() {
+                            execute_pending_safe_off_with_unwind_boundary(
+                                pending, bus, &mut i2c,
+                            );
+                        }
+                        if let Some(pending) =
+                            active_pic16_batch_shutdown(&worker_lifetime.authority)
+                        {
+                            execute_pending_safe_off_with_unwind_boundary(
+                                pending, bus, &mut i2c,
+                            );
+                        }
+                        while let Ok(envelope) = rx.try_recv() {
+                            reject_envelope_for_service_close(envelope, bus);
+                        }
+                        lifecycle.finish();
+                        break;
+                    }
                 }
 
                 if let Some(job) = pic16_job.as_mut() {
@@ -10751,6 +11469,14 @@ pub(crate) fn spawn_sim_i2c_service(
                         break;
                     }
                 };
+                if worker_lifetime
+                    .authority
+                    .close_requested
+                    .load(Ordering::SeqCst)
+                {
+                    reject_envelope_for_service_close(envelope, bus);
+                    continue;
+                }
                 let Some((request, state, permit)) =
                     start_envelope_at(envelope, bus, Instant::now())
                 else {
@@ -10800,11 +11526,15 @@ pub(crate) fn spawn_sim_i2c_service(
                 state.store(I2C_REQUEST_FINISHED, Ordering::Release);
             }
         })?;
-    Ok(I2cServiceHandle {
+    let handle = I2cServiceHandle {
         bus,
         tx: I2cServiceSender::Deadline(tx),
         safety,
         safe_off_mailbox: Some(safe_off_mailbox),
+    };
+    Ok(I2cServiceOwner {
+        handle,
+        worker: Some(worker),
     })
 }
 
@@ -10873,7 +11603,7 @@ fn process_sim_i2c_request(i2c: &mut I2cBus, req: I2cRequest, permit: &I2cSafety
                 .begin_stage(i2c.bus, addr, "generic write")
                 .and_then(|_stage| {
                     i2c.set_slave(addr)
-                        .and_then(|_| i2c.write(&data).map(|_| ()))
+                        .and_then(|_| i2c.write_exact(&data, "generic write"))
                 });
             let _ = reply_tx.send(result);
         }
@@ -10908,10 +11638,14 @@ fn process_sim_i2c_request(i2c: &mut I2cBus, req: I2cRequest, permit: &I2cSafety
                 });
             let _ = reply_tx.send(result);
         }
-        I2cRequest::ReadHashboardEepromPrefix { addr, reply_tx } => {
+        I2cRequest::ReadHashboardEepromSpan {
+            addr,
+            span,
+            reply_tx,
+        } => {
             let result = permit
-                .begin_stage(i2c.bus, addr, "hashboard EEPROM identity-prefix read")
-                .and_then(|_stage| i2c.read_protected_hashboard_eeprom_prefix(addr));
+                .begin_stage(i2c.bus, addr, "hashboard EEPROM identity read")
+                .and_then(|_stage| i2c.read_protected_hashboard_eeprom_span(addr, span));
             let _ = reply_tx.send(result);
         }
         I2cRequest::ReadLm75TemperatureRegister { addr, reply_tx } => {
@@ -11037,11 +11771,35 @@ fn spawn_reserved_i2c_service_with_policy(
     safety: Arc<I2cSafetyAuthority>,
     registry: I2cServiceRegistryLease,
 ) -> std::io::Result<I2cServiceHandle> {
+    let I2cServiceOwner { handle, worker: _ } = spawn_reserved_i2c_service_with_policy_owned(
+        bus,
+        use_devmem,
+        restore_kernel_registers,
+        write_denylist,
+        tx,
+        rx,
+        safety,
+        registry,
+    )?;
+    Ok(handle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_reserved_i2c_service_with_policy_owned(
+    bus: u8,
+    use_devmem: bool,
+    restore_kernel_registers: bool,
+    write_denylist: Vec<u8>,
+    tx: mpsc::SyncSender<I2cServiceEnvelope>,
+    rx: mpsc::Receiver<I2cServiceEnvelope>,
+    safety: Arc<I2cSafetyAuthority>,
+    registry: I2cServiceRegistryLease,
+) -> std::io::Result<I2cServiceOwner> {
     let worker_safety = Arc::clone(&safety);
     let safe_off_mailbox = Arc::new(I2cSafeOffMailbox::default());
     let worker_safe_off_mailbox = Arc::clone(&safe_off_mailbox);
 
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("i2c-service".to_string())
         .spawn(move || {
             let loop_safety = Arc::clone(&worker_safety);
@@ -11064,11 +11822,15 @@ fn spawn_reserved_i2c_service_with_policy(
             drop(worker_lifetime);
         })?;
 
-    Ok(I2cServiceHandle {
+    let handle = I2cServiceHandle {
         bus,
         tx: I2cServiceSender::Deadline(tx),
         safety,
         safe_off_mailbox: Some(safe_off_mailbox),
+    };
+    Ok(I2cServiceOwner {
+        handle,
+        worker: Some(worker),
     })
 }
 
@@ -11207,6 +11969,63 @@ fn i2c_service_loop(
                 &safety,
             );
             continue;
+        }
+
+        if safety.close_requested.load(Ordering::SeqCst) {
+            safe_off_mailbox.begin_close();
+            if let Some(job) = pic16_job.as_ref() {
+                job.request_cancel();
+            } else {
+                while let Some(pending) = safe_off_mailbox.take_next() {
+                    if i2c_bus.is_none() {
+                        i2c_bus = reopen_i2c_service_bus(
+                            bus,
+                            use_devmem,
+                            restore_kernel_registers,
+                            &write_denylist,
+                            &safety,
+                        );
+                    }
+                    execute_pending_safe_off_with_recovery(
+                        pending,
+                        bus,
+                        use_devmem,
+                        restore_kernel_registers,
+                        &write_denylist,
+                        &mut i2c_bus,
+                        &mut last_reset_time,
+                        &mut consecutive_resets,
+                        &safety,
+                    );
+                }
+                if let Some(pending) = active_pic16_batch_shutdown(&safety) {
+                    if i2c_bus.is_none() {
+                        i2c_bus = reopen_i2c_service_bus(
+                            bus,
+                            use_devmem,
+                            restore_kernel_registers,
+                            &write_denylist,
+                            &safety,
+                        );
+                    }
+                    execute_pending_safe_off_with_recovery(
+                        pending,
+                        bus,
+                        use_devmem,
+                        restore_kernel_registers,
+                        &write_denylist,
+                        &mut i2c_bus,
+                        &mut last_reset_time,
+                        &mut consecutive_resets,
+                        &safety,
+                    );
+                }
+                while let Ok(envelope) = rx.try_recv() {
+                    reject_envelope_for_service_close(envelope, bus);
+                }
+                lifecycle.finish();
+                break;
+            }
         }
 
         if let Some(job) = pic16_job.as_mut() {
@@ -11384,6 +12203,10 @@ fn i2c_service_loop(
                 break;
             }
         };
+        if safety.close_requested.load(Ordering::SeqCst) {
+            reject_envelope_for_service_close(envelope, bus);
+            continue;
+        }
         let Some((req, state, permit)) = start_envelope_at(envelope, bus, Instant::now()) else {
             continue;
         };
@@ -11564,7 +12387,7 @@ fn i2c_service_loop(
                     .begin_stage(bus, addr, "generic write")
                     .and_then(|_stage| {
                         i2c.set_slave(addr)?;
-                        i2c.write(&data).map(|_| ())
+                        i2c.write_exact(&data, "generic write")
                     });
                 if i2c_result_requires_transport_recovery(&result) {
                     recover_i2c_backend(
@@ -11637,10 +12460,14 @@ fn i2c_service_loop(
                 }
                 let _ = reply_tx.send(result);
             }
-            I2cRequest::ReadHashboardEepromPrefix { addr, reply_tx } => {
+            I2cRequest::ReadHashboardEepromSpan {
+                addr,
+                span,
+                reply_tx,
+            } => {
                 let result = permit
-                    .begin_stage(bus, addr, "hashboard EEPROM identity-prefix read")
-                    .and_then(|_stage| i2c.read_protected_hashboard_eeprom_prefix(addr));
+                    .begin_stage(bus, addr, "hashboard EEPROM identity read")
+                    .and_then(|_stage| i2c.read_protected_hashboard_eeprom_span(addr, span));
                 if i2c_result_requires_transport_recovery(&result) {
                     recover_i2c_backend(
                         bus,
@@ -12166,7 +12993,7 @@ fn execute_transaction_steps(
         };
         match step {
             I2cTransactionStep::Write(data) => {
-                i2c.write(&data)?;
+                i2c.write_exact(&data, "compound transaction write")?;
             }
             I2cTransactionStep::WriteByteByByte(data) => {
                 i2c.write_byte_by_byte(&data)?;

@@ -1049,14 +1049,11 @@ impl PowerModel {
             remaining_budget = (available_dynamic_w - clamped_power).max(0.0);
         }
 
-        // Snap each frequency to the nearest PLL entry that doesn't exceed it
+        // Snap each frequency to the nearest PLL entry that doesn't exceed it.
+        // P1-4: empty unknown-chip table falls back to min_freq_mhz (no [0] panic).
         let pll = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(self.chip_id);
         for (i, freq) in result.iter_mut().enumerate() {
-            *freq = pll
-                .iter()
-                .rev()
-                .find(|&&f| f <= *freq)
-                .copied()
+            *freq = dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, *freq)
                 .unwrap_or(min_freq_mhz);
             // Ensure we don't go below the minimum — but the floor must never
             // exceed the chip's stable ceiling. A weak/degraded chip whose
@@ -1232,12 +1229,8 @@ impl PowerModel {
             let target_freq = current_freq as f64 + additional_freq;
             let target_mhz = (target_freq as u16).min(max_stable);
 
-            // Snap to PLL
-            let new_freq = pll
-                .iter()
-                .rev()
-                .find(|&&f| f <= target_mhz)
-                .copied()
+            // Snap to PLL (P1-4 empty-safe)
+            let new_freq = dcentrald_asic::drivers::MinerProfile::snap_pll_floor(pll, target_mhz)
                 .unwrap_or(min_freq_mhz);
 
             if new_freq > current_freq {

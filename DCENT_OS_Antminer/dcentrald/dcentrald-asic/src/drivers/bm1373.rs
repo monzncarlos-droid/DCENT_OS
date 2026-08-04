@@ -387,8 +387,11 @@ impl ChipDriver for Bm1373Driver {
     }
 
     fn ticket_mask(&self, difficulty: u32) -> u32 {
-        // Same as BM1366/BM1368/BM1370: (difficulty - 1).
-        difficulty.saturating_sub(1)
+        // G25 pure SSOT: industrial plain (BM136x family).
+        dcentrald_common::ticket_mask_from_difficulty(
+            dcentrald_common::TicketMaskEncoding::PlainDiffMinusOne,
+            difficulty,
+        )
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {

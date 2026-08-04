@@ -42,7 +42,9 @@ fn fan_mode_from_profile_cap(profile_max_pwm: u8) -> FanMode {
 
 /// Chokepoint for every fan PWM write inside the thermal controller.
 /// Routes through `dcentrald_api_types::thermal_model::safe_fan_pwm`,
-/// which is the canonical helper that defends the home-mining PWM cap.
+/// which is the canonical helper that defends the home-mining PWM cap,
+/// then intersects [`dcentrald_common::FanCommand`] so the decade P1-6
+/// home-policy language cannot drift from this controller.
 /// Wired in  so a corrupted `profile.fan_max_pwm` (>127) or a
 /// stray raw 127 write cannot leak past this layer. Pass
 /// `Some(trigger)` to force the mode-cap PWM (safety override) or
@@ -56,7 +58,16 @@ fn safety_capped_pwm(profile_max_pwm: u8, trigger: Option<FanSafetyTrigger>, req
     // honors the operator's ceiling rather than relying on the daemon's downstream
     // re-clamp as the only guard. This only ever LOWERS the result (no-op on the
     // normal None-path callers, which already pass requested == profile_max_pwm).
-    safe_fan_pwm(mode, trigger, requested).min(profile_max_pwm)
+    let api_capped = safe_fan_pwm(mode, trigger, requested).min(profile_max_pwm);
+    // P1-6: pure FanCommand chokepoint — home profiles always apply the residential
+    // PWM-30 ceiling; industrial/advanced modes opt out of the home intersect.
+    let apply_home = matches!(mode, FanMode::QuietHome | FanMode::Home);
+    dcentrald_common::FanCommand {
+        profile_max_pwm,
+        requested_pwm: api_capped,
+        apply_home_safety_cap: apply_home,
+    }
+    .effective_pwm()
 }
 
 /// Clamp a PWM request to a profile min/max pair without trusting the pair's
@@ -986,14 +997,57 @@ pub enum ThermalAction {
     /// Throttle frequency and set fan PWM.
     ThrottleAndFan { pwm: u8, freq_reduction_pct: u8 },
 
-    /// Emergency shutdown: disable all hash boards, fans to max.
+    /// Emergency shutdown: cut hashboard power, then command fans to the
+    /// home-capped emergency PWM (never industrial 100% blast).
     EmergencyShutdown,
 
-    /// Fan failure detected: disable boards, fans to max.
+    /// Fan failure: cut hashboard power, then home-capped emergency fans.
     FanFailure,
 
     /// Temperature has recovered, restart init sequence.
     RestartInit,
+}
+
+impl ThermalAction {
+    /// Map this controller action into the pure [`dcentrald_common::SafetyAction`]
+    /// policy language (decade backlog P1-6).
+    ///
+    /// Returns `None` for actions that are not emergency/teardown intents
+    /// (`RestartInit`, ordinary fan/throttle commands that do not imply a power cut).
+    ///
+    /// **Cut-hash-before-noise:** emergency variants always expand to
+    /// `CutPower` then `CommandFans` via [`PowerCut::with_emergency_fans`].
+    pub fn as_safety_action(self, profile_max_pwm: u8) -> Option<dcentrald_common::SafetyAction> {
+        use dcentrald_common::{FanCommand, PowerCut, PowerCutReason, SafetyAction};
+        match self {
+            Self::EmergencyShutdown => {
+                Some(PowerCut::thermal_emergency().with_emergency_fans(profile_max_pwm))
+            }
+            Self::FanFailure => Some(
+                PowerCut {
+                    reason: PowerCutReason::FanFailure,
+                    cut_hash_before_noise: true,
+                }
+                .with_emergency_fans(profile_max_pwm),
+            ),
+            Self::SetFanPwm(pwm) => Some(SafetyAction::FanOnly(FanCommand {
+                profile_max_pwm,
+                requested_pwm: pwm,
+                apply_home_safety_cap: true,
+            })),
+            Self::ThrottleAndFan { pwm, .. } => Some(SafetyAction::FanOnly(FanCommand {
+                profile_max_pwm,
+                requested_pwm: pwm,
+                apply_home_safety_cap: true,
+            })),
+            Self::RestartInit => None,
+        }
+    }
+
+    /// True when adapters must cut hash rails before any fan raise.
+    pub const fn requires_power_cut(self) -> bool {
+        matches!(self, Self::EmergencyShutdown | Self::FanFailure)
+    }
 }
 
 /// Reconcile the controller's `ThermalAction` with the Wave-E
@@ -1353,6 +1407,73 @@ mod tests {
         assert!(matches!(action, ThermalAction::SetFanPwm(25)));
         assert_eq!(controller.current_pwm(), 25);
         assert!(matches!(controller.state(), ThermalState::Sleep));
+    }
+
+    #[test]
+    fn emergency_actions_map_to_safety_action_cut_then_fan() {
+        use dcentrald_common::{
+            power_precedes_fan_raise, PowerCutReason, SafetyStep, HOME_FAN_PWM_SAFETY_MAX,
+        };
+
+        let action = ThermalAction::EmergencyShutdown
+            .as_safety_action(100)
+            .expect("emergency maps");
+        let steps = action.steps();
+        assert!(power_precedes_fan_raise(&steps));
+        assert!(matches!(
+            steps[0],
+            SafetyStep::CutPower(c) if c.reason == PowerCutReason::ThermalEmergency
+        ));
+        if let SafetyStep::CommandFans(fan) = steps[1] {
+            assert_eq!(fan.effective_pwm(), HOME_FAN_PWM_SAFETY_MAX);
+            assert!(fan.effective_pwm() < 100);
+        } else {
+            panic!("expected fan step");
+        }
+
+        let fan_fail = ThermalAction::FanFailure
+            .as_safety_action(30)
+            .expect("fan failure maps");
+        let steps = fan_fail.steps();
+        assert!(matches!(
+            steps[0],
+            SafetyStep::CutPower(c) if c.reason == PowerCutReason::FanFailure
+        ));
+        assert!(ThermalAction::EmergencyShutdown.requires_power_cut());
+        assert!(!ThermalAction::SetFanPwm(10).requires_power_cut());
+        assert!(ThermalAction::RestartInit.as_safety_action(30).is_none());
+    }
+
+    #[test]
+    fn set_fan_pwm_maps_to_fan_only_with_home_cap() {
+        use dcentrald_common::{SafetyAction, HOME_FAN_PWM_SAFETY_MAX};
+        let action = ThermalAction::SetFanPwm(100)
+            .as_safety_action(100)
+            .expect("fan maps");
+        match action {
+            SafetyAction::FanOnly(fan) => {
+                assert_eq!(fan.effective_pwm(), HOME_FAN_PWM_SAFETY_MAX);
+            }
+            other => panic!("expected FanOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_capped_pwm_intersects_common_fan_command_home_cap() {
+        // P1-6: home profile must never exceed dcentrald_common::HOME_FAN_PWM_SAFETY_MAX
+        // even when the request is 100/127 and a safety trigger is active.
+        use dcentrald_api_types::thermal_model::FanSafetyTrigger::EmergencyShutdown;
+        let home_cap = dcentrald_common::HOME_FAN_PWM_SAFETY_MAX;
+        assert_eq!(
+            safety_capped_pwm(30, Some(EmergencyShutdown), 100),
+            home_cap
+        );
+        assert_eq!(safety_capped_pwm(30, None, 100), home_cap);
+        assert!(safety_capped_pwm(25, Some(EmergencyShutdown), 100) <= 25);
+        // Industrial opt-out still respects profile_max (may exceed home 30)
+        let industrial = safety_capped_pwm(100, None, 80);
+        assert!(industrial <= 100);
+        assert_eq!(industrial, 80.min(100));
     }
 
     #[test]

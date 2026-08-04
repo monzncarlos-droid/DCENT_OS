@@ -56,6 +56,17 @@
 //! constructor is a non-mutating refusal and no environment override can
 //! promote this evidence into hardware authority.
 
+// clippy/dead_code: CV1835 (CViTek) is an EVIDENCE-RETAINED platform port. The
+// module is a complete RE'd bring-up path with no live fleet unit, so most of it
+// has no production caller yet and every item reads as dead code. It is retained
+// deliberately — the repo models exactly this state as
+// `RuntimeStatus::EvidenceRetainedNotImplemented`. Deleting it to satisfy the
+// lint would destroy real reverse-engineering work; wiring it to satisfy the lint
+// would promote an unproven platform. Allowed here until a bench unit lands.
+#![allow(dead_code)]
+// Same rationale: the retained bring-up path imports the symbols it will use
+// once wired; dropping the imports now would just have to be undone.
+#![allow(unused_imports)]
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -247,6 +258,14 @@ impl CViTekPlatform {
     /// evidence, not mutation authority. In particular, construction must not
     /// replay pinmux, select an MMIO UART table, probe I²C, or honor an
     /// environment override.
+    ///
+    /// Status classification (H7 G8): this refusal is
+    /// `RuntimeStatus::EvidenceRetainedNotImplemented` on the
+    /// `cv1835-s19jpro` `BoardDesc` row — a deliberate fail-closed product
+    /// decision with retained evidence. It is NOT the same state as the
+    /// Amlogic routing refusal (`RuntimeStatus::SpecialisedLifecycle`), which
+    /// mines via another lane. See `dcentrald-common::board_desc` and
+    /// `dcent_schema::hardware::RuntimeStatus`.
     pub fn new() -> Result<Self> {
         Err(HalError::Platform(
             "CV1835 runtime NOT IMPLEMENTED: reverse-engineered register evidence is retained, but no runtime mutation lane is admitted"
@@ -1029,6 +1048,37 @@ mod tests {
             Ok(_) => panic!("CV1835 runtime must remain unadmitted"),
         };
         assert!(error.to_string().contains("runtime NOT IMPLEMENTED"));
+    }
+
+    /// H7 G8 drift gate: the constructor refusal and the registry
+    /// classification are the same fact expressed twice; if one changes, the
+    /// other must be updated deliberately. CVitek is
+    /// `EvidenceRetainedNotImplemented` (genuinely not implemented, evidence
+    /// retained) — never the Amlogic-style `SpecialisedLifecycle` routing
+    /// refusal.
+    #[test]
+    fn cv1835_refusal_matches_board_desc_runtime_status_classification() {
+        let error = match CViTekPlatform::new() {
+            Err(error) => error,
+            Ok(_) => panic!("CV1835 runtime must remain unadmitted"),
+        };
+        assert!(error.to_string().contains("NOT IMPLEMENTED"));
+
+        let desc = dcentrald_common::BoardDesc::lookup("cv1835-s19jpro")
+            .expect("cv1835-s19jpro registry row");
+        match desc.runtime_status {
+            dcentrald_common::RuntimeStatus::EvidenceRetainedNotImplemented { evidence } => {
+                assert!(
+                    !evidence.is_empty(),
+                    "retained evidence list must be non-empty"
+                );
+            }
+            other => {
+                panic!("cv1835-s19jpro must stay EvidenceRetainedNotImplemented, got {other:?}")
+            }
+        }
+        assert!(!desc.runtime_status.permits_mining_lane());
+        assert!(!desc.public_beta_install);
     }
 
     #[test]

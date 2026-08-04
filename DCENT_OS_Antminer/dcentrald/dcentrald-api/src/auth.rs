@@ -127,6 +127,10 @@ static SESSION_LAST_SEEN: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static WEBSOCKET_TICKETS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Terminal API posture for reversible external-media observation runs.
+/// When true, auth state may be read but never migrated, quarantined, chmod'd,
+/// created, or replaced, and HTTP mutations are refused before route handlers.
+static OBSERVER_ONLY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct WsTicketRecord {
@@ -350,9 +354,20 @@ pub(crate) fn is_release_image_at(path: &std::path::Path) -> bool {
 }
 
 /// Initialize auth module configuration. Call once at API server startup.
-pub fn init_auth_config(metrics_require_auth: bool, websocket_tickets_enabled: bool) {
+pub fn init_auth_config(
+    metrics_require_auth: bool,
+    websocket_tickets_enabled: bool,
+    observer_only: bool,
+) {
     METRICS_REQUIRE_AUTH.store(metrics_require_auth, Ordering::Relaxed);
     WEBSOCKET_TICKETS_ENABLED.store(websocket_tickets_enabled, Ordering::Relaxed);
+    OBSERVER_ONLY.store(observer_only, Ordering::Release);
+}
+
+/// True when this process is serving a terminal observation-only surface.
+/// Read paths use this to suppress otherwise implicit migration writes.
+pub(crate) fn observer_only_enabled() -> bool {
+    OBSERVER_ONLY.load(Ordering::Acquire)
 }
 
 /// Override the default session idle timeout (seconds). `0` disables the idle
@@ -610,6 +625,18 @@ pub(crate) fn load_auth_at(
 }
 
 fn load_auth_with_release_posture(path: &std::path::Path, release_image: bool) -> Option<AuthData> {
+    load_auth_with_release_posture_policy(
+        path,
+        release_image,
+        !OBSERVER_ONLY.load(Ordering::Acquire),
+    )
+}
+
+fn load_auth_with_release_posture_policy(
+    path: &std::path::Path,
+    release_image: bool,
+    allow_persistent_mutation: bool,
+) -> Option<AuthData> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -635,11 +662,25 @@ fn load_auth_with_release_posture(path: &std::path::Path, release_image: bool) -
     };
     let data = match String::from_utf8(bytes) {
         Ok(data) => data,
-        Err(err) => return handle_corrupt_auth(path, release_image, err.to_string()),
+        Err(err) => {
+            return handle_corrupt_auth(
+                path,
+                release_image,
+                allow_persistent_mutation,
+                err.to_string(),
+            )
+        }
     };
     let mut auth: AuthData = match serde_json::from_str(&data) {
         Ok(auth) => auth,
-        Err(err) => return handle_corrupt_auth(path, release_image, err.to_string()),
+        Err(err) => {
+            return handle_corrupt_auth(
+                path,
+                release_image,
+                allow_persistent_mutation,
+                err.to_string(),
+            )
+        }
     };
     let mut dirty = false;
 
@@ -665,7 +706,7 @@ fn load_auth_with_release_posture(path: &std::path::Path, release_image: bool) -
         dirty = true;
     }
 
-    if dirty {
+    if dirty && allow_persistent_mutation {
         let _ = save_auth_at(path, &auth);
     }
 
@@ -684,9 +725,14 @@ fn corrupt_auth_sentinel() -> AuthData {
 fn handle_corrupt_auth(
     path: &std::path::Path,
     release_image: bool,
+    allow_persistent_mutation: bool,
     reason: String,
 ) -> Option<AuthData> {
-    let quarantine_path = quarantine_corrupt_auth(path);
+    let quarantine_path = if allow_persistent_mutation {
+        quarantine_corrupt_auth(path)
+    } else {
+        None
+    };
     tracing::error!(
         target: "auth_persistence",
         path = %path.display(),
@@ -696,7 +742,8 @@ fn handle_corrupt_auth(
             .unwrap_or_else(|| "<failed>".to_string()),
         reason = %reason,
         release_image,
-        "auth.json is corrupt; quarantined and revoked in-memory sessions",
+        observer_only = !allow_persistent_mutation,
+        "auth.json is corrupt; sessions revoked in memory (observer-only never mutates persistence)",
     );
     if release_image {
         Some(corrupt_auth_sentinel())
@@ -767,6 +814,12 @@ fn quarantine_corrupt_auth(path: &std::path::Path) -> Option<std::path::PathBuf>
 /// write. Failures to tighten perms are logged but do not block the save —
 /// fail-soft so password rotation never bricks an in-the-field unit.
 pub fn save_auth(auth: &AuthData) -> std::io::Result<()> {
+    if OBSERVER_ONLY.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "observer-only API refuses auth persistence mutation",
+        ));
+    }
     save_auth_at(std::path::Path::new(AUTH_FILE), auth)
 }
 
@@ -835,6 +888,9 @@ fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
 /// startup means the unit can still serve the dashboard's "set password"
 /// flow.
 pub fn verify_auth_file_perms() -> std::io::Result<()> {
+    if OBSERVER_ONLY.load(Ordering::Acquire) {
+        return Ok(());
+    }
     verify_auth_file_perms_at(std::path::Path::new(AUTH_FILE))
 }
 
@@ -1777,6 +1833,18 @@ pub fn redact_ws_token(uri_or_query: &str) -> String {
 pub async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_string();
 
+    if OBSERVER_ONLY.load(Ordering::Acquire) && !observer_method_allowed(request.method()) {
+        let body = serde_json::json!({
+            "error": "Observer-only API",
+            "detail": "This reversible external-media run refuses every HTTP mutation",
+        });
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
+            .unwrap();
+    }
+
     if !is_password_set()
         && is_pre_setup_mutation(&path, request.method())
         && !is_same_origin_setup_request(&request)
@@ -1917,6 +1985,10 @@ pub async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
     }
 }
 
+fn observer_method_allowed(method: &Method) -> bool {
+    matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS)
+}
+
 /// Simple base64 decode (no external dependency).
 fn base64_decode(input: &str) -> std::result::Result<String, ()> {
     // Minimal base64 decode for Basic auth
@@ -2027,15 +2099,16 @@ mod tests {
     use super::{
         check_login_rate_limit_at, constant_time_eq, hash_session_token,
         is_dashboard_proxy_request, is_direct_loopback_request, is_password_set_at,
-        is_pre_setup_safe, is_proxy_header_trusted_for_image, is_release_image_at,
-        is_setup_flow_mutation, is_setup_flow_mutation_for_image, is_strong_proxy_nonce,
-        is_trusted_loopback_proxy_request, is_trusted_loopback_proxy_request_for_image,
-        is_write_method, load_auth_at, opt_out_grants_write_for_image,
-        read_only_role_blocks_request, read_proxy_nonce_at, record_login_failure_at,
-        record_login_success, redact_ws_token, resolve_effective_auth, save_auth_at,
-        session_idle_ok_and_touch_at, session_idle_timeout_secs, set_session_idle_timeout_secs,
-        ws_query_token, AuthData, AuthSession, DASHBOARD_PROXY_LEGACY_VALUE,
-        LOGIN_RATE_LIMIT_SOFT_MAX,
+        is_pre_setup_safe, is_proxy_header_trusted_for_image, is_release_image,
+        is_release_image_at, is_setup_flow_mutation, is_setup_flow_mutation_for_image,
+        is_strong_proxy_nonce, is_trusted_loopback_proxy_request,
+        is_trusted_loopback_proxy_request_for_image, is_write_method, load_auth_at,
+        load_auth_with_release_posture_policy, observer_method_allowed,
+        opt_out_grants_write_for_image, read_only_role_blocks_request, read_proxy_nonce_at,
+        record_login_failure_at, record_login_success, redact_ws_token, resolve_effective_auth,
+        save_auth_at, session_idle_ok_and_touch_at, session_idle_timeout_secs,
+        set_session_idle_timeout_secs, ws_query_token, AuthData, AuthSession,
+        DASHBOARD_PROXY_LEGACY_VALUE, LOGIN_RATE_LIMIT_SOFT_MAX, RELEASE_IMAGE_MARKER,
     };
     use super::{SessionRole, LOGIN_RATE_LIMIT_WINDOW_SECS};
     use axum::body::Body;
@@ -2411,6 +2484,97 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observer_only_auth_load_never_migrates_or_quarantines_persistent_state() {
+        let root = scratch_dir("observer-only");
+        let legacy_path = root.join("legacy").join("auth.json");
+        let legacy = br#"{"version":1,"password_hash":"sha256:valid","api_token":"legacy-token","sessions":[]}"#;
+        raw_write_file(&legacy_path, legacy);
+
+        let loaded = load_auth_with_release_posture_policy(&legacy_path, false, false)
+            .expect("observer-only may migrate legacy auth in memory");
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(
+            std::fs::read(&legacy_path).expect("legacy file remains readable"),
+            legacy,
+            "observer-only must not rewrite a legacy auth file"
+        );
+
+        let corrupt_path = root.join("corrupt").join("auth.json");
+        let corrupt = br#"{"version":2,"password_hash":"#;
+        raw_write_file(&corrupt_path, corrupt);
+        assert!(load_auth_with_release_posture_policy(&corrupt_path, true, false).is_some());
+        assert_eq!(
+            std::fs::read(&corrupt_path).expect("corrupt file remains in place"),
+            corrupt,
+            "observer-only must not rename or replace corrupt auth"
+        );
+        let quarantines = corrupt_path
+            .parent()
+            .expect("corrupt parent")
+            .read_dir()
+            .expect("read corrupt parent")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.corrupt.")
+            })
+            .count();
+        assert_eq!(quarantines, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observer_only_method_policy_allows_only_safe_observation_verbs() {
+        for method in [&Method::GET, &Method::HEAD, &Method::OPTIONS] {
+            assert!(observer_method_allowed(method));
+        }
+        for method in [
+            &Method::POST,
+            &Method::PUT,
+            &Method::PATCH,
+            &Method::DELETE,
+            &Method::CONNECT,
+            &Method::TRACE,
+        ] {
+            assert!(!observer_method_allowed(method));
+        }
+    }
+
+    /// Host-hygiene guard for every dev-posture assertion below.
+    ///
+    /// `is_release_image()` probes `/etc/dcentos/release-image` ONCE and caches
+    /// the answer in a process-wide `AtomicU8`, and the release posture
+    /// deliberately disables the freedom-first opt-outs and the trusted-loopback
+    /// proxy bypass. So a marker left on the host makes several unrelated
+    /// dev-posture tests below fail with bare `assertion failed:` lines that look
+    /// like an auth regression rather than a dirty host.
+    ///
+    /// Observed 2026-07-24: an empty DIRECTORY at `/etc/dcentos/release-image`
+    /// (production stamps a regular FILE at Buildroot post-build) failed five
+    /// tests here. `is_release_image_at` uses `Path::exists()`, which is
+    /// deliberately fail-closed — ANY inode at the marker path means "release" —
+    /// so a stray `mkdir -p` of the full marker path flips the whole posture.
+    /// `scripts/ci/release-image-negative-test.sh` provisions and traps-removes
+    /// the marker correctly; it also refuses to run when one already exists.
+    ///
+    /// Fail here, once, with instructions instead.
+    #[test]
+    fn dev_posture_tests_require_an_absent_release_image_marker() {
+        assert!(
+            !is_release_image(),
+            "host has {RELEASE_IMAGE_MARKER} present, so this process is in RELEASE posture and \
+             the dev-posture tests in this module cannot hold. Production stamps a regular file \
+             there; a leaked CI marker or a stray `mkdir -p` of the full path both trip the \
+             fail-closed `Path::exists()` probe. Remove it (`rmdir` if it is an empty directory, \
+             after verifying this host is not a real release image) and re-run."
+        );
     }
 
     #[test]

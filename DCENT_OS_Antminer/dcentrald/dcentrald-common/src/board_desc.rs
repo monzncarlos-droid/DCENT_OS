@@ -29,8 +29,9 @@
 #![allow(dead_code)] // Scaffold: fields/enums reserved for migration consumers.
 
 use dcent_schema::hardware::{
-    ArtifactKind, ArtifactMaturity, HardwareEnablementPolicy, ImplementationMaturity,
-    InstallAuthorization, RecoveryMaturity, StorageTopology, UpdateMechanism,
+    ArtifactKind, ArtifactMaturity, GenericConstruction, HardwareEnablementPolicy,
+    ImplementationMaturity, InstallAuthorization, LifecycleLane, RecoveryMaturity, RuntimeStatus,
+    StorageTopology, UpdateMechanism,
 };
 
 /// High-level SoC / carrier family (mirrors HAL `BoardType` names without
@@ -112,6 +113,15 @@ pub enum WorkEngineKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AsicProtocolIdentity {
     Bm1387,
+    /// S15 / T15 7nm silicon.
+    ///
+    /// The numeric mapping below is a *catalog* identity used by declarative
+    /// registration and the acceptance matrix. It is deliberately NOT evidence
+    /// that a chain reporting `0x1391` is trustworthy: BM1391 enumerates
+    /// register-compatible as `0x1387` (see `dcentrald-asic` `bm1387.rs`), so a
+    /// raw `0x1391` on a serial chain is refused as an unsupported identity
+    /// layout rather than decoded.
+    Bm1391,
     Bm1396,
     Bm1397,
     Bm1398,
@@ -130,6 +140,7 @@ impl AsicProtocolIdentity {
     pub const fn from_chip_id(chip_id: u16) -> Option<Self> {
         match chip_id {
             0x1387 => Some(Self::Bm1387),
+            0x1391 => Some(Self::Bm1391),
             0x1396 => Some(Self::Bm1396),
             0x1397 => Some(Self::Bm1397),
             0x1398 => Some(Self::Bm1398),
@@ -141,12 +152,32 @@ impl AsicProtocolIdentity {
         }
     }
 
+    /// Reverse map for profile / nominal-hashrate lookup (P2-9 composition).
+    ///
+    /// [`Self::RuntimeDiscovered`] has no single ChipID — returns `None` so
+    /// callers must use measured silicon identity instead of guessing.
+    pub const fn to_chip_id(self) -> Option<u16> {
+        match self {
+            Self::Bm1387 => Some(0x1387),
+            Self::Bm1391 => Some(0x1391),
+            Self::Bm1396 => Some(0x1396),
+            Self::Bm1397 => Some(0x1397),
+            Self::Bm1398 => Some(0x1398),
+            Self::Bm1362 => Some(0x1362),
+            Self::Bm1366 => Some(0x1366),
+            Self::Bm1368 => Some(0x1368),
+            Self::Bm1370 => Some(0x1370),
+            Self::RuntimeDiscovered => None,
+        }
+    }
+
     /// Parse the canonical `BMxxxx` label used by configuration and hardware
     /// identity snapshots. Unknown labels remain unknown instead of being
     /// coerced to a nearby protocol family.
     pub fn from_chip_label(label: &str) -> Option<Self> {
         match label.trim().to_ascii_uppercase().as_str() {
             "BM1387" => Some(Self::Bm1387),
+            "BM1391" => Some(Self::Bm1391),
             "BM1396" => Some(Self::Bm1396),
             "BM1397" => Some(Self::Bm1397),
             "BM1398" => Some(Self::Bm1398),
@@ -275,6 +306,65 @@ const CV1835_EVIDENCE_ONLY_ENABLEMENT: HardwareEnablementPolicy = HardwareEnable
     artifact_maturity: ArtifactMaturity::NotImplemented,
 };
 
+/// STM32MP15 / BCB100: every facet refuses, and `storage_topology` is
+/// explicitly `Unknown` rather than borrowed from a sibling family.
+///
+/// The BCB100 carrier is documented as eMMC + microSD boot
+/// (`dcentrald-hal/src/platform/stm32mp15.rs:5`), but no bench probe has ever
+/// captured its partition map, so we may not claim `SingleSlot` (which would
+/// assert we know where a writer would land) nor `ExternalMediaOnly` (which
+/// would assert SD is the only surface). `UpdateMechanism::None` is the
+/// matching honest value: unlike CVitek there is not even a passive boot
+/// selector we have read.
+const STM32MP15_UNVERIFIED_ENABLEMENT: HardwareEnablementPolicy = HardwareEnablementPolicy {
+    storage_topology: StorageTopology::Unknown,
+    update_mechanism: UpdateMechanism::None,
+    update_maturity: ImplementationMaturity::NotImplemented,
+    install_authorization: InstallAuthorization::Denied,
+    recovery_maturity: RecoveryMaturity::NotImplemented,
+    artifact_kind: ArtifactKind::None,
+    artifact_maturity: ArtifactMaturity::NotImplemented,
+};
+
+/// Retained CV1835 reverse-engineering evidence backing the deliberate
+/// `EvidenceRetainedNotImplemented` refusal on `cv1835-s19jpro`
+/// (`CViTekPlatform::new`, `dcentrald-hal/src/platform/cvitek.rs`).
+/// Paths are relative to `DCENT_OS_Antminer/dcentrald/` and existence-checked
+/// by `cv1835_retained_evidence_paths_exist_on_disk`.
+const CV1835_RETAINED_EVIDENCE: &[&str] = &[
+    "dcentrald-hal/src/platform/cvitek.rs",
+    "dcentrald-hal/src/platform/cvitek_cold_boot.rs",
+    "dcentrald-hal/src/platform/cvitek_pinmux.rs",
+];
+
+/// The four am1 S15/T15-class control-board datums that remain UNCONFIRMED
+/// (`scripts/hw-acceptance/skus.conf` rows `am1-s15` / `am1-t15`: "4
+/// control-board datums UNCONFIRMED (capture-first)").
+const AM1_S15_CLASS_UNCONFIRMED_DATUMS: &[&str] = &[
+    "control-board GPIO map",
+    "chain UART transport bases",
+    "I2C topology",
+    "cold-boot sequence",
+];
+
+/// BCB100 datums that no bench probe has captured.
+///
+/// Sourced from the HAL scaffold's own refusals, not from a family guess:
+/// `stm32mp15.rs:31-34` marks `BCB100_CANDIDATE_CHAIN_UARTS` "inferred",
+/// `:195` refuses fan control because the PWM/tach map is not live-verified,
+/// `:201` refuses GPIO control because the reset/plug map is not
+/// live-verified, and the toolbox route notes the exact-pilot posture holds
+/// "until a bench probe captures pic_address / plug_detect_gpio /
+/// enable_gpio" (`dcent-toolbox/src/dcent_toolbox/core/installer.py:2008-2011`).
+const BCB100_UNCONFIRMED_DATUMS: &[&str] = &[
+    "hashboard voltage controller address (pic_address)",
+    "plug-detect GPIO map",
+    "hashboard enable / reset GPIO map",
+    "fan PWM and tachometer map",
+    "chain UART device mapping (ttySTM* candidates are inferred, not captured)",
+    "eMMC/microSD partition map and boot selector",
+];
+
 /// Declarative control-board target description.
 ///
 /// `board_target` should match `/etc/dcentos/board_target` and toolbox package
@@ -307,6 +397,14 @@ pub struct BoardDesc {
     pub public_beta_install: bool,
     /// Whether mining is allowed to auto-start on a fresh image (usually false).
     pub mining_default_enabled: bool,
+    /// Why this target does or does not run (H7 G8). Distinguishes an
+    /// architectural routing refusal (`SpecialisedLifecycle` — e.g. Amlogic,
+    /// which mines via the native serial lane and deliberately refuses generic
+    /// `Platform` construction) from a genuine fail-closed
+    /// `EvidenceRetainedNotImplemented` (e.g. CVitek). Orthogonal to
+    /// `enablement` maturity/authorization facets: classification/reporting
+    /// only, never mutation authority.
+    pub runtime_status: RuntimeStatus,
 }
 
 impl BoardDesc {
@@ -314,6 +412,7 @@ impl BoardDesc {
     pub const fn am1_s9() -> Self {
         Self {
             board_target: "am1-s9",
+            runtime_status: RuntimeStatus::GenericPlatform,
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::FpgaUio,
             work_engine: WorkEngineKind::FpgaWorkFifo,
@@ -326,11 +425,74 @@ impl BoardDesc {
         }
     }
 
+    /// S15 exact composition; management-only, capture-first.
+    ///
+    /// Registering the row does NOT enable the hardware — every enablement
+    /// facet below refuses. What it buys is a *typed* refusal: before this row
+    /// existed, `dcent-accept.sh`'s install-hint policy found zero matching
+    /// entries for `am1-s15` and exited with an untyped "install policy is not
+    /// uniquely declared" error, which reads as a tooling bug rather than a
+    /// deliberate decision. Now it resolves to `install_authorization: denied`
+    /// plus `artifact_kind: none` and reports PERSISTENT INSTALL REFUSED.
+    ///
+    /// `chain_transport: None` is the fail-closed choice while the four
+    /// control-board datums remain UNCONFIRMED (`scripts/hw-acceptance/skus.conf`).
+    /// Declaring a concrete transport here would assert an am1 carrier nobody
+    /// has captured; a target that cannot open a chain cannot open the wrong
+    /// one. Likewise `voltage_controller: RuntimeDiscovered` — the S9 template's
+    /// `Pic16F1704` is a real controller claim and must not be copied across on
+    /// family resemblance.
+    pub const fn am1_s15() -> Self {
+        Self {
+            board_target: "am1-s15",
+            runtime_status: RuntimeStatus::CaptureFirst {
+                unconfirmed: AM1_S15_CLASS_UNCONFIRMED_DATUMS,
+            },
+            family: BoardFamily::Zynq,
+            chain_transport: ChainTransportKind::None,
+            work_engine: WorkEngineKind::ManagementOnly,
+            asic_protocol: AsicProtocolIdentity::Bm1391,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
+            slot_policy: SlotPolicy::ZynqAbFwSetenv,
+            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            public_beta_install: false,
+            mining_default_enabled: false,
+        }
+    }
+
+    /// T15 exact composition; management-only sibling of [`Self::am1_s15`].
+    ///
+    /// Same silicon and the same UNCONFIRMED control-board datums, so it
+    /// carries the identical fail-closed facets. Kept as its own row rather
+    /// than aliased to `am1-s15` so that when first-light capture promotes one
+    /// of the two, the other does not silently inherit the promotion.
+    pub const fn am1_t15() -> Self {
+        Self {
+            board_target: "am1-t15",
+            runtime_status: RuntimeStatus::CaptureFirst {
+                unconfirmed: AM1_S15_CLASS_UNCONFIRMED_DATUMS,
+            },
+            family: BoardFamily::Zynq,
+            chain_transport: ChainTransportKind::None,
+            work_engine: WorkEngineKind::ManagementOnly,
+            asic_protocol: AsicProtocolIdentity::Bm1391,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
+            slot_policy: SlotPolicy::ZynqAbFwSetenv,
+            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            public_beta_install: false,
+            mining_default_enabled: false,
+        }
+    }
+
     /// S19j Pro Xilinx target (am2): public-beta self-update, but no
     /// vendor-source first-install capsule.
     pub const fn am2_s19jpro() -> Self {
         Self {
             board_target: "am2-s19j",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::S19jHybrid,
+                generic_construction: GenericConstruction::ManagementOnly,
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::SerialWork,
@@ -347,6 +509,10 @@ impl BoardDesc {
     pub const fn am3_bb_s19jpro() -> Self {
         Self {
             board_target: "am3-bb-s19jpro",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::Am3BbSerial,
+                generic_construction: GenericConstruction::ManagementOnly,
+            },
             family: BoardFamily::BeagleBone,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -363,6 +529,9 @@ impl BoardDesc {
     pub const fn am3_bb() -> Self {
         Self {
             board_target: "am3-bb",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "generic am3-bb image lacks exact carrier proof; am3-bb-s19jpro is the executable route",
+            },
             family: BoardFamily::BeagleBone,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -379,6 +548,10 @@ impl BoardDesc {
     pub const fn am3_s21() -> Self {
         Self {
             board_target: "am3-s21",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -395,6 +568,10 @@ impl BoardDesc {
     pub const fn am3_s21pro() -> Self {
         Self {
             board_target: "am3-s21pro",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -411,6 +588,10 @@ impl BoardDesc {
     pub const fn am3_s21xp() -> Self {
         Self {
             board_target: "am3-s21xp",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -427,6 +608,10 @@ impl BoardDesc {
     pub const fn am3_t21() -> Self {
         Self {
             board_target: "am3-t21",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -443,6 +628,10 @@ impl BoardDesc {
     pub const fn am3_s19kpro() -> Self {
         Self {
             board_target: "am3-s19k",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -459,6 +648,10 @@ impl BoardDesc {
     pub const fn am3_s19xp() -> Self {
         Self {
             board_target: "am3-s19xp",
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::SerialWork,
@@ -475,6 +668,9 @@ impl BoardDesc {
     pub const fn am3_s19jpro_aml() -> Self {
         Self {
             board_target: "am3-s19jpro-aml",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "dedicated Amlogic S19j Pro controller profile is not implemented",
+            },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -491,6 +687,9 @@ impl BoardDesc {
     pub const fn cv1835_s19jpro() -> Self {
         Self {
             board_target: "cv1835-s19jpro",
+            runtime_status: RuntimeStatus::EvidenceRetainedNotImplemented {
+                evidence: CV1835_RETAINED_EVIDENCE,
+            },
             family: BoardFamily::Cvitek,
             chain_transport: ChainTransportKind::UartTrans,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -503,10 +702,59 @@ impl BoardDesc {
         }
     }
 
+    /// STM32MP15 / Braiins BCB100 S19-family carrier — capture-first, every
+    /// facet denied.
+    ///
+    /// `BoardFamily::Stm32Mp15` has existed since the HAL scaffold landed
+    /// (`board_desc.rs` `BoardFamily::Stm32Mp15`), and the toolbox ships a
+    /// double-gated route for `board_target: "bcb100-s19jpro"`
+    /// (`dcent-toolbox/src/dcent_toolbox/core/installer.py:1987-2012`), yet the
+    /// registry had **no** `stm32mp15` row — so the projected install matrix
+    /// had no `stm32mp15` line at all and the family was invisible rather than
+    /// visibly refused. Registering the row does NOT enable anything: it turns
+    /// a silent absence into a typed, CI-visible refusal.
+    ///
+    /// Every fail-closed choice below is deliberate and must not be "tidied":
+    /// - `chain_transport: None` — the four `/dev/ttySTM*` names in
+    ///   `dcentrald-hal/src/platform/stm32mp15.rs:29-40` are explicitly
+    ///   *inferred*; declaring `Serial` would assert a carrier nobody captured.
+    ///   Same reasoning as [`Self::am1_s15`].
+    /// - `asic_protocol: RuntimeDiscovered` — BCB100 is a *replacement* control
+    ///   board for the whole S19 family, so the hashboard silicon is a property
+    ///   of the donor chassis, not of this carrier. A concrete family here would
+    ///   be a guess, and `main.rs`'s serial route explicitly refuses a
+    ///   `RuntimeDiscovered` descriptor before hardware construction.
+    /// - `voltage_controller: RuntimeDiscovered` — `pic_address` is one of the
+    ///   uncaptured datums; the S19-family `DsPic33Ep` must not be inherited on
+    ///   family resemblance.
+    /// - `enablement: STM32MP15_UNVERIFIED_ENABLEMENT` — `storage_topology`
+    ///   stays `Unknown` because no partition map has been read.
+    pub const fn bcb100_s19jpro() -> Self {
+        Self {
+            board_target: "bcb100-s19jpro",
+            runtime_status: RuntimeStatus::CaptureFirst {
+                unconfirmed: BCB100_UNCONFIRMED_DATUMS,
+            },
+            family: BoardFamily::Stm32Mp15,
+            chain_transport: ChainTransportKind::None,
+            work_engine: WorkEngineKind::ManagementOnly,
+            asic_protocol: AsicProtocolIdentity::RuntimeDiscovered,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
+            slot_policy: SlotPolicy::LabGated,
+            enablement: STM32MP15_UNVERIFIED_ENABLEMENT,
+            public_beta_install: false,
+            mining_default_enabled: false,
+        }
+    }
+
     /// Zynq S19 Pro AM2 — experimental / identity-gated (TD-003/TD-016 class).
     pub const fn am2_s19pro() -> Self {
         Self {
             board_target: "am2-s19pro",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate:
+                    "TD-003/TD-016 identity gate; native BM1398 runtime is refused before admission",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -523,6 +771,9 @@ impl BoardDesc {
     pub const fn am2_s17() -> Self {
         Self {
             board_target: "am2-s17p",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "TD-003 scaffold; S17/BM1397 promotion pending",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -539,10 +790,13 @@ impl BoardDesc {
     pub const fn am2_s17plus() -> Self {
         Self {
             board_target: "am2-s17plus",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "PIC16/BM1397 bench admission pending",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
-            asic_protocol: AsicProtocolIdentity::Bm1396,
+            asic_protocol: AsicProtocolIdentity::Bm1397,
             voltage_controller: VoltageControllerClass::Pic16F1704,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
             enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
@@ -555,6 +809,9 @@ impl BoardDesc {
     pub const fn am2_t17() -> Self {
         Self {
             board_target: "am2-t17",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "PIC16/BM1397 bench admission pending",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -571,10 +828,13 @@ impl BoardDesc {
     pub const fn am2_t17plus() -> Self {
         Self {
             board_target: "am2-t17plus",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "PIC16/BM1397 bench admission pending",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
-            asic_protocol: AsicProtocolIdentity::Bm1396,
+            asic_protocol: AsicProtocolIdentity::Bm1397,
             voltage_controller: VoltageControllerClass::Pic16F1704,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
             enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
@@ -587,6 +847,9 @@ impl BoardDesc {
     pub const fn am2_t19() -> Self {
         Self {
             board_target: "am2-t19",
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "TD-003 scaffold; no artifact producer",
+            },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
             work_engine: WorkEngineKind::ManagementOnly,
@@ -647,6 +910,8 @@ impl BoardDesc {
     pub fn all_registered() -> &'static [BoardDesc] {
         static REGISTRY: &[BoardDesc] = &[
             BoardDesc::am1_s9(),
+            BoardDesc::am1_s15(),
+            BoardDesc::am1_t15(),
             BoardDesc::am2_s19jpro(),
             BoardDesc::am2_s19pro(),
             BoardDesc::am2_s17(),
@@ -664,6 +929,7 @@ impl BoardDesc {
             BoardDesc::am3_s19xp(),
             BoardDesc::am3_s19jpro_aml(),
             BoardDesc::cv1835_s19jpro(),
+            BoardDesc::bcb100_s19jpro(),
         ];
         REGISTRY
     }
@@ -746,6 +1012,158 @@ mod tests {
     fn unknown_target_is_none() {
         assert!(BoardDesc::lookup("am2-not-a-real-sku").is_none());
         assert!(BoardDesc::lookup("").is_none());
+    }
+
+    /// H7 G8 required invariant: `EvidenceRetainedNotImplemented` implies a
+    /// non-empty evidence list AND NOT `public_beta_install`.
+    #[test]
+    fn evidence_retained_not_implemented_requires_evidence_and_forbids_public_beta_install() {
+        let mut seen = Vec::new();
+        for desc in BoardDesc::all_registered() {
+            if let RuntimeStatus::EvidenceRetainedNotImplemented { evidence } = desc.runtime_status
+            {
+                seen.push(desc.board_target);
+                assert!(
+                    !evidence.is_empty(),
+                    "{}: EvidenceRetainedNotImplemented must carry retained evidence",
+                    desc.board_target
+                );
+                for entry in evidence {
+                    assert!(
+                        !entry.trim().is_empty(),
+                        "{}: blank evidence entry",
+                        desc.board_target
+                    );
+                }
+                assert!(
+                    !desc.public_beta_install,
+                    "{}: a not-implemented target must never be a public-beta install target",
+                    desc.board_target
+                );
+                assert!(
+                    !desc.product_install_allowed(),
+                    "{}: a not-implemented target must never allow product install",
+                    desc.board_target
+                );
+            }
+        }
+        assert_eq!(
+            seen,
+            vec!["cv1835-s19jpro"],
+            "exactly cv1835-s19jpro is EvidenceRetainedNotImplemented today; \
+             grow this pin deliberately when classifying another target"
+        );
+    }
+
+    /// The two unconditional constructor refusals are DIFFERENT states and
+    /// must never be flattened: Amlogic ROUTES ELSEWHERE (native serial lane,
+    /// `amlogic/mod.rs` `AmlogicPlatform::new` refusal), CVitek is genuinely
+    /// not implemented with retained evidence (`cvitek.rs` `CViTekPlatform::new`).
+    #[test]
+    fn cvitek_and_amlogic_refusals_are_distinct_status_classes() {
+        let cv = BoardDesc::lookup("cv1835-s19jpro").expect("cv1835-s19jpro");
+        assert!(matches!(
+            cv.runtime_status,
+            RuntimeStatus::EvidenceRetainedNotImplemented { .. }
+        ));
+        assert!(!cv.runtime_status.permits_mining_lane());
+
+        let s21 = BoardDesc::lookup("am3-s21").expect("am3-s21");
+        assert_eq!(
+            s21.runtime_status,
+            RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::AmlogicNativeSerial,
+                generic_construction: GenericConstruction::Refused,
+            }
+        );
+        assert!(s21.runtime_status.permits_mining_lane());
+
+        assert_ne!(cv.runtime_status, s21.runtime_status);
+    }
+
+    /// Every registered status must be structurally well-formed (fail closed
+    /// on absent evidence) and must agree with the row's own work engine:
+    /// a status that names a mining lane must not sit on a management-only
+    /// row, and vice versa.
+    #[test]
+    fn every_registered_runtime_status_is_well_formed_and_agrees_with_work_engine() {
+        for desc in BoardDesc::all_registered() {
+            assert!(
+                desc.runtime_status.is_well_formed(),
+                "{}: runtime_status {:?} is not well-formed",
+                desc.board_target,
+                desc.runtime_status
+            );
+            let names_mining_lane = desc.runtime_status.permits_mining_lane();
+            let management_only = matches!(desc.work_engine, WorkEngineKind::ManagementOnly);
+            assert_eq!(
+                names_mining_lane, !management_only,
+                "{}: runtime_status {:?} disagrees with work_engine {:?}",
+                desc.board_target, desc.runtime_status, desc.work_engine
+            );
+        }
+    }
+
+    /// The Amlogic generic-construction refusal (`AmlogicPlatform::new`) is
+    /// family-wide, so every Amlogic row that names the native serial lane
+    /// must declare `GenericConstruction::Refused` — never `ManagementOnly`.
+    #[test]
+    fn amlogic_lifecycle_rows_declare_refused_generic_construction() {
+        let mut lane_rows = 0;
+        for desc in BoardDesc::all_registered()
+            .iter()
+            .filter(|d| d.family == BoardFamily::Amlogic)
+        {
+            match desc.runtime_status {
+                RuntimeStatus::SpecialisedLifecycle {
+                    lane,
+                    generic_construction,
+                } => {
+                    lane_rows += 1;
+                    assert_eq!(
+                        lane,
+                        LifecycleLane::AmlogicNativeSerial,
+                        "{}",
+                        desc.board_target
+                    );
+                    assert_eq!(
+                        generic_construction,
+                        GenericConstruction::Refused,
+                        "{}: Amlogic generic Platform construction is refused by design",
+                        desc.board_target
+                    );
+                }
+                RuntimeStatus::ManagementOnlyByPolicy { .. } => {}
+                other => panic!(
+                    "{}: unexpected Amlogic runtime_status {other:?}",
+                    desc.board_target
+                ),
+            }
+        }
+        assert_eq!(
+            lane_rows, 6,
+            "six Amlogic rows route via the native serial lane"
+        );
+    }
+
+    /// The retained CV1835 evidence must be real files, not decorative
+    /// strings — fail closed on absent evidence (CONTEXT §1.4).
+    #[test]
+    fn cv1835_retained_evidence_paths_exist_on_disk() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("dcentrald-common lives under DCENT_OS_Antminer/dcentrald");
+        let RuntimeStatus::EvidenceRetainedNotImplemented { evidence } =
+            BoardDesc::cv1835_s19jpro().runtime_status
+        else {
+            panic!("cv1835-s19jpro must be EvidenceRetainedNotImplemented");
+        };
+        for rel in evidence {
+            assert!(
+                workspace_root.join(rel).is_file(),
+                "retained CV1835 evidence path missing on disk: {rel}"
+            );
+        }
     }
 
     #[test]
@@ -950,6 +1368,10 @@ mod tests {
                 "{} acceptance ASIC label/ChipID mismatch",
                 fields[0]
             );
+            // The S17Plus/T17Plus exception that briefly lived here is GONE: the
+            // descriptors were promoted to Bm1397 by operator decision 2026-08-03,
+            // so every row agrees again and no carve-out is needed. Do not
+            // reintroduce one — if this assert fires, a layer has drifted.
             assert_eq!(
                 descriptor.asic_protocol, configured_protocol,
                 "{} acceptance ASIC identity disagrees with BoardDesc {}",
@@ -958,7 +1380,7 @@ mod tests {
             validated_rows += 1;
         }
         assert_eq!(
-            validated_rows, 16,
+            validated_rows, 19,
             "registered acceptance coverage changed; classify new aliases explicitly"
         );
     }
@@ -1103,12 +1525,105 @@ mod tests {
             "am3-bb",
             "am3-s19jpro-aml",
             "cv1835-s19jpro",
+            "bcb100-s19jpro",
         ] {
             let descriptor = BoardDesc::lookup(id).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(
                 descriptor.work_engine,
                 WorkEngineKind::ManagementOnly,
                 "{id} must be rejected before a hardware-owning runtime is constructed"
+            );
+        }
+    }
+
+    /// Mirror of `install_matrix::tests::cv1835_has_no_artifact_or_install_lane`
+    /// for the STM32MP15 / BCB100 family (queue rank 12, H6 G-4).
+    ///
+    /// It asserts against the *projected* install-matrix row rather than the
+    /// descriptor, exactly like its CVitek sibling, because the projection is
+    /// what docs, CI, and the Toolbox actually consume. Before this row
+    /// existed, `install_matrix()` had no `stm32mp15` line at all, so the
+    /// family was silently absent instead of visibly refused.
+    #[test]
+    fn stm32mp15_has_no_artifact_or_install_lane() {
+        let row = crate::install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "bcb100-s19jpro")
+            .expect("STM32MP15 / BCB100 row");
+        assert_eq!(row.family, BoardFamily::Stm32Mp15);
+        // Unknown, NOT borrowed from a sibling family: no partition map read.
+        assert_eq!(row.enablement.storage_topology, StorageTopology::Unknown);
+        assert_eq!(row.enablement.update_mechanism, UpdateMechanism::None);
+        assert_eq!(
+            row.enablement.update_maturity,
+            ImplementationMaturity::NotImplemented
+        );
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert_eq!(
+            row.enablement.recovery_maturity,
+            RecoveryMaturity::NotImplemented
+        );
+        assert_eq!(row.enablement.artifact_kind, ArtifactKind::None);
+        assert_eq!(
+            row.enablement.artifact_maturity,
+            ArtifactMaturity::NotImplemented
+        );
+        assert!(!row.public_beta_install);
+        assert!(!row.persistent_update_allowed);
+        assert!(!row.product_install_allowed);
+        assert!(!row.ab_sysupgrade);
+        assert!(!row.mining_default_enabled);
+    }
+
+    /// The all-`Denied` row must genuinely deny, not merely be labelled denied.
+    ///
+    /// Registering a descriptor is the *only* way a runtime dispatch can get
+    /// past `main.rs`'s "no BoardDesc is registered" refusal, so this pins the
+    /// three independent facets that keep the next gate closed:
+    /// `ManagementOnly` (hard refusal in `runtime_dispatch_admission`),
+    /// `RuntimeDiscovered` ASIC protocol (the serial route refuses it, and
+    /// `admit_asic_protocol` can never mint a proof for it), and a `None`
+    /// transport (no concrete carrier is asserted). Relaxing any one of these
+    /// on evidence other than a bench capture re-opens a lane.
+    #[test]
+    fn bcb100_all_denied_row_cannot_admit_any_mining_lane() {
+        let d = BoardDesc::lookup("bcb100-s19jpro").expect("bcb100-s19jpro");
+        assert_eq!(d.family, BoardFamily::Stm32Mp15);
+        assert_eq!(d.work_engine, WorkEngineKind::ManagementOnly);
+        assert_eq!(d.chain_transport, ChainTransportKind::None);
+        assert_eq!(d.asic_protocol, AsicProtocolIdentity::RuntimeDiscovered);
+        assert_eq!(
+            d.voltage_controller,
+            VoltageControllerClass::RuntimeDiscovered
+        );
+        assert_eq!(d.slot_policy, SlotPolicy::LabGated);
+        assert!(!d.enablement.allows_persistent_update());
+        assert!(!d.enablement.allows_restore());
+        assert!(!d.product_install_allowed());
+        assert!(!BoardDesc::is_public_beta_install_target("bcb100-s19jpro"));
+        assert!(!d.runtime_status.permits_mining_lane());
+        assert!(d.runtime_status.is_well_formed());
+        assert!(matches!(
+            d.runtime_status,
+            RuntimeStatus::CaptureFirst { .. }
+        ));
+
+        // No concrete ASIC family can ever be admitted from this row: the
+        // declared protocol is RuntimeDiscovered, so the declared/required
+        // comparison fails before the runtime-evidence comparison is reached.
+        for required in [
+            AsicProtocolIdentity::Bm1362,
+            AsicProtocolIdentity::Bm1366,
+            AsicProtocolIdentity::Bm1368,
+            AsicProtocolIdentity::Bm1370,
+            AsicProtocolIdentity::Bm1398,
+        ] {
+            assert!(
+                d.admit_asic_protocol(Some(required), required).is_err(),
+                "bcb100-s19jpro must not admit {required:?}"
             );
         }
     }
@@ -1163,6 +1678,23 @@ mod tests {
             ids.len(),
             sorted.len(),
             "duplicate board_target in registry"
+        );
+    }
+
+    #[test]
+    fn asic_protocol_chip_id_roundtrip_for_known_families() {
+        for id in [
+            0x1387u16, 0x1396, 0x1397, 0x1398, 0x1362, 0x1366, 0x1368, 0x1370,
+        ] {
+            let identity = AsicProtocolIdentity::from_chip_id(id).expect("known id");
+            assert_eq!(identity.to_chip_id(), Some(id));
+        }
+        assert_eq!(AsicProtocolIdentity::RuntimeDiscovered.to_chip_id(), None);
+        // Public-beta board rows expose a profile-usable ChipID.
+        assert_eq!(BoardDesc::am1_s9().asic_protocol.to_chip_id(), Some(0x1387));
+        assert_eq!(
+            BoardDesc::am2_s19jpro().asic_protocol.to_chip_id(),
+            Some(0x1362)
         );
     }
 

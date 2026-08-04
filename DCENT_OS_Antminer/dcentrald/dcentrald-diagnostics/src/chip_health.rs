@@ -271,6 +271,12 @@ pub struct ChipHealthChainSnapshot {
     pub voltage_mv: u16,
     pub errors: u32,
     pub status: String,
+    /// Localized, `Inferred`-grade repair recommendations derived from this
+    /// chain's ChipMap by [`crate::repair_advisor::analyze_chipmap`]. Additive
+    /// and backward-compatible: absent from old snapshots, omitted from the wire
+    /// when empty (a healthy board produces none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_recommendations: Vec<crate::repair_advisor::RepairRecommendation>,
     pub chipmap: ChipMap,
 }
 

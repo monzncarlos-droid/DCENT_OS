@@ -181,6 +181,13 @@ The firmware is a multi-crate Rust workspace targeting `xtensa-esp32s3-espidf`:
 | BM1366  | Ultra, Hex Ultra (6× BM1366) | ~500 GH/s / ~3 TH/s | Ultra: driver proven / host-tested. **Hex Ultra: EXPERIMENTAL** — 6×BM1366 (the largest Bitaxe topology) |
 | BM1368  | Supra, Hex Supra (6× BM1368) | ~600 GH/s / ~3.6 TH/s | Driver proven / host-tested; Hex Supra dispatcher/job-id fix live-proven, ~3.7 TH/s rated (live soak pending) |
 | BM1370  | Gamma (1× BM1370), legacy dual-chip lab context (2× BM1370) | ~1.2 TH/s / ~2.7 TH/s | Driver proven / host-tested; Gamma live bring-up confirmed (sustained soak pending); legacy BM1370 lab evidence remains internal context |
+| BM1366  | **Lucky Miner LV06 (1×), LV07 (2×), LV08 (9× BM1366)** | vendor-rated 40 W / 40 W / 140 W | **EXPERIMENTAL — no live hardware.** `LiveProof::None`: no Lucky unit exists on any bench, so nothing here is live-proven, soaked or field-validated. Registration + host tests only |
+
+Lucky Miner LVxx are third-party ESP32-S3 (N16R8, 16 MB) BitAxe-class boards
+reusing the stock BitAxe pinout. LV08 is a **9-chip** single-UART daisy chain —
+a topology beyond the 6-chip Hex boards — on **one** voltage domain with chips
+in parallel at ~1.2 V. Support is registration-level and experimental: images
+build and pass host tests, and nothing more has been demonstrated.
 
 The public Toolbox-installable Bitaxe-class variants are Max, Ultra, Supra,
 Gamma, Hex Ultra, and Hex Supra. They run from the same Rust workspace with a
@@ -327,11 +334,27 @@ cargo build --release -p dcentaxe \
 | Bitaxe Hex Ultra | 6× BM1366 | `bitaxe-hex-ultra` | `dcentaxe-bitaxe-hex-ultra-<version>-update.bin` | `dcentaxe-bitaxe-hex-ultra-<version>-factory.bin` | **EXPERIMENTAL** — 6×BM1366 (the largest Bitaxe topology) |
 | Bitaxe Hex Supra | 6× BM1368 | `bitaxe-hex-supra` | `dcentaxe-bitaxe-hex-supra-<version>-update.bin` | `dcentaxe-bitaxe-hex-supra-<version>-factory.bin` | Hex dispatcher path host-tested, including BM1368 job-id fix; ~3.7 TH/s rated (live soak pending) |
 
-Gamma Duo, legacy BM1370 dual-chip lab targets, Touch-class, Nerd, and DCENT_axe first-article targets remain
-internal/lab build targets. They can still be built deliberately with a manual
-feature/package invocation, or included in the matrix with
+Gamma Duo, legacy BM1370 dual-chip lab targets, Touch-class, Nerd, DCENT_axe first-article,
+Hammer (`hammer-bc0x` / `hammer-dc0x`) and Lucky Miner (`lucky-lv06` / `lucky-lv07` /
+`lucky-lv08`) targets remain internal/lab build targets. They can still be built
+deliberately with a manual feature/package invocation, or included in the matrix with
 `INCLUDE_INTERNAL_TARGETS=1` / `-IncludeInternalTargets`, but the current public
 Toolbox routes intentionally accept only the six rows above.
+
+Hammer and Lucky are **16 MB (N16R8)** boards and need the shared 16 MB flash
+geometry — the build matrix selects it automatically:
+
+```bash
+ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.16mb" \
+  cargo build --release -p dcentaxe --no-default-features --features lucky-lv08
+```
+
+Packaging those targets by hand must pass the matching table
+(`PARTITIONS_CSV=partitions-16mb.csv` / `-PartitionsCsv`), or the manifest's
+`ota.slotSize` describes the 8 MB layout instead of the board's real one.
+Return-to-stock note for Lucky: the LVXX stock layout keeps a ~4 MB `factory`
+partition that this pure-OTA scheme does not reproduce, so going back to vendor
+firmware is a full serial re-flash, not an OTA.
 
 ### Flash
 

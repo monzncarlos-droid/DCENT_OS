@@ -12,6 +12,22 @@
 //!   where `LEN = payload_len + 3` and
 //!   `CKSUM = (LEN + CMD + Σpayload) & 0xFF`. Preamble bytes are NOT
 //!   in the sum.
+//!
+//!   **UB-09 checksum-model correction (2026-08-02, DESK EVIDENCE from ePIC's
+//!   GPL, unstripped `pic_driver.ko`):** the device actually emits/validates
+//!   the checksum as a **16-bit big-endian pair** `[SUM_HI, SUM_LO]` with
+//!   `sum = LEN + CMD + Σpayload` and `LEN = payload_len + 4`. The two models
+//!   are byte-identical while `sum <= 0xFF` (the legacy trailing `0x00`
+//!   "payload" byte is really `SUM_HI`), which is why every short held
+//!   capture always validated and the truncation stayed invisible.
+//!   [`decode_framed_sum`] accepts BOTH: the legacy single-byte reading first
+//!   (payload shapes of all pre-fix frames are preserved for live-proven
+//!   consumers), then the BE16 reading for frames with `sum > 0xFF` that the
+//!   legacy model wrongly rejected. [`DspicFrame::encode_framed_sum_be16`]
+//!   emits the BE16 form; the legacy [`DspicFrame::encode_framed_sum`] is
+//!   unchanged (its TX bytes are live-proven and pinned downstream). This is
+//!   protocol/timing knowledge imported from a GPL driver — NO ePIC register
+//!   addresses are involved, and none of this is live-verified on our units.
 //! - **FRAMED-SHORT** — dsPIC FW=0x86 special-case for GET_VERSION (and
 //!   possibly SET_VOLTAGE). 3 bytes, same as BARE.
 //!
@@ -56,6 +72,13 @@ pub enum DspicOpcode {
     GetMac = 0x21,
     RdTempOffset = 0x23,
     Measure = 0x3A,
+    /// ⚠️ UB-11 (2026-08-02): 0x3B is the LM75 temperature passthrough WRITE
+    /// half (paired with 0x3C READ), NOT a voltage read. Our `a lab unit` captures
+    /// and ePIC's GPL `pic_driver.ko` (desk evidence) agree. The historical
+    /// "GetV2"/get-voltage reading — and the planned " 0x3B/0x3A
+    /// rail-up proxy" that rested on it — is SUPERSEDED; rail readback is
+    /// `Measure` (0x3A) / `GetVoltage` (0x18). Enum name kept for serde/API
+    /// stability; see `dcentrald-asic::dspic::CMD_LM75_PASSTHROUGH_WRITE`.
     GetV2 = 0x3B,
     // --- APW PSU runtime ---
     PsuWatchdog = 0x81, // payload 0x00 = disarm, 0x01 = arm
@@ -138,6 +161,42 @@ impl DspicFrame {
         out
     }
 
+    /// Encode this frame in the FRAMED-SUM16 wire form with the 16-bit
+    /// big-endian checksum pair:
+    /// `[0x55, 0xAA, LEN, CMD, payload..., SUM_HI, SUM_LO]` where
+    /// `LEN = payload_len + 4` (LEN + CMD + payload + 2 checksum bytes) and
+    /// `sum = LEN + CMD + Σpayload` as a `u16`.
+    ///
+    /// DESK EVIDENCE (UB-09, 2026-08-01/02): ePIC's GPL, unstripped
+    /// `pic_driver.ko` emits the checksum as this BE16 pair; four independent
+    /// agents regenerated our held captures `55 AA 04 07 00 0B` (RESET, empty
+    /// payload) and `55 AA 05 15 01 00 1B` (ENABLE, payload `[0x01]`)
+    /// byte-for-byte from that rule. While `sum <= 0xFF` this encoder is
+    /// byte-identical to [`encode_framed_sum`](Self::encode_framed_sum) called
+    /// with `payload + [0x00]` — the legacy trailing `0x00` "payload" byte is
+    /// really `SUM_HI`. Only frames with `sum > 0xFF` differ, which is why the
+    /// truncated single-byte model survived every short held capture.
+    ///
+    /// [`encode_framed_sum`](Self::encode_framed_sum) is deliberately kept
+    /// unchanged (live-proven TX bytes across the fleet are pinned by
+    /// downstream tests, e.g. `watchdog_policy`); use THIS encoder for any
+    /// frame whose `LEN + CMD + Σpayload` can exceed `0xFF`.
+    pub fn encode_framed_sum_be16(&self) -> Vec<u8> {
+        // LEN counts itself + CMD + payload + the two checksum bytes.
+        let len = (1 + 1 + self.payload.len() + 2) as u8;
+        let mut sum: u16 = (len as u16) + (self.opcode.as_u8() as u16);
+        for b in &self.payload {
+            sum = sum.wrapping_add(*b as u16);
+        }
+        let mut out = Vec::with_capacity(2 + len as usize);
+        out.extend_from_slice(&PREAMBLE);
+        out.push(len);
+        out.push(self.opcode.as_u8());
+        out.extend_from_slice(&self.payload);
+        out.extend_from_slice(&sum.to_be_bytes());
+        out
+    }
+
     /// Encode this frame in BARE wire form — `[0x55, 0xAA, CMD,
     /// payload...]`. Used by PIC16F1704 on S9/L3+ over FPGA AXI IIC.
     /// No LEN, no CKSUM.
@@ -191,22 +250,59 @@ pub fn decode_framed_sum(buf: &[u8]) -> Result<DspicFrame, DspicFrameError> {
     }
     let cmd = buf[3];
     let opcode = opcode_from_u8(cmd).ok_or(DspicFrameError::UnknownOpcode { byte: cmd })?;
-    let payload = &buf[4..buf.len() - 1];
-    let cksum = buf[buf.len() - 1];
-    let mut sum: u16 = (len as u16) + (cmd as u16);
-    for b in payload {
-        sum = sum.wrapping_add(*b as u16);
+
+    // Legacy single-byte checksum interpretation FIRST (behaviour-preserving):
+    // every frame that validated before the UB-09 fix still decodes with an
+    // identical payload shape. For `sum <= 0xFF` BE16 frames this interprets
+    // the device's SUM_HI (0x00) as a trailing payload byte, which is exactly
+    // what every pre-fix consumer (e.g. the live-proven am3-bb reply path)
+    // already expects.
+    let legacy_payload = &buf[4..buf.len() - 1];
+    let legacy_cksum = buf[buf.len() - 1];
+    let mut legacy_sum: u16 = (len as u16) + (cmd as u16);
+    for b in legacy_payload {
+        legacy_sum = legacy_sum.wrapping_add(*b as u16);
     }
-    let computed = (sum & 0xFF) as u8;
-    if computed != cksum {
-        return Err(DspicFrameError::CksumMismatch {
-            computed,
-            found: cksum,
+    let legacy_computed = (legacy_sum & 0xFF) as u8;
+    if legacy_computed == legacy_cksum {
+        return Ok(DspicFrame {
+            opcode,
+            payload: legacy_payload.to_vec(),
         });
     }
-    Ok(DspicFrame {
-        opcode,
-        payload: payload.to_vec(),
+
+    // UB-09 fix (DESK EVIDENCE, ePIC pic_driver.ko GPL/unstripped, 2026-08-01):
+    // the real device checksum is a 16-bit BIG-ENDIAN pair [SUM_HI, SUM_LO]
+    // with `sum = LEN + CMD + Σpayload`. The single-byte model above is
+    // byte-identical while `sum <= 0xFF` (SUM_HI = 0x00 masquerades as a
+    // payload byte), so every short held capture always validated and the
+    // truncation stayed invisible. Any frame with `sum > 0xFF` fails the
+    // legacy check (the accumulator picks up SUM_HI and truncates) and is
+    // only decodable here. A frame can never validate under the legacy model
+    // AND fail here with a different meaning: for `sum > 0xFF` the legacy
+    // computed value is `(sum + SUM_HI) & 0xFF != SUM_LO` whenever
+    // `SUM_HI != 0`, so the two acceptance sets only overlap where they are
+    // byte-identical.
+    if (len as usize) >= 4 {
+        let be16_payload = &buf[4..buf.len() - 2];
+        let found16 = u16::from_be_bytes([buf[buf.len() - 2], buf[buf.len() - 1]]);
+        let mut sum16: u16 = (len as u16) + (cmd as u16);
+        for b in be16_payload {
+            sum16 = sum16.wrapping_add(*b as u16);
+        }
+        if sum16 == found16 {
+            return Ok(DspicFrame {
+                opcode,
+                payload: be16_payload.to_vec(),
+            });
+        }
+    }
+
+    // Both models reject: report the legacy computation (pre-fix error shape,
+    // pinned by existing tests and downstream error-string consumers).
+    Err(DspicFrameError::CksumMismatch {
+        computed: legacy_computed,
+        found: legacy_cksum,
     })
 }
 
@@ -678,6 +774,93 @@ mod tests {
                 opcode
             );
         }
+    }
+
+    #[test]
+    fn ub09_held_capture_frames_still_validate() {
+        // UB-09 regression proof: both held wire captures must keep validating
+        // after the BE16 checksum fix, with their pre-fix payload shapes
+        // preserved (legacy single-byte interpretation is tried first).
+        let reset = decode_framed_sum(&[0x55, 0xAA, 0x04, 0x07, 0x00, 0x0B]).unwrap();
+        assert_eq!(reset.opcode, DspicOpcode::Reset);
+        assert_eq!(reset.payload, [0x00]);
+
+        let enable = decode_framed_sum(&[0x55, 0xAA, 0x05, 0x15, 0x01, 0x00, 0x1B]).unwrap();
+        assert_eq!(enable.opcode, DspicOpcode::Enable);
+        assert_eq!(enable.payload, [0x01, 0x00]);
+    }
+
+    #[test]
+    fn ub09_be16_checksum_frame_with_sum_over_0xff_decodes() {
+        // UB-09 (DESK EVIDENCE, ePIC pic_driver.ko GPL/unstripped, 2026-08-01):
+        // the device checksum is a 16-bit big-endian pair [sum_hi, sum_lo],
+        // sum = LEN + CMD + Σpayload. Both models are byte-identical while
+        // sum <= 0xFF; this frame has sum = 0x06 + 0x10 + 0xFF + 0xFF = 0x0214.
+        //
+        // BEFORE the fix this returned
+        // CksumMismatch { computed: 0x16, found: 0x14 } — verified by running
+        // this exact test against the pre-fix decoder (it treated sum_hi=0x02
+        // as a payload byte and truncated the accumulator to one byte).
+        let wire = [0x55, 0xAA, 0x06, 0x10, 0xFF, 0xFF, 0x02, 0x14];
+        let f = decode_framed_sum(&wire).expect("BE16 high-sum frame must decode");
+        assert_eq!(f.opcode, DspicOpcode::SetVoltage);
+        assert_eq!(f.payload, [0xFF, 0xFF]);
+
+        // Encoder round-trip for the BE16 wire form.
+        let enc =
+            DspicFrame::new(DspicOpcode::SetVoltage, vec![0xFF, 0xFF]).encode_framed_sum_be16();
+        assert_eq!(enc, wire);
+    }
+
+    #[test]
+    fn ub09_be16_encoder_is_byte_identical_to_legacy_for_low_sums() {
+        // While sum <= 0xFF the two models emit identical bytes: the legacy
+        // encoder's trailing 0x00 "payload" byte is the BE16 model's sum_hi.
+        // This is exactly why every short held capture always validated and
+        // the defect stayed invisible.
+        let be16 = DspicFrame::new(DspicOpcode::Reset, vec![]).encode_framed_sum_be16();
+        let legacy = DspicFrame::new(DspicOpcode::Reset, vec![0x00]).encode_framed_sum();
+        assert_eq!(be16, legacy);
+        assert_eq!(be16, [0x55, 0xAA, 0x04, 0x07, 0x00, 0x0B]);
+
+        let be16 = DspicFrame::new(DspicOpcode::Enable, vec![0x01]).encode_framed_sum_be16();
+        let legacy = DspicFrame::new(DspicOpcode::Enable, vec![0x01, 0x00]).encode_framed_sum();
+        assert_eq!(be16, legacy);
+        assert_eq!(be16, [0x55, 0xAA, 0x05, 0x15, 0x01, 0x00, 0x1B]);
+    }
+
+    #[test]
+    fn ub09_corrupted_be16_long_frame_still_fails() {
+        // sum_lo off by one: neither the legacy nor the BE16 model validates.
+        let wire = [0x55, 0xAA, 0x06, 0x10, 0xFF, 0xFF, 0x02, 0x15];
+        assert!(matches!(
+            decode_framed_sum(&wire),
+            Err(DspicFrameError::CksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn ub09_reply_body_decoder_accepts_be16_long_replies() {
+        let r = decode_framed_sum_reply_body(&[0x06, 0x10, 0xFF, 0xFF, 0x02, 0x14]).unwrap();
+        assert_eq!(r.opcode, DspicOpcode::SetVoltage);
+        assert_eq!(r.payload, [0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn ub10_dot25_bosminer_get_version_reply_checksums_with_length_prefix() {
+        // UB-10 desk anchor: the `a lab unit` bosminer framed GET_VERSION reply logged
+        // as `[17 89 00 A5]` (WAVE46-EEPROM-BUS-WARMUP.md) only checksums when a
+        // leading LEN byte 0x05 participates in the sum:
+        //   0x05 + 0x17 + 0x89 + 0x00 = 0xA5.
+        // i.e. the full wire reply is `[05 17 89 00 A5]` — length-prefixed
+        // exactly as ePIC's pic_driver.ko validates (reply[0]==len,
+        // reply[1]==cmd), and bosminer's per-byte reader had already consumed
+        // the LEN byte before the logged remainder. Under the BE16 model the
+        // trailing [00 A5] is the checksum pair and the payload is [0x89].
+        let reply = decode_framed_sum_reply_body(&[0x05, 0x17, 0x89, 0x00, 0xA5]).unwrap();
+        assert_eq!(reply.opcode, DspicOpcode::GetVersion);
+        // Legacy-first interpretation keeps the historical payload shape.
+        assert_eq!(reply.payload, [0x89, 0x00]);
     }
 
     #[test]

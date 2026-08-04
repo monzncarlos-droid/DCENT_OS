@@ -519,6 +519,8 @@ fn parse_ipv4_address(stdout: &str) -> Option<ParsedInterfaceAddress> {
             if field == "inet" {
                 let cidr = fields.next()?;
                 let (address, prefix) = cidr.split_once('/')?;
+                // `?` on the filtered parse: an absent or >32 prefix is exactly the
+                // `None` this function already returned by hand.
                 prefix.parse::<u8>().ok().filter(|prefix| *prefix <= 32)?;
                 return address.parse::<std::net::Ipv4Addr>().ok().map(|address| {
                     ParsedInterfaceAddress {

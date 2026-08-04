@@ -10,6 +10,11 @@ import { getLiveWallWatts } from '../utils/power';
 
 const POLL_INTERVAL_MS = 5000;
 const STATS_POLL_INTERVAL_MS = 10000; // Stats less frequently than status
+// If the WS transport reads "live" but no telemetry has been *stored* for this long,
+// the stats publisher has wedged while log / mining_sync frames keep markWsFrame()
+// fresh — resume the REST fallback instead of freezing the dashboard while it shows
+// LIVE. Comfortably above the stats push cadence so a healthy WS never trips it.
+const STALE_TELEMETRY_MS = 15000;
 
 export function useMinerData() {
   // P3-6: subscribe only to the (stable) action functions, not the whole store.
@@ -39,9 +44,17 @@ export function useMinerData() {
         // not present in the WS message (uptime_s, firmware_version, mode).
         const prev = useMinerStore.getState().status;
         const liveChains = Array.isArray(msg.chains) ? msg.chains : (prev?.chains ?? []);
-        const fans = msg.fans.per_fan
-          ? msg.fans
-          : { ...msg.fans, per_fan: prev?.fans.per_fan };
+        // The daemon is untrusted: a partial / version-skewed stats frame can omit
+        // `fans` (and a previous status can lack `fans`). Guard both accesses like
+        // `chains` above — an unguarded `msg.fans.per_fan` throws inside this WS
+        // listener AFTER markWsFrame() (line ~32) has already run, which freezes all
+        // telemetry while the transport chip still reads LIVE and the REST fallback
+        // stays suppressed (it early-returns while transport === 'ws-live').
+        const fans = msg.fans
+          ? (msg.fans.per_fan
+              ? msg.fans
+              : { ...msg.fans, per_fan: prev?.fans?.per_fan })
+          : (prev?.fans ?? { pwm: 0, rpm: 0 });
         const baseStatus: StatusResponse = prev ?? {
           hashrate_ghs: msg.hashrate_ghs,
           hashrate_5s_ghs: msg.hashrate_5s_ghs,
@@ -62,7 +75,7 @@ export function useMinerData() {
           rejected: msg.rejected,
           chains: liveChains,
           fans,
-          pool: msg.pool,
+          pool: msg.pool ?? prev?.pool,
         });
 
         const prevStats = useMinerStore.getState().stats;
@@ -134,8 +147,13 @@ export function useMinerData() {
         const isFirstPush = lastHistoryPush.current === 0;
         if (isFirstPush || now - lastHistoryPush.current > 10000) {
           lastHistoryPush.current = now;
-          const avgTemp = liveChains.length > 0
-            ? liveChains.reduce((s, c) => s + c.temp_c, 0) / liveChains.length
+          // temp_c === 0 is the "board unpowered / asleep" sentinel (see ChainState
+          // docs), not a real 0 °C reading. Averaging it in under-reports the true
+          // temperature (e.g. [61, 63, 0] -> 41 instead of ~62). Average only boards
+          // that are actually reporting a temperature.
+          const reportingChains = liveChains.filter((c) => (c.temp_c ?? 0) > 0);
+          const avgTemp = reportingChains.length > 0
+            ? reportingChains.reduce((s, c) => s + c.temp_c, 0) / reportingChains.length
             : 0;
           const statsState = useMinerStore.getState().stats;
           const wsPower = getLiveWallWatts({
@@ -201,7 +219,11 @@ export function useMinerData() {
           sats_today: msg.sats_today,
           night_mode_active: msg.night_mode_active,
           night_mode_starts_in_s: msg.night_mode_starts_in_s,
-          hashrate_ghs: 0,
+          // A WS heater frame doesn't carry hashrate; hardcoding 0 clobbered the
+          // REST-sourced value (GET /api/home/status), making the heater read
+          // "0 GH/s / not earning" whenever `status` was momentarily null. Preserve
+          // the prior value (line ~196 already does this for `fans`).
+          hashrate_ghs: previousHeaterStatus?.hashrate_ghs ?? 0,
         });
       }
 
@@ -240,7 +262,13 @@ export function useMinerData() {
   // REST polling fallback for status
   useEffect(() => {
     const poll = async () => {
-      if (useMinerStore.getState().transport === 'ws-live') return;
+      const ts = useMinerStore.getState();
+      // Only suppress the REST fallback when the WS is live AND telemetry is actually
+      // fresh. A wedged stats publisher (frames still arriving as logs) would otherwise
+      // keep transport === 'ws-live' forever and freeze the dashboard.
+      const telemetryStale =
+        ts.lastUpdate === 0 || Date.now() - ts.lastUpdate > STALE_TELEMETRY_MS;
+      if (ts.transport === 'ws-live' && !telemetryStale) return;
       store.setWsConnected(false);
       try {
         const status = await api.getStatus();
@@ -263,8 +291,11 @@ export function useMinerData() {
         const isFirstPush = lastHistoryPush.current === 0;
         if (isFirstPush || now - lastHistoryPush.current > 10000) {
           lastHistoryPush.current = now;
-          const avgTemp = chains.length > 0
-            ? chains.reduce((s, c) => s + c.temp_c, 0) / chains.length
+          // Exclude the temp_c === 0 "unpowered / asleep" sentinel (as in the WS path)
+          // so recorded history isn't dragged down by an unpowered board.
+          const reportingChains = chains.filter((c) => (c.temp_c ?? 0) > 0);
+          const avgTemp = reportingChains.length > 0
+            ? reportingChains.reduce((s, c) => s + c.temp_c, 0) / reportingChains.length
             : 0;
           const statsState = useMinerStore.getState().stats;
           const power = getLiveWallWatts(statsState?.power);

@@ -540,6 +540,7 @@ dependencies = [
 name = "dcentaxe-hal"
 version = "0.3.0"
 dependencies = [
+ "dcentaxe-asic",
  "esp-idf-hal",
  "esp-idf-svc",
  "log",
@@ -575,6 +576,7 @@ dependencies = [
 name = "dcentaxe-stratum"
 version = "0.3.0"
 dependencies = [
+ "dcentaxe-asic",
  "hex",
  "libc",
  "log",

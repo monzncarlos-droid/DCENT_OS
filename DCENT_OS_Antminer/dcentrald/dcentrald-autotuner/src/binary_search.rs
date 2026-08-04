@@ -32,10 +32,9 @@ fn safe_pll_search_bounds(
     max_freq_mhz: u16,
     pll_table: &'static [u16],
 ) -> (usize, usize) {
-    debug_assert!(
-        !pll_table.is_empty(),
-        "ASIC PLL tables must contain at least one lockable frequency"
-    );
+    // Empty table is a fail-closed P1-4 path (unknown chip), not a programmer
+    // error — never debug_assert-panic here; callers use try_new_for_chip for
+    // hard refuse and empty-safe getters for legacy new_for_chip.
     if pll_table.is_empty() {
         return (0, 0);
     }
@@ -83,6 +82,23 @@ pub struct ChipSearchState {
 
 impl ChipSearchState {
     fn new(chip_index: u8, min_freq: u16, max_freq: u16, pll_table: &'static [u16]) -> Self {
+        // Empty PLL table (unknown chip / P1-4 refuse path): mark done immediately
+        // so test_freq / advance never index out of bounds.
+        if pll_table.is_empty() {
+            return Self {
+                chip_index,
+                lo: 0,
+                hi: 0,
+                mid: 0,
+                best_stable_idx: None,
+                done: true,
+                total_nonces: 0,
+                last_error_rate: 0.0,
+                observations: Vec::new(),
+                pll_table,
+            };
+        }
+
         let (lo, hi) = safe_pll_search_bounds(min_freq, max_freq, pll_table);
         let mid = (lo + hi) / 2;
 
@@ -100,13 +116,17 @@ impl ChipSearchState {
         }
     }
 
-    /// Get the current test frequency.
+    /// Get the current test frequency (0 if PLL table is empty — never panics).
     pub fn test_freq(&self) -> u16 {
-        self.pll_table[self.mid]
+        self.pll_table.get(self.mid).copied().unwrap_or(0)
     }
 
     /// Advance the binary search based on whether the current frequency was stable.
     fn advance(&mut self, stable: bool) {
+        if self.pll_table.is_empty() {
+            self.done = true;
+            return;
+        }
         if stable {
             // This frequency is stable — record it and try higher
             self.best_stable_idx = Some(self.mid);
@@ -136,7 +156,7 @@ impl ChipSearchState {
     fn result(&self, nominal_mhz: u16) -> ChipProfile {
         let max_stable = self
             .best_stable_idx
-            .map(|idx| self.pll_table[idx])
+            .and_then(|idx| self.pll_table.get(idx).copied())
             .unwrap_or(0);
 
         let grade = grade_chip(max_stable, nominal_mhz);
@@ -188,6 +208,10 @@ impl BinarySearchTuner {
     }
 
     /// Create a tuner for a specific chip type with its PLL frequency table.
+    ///
+    /// Unknown chip IDs resolve to an empty PLL table (fail-closed — no silent
+    /// BM1387 fallback). Callers should prefer [`Self::try_new_for_chip`] when
+    /// they need to refuse tuning rather than search an empty space.
     pub fn new_for_chip(config: AutoTunerConfig, nominal_mhz: u16, chip_id: u16) -> Self {
         let pll_table = dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(chip_id);
         Self {
@@ -196,6 +220,31 @@ impl BinarySearchTuner {
             pll_table,
             chip_id,
         }
+    }
+
+    /// Construct a tuner only when a non-empty PLL table is registered for
+    /// `chip_id`. Returns `None` for unknown silicon (P1-4 refuse path).
+    pub fn try_new_for_chip(
+        config: AutoTunerConfig,
+        nominal_mhz: u16,
+        chip_id: u16,
+    ) -> Option<Self> {
+        let pll_table =
+            dcentrald_asic::drivers::MinerProfile::try_pll_frequencies_for_chip(chip_id)?;
+        if pll_table.is_empty() {
+            return None;
+        }
+        Some(Self {
+            config,
+            nominal_mhz,
+            pll_table,
+            chip_id,
+        })
+    }
+
+    /// True when this tuner has a non-empty discrete PLL search table.
+    pub fn has_pll_table(&self) -> bool {
+        !self.pll_table.is_empty()
     }
 
     /// Compute frequency-dependent minimum samples for a chip.
@@ -268,7 +317,7 @@ impl BinarySearchTuner {
                 if s.done {
                     let freq = s
                         .best_stable_idx
-                        .map(|idx| self.pll_table[idx])
+                        .and_then(|idx| self.pll_table.get(idx).copied())
                         .unwrap_or_else(|| self.safe_search_floor_mhz());
                     (s.chip_index, freq)
                 } else {
@@ -585,15 +634,39 @@ enum VerificationResult {
 impl VerificationState {
     /// Create a new verification state from finalized chip profiles.
     ///
+    /// **G4 / P1-4 fail-closed:** this legacy constructor no longer silently
+    /// loads the BM1387 PLL table. It uses an **empty** table so verification
+    /// step-down is a no-op until the caller supplies a real table via
+    /// [`Self::new_with_pll`] or [`Self::try_new_for_chip`].
+    ///
+    /// Production characterize/re-char in `tuner.rs` does **not** use this
+    /// type for step-down (it uses `step_down_freq` + `chain_chip_id`); this
+    /// API remains for host tooling and unit tests that opt into a table.
+    ///
     /// `verification_window_s`: how long to verify (default 30s).
     /// `error_threshold`: maximum acceptable error rate as a fraction (default 0.005 = 0.5%).
     pub fn new(profiles: &[ChipProfile], verification_window_s: f64, error_threshold: f64) -> Self {
-        Self::new_with_pll(
+        Self::new_with_pll(profiles, verification_window_s, error_threshold, &[])
+    }
+
+    /// Construct verification with the registered discrete PLL table for
+    /// `chip_id`, or `None` when the chip has no table (refuse silent BM1387).
+    pub fn try_new_for_chip(
+        profiles: &[ChipProfile],
+        verification_window_s: f64,
+        error_threshold: f64,
+        chip_id: u16,
+    ) -> Option<Self> {
+        let pll = dcentrald_asic::drivers::MinerProfile::try_pll_frequencies_for_chip(chip_id)?;
+        if pll.is_empty() {
+            return None;
+        }
+        Some(Self::new_with_pll(
             profiles,
             verification_window_s,
             error_threshold,
-            dcentrald_asic::drivers::MinerProfile::pll_frequencies_for_chip(0x1387),
-        )
+            pll,
+        ))
     }
 
     /// Create with a chip-specific PLL table for step-down calculations.
@@ -698,7 +771,7 @@ impl VerificationState {
                 let idx = chip.chip_index as usize;
                 if idx < profiles.len() {
                     let old_freq = profiles[idx].operating_mhz;
-                    // Step down one PLL level
+                    // Strict previous PLL entry (empty table → stay put; P1-4).
                     let new_freq = self
                         .pll_table
                         .iter()
@@ -722,6 +795,11 @@ impl VerificationState {
                 }
             }
         }
+    }
+
+    /// True when a non-empty discrete PLL step-down table is loaded.
+    pub fn has_pll_table(&self) -> bool {
+        !self.pll_table.is_empty()
     }
 
     /// Check if all chips have completed verification.
@@ -1106,7 +1184,9 @@ mod tests {
             vf_curve: None,
         }];
 
-        let mut verify = VerificationState::new(&profiles, 5.0, 0.005);
+        // Explicit chip table — no silent BM1387 via VerificationState::new.
+        let mut verify =
+            VerificationState::try_new_for_chip(&profiles, 5.0, 0.005, 0x1387).expect("BM1387");
 
         // Send 2 snapshots totaling 6s of data with 0 errors
         let snap = crate::chip_stats::ChipStatsSnapshot {
@@ -1144,7 +1224,8 @@ mod tests {
             vf_curve: None,
         }];
 
-        let mut verify = VerificationState::new(&profiles, 5.0, 0.005);
+        let mut verify =
+            VerificationState::try_new_for_chip(&profiles, 5.0, 0.005, 0x1387).expect("BM1387");
 
         // Send snapshot with >0.5% error rate
         let snap = crate::chip_stats::ChipStatsSnapshot {
@@ -1172,6 +1253,217 @@ mod tests {
             profiles[0].operating_mhz < 650,
             "Should have stepped down from 650, got {}",
             profiles[0].operating_mhz
+        );
+    }
+
+    /// G4: VerificationState::new must not invent BM1387 PLL; empty table is fail-closed.
+    #[test]
+    fn verification_new_is_empty_fail_closed_not_bm1387() {
+        let profiles = vec![ChipProfile {
+            chip_index: 0,
+            max_stable_mhz: 700,
+            operating_mhz: 650,
+            grade: ChipGrade::A,
+            error_rate: 0.0,
+            nonces_counted: 100,
+            thermal_max_stable_mhz: None,
+            vf_curve: None,
+        }];
+        let mut verify = VerificationState::new(&profiles, 5.0, 0.005);
+        assert!(
+            !verify.has_pll_table(),
+            "legacy new() must not load BM1387 PLL"
+        );
+
+        let snap = crate::chip_stats::ChipStatsSnapshot {
+            chain_id: 6,
+            measurement_epoch: 0,
+            chip_nonces: vec![100],
+            chip_errors: vec![5],
+            window_duration_s: 6.0,
+            timestamp: std::time::Instant::now(),
+            board_temp_c: None,
+            chip_hw_errors: None,
+            chip_timeouts: None,
+            chip_duplicates: None,
+            current_difficulty: 256,
+            chip_temps_c: None,
+            psu_power_w: None,
+        };
+        assert!(verify.process_snapshot(&snap));
+        assert_eq!(verify.step_down_count(), 1);
+        let mut profiles_mut = profiles.clone();
+        verify.apply_results(&mut profiles_mut);
+        // Empty table: step-down is a no-op (stay at operating_mhz).
+        assert_eq!(profiles_mut[0].operating_mhz, 650);
+
+        assert!(
+            VerificationState::try_new_for_chip(&profiles, 5.0, 0.005, 0xFFFF).is_none(),
+            "unknown chip must refuse verification PLL"
+        );
+        assert!(
+            VerificationState::try_new_for_chip(&profiles, 5.0, 0.005, 0x1362)
+                .is_some_and(|v| v.has_pll_table()),
+            "BM1362 must still construct with its own table"
+        );
+    }
+
+    /// P1-4: refuse constructing a binary-search tuner for unknown silicon.
+    #[test]
+    fn try_new_for_chip_refuses_unknown_pll() {
+        let config = AutoTunerConfig::default();
+        assert!(
+            BinarySearchTuner::try_new_for_chip(config.clone(), 650, 0xFFFF).is_none(),
+            "unknown chip must not get a tuner"
+        );
+        assert!(
+            BinarySearchTuner::try_new_for_chip(config.clone(), 650, 0x1390).is_none(),
+            "RE-pending sentinel must not get a tuner"
+        );
+        let known = BinarySearchTuner::try_new_for_chip(config, 650, 0x1387)
+            .expect("BM1387 must still construct");
+        assert!(known.has_pll_table());
+        // Compat path: empty table, not BM1387 alias.
+        let empty = BinarySearchTuner::new_for_chip(AutoTunerConfig::default(), 650, 0xABCD);
+        assert!(!empty.has_pll_table());
+        assert!(empty.pll_table.is_empty());
+    }
+
+    /// P1-4 regression: empty PLL path must never panic on init/test_freq/current_frequencies.
+    ///
+    /// Production characterize uses try_new_for_chip (refuse Err), but the legacy
+    /// new_for_chip + empty slice path remains for host tooling — it must be bounds-safe.
+    #[test]
+    fn empty_pll_table_does_not_panic_on_search_path() {
+        let empty = BinarySearchTuner::new_for_chip(AutoTunerConfig::default(), 650, 0xABCD);
+        assert!(empty.pll_table.is_empty());
+
+        let mut states = empty.init_search(3);
+        assert_eq!(states.len(), 3);
+        assert!(
+            BinarySearchTuner::all_done(&states),
+            "empty PLL must mark all chips done immediately"
+        );
+        for s in &states {
+            assert_eq!(s.test_freq(), 0);
+            assert!(s.done);
+        }
+
+        // current_frequencies must not index-panic
+        let freqs = empty.current_frequencies(&states);
+        assert_eq!(freqs, vec![(0, 0), (1, 0), (2, 0)]);
+
+        // finalize grades as D / 0 MHz
+        let profiles = empty.finalize(&states);
+        assert_eq!(profiles.len(), 3);
+        assert!(profiles.iter().all(|p| p.max_stable_mhz == 0));
+        assert!(profiles.iter().all(|p| p.grade == ChipGrade::D));
+
+        // process_snapshot on already-done empty states must not panic
+        let snap = crate::chip_stats::ChipStatsSnapshot {
+            chain_id: 0,
+            measurement_epoch: 0,
+            chip_nonces: vec![0, 0, 0],
+            chip_errors: vec![0, 0, 0],
+            window_duration_s: 3.0,
+            timestamp: std::time::Instant::now(),
+            board_temp_c: None,
+            chip_hw_errors: None,
+            chip_timeouts: None,
+            chip_duplicates: None,
+            current_difficulty: 256,
+            chip_temps_c: None,
+            psu_power_w: None,
+        };
+        assert!(empty.process_snapshot(&mut states, &snap));
+        assert!(BinarySearchTuner::all_done(&states));
+
+        // re-char path with empty table
+        let re = empty.init_search_for_chips(&[1, 5]);
+        assert!(BinarySearchTuner::all_done(&re));
+        let _ = empty.current_frequencies(&re);
+    }
+
+    /// Source-pin: tuner production PLL snaps use snap_pll_floor / next_above (no bare [0]).
+    #[test]
+    fn tuner_pll_snaps_use_empty_safe_helpers() {
+        let tuner_src = include_str!("tuner.rs");
+        assert!(
+            tuner_src.contains("snap_pll_floor"),
+            "tuner.rs must use MinerProfile::snap_pll_floor"
+        );
+        assert!(
+            tuner_src.contains("snap_pll_next_above"),
+            "tuner.rs boost path must use snap_pll_next_above"
+        );
+        // No remaining rev().find floor pattern on PLL tables in tuner.
+        assert!(
+            !tuner_src.contains(".rev()\n                        .find(|&&f| f <="),
+            "tuner.rs must not use ad-hoc rev().find PLL floor snaps"
+        );
+    }
+
+    /// G4 source-pin: PLL policy chip id never silently defaults to 0x1387.
+    #[test]
+    fn tuner_profile_chip_id_uses_pll_policy_helper() {
+        let tuner_src = include_str!("tuner.rs");
+        assert!(
+            tuner_src.contains("chip_id_for_pll_policy"),
+            "tuner.rs must resolve profile chip ids via chip_id_for_pll_policy"
+        );
+        // The old silent BM1387 alias must not remain on the profile path.
+        assert!(
+            !tuner_src.contains("chip_id_from_type(&profile.chip_type).unwrap_or(0x1387)"),
+            "profile_chip_id must not unwrap_or(0x1387)"
+        );
+        assert!(
+            !tuner_src.contains("chip_id_from_type(&chip_type).unwrap_or(0x1387)"),
+            "AutoTuner::new must not unwrap_or(0x1387)"
+        );
+        // G18: telemetry power model must not silent-alias unknown chip to BM1387.
+        let telemetry_src = include_str!("telemetry.rs");
+        assert!(
+            telemetry_src.contains("chip_id_for_pll_policy"),
+            "telemetry.rs must resolve chip ids via chip_id_for_pll_policy"
+        );
+        assert!(
+            !telemetry_src.contains("unwrap_or(0x1387)"),
+            "telemetry must not unwrap_or(0x1387)"
+        );
+    }
+
+    /// Source-pin: characterize production path uses try_new_for_chip (not bare new_for_chip).
+    #[test]
+    fn characterize_call_sites_use_try_new_for_chip() {
+        let tuner_src = include_str!("tuner.rs");
+        // Production paths must refuse via try_new_for_chip.
+        assert!(
+            tuner_src.contains("BinarySearchTuner::try_new_for_chip"),
+            "tuner.rs must call try_new_for_chip for P1-4 refuse"
+        );
+        assert!(
+            tuner_src.contains("UnknownChipPll"),
+            "tuner.rs must surface UnknownChipPll on characterize refuse"
+        );
+        // Characterize must not construct via bare new_for_chip after P1-4 close.
+        // (new_for_chip may still exist as a library API; production loops use try_.)
+        let characterize_block = tuner_src
+            .split("async fn characterize_chain")
+            .nth(1)
+            .and_then(|s| s.split("async fn ").next())
+            .expect("characterize_chain present");
+        assert!(
+            !characterize_block.contains("BinarySearchTuner::new_for_chip("),
+            "characterize_chain must not use new_for_chip (panic/wrong-table risk)"
+        );
+        let rechar_block = tuner_src
+            .split("async fn recharacterize_chips")
+            .nth(1)
+            .and_then(|s| s.split("async fn ").next())
+            .expect("recharacterize_chips present");
+        assert!(
+            !rechar_block.contains("BinarySearchTuner::new_for_chip("),
+            "recharacterize_chips must not use new_for_chip"
         );
     }
 }

@@ -189,9 +189,10 @@ pub fn vnish_profile_decision(
 /// `HashrateMax` user opt-in is capped at 100, never 127 (w24-thermal-safety
 /// F-2; the IP rejects PWM > 100).
 ///
-/// Safety invariant: every safety path (sensor error, fan failure,
-/// EmergencyShutdown, daemon crash, stale-temp) MUST cap at the mode's cap,
-/// and no mode cap exceeds the IP ceiling.
+/// + : every
+/// safety path (sensor error, fan failure, EmergencyShutdown, daemon
+/// crash, stale-temp) MUST cap at the mode's cap, and no mode cap exceeds
+/// the IP ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanMode {

@@ -30,7 +30,13 @@ version_rolling = true
 passthrough = false
 suggest_difficulty = 8192
 serial_device = "/dev/ttyS2"
-serial_chip_count = 195
+# PER-CHAIN chip count, not the unit total. A standard S21 Pro is 3 hashboards
+# x 65 BM1370 = 195 chips total (bitaxeGamma readme; mujina PROTOCOL.md "65x
+# BM1370"; BM1373_S23_RESEARCH.md "Chips/chain | 65"; model.rs s21pro
+# chips_per_chain_hint = 65). This field previously held 195, the unit total,
+# which outranked the 65 model hint and made assigned-geometry validation fail
+# — but only AFTER the rail was already energized.
+serial_chip_count = 65
 serial_chip_type = "BM1370"
 
 [power]

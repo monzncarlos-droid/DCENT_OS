@@ -20,7 +20,28 @@ from pathlib import Path
 
 
 EXPECTED_SAFETY_CLAMP_COUNT = 93
-EXPECTED_SAFETY_CLAMP_DIGEST = "a9f2cb3e3e6e72b3e54d0aa4f3ff2df8551da52b6fa59fbf3d5c98649ea75b16"
+# G30: BM1368 ramp clamp site content/line drift after pure plan thin-wrap;
+# classified count unchanged (91). Digest re-pin only.
+# G42: BM1391 open-coded freq/25 clamp removed; pure-pin ban string replaces site.
+# G43 (2026-08-03, hardware-enablement rank 44): 91 -> 92. ONE new classified
+# clamp, `bm1485.rs:605` `target_mhz.clamp(100, 700)`, bounding the PLL divider
+# SEARCH target in the new BM1485 (Antminer L3/L3+) Scaffold driver. It is a
+# frequency clamp by pattern; it is NOT a live safety clamp — the driver's
+# `init_chain`/`set_frequency`/`set_voltage`/`send_work` all return `Err` and it
+# cannot energize. Bounds come from `bm1485.md:176-183`, not from a guess.
+# Deliberately re-pinned rather than exempted: the manifest classifies by
+# pattern, not by reachability, and carving out "unreachable" clamps would make
+# the count depend on a judgement this gate cannot verify.
+# G44 (2026-08-04, CI clippy-green pass): 92 -> 93. NO new clamp was introduced.
+# `serial_mining.rs` already bounded the AM2 BM1362 PIC-heartbeat failure budget
+# with `.max(1).min(AM2_BM1362_PIC_HEARTBEAT_MAX_FAILURES)`; clippy::manual_clamp
+# flagged it and it was rewritten as `.clamp(1, ..)`, which is equivalent for this
+# integer expression. The manifest matches on `.clamp(`, so the effect was to make
+# an ALREADY-PRESENT bound VISIBLE to this gate for the first time — coverage went
+# up, behaviour did not change. Re-pinned rather than exempted, for the same reason
+# as G43: the manifest classifies by pattern, and hand-carving exceptions would put
+# the count at the mercy of a judgement it cannot check.
+EXPECTED_SAFETY_CLAMP_DIGEST = "b6e29dd913f79eb6fc0f20d8a7549af2544436098bb674743b6ec72b330c48d8"
 
 CLAMP_RE = re.compile(r"\.clamp\s*\(")
 COMMENT_PREFIXES = ("//", "///", "//!","/*", "*")
@@ -208,6 +229,22 @@ def self_test(sites: list[ClampSite]) -> bool:
             return False
         print("SAFETY_CLAMP_SELFTEST_OK")
         return True
+
+    # Do NOT return bare False here. `verify(quiet=True)` prints nothing, so a
+    # bare return produced a red gate with ZERO output: the CI line says
+    # "classified clamp set drifted OR negative control failed" and the operator
+    # could not tell which. It is always the FORMER — the negative control below
+    # is only reached when verify() passes, so a silent failure can never be it.
+    # (2026-08-03: this cost a full investigation to rediscover.)
+    print(
+        "SAFETY_CLAMP_SELFTEST_FAILED classified clamp set drifted: "
+        f"count={len(sites)} expected={EXPECTED_SAFETY_CLAMP_COUNT} "
+        f"digest={digest_sites(sites)} "
+        f"expected_digest={EXPECTED_SAFETY_CLAMP_DIGEST} "
+        "(negative control NOT reached). "
+        "Re-run without --self-test to list every classified site.",
+        file=sys.stderr,
+    )
     return False
 
 

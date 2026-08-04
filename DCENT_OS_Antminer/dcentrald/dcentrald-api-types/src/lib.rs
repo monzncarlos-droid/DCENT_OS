@@ -22,6 +22,10 @@ pub mod autotune_phase;
 pub mod autotune_policy;
 ///  baud-A: per-chip baud-upgrade plan + triple-write rule (HAL-free).
 pub mod baud_switch;
+/// BHB56902 (BM1366 / S19k Pro) hashboard-EEPROM block — the BHB56xxx sibling of
+/// `zhiju_eeprom`, byte-exact from the AMTC S19k Pro jig. Same CRC5 + identity layout,
+/// 6-byte-longer block. Unblocks native-BM1366 identity-gated admission.
+pub mod bm1366_eeprom;
 /// S21/BM1368 per-chip temperature readback DTO shape (HAL-free, not live-proven by default).
 pub mod bm1368_temperature;
 /// Evidence-scoped BM1398 chip, NBP1901 chain, and FPGA FIFO contracts.
@@ -58,6 +62,9 @@ pub mod cgminer_status_codes;
 pub mod chip_init;
 ///  thm-C: cold-environment auto-target adjuster (HAL-free).
 pub mod cold_environment;
+/// Deployed Bitmain hashboard-EEPROM decoder (real on-wire XXTEA 3-region format;
+/// HAL-free, decode-only). Complements the jig-block layout in `zhiju_eeprom`.
+pub mod deployed_eeprom;
 ///  dvr-A: S17/S19 hashboard diode voltage reference (HAL-free).
 pub mod diode_voltage;
 ///  dsp-A: dsPIC / PIC16F1704 / APW PSU wire format codec.
@@ -70,12 +77,20 @@ pub mod failure_mode;
 pub mod firmware_boot_timeline;
 ///  strat-A: cross-firmware Stratum + DevFee capability matrix (HAL-free).
 pub mod firmware_stratum_matrix;
+/// W8 (): read-only FPGA bitstream identity/provenance + the GAP-C2-2
+/// "validated and never installed" installer contract (HAL-free).
+pub mod fpga_bitstream;
 ///  fpga-A: Zynq FPGA register-map catalog (HAL-free).
 pub mod fpga_register_map;
 ///  frq-A: initial-frequency-ramp planner + cores_per_chip (HAL-free).
 pub mod frequency_scaling;
 ///  diag-A: hashboard fault triage flowchart (HAL-free).
 pub mod hashboard_diagnostics;
+/// Capability-first hashboard-EEPROM identity bridge over `zhiju_eeprom` +
+/// `bm1366_eeprom`: dispatch on the family byte and, where the evidence is EXACT
+/// (unique 0x05 family → BM1366), produce the observed `AsicProtocolIdentity` for
+/// two-source admission. The ambiguous 0x04 family is deliberately never disambiguated.
+pub mod hashboard_eeprom;
 /// PH-3 (): pure default-OFF hashrate auto-recovery ladder FSM (HAL-free, host-tested).
 pub mod hashrate_recovery;
 ///  ipr-A: Bitmain IP Reporter UDP protocol codec (HAL-free).
@@ -141,6 +156,10 @@ pub mod psu_model;
 pub mod pvt_table;
 ///  ramp-A: LuxOS 10-min boot-to-mining ramp curve (HAL-free).
 pub mod ramp_curve;
+/// LM90-family remote-diode temp-sensor decoder (TMP451/ADT7461/NCT218) — pure
+/// register-bytes→temperature logic, so S9 board-temp can read a real sensor instead of
+/// falling back to the XADC die temp.
+pub mod remote_temp_sensor;
 ///  thm-B: MAD-based bad-sensor outlier detector (HAL-free).
 pub mod sensor_outlier;
 ///  shv-A: share validation pipeline DTOs (HAL-free).
@@ -171,6 +190,10 @@ pub mod watchdog_policy;
 pub mod whatsminer_btminer;
 ///  wrk-A: chip-family work frame builder (HAL-free).
 pub mod work_dispatch;
+/// Bitmain "zhiju" hashboard-EEPROM plaintext block, byte-exact from the AMTC
+/// S19 Pro factory jig. Supplies the chip-identity fields that the `(0x04,0x11)`
+/// preamble alone cannot provide (that family spans BM1398 *and* BM1362).
+pub mod zhiju_eeprom;
 
 use serde::{Deserialize, Serialize};
 

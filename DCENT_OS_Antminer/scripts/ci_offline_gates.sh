@@ -11,14 +11,19 @@ PROJECT_DIR=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
 cd "$PROJECT_DIR"
 
 STATIC_ONLY=0
+FAIL_FAST=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --static-only)
             STATIC_ONLY=1
             ;;
+        --fail-fast)
+            FAIL_FAST=1
+            ;;
         -h|--help)
-            printf 'Usage: %s [--static-only]\n' "$0"
+            printf 'Usage: %s [--static-only] [--fail-fast]\n' "$0"
             printf '  --static-only  Run source/text gates only; no cargo, Docker, or hardware actions.\n'
+            printf '  --fail-fast    Exit immediately after the first failed gate.\n'
             exit 0
             ;;
         *)
@@ -38,6 +43,9 @@ pass() {
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
     failures=$((failures + 1))
+    if [ "$FAIL_FAST" -eq 1 ]; then
+        exit 1
+    fi
 }
 
 require_file() {
@@ -62,6 +70,23 @@ require_pattern() {
         pass "$label"
     else
         fail "$label: missing pattern '$pattern' in $file"
+    fi
+}
+
+require_line_regex() {
+    file=$1
+    pattern=$2
+    label=$3
+
+    if [ ! -f "$file" ]; then
+        fail "$label: missing file $file"
+        return
+    fi
+
+    if LC_ALL=C grep -E -- "$pattern" "$file" >/dev/null 2>&1; then
+        pass "$label"
+    else
+        fail "$label: missing active anchored line matching '$pattern' in $file"
     fi
 }
 
@@ -799,6 +824,17 @@ fi
 require_file 'scripts/check_install_path_honesty.py'
 require_file 'scripts/check_install_path_go_guard.py'
 require_file 'scripts/test_sd_common_mbr_static.sh'
+# Cross-compile matrix honesty: cargo check cells are cfg/type-check only
+# (not object codegen/link/release). Continuous-audit residual 2026-07-29.
+require_file 'scripts/check_cross_compile_matrix_honesty.py'
+require_file 'scripts/test_check_cross_compile_matrix_honesty.py'
+# Work-dispatch admission CI coverage: serial/hybrid/stock lifecycle tests +
+# serial BIP320/hash_on_disconnect must-wire (2026-07-29 residual).
+require_file 'scripts/check_work_dispatch_ci_coverage.py'
+require_file 'scripts/test_check_work_dispatch_ci_coverage.py'
+# Defconfig doc-reference honesty: every Buildroot defconfig named in an
+# authoritative doc must exist on disk (2026-08-02 rank-11 phantom-CV1835 fix).
+require_file 'scripts/check_defconfig_doc_references.py'
 if command -v python3 >/dev/null 2>&1; then
     if python3 scripts/check_install_path_honesty.py >/dev/null 2>&1; then
         pass "install-path honesty check"
@@ -810,6 +846,36 @@ if command -v python3 >/dev/null 2>&1; then
     else
         fail "install-path GO guard failed"
     fi
+    if python3 scripts/check_cross_compile_matrix_honesty.py >/dev/null 2>&1; then
+        pass "cross-compile matrix honesty (cargo check = cfg/type-check)"
+    else
+        fail "cross-compile matrix honesty check failed"
+    fi
+    if python3 scripts/test_check_cross_compile_matrix_honesty.py >/dev/null 2>&1; then
+        pass "cross-compile matrix honesty unit selftest"
+    else
+        fail "cross-compile matrix honesty unit selftest failed"
+    fi
+    if python3 scripts/check_work_dispatch_ci_coverage.py >/dev/null 2>&1; then
+        pass "work-dispatch CI coverage (lifecycle + serial must-wire)"
+    else
+        fail "work-dispatch CI coverage check failed"
+    fi
+    if python3 scripts/test_check_work_dispatch_ci_coverage.py >/dev/null 2>&1; then
+        pass "work-dispatch CI coverage unit selftest"
+    else
+        fail "work-dispatch CI coverage unit selftest failed"
+    fi
+    if python3 scripts/check_defconfig_doc_references.py >/dev/null 2>&1; then
+        pass "defconfig doc-reference honesty (every doc-named defconfig exists on disk)"
+    else
+        fail "defconfig doc-reference honesty check failed"
+    fi
+    if python3 scripts/check_defconfig_doc_references.py --self-test >/dev/null 2>&1; then
+        pass "defconfig doc-reference parser selftest"
+    else
+        fail "defconfig doc-reference parser selftest failed"
+    fi
 elif command -v py >/dev/null 2>&1; then
     if py -3 scripts/check_install_path_honesty.py >/dev/null 2>&1; then
         pass "install-path honesty check"
@@ -820,6 +886,36 @@ elif command -v py >/dev/null 2>&1; then
         pass "install-path GO guard"
     else
         fail "install-path GO guard failed"
+    fi
+    if py -3 scripts/check_cross_compile_matrix_honesty.py >/dev/null 2>&1; then
+        pass "cross-compile matrix honesty (cargo check = cfg/type-check)"
+    else
+        fail "cross-compile matrix honesty check failed"
+    fi
+    if py -3 scripts/test_check_cross_compile_matrix_honesty.py >/dev/null 2>&1; then
+        pass "cross-compile matrix honesty unit selftest"
+    else
+        fail "cross-compile matrix honesty unit selftest failed"
+    fi
+    if py -3 scripts/check_work_dispatch_ci_coverage.py >/dev/null 2>&1; then
+        pass "work-dispatch CI coverage (lifecycle + serial must-wire)"
+    else
+        fail "work-dispatch CI coverage check failed"
+    fi
+    if py -3 scripts/test_check_work_dispatch_ci_coverage.py >/dev/null 2>&1; then
+        pass "work-dispatch CI coverage unit selftest"
+    else
+        fail "work-dispatch CI coverage unit selftest failed"
+    fi
+    if py -3 scripts/check_defconfig_doc_references.py >/dev/null 2>&1; then
+        pass "defconfig doc-reference honesty (every doc-named defconfig exists on disk)"
+    else
+        fail "defconfig doc-reference honesty check failed"
+    fi
+    if py -3 scripts/check_defconfig_doc_references.py --self-test >/dev/null 2>&1; then
+        pass "defconfig doc-reference parser selftest"
+    else
+        fail "defconfig doc-reference parser selftest failed"
     fi
 else
     fail "python3/py required for install-path honesty/GO guards"
@@ -961,35 +1057,34 @@ if awk -F '\t' '
         for (i = 1; i <= NF; i++) {
             if ($i == "board_target") board_target_col = i
             if ($i == "install_authorization") install_authorization_col = i
-            if ($i == "public_beta") public_beta_col = i
+            if ($i == "public_beta_install") public_beta_col = i
         }
         next
     }
     board_target_col && install_authorization_col && public_beta_col && \
         $install_authorization_col == "public_beta" && $public_beta_col == "1" {
         if ($board_target_col == "am1-s9") am1_s9 = 1
-        if ($board_target_col == "am2-s19j") am2_s19j = 1
     }
     END {
         exit !(board_target_col && install_authorization_col && public_beta_col && \
-            am1_s9 && am2_s19j)
+            am1_s9)
     }
 ' docs/architecture/install_matrix.tsv; then
-    pass 'install_matrix.tsv lists public-beta runtime board targets am1-s9 and am2-s19j'
+    pass 'install_matrix.tsv lists public-beta runtime board target am1-s9 (S9-only beta scope)'
 else
-    fail 'install_matrix.tsv missing public-beta runtime rows am1-s9 / am2-s19j'
+    fail 'install_matrix.tsv missing public-beta runtime row am1-s9'
 fi
 if awk -F'\t' '
     NR == 1 {
-        for (i = 1; i <= NF; i++) if ($i == "public_beta") public_beta_col = i
+        for (i = 1; i <= NF; i++) if ($i == "public_beta_install") public_beta_col = i
         next
     }
     public_beta_col && $public_beta_col == "1" { count++ }
-    END { exit !(public_beta_col && count == 2) }
+    END { exit !(public_beta_col && count == 1) }
 ' docs/architecture/install_matrix.tsv; then
-    pass 'install_matrix.tsv has exactly two public_beta=1 rows'
+    pass 'install_matrix.tsv has exactly one public_beta_install=1 row (S9-only)'
 else
-    fail 'install_matrix.tsv public_beta=1 row count is not exactly 2'
+    fail 'install_matrix.tsv public_beta_install=1 row count is not exactly 1'
 fi
 if cmp -s \
     docs/architecture/hardware_enablement_matrix.json \
@@ -1243,6 +1338,20 @@ require_pattern 'dcentrald/dcentrald/src/runtime/notifications.rs' 'mapping_then
 require_pattern 'dcentrald/dcentrald-asic/src/lib.rs' 'deterministic_mock_chain_mini_soak_covers_share_failover_and_ota_preflight' 'MockChain mini-soak executes in dcentrald-asic host tests'
 require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'board_version_deep_parity_pins_power_and_support_attributes' 'ESP board-version deep parity pins power/fan/temp/support attributes'
 require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'every_model_has_explicit_default_board_version' 'ESP every BitAxeModel has an explicit default board-version pin'
+# Lucky Miner LVxx (EXPERIMENTAL, no live hardware). These EXTEND the two pins
+# above; never replace them. The voltage-domain pin is the load-bearing one:
+# the LVXX vendor fork deleted a live 3.6 V / 9-chip LV08 case, and
+# `power.rs` derives the rail as per-chip mV x voltage_domains, so any Lucky
+# row with voltage_domains > 1 would command a multiple of 1.2 V onto nine
+# PARALLEL dies. The tach pin keeps LV07/LV08 fail-closed on fan proof without
+# joining `is_hex()` (which would also mislabel them as 6-ASIC/3-domain).
+require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'lucky_voltage_domains_pinned_to_one_parallel_domain' 'ESP Lucky LVxx rows pin one parallel voltage domain (3.6 V trap guard)'
+require_pattern '../dcentos-esp/dcentaxe-hal/src/board.rs' 'lucky_lv07_lv08_require_tach_proof_via_capability_not_is_hex' 'ESP Lucky multi-chip rows require tach proof by capability, not is_hex()'
+# The Python mirror keys rows by board_version, so a duplicate key silently
+# collapses two rows into one (and `find()` makes the second row unreachable
+# dead code on the Rust side). The drift gate must fail loudly at the
+# collision instead.
+require_pattern '../dcent-toolbox/tests/test_board_catalog_consistency.py' 'duplicate board_version key(s) in BoardVersionProfile::ALL' 'toolbox ESP drift gate fails loudly on a duplicate board_version key'
 require_pattern '../dcentos-esp/knowledge-base/upstream/esp-miner/fixture_manifest.json' 'last_synced_on' 'ESP-Miner fixture manifest records last sync date'
 require_pattern '../dcentos-esp/knowledge-base/upstream/esp-miner/fixture_manifest.json' 'no_network_fetch_in_ci' 'ESP-Miner fixture drift gate stays source-only'
 require_pattern '../dcentos-esp/docs/DCENT_AXE_OPERATOR_BENCH_RUNBOOK.md' 'ESP-9: ESP-Miner Fixture Sync Review' 'operator runbook carries ESP-Miner fixture sync checklist'
@@ -1839,7 +1948,7 @@ kill9_bosminer_check() {
             start=1
         fi
         window=$(sed -n "${start},${ln}p" "$f")
-        if printf '%s\n' "$window" | grep -qE 'PLATFORM_FAMILY[[:space:]]*=[[:space:]]*"amlogic"'; then
+        if printf '%s\n' "$window" | grep -qE 'PLATFORM_FAMILY"?[[:space:]]*=[[:space:]]*"amlogic"'; then
             continue
         fi
         if printf '%s\n' "$window" | grep -qE 'kill[[:space:]]+-TERM'; then
@@ -3050,22 +3159,30 @@ fan_pwm_cap_check
 #
 bm1387_misc_ctrl_triple_write_check() {
     f='dcentrald/dcentrald-asic/src/drivers/bm1387.rs'
+    pure='dcentrald/dcentrald-common/src/chain_transport.rs'
     if [ ! -f "$f" ]; then
         fail "QA-002 bm1387-triple-write: missing $f (path drift?)"
         return
     fi
     ok=1
     why=''
-    # 3-iteration loop guarding the MiscCtrl write.
-    if ! grep -E 'for[[:space:]]+_[[:space:]]+in[[:space:]]+0\.\.3' "$f" >/dev/null 2>&1; then
-        ok=0; why="$why [missing 'for _ in 0..3' triple-write loop]"
+    # Preferred: pure cadence SSOT (plan_bm1387_misc_ctrl_i2c_off_chip0) + value/reg pins.
+    if grep -E 'plan_bm1387_misc_ctrl_i2c_off_chip0' "$f" >/dev/null 2>&1 \
+        && grep -E '0x4020[_]?0180' "$f" >/dev/null 2>&1 \
+        && [ -f "$pure" ] \
+        && grep -E 'MISC_CTRL_REG_BM1387|0x1[Cc]' "$pure" >/dev/null 2>&1 \
+        && grep -E 'BM1387_MISC_CTRL_I2C_OFF_MINING|0x4020[_]?0180' "$pure" >/dev/null 2>&1 \
+        && grep -E 'MISC_CTRL_TRIPLE_WRITE_COUNT|for _ in 0\.\.MISC_CTRL_TRIPLE_WRITE_COUNT' "$pure" >/dev/null 2>&1; then
+        pass "QA-002 bm1387-triple-write: disable_i2c_on_chip0 consumes pure plan (0x4020_0180 @ 0x1C ×3 / 5ms SSOT)"
+        return
     fi
-    # 5 ms inter-write delay.
+    # Legacy open-coded loop (pre-pure-plan) still accepted.
+    if ! grep -E 'for[[:space:]]+_[[:space:]]+in[[:space:]]+0\.\.3' "$f" >/dev/null 2>&1; then
+        ok=0; why="$why [missing pure plan consume OR 'for _ in 0..3' triple-write loop]"
+    fi
     if ! grep -E 'from_millis\([[:space:]]*5[[:space:]]*\)' "$f" >/dev/null 2>&1; then
         ok=0; why="$why [missing 5ms inter-write delay]"
     fi
-    # The mining-mode-I2C-off MiscCtrl constant (tolerate 0x4020_0180 /
-    # 0x40200180 spellings).
     if ! grep -E '0x4020[_]?0180' "$f" >/dev/null 2>&1; then
         ok=0; why="$why [missing MiscCtrl 0x4020_0180 constant]"
     fi
@@ -4128,20 +4245,69 @@ accept_harness_check() {
     require_file "$base/test_accept_fuzz.sh"
     require_file "$base/test_skus_conf_valid.sh"
     require_file "$base/test_release_state_route.sh"
+    require_file "$base/test_am3_bb_acceptance_route.sh"
+    require_file 'scripts/test_dev_deploy_output_static.py'
+    require_file 'scripts/test_dev_deploy_behavior.py'
+    require_file 'scripts/test_dcentrald_deploy_recovery.sh'
+    require_file 'scripts/test_dcentos_deploy_lock.sh'
+    require_file 'scripts/test_dcentrald_deploy_upgrade_guard.sh'
+    require_file 'scripts/dev_deploy_recovery_admin.sh'
 
-    for t in test_accept_parse.sh test_accept_fuzz.sh test_skus_conf_valid.sh test_release_state_route.sh; do
-        if [ -f "$base/$t" ]; then
-            if sh "$base/$t" >/dev/null 2>&1; then
-                pass "hw-acceptance: $t green (accepted-share gate parser pinned)"
-            else
-                fail "hw-acceptance: $t FAILED (accepted-share PASS/FAIL parser regressed)"
-            fi
-        fi
-    done
+    if python3 scripts/test_dev_deploy_output_static.py >/dev/null 2>&1; then
+        pass 'dev-deploy: process identity, immutable config, atomic receipt, and failed-launch cleanup contracts are pinned'
+    else
+        fail 'dev-deploy: exact process/config/evidence cleanup contract regressed'
+    fi
+    if python3 scripts/test_dev_deploy_behavior.py >/dev/null 2>&1; then
+        pass 'dev-deploy: fake transport proves explicit runtime config and receipt-failure exact cleanup behavior'
+    else
+        fail 'dev-deploy: behavioral fake-transport cleanup contract regressed'
+    fi
+    if sh scripts/test_dcentrald_deploy_recovery.sh >/dev/null 2>&1; then
+        pass 'dev-deploy: boot resolver restores or commits one exact persistent binary/config generation'
+    else
+        fail 'dev-deploy: persistent binary/config boot recovery contract regressed'
+    fi
+    if sh scripts/test_dcentos_deploy_lock.sh >/dev/null 2>&1; then
+        pass 'dev-deploy: kernel lock excludes admission and releases on owner death or explicit handoff'
+    else
+        fail 'dev-deploy: kernel-backed admission exclusion contract regressed'
+    fi
+    if sh scripts/test_dcentrald_deploy_upgrade_guard.sh >/dev/null 2>&1; then
+        pass 'dev-deploy: slot transitions refuse active or split persistent generations'
+    else
+        fail 'dev-deploy: firmware transition guard regressed'
+    fi
+
+    if sh scripts/hw-acceptance/test_accept_parse.sh >/dev/null 2>&1; then
+        pass 'hw-acceptance: test_accept_parse.sh green (accepted-share gate parser pinned)'
+    else
+        fail 'hw-acceptance: test_accept_parse.sh FAILED (accepted-share PASS/FAIL parser regressed)'
+    fi
+    if sh scripts/hw-acceptance/test_accept_fuzz.sh >/dev/null 2>&1; then
+        pass 'hw-acceptance: test_accept_fuzz.sh green (accepted-share gate parser pinned)'
+    else
+        fail 'hw-acceptance: test_accept_fuzz.sh FAILED (accepted-share PASS/FAIL parser regressed)'
+    fi
+    if sh scripts/hw-acceptance/test_skus_conf_valid.sh >/dev/null 2>&1; then
+        pass 'hw-acceptance: test_skus_conf_valid.sh green (accepted-share gate parser pinned)'
+    else
+        fail 'hw-acceptance: test_skus_conf_valid.sh FAILED (accepted-share PASS/FAIL parser regressed)'
+    fi
+    if sh scripts/hw-acceptance/test_release_state_route.sh >/dev/null 2>&1; then
+        pass 'hw-acceptance: NOT-IMPLEMENTED rows refuse runnable phases before transport'
+    else
+        fail 'hw-acceptance: NOT-IMPLEMENTED route refusal or bootlog evidence path regressed'
+    fi
+    if sh scripts/hw-acceptance/test_am3_bb_acceptance_route.sh >/dev/null 2>&1; then
+        pass 'hw-acceptance: AM3-BB observers are route-bound/read-only and mutating phases refuse before transport'
+    else
+        fail 'hw-acceptance: AM3-BB identity, enumeration, refusal, or no-install contract regressed'
+    fi
 
     if [ -f "$base/skus.conf" ]; then
         missing=''
-        for want in S9 S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19kPro T19 S19XP S21 T21 S21Pro S21XP; do
+        for want in S9 S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19jProBB S19kPro T19 S19XP S21 T21 S21Pro S21XP; do
             if ! grep -qE "^$want\|" "$base/skus.conf"; then
                 missing="$missing $want"
             fi
@@ -4149,9 +4315,99 @@ accept_harness_check() {
         if [ -n "$missing" ]; then
             fail "hw-acceptance: skus.conf is missing target SKU row(s):$missing (target-set drift)"
         else
-            pass "hw-acceptance: skus.conf lists all 20 target SKU rows"
+            pass "hw-acceptance: skus.conf lists all 21 target SKU rows"
         fi
     fi
+    require_pattern "$base/lib/accept_parse.sh" 'AM3_BB_ENUMERATION_RECEIPT schema=v1' \
+        'hw-acceptance: AM3-BB enumeration requires an exact unique-population receipt'
+    require_pattern "$base/lib/accept_parse.sh" 'AM3_ENUM_PENDING:no_unique_population_receipt' \
+        'hw-acceptance: AM3-BB assignment-only evidence remains pending'
+    require_pattern "$base/dcent-accept.sh" 'external-media/all|external-media/backup|external-media/firstlight|external-media/ota' \
+        'hw-acceptance: AM3-BB generic deploy, backup, and OTA phases refuse before helpers'
+    require_pattern 'dcentrald/dcentrald/src/am3_bb_mining.rs' 'AM3_BB_TOPOLOGY_CAPTURE_RECEIPT schema=v2' \
+        'hw-acceptance: AM3-BB topology capture is explicitly non-admission evidence'
+    require_pattern 'dcentrald/dcentrald/src/am3_bb_mining.rs' 'AM3_BB_ROUTE_ADMISSION_RECEIPT schema=v2' \
+        'hw-acceptance: AM3-BB runtime emits a PID/topology-bound post-watchdog admission receipt'
+    require_pattern "$base/lib/accept_parse.sh" 'ACCEPTANCE_SCOPE_PASS' \
+        'hw-acceptance: matrix verdict is diagnostic completeness rather than release authority'
+    require_pattern "$base/lib/accept_parse.sh" 'board_target_mismatch' \
+        'hw-acceptance: matrix results are bound to the manifest board target'
+    require_pattern "$base/lib/accept_parse.sh" '_mxpolicy_count' \
+        'hw-acceptance: matrix results bind the one fixed policy identifier'
+    reject_pattern "$base/dcent-accept.sh" 'DCENT_ACCEPT_CAPSTONE_N' \
+        'hw-acceptance: ambient environment cannot weaken the capstone share threshold'
+    reject_pattern "$base/dcent-accept.sh" 'DCENT_ACCEPT_CAPSTONE_T' \
+        'hw-acceptance: ambient environment cannot weaken the capstone duration'
+    reject_pattern "$base/dcent-accept.sh" 'DCENT_ACCEPT_TEMP_CEILING' \
+        'hw-acceptance: ambient environment cannot weaken the thermal ceiling'
+    reject_pattern "$base/dcent-accept.sh" 'RELEASE_GO' \
+        'hw-acceptance: observer JSON cannot mint a positive release verdict'
+    reject_pattern "$base/dcent-accept.sh" 'RELEASE_NOGO' \
+        'hw-acceptance: observer JSON cannot mint a negative release verdict'
+    require_pattern "$base/dcent-accept.sh" '--case-dir=/tmp/dcentos-am3-bb.<mktemp-suffix>' \
+        'hw-acceptance: AM3-BB observers require a fresh witnessed case directory'
+    require_pattern "$base/dcent-accept.sh" 'StrictHostKeyChecking=yes' \
+        'hw-acceptance: live observation requires strict pinned SSH host authentication'
+    require_pattern "$base/dcent-accept.sh" '--expected-mac=xx:xx:xx:xx:xx:xx' \
+        'hw-acceptance: live observation binds independently recorded unit MAC identity'
+    require_pattern "$base/dcent-accept.sh" '--output="$deploy_receipt"' \
+        'hw-acceptance: first-light consumes the exact launched PID/start/executable receipt'
+    require_pattern "$base/dcent-accept.sh" 'first-light producer transition was not exactly bound to the launched runtime' \
+        'hw-acceptance: first-light rejects stale pre-launch or mismatched post-launch producers'
+    require_pattern "$base/dcent-accept.sh" 'SOAK_MAX_SHARE_STALL=300' \
+        'hw-acceptance: soak policy caps accepted-share progress stalls'
+    require_pattern "$base/lib/accept_parse.sh" 'SOAK_FAIL:hashrate_unavailable' \
+        'hw-acceptance: all-zero hashrate cannot satisfy retention'
+    require_pattern 'scripts/dev_deploy.sh' 'DCENTRALD_UNVERIFIABLE' \
+        'dev-deploy: recognized but uninspectable daemon owners fail closed'
+    require_pattern 'scripts/dev_deploy.sh' 'stop_exact_launched_process' \
+        'dev-deploy: launched processes are stopped only by revalidated PID/start/executable identity'
+    require_pattern 'scripts/dev_deploy.sh' 'RUNTIME_CONFIG_DIR="/tmp/dcentrald-runtime.${CONFIG_BIND_SHA256}.${DEPLOY_START}.$$"' \
+        'dev-deploy: explicit runtime configs use private run-unique content-addressed directories'
+    require_pattern 'scripts/dev_deploy.sh' 'START_ERROR=explicit_config_hash_changed' \
+        'dev-deploy: explicit runtime config bytes are rechecked at the launch boundary'
+    reject_pattern "$base/dcent-accept.sh" 'ACCEPTANCE ALL-PASS' \
+        'hw-acceptance: local diagnostic flow never emits release-looking all-pass authority'
+    require_pattern 'dcentrald/dcentrald-api/src/auth.rs' 'observer_method_allowed' \
+        'hw-acceptance: AM3-BB observer API refuses mutating HTTP methods before handlers'
+    require_pattern 'dcentrald/dcentrald-api/src/cgminer.rs' 'observer_restricted_verb' \
+        'hw-acceptance: AM3-BB observer API refuses CGMiner control and session mutation'
+    require_pattern 'dcentrald/dcentrald-api/src/rest/late.rs' 'observer-only API forbids onboarding persistence' \
+        'hw-acceptance: onboarding reads cannot migrate persistent state in observer mode'
+    require_pattern 'dcentrald/dcentrald/src/runtime/api.rs' 'if observer_only {' \
+        'hw-acceptance: observer runtime suppresses configured identity fallback and command sinks'
+    require_pattern 'dcentrald/dcentrald/src/main.rs' 'let verify_bundle_publication = if am3_bb_mode || ephemeral_runtime {' \
+        'hw-acceptance: external-media AM3-BB and every ephemeral runtime suppress persistent capability publication'
+    require_pattern 'dcentrald/dcentrald/src/main.rs' 'skipping persistent verify-bundle capability publication for non-persistent runtime' \
+        'hw-acceptance: capability suppression is explicitly observable'
+    procedure='../../docs/dev/2026-07-02-antminer-production-readiness/hw-procedures/BP-AM3-BB-GPIO59-WATCHDOG.md'
+    require_file "$procedure"
+    require_pattern "$procedure" 'AM3_BB_GPIO59_WATCHDOG_ACCEPTANCE_OK' \
+        'hw-acceptance: AM3-BB procedure defines the exact reviewed completion sentinel'
+    require_pattern "$procedure" 'External media or `/tmp` runtime only' \
+        'hw-acceptance: AM3-BB procedure keeps NAND and boot-environment writes out of scope'
+    require_pattern "$procedure" 'env -i' \
+        'hw-acceptance: AM3-BB canonical launch starts from an empty environment'
+    require_pattern "$procedure" 'DCENTOS_AUDIT_LOG_PATH="$case_dir/dcentrald-audit.ndjson"' \
+        'hw-acceptance: AM3-BB audit output is redirected below the fresh case directory'
+    require_pattern "$procedure" 'persistent-mounts-read-only.proof' \
+        'hw-acceptance: AM3-BB procedure records bounded read-only mount snapshots without claiming continuous observation'
+    require_pattern "$procedure" 'cannot, from a normally booted stock system' \
+        'hw-acceptance: AM3-BB procedure does not overclaim zero persistent-media mutation'
+    require_pattern "$procedure" 'PT_INTERP' \
+        'hw-acceptance: AM3-BB procedure binds a static executable image'
+    require_pattern "$procedure" 'final UART stop bit' \
+        'hw-acceptance: AM3-BB shutdown timing has a physically synchronized t0'
+    require_pattern "$procedure" 'process.environ.raw' \
+        'hw-acceptance: AM3-BB procedure hash-binds raw NUL-delimited process evidence'
+    require_pattern "$procedure" 'acceptance_rc=0' \
+        'hw-acceptance: AM3-BB procedure accumulates every acceptance phase failure'
+    require_pattern "$procedure" 'sha256sum -c "$host_evidence_dir/acceptance-harness.sha256" || acceptance_rc=1' \
+        'hw-acceptance: AM3-BB procedure rechecks the harness manifest after all phases'
+    require_pattern "$procedure" 'acceptance-harness-manifest.sha256.tmp' \
+        'hw-acceptance: nested acceptance manifest binding is published atomically'
+    require_pattern "$procedure" 'configured address-assignment plan' \
+        'hw-acceptance: AM3-BB procedure distinguishes assigned addresses from measured chips'
 }
 accept_harness_check
 
@@ -4438,9 +4694,11 @@ sysupgrade_packaging_static_check
 release_envelope_reproducibility_check() {
     require_file 'scripts/test_release_envelope_reproducibility.sh'
     if [ -f 'scripts/test_release_envelope_reproducibility.sh' ]; then
-        if bash 'scripts/test_release_envelope_reproducibility.sh' >/dev/null 2>&1; then
+        release_envelope_output=''
+        if release_envelope_output=$(bash 'scripts/test_release_envelope_reproducibility.sh' 2>&1); then
             pass "release envelope is reproducible and provenance rejects invalid inputs"
         else
+            printf '%s\n' "$release_envelope_output" >&2
             fail "release envelope reproducibility/provenance contract regressed"
         fi
     fi
@@ -5004,7 +5262,7 @@ ce026_reverse_ab_and_am2_first_install_boundary_check() {
         "$tag REVERSE: sysupgrade harness defines the reverse both-slots layout"
     require_pattern "$harness" '1,1,1,1,4,1,1,900,900' \
         "$tag REVERSE: reverse layout provisions BOTH slots (mtd7 + mtd8, 128KiB eraseblocks)"
-    require_pattern "$harness" 'OFFLINE_NANDSIM_PROOF_OK target=\$TARGET direction=reverse current_fw=1 inactive_mtd=8' \
+    require_pattern "$harness" 'OFFLINE_NANDSIM_PROOF_OK target=$TARGET direction=reverse current_fw=1 inactive_mtd=8' \
         "$tag REVERSE: sysupgrade harness emits the distinct reverse sentinel (current_fw=1 inactive_mtd=8)"
 
     # (2) AM2 FIRST-INSTALL BOUNDARY: the S9 stage1 harness cannot accept an
@@ -5018,7 +5276,7 @@ ce026_reverse_ab_and_am2_first_install_boundary_check() {
         "$tag AM2-FIRST-INSTALL: stage1 harness has no AM2 package input"
     reject_pattern "$stage1" 'OFFLINE_FIRST_INSTALL_PROOF_OK target=am2' \
         "$tag AM2-FIRST-INSTALL: stage1 harness cannot emit an AM2 proof sentinel"
-    require_pattern "$capsule_contract" '^Status: architecture contract; not implemented$' \
+    require_line_regex "$capsule_contract" '^Status: architecture contract; not implemented$' \
         "$tag AM2-FIRST-INSTALL: capsule contract remains explicitly unimplemented"
     require_pattern "$capsule_contract" 'must refuse before package upload or target mutation' \
         "$tag AM2-FIRST-INSTALL: capsule contract refuses vendor-source mutation"
@@ -5189,6 +5447,21 @@ sim_hal_evidence_contract_gates() {
     # gate.  Pin the executable model proofs to the workflow so they cannot
     # become another orphaned safety suite during CI refactors.
     sim_workflow='../../.github/workflows/dcentos-offline-gates.yml'
+    exact_test_runner='scripts/run_exact_cargo_test.sh'
+    require_file "$exact_test_runner"
+    require_pattern "$exact_test_runner" 'cargo test "$@" "$exact_test" -- --list' \
+        'CI exact-test runner inventories the fully qualified contract before execution'
+    require_pattern "$exact_test_runner" 'if [ "$match_count" -ne 1 ]; then' \
+        'CI exact-test runner rejects missing or ambiguous contracts'
+    require_pattern "$exact_test_runner" 'cargo test "$@" "$exact_test" -- --exact --include-ignored' \
+        'CI exact-test runner executes the inventoried contract even when it is ignored'
+    if sh scripts/test_run_exact_cargo_test.sh; then
+        pass 'CI exact-test runner rejects zero/duplicate inventories, includes ignored tests, and propagates Cargo failures'
+    else
+        fail 'CI exact-test runner behavioral contract failed'
+    fi
+    reject_pattern "$sim_workflow" ' -- --exact' \
+        'CI workflow routes every exact load-bearing Rust contract through the inventory runner'
     require_pattern "$sim_workflow" 'sim-hal-contract:' \
         'SIM-HAL CI: independent executable contract job is present'
     require_pattern "$sim_workflow" \
@@ -5207,13 +5480,13 @@ sim_hal_evidence_contract_gates() {
         'cargo test -p dcentrald-asic --features sim-hal --test sim_pic16_runtime' \
         'SIM-HAL CI: PIC16 cold-boot runtime grammar and admission regression executes'
     require_pattern "$sim_workflow" \
-        'cargo test -p dcentrald --features sim-hal --bin dcentrald hardware_preflight_policy_tests' \
+        'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald --features sim-hal --bin dcentrald -- hardware_preflight_policy_tests' \
         'SIM-HAL CI: daemon PIC16 controller-admission regression executes'
     require_pattern "$sim_workflow" \
-        'cargo test -p dcentrald --features sim-hal --bin dcentrald initialized_pic_addrs_tests' \
+        'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald --features sim-hal --bin dcentrald -- initialized_pic_addrs_tests' \
         'SIM-HAL CI: PIC16 heartbeat membership remains deduplicated'
     require_pattern "$sim_workflow" \
-        'caller_supplied_privileged_intent_surface_stays_crate_private' \
+        'sh ../scripts/run_exact_cargo_test.sh i2c::i2c_service_deadline_tests::caller_supplied_privileged_intent_surface_stays_crate_private --locked -p dcentrald-hal --features sim-hal --lib' \
         'SIM-HAL CI: I2C privileged-intent visibility regression executes'
     require_pattern "$sim_workflow" \
         'cargo test -p dcentrald-hal --doc' \
@@ -5222,7 +5495,7 @@ sim_hal_evidence_contract_gates() {
         'init_heartbeat_ownership_tests' \
         'SIM-HAL CI: initialization-heartbeat ownership regression executes'
     require_pattern "$sim_workflow" \
-        'cargo test -p dcentrald --features sim-hal --bin dcentrald voltage_mailbox::tests' \
+        'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald --features sim-hal --bin dcentrald -- voltage_mailbox::tests' \
         'SIM-HAL CI: prioritized voltage mailbox lifecycle regressions execute'
     require_pattern "$sim_workflow" \
         'psu_apw12_smbus::tests::power_off' \
@@ -5230,6 +5503,1112 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'psu_apw12_smbus::tests::cold_boot' \
         'SIM-HAL CI: partial cold-boot rollback regression executes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_management_fabric_latch_is_unique_and_rejects_stale_clones --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'SIM-HAL CI: exact AM2 terminal management-fabric latch regression executes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_guard_retries_real_negative_i2c_barrier_before_any_safe_off_leg --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'SIM-HAL CI: exact AM2 guard retries a real negative terminal barrier before final legs'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::production_apw_state_machine_retains_failed_owner_and_never_replays_receipt --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'SIM-HAL CI: production AM2 APW owner-retention state machine executes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::joined_actor_panic_is_reported_after_safe_shutdown_without_hiding_primary_error --locked -p dcentrald --bin dcentrald' \
+        'CI: joined hardware-actor panic remains a terminal operator-visible error'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh execution_fence::tests::revocation_is_nonblocking_and_rejects_late_commit_before_wait_finishes --locked -p dcentrald --bin dcentrald' \
+        'CI: queued terminal writer cannot block a late closed-generation rejection'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh execution_fence::tests::revoked_try_wait_is_pending_without_spawning_and_completes_after_release --locked -p dcentrald --bin dcentrald' \
+        'CI: revoked serial execution exposes one-shot nonblocking quiescence evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh execution_fence::tests::panicked_commit_marks_the_quiescent_fence_receipt_dirty --locked -p dcentrald --bin dcentrald' \
+        'CI: generic execution records explicit dirty evidence when a commit unwinds'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_failure_and_operator_stop_verify_power_off_before_waiting_on_serial_commit_fence --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 first-stage cutoff and nonblocking serial revocation ordering executes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_closeouts_revoke_serial_and_bound_watchdog_before_gpio_cut --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 closeouts revoke UART admission and bound watchdog feeds before GPIO I/O'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_route_domain_phase_matrix_is_owner_issued --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial route lifecycle distinguishes never-opened from owner-closed domains'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_route_domain_closeouts_reject_cross_run_pairing_and_duplicate_claims --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial route domains reject duplicate claims and cross-run evidence pairing'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::dropping_opened_route_domains_revokes_uart_and_api_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: dropping an opened exact route owner synchronously revokes UART and API admission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_persistent_cut_failure_revokes_serial_before_immediate_retries_and_fence_wait --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 persistent GPIO failure cannot delay serial revocation'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_serial_fence_timeout_drops_revoked_owner_without_blocking_waiter --locked -p dcentrald --bin dcentrald' \
+        'CI: timed-out AM2 serial fence observation retains no detached blocking waiter'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_serial_fence_timeout_allows_runtime_drop_before_commit_release --locked -p dcentrald --bin dcentrald' \
+        'CI: timed-out AM2 serial fence observation cannot stall Tokio runtime destruction'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_serial_fence_never_probes_after_absolute_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 serial closeout never probes or accepts quiescence after the absolute deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_and_legacy_shutdown_revoke_before_watchdog_and_cut_before_uart_wait --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic and legacy UART shutdown revoke before waits and cut power before polling'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_emergency_cut_cannot_be_reused_as_terminal_safeoff_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic pre-fence emergency cut cannot substitute for terminal checked safe-off evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_out_of_band_hard_stop_clears_every_terminal_ownership_flag --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 hard-stop consumes terminal ownership without recursive Drop re-entry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_out_of_band_hard_stop_cannot_drop_assign_or_early_return_live_ownership --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 hard-stop has no drop-assignment, early-return, or live-owner redispatch path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_native_route_fails_closed_before_optional_hardware_observation --locked -p dcentrald --bin dcentrald' \
+        'CI: native BM1366 is refused before optional EEPROM observation and has no retired BHB56 dsPIC route'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_dspic_heartbeat_is_bounded_observable_and_terminally_consumed --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 BM1362 dsPIC heartbeat failure is bounded and consumed as terminal safe-off intent'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::legacy_serial_topology_refuses_pic_heartbeat_before_spawn --locked -p dcentrald --bin dcentrald' \
+        'CI: legacy serial topology cannot mint a PIC-heartbeat actor'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::runtime_thread_join_budget_exceeds_service_heartbeat_call_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: serial actor join budget strictly exceeds the service heartbeat call bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::cancellation_interrupts_wait_for_runtime_owner_lock --locked -p dcentrald --bin dcentrald' \
+        'CI: APW heartbeat cancellation cannot block behind the retained PSU mutex'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh i2c::i2c_service_deadline_tests::published_heartbeat_call_bound_covers_internal_service_deadline --locked -p dcentrald-hal --lib' \
+        'CI: HAL public heartbeat call bound covers its internal queue and execution deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::cancellable_heartbeat_stops_during_retry_flush_before_second_read --locked -p dcentrald-hal --lib' \
+        'CI: APW heartbeat cancellation stops a retry flush before its second service read'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1398_native_route_fails_closed_before_optional_hardware_observation --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1398 native route fails closed before optional EEPROM observation without exact physical identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am2_bm1362_serial_admission::tests::exact_am2_zynq_bm1362_direct_serial_composition_is_admitted --locked -p dcentrald --bin dcentrald' \
+        'CI: direct-serial AM2 admission consumes the detector canonical control-board identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_admission::tests::exact_am2_zynq_bm1362_hybrid_composition_is_admitted --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid AM2 admission consumes the detector canonical control-board identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_execution_fence_rejects_panicked_commit_as_clean_shutdown_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: serial commit panic cannot authorize clean watchdog disarm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_terminal_physical_io_uses_blocking_workers --locked -p dcentrald --bin dcentrald' \
+        'CI: serial terminal PSU, controller, GPIO, and fan I/O cannot park Tokio workers'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh terminal_io_owner::tests::destructor_work_runs_on_the_single_blocking_owner_in_submission_order --locked -p dcentrald --bin dcentrald' \
+        'CI: destructor terminal I/O executes FIFO on the dedicated blocking owner'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_guard_destructors_transfer_terminal_io_to_the_blocking_owner --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic and AM2 serial guard Drops cannot perform terminal I/O on Tokio workers'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_run_scope_drop_transfers_io_but_clean_retirement_is_awaited --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid async Drop transfers I/O while clean retirement remains awaited'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::early_cutoff_start_is_recorded_at_the_physical_value_write_boundary --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid cutoff timing starts at the physical sysfs value write boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::am2_controller::tests::am2_s19pro_is_not_admitted_without_independent_physical_identity --locked -p dcentrald-hal --lib' \
+        'CI: S19 Pro controller authority is refused without independent physical identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh dspic::pic0x89_tests::observed_dspic_endpoint_session_rejects_unknown_and_unmodeled_firmware --locked -p dcentrald-asic --lib' \
+        'CI: observed dsPIC session rejects unknown and unmodeled firmware'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh dspic::pic0x89_tests::observed_dspic_endpoint_session_preserves_bound_address_and_firmware_for_all_views --locked -p dcentrald-asic --lib' \
+        'CI: observed dsPIC session preserves its exact address and firmware authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::terminal_fence_orders_an_entered_commit_before_safe_off_and_rejects_later_commit --locked -p dcentrald-hal --lib' \
+        'CI: HAL mutation fence nonblocking probe orders an entered commit before safe-off'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::preparatory_lease_timeout_can_still_prove_commit_fence_quiescence --locked -p dcentrald-hal --lib' \
+        'CI: HAL distinguishes stale preparatory leases from active final commits'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::revocation_rejects_a_waiting_stale_commit_before_the_entered_commit_returns --locked -p dcentrald-hal --lib' \
+        'CI: a stale HAL commit rejects immediately after lock-independent revocation'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::panicked_commit_mints_dirty_quiescence_evidence_and_rejects_late_mutation --locked -p dcentrald-hal --lib' \
+        'CI: HAL commit panic produces dirty quiescence evidence and closes admission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::only_zero_timeout_allows_an_initial_quiescent_observation_at_its_deadline --locked -p dcentrald-hal --lib' \
+        'CI: only an initial zero-time quiescent probe may mint evidence at its deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh hardware_mutation_fence::tests::bounded_hardware_mutation_fence_timeout_allows_runtime_drop_before_commit_release --locked -p dcentrald --bin dcentrald' \
+        'CI: HAL commit-fence timeout cannot retain Tokio runtime destruction'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh hardware_mutation_fence::tests::hardware_mutation_fence_never_probes_after_absolute_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: HAL commit-fence observer never probes after its absolute deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh hardware_mutation_fence::tests::poisoned_commit_fence_is_negative_clean_shutdown_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: a poisoned HAL fence cannot authorize clean watchdog disarm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh bounded_nonblocking_probe::tests::immediate_completion_preserves_value_and_strict_timestamp --locked -p dcentrald --bin dcentrald' \
+        'CI: shared nonblocking probe accepts an exact timely completion timestamp'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh bounded_nonblocking_probe::tests::completion_at_deadline_is_not_timely --locked -p dcentrald --bin dcentrald' \
+        'CI: shared nonblocking probe classifies equality with the deadline as late'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh bounded_nonblocking_probe::tests::pending_state_is_returned_and_never_probed_after_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: shared nonblocking probe retains pending authority without post-deadline probes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::held_commit_denies_replacement_until_bounded_revocation_retry_succeeds --locked -p dcentrald --bin dcentrald' \
+        'CI: unresolved measured composition denies replacement until a bounded retry proves quiescence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::fast_invalidation_retains_the_exact_token_and_denies_reopening --locked -p dcentrald --bin dcentrald' \
+        'CI: fast composition invalidation retains its exact token and closed activation authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::revocation_epoch_exhaustion_still_reclaims_execution_and_identity --locked -p dcentrald --bin dcentrald' \
+        'CI: revocation epoch exhaustion remains fail-closed while reclaiming execution and measured identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::active_session_drop_with_held_commit_is_nonblocking --locked -p dcentrald --bin dcentrald' \
+        'CI: measured composition session Drop never waits for a held physical commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::composition_revocation_timeout_allows_runtime_drop_before_commit_release --locked -p dcentrald --bin dcentrald' \
+        'CI: bounded composition revocation cannot retain Tokio runtime destruction'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::composition_authority_source_has_no_production_blocking_fence_or_drop_wait --locked -p dcentrald --bin dcentrald' \
+        'CI: composition authority and Drop expose no production blocking fence path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::contended_authority_mutex_respects_deadline_and_runtime_drop --locked -p dcentrald --bin dcentrald' \
+        'CI: composition authority mutex contention respects deadline and Tokio runtime destruction'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::cancelled_bounded_revocation_while_authority_busy_closes_commit_generation --locked -p dcentrald --bin dcentrald' \
+        'CI: cancellation during authority contention leaves current composition admission closed'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::cancelled_bounded_revocation_after_pending_retains_exclusive_retry_state --locked -p dcentrald --bin dcentrald' \
+        'CI: cancellation after pending composition revocation retains exclusive retry state'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::panicked_execution_commit_is_not_clean_composition_revocation_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: measured-runtime commit panic cannot authorize replacement or clean shutdown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::cancelled_bounded_invalidation_cannot_be_overwritten_by_activation_publish --locked -p dcentrald --bin dcentrald' \
+        'CI: cancelled lock-independent composition invalidation cannot be overwritten by activation publication'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh asic_identity_publication::tests::identity_clear_after_deadline_is_not_attributed_to_early_execution_fence --locked -p dcentrald --bin dcentrald' \
+        'CI: late identity clearance cannot borrow an earlier execution-fence timestamp'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::td003_destructive_write_guard_tests::shutdown_fences_internal_execution_before_identity_revocation_and_safe_off --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon revokes execution before awaits and fences after task reclamation before safe-off'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::watchdog_interval_tests::standard_watchdog_disarm_is_owner_admitted_only_inside_teardown_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: standard watchdog owner rejects Disarm outside its admitted teardown deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::completion_first_observed_at_the_deadline_is_not_positive_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: blocking worker completion first observed at the deadline is negative evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::absolute_join_never_rebases_an_expired_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: blocking worker cleanup cannot rebase an already-expired caller deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_issuance_rejects_duplicate_slots_and_names --locked -p dcentrald --bin dcentrald' \
+        'CI: fixed thread-roster issuance rejects duplicate slots and diagnostic identities'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_conditional_slot_requires_explicit_non_applicability --locked -p dcentrald --bin dcentrald' \
+        'CI: conditional thread slots require explicit owner-issued non-applicability'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_conditional_resolution_matches_discovered_topology --locked -p dcentrald --bin dcentrald' \
+        'CI: conditional thread slots must agree with the discovered hardware topology'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_reservation_drop_and_duplicate_are_terminal_failures --locked -p dcentrald --bin dcentrald' \
+        'CI: dropped or duplicate pre-spawn slot reservation permanently denies roster authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_panic_and_timeout_are_diagnostic_only --locked -p dcentrald --bin dcentrald' \
+        'CI: fixed-roster panic and timeout remain diagnostic-only'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_distinguishes_topology_absence_from_pre_runtime_closeout --locked -p dcentrald --bin dcentrald' \
+        'CI: fixed roster distinguishes topology absence from pre-runtime closeout'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_pre_runtime_closeout_is_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: pre-runtime thread closeout authority remains issuer-bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_runtime_seal_closes_registration_permanently --locked -p dcentrald --bin dcentrald' \
+        'CI: exact runtime roster seal permanently closes thread registration'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::thread_guard::tests::fixed_roster_start_failure_cannot_be_reclassified_as_not_admitted --locked -p dcentrald --bin dcentrald' \
+        'CI: failed exact actor start cannot be reclassified as pre-runtime absence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::completion_first_observed_at_the_deadline_is_not_positive_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: async task completion first observed at the deadline is negative evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::absolute_task_join_never_rebases_an_expired_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: async task cleanup cannot rebase an already-expired caller deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::mining_hardware_tasks_are_owned_and_quiesced_before_hardware_teardown --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining hardware tasks are owned and quiesced before hardware teardown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::teardown_budget::tests::absolute_schedule_is_strict_ordered_checked_and_nonextending --locked -p dcentrald --bin dcentrald' \
+        'CI: teardown deadline schedule is strict, checked, and nonextending'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::teardown_budget::tests::budget_is_one_shot_run_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: teardown budget is one-shot and watchdog run/issuer bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::teardown_budget::tests::sequential_stages_share_one_cleanup_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: sequential teardown stages cannot refresh the cleanup deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::teardown_budget::tests::every_stage_boundary_is_strict --locked -p dcentrald --bin dcentrald' \
+        'CI: teardown stage completion exactly at a deadline remains negative evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::teardown_budget::tests::disarm_command_and_completion_reject_pre_budget_timestamps --locked -p dcentrald --bin dcentrald' \
+        'CI: teardown stages reject timestamps forged before the shared budget start'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::td003_destructive_write_guard_tests::terminal_sync_transport_and_fan_io_runs_on_blocking_workers --locked -p dcentrald --bin dcentrald' \
+        'CI: synchronous daemon controller, GPIO, and fan shutdown I/O cannot park a Tokio worker'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh tests::legacy_watchdog_cancellation_never_magic_closes_before_safeoff --locked -p dcentrald --bin dcentrald' \
+        'CI: legacy watchdog cancellation stops feeds without premature magic close'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::watchdog_interval_tests::watchdog_selects_prioritize_terminal_control_before_kick_ticks --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog terminal control wins a coincident kick tick'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::watchdog_feed_gate::tests::terminal_close_and_physical_kick_share_one_linearization_boundary --locked -p dcentrald --bin dcentrald' \
+        'CI: terminal watchdog closure and physical kicks share one serialized boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::watchdog_feed_gate::tests::physical_deadline_time_is_sampled_only_after_gate_lock_acquisition --locked -p dcentrald --bin dcentrald' \
+        'CI: physical watchdog deadline time is sampled inside the serialized kick boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::watchdog_feed_gate::tests::deadline_publication_never_waits_for_a_blocked_physical_kick --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog teardown deadline publication cannot wait behind a blocked physical kick'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::watchdog_feed_gate::tests::lock_free_stop_signal_withholds_every_later_feed_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: lock-free crash signal terminally suppresses later watchdog feed admission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::watchdog_closeout_orders_barriers_quiescence_and_safeoff_before_disarm --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB uses nonblocking final-commit evidence before safe-off and Disarm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::gpio59_cutoff_receipt_precedes_dspic_and_reset_defense_in_depth --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB checked GPIO59 cutoff precedes shared-controller and reset defense-in-depth work'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::retained_gpio59_cutoff_set_prepares_glitch_free_off_and_owns_the_only_on_transition --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB preconfigures GPIO59 OFF before retaining the sole one-shot ON authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::every_retained_gpio59_lane_can_cut_with_an_independent_file_offset --locked -p dcentrald --bin dcentrald' \
+        'CI: every AM3-BB GPIO59 cutoff lane owns an independent file offset'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::retained_gpio59_cutoff_uses_open_inode_after_ordinary_unlink_fixture --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB ordinary-file fixture proves retained GPIO59 cutoff does not reopen a pathname without claiming sysfs-unexport survival'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::emergency_gpio59_cut_before_energization_permanently_revokes_on_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB terminal cutoff publication permanently revokes board-enable assertion authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::panic_gpio59_cut_serializes_with_published_on_writer_and_finishes_low --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB panic cutoff serializes with the sole published ON writer and finishes physically LOW'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::panic_cutoff_iteration_budget_exhausts_when_a_foreign_on_writer_never_retires --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB panic cutoff exhausts its completed-iteration budget fail-closed when a foreign ON writer never retires'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::polarity_drift_is_cut_physically_low_but_refuses_a_checked_receipt --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB raw direction cutoff survives polarity drift without minting false checked evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::raw_cutoff_descriptor_failure_still_revokes_on_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB raw cutoff failure still terminally revokes ON authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::landed_on_write_with_failed_readback_is_immediately_recut --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB landed HIGH is immediately re-cut when checked ON readback fails'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::heartbeat_terminal_error_cuts_gpio59_before_returning_failure --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB heartbeat terminal failure cuts GPIO59 before returning to its caller'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::post_energization_cancellation_never_reports_clean_shutdown --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB post-energization cancellation remains reset-pending and cannot claim clean shutdown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::stratum_guard_owns_cancellation_before_first_spawn --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB Stratum cancellation and publisher gate are owned before the first spawn can fail'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::stratum_and_cleanup_deadlines_are_strictly_capped --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB Stratum, API, and heartbeat cleanup stages stay under fixed absolute caps'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::mining_loop_top_level_error_is_structurally_pre_spawn --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB top-level errors are structurally limited to the pre-spawn boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::stratum_abort_never_waits_beyond_the_original_absolute_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB non-cooperative Stratum abort never adds an untimed follow-up join'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::stratum_partial_roster_error_retains_and_aborts_all_owned_tasks --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB partial Stratum rosters retain every task handle until Drop aborts them'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime_policy::tests::ephemeral_policy_requires_the_exact_explicit_value --locked -p dcentrald --bin dcentrald' \
+        'CI: ephemeral runtime policy accepts only the exact explicit value 1'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh minimal_app_state_tests::ephemeral_policy_overrides_persistent_audit_sink_and_writes_only_tmpfs --locked -p dcentrald-api --lib' \
+        'CI: ephemeral API audit output cannot inherit a persistent sink override'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh tests::f1_only_fully_owned_closeout_arms_use_management_only_on_err --locked -p dcentrald --bin dcentrald' \
+        'CI: only routes with complete closeout evidence may enter stable management-only after error'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::concurrent_gpio_export_error_is_accepted_only_after_node_materializes --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB accepts a competing GPIO exporter only after observing its materialized node'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::delayed_gpio_attributes_are_boundedly_observed_after_export --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB bounds delayed sysfs GPIO attribute materialization'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::non_active_high_gpio59_topology_is_refused_before_any_gpio_mutation --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB refuses unsupported GPIO59 polarity before any GPIO mutation'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::retained_gpio59_authority_is_preopened_once_and_panic_cut_runs_first --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB preopens independent cutoff lanes and panic teardown cuts GPIO59 before reset sysfs work'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::beaglebone_cold_boot::tests::cold_boot_v2_refuses_mismatched_prepared_board_enable_before_io --locked -p dcentrald-hal --lib' \
+        'CI: AM3-BB cold boot refuses mismatched prepared board-enable authority before hardware I/O'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh platform::hardware_mutation_gate_tests::absolute_mutation_drain_never_rebases_an_expired_deadline --locked -p dcentrald-hal --lib' \
+        'CI: hardware-mutation drain closes admission without rebasing an expired deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::admitted_platform_topology_is_captured_once_and_moved_into_the_engine --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB captures admitted platform topology once and moves it into the engine'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::stratum_task_guard_joins_publishers_before_terminal_state --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB joins Stratum router and status publishers before publishing terminal state'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh am3_bb_mining::tests::heartbeat_roster_is_watchdog_issued_reserved_before_spawn_and_manifest_typed --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB reserves its watchdog-issued heartbeat slot before spawn and passes only typed actor authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::normal_shutdown_retires_every_hardware_owner_before_watchdog_disarm --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid shutdown uses bounded API final-commit evidence before safe-off and Disarm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::hybrid_terminal_safe_off_marker_consumes_watchdog_closeout_receipt --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid management-safe disposition consumes positive watchdog closeout evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::serial_dispatch_rejoins_normal_shutdown_with_retained_pic0x89_session --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid serial-dispatch routes rejoin the sole API/actor/safe-off watchdog closeout pipeline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::heartbeat_roster_is_watchdog_issued_reserved_before_spawn_and_manifest_typed --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid reserves watchdog-issued PSU/PIC heartbeat slots before spawn and passes only typed actor authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::am2_power_shutdown_evidence_tests::applicable_but_missing_psu_leg_cannot_be_reported_as_graceful --locked -p dcentrald --bin dcentrald' \
+        'CI: applicable AM2 shutdown legs cannot be omitted as NotApplicable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_failure_disposition_requires_positive_watchdog_closeout --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial management-safe disposition requires a positive watchdog closeout receipt'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::local_teardown_request_bounds_feeds_without_actor_acknowledgement --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog teardown deadline is locally visible before actor acknowledgement'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::admission_distinguishes_pre_open_from_post_open_failures --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog admission distinguishes no-open failures from reset-pending post-open outcomes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::only_opened_or_unknown_admission_carries_reset_pending_marker --locked -p dcentrald --bin dcentrald' \
+        'CI: only opened-or-unknown watchdog admission carries the reset-pending marker through error chains'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::watchdog_teardown_request_and_actor_acknowledgement_are_separate_boundaries --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog Teardown publication is synchronous and actor acknowledgement is a separate boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::watchdog_teardown_receipt_timestamp_cannot_launder_late_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog worker timestamp prevents late teardown admission from being laundered by host receipt timing'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::watchdog_teardown_admission_wait_uses_the_original_absolute_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog teardown admission wait uses the original absolute cutoff-start deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::locally_latched_deadline_accepts_only_its_matching_actor_command --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog locally latched teardown accepts only the identical actor deadline'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::absolute_budget_disarm_uses_the_watchdog_issued_schedule --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog Disarm consumes its own run-bound absolute teardown schedule'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::worker_rejects_disarm_after_absolute_start_deadline_even_before_feed_deadline --locked -p dcentrald --bin dcentrald' \
+        'CI: exact watchdog worker revalidates DisarmStart at the physical magic-close boundary'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::disarm_permit_from_another_watchdog_run_is_rejected --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog disarm rejects a complete permit from another run scope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::same_run_permit_from_another_composition_is_rejected --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog disarm rejects a same-run permit from another hardware composition'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::watchdog_composition_binding_is_single_use --locked -p dcentrald --bin dcentrald' \
+        'CI: watchdog hardware-composition binding is one-shot'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::nopic_serial_actor_roster_is_watchdog_issued_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic serial actor roster is watchdog-issued and issuer-bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::am2_serial_actor_roster_records_bypass_topology_and_issuer_binding --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 serial actor roster records conditional topology and issuer binding'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::serial_watchdog_admission_cannot_change_composition_after_claim --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial watchdog admission cannot change composition after claim'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::exact_serial_compositions_reject_untyped_mining_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial watchdog Mining rejects admission without typed runtime-actor authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::hybrid_actor_roster_owner_is_single_claim_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid actor roster owner is one-shot and issuer-bound to its route scope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::am3_actor_roster_owner_is_single_claim_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB actor roster owner is one-shot and issuer-bound to its route scope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::never_energized_evidence_from_another_run_is_rejected --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 pre-energization close authority rejects another watchdog run'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::standard_roster_rejects_every_slot_never_started --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining roster cannot authorize a run that never owned its required dispatcher'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::standard_roster_receipt_is_run_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining actor receipt is run- and issuer-bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::standard_roster_terminalization_is_one_shot_and_closes_spawn_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining actor terminalization is one-shot and closes spawn admission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::standard_roster_timeout_returns_diagnostics_without_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining actor timeout remains diagnostic-only'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::task_guard::tests::standard_roster_panic_is_quiescent_but_not_clean_disarm_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: standard mining actor panic is quiescent but cannot authorize clean watchdog Disarm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::standard_disarm_permit_uses_watchdog_issued_actor_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: standard watchdog terminal authority is bound to its watchdog-issued actor and unit-closeout identities'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::standard_closeout_tests::standard_unit_closeout_receipts_are_one_shot_run_and_issuer_bound --locked -p dcentrald --bin dcentrald' \
+        'CI: standard unit closeout receipts are one-shot and watchdog run/issuer bound'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::standard_closeout_tests::standard_unit_closeout_rejects_cross_run_and_mixed_issuer_receipts --locked -p dcentrald --bin dcentrald' \
+        'CI: standard unit closeout rejects mixed issuers and cross-run receipt substitution'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::standard_closeout_tests::standard_shutdown_source_has_no_remintable_unit_closeout_markers --locked -p dcentrald --bin dcentrald' \
+        'CI: standard shutdown contains no remintable zero-sized closeout markers'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh runtime::safety_watchdog::tests::production_watchdog_disarm_uses_only_move_only_exact_route_manifests --locked -p dcentrald --bin dcentrald' \
+        'CI: every nonstandard production watchdog route consumes an exact move-only evidence manifest'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_apw_heartbeat_retries_only_wire_exhaustion_and_fails_typed_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 direct APW heartbeat retries only typed ordinary-wire exhaustion'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_apw_heartbeat_threshold_retries_terminates_and_recovers --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 direct APW ordinary-wire retry budget is bounded and recoverable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_stabilization_observes_terminal_exit_before_hardware_bringup_continues --locked -p dcentrald --bin dcentrald' \
+        'CI: APW terminal receipt cancels exact BM1362 hardware bring-up during stabilization'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_checked_teardown_retains_failed_leg_owners_and_retries_composite_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 teardown cuts retained dsPIC endpoints independently of aggregate APW evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_stabilization_closed_channel_preserves_ordinary_shutdown --locked -p dcentrald --bin dcentrald' \
+        'CI: closed APW exit channel preserves an already-active ordinary shutdown diagnosis'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_stabilization_timer_boundary_preserves_shutdown_attribution --locked -p dcentrald --bin dcentrald' \
+        'CI: APW stabilization timer boundary preserves ordinary shutdown attribution'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_actor_unexpected_exit_cancels_lifecycle_and_publishes_reason --locked -p dcentrald --bin dcentrald' \
+        'CI: unexpected APW heartbeat actor loss cancels lifecycle and remains diagnosable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon_lifecycle::tests::safe_off_error_forbids_the_management_plane --locked -p dcentrald --bin dcentrald' \
+        'CI: safe-off failure forbids management-only lifecycle recovery'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_terminal_publication_does_not_relabel_ordinary_shutdown --locked -p dcentrald --bin dcentrald' \
+        'CI: in-flight APW failure cannot relabel an already-active ordinary shutdown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_actor_topology_rejects_controller_conflicts_before_route_use --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial actor topology rejects contradictory controller evidence before route use'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_io_rejects_alternate_actor_before_spawn_closure --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial roster rejects an alternate actor before its spawn closure runs'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_actor_rosters_reserve_before_spawn_and_feed_typed_manifests --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial actors reserve before spawn and feed typed watchdog manifests'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_pre_runtime_closeout_classifies_only_untouched_actor_slots --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial pre-runtime closeout classifies only untouched conditional actor slots'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_actor_closeout_requires_matching_route_domain_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial actor closeout requires matching route-domain authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_runtime_actor_admission_requires_promoted_execution_and_same_roster --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial runtime actors require promoted execution and their issuing roster'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_runtime_actor_admission_closes_as_joined_after_typed_mining_permit --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial Mining permit closes runtime actors as joined evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_actor_topology_is_power_bound_and_failed_start_stays_negative --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 actor topology is power-bound and failed starts remain negative evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_reset_closeout_distinguishes_never_attempted_from_serial_barrier --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 reset closeout distinguishes never-attempted from serial-barrier evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_reset_mutation_is_route_bound_read_back_and_manifested --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 reset mutation is route-bound, read back, and terminally manifested'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_dspic_safeoff_distinguishes_never_armed_from_lost_armed_owner --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 dsPIC safe-off distinguishes never armed from lost armed authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh board_control::tests::exact_am2_reset_receipt_requires_assert_and_release_register_readback --locked -p dcentrald-hal --lib' \
+        'CI: exact AM2 reset receipt requires asserted and released register readback'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_invariant_failures_preserve_ordered_safety_legs --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial invariant failures preserve every independent terminal safety leg'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_session_closeout_distinguishes_pending_observing_and_executing --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial session closeout distinguishes never-observed, observation-only, and executing phases'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_session_promotion_mismatch_restores_observation_and_revokes_late_work --locked -p dcentrald --bin dcentrald' \
+        'CI: failed exact serial promotion restores observation authority for ordered revocation'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_session_rejects_cross_session_observation_facade --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial observation facade is issuer-bound and cannot cross sessions'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_raw_observation_is_restricted_and_promoted_without_reopen --locked -p dcentrald --bin dcentrald' \
+        'CI: exact raw UART observation remains restricted to one promotable session'
+    # Work-dispatch admission lifecycle + serial safety must-wire (2026-07-29).
+    # Sibling work_dispatch_admission_tests modules (not under tests::) + BIP320 /
+    # hash_on_disconnect honesty. Pin kept in check_work_dispatch_ci_coverage.py.
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_watchdog_state_maps_ownership --locked -p dcentrald --bin dcentrald' \
+        'CI: serial work-dispatch maps watchdog ownership states'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_heartbeat_nopic_and_passthrough_require_none --locked -p dcentrald --bin dcentrald' \
+        'CI: serial NoPic/passthrough heartbeat requirement is none'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_admit_green_succeeds --locked -p dcentrald --bin dcentrald' \
+        'CI: serial admit succeeds when watchdog+HB+thermal green'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_admit_refuses_failed_dspic_heartbeat --locked -p dcentrald --bin dcentrald' \
+        'CI: serial admit refuses failed dsPIC heartbeat'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_admit_refuses_watchdog_unavailable --locked -p dcentrald --bin dcentrald' \
+        'CI: serial admit refuses unavailable watchdog'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_terminal_revoke_blocks_re_admit_until_teardown --locked -p dcentrald --bin dcentrald' \
+        'CI: serial terminal revoke blocks re-admit until teardown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::work_dispatch_admission_tests::serial_run_owns_lifecycle_and_calls_shipped_adapters --locked -p dcentrald --bin dcentrald' \
+        'CI: serial run owns WorkDispatchLifecycle and shipped adapters'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_watchdog_state_maps_config_and_mining_enter --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid work-dispatch maps watchdog ownership states'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_heartbeat_passthrough_requires_none --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid passthrough heartbeat requirement is none'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_admit_green_succeeds --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid admit succeeds when pillars green'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_admit_refuses_failed_pic_heartbeat --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid admit refuses failed PIC heartbeat'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_admit_refuses_thermal_not_ready --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid admit refuses thermal not-ready'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_terminal_revoke_blocks_re_admit_until_teardown --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid terminal revoke blocks re-admit until teardown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::hybrid_run_owns_lifecycle_and_calls_shipped_adapters --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid run owns WorkDispatchLifecycle and shipped adapters'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_nonce2_beta_gate_is_explicit_and_fail_closed --locked -p dcentrald --bin dcentrald' \
+        'CI: stock nonce2 beta gate is explicit and fail-closed'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_nonce2_beta_refusal_precedes_all_device_access --locked -p dcentrald --bin dcentrald' \
+        'CI: stock nonce2 beta refusal precedes all device access'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_nonce2_beta_suppresses_every_uncorrelated_pool_submission --locked -p dcentrald --bin dcentrald' \
+        'CI: stock nonce2 beta suppresses every uncorrelated pool submission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_watchdog_state_maps_config_and_kicker_presence --locked -p dcentrald --bin dcentrald' \
+        'CI: stock work-dispatch maps watchdog/kicker states'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::admit_before_work_dispatch_succeeds_when_pillars_green --locked -p dcentrald --bin dcentrald' \
+        'CI: stock admit succeeds when pillars green'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::admit_refuses_failed_initial_pic_heartbeat --locked -p dcentrald --bin dcentrald' \
+        'CI: stock admit refuses failed initial PIC heartbeat'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::admit_refuses_when_soc_watchdog_enabled_but_kicker_missing --locked -p dcentrald --bin dcentrald' \
+        'CI: stock admit refuses missing kicker when SoC WDT enabled'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::terminal_revoke_on_heartbeat_failure_blocks_re_admit_and_cuts_hash_first --locked -p dcentrald --bin dcentrald' \
+        'CI: stock terminal revoke cuts hash first and blocks re-admit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::operator_shutdown_revoke_also_stops_feed_and_parks_fans --locked -p dcentrald --bin dcentrald' \
+        'CI: stock operator shutdown stops feed and parks fans'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_run_owns_lifecycle_and_calls_shipped_admit_revoke_adapters --locked -p dcentrald --bin dcentrald' \
+        'CI: stock run owns WorkDispatchLifecycle and shipped adapters'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_watchdog_state_maps_config_and_feed_owner --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon work-dispatch maps watchdog/feed-owner states'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_thermal_maps_emergency_vs_ready --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon thermal emergency vs ready mapping'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_admit_green_succeeds_with_initialized_pics --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon admit succeeds when pillars green'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_nopic_empty_controllers_uses_none_required --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon NoPic empty controllers use NoneRequired heartbeat'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_admit_refuses_failed_pic_heartbeat --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon admit refuses failed PIC heartbeat'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_admit_refuses_when_soc_watchdog_enabled_but_feed_owner_missing --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon admit refuses missing feed owner when SoC WDT enabled'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_admit_refuses_thermal_emergency --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon admit refuses thermal emergency'
+    # Work-domain refactor admission coverage (registered 2026-08-02). These four
+    # tests shipped in stock_mining.rs / daemon.rs on 2026-07-30 but were never
+    # wired into the workflow or this inventory, which is what the work-dispatch
+    # coverage gate was reporting. Registered only after the bin crate was made
+    # to compile and all four were OBSERVED passing.
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_thermal_requires_measured_startup_and_latch_dominates --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon thermal requires measured startup and latch dominates'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_terminal_revoke_blocks_re_admit_and_cuts_hash_first --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon terminal revoke cuts hash first and blocks re-admit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_run_owns_lifecycle_and_admits_before_work_dispatcher --locked -p dcentrald --bin dcentrald' \
+        'CI: daemon run owns WorkDispatchLifecycle and admits before WorkDispatcher'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_rolled_version_reconstructs_when_pool_did_not_negotiate_mask --locked -p dcentrald --bin dcentrald' \
+        'CI: serial BIP320 rolled version reconstructs without negotiated mask'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_rolled_version_accepts_only_negotiated_mask_bits --locked -p dcentrald --bin dcentrald' \
+        'CI: serial BIP320 rolled version accepts only negotiated mask bits'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_source_clears_stale_work_when_hash_on_disconnect_is_false --locked -p dcentrald --bin dcentrald' \
+        'CI: serial clears stale work when hash_on_disconnect does not cut hash'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::work_dispatch_admission_tests::multi_pic_voltage_enable_uses_production_powerup_planner --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid multi-PIC enable uses production power-up planner (P1-5)'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_heartbeat_terminal_limit_precedes_short_watchdog_reset_windows --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 heartbeat terminal limit precedes short WDT reset windows'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_heartbeat_requires_supported_observed_dspic_firmware --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 heartbeat requires supported observed dsPIC firmware'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_heartbeat_failure_budget_is_bounded_and_success_resets_it --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 heartbeat failure budget is bounded and success resets it'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_fan_loop_disposition_is_terminal_for_every_revoked_state --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic fan loop disposition is terminal for every revoked state'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::terminal_barrier_failure_consumes_no_safe_off_leg_before_retry --locked -p dcentrald --bin dcentrald' \
+        'CI: terminal barrier failure consumes no safe-off leg before retry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_never_energized_closeout_is_not_terminal_safe_off_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 never-energized closeout is not terminal safe-off evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_bm1362_refuses_unmonitored_uart_trans_routes --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 BM1362 refuses unmonitored UART-trans routes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::validated_serial_admission_binds_exact_route_family_and_separate_geometry --locked -p dcentrald --bin dcentrald' \
+        'CI: validated serial admission binds exact route family and geometry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::ambiguous_nopic_count_refuses_instead_of_guessing_a_pic_driver --locked -p dcentrald --bin dcentrald' \
+        'CI: ambiguous NoPic count refuses instead of guessing PIC driver'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_serial_voltage_identity_rejects_impossible_model_chip_pairs --locked -p dcentrald --bin dcentrald' \
+        'CI: native serial voltage identity rejects impossible model/chip pairs'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::preenergize_airflow_envelope_reports_low_point_and_restore_failures_together --locked -p dcentrald --bin dcentrald' \
+        'CI: preenergize airflow reports low-point and restore failures together'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::preenergize_airflow_envelope_refuses_low_point_and_restores_maximum --locked -p dcentrald --bin dcentrald' \
+        'CI: preenergize airflow refuses low point and restores maximum'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::preenergize_airflow_envelope_proves_max_then_min_then_restores_max --locked -p dcentrald --bin dcentrald' \
+        'CI: preenergize airflow proves max then min then restores max'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_nonce_safety_distinguishes_startup_midrun_and_disabled --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 nonce safety distinguishes startup midrun and disabled'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_actor_receiver_loss_and_three_read_errors_are_terminal --locked -p dcentrald --bin dcentrald' \
+        'CI: serial actor receiver loss and three read errors are terminal'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_serial_identity_never_comes_from_default_or_explicit_geometry --locked -p dcentrald --bin dcentrald' \
+        'CI: native serial identity never comes from default or explicit geometry alone'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_experimental_opt_in_admits_only_the_exact_env_value --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1366 experimental opt-in admits only the exact env value'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_experimental_admission_consumes_the_real_opt_in_and_observed_identity --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1366 experimental admission consumes real opt-in and observed identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_stabilization_requires_live_actor_and_successful_progress --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 APW stabilization requires live actor and successful progress'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_execution_terminal_rejects_late_physical_commit --locked -p dcentrald --bin dcentrald' \
+        'CI: serial execution terminal rejects late physical commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::retained_single_owner_safe_off_legs_execute_all_pending_work_and_never_replay_success --locked -p dcentrald --bin dcentrald' \
+        'CI: retained single-owner safe-off legs execute all pending work without success replay'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_actor_freshness_rejects_queued_or_disconnected_required_exits --locked -p dcentrald --bin dcentrald' \
+        'CI: exact serial actor freshness rejects queued or disconnected required exits'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_bringup_wait_is_immediately_cancellation_aware --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 bringup wait is immediately cancellation-aware'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_cancellation_refuses_every_subsequent_validated_serial_commit --locked -p dcentrald --bin dcentrald' \
+        'CI: AM2 cancellation refuses every subsequent validated serial commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_bringup_validates_before_consuming_power_boundary_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 bringup validates before consuming power-boundary authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_pool_disconnect_requires_announced_authority_and_uart_commit --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1362 pool disconnect requires announced authority and UART commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_degraded_enumeration_component_cannot_bypass_runtime_refusal --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1366 degraded enumeration cannot bypass runtime refusal'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_enumeration_admission_is_strict_or_explicitly_degraded --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1366 enumeration admission is strict or explicitly degraded'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::validated_serial_admission_rejects_family_cross_use_and_impossible_frame_envelope --locked -p dcentrald --bin dcentrald' \
+        'CI: validated serial admission rejects family cross-use and impossible frame envelope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::assigned_serial_geometry_requires_exact_unique_configured_address_coverage --locked -p dcentrald --bin dcentrald' \
+        'CI: assigned serial geometry requires exact unique configured address coverage'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_serial_geometry_requires_catalog_evidence_or_explicit_override --locked -p dcentrald --bin dcentrald' \
+        'CI: native serial geometry requires catalog evidence or explicit override'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_serial_difficulty_requires_a_registered_profile --locked -p dcentrald --bin dcentrald' \
+        'CI: native serial difficulty requires a registered profile'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_runtime_has_no_unbrokered_kernel_i2c_fd_or_ioctl_path --locked -p dcentrald --bin dcentrald' \
+        'CI: serial runtime has no unbrokered kernel i2c fd or ioctl path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::unique_owner_installation_never_replaces_live_or_completed_custody --locked -p dcentrald --bin dcentrald' \
+        'CI: unique owner installation never replaces live or completed custody'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am3_bb_uart_trans_chain_parser_accepts_deduped_ttyo_list --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB uart-trans parser accepts deduped ttyO list'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am3_bb_uart_trans_chain_parser_accepts_single_ttyo_path --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB uart-trans parser accepts single ttyO path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am3_bb_uart_trans_chain_parser_rejects_unknown_or_empty_paths --locked -p dcentrald --bin dcentrald' \
+        'CI: AM3-BB uart-trans parser rejects unknown or empty paths'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::apw_bypass_and_unclassified_state_transitions_are_explicit --locked -p dcentrald --bin dcentrald' \
+        'CI: APW bypass and unclassified state transitions are explicit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1368_fixture_interval_agrees_with_the_general_ladder --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1368 fixture interval agrees with general ladder'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1370_and_bm1368_chip_ids_are_distinct_in_discriminator --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1370 and BM1368 chip ids are distinct in discriminator'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1370_serial_execution_requires_exact_experimental_chip_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1370 serial execution requires exact experimental chip authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1398_fixture_validates_full_header_with_rolled_midstate --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1398 fixture validates full header with rolled midstate'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1398_rejects_out_of_range_midstate_even_without_rolling --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1398 rejects out-of-range midstate even without rolling'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1398_work_id_wraps_on_seven_bit_job_ring --locked -p dcentrald --bin dcentrald' \
+        'CI: BM1398 work id wraps on seven-bit job ring'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_apw_applicability_is_explicit_and_unclassified_state_cannot_close --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 APW applicability is explicit; unclassified state cannot close'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_bm1362_init_uses_constructor_plan_and_retained_observations --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 BM1362 init uses constructor plan and retained observations'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_am2_power_boundary_remains_crossed_when_gpio_assertion_is_unknown --locked -p dcentrald --bin dcentrald' \
+        'CI: exact AM2 power boundary remains crossed when GPIO assertion is unknown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_route_api_lifecycle_distinguishes_never_opened_from_opened_and_closed --locked -p dcentrald --bin dcentrald' \
+        'CI: exact route API lifecycle distinguishes never-opened from opened and closed'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_amlogic_serial_source_has_one_validated_write_and_shutdown_path --locked -p dcentrald --bin dcentrald' \
+        'CI: native Amlogic serial source has one validated write and shutdown path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_family_classifier_matches_profile_table --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic family classifier matches profile table'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::pic_enable_cmd_vnish_byte_exact --locked -p dcentrald --bin dcentrald' \
+        'CI: PIC enable cmd Vnish byte-exact'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::pic_family_default_path_is_unchanged_for_non_nopic_units --locked -p dcentrald --bin dcentrald' \
+        'CI: PIC family default path is unchanged for non-NoPic units'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::pinned_bm1370_model_wins_over_misleading_chip_count --locked -p dcentrald --bin dcentrald' \
+        'CI: pinned BM1370 model wins over misleading chip count'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::retired_bhb56_dspic_route_has_no_runtime_capability_surface --locked -p dcentrald --bin dcentrald' \
+        'CI: retired BHB56 dsPIC route has no runtime capability surface'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s21pro_family_models_resolve_to_bm1370_not_bm1368 --locked -p dcentrald --bin dcentrald' \
+        'CI: S21 Pro family models resolve to BM1370 not BM1368'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_actor_distinguishes_empty_poll_liveness_from_committed_work --locked -p dcentrald --bin dcentrald' \
+        'CI: serial actor distinguishes empty poll liveness from committed work'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_actor_mints_commit_evidence_only_after_successful_tx --locked -p dcentrald --bin dcentrald' \
+        'CI: serial actor mints commit evidence only after successful tx'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_address_ladder_is_unchanged_for_shipped_populations_and_safe_at_one_chip --locked -p dcentrald --bin dcentrald' \
+        'CI: serial address ladder is unchanged for shipped populations and safe at one chip'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_share_fixture_keeps_target_and_achieved_difficulty_separate --locked -p dcentrald --bin dcentrald' \
+        'CI: serial share fixture keeps target and achieved difficulty separate'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_thermal_selection_preserves_effective_source_provenance --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 thermal selection preserves effective source provenance'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::open_core_rail_plan_is_atomic_and_fail_closed --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid open core rail plan is atomic and fail closed'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::elevated_rail_has_one_asic_init_attempt_without_a_dwell_budget --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid elevated rail has one asic init attempt without a dwell budget'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_endpoint_migration_reuses_existing_eeprom_and_version_observations --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 endpoint migration reuses existing eeprom and version observations'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::selected_pic0x89_owner_has_no_raw_model_address_fallback --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid selected pic0x89 owner has no raw model address fallback'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::normal_shutdown_exact_pic0x89_owner_cannot_reconstruct_raw_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid normal shutdown exact pic0x89 owner cannot reconstruct raw authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::normal_shutdown_requests_feeder_stop_before_cutoff_ack_and_later_join --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid normal shutdown requests feeder stop before cutoff ack and later join'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::post_enable_uart_gate_failure_reuses_retained_pic0x89_controller --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid post enable uart gate failure reuses retained pic0x89 controller'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::selected_pic0x89_heartbeat_owner_is_issued_by_retained_endpoint_session --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid selected pic0x89 heartbeat owner is issued by retained endpoint session'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::selected_pic0x89_thermal_owner_is_issued_by_retained_endpoint_session --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid selected pic0x89 thermal owner is issued by retained endpoint session'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::re018_pll_hex_envelope_accepts_proven_and_refuses_unsafe --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid re018 pll hex envelope accepts proven and refuses unsafe'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::at3_chain_id_for_pic_addr_maps_canonical_dspic_addrs_to_slots --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid at3 chain id for pic addr maps canonical dspic addrs to slots'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::at3_rail_read_gate_defaults_off_and_opts_in_via_config --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid at3 rail read gate defaults off and opts in via config'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::at3_rail_read_interval_defaults_30_and_clamps --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid at3 rail read interval defaults 30 and clamps'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_bus_prime_order_primes_non_selected_ascending --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 bus prime order primes non selected ascending'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_hybrid_bip320_reconstruction_matches_shared_bm1362_helper --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 hybrid bip320 reconstruction matches shared bm1362 helper'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_phase1_multi_serial_devices_selects_first_chain_only --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 phase1 multi serial devices selects first chain only'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_phase1_dual_plan_is_logged_but_execution_selector_stays_first_only --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 phase1 dual plan is logged but execution selector stays first only'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_dual_chain_gate_is_default_off --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 dual chain gate is default off'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_dual_chain_second_uart_default_and_override --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 dual chain second uart default and override'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_serial_chain_state_attributes_and_dedups --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 serial chain state attributes and dedups'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_dual_chain_attributes_nonces_to_the_producing_chain_only --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 dual chain attributes nonces to the producing chain only'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_dual_chain_bip320_reconstruction_is_per_chain_correct --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 dual chain bip320 reconstruction is per chain correct'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_teardown_params_global_set_then_read_round_trip --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 teardown params global set then read round trip'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_fastuart_settle_ms_default_override_and_clamp --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 fastuart settle ms default override and clamp'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_env_flag_off_only_true_for_falsey_values --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 env flag off only true for falsey values'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_safe_teardown_default_on_opt_out --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 safe teardown default on opt out'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::board_control_uio_falls_back_to_17_on_host --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid board control uio falls back to 17 on host'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::s19_dspic_addrs_cover_all_three_controllers --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid s19 dspic addrs cover all three controllers'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::psu_override_active_truth_table --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid psu override active truth table'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::chip_rail_target_ignores_psu_override_voltage --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid chip rail target ignores psu override voltage'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_uart_fallback_candidates_exclude_ps_console_uart --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 uart fallback candidates exclude ps console uart'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::gpio_number_spec_parser_accepts_numeric_and_pwr_control_label_specs --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid gpio number spec parser accepts numeric and pwr control label specs'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::proc_comm_matcher_requires_exact_bosminer_name --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid proc comm matcher requires exact bosminer name'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::xil_pic_get_version_framed_reply_parser_accepts_fw89 --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid xil pic get version framed reply parser accepts fw89'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::xil_pic_get_version_transaction_uses_bytewise_write_and_single_byte_read --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid xil pic get version transaction uses bytewise write and single byte read'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::pic_get_version_retry_budget_is_bosminer_faithful --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid pic get version retry budget is bosminer faithful'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::pic_get_version_helper_can_still_prepend_flush_when_asked --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid pic get version helper can still prepend flush when asked'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::parse_ablation_fields_extracts_canonical_summary_shape --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid parse ablation fields extracts canonical summary shape'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::parse_ablation_fields_captures_126_to_28_collapse_signature --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid parse ablation fields captures 126 to 28 collapse signature'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave42_env_gate_name_is_dcent_am2_dspic_bosminer_faithful --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave42 env gate name is dcent am2 dspic bosminer faithful'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_recognizes_strace_4byte_response_with_fw_at_index_1 --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse recognizes strace 4byte response with fw at index 1'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_handles_all_known_fw_bytes_in_4byte_shape --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse handles all known fw bytes in 4byte shape'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::daemon_side_fw86_refuses_voltage_without_lab_override --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid daemon side fw86 refuses voltage without lab override'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_does_not_false_positive_on_older_3byte_shape --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse does not false positive on older 3byte shape'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_does_not_false_positive_on_vnish_5byte_shape --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse does not false positive on vnish 5byte shape'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_rejects_strace_shape_with_garbage_status_byte --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse rejects strace shape with garbage status byte'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_rejects_strace_shape_with_garbage_fw_byte --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse rejects strace shape with garbage fw byte'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::wave28b_parse_handles_1_byte_read_without_false_4byte_match --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid wave28b parse handles 1 byte read without false 4byte match'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::parse_ablation_fields_tolerates_missing_or_error_summaries --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid parse ablation fields tolerates missing or error summaries'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::freq_only_default_off_is_byte_identical_gate --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid freq only default off is byte identical gate'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::freq_only_opt_in_via_config_key --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid freq only opt in via config key'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::applied_pll_band_is_proven_table_intersection_400_545 --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid applied pll band is proven table intersection 400 545'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::built_config_hard_pins_voltage_and_dvfs_off_and_clamps_band --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid built config hard pins voltage and dvfs off and clamps band'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::quiet_home_efficiency_is_the_default_objective_for_dot25 --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid quiet home efficiency is the default objective for dot25'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::explicit_operator_hashrate_target_is_preserved_not_silently_quieted --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid explicit operator hashrate target is preserved not silently quieted'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::hacker_mode_opts_back_into_hashrate_but_voltage_stays_off --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid hacker mode opts back into hashrate but voltage stays off'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::chain_stats_snapshot_is_chip_count_aware_and_resets_window --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid chain stats snapshot is chip count aware and resets window'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::quiet_idle_pwm_default_home_path --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid quiet idle pwm default home path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::quiet_idle_pwm_clamps_down_to_fan_max --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid quiet idle pwm clamps down to fan max'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::quiet_idle_pwm_never_exceeds_safety_max --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid quiet idle pwm never exceeds safety max'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::quiet_idle_pwm_zero_is_preserved --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid quiet idle pwm zero is preserved'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::re018_decoded_register_values_are_byte_exact --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid re018 decoded register values are byte exact'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::re018_hashrate_fix_constants_are_byte_exact --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid re018 hashrate fix constants are byte exact'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::re018_nonce_space_base_matches_traced_values --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid re018 nonce space base matches traced values'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::re018_gate_is_off_by_default --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid re018 gate is off by default'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_mid_run_stall_timeout_default_override_and_disable --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 mid run stall timeout default override and disable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_mid_run_stall_fires_only_after_generous_timeout --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 mid run stall fires only after generous timeout'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_nonce_recently_active_is_conservative --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 nonce recently active is conservative'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_recent_window_hashrate_drops_when_activity_stops --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 recent window hashrate drops when activity stops'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_rolling_window_hashrate_stable_on_sparse_eco_cadence --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 rolling window hashrate stable on sparse eco cadence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_fan_fault_step_requires_sustained_confident_zero_rpm --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 fan fault step requires sustained confident zero rpm'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_graded_throttle_steps_down_only_above_hot --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 graded throttle steps down only above hot'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::hybrid_route_admission_is_consumed_at_first_run_entry --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid hybrid route admission is consumed at first run entry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_chain_state_status_reverts_to_stalled_when_inactive --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 chain state status reverts to stalled when inactive'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_publish_status_downgrades_to_stalled_on_inactivity --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid am2 publish status downgrades to stalled on inactivity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::smart_apw_lenience_excludes_typed_controller_and_safety_failures --locked -p dcentrald --bin dcentrald' \
+        'CI: opportunistic smart APW lenience excludes typed controller and safety failures'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::smart_apw_lenient_service_terminal_refusal_returns_error_without_heartbeat --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'SIM-HAL CI: smart APW bring-up returns a terminal service refusal before heartbeat spawn'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::smart_apw_heartbeat_typed_refusal_cancels_hybrid_run --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'SIM-HAL CI: smart APW heartbeat authority loss cancels the hybrid lifecycle'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::serialized_apw_service_rejects_positive_short_frame_before_later_boot_verbs --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: serialized APW exact-write completion regression executes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::terminally_superseded_apw_service_mutation_has_zero_retry_or_buffer_drain --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: terminally superseded APW mutation remains non-retryable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::terminally_superseded_apw_heartbeat_has_no_opcode_fallback_retry_or_state_change --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: terminally superseded APW heartbeat cannot fall back or mutate state'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::dual_ordinary_wire_heartbeat_exhaustion_has_a_dedicated_retryable_type --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: dual ordinary-wire heartbeat failure constructs the dedicated retryable type'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::apw_error_classification_preserves_fabric_ownership_and_defers_only_wire_exhaustion --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: APW preserves typed fabric ownership failures and defers only wire exhaustion'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::every_raw_apw_observation_and_loki_cold_wake_path_preserves_typed_errors --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: raw APW observations and standalone Loki cold-wake preserve typed ownership failures'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::legacy_cold_boot_returns_typed_probe_error_without_outer_retry_or_reflush --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: legacy APW cold boot returns typed probe refusal without retry or flush'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::cached_legacy_cold_boot_returns_typed_disable_error_after_only_wire_probe_retries --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: cached legacy APW cold boot returns typed Disable refusal immediately'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh psu::tests::higher_level_apw_boot_wrappers_defer_only_ordinary_wire_failures --locked -p dcentrald-hal --features sim-hal --lib' \
+        'SIM-HAL CI: higher APW boot wrappers defer only ordinary wire failures'
     require_pattern "$sim_workflow" \
         'runtime::thread_guard::tests' \
         'SIM-HAL CI: bounded runtime-thread ownership regression executes'
@@ -5246,22 +6625,22 @@ sim_hal_evidence_contract_gates
 nopic_watchdog_evidence_contract_gates() {
     workflow='../../.github/workflows/dcentos-offline-gates.yml'
     require_pattern "$workflow" \
-        'cargo test -p dcentrald --bin dcentrald runtime::safety_watchdog::tests' \
+        'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald --bin dcentrald -- runtime::safety_watchdog::tests' \
         'NoPic watchdog CI: fail-closed worker state-machine tests execute'
     require_pattern "$workflow" \
-        'cargo test -p dcentrald --bin dcentrald nopic_watchdog_and_safeoff_order_is_fail_closed' \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_watchdog_and_safeoff_order_is_fail_closed --locked -p dcentrald --bin dcentrald' \
         'NoPic watchdog CI: engine teardown source-order contract executes'
     require_pattern "$workflow" \
-        'cargo test -p dcentrald --bin dcentrald watchdog_armed_on_all_mining_entry_paths' \
+        'sh ../scripts/run_exact_cargo_test.sh tests::watchdog_armed_on_all_mining_entry_paths --locked -p dcentrald --bin dcentrald' \
         'NoPic watchdog CI: mining entry-path admission contract executes'
     require_pattern "$workflow" \
-        'cargo test -p dcentrald-hal --lib hardware_mutation_gate_tests' \
+        'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald-hal --lib -- hardware_mutation_gate_tests' \
         'NoPic watchdog CI: control-plane mutation drain contract executes'
     require_pattern "$workflow" \
-        'checked_fan_command_surfaces_partial_two_channel_write' \
+        'sh ../scripts/run_exact_cargo_test.sh platform::amlogic::tests::checked_fan_command_surfaces_partial_two_channel_write --locked -p dcentrald-hal --lib' \
         'NoPic watchdog CI: partial two-channel fan failure executes'
     require_pattern "$workflow" \
-        'checked_psu_gpio_parser_never_converts_unknown_data_to_off' \
+        'sh ../scripts/run_exact_cargo_test.sh platform::amlogic::tests::checked_psu_gpio_parser_never_converts_unknown_data_to_off --locked -p dcentrald-hal --lib' \
         'NoPic watchdog CI: unknown GPIO readback remains fail-closed'
     require_pattern 'dcentrald/dcentrald-api/src/rest/late.rs' \
         'state.hardware_mutation_gate.try_acquire()' \
@@ -5358,6 +6737,30 @@ fi
 # must not be admitted automatically after an abnormal exit. Check every board
 # overlay dynamically so new product supervisors inherit the same fail-closed
 # policy instead of reintroducing a bounded-but-unsafe crash loop.
+# The aggregate policy directly executes the three component behavioral suites;
+# require each transitive dependency and pin the active delegations below so
+# comments cannot counterfeit either existence or execution ownership.
+require_file 'scripts/test_dcentrald_process_identity.sh'
+require_file 'scripts/test_am3_bb_emergency_safeoff.sh'
+require_file 'scripts/test_zynq_terminal_safety.sh'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*IDENTITY_TEST="\$SCRIPT_DIR/test_dcentrald_process_identity\.sh"[[:space:]]*$' \
+    'dcentrald crash policy: exact-process identity component is delegated'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*elif[[:space:]]+sh[[:space:]]+"\$IDENTITY_TEST";[[:space:]]+then[[:space:]]*$' \
+    'dcentrald crash policy: exact-process identity component is executed'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*AM3_BB_SAFEOFF_TEST="\$SCRIPT_DIR/test_am3_bb_emergency_safeoff\.sh"[[:space:]]*$' \
+    'dcentrald crash policy: AM3-BB safe-off component is delegated'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*elif[[:space:]]+sh[[:space:]]+"\$AM3_BB_SAFEOFF_TEST";[[:space:]]+then[[:space:]]*$' \
+    'dcentrald crash policy: AM3-BB safe-off component is executed'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*ZYNQ_SAFEOFF_TEST="\$SCRIPT_DIR/test_zynq_terminal_safety\.sh"[[:space:]]*$' \
+    'dcentrald crash policy: Zynq safe-off component is delegated'
+require_line_regex 'scripts/test_dcentrald_crash_restart_policy.sh' \
+    '^[[:space:]]*elif[[:space:]]+sh[[:space:]]+"\$ZYNQ_SAFEOFF_TEST";[[:space:]]+then[[:space:]]*$' \
+    'dcentrald crash policy: Zynq safe-off component is executed'
 if sh scripts/test_dcentrald_crash_restart_policy.sh; then
     pass 'dcentrald crash policy: every shipped supervisor refuses automatic readmission'
 else
@@ -5432,30 +6835,38 @@ else
     fail 'Zynq payload geometry: canonical boundaries or producer/consumer wiring regressed'
 fi
 
-# Anti-orphan meta-gate (structural fix for the recurring orphaned-safety-test
-# class — ESP ban-gates, dcent-schema, and packaging-static all once ran NOWHERE,
-# so a test that LOOKS like coverage protected nothing). Enforce that every
-# scripts/test_*.sh safety test is actually invoked by THIS offline gate (the
-# aggregator CI runs). A newly-added test that is not wired in fails here instead
-# of silently rotting un-run. Live-hardware probes are named *_probe.sh (not
-# test_*.sh) and are correctly excluded by the glob.
-anti_orphan_test_gate() {
-    _self='scripts/ci_offline_gates.sh'
-    # RECURSIVE: a nested safety test (e.g. scripts/hw-acceptance/test_*.sh) is
-    # just as orphanable as a top-level one, so walk the whole scripts/ tree — not
-    # a shallow `scripts/test_*.sh` glob that would miss them. Paths carry no
-    # spaces, so word-splitting the find output is safe here.
-    for _t in $(find scripts -name 'test_*.sh' 2>/dev/null | sort); do
-        [ -f "$_t" ] || continue
-        _b=$(basename "$_t")
-        if grep -Fq "$_b" "$_self"; then
-            pass "anti-orphan: $_b is invoked by the offline gate"
-        else
-            fail "anti-orphan: $_b is a safety test that ci_offline_gates.sh does NOT invoke (orphaned — wire it in so it actually gates the release)"
-        fi
-    done
-}
-anti_orphan_test_gate
+# Anti-orphan meta-gate. Raw basename grep is forbidden: comments,
+# `require_pattern` arguments, and `sh -n` syntax checks are not execution.
+# The reachability checker lexes active shell commands, follows variable-bound
+# aggregate delegation, and admits exact workflow `run:` commands for tests
+# whose restricted inputs intentionally exist only in those jobs.
+require_file 'scripts/check_test_gate_reachability.py'
+if python3 scripts/check_test_gate_reachability.py --self-test >/dev/null 2>&1 &&
+   python3 scripts/check_test_gate_reachability.py; then
+    pass 'anti-orphan: every shell safety suite has an active gate path'
+else
+    fail 'anti-orphan: a shell safety suite is mentioned but not actively reachable'
+fi
+
+require_file 'scripts/check_exact_selector_parity.py'
+require_file 'scripts/run_filtered_cargo_test.sh'
+require_file 'scripts/check_direct_cargo_filters.py'
+if [ "$STATIC_ONLY" -eq 1 ]; then
+    if python3 scripts/check_exact_selector_parity.py --inventory-only; then
+        pass 'exact selectors: workflow and static inventories are equal (Cargo resolution skipped by --static-only)'
+    else
+        fail 'exact selectors: workflow/static inventory parity regressed'
+    fi
+elif python3 scripts/check_exact_selector_parity.py; then
+    pass 'exact selectors: workflow and static inventories are equal and source-resolvable'
+else
+    fail 'exact selectors: workflow/static parity or source resolution regressed'
+fi
+if python3 scripts/check_direct_cargo_filters.py; then
+    pass 'direct cargo filters: no zero-match false-green risk in scoped workflows'
+else
+    fail 'direct cargo filters: bare cargo test FILTER still present in scoped workflows'
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf '\nDCENT_OS offline gates failed: %s failure(s)\n' "$failures" >&2

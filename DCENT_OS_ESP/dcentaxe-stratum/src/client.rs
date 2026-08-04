@@ -17,7 +17,9 @@ use log::{debug, error, info, warn};
 use serde_json::Value;
 
 use crate::mask::{mask_wallet, sanitize_pool_url};
+use crate::pool_agreement::PoolAgreementMonitor;
 use crate::types::*;
+use dcentaxe_asic::common::PowAlgorithm;
 
 /// Optional hook for solo-mesh share candidates (`job_id` starts with `solo-`).
 /// Binary mesh runtime registers this so candidates never hit `mining.submit`.
@@ -273,6 +275,35 @@ pub struct StratumClient {
 
     /// Optional live status handle for API/reporting layers.
     status: Option<SharedStratumStatus>,
+
+    /// Proof-of-work algorithm this client mines (P1 Scrypt seam).
+    /// `Sha256d` unless explicitly set. Gates BIP310 `mining.configure`
+    /// version-rolling negotiation: Scrypt has no AsicBoost equivalent, so
+    /// negotiation is skipped entirely for it (design §2.3).
+    pow_algorithm: PowAlgorithm,
+
+    /// P2: live cross-check that our share-target math agrees with the pool's.
+    ///
+    /// Every share this client submits was already locally validated as
+    /// meeting the pool target, so a systematic reject stream is evidence the
+    /// diff-1 constant disagrees — the classic scrypt `x65536` trap, which is
+    /// otherwise invisible on the wire (design §2.3 / risk R4).
+    pool_agreement: PoolAgreementMonitor,
+}
+
+/// Pure production-choice function (P1 Scrypt seam): should this connection
+/// negotiate BIP310 version rolling via `mining.configure`?
+///
+/// Extracted from `connect()` so the caller's decision — the AND of the
+/// configured `version_rolling` flag and the algorithm's capability — is a
+/// testable pure function rather than an inline condition (the
+/// policy-wiring-needs-its-own-test rule). `connect()` MUST route through
+/// this function; do not re-inline the condition.
+pub(crate) fn should_negotiate_version_rolling(
+    config_version_rolling: bool,
+    algorithm: PowAlgorithm,
+) -> bool {
+    config_version_rolling && algorithm.supports_version_rolling()
 }
 
 impl StratumClient {
@@ -312,6 +343,43 @@ impl StratumClient {
             failover_entered_at: None,
             last_primary_reprobe_at: None,
             status: None,
+            pow_algorithm: PowAlgorithm::Sha256d,
+            pool_agreement: PoolAgreementMonitor::new(PowAlgorithm::Sha256d),
+        }
+    }
+
+    /// Set the proof-of-work algorithm for this client (P1 Scrypt seam).
+    /// Defaults to `Sha256d`. Also re-keys and resets the pool-agreement
+    /// monitor: samples gathered under one algorithm's target math say nothing
+    /// about another's.
+    pub fn set_pow_algorithm(&mut self, algorithm: PowAlgorithm) {
+        self.pow_algorithm = algorithm;
+        self.pool_agreement.set_algorithm(algorithm);
+    }
+
+    /// P2 pool-agreement monitor (read-only view for API / diagnostics).
+    pub fn pool_agreement(&self) -> &PoolAgreementMonitor {
+        &self.pool_agreement
+    }
+
+    /// Feed ONE pool verdict on a share we locally validated, and emit the
+    /// divergence warning exactly once per session if the pool systematically
+    /// disagrees with our target math.
+    ///
+    /// Called from every accept/reject resolution path. All shares reaching a
+    /// pool response were locally validated (the dispatcher only submits when
+    /// `meets_pool_target`), so every sample is informative.
+    fn note_pool_share_verdict(&mut self, accepted: bool) {
+        self.pool_agreement.record(accepted);
+        if self.pool_agreement.take_new_divergence_alarm() {
+            warn!(
+                "Stratum: POOL TARGET DISAGREEMENT ({} algorithm) — {}/{} locally-valid shares \
+                 rejected. {}",
+                self.pow_algorithm,
+                self.pool_agreement.rejected(),
+                self.pool_agreement.resolved(),
+                self.pool_agreement.diagnosis()
+            );
         }
     }
 
@@ -1111,8 +1179,10 @@ impl StratumClient {
 
         self.stream = Some(stream);
 
-        // mining.configure (version rolling, optional)
-        if self.config.version_rolling {
+        // mining.configure (version rolling, optional). Algorithm-gated:
+        // Scrypt has no AsicBoost/BIP320 equivalent, so negotiation is
+        // skipped entirely for it (P1 seam; Sha256d behavior unchanged).
+        if should_negotiate_version_rolling(self.config.version_rolling, self.pow_algorithm) {
             self.send_configure()?;
         }
 
@@ -2029,6 +2099,7 @@ impl StratumClient {
         if let Some(ref err) = error {
             if !err.is_null() {
                 self.shares_rejected += 1;
+                self.note_pool_share_verdict(false);
                 let (err_code, err_msg) = Self::submit_error_code_and_message(err);
                 let auth_fatal = Self::is_submit_auth_fatal(err_code, &err_msg);
                 warn!(
@@ -2066,6 +2137,7 @@ impl StratumClient {
         let accepted = result.as_ref().and_then(|v| v.as_bool()).unwrap_or(false);
         if accepted {
             self.shares_accepted += 1;
+            self.note_pool_share_verdict(true);
             info!(
                 "Stratum: share ACCEPTED for job {} ({}/{})",
                 job_id_str, self.shares_accepted, self.shares_submitted
@@ -2087,6 +2159,7 @@ impl StratumClient {
             false
         } else {
             self.shares_rejected += 1;
+            self.note_pool_share_verdict(false);
             // Surface any available payload as the reject reason instead of the
             // opaque constant, so reject_reason_counts is diagnosable in the
             // field (e.g. a systematic "low difficulty share" regression).
@@ -2175,6 +2248,7 @@ impl StratumClient {
 
         if accepted {
             self.shares_accepted += 1;
+            self.note_pool_share_verdict(true);
             info!(
                 "Stratum: late ACCEPT for evicted submit job {} (id={})",
                 job_id_str, id
@@ -2196,6 +2270,7 @@ impl StratumClient {
             self.sync_status(None);
         } else {
             self.shares_rejected += 1;
+            self.note_pool_share_verdict(false);
             let reason = match &error {
                 Some(err) if !err.is_null() => Self::submit_error_code_and_message(err).1,
                 _ => "pool rejected share".to_string(),
@@ -2526,7 +2601,10 @@ fn parse_set_difficulty(params: Value) -> StratumMessage {
     match diff {
         Some(d) if d.is_finite() && d > 0.0 => StratumMessage::SetDifficulty(d),
         _ => {
-            warn!("Stratum: rejecting malformed mining.set_difficulty ({})", params);
+            warn!(
+                "Stratum: rejecting malformed mining.set_difficulty ({})",
+                params
+            );
             StratumMessage::Unknown(format!("bad set_difficulty: {}", params))
         }
     }
@@ -3526,6 +3604,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // STRATUM-6: version-rolling min-bit-count negotiation
     // -----------------------------------------------------------------------
+    #[test]
+    fn negotiation_gate_is_config_and_algorithm_conjunction() {
+        // P1 seam pin: mining.configure fires only when the config flag is on
+        // AND the algorithm supports rolling. Sha256d + version_rolling=true
+        // (the shipping default) must stay negotiating — a regression here
+        // silently drops ASICBoost on every board.
+        assert!(should_negotiate_version_rolling(
+            true,
+            PowAlgorithm::Sha256d
+        ));
+        assert!(!should_negotiate_version_rolling(
+            false,
+            PowAlgorithm::Sha256d
+        ));
+        assert!(!should_negotiate_version_rolling(
+            true,
+            PowAlgorithm::Scrypt1024
+        ));
+        assert!(!should_negotiate_version_rolling(
+            false,
+            PowAlgorithm::Scrypt1024
+        ));
+        // New clients default to Sha256d (production wiring: connect() gates
+        // on `self.pow_algorithm`, which only set_pow_algorithm can change).
+        let (_tx, event_rx) = std::sync::mpsc::channel::<MiningEvent>();
+        let (event_tx, _rx2) = std::sync::mpsc::channel::<StratumEvent>();
+        let client = StratumClient::new(StratumConfig::default(), event_tx, event_rx);
+        assert_eq!(client.pow_algorithm, PowAlgorithm::Sha256d);
+        drop(client);
+    }
+
     #[test]
     fn test_configure_zero_bit_mask_disables_rolling() {
         let mut client = test_client();

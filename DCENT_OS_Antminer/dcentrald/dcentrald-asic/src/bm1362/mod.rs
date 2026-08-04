@@ -66,6 +66,10 @@ use crate::protocol::crc5;
 /// module does not mint daemon hardware identity or topology authority.
 pub mod assigned_address;
 
+/// Exact 7-byte reset-baseline GetAddress body validation. Kept separate from
+/// assigned-address parsing because the two BM1362 response shapes differ.
+pub mod unassigned_address;
+
 /// W13.B1 (2026-05-10): BM1362 UART_RELAY ASIC register `0x2C`
 /// candidate/control evidence for the per-chain UART relay.
 ///

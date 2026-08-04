@@ -446,6 +446,119 @@ pub fn resolve_is_nopic_from_eeprom(declarative_nopic: bool, chain_slots: usize)
     resolve_pic_type_from_eeprom(declarative, chain_slots) == PicType::NoPic
 }
 
+/// Decode a REAL deployed hashboard-EEPROM page to an exact observed ASIC
+/// identity, for the native experimental-admission bridge (Hardware-Enablement
+/// frontier item C1-U5, 2026-07-25).
+///
+/// This is a **pure delegation** to the no-HAL, fail-closed
+/// [`dcentrald_api_types::hashboard_eeprom::observed_protocol_from_deployed_page`]
+/// (XXTEA + 3-region decode, proven byte-exact against four held real dumps).
+/// The daemon-side seam intentionally does NOT re-implement the SKU→identity
+/// mapping: a second resolver could drift from the two load-bearing invariants —
+/// the `0x04`/BHB42xxx family (which spans BM1398 and BM1362) must never mint
+/// [`AsicProtocolIdentity::Bm1398`], and the cross-table-contradicted `BHB428xx`
+/// SKU must stay `None` (minting either family would route the board into the
+/// wrong voltage tables). Delegation keeps those invariants in one place.
+///
+/// Read-only and side-effect free: it consumes bytes already read from the
+/// write-denylisted (`0x50..=0x57`) EEPROM, commands no hardware, and grants no
+/// admission by itself. A weak, absent, malformed, contradicted, or unvalidated
+/// page yields `None`, which callers MUST treat as "do not admit" — never as a
+/// default family. The experimental opt-in + two-source `observed == required`
+/// check is applied separately by
+/// [`dcentrald_api_types::hashboard_eeprom::admit_native_experimental`].
+pub fn resolve_chip_id_from_eeprom(
+    page: &[u8],
+) -> Option<dcentrald_common::board_desc::AsicProtocolIdentity> {
+    dcentrald_api_types::hashboard_eeprom::observed_protocol_from_deployed_page(page)
+}
+
+/// Two decodable hashboard EEPROMs on the same unit reported different ASIC
+/// families.
+///
+/// This is never admitted. A mixed-silicon unit has no single correct voltage
+/// table, PLL table, or work codec, so "pick the first one" is not a degraded
+/// mode — it is a wrong mode applied to real hardware. Callers must refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedHashboardIdentity {
+    pub first_slot: usize,
+    pub first: dcentrald_common::board_desc::AsicProtocolIdentity,
+    pub conflicting_slot: usize,
+    pub conflicting: dcentrald_common::board_desc::AsicProtocolIdentity,
+}
+
+impl std::fmt::Display for MixedHashboardIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "slot {} decoded {:?} but slot {} decoded {:?}",
+            self.first_slot, self.first, self.conflicting_slot, self.conflicting
+        )
+    }
+}
+
+/// Fold hashboard EEPROM pages a caller ALREADY HOLDS into one agreed observed
+/// ASIC identity.
+///
+/// Pure and side-effect free: it consumes retained bytes, opens nothing, reads
+/// nothing, and grants no admission by itself. Its result is only ever the
+/// `observed` half of a two-source
+/// [`dcentrald_api_types::hashboard_eeprom::admit_native_experimental`] check.
+///
+/// Every rule here is deliberately fail-closed:
+/// - a slot that is absent, unreadable, weak, malformed, contradicted, or
+///   unvalidated contributes NOTHING rather than a default family. An
+///   unpopulated third slot is normal on a two-board unit and must not veto
+///   the two that are present;
+/// - every slot that DOES decode must agree, otherwise this is `Err` and the
+///   caller refuses;
+/// - if nothing decodes the answer is `Ok(None)`, which the admission layer
+///   treats as "no independent evidence established" and also refuses.
+///
+/// `Ok(Some(..))` therefore means "at least one hashboard decoded, and no
+/// hashboard that decoded disagreed" — never "we assumed a family".
+pub fn fold_observed_identity_from_retained_pages(
+    pages: &[Option<Vec<u8>>],
+) -> Result<Option<dcentrald_common::board_desc::AsicProtocolIdentity>, MixedHashboardIdentity> {
+    fold_observed_identity_with(pages, resolve_chip_id_from_eeprom)
+}
+
+/// Decoder-injected core of [`fold_observed_identity_from_retained_pages`].
+///
+/// Split out so the agree / disagree / ignore-undecodable decisions can be
+/// exercised exhaustively without hand-forging XXTEA-encrypted deployed pages,
+/// which would mostly re-test the cipher rather than this policy. The public
+/// wrapper above is the only production entry point and always passes the real
+/// decoder; a test that constructs a page the real decoder rejects still pins
+/// that wiring.
+fn fold_observed_identity_with(
+    pages: &[Option<Vec<u8>>],
+    decode: impl Fn(&[u8]) -> Option<dcentrald_common::board_desc::AsicProtocolIdentity>,
+) -> Result<Option<dcentrald_common::board_desc::AsicProtocolIdentity>, MixedHashboardIdentity> {
+    let mut agreed: Option<(usize, dcentrald_common::board_desc::AsicProtocolIdentity)> = None;
+    for (slot, page) in pages.iter().enumerate() {
+        let Some(page) = page.as_deref() else {
+            continue;
+        };
+        let Some(observed) = decode(page) else {
+            continue;
+        };
+        match agreed {
+            None => agreed = Some((slot, observed)),
+            Some((first_slot, first)) if first != observed => {
+                return Err(MixedHashboardIdentity {
+                    first_slot,
+                    first,
+                    conflicting_slot: slot,
+                    conflicting: observed,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(agreed.map(|(_, identity)| identity))
+}
+
 pub fn hash_hashboard_eeprom_bytes(bus: u8, addr: u8, data: &[u8]) -> Option<String> {
     if data.len() < 16 {
         return None;
@@ -719,6 +832,13 @@ pub fn collect_hardware_info(config: &DcentraldConfig) -> dcentrald_api::Hardwar
     info
 }
 
+/// Canonical passive-observation label for the exact Zynq AM2 fabric.
+///
+/// Hardware-route admission consumes this same constant so the detector and
+/// its destructive-route consumers cannot silently drift to different
+/// identity strings.
+pub(crate) const OBSERVED_CONTROL_BOARD_ZYNQ_AM2: &str = "Zynq am2";
+
 /// Detect control board type from platform signatures.
 pub fn detect_control_board() -> String {
     // Check for Amlogic
@@ -728,14 +848,21 @@ pub fn detect_control_board() -> String {
 
     // Check for Zynq (UIO devices exist)
     if std::path::Path::new("/dev/uio0").exists() {
-        // Distinguish am1-s9 vs am2-s17 via UIO count or naming
-        let uio_count = std::fs::read_dir("/sys/class/uio")
-            .map(|d| d.count())
-            .unwrap_or(0);
-        return if uio_count > 14 {
-            "Zynq am2-s17".to_string()
-        } else {
-            "Zynq am1-s9".to_string()
+        // Destructive transport selection consumes this observation. Prove a
+        // complete named chain topology; a device count is vulnerable to boot
+        // races and can misclassify an incomplete AM2 census as AM1/S9.
+        return match dcentrald_hal::platform::zynq::detect_exact_zynq_fabric_topology() {
+            Ok(dcentrald_hal::platform::zynq::ZynqFabricTopology::S9) => "Zynq am1-s9".to_string(),
+            Ok(dcentrald_hal::platform::zynq::ZynqFabricTopology::Am2) => {
+                OBSERVED_CONTROL_BOARD_ZYNQ_AM2.to_string()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Zynq control-board fabric is not exact enough for destructive transport admission"
+                );
+                "Zynq ambiguous".to_string()
+            }
         };
     }
 
@@ -803,11 +930,15 @@ pub fn read_hb_type() -> Option<String> {
 /// SPLICED unrelated EEPROM fields (board model + serial digits + revision) into
 /// one contiguous token that looked like a board-type string but was not any real
 /// field. A real EEPROM string field is contiguous, so we stop at the first
-/// non-alphanumeric byte and keep the longest single run. The AUTHORITATIVE
-/// hashboard SKU classification is the structured 2-byte preamble path
-/// (`read_hashboard_eeprom_preamble_for_slot` + `classify_by_eeprom_preamble`,
-/// wired telemetry-only in `daemon.rs`); this loose scan is a display-only
-/// fallback and must never fabricate a spliced string. Read-only inventory path.
+/// non-alphanumeric byte and keep the longest single run. The structured
+/// 2-byte preamble path (`read_hashboard_eeprom_preamble_for_slot` +
+/// `classify_by_eeprom_preamble`, wired telemetry-only in `daemon.rs`) is
+/// better-founded than this loose scan, but it is a FAMILY HINT and not
+/// authoritative SKU identity — `[0x05, 0x11]` alone spans BM1366, BM1368 and
+/// BM1370 boards. Exact identity comes from decoding the full 256-byte page
+/// (`dcentrald_api_types::deployed_eeprom::decode_deployed_eeprom`). This loose
+/// scan is a display-only fallback below both of them and must never fabricate a
+/// spliced string. Read-only inventory path.
 fn extract_hb_type_token(data: &[u8]) -> Option<String> {
     let mut run = String::new();
     let mut best = String::new();
@@ -864,6 +995,125 @@ mod tests {
     use std::sync::Mutex;
 
     static EEPROM_PIC_DETECT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    mod fold_retained_pages {
+        use super::super::*;
+        use dcentrald_common::board_desc::AsicProtocolIdentity;
+
+        fn page(tag: u8) -> Option<Vec<u8>> {
+            Some(vec![tag; 8])
+        }
+
+        /// Stub decoder: byte 0 selects a family, anything else is undecodable.
+        fn stub(bytes: &[u8]) -> Option<AsicProtocolIdentity> {
+            match bytes.first() {
+                Some(0x66) => Some(AsicProtocolIdentity::Bm1366),
+                Some(0x62) => Some(AsicProtocolIdentity::Bm1362),
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn no_decodable_slot_yields_no_evidence_rather_than_a_default_family() {
+            // Every failure shape a real unit produces: absent slot, unreadable
+            // slot, and a page the decoder rejects. None of them may invent an
+            // identity, because `Ok(None)` is what makes the admission refuse.
+            let pages = [None, page(0x00), page(0xff)];
+            assert_eq!(fold_observed_identity_with(&pages, stub), Ok(None));
+        }
+
+        #[test]
+        fn an_unpopulated_slot_cannot_veto_the_hashboards_that_are_present() {
+            // A two-board unit leaves slot 2 empty. Treating "did not decode" as
+            // a disagreement would refuse every real two-board S19k Pro.
+            let pages = [page(0x66), page(0x66), None];
+            assert_eq!(
+                fold_observed_identity_with(&pages, stub),
+                Ok(Some(AsicProtocolIdentity::Bm1366))
+            );
+            let sparse = [None, page(0x66), None];
+            assert_eq!(
+                fold_observed_identity_with(&sparse, stub),
+                Ok(Some(AsicProtocolIdentity::Bm1366))
+            );
+        }
+
+        #[test]
+        fn decodable_slots_that_disagree_are_refused_and_name_both_sides() {
+            // Mixed silicon has no single correct voltage/PLL/work-codec table,
+            // so "pick the first" is a wrong mode applied to real hardware.
+            let pages = [page(0x66), page(0x62), None];
+            let err = fold_observed_identity_with(&pages, stub)
+                .expect_err("mixed hashboard identities must refuse");
+            assert_eq!(err.first_slot, 0);
+            assert_eq!(err.first, AsicProtocolIdentity::Bm1366);
+            assert_eq!(err.conflicting_slot, 1);
+            assert_eq!(err.conflicting, AsicProtocolIdentity::Bm1362);
+            // The message has to be actionable in a refusal log.
+            let rendered = err.to_string();
+            assert!(rendered.contains("slot 0"), "{rendered}");
+            assert!(rendered.contains("slot 1"), "{rendered}");
+            assert!(rendered.contains("Bm1366"), "{rendered}");
+            assert!(rendered.contains("Bm1362"), "{rendered}");
+        }
+
+        #[test]
+        fn disagreement_is_detected_even_when_an_undecodable_slot_sits_between() {
+            // The skip path must not reset the agreed-so-far accumulator.
+            let pages = [page(0x66), page(0x00), page(0x62)];
+            let err = fold_observed_identity_with(&pages, stub)
+                .expect_err("a gap between two conflicting boards must still refuse");
+            assert_eq!(err.first_slot, 0);
+            assert_eq!(err.conflicting_slot, 2);
+        }
+
+        #[test]
+        fn the_production_wrapper_is_wired_to_the_real_fail_closed_decoder() {
+            // The stub above proves the policy; this proves the wrapper is not
+            // wired to something permissive. Real deployed pages are XXTEA
+            // ciphertext, so these plainly-invalid pages must decode to nothing.
+            let pages = [Some(vec![0x66; 8]), Some(vec![0x00; 256]), None];
+            assert_eq!(fold_observed_identity_from_retained_pages(&pages), Ok(None));
+        }
+    }
+
+    /// C1-U5 (2026-07-25): the daemon-side deployed-EEPROM identity seam
+    /// delegates to the fail-closed api-types bridge and never mints an identity
+    /// from a weak, absent, malformed, or garbage page. The positive SKU→identity
+    /// mapping (BHB426→Bm1362, BHB569→Bm1366, contradicted BHB428→None, and the
+    /// structural "never Bm1398") is authoritatively pinned upstream in
+    /// `dcentrald_api_types::{deployed_eeprom, hashboard_eeprom}` and delegated —
+    /// not re-implemented here — so this seam only re-verifies fail-closure.
+    #[test]
+    fn resolve_chip_id_from_eeprom_is_fail_closed_on_junk_pages() {
+        use dcentrald_common::board_desc::AsicProtocolIdentity;
+
+        // Empty / short pages: not a 256-byte page → refused → None.
+        assert_eq!(resolve_chip_id_from_eeprom(&[]), None);
+        assert_eq!(resolve_chip_id_from_eeprom(&[0x04, 0x11, 0x00]), None);
+
+        // All-0xFF / all-0x00 256-byte pages: algorithm nibble is not XXTEA (0x1)
+        // → UnsupportedAlgorithm → None.
+        assert_eq!(resolve_chip_id_from_eeprom(&[0xffu8; 256]), None);
+        assert_eq!(resolve_chip_id_from_eeprom(&[0x00u8; 256]), None);
+
+        // Correct BHB42xxx-class preamble (0x04,0x11 = XXTEA kv1) but garbage
+        // region ciphertext → decrypts to noise → implausible board_name →
+        // fail-closed None (the wrong-key / mis-framed guard).
+        let mut junk = [0xffu8; 256];
+        junk[0] = 0x04;
+        junk[1] = 0x11;
+        assert_eq!(resolve_chip_id_from_eeprom(&junk), None);
+
+        // The seam can NEVER mint BM1398 from any of these inputs (mirrors the
+        // load-bearing "0x04/BHB42xxx never admits BM1398" invariant).
+        for page in [&[][..], &[0x04, 0x11][..], &[0xffu8; 256][..], &junk[..]] {
+            assert_ne!(
+                resolve_chip_id_from_eeprom(page),
+                Some(AsicProtocolIdentity::Bm1398)
+            );
+        }
+    }
 
     #[test]
     fn owned_eeprom_retry_policy_never_retries_authority_or_unknown_outcome() {

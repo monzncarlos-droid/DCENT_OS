@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::types::{JobTemplate, MAX_V1_EXTRANONCE2_SIZE};
 use crate::work::compute_midstate_from_prefix;
+use crate::work_domain::WorkBuildError;
 
 /// Compute the SHA256d (double SHA-256) of input data.
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -129,19 +130,41 @@ pub fn compute_midstate(header_prefix: &[u8; 64]) -> [u8; 32] {
 /// Generate an extranonce2 value from a counter.
 ///
 /// Returns `size` bytes representing the counter in little-endian format.
-/// The counter is truncated to fit the requested size.
+/// Invalid widths and values outside the exact server-sized domain fail
+/// explicitly; this helper must never be a truncating bypass around
+/// [`crate::work::WorkBuilder`].
 ///
 /// Typical sizes:
 ///   - 4 bytes (most pools): 2^32 = ~4 billion unique work units per job
 ///   - 8 bytes (some pools): 2^64 = virtually unlimited
-pub fn generate_extranonce2(counter: u64, size: usize) -> Vec<u8> {
-    let size = size.min(MAX_V1_EXTRANONCE2_SIZE);
+pub fn generate_extranonce2(counter: u64, size: usize) -> Result<Vec<u8>, WorkBuildError> {
+    if !(1..=MAX_V1_EXTRANONCE2_SIZE).contains(&size) {
+        return Err(WorkBuildError::InvalidExtranonce2Size(size));
+    }
+    let max = if size == MAX_V1_EXTRANONCE2_SIZE {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    };
+    if counter > max {
+        return Err(WorkBuildError::Extranonce2OutOfDomain {
+            value: counter,
+            width: size,
+            max,
+        });
+    }
     let bytes = counter.to_le_bytes();
-    let copy_len = size.min(8);
     let mut result = vec![0u8; size];
-    result[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    result
+    result.copy_from_slice(&bytes[..size]);
+    Ok(result)
 }
+
+/// `(merkle_root, midstate, header_tail)` as produced by [`process_job`].
+///
+/// Named rather than returned as a bare triple so the three same-shaped byte
+/// arrays cannot be silently reordered at a call site — two of them are 32 bytes
+/// and swapping them would still compile.
+pub type ProcessedJobParts = ([u8; 32], [u8; 32], [u8; 16]);
 
 /// Process a job template into work-ready components.
 ///
@@ -151,9 +174,12 @@ pub fn generate_extranonce2(counter: u64, size: usize) -> Vec<u8> {
 /// - `midstate`: SHA-256 intermediate state of first 64 header bytes (for ASIC)
 /// - `header_tail`: Last 4 bytes of merkle root + ntime + nbits + padding
 ///   (the ASIC processes this along with the nonce)
-pub fn process_job(job: &JobTemplate, extranonce2_counter: u64) -> ([u8; 32], [u8; 32], [u8; 16]) {
+pub fn process_job(
+    job: &JobTemplate,
+    extranonce2_counter: u64,
+) -> Result<ProcessedJobParts, WorkBuildError> {
     // Generate extranonce2
-    let extranonce2 = generate_extranonce2(extranonce2_counter, job.extranonce2_size);
+    let extranonce2 = generate_extranonce2(extranonce2_counter, job.extranonce2_size)?;
 
     // Build and hash coinbase
     let coinbase = build_coinbase(
@@ -189,7 +215,7 @@ pub fn process_job(job: &JobTemplate, extranonce2_counter: u64) -> ([u8; 32], [u
     header_tail[8..12].copy_from_slice(&job.nbits.to_le_bytes());
     // bytes 12..15 are the nonce placeholder (zeros — ASIC fills this)
 
-    (merkle_root, midstate, header_tail)
+    Ok((merkle_root, midstate, header_tail))
 }
 
 #[cfg(test)]
@@ -255,18 +281,24 @@ mod tests {
     #[test]
     fn test_generate_extranonce2() {
         let en2_zero = generate_extranonce2(1, 0);
-        assert!(en2_zero.is_empty());
+        assert!(matches!(
+            en2_zero,
+            Err(WorkBuildError::InvalidExtranonce2Size(0))
+        ));
 
-        let en2 = generate_extranonce2(1, 4);
+        let en2 = generate_extranonce2(1, 4).unwrap();
         assert_eq!(en2, vec![0x01, 0x00, 0x00, 0x00]); // LE
         assert_eq!(en2.len(), 4);
 
-        let en2_8 = generate_extranonce2(1, 8);
+        let en2_8 = generate_extranonce2(1, 8).unwrap();
         assert_eq!(en2_8.len(), 8);
         assert_eq!(en2_8[0], 0x01);
 
         let en2_capped = generate_extranonce2(1, MAX_V1_EXTRANONCE2_SIZE + 1024);
-        assert_eq!(en2_capped.len(), MAX_V1_EXTRANONCE2_SIZE);
+        assert!(matches!(
+            en2_capped,
+            Err(WorkBuildError::InvalidExtranonce2Size(_))
+        ));
     }
 
     #[test]
@@ -398,46 +430,89 @@ mod tests {
         assert_eq!(header.len(), 80);
     }
 
+    /// G22: mining engines must thin-wrap this pure SSOT (not open-code 80-byte layout).
+    /// Stock midstate path intentionally stays separate — do not force StockWorkEntry unify.
+    #[test]
+    fn mining_engines_consume_build_block_header_ssot() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (rel, fn_name) in [
+            ("dcentrald/src/serial_mining.rs", "fn serial_build_header"),
+            (
+                "dcentrald/src/s19j_hybrid_mining.rs",
+                "fn hybrid_build_header",
+            ),
+            ("dcentrald/src/s19j_tap_mining.rs", "fn tap_build_header"),
+            (
+                "dcentrald/src/work_dispatcher.rs",
+                "fn dispatcher_build_header",
+            ),
+        ] {
+            let src = std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| {
+                panic!("read {rel}: {e}");
+            });
+            let body = src
+                .split(fn_name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{rel}: missing {fn_name}"))
+                .split("fn ")
+                .next()
+                .expect("function body");
+            assert!(
+                body.contains("build_block_header")
+                    || body.contains("dcentrald_stratum::v1::job::build_block_header"),
+                "{rel} {fn_name} must thin-wrap stratum build_block_header SSOT"
+            );
+            // Must not re-open-code the 80-byte field layout.
+            assert!(
+                !body.contains("header[0..4].copy_from_slice")
+                    && !body.contains("header[4..36].copy_from_slice"),
+                "{rel} {fn_name} must not open-code header field copies"
+            );
+        }
+        // Honesty: stock path remains separate (midstate / header_tail engine residual).
+        let stock = std::fs::read_to_string(root.join("dcentrald/src/stock_mining.rs"))
+            .expect("stock_mining");
+        assert!(
+            stock.contains("Do not unify with hybrid/serial WorkEntry")
+                || stock.contains("StockWorkEntry"),
+            "stock midstate entry must stay distinct (not false-unified)"
+        );
+    }
+
     #[test]
     fn generate_extranonce2_counter_zero_produces_all_zeros() {
         // Counter=0 is the first work unit per job. Some downstream code
         // may treat all-zero extranonce as "no work assigned"; pin that
         // generate_extranonce2 actually produces all-zero bytes for counter=0
         // so any "no work" sentinel logic stays correct.
-        let en2 = generate_extranonce2(0, 4);
+        let en2 = generate_extranonce2(0, 4).unwrap();
         assert_eq!(en2, vec![0u8; 4]);
     }
 
     #[test]
-    fn generate_extranonce2_silently_truncates_counter_past_size_capacity() {
-        // KNOWN BEHAVIOR: counter > 2^(size*8) silently truncates the high
-        // bits. With size=4 (typical V1), counter=0x1_0000_0001 produces
-        // [0x01, 0x00, 0x00, 0x00] — same as counter=1. In practice
-        // unreachable (4 billion shares per pool job) but pin the
-        // truncation behavior so a future fix that adds explicit
-        // wraparound detection updates this test.
-        let en2_low = generate_extranonce2(1, 4);
-        let en2_high = generate_extranonce2(0x1_0000_0001, 4);
+    fn generate_extranonce2_rejects_counter_past_size_capacity() {
+        let error = generate_extranonce2(0x1_0000_0001, 4).unwrap_err();
         assert_eq!(
-            en2_low, en2_high,
-            "high bits silently truncated to fit size"
+            error,
+            WorkBuildError::Extranonce2OutOfDomain {
+                value: 0x1_0000_0001,
+                width: 4,
+                max: u32::MAX as u64,
+            }
         );
-        assert_eq!(en2_low, vec![0x01, 0x00, 0x00, 0x00]);
     }
 
     #[test]
     fn generate_extranonce2_size_two_holds_uint16_range() {
         // size=2 extranonce gives 65536 unique work units before wrap.
         // Pin the LE byte ordering at the boundary.
-        let max_u16 = generate_extranonce2(u16::MAX as u64, 2);
+        let max_u16 = generate_extranonce2(u16::MAX as u64, 2).unwrap();
         assert_eq!(max_u16, vec![0xFF, 0xFF]);
 
-        let one_past = generate_extranonce2(u16::MAX as u64 + 1, 2);
-        assert_eq!(
-            one_past,
-            vec![0x00, 0x00],
-            "size=2 counter wraps at 65536 — same silent truncation as size=4"
-        );
+        assert!(matches!(
+            generate_extranonce2(u16::MAX as u64 + 1, 2),
+            Err(WorkBuildError::Extranonce2OutOfDomain { .. })
+        ));
     }
 
     #[test]
@@ -446,6 +521,8 @@ mod tests {
         // — work generation is deterministic. Pin so a refactor that
         // introduces nondeterminism (e.g. randomized padding) is caught.
         let job = JobTemplate {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: "test".to_string(),
             prev_block_hash: [0x42; 32],
             coinbase1: vec![0x01, 0x02, 0x03, 0x04],
@@ -463,15 +540,15 @@ mod tests {
             pool_difficulty: 1.0,
         };
 
-        let (root_a, mid_a, tail_a) = process_job(&job, 7);
-        let (root_b, mid_b, tail_b) = process_job(&job, 7);
+        let (root_a, mid_a, tail_a) = process_job(&job, 7).unwrap();
+        let (root_b, mid_b, tail_b) = process_job(&job, 7).unwrap();
         assert_eq!(root_a, root_b);
         assert_eq!(mid_a, mid_b);
         assert_eq!(tail_a, tail_b);
 
         // Different counter must produce different merkle root (otherwise
         // extranonce2 isn't actually salting the coinbase).
-        let (root_c, _, _) = process_job(&job, 8);
+        let (root_c, _, _) = process_job(&job, 8).unwrap();
         assert_ne!(root_a, root_c);
     }
 
@@ -482,6 +559,8 @@ mod tests {
         // layout so a refactor doesn't silently shift the field offsets
         // and break ASIC nonce search.
         let job = JobTemplate {
+            work_generation: crate::work_domain::WorkGeneration::UNTRACKED,
+            v1_work_domain: None,
             job_id: "test".to_string(),
             prev_block_hash: [0x42; 32],
             coinbase1: vec![0x01],
@@ -499,7 +578,7 @@ mod tests {
             pool_difficulty: 1.0,
         };
 
-        let (merkle_root, _, tail) = process_job(&job, 0);
+        let (merkle_root, _, tail) = process_job(&job, 0).unwrap();
 
         // Tail layout: [merkle_root[28..32]] [ntime LE] [nbits LE] [zeros]
         assert_eq!(&tail[0..4], &merkle_root[28..32]);

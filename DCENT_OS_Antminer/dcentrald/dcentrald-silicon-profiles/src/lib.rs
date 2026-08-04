@@ -66,6 +66,10 @@ pub mod bm1370;
 /// Gated behind `experimental_chips`.
 #[cfg(feature = "experimental_chips")]
 pub mod bm1373;
+/// Rank-37 (2026-08-03) scaffold: BM1385 (Antminer S7 — 28 nm, pre-S9
+/// generation) data-only geometry profile. Jig-extracted, fail-closed; no
+/// live S7 on the fleet. See module docs for the byte-extraction provenance.
+pub mod bm1385;
 ///  tune-D: BM1387 (Antminer S9 / S9i / T9) silicon profile.
 pub mod bm1387;
 ///  scaffold: BM1391 (S11/S15/T15) data-only geometry profile.
@@ -110,6 +114,17 @@ pub mod gdtuner;
 /// 9: per-control-board GPIO maps (CV1835 / AM335x / Amlogic /
 /// Zynq / Braiins BBB).
 pub mod gpio_maps;
+/// UB-26 (2026-08-03): declarative hashboard IDENTITY catalog — all 50 roster
+/// SKUs keyed by **exact** `model_id`, joined from the DCENT catalog, the ePIC
+/// jig DB and the VNish 1.2.7 model matrix. Supplies the 34 SKUs that had no
+/// `hashboards::HashboardCatalogEntry`; adding board #51 is a data row, not an
+/// enum variant. Identity + provenance only — authorizes nothing.
+pub mod hashboard_catalog;
+/// UB-06 (2026-08-02): data-driven hashboard topology registry — 50 SKUs
+/// keyed by SKU string, generated from the held ePIC UMC OS v1.22.0 jig
+/// hashboard DB (desk evidence / Experimental provenance; the legacy
+/// `hashboards::Hashboard` catalog stays the live-measured authority).
+pub mod hashboard_topology;
 /// 9: hashboard SKU catalog (BHB42601/42801/42611 + BHB56902 +
 /// legacy BHB-S9/S11/S17 placeholders).
 pub mod hashboards;
@@ -131,6 +146,12 @@ pub mod pic_heartbeat;
 /// 9: PIC microcontroller catalog (dsPIC33EP16GS202 + PIC1704
 /// + S21 Amlogic NoPic sentinel).
 pub mod pics;
+/// Rank-35 (2026-08-03): fused `PowerTopology` descriptor — one declarative
+/// dispatch input per PSU, joining the routing catalog (`psus`) with the
+/// spec catalog (`dcentrald_api_types::psu_model`) plus the shipped-HAL
+/// control-binding name and read-only-PMBus applicability. Data only —
+/// constructs no driver, carries no polarity, wires into no live path.
+pub mod power_topology;
 /// 9: PSU catalog (15 PSUs from APW3++ → APW12+ → APW121215a).
 pub mod psus;
 ///  W5-A: runtime profile registry + JSON-bundle loader.
@@ -138,8 +159,22 @@ pub mod psus;
 /// Owns the disk-backed profile catalog at `/etc/dcentrald/profiles.d/`.
 /// See `plans/wave4-profile-import-infrastructure.md` §B for the spec.
 pub mod registry;
+/// Rank-33 (2026-08-03): declarative per-SKU temperature-sensor topology
+/// (direct vs I²C-mux transports, physical positions) over the
+/// `hashboard_topology` registry, plus the shared fail-closed
+/// `SensorSweep`/`SweepLedger` coverage accounting. Data + accounting only —
+/// no thermal control behaviour lives here.
+pub mod sensor_topology;
 ///  tune-C: staggered chain power-up planner.
 pub mod staggered_powerup;
+/// Rank-31 (2026-08-03): VNish 1.2.7 thermal/hardware matrix — 77 models
+/// keyed by Bitmain `btm_model`, generated from the re-armada 2026-04-25
+/// extraction of 18 VNish firmware images. THIRD-PARTY TRANSCRIPTION
+/// provenance (`DeskVnishFirmwareExperimental`), distinct from the
+/// ePIC-transcribed jig registry and from DCENT live measurement; conflicts
+/// between the desk corpora are recorded + test-pinned, never overwritten.
+/// Data + accounting only — no thermal control behaviour lives here.
+pub mod vnish_thermal;
 
 pub use registry::{
     global, ProfileBundle, ProfileLoadError, ProfileMetadata, ProfileRegistry,

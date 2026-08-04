@@ -68,9 +68,12 @@ export function Thermostat({ onToggle, isMining: isMiningProp, toggling, powerCo
 
   const tempUnit = settings.temperatureUnit;
 
-  // Average chip temperature across chains (honest — real telemetry).
-  const chipTemp = status?.chains && status.chains.length > 0
-    ? status.chains.reduce((sum, c) => sum + c.temp_c, 0) / status.chains.length
+  // Average chip temperature across chains that are actually reporting. temp_c === 0
+  // is the "board unpowered / asleep" sentinel (not a real 0 °C) — averaging it in
+  // under-reports the true temperature (e.g. [61, 63, 0] -> 41 instead of ~62).
+  const reportingChains = status?.chains?.filter((c) => (c.temp_c ?? 0) > 0) ?? [];
+  const chipTemp = reportingChains.length > 0
+    ? reportingChains.reduce((sum, c) => sum + c.temp_c, 0) / reportingChains.length
     : 0;
 
   const hasRoomTemp = heaterStatus?.room_temp_c != null;

@@ -51,253 +51,30 @@ macro_rules! model {
 /// S9 through S23 coverage rows used by the simulator and tier-honesty gate.
 /// Unknown geometry remains `None`; it is never filled from projections.
 pub static ANTMINER_MODELS: &[ModelEvidence] = &[
-    model!(
-        "s9",
-        0x1387,
-        3,
-        Some(63),
-        115_200,
-        7,
-        Some(650),
-        Some(8_000),
-        Some(9_000),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, ""]
-    ),
-    model!(
-        "s11",
-        0x1391,
-        3,
-        None,
-        115_200,
-        7,
-        None,
-        None,
-        None,
-        Structural,
-        &[MASTER_MODELS, ""]
-    ),
-    model!(
-        "s15",
-        0x1391,
-        3,
-        None,
-        115_200,
-        7,
-        None,
-        None,
-        None,
-        Scaffold,
-        &[MASTER_MODELS]
-    ),
-    model!(
-        "t15",
-        0x1391,
-        3,
-        None,
-        115_200,
-        7,
-        None,
-        None,
-        None,
-        Scaffold,
-        &[MASTER_MODELS]
-    ),
-    model!(
-        "s17",
-        0x1397,
-        3,
-        Some(48),
-        115_740,
-        7,
-        Some(650),
-        None,
-        None,
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, S17_JIG]
-    ),
-    model!(
-        "s17pro",
-        0x1397,
-        3,
-        Some(48),
-        115_740,
-        7,
-        Some(650),
-        None,
-        None,
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, S17_JIG]
-    ),
-    model!(
-        "t17",
-        0x1397,
-        3,
-        Some(30),
-        115_740,
-        7,
-        Some(650),
-        None,
-        None,
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, S17_JIG]
-    ),
-    model!(
-        "s17plus",
-        0x1396,
-        3,
-        Some(65),
-        115_740,
-        7,
-        None,
-        None,
-        None,
-        Structural,
-        &[MASTER_MODELS, ""]
-    ),
-    model!(
-        "t17plus",
-        0x1396,
-        3,
-        Some(44),
-        115_740,
-        7,
-        None,
-        None,
-        None,
-        Structural,
-        &[MASTER_MODELS, ""]
-    ),
-    model!(
-        "s17e",
-        0x1397,
-        3,
-        None,
-        115_740,
-        7,
-        None,
-        None,
-        None,
-        Structural,
-        &[MASTER_MODELS, ""]
-    ),
-    model!(
-        "s19",
-        0x1398,
-        3,
-        None,
-        115_740,
-        7,
-        Some(650),
-        None,
-        None,
-        Structural,
-        &[MASTER_MODELS, MASTER_PLL, S19_JIG]
-    ),
-    model!(
-        "s19pro",
-        0x1398,
-        3,
-        Some(114),
-        115_740,
-        7,
-        Some(675),
-        Some(13_000),
-        Some(14_200),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, S19_JIG, ""]
-    ),
-    model!(
-        "s19jpro",
-        0x1362,
-        3,
-        Some(126),
-        115_200,
-        9,
-        Some(545),
-        None,
-        None,
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, ""]
-    ),
-    model!(
-        "s19xp",
-        0x1366,
-        3,
-        Some(110),
-        115_200,
-        9,
-        Some(675),
-        Some(13_400),
-        Some(14_200),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, ""]
-    ),
-    model!(
-        "s19kpro",
-        0x1366,
-        3,
-        Some(77),
-        115_200,
-        9,
-        Some(670),
-        Some(13_400),
-        Some(14_200),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, ""]
-    ),
-    model!(
-        "s21",
-        0x1368,
-        3,
-        Some(108),
-        115_200,
-        9,
-        Some(525),
-        Some(13_400),
-        Some(14_200),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, ""]
-    ),
-    model!(
-        "s21pro",
-        0x1370,
-        3,
-        Some(65),
-        115_200,
-        9,
-        Some(525),
-        Some(13_400),
-        Some(14_200),
-        Exact,
-        &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]
-    ),
-    model!(
-        "s21xp",
-        0x1370,
-        3,
-        None,
-        115_200,
-        9,
-        None,
-        Some(13_400),
-        Some(14_200),
-        Structural,
-        &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]
-    ),
-    model!(
-        "s23",
-        0x1372,
-        4,
-        None,
-        115_200,
-        9,
-        None,
-        None,
-        None,
-        Scaffold,
-        &[""]
-    ),
+    model!("s9", 0x1387, 3, Some(63), 115_200, 7, Some(650), Some(8_000), Some(9_000), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s11", 0x1391, 3, None, 115_200, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
+    model!("s15", 0x1391, 3, None, 115_200, 7, None, None, None, Scaffold, &[MASTER_MODELS]),
+    model!("t15", 0x1391, 3, None, 115_200, 7, None, None, None, Scaffold, &[MASTER_MODELS]),
+    model!("s17", 0x1397, 3, Some(48), 115_740, 7, Some(650), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, S17_JIG]),
+    model!("s17pro", 0x1397, 3, Some(48), 115_740, 7, Some(650), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, S17_JIG]),
+    model!("t17", 0x1397, 3, Some(30), 115_740, 7, Some(650), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, S17_JIG]),
+    // 2026-08-03 mapping correction (W8-G): S17+/T17+ are BM1397 (0x1397) and
+    // S17e/T17e are BM1396 (0x1396). The reversed pairing came from PR-056
+    // (`2026-05-16-bm1396-vs-bm1397-disambiguation.md`), whose model attribution
+    // is circular (it traced only to two comment lines) and is now retracted in
+    // that document's correction banner. Chip COUNTS are unchanged.
+    model!("s17plus", 0x1397, 3, Some(65), 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
+    model!("t17plus", 0x1397, 3, Some(44), 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
+    model!("s17e", 0x1396, 3, None, 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, "", ""]),
+    model!("s19", 0x1398, 3, None, 115_740, 7, Some(650), None, None, Structural, &[MASTER_MODELS, MASTER_PLL, S19_JIG]),
+    model!("s19pro", 0x1398, 3, Some(114), 115_740, 7, Some(675), Some(13_000), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S19_JIG, ""]),
+    model!("s19jpro", 0x1362, 3, Some(126), 115_200, 9, Some(545), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s19xp", 0x1366, 3, Some(110), 115_200, 9, Some(675), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s19kpro", 0x1366, 3, Some(77), 115_200, 9, Some(670), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s21", 0x1368, 3, Some(108), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s21pro", 0x1370, 3, Some(65), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]),
+    model!("s21xp", 0x1370, 3, None, 115_200, 9, None, Some(13_400), Some(14_200), Structural, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]),
+    model!("s23", 0x1372, 4, None, 115_200, 9, None, None, None, Scaffold, &[""]),
 ];
 
 pub fn model_evidence(slug: &str) -> Option<&'static ModelEvidence> {
@@ -306,6 +83,14 @@ pub fn model_evidence(slug: &str) -> Option<&'static ModelEvidence> {
 
 #[cfg(test)]
 mod tests {
+    // clippy: the workspace sets `unwrap_used` / `expect_used` / `indexing_slicing`
+    // to `warn` and CI runs `-D warnings`. Inside a test module those lints are
+    // inverted: panicking IS the assertion mechanism, and a catalog row that is
+    // absent when a pin says it must exist should fail the test loudly rather than
+    // be silently `if let`-ed away. Scoped to `mod tests` only — production code in
+    // this crate stays under the full restriction set.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
     use super::*;
 
     #[test]
@@ -320,6 +105,118 @@ mod tests {
         assert_eq!(s23.strength, EvidenceStrength::Scaffold);
         assert_eq!(s23.chips_per_chain, None);
         assert_eq!(s23.default_frequency_mhz, None);
+    }
+
+    /// The S17-class model -> chip-family mapping, pinned in both directions so
+    /// a future edit cannot silently re-reverse it.
+    ///
+    /// HISTORY — this reversal was live in the repository for ~2.5 months. Its
+    /// source is PR-056,
+    /// ,
+    /// which recorded `0x1396` = S17+/T17+ and `0x1397` = S17/T17/S17e/T17e. That
+    /// mapping was CIRCULAR: it traced only to two in-repo comment lines
+    /// (`dcentrald-asic/src/bm1393.rs:172` and
+    /// `dcentrald-silicon-profiles/src/asics.rs:155`), and the document itself
+    /// states it had no measurement behind it ("Empirical readback: UNKNOWN --
+    /// needs hardware"). Worse, PR-056 §3/§5 declared the then-correct
+    /// `drivers/bm1396.rs` "T17e/S17e-era" header a stray mis-attribution and
+    /// "corrected" it to S17+/T17+, which is what later readers kept adopting.
+    /// PR-056's model attribution is retracted (see its correction banner); its
+    /// dispatch-safety verdict still stands and is unaffected by this test.
+    ///
+    /// Operator-confirmed 2026-08-03: S17+/T17+ = BM1397 (`0x1397`),
+    /// S17e/T17e = BM1396 (`0x1396`). Corroborated by
+    /// :16,18` and
+    /// :31`
+    /// (Bitmain AMTC maintenance guide: T17e = 78 chips, 13 domains x 6, 1.35 V).
+    ///
+    /// This pins IDENTITY only. It says nothing about driver dispatch: BM1396
+    /// stays unregistered in `ChipRegistry` and `detect(0x1396)` still returns
+    /// `None` (pinned separately by `pr056_bm1396_vs_bm1397_disambiguation` in
+    /// `dcentrald-asic/src/drivers/mod.rs`).
+    #[test]
+    fn bm1396_bm1397_model_mapping_is_not_reversed() {
+        // The "+" variants are BM1397. Positive assertion...
+        for slug in ["s17plus", "t17plus"] {
+            let row = model_evidence(slug).expect("plus-variant row");
+            assert_eq!(
+                row.chip_id, 0x1397,
+                "{slug} must be BM1397 (0x1397); 0x1396 is the PR-056 reversal"
+            );
+            // ...and the explicit negative, so a swap cannot pass by accident.
+            assert_ne!(
+                row.chip_id, 0x1396,
+                "{slug} must NOT be BM1396 -- that is the retracted PR-056 mapping"
+            );
+        }
+
+        // The "e" variants are BM1396. Only S17e has a catalog row today; T17e
+        // is carried by `DCENT_OS_Antminer/scripts/hw-acceptance/skus.conf`
+        // (chip BM1396, chip_id capture-first) and has no row here yet. If a
+        // t17e row is ever added it must land on 0x1396, which this loop then
+        // enforces automatically.
+        for slug in ["s17e", "t17e"] {
+            let Some(row) = model_evidence(slug) else {
+                continue;
+            };
+            assert_eq!(
+                row.chip_id, 0x1396,
+                "{slug} must be BM1396 (0x1396); 0x1397 is the PR-056 reversal"
+            );
+            assert_ne!(
+                row.chip_id, 0x1397,
+                "{slug} must NOT be BM1397 -- that is the retracted PR-056 mapping"
+            );
+        }
+
+        // Base S17 / S17 Pro / T17 were never in dispute and stay BM1397. Pinned
+        // so a future "fix" cannot drag them along with the corrected variants.
+        for slug in ["s17", "s17pro", "t17"] {
+            assert_eq!(
+                model_evidence(slug).expect("base S17-class row").chip_id,
+                0x1397,
+                "{slug} is BM1397 and was never part of the reversal"
+            );
+        }
+
+        // Chip COUNTS are an independent fact and must survive the correction.
+        //
+        // Operator-confirmed 2026-08-03, pinned for the WHOLE S17 era because the
+        // 48-vs-65 pair is actively mis-stated in a source we otherwise trust:
+        //  §3.2 headed
+        // its S17+ profile table "3 chains x 48 chips". **48 is the S17 / S17 Pro
+        // geometry, not the S17+.** Anyone reconciling code against that header
+        // would drag s17plus from 65 down to 48. These asserts stop that.
+        //
+        //   S17, S17 Pro -> 3 x 48 = 144      S17+ -> 3 x 65 = 195
+        //   T17          -> 3 x 30 =  90      T17+ -> 3 x 44 = 132
+        //
+        // (That same header's CHIP FAMILY half — "S17+ (BM1397)" — is correct and
+        // is one of the four sources that overturned the PR-056 reversal above.
+        // Trust its family, distrust its count.)
+        for (slug, expected, total) in [
+            ("s17", 48u16, 144u16),
+            ("s17pro", 48, 144),
+            ("s17plus", 65, 195),
+            ("t17", 30, 90),
+            ("t17plus", 44, 132),
+        ] {
+            let m = model_evidence(slug).expect("S17-era row");
+            assert_eq!(
+                m.chips_per_chain,
+                Some(expected),
+                "{slug} geometry is {}x{expected}={total} regardless of chip family",
+                m.chains
+            );
+            assert_eq!(
+                m.chains as u16 * expected,
+                total,
+                "{slug} chains x chips/chain must equal {total}"
+            );
+        }
+
+        // The two chip IDs must never collapse into one another.
+        assert_ne!(0x1396, 0x1397);
     }
 
     /// Voltage bounds must be ordered where both are present. An inverted or

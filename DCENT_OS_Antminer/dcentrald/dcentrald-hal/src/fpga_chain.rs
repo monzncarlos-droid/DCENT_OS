@@ -39,8 +39,10 @@ pub const REG_CTRL: u32 = 0x08;
 pub const REG_STAT: u32 = 0x0C;
 
 /// Baud rate divisor register.
-/// Baud rate = FPGA_CLK_HZ / (16 * (BAUD_REG + 1))
-/// FPGA clock is 200 MHz (100 MHz FCLK doubled by PL PLL).
+/// Baud rate = fabric_hz / (16 * (BAUD_REG + 1))
+/// The fabric clock is 200 MHz on the S9 bitstream only (100 MHz FCLK doubled
+/// by PL PLL); the S19j Pro FCLK0 is 100 MHz — see `CARRIER_FIFO_FABRIC`
+/// (W8 CLK-1) before applying Hz math on a non-S9 carrier.
 pub const REG_BAUD: u32 = 0x10;
 
 /// Inter-work delay register (reset value = 1).
@@ -107,8 +109,137 @@ pub const REG_WORK_TX_LAST: u32 = 0x14;
 // FPGA clock and baud constants
 // ---------------------------------------------------------------------------
 
-/// FPGA fabric clock frequency in Hz (100 MHz FCLK doubled by PL PLL).
+/// **S9 (am1) bitstream** FPGA FIFO fabric clock in Hz.
+///
+/// W8 CLK-1 correction (2026-08-03): this 200 MHz is the **S9 bitstream's**
+/// serializer clock ("100 MHz FCLK doubled by PL PLL") and is an S9-only
+/// value, NOT a Zynq-wide constant. The S19j Pro (am2) live probe reads
+/// FCLK0 = 100 MHz and states verbatim: "S9 has FCLK at 200 MHz (100 MHz
+/// doubled by PL PLL). S19j Pro has FCLK0 at 100 MHz. This affects baud rate
+/// calculations for the FPGA FIFO path."
+/// (:587,596`.)
+///
+/// Applying this constant's Hz↔divisor math to a non-S9 carrier makes every
+/// derived baud 2× off (garbled-enum symptom class, C1 §6). The per-carrier
+/// declared value lives in [`CARRIER_FIFO_FABRIC`]; new Hz-domain code must
+/// use [`fifo_fabric_hz`] + [`baud_from_divisor_on`] instead of this
+/// constant. Kept (S9 value, byte-identical consumers) because every current
+/// production Hz↔divisor conversion is on the S9 `FpgaUio` path; am2 mining
+/// uses the PL-UART serial path and programs FIFO divisors as raw register
+/// values, never through this constant's Hz math.
 pub const FPGA_CLK_HZ: u32 = 200_000_000;
+
+/// Convert a BAUD_REG divisor to a line rate on an explicitly declared FIFO
+/// fabric clock. Prefer this (with a [`CARRIER_FIFO_FABRIC`] value) over the
+/// S9-scoped [`FPGA_CLK_HZ`] wrappers for any non-S9 carrier (CLK-1).
+pub const fn baud_from_divisor_on(fabric_hz: u32, divisor: u32) -> u32 {
+    fabric_hz / (16 * (divisor + 1))
+}
+
+/// Convert a target line rate to a BAUD_REG divisor on an explicitly declared
+/// FIFO fabric clock. Returns `u32::MAX` for `baud == 0` (never divides by 0).
+pub const fn divisor_from_baud_on(fabric_hz: u32, baud: u32) -> u32 {
+    if baud == 0 {
+        return u32::MAX;
+    }
+    let ratio = fabric_hz / (16 * baud);
+    if ratio == 0 {
+        0
+    } else {
+        ratio - 1
+    }
+}
+
+/// Per-carrier declared FPGA FIFO fabric clock (W8 CLK-1 capability
+/// extraction — the next carrier is a data row, not new code).
+///
+/// `fifo_fabric_hz == None` means the carrier's FIFO serializer clock is
+/// **undeclared** and any Hz↔divisor computation for it must refuse
+/// (fail-closed, constitution §1.4 "absent data stays None"). In particular
+/// the am2 rows are `None` on purpose: FCLK0 = 100 MHz is live-verified
+/// (`S19J_PRO_BRAIINSOS_LIVE_PROBE.md:587`), but whether the am2 bitstream's
+/// FIFO serializer runs at FCLK0 or doubles it like the S9 bitstream has
+/// never been declared or probed, and am2 mining does not use the FIFO Hz
+/// path today. Declaring 100 MHz here would be an inference dressed as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierFifoFabric {
+    /// Canonical `/etc/dcentos/board_target` id (must be a registered
+    /// `dcentrald_common::BoardDesc` row — cross-pinned by test).
+    pub board_target: &'static str,
+    /// Declared FIFO serializer clock, or `None` if undeclared (refuse).
+    pub fifo_fabric_hz: Option<u32>,
+    /// Where the value (or the deliberate absence) comes from.
+    pub provenance: &'static str,
+}
+
+/// One row per registered Zynq carrier. Non-Zynq families (Amlogic, BB,
+/// CVitek, STM32MP15) have no Braiins-layout FPGA FIFO and take no row.
+pub static CARRIER_FIFO_FABRIC: &[CarrierFifoFabric] = &[
+    CarrierFifoFabric {
+        board_target: "am1-s9",
+        fifo_fabric_hz: Some(200_000_000),
+        provenance: "DECLARED: S9 bitstream serializer (100 MHz FCLK doubled by PL PLL); \
+                     live-proven by S9 mining at divisors 0x6C/0x07/0x03; \
+                     S19J_PRO_BRAIINSOS_LIVE_PROBE.md:596",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-s15",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-t15",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-s19j",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: FCLK0=100 MHz live-verified \
+                     (S19J_PRO_BRAIINSOS_LIVE_PROBE.md:587) but the am2 FIFO \
+                     serializer clock is not declared; am2 mining is PL-UART",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-s19pro",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-s17p",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-s17plus",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-t17",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-t17plus",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-t19",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+];
+
+/// Look up the declared FIFO fabric clock for a carrier. Unknown targets and
+/// undeclared carriers both return `None` — callers must refuse, never
+/// default to [`FPGA_CLK_HZ`].
+pub fn fifo_fabric_hz(board_target: &str) -> Option<u32> {
+    CARRIER_FIFO_FABRIC
+        .iter()
+        .find(|row| row.board_target == board_target)
+        .and_then(|row| row.fifo_fabric_hz)
+}
 
 /// BAUD_REG value for 115200 baud (default for enumeration).
 pub const BAUD_REG_115200: u32 = 0x6C;
@@ -1515,6 +1646,108 @@ pub fn flush_all_work_tx_devmem() {
 // ---------------------------------------------------------------------------
 // Unit tests (Phase 4B)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod carrier_fifo_fabric_tests {
+    use super::*;
+    use dcentrald_common::board_desc::{BoardDesc, BoardFamily};
+
+    /// W8 CLK-1: the S9 row is the ONLY declared FIFO fabric, it is exactly
+    /// the live-proven 200 MHz, and it equals the legacy S9-scoped constant.
+    /// Mutation-sensitive: swapping either the row (e.g. to 100 MHz) or
+    /// `FPGA_CLK_HZ` fails this test.
+    #[test]
+    fn s9_fifo_fabric_is_declared_200mhz_and_matches_legacy_constant() {
+        assert_eq!(fifo_fabric_hz("am1-s9"), Some(200_000_000));
+        assert_eq!(fifo_fabric_hz("am1-s9"), Some(FPGA_CLK_HZ));
+        let declared: Vec<_> = CARRIER_FIFO_FABRIC
+            .iter()
+            .filter(|r| r.fifo_fabric_hz.is_some())
+            .map(|r| r.board_target)
+            .collect();
+        assert_eq!(
+            declared,
+            vec!["am1-s9"],
+            "only the S9 bitstream has a DECLARED FIFO serializer clock today; \
+             declare a new carrier's value deliberately with provenance, never \
+             by inheriting the S9 200 MHz"
+        );
+    }
+
+    /// W8 CLK-1: every am2 carrier refuses Hz math (None) until its bitstream
+    /// serializer clock is actually declared. FCLK0=100 MHz is live-verified
+    /// but is NOT proof of the FIFO serializer rate.
+    #[test]
+    fn am2_carriers_have_no_declared_fifo_fabric() {
+        for target in [
+            "am2-s19j",
+            "am2-s19pro",
+            "am2-s17p",
+            "am2-s17plus",
+            "am2-t17",
+            "am2-t17plus",
+            "am2-t19",
+        ] {
+            assert_eq!(
+                fifo_fabric_hz(target),
+                None,
+                "{target}: am2 FIFO fabric must stay undeclared (fail-closed) \
+                 until the bitstream serializer clock is probed/declared"
+            );
+        }
+        // Unknown target also refuses.
+        assert_eq!(fifo_fabric_hz("not-a-target"), None);
+    }
+
+    /// W8 CLK-1 bijection gate: the fabric table covers exactly the
+    /// registered Zynq BoardDesc rows — a new Zynq carrier cannot ship
+    /// without taking a position (declared value or explicit None row), and
+    /// the table cannot carry rows for unregistered targets.
+    #[test]
+    fn fabric_table_is_bijective_with_registered_zynq_targets() {
+        let mut zynq_targets: Vec<_> = BoardDesc::all_registered()
+            .iter()
+            .filter(|d| d.family == BoardFamily::Zynq)
+            .map(|d| d.board_target)
+            .collect();
+        let mut table_targets: Vec<_> =
+            CARRIER_FIFO_FABRIC.iter().map(|r| r.board_target).collect();
+        zynq_targets.sort_unstable();
+        table_targets.sort_unstable();
+        assert_eq!(
+            table_targets, zynq_targets,
+            "CARRIER_FIFO_FABRIC must cover exactly the registered Zynq \
+             BoardDesc targets (next carrier = a data row, not new code)"
+        );
+    }
+
+    /// The parameterized conversions agree with the legacy S9 constants and
+    /// pin the CLK-1 hazard arithmetic: the same divisor on a 100 MHz fabric
+    /// lands at half the line rate.
+    #[test]
+    fn parameterized_baud_math_matches_legacy_and_pins_the_2x_hazard() {
+        // Legacy equivalence at the S9 fabric for all three canonical divisors.
+        for div in [BAUD_REG_115200, BAUD_REG_1_5M, BAUD_REG_3M] {
+            assert_eq!(
+                baud_from_divisor_on(FPGA_CLK_HZ, div),
+                FpgaChain::baud_from_divisor(div),
+                "divisor 0x{div:02X}: parameterized math must equal legacy S9 math"
+            );
+        }
+        assert_eq!(baud_from_divisor_on(200_000_000, 0x6C), 114_678);
+        assert_eq!(baud_from_divisor_on(200_000_000, 0x07), 1_562_500);
+        assert_eq!(baud_from_divisor_on(200_000_000, 0x03), 3_125_000);
+        assert_eq!(divisor_from_baud_on(200_000_000, 115_200), 107);
+        assert_eq!(divisor_from_baud_on(200_000_000, 1_562_500), 7);
+        assert_eq!(divisor_from_baud_on(200_000_000, 3_125_000), 3);
+        // CLK-1 latent hazard, pinned as arithmetic: S9 divisor on a 100 MHz
+        // fabric = half the intended rate (57,339 ≈ 115200/2) — the "every
+        // baud 2× off" failure C1 §6 predicts for a mis-scoped constant.
+        assert_eq!(baud_from_divisor_on(100_000_000, 0x6C), 57_339);
+        // Zero-baud never divides by zero.
+        assert_eq!(divisor_from_baud_on(200_000_000, 0), u32::MAX);
+    }
+}
 
 #[cfg(test)]
 mod tests {

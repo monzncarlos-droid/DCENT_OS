@@ -141,7 +141,11 @@ pub const S21_PROFILES: &[PowerProfile] = &[
 pub enum MinerModel {
     /// Antminer S9 / S9i / T9 (BM1387).
     AntminerS9,
-    /// Antminer S17 / S17 Pro / S17e (BM1397).  W7-D.
+    /// Antminer S17 / S17 Pro (BM1397).  W7-D.
+    ///
+    /// 2026-08-03 (W8-G): the S17e was listed here as BM1397; it is BM1396.
+    /// This preset variant keeps covering the BM1397 S17-class SKUs
+    /// (S17 / S17 Pro / S17+ / T17 / T17+); S17e/T17e have no preset.
     AntminerS17,
     /// Antminer S19 (126 TH stock, BM1398).
     AntminerS19,
@@ -191,7 +195,7 @@ impl MinerModel {
     /// decision); the generic per-chip silicon profile is the safe fallback the
     /// autotuner uses meanwhile. The exact preset-row capture procedure is the
     /// named live task in the bench packages:
-    ///   - S17 datum list
+    ///   - S17 →  (S17 datum list)
     ///   - S21 Pro / S21 XP → `.../BP-AMLOGIC-BRINGUP.md` (BM1370 preset capture)
     ///
     /// This emptiness is regression-pinned by `s19k_pro_has_no_preset_rows_yet`

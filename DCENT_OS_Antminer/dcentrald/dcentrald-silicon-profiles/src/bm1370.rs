@@ -99,8 +99,33 @@ pub const BM1370_CORES_PER_CHIP: u32 = 1280;
 /// line 79: 234 TH/s Ã· 195 chips â‰ˆ 1.2 TH/s per chip at 525 MHz).
 pub const BM1370_PER_CHIP_HASHRATE_THS: f32 = 1.2;
 
-/// Standard Antminer S21 Pro chips per chain (195).
-pub const BM1370_CHIPS_PER_CHAIN_S21_PRO: u32 = 195;
+/// Total BM1370 chips in a standard 3-hashboard Antminer S21 Pro (195).
+///
+/// This is the WHOLE-UNIT count, not a per-chain count. It was previously named
+/// `BM1370_CHIPS_PER_CHAIN_S21_PRO`, which contradicted the sibling doc comment
+/// on `BM1370_PER_CHIP_HASHRATE_THS` above ("234 TH/s / 195 chips") and put a
+/// unit total into `serial_chip_count`, a documented per-chain field
+/// (`dcentrald/src/config.rs`: "serial_chip_count is chips per chain, not the
+/// 144-chip unit total").
+pub const BM1370_CHIPS_TOTAL_S21_PRO: u32 = 195;
+
+/// BM1370 chips on ONE Antminer S21 Pro hashboard chain (65).
+///
+/// Four independent held sources agree on 3 hashboards x 65 chips = 195 total:
+/// - : "3 hashboards with 65 chips
+///   each, for a total of 195 chips" at a 234 TH/s nameplate.
+/// - : "Antminer S21 Pro
+///   (65x BM1370 chips)", and "65 chips: `0x00001EB5` (S21 Pro)".
+/// - : "Chips/chain |
+///   65 (S21 Pro)".
+/// - `dcentrald/src/model.rs` `s21pro` -> `chips_per_chain_hint: Some(65)`.
+///
+/// The HASHCOUNTING value `0x00001EB5` is the 65-128 chip bucket, which is
+/// itself per-chain evidence (`MYSTERY_REGISTERS.md`).
+pub const BM1370_CHIPS_PER_CHAIN_S21_PRO: u32 = 65;
+
+/// Standard Antminer S21 Pro hashboard/chain count (3).
+pub const BM1370_CHAIN_COUNT_S21_PRO: u32 = 3;
 
 /// Standard S21 Pro chain count (1 â€” single-board variant; multi-board
 /// air-cooled S21 Pro uses 3 chains scaled appropriately).
@@ -142,7 +167,8 @@ pub const BM1370_VCO_MAX_MHZ_REFDIV1: u32 = 3125;
 /// independent PLLs. `get_pllparam_divider@CB644.c`.
 pub const BM1370_FBDIV_MIN: u32 = 16;
 pub const BM1370_FBDIV_MAX: u32 = 250;
-pub const BM1370_PLL_COUNT: u32 = 3;
+/// Count of RE-mapped PLLs (SSOT: `dcentrald_common::BM1370_PLL_COUNT`).
+pub const BM1370_PLL_COUNT: u32 = dcentrald_common::BM1370_PLL_COUNT as u32;
 
 /// BM1370 per-PLL chip-register addresses -- the on-wire SET_CONFIG register
 /// each PLL's divider word is written to, indexed by pll_id 0..2.
@@ -156,23 +182,49 @@ pub const BM1370_PLL_COUNT: u32 = 3;
 /// previously-known BM1370 PLL1 address exactly, which anchors the
 /// `[PLL0, PLL1, PLL2]` ordering. Closes the "needs a live read" gap; this
 /// is desk-RE ground truth, not a bench promotion of the S21 Pro SKU.
-pub const BM1370_PLL_REGISTER_ADDRS: [u8; 3] = [0x08, 0x60, 0x64];
+/// Per-PLL SET_CONFIG register map — SSOT re-export from `dcentrald_common` (P1-4).
+pub const BM1370_PLL_REGISTER_ADDRS: [u8; 3] = dcentrald_common::BM1370_PLL_REGISTER_ADDRS;
 
 /// BM1370 PLL0 chip-register address (0x08). See [`BM1370_PLL_REGISTER_ADDRS`].
-pub const BM1370_PLL0_REG_ADDR: u8 = 0x08;
+pub const BM1370_PLL0_REG_ADDR: u8 = dcentrald_common::BM1370_PLL_REGISTER_ADDRS[0];
 /// BM1370 PLL1 chip-register address (0x60) -- matches the long-known value.
-pub const BM1370_PLL1_REG_ADDR: u8 = 0x60;
+pub const BM1370_PLL1_REG_ADDR: u8 = dcentrald_common::BM1370_PLL_REGISTER_ADDRS[1];
 /// BM1370 PLL2 chip-register address (0x64). See [`BM1370_PLL_REGISTER_ADDRS`].
-pub const BM1370_PLL2_REG_ADDR: u8 = 0x64;
+pub const BM1370_PLL2_REG_ADDR: u8 = dcentrald_common::BM1370_PLL_REGISTER_ADDRS[2];
 
 /// BM1370 SET_ADDRESS command byte = 0x40 (5-byte, CRC5 poly x^5+x^2+1,
 /// init 0x1F). `generate_set_address_command@CC680.c`.
 pub const BM1370_CMD_SET_ADDRESS: u8 = 0x40;
 
-/// S21 Pro/XP board DC-DC: TI DAC53401 at I2C addr 0x21 (board "NBT2006-36");
-/// 10-bit N left-justified (data[0]=N>>6, data[1]=N<<2).
-/// `set_dac53401_voltage@4B718.c`.
-pub const BM1370_DAC53401_I2C_ADDR: u8 = 0x21;
+// S21 Pro/XP board DC-DC: TI DAC53401 on board "NBT2006-36". 10-bit N
+// left-justified (data[0]=N>>6, data[1]=N<<2). `set_dac53401_voltage@4B718.c`.
+//
+// CORRECTION (2026-07-27). This was a single constant
+// `BM1370_DAC53401_I2C_ADDR = 0x21`, which labelled the DAC-DATA REGISTER as
+// the I2C slave address. The vendor decompilation settles it:
+//
+//   pic_write_iic(uint8_t which_chain, uint8_t slave, uint8_t reg, ...)   // @C5C3C
+//   write_dac(...)            -> dac_addr = 72;  pic_write_iic(chain, 72u, which_reg, ...)   // @4B0C8
+//   set_dac53401_voltage(...) -> write_dac(which_chain, 1u, 33u, data, 2)                    // @4B718
+//
+// 72 = 0x48 is the SLAVE; 33 = 0x21 is the register that receives the code.
+// The sibling `bm1366` module already had this right, so the two modules
+// disagreed about the same part. Split into the full trio and named to match
+// `bm1366::DAC53401_*` so a future reader compares like with like.
+//
+// This constant had zero consumers workspace-wide, so the mislabel was a latent
+// trap rather than a live bug -- and renaming it is compile-safe by
+// construction. Deliberately NOT kept as a deprecated alias: the old name is
+// the trap.
+
+/// TI DAC53401 I2C slave address on the NBT2006-36 board rail (7-bit).
+pub const BM1370_DAC53401_I2C_ADDR_SLAVE: u8 = 0x48;
+
+/// DAC-DATA register that receives the `N << 2` code (big-endian u16).
+pub const BM1370_DAC53401_DATA_REG: u8 = 0x21;
+
+/// Config/init register poked during `init_dac53401_NBT2006_36`.
+pub const BM1370_DAC53401_INIT_REG: u8 = 0xD1;
 
 /// Register 0x58 (IO Driver Strength) â€” S21 Pro variant.
 /// NOT 0x02111111 like other chips. Per chip-init-sequences.md line 252.
@@ -318,6 +370,45 @@ mod tests {
         assert_eq!(BM1370_TABLE.max_step(), 2);
     }
 
+    /// The DAC53401 is the same TI part on both boards, so the two modules must
+    /// not disagree about which byte is the slave and which is the register.
+    ///
+    /// They did: `bm1370` carried a single `..._I2C_ADDR = 0x21`, naming the
+    /// DAC-DATA register as the slave, while `bm1366` had the correct trio. A
+    /// cross-module equality is the cheapest thing that makes that class of
+    /// drift impossible to reintroduce silently in either direction.
+    #[test]
+    fn dac53401_addressing_agrees_with_the_bm1366_module() {
+        use crate::bm1366;
+
+        assert_eq!(
+            BM1370_DAC53401_I2C_ADDR_SLAVE,
+            bm1366::DAC53401_I2C_ADDR,
+            "DAC53401 slave address disagrees across chip modules; the vendor's \
+             write_dac@4B0C8 passes 72 (0x48) as `slave` to \
+             pic_write_iic(chain, slave, reg, ..)"
+        );
+        assert_eq!(
+            BM1370_DAC53401_DATA_REG,
+            bm1366::DAC53401_DATA_REG,
+            "DAC53401 data register disagrees across chip modules; \
+             set_dac53401_voltage@4B718 passes 33 (0x21) as `which_reg`"
+        );
+        assert_eq!(
+            BM1370_DAC53401_INIT_REG,
+            bm1366::DAC53401_INIT_REG,
+            "DAC53401 init/config register disagrees across chip modules"
+        );
+
+        // The two roles must stay distinct. If a future edit collapses them
+        // back to one value, the equalities above would still pass.
+        assert_ne!(
+            BM1370_DAC53401_I2C_ADDR_SLAVE, BM1370_DAC53401_DATA_REG,
+            "slave address and data register must not be the same byte — \
+             conflating them is exactly the defect this test was added for"
+        );
+    }
+
     #[test]
     fn pll_register_addrs_re_confirmed_from_jig() {
         // Byte-exact from the S21 Pro single_board_test jig:
@@ -376,13 +467,34 @@ mod tests {
         // BM1373_S23_RESEARCH.md line 79: 234 TH/s Ã· 195 chips â‰ˆ 1.2 TH/s
         // per chip at 525 MHz.
         assert!((BM1370_PER_CHIP_HASHRATE_THS - 1.2).abs() < 1e-3);
-        assert_eq!(BM1370_CHIPS_PER_CHAIN_S21_PRO, 195);
+        assert_eq!(BM1370_CHIPS_TOTAL_S21_PRO, 195);
         // 195 chips Ã— 1.2 TH/s â‰ˆ 234 TH/s â€” anchor matches.
-        let computed_total = (BM1370_CHIPS_PER_CHAIN_S21_PRO as f32) * BM1370_PER_CHIP_HASHRATE_THS;
+        let computed_total = (BM1370_CHIPS_TOTAL_S21_PRO as f32) * BM1370_PER_CHIP_HASHRATE_THS;
         assert!(
             (computed_total - 234.0).abs() < 1.0,
             "computed {} TH/s should match S21 Pro nameplate 234 TH/s",
             computed_total
+        );
+    }
+
+    /// Per-chain and whole-unit S21 Pro geometry must stay distinguishable.
+    ///
+    /// The two were previously the same constant named `..._CHIPS_PER_CHAIN_...`
+    /// while holding the unit total (195). That mislabel is how the shipped
+    /// `am3-s21pro/etc/dcentrald.toml` came to put 195 into `serial_chip_count`,
+    /// a per-chain field. Pin the relationship so the names cannot drift back.
+    #[test]
+    fn s21_pro_per_chain_times_chain_count_is_the_unit_total() {
+        assert_eq!(BM1370_CHIPS_PER_CHAIN_S21_PRO, 65);
+        assert_eq!(BM1370_CHAIN_COUNT_S21_PRO, 3);
+        assert_eq!(
+            BM1370_CHIPS_PER_CHAIN_S21_PRO * BM1370_CHAIN_COUNT_S21_PRO,
+            BM1370_CHIPS_TOTAL_S21_PRO,
+            "3 hashboards x 65 BM1370 must equal the 195-chip S21 Pro total"
+        );
+        assert_ne!(
+            BM1370_CHIPS_PER_CHAIN_S21_PRO, BM1370_CHIPS_TOTAL_S21_PRO,
+            "per-chain must never be re-aliased to the unit total"
         );
     }
 

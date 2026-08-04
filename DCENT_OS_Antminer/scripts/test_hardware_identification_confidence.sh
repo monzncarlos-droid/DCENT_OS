@@ -84,12 +84,15 @@ rest_rs='dcentrald/dcentrald-api/src/rest.rs'
 rest_late_rs='dcentrald/dcentrald-api/src/rest/late.rs'
 hardware_rs='dcentrald/dcentrald/src/runtime/hardware_info.rs'
 publication_rs='dcentrald/dcentrald/src/asic_identity_publication.rs'
+execution_fence_rs='dcentrald/dcentrald/src/execution_fence.rs'
+runtime_execution_rs='dcentrald/dcentrald/src/runtime_execution.rs'
 daemon_rs='dcentrald/dcentrald/src/daemon.rs'
 dispatcher_rs='dcentrald/dcentrald/src/work_dispatcher.rs'
 main_rs='dcentrald/dcentrald/src/main.rs'
 
 for f in "$api_lib" "$rest_rs" "$rest_late_rs" "$hardware_rs" \
-    "$publication_rs" "$daemon_rs" "$dispatcher_rs" "$main_rs"; do
+    "$publication_rs" "$execution_fence_rs" "$runtime_execution_rs" "$daemon_rs" \
+    "$dispatcher_rs" "$main_rs"; do
     require_file "$f"
 done
 
@@ -158,12 +161,46 @@ require_pattern "$rest_late_rs" 'hardware_identity_bm1387_t9_declaration_is_not_
 
 require_pattern "$main_rs" 'mod asic_identity_publication;' \
     'measured ASIC publication module is wired into the daemon'
+require_pattern "$main_rs" 'mod runtime_execution;' \
+    'measured runtime-execution authority is wired into the daemon'
+require_pattern "$main_rs" 'mod execution_fence;' \
+    'generic execution-fence authority is wired into the daemon'
 require_pattern "$publication_rs" 'pub(crate) struct EnumeratedMiningChainReceipt {' \
     'successful GetAddress enumeration has an explicit receipt type'
 require_pattern "$publication_rs" 'from_successful_get_address' \
     'enumeration receipt construction names its measured provenance'
-require_pattern "$publication_rs" 'state.active = None;' \
-    'every composition transition invalidates the prior generation first'
+require_pattern "$publication_rs" 'let phase = std::mem::take(&mut state.phase);' \
+    'every composition transition consumes the single prior authority phase'
+require_pattern "$publication_rs" 'CompositionPhase::Active(active) => CompositionPhase::Revoking' \
+    'active composition ownership moves into the exclusive revoking phase'
+require_pattern "$publication_rs" 'fence: Some(active.execution_terminal.revoke()),' \
+    'identity revocation closes prior-generation runtime admission without a blocking waiter'
+require_pattern "$publication_rs" 'Arc::clone(&self.active_generation),' \
+    'measured publication binds its execution domain to the authority generation latch'
+require_pattern "$runtime_execution_rs" \
+    'inner: ExecutionFencePort<HardwareCompositionToken>,' \
+    'runtime final-commit authority wraps the exact measured composition fence'
+require_pattern "$runtime_execution_rs" 'active_generation: Arc<AtomicU64>,' \
+    'runtime final-commit authority carries the lock-independent generation latch'
+require_pattern "$runtime_execution_rs" 'self.inner.commit_if(' \
+    'runtime commits check both the composition latch and generic execution fence'
+require_pattern "$execution_fence_rs" 'pub(crate) struct ExecutionFencePort<T> {' \
+    'runtime final-commit authority uses an explicit generic capability'
+require_pattern "$execution_fence_rs" 'commit_fence: RwLock<()>,' \
+    'runtime terminal fencing preserves independent steady-state commit concurrency'
+require_pattern "$execution_fence_rs" 'pub(crate) fn revoke(self) -> RevokedExecutionFence<T>' \
+    'runtime execution authority exposes irreversible nonblocking revocation'
+require_absent_pattern "$execution_fence_rs" 'close_and_wait_for_commit_fence' \
+    'runtime execution authority has no production blocking terminal waiter'
+require_pattern "$runtime_execution_rs" \
+    'terminal_close_rejects_a_later_commit_without_running_its_closure' \
+    'late runtime commits have a negative Rust regression test'
+require_pattern "$runtime_execution_rs" \
+    'entered_commit_finishes_before_terminal_fence_receipt' \
+    'terminal receipts wait for already-entered final commits'
+require_pattern "$runtime_execution_rs" \
+    'independent_runtime_commits_are_not_serialized_in_steady_state' \
+    'runtime commit fencing has a steady-state concurrency regression test'
 require_pattern "$daemon_rs" 'self.asic_enumeration_receipts.clear();' \
     'every init generation invalidates earlier enumeration receipts'
 require_pattern_count "$daemon_rs" \
@@ -171,8 +208,33 @@ require_pattern_count "$daemon_rs" \
     'daemon has exactly one production receipt-minting site'
 require_pattern "$daemon_rs" 'chain.mining && chain.chain_id == receipt.chain_id()' \
     'dispatcher snapshot filters receipts to currently mining chains'
-require_pattern "$dispatcher_rs" 'publication.publish(self.chip_id)' \
-    'active dispatcher supplies the final identity-consensus input'
+require_pattern "$publication_rs" 'pub(crate) fn activate_execution(' \
+    'measured publication and driver authority have one fused activation boundary'
+require_pattern "$publication_rs" \
+    'let session = match publication.publish(driver_admission.chip_id())' \
+    'measured identity publication must succeed before dispatcher admission is minted'
+require_pattern "$dispatcher_rs" \
+    'execution_admission: MeasuredDispatcherExecutionAdmission' \
+    'dispatcher construction consumes the move-only measured execution admission'
+require_pattern "$dispatcher_rs" \
+    'identity_composition_session: ActiveCompositionSession' \
+    'dispatcher owns the already-published composition session for its full lifetime'
+require_pattern "$dispatcher_rs" \
+    'runtime_execution_commit_port: RuntimeExecutionCommitPort' \
+    'dispatcher stores the exact measured-generation final-commit authority'
+require_pattern "$dispatcher_rs" \
+    'every_dispatcher_hardware_write_uses_the_measured_execution_commit_port' \
+    'dispatcher hardware-write coverage has a Rust source-contract regression test'
+require_pattern "$daemon_rs" \
+    'runtime_voltage_energizing_commits_are_fenced_but_disable_remains_available' \
+    'voltage energizing commits are fenced while terminal disable remains available'
+require_pattern "$daemon_rs" \
+    'shutdown_fences_internal_execution_before_identity_revocation_and_safe_off' \
+    'shutdown ordering has a Rust source-contract regression test'
+require_absent_pattern "$dispatcher_rs" 'publication.publish(self.chip_id)' \
+    'dispatcher cannot defer identity publication until after construction'
+require_absent_pattern "$dispatcher_rs" 'set_asic_identity_publication_port' \
+    'dispatcher has no optional post-construction identity-publication setter'
 require_pattern "$publication_rs" 'exact_consensus_publishes_generation_bound_measured_identity' \
     'exact all-chain consensus has a positive Rust regression test'
 require_pattern "$publication_rs" 'partial_and_mixed_enumeration_never_publish_measured_identity' \

@@ -179,6 +179,50 @@ pub fn power_precedes_fan_raise(steps: &[SafetyStep]) -> bool {
     true
 }
 
+/// Outcome of executing a [`SafetyAction`] through adapter callbacks (P1-6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SafetyApplyReport {
+    /// Number of steps that began execution (including the failing one).
+    pub steps_attempted: usize,
+    /// True if a CutPower step completed successfully.
+    pub cut_power_applied: bool,
+    /// Effective fan PWM after a successful CommandFans step.
+    pub fan_pwm_applied: Option<u8>,
+}
+
+/// Execute [`SafetyAction::steps`] in order via injected adapters.
+///
+/// Pure orchestration — no HAL. Engines supply:
+/// - `on_cut`: disable voltage rails / PWR_CONTROL (cut-hash-before-noise)
+/// - `on_fan`: write effective PWM only (already home-capped by [`FanCommand`])
+///
+/// Stops on first callback error and returns the partial report + error.
+pub fn apply_safety_action<E>(
+    action: SafetyAction,
+    mut on_cut: impl FnMut(PowerCut) -> Result<(), E>,
+    mut on_fan: impl FnMut(u8) -> Result<(), E>,
+) -> Result<SafetyApplyReport, (SafetyApplyReport, E)> {
+    let mut report = SafetyApplyReport::default();
+    for step in action.steps() {
+        report.steps_attempted = report.steps_attempted.saturating_add(1);
+        match step {
+            SafetyStep::CutPower(cut) => match on_cut(cut) {
+                Ok(()) => report.cut_power_applied = true,
+                Err(e) => return Err((report, e)),
+            },
+            SafetyStep::CommandFans(fan) => {
+                let pwm = fan.effective_pwm();
+                match on_fan(pwm) {
+                    Ok(()) => report.fan_pwm_applied = Some(pwm),
+                    Err(e) => return Err((report, e)),
+                }
+            }
+        }
+    }
+    debug_assert!(power_precedes_fan_raise(&action.steps()));
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +308,88 @@ mod tests {
         } else {
             panic!("expected fan step");
         }
+    }
+
+    #[test]
+    fn apply_safety_action_executes_cut_before_fan_and_reports() {
+        let action = PowerCut::home_thermal_hard_stop_action(30);
+        let mut cuts = 0u32;
+        let mut fans: Vec<u8> = Vec::new();
+        let report = apply_safety_action(
+            action,
+            |cut| {
+                assert_eq!(cut.reason, PowerCutReason::ThermalEmergency);
+                cuts += 1;
+                Ok::<(), &'static str>(())
+            },
+            |pwm| {
+                fans.push(pwm);
+                Ok(())
+            },
+        )
+        .expect("apply");
+        assert_eq!(cuts, 1);
+        assert_eq!(fans, [HOME_FAN_PWM_SAFETY_MAX]);
+        assert!(report.cut_power_applied);
+        assert_eq!(report.fan_pwm_applied, Some(HOME_FAN_PWM_SAFETY_MAX));
+        assert_eq!(report.steps_attempted, 2);
+    }
+
+    #[test]
+    fn apply_safety_action_stops_on_cut_error_without_fan() {
+        let action = PowerCut::home_thermal_hard_stop_action(30);
+        let mut fans = 0u32;
+        let err = apply_safety_action(
+            action,
+            |_cut| Err("rail dead"),
+            |_pwm| {
+                fans += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.1, "rail dead");
+        assert!(!err.0.cut_power_applied);
+        assert_eq!(err.0.steps_attempted, 1);
+        assert_eq!(fans, 0);
+    }
+
+    #[test]
+    fn apply_safety_action_fan_only_skips_cut() {
+        let action = SafetyAction::FanOnly(FanCommand::home_quiet_park(30));
+        let report = apply_safety_action(
+            action,
+            |_cut| Err("must not cut"),
+            |pwm| {
+                assert_eq!(pwm, 0);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .expect("fan only");
+        assert!(!report.cut_power_applied);
+        assert_eq!(report.fan_pwm_applied, Some(0));
+    }
+
+    #[test]
+    fn fan_only_from_requested_pwm_applies_home_cap() {
+        // Throttle/set-fan path: requested 100 with profile 100 → home cap 30.
+        let action = SafetyAction::FanOnly(FanCommand {
+            profile_max_pwm: 100,
+            requested_pwm: 100,
+            apply_home_safety_cap: true,
+        });
+        let mut saw = 0u8;
+        let report = apply_safety_action(
+            action,
+            |_cut| Err("must not cut on FanOnly"),
+            |pwm| {
+                saw = pwm;
+                Ok::<(), &'static str>(())
+            },
+        )
+        .expect("fan only");
+        assert_eq!(saw, HOME_FAN_PWM_SAFETY_MAX);
+        assert_eq!(report.fan_pwm_applied, Some(HOME_FAN_PWM_SAFETY_MAX));
+        assert!(!report.cut_power_applied);
     }
 }

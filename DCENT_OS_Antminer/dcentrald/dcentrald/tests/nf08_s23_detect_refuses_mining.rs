@@ -120,11 +120,16 @@ fn daemon_and_dispatcher_gate_dispatch_through_registry_and_typed_identity() {
     assert!(DAEMON_RS.contains("registry.detect(self.chip_id)"));
     assert!(DAEMON_RS.contains("No built-in driver for ChipID"));
 
-    assert!(WORK_DISPATCHER_RS.contains("ChipRegistry::with_execution_policy("));
+    assert!(WORK_DISPATCHER_RS.contains("ChipRegistry::from_admission(driver_admission)"));
     assert!(WORK_DISPATCHER_RS.contains("normalize_dispatch_write_identity("));
     assert!(WORK_DISPATCHER_RS.contains("registry.detect(chip.chip_id())"));
     assert!(WORK_DISPATCHER_RS.contains("if driver.is_none()"));
-    assert!(WORK_DISPATCHER_RS.contains("cannot generate ASIC work for unknown chip type"));
+    assert!(WORK_DISPATCHER_RS
+        .contains("Measured dispatcher admission did not resolve its exact driver"));
+    assert!(
+        !WORK_DISPATCHER_RS.contains("ChipRegistry::with_execution_policy("),
+        "dispatcher must consume exact measured admission instead of reconstructing policy authority"
+    );
 
     // The env-gated `new()` consumes the two-gate policy, and the S23 scaffold
     // is dual-keyed via `register_alias`.

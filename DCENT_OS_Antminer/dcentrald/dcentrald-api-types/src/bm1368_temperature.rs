@@ -12,6 +12,52 @@ pub const BM1368_CHIP_TEMPERATURE_SCHEMA: &str = "dcentos.hardware.bm1368_chip_t
 pub const BM1368_S21_CHIPS_PER_CHAIN: u16 = 108;
 pub const BM1368_S21_ADDRESS_INTERVAL: u8 = 2;
 
+// --- BM1368 Synopsys on-die temperature-sensor transfer function (item C6-4) ---
+//
+// Provenance: Bitmain AMTC factory single-board-test jig for S21/BM1368
+// (byte-
+// identical to `amtc-s21-jig/single_board_test_bm1368`; `Config.ini Asic_Type=BM1368`).
+// Conversion at `get_register_value_with_ext_data@0x2CD9C` (register-0xB4/180 handler):
+//     temp_c = (float)(uint16)reg * 0.171342 - 299.5144
+// Coefficients are IEEE-754 doubles in the jig constant pool at file offsets 0x1D718
+// (slope) and 0x1D720 (offset). Control register 0xB0
+// (`set_chain_asic_synopsys_temp@0xCF5DC`) enables the sensor; data register 0xB4
+// (`get_chain_asic_synopsys_temp@0xCF628`) is polled for the reading. The identical
+// transfer function appears in the S21pro/BM1370 and S21xp jigs, confirming it is the
+// generic Synopsys DWC PVT temp-sensor macro for the BM136x/137x family. (Census pointer
+// `CF5DC` was the sensor *enable* function, not the conversion.)
+//
+// STATUS: byte-exact transcription of the factory-jig transfer function. It has NOT been
+// re-verified against a live BM1368 die reading, so this decoder stays UNWIRED from
+// `from_live_observations`; API status remains `NotProven`. The KAT proves transcription
+// stability only, not production temperature accuracy. BM1362 is NOT byte-confirmed (the
+// held jig ELF is stripped) — this decoder is BM1368-specific.
+
+/// Synopsys temp-sensor slope (jig IEEE-754 double @ file offset 0x1D718).
+pub const BM1368_SYNOPSYS_TEMP_SLOPE: f64 = 0.171342;
+/// Synopsys temp-sensor offset (jig IEEE-754 double @ file offset 0x1D720).
+pub const BM1368_SYNOPSYS_TEMP_OFFSET: f64 = 299.5144;
+/// Sensor control register (`set_chain_asic_synopsys_temp@0xCF5DC`).
+pub const BM1368_SYNOPSYS_TEMP_CTRL_REG: u8 = 0xB0;
+/// Sensor data/readout register (`get_chain_asic_synopsys_temp@0xCF628`).
+pub const BM1368_SYNOPSYS_TEMP_DATA_REG: u8 = 0xB4;
+/// Bit 31 of the register-0xB4 response = data-ready/valid flag.
+pub const BM1368_SYNOPSYS_TEMP_VALID_FLAG: u32 = 0x8000_0000;
+
+/// Decode a BM1368 Synopsys temp-sensor register-`0xB4` response word into degrees C.
+///
+/// Returns `None` when the data-ready flag (bit 31) is clear — the factory jig treats a
+/// cleared flag as an invalid reading and logs it instead of converting. The raw reading
+/// is the low 16 bits (zero-extended, no sign extension). The math is done in `f64` then
+/// narrowed to `f32` to match the jig's `(float)(...)` semantics. Pure; no HAL/IO.
+pub fn bm1368_decode_synopsys_temp_c(reg_value: u32) -> Option<f32> {
+    if reg_value & BM1368_SYNOPSYS_TEMP_VALID_FLAG == 0 {
+        return None;
+    }
+    let raw = (reg_value & 0xFFFF) as f64;
+    Some((raw * BM1368_SYNOPSYS_TEMP_SLOPE - BM1368_SYNOPSYS_TEMP_OFFSET) as f32)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bm1368ChipTemperatureStatus {
@@ -92,8 +138,9 @@ pub fn is_bm1368_chip_type(chip_type: &str) -> bool {
 pub fn bm1368_address_interval(chip_count: u16) -> Option<u8> {
     match chip_count {
         0 => None,
-        BM1368_S21_CHIPS_PER_CHAIN => Some(BM1368_S21_ADDRESS_INTERVAL),
-        1..=256 => Some((256 / chip_count).max(1) as u8),
+        // P1-3: full-population stride SSOT in dcentrald-common (S21 108 → 2).
+        1..=255 => Some(dcentrald_common::bm1397plus_addr_interval(chip_count as u8)),
+        256 => Some(1),
         _ => None,
     }
 }
@@ -279,6 +326,30 @@ impl Bm1368ChipTemperatureResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bm1368_synopsys_temp_matches_factory_jig_transfer_function() {
+        // KAT computed from the byte-exact jig coefficients
+        // (get_register_value_with_ext_data@0x2CD9C; slope @0x1D718, offset @0x1D720).
+        // Proves transcription stability, NOT live temperature accuracy. Approximate
+        // comparison survives target-dependent f32 rounding of the literals.
+        let approx = |reg: u32, want: f32| {
+            let got = bm1368_decode_synopsys_temp_c(reg).expect("data-ready flag set");
+            assert!(
+                (got - want).abs() < 1e-3,
+                "reg={reg:#010x} got={got} want={want}"
+            );
+        };
+        approx(0x8000_0766, 25.007_347); // raw 1894
+        approx(0x8000_07D0, 43.169_601); // raw 2000
+        approx(0x8000_0800, 51.394_016); // raw 2048
+                                         // Data-ready flag (bit 31) clear => invalid reading, no conversion.
+        assert_eq!(bm1368_decode_synopsys_temp_c(0x0000_0766), None);
+        // Register/coefficient constants stay pinned to the jig source.
+        assert_eq!(BM1368_SYNOPSYS_TEMP_CTRL_REG, 0xB0);
+        assert_eq!(BM1368_SYNOPSYS_TEMP_DATA_REG, 0xB4);
+        assert_eq!(BM1368_SYNOPSYS_TEMP_VALID_FLAG, 0x8000_0000);
+    }
 
     #[test]
     fn s21_address_plan_uses_verified_interval_two() {

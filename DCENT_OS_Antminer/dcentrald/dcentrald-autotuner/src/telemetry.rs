@@ -386,7 +386,8 @@ pub fn build_efficiency_snapshot(
     let mut control_board_added = false;
 
     for profile in profiles.values() {
-        let chip_id = crate::chip_id_from_type(&profile.chip_type).unwrap_or(0x1387);
+        // G4/G18 honesty: never silent-alias unknown chip to BM1387.
+        let chip_id = crate::chip_id_for_pll_policy(&profile.chip_type);
         let power_model =
             crate::power_budget::PowerModel::new_for_chip(chip_id).with_power_scale(power_scale);
         let voltage_mv = profile.optimal_voltage_mv.unwrap_or(profile.voltage_mv);

@@ -1,0 +1,35 @@
+# Shared ESP32-S3 **16 MB (N16R8)** flash layout — used by every 16 MB board
+# target, not one vendor's. Current consumers:
+#   * Hammer BC0x / DC0x — 16 MB DIO 80 MHz, verified from the Hammer vendor
+#     corpus (HAMMER_HARDWARE_MATRIX.md §6).
+#   * Lucky Miner LV06 / LV07 / LV08 — ESP32-S3 N16R8, same 16 MB geometry
+#     (Lucky enablement wave 2026-07-27). EXPERIMENTAL: no Lucky hardware is on
+#     any bench, so this layout is host/desk-derived, never flash-verified on a
+#     Lucky unit.
+# (Renamed from `partitions-hammer-16mb.csv` when the second family arrived —
+# one geometry, one file. Do NOT fork a per-vendor copy: two partition CSVs
+# that drift are an OTA-slot-geometry hazard.)
+#
+# WHY A SEPARATE CSV: the stock repo `partitions.csv` is an 8 MB layout
+# (coredump at 0x800000, 3 MB OTA slots) and is INCOMPATIBLE with 16 MB
+# hardware; Hammer BC04's vendor app alone is 3.19 MB, which already exceeds a
+# 3 MB OTA slot. This layout gives two 4 MB OTA slots and uses the full 16 MB.
+# Selected per board target via the sdkconfig overlay
+# `sdkconfig.defaults.16mb` (ESP_IDF_SDKCONFIG_DEFAULTS=
+# "sdkconfig.defaults;sdkconfig.defaults.16mb"); 8 MB boards keep
+# `partitions.csv` untouched.
+#
+# ⚠ RETURN-TO-STOCK NOTE (Lucky): the LVXX stock layout keeps a ~4 MB `factory`
+# partition that this pure-OTA scheme does NOT reproduce. Flashing DCENT_OS
+# over a Lucky unit therefore overwrites the vendor factory slot; restoring
+# stock needs a full serial re-flash of the vendor image, not an OTA. Not
+# solved here — flagged so nobody assumes an OTA round-trip back to stock.
+#
+# Name,   Type, SubType,  Offset,   Size,   Flags
+nvs,      data, nvs,      0x9000,   0x6000,
+otadata,  data, ota,      0xf000,   0x2000,
+ota_0,    app,  ota_0,    0x20000,  0x400000,
+ota_1,    app,  ota_1,    0x420000, 0x400000,
+littlefs, data, spiffs,   0x820000, 0x7C0000,
+# Panic coredump (ESP-IDF ELF format, CRC32-checked). Read via /api/system/coredump.
+coredump, data, coredump, 0xFE0000, 0x10000,

@@ -33,15 +33,18 @@
 use anyhow::{Context, Result};
 use dcentrald_common::am2_topology::{dspic_address_for_slot, slot_for_uart};
 
-/// Canonical AM2 dsPIC I²C address table, indexed by hashboard slot 0..=3.
-/// Matches `s19j_hybrid_mining::S19_DSPIC_ADDRS` (kept in lockstep — single
-/// source of truth is `dcentrald_common::am2_topology` and is consumed below.
-///
-/// Slot 0 = PL UART 0 = `/dev/ttyS1` → dsPIC 0x20
-/// Slot 1 = PL UART 1 = `/dev/ttyS2` → dsPIC 0x21
-/// Slot 2 = PL UART 2 = `/dev/ttyS3` → dsPIC 0x22
-/// Slot 3 = PL UART 3 = `/dev/ttyS4` → dsPIC 0x23
-///
+// Canonical AM2 dsPIC I²C address table, indexed by hashboard slot 0..=3.
+// Matches `s19j_hybrid_mining::S19_DSPIC_ADDRS` (kept in lockstep — single
+// source of truth is `dcentrald_common::am2_topology`, consumed below).
+//
+//   Slot 0 = PL UART 0 = `/dev/ttyS1` → dsPIC 0x20
+//   Slot 1 = PL UART 1 = `/dev/ttyS2` → dsPIC 0x21
+//   Slot 2 = PL UART 2 = `/dev/ttyS3` → dsPIC 0x22
+//   Slot 3 = PL UART 3 = `/dev/ttyS4` → dsPIC 0x23
+//
+// (Plain `//`, not `///`: this documents the module's topology contract, not the
+// item that follows it.)
+
 /// One planned chain — the runtime opens one `SerialChainBackend`,
 /// orchestrates one PIC's voltage path, and dispatches/polls work per
 /// instance of this record.
