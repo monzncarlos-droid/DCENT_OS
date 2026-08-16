@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 ROOTFS_MTD="$DCENT_AM3_ROOTFS_MTD"
-# S19k Pro .78 U-Boot env: nandrootfs=0x0B800000, mtd5 base=0x06100000.
+# S19k Pro .78 U-Boot env: nandrootfs=0x0B800000, physical mtd5=0x06700000.
 ROOTFS_OFFSET_HEX="$DCENT_AM3_ROOTFS_OFFSET_HEX"
 ROOTFS_WINDOW_HEX="$DCENT_AM3_ROOTFS_WINDOW_HEX"
 ROOTFS_ERASE_COUNT="$DCENT_AM3_ROOTFS_ERASE_COUNT"
@@ -49,6 +49,22 @@ require_lab_flags() {
     done
     [ "$allow" = "true" ] || { echo "Missing --lab-only" >&2; exit 1; }
     [ "$recovery" = "true" ] || { echo "Missing --i-have-recovery" >&2; exit 1; }
+}
+
+# : --lab-only is not a FLASH override. Do not gpio/flash_erase/nandwrite
+# then refuse.
+refuse_clear_for_flash_nand() {
+    CLEAR_FOR_FLASH=false
+    if [ "$CLEAR_FOR_FLASH" != true ]; then
+        echo "ERROR: CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite." >&2
+        echo "schema=dcentos.amlogic-lab-rootfs/v1"
+        echo "nandwrite=false"
+        echo "gpio_write=false"
+        echo "execute=CLEAR_FOR_FLASH"
+        echo "clear_for_flash=false"
+        echo "--lab-only is not a FLASH override. FLASH NOT_YET"
+        exit 1
+    fi
 }
 
 require_uint() {
@@ -174,6 +190,58 @@ require_exact_amlogic_target() {
     esac
 }
 
+
+# SKU-scoped GPIO437 SafeOff. T6: am3-s19k 0=ON / 1=OFF. RE-4C S21-family 1=ON / 0=OFF.
+# Identity is read on the target. Refuse NAND mutation if SafeOff cannot be proven.
+require_gpio437_safe_off_before_mutation() {
+    local miner_ip="$1"
+    local hint
+    hint=$(ssh $SSH_OPTS "root@$miner_ip" '
+        cat /etc/dcentos/board_target 2>/dev/null
+        grep -i s19k /etc/bosminer.toml /etc/bosminer_model.json /config/CONF_MINER_TYPE 2>/dev/null
+    ' || true)
+    local safe_off
+    local safe_dir
+    local polarity
+    case "$hint" in
+        *am3-s19k*|*s19k*|*S19K*|*S19k*)
+            safe_off=1
+            safe_dir=high
+            polarity=am3-s19k-active-low
+            ;;
+        *s21*|*S21*|*am3-s21*)
+            safe_off=0
+            safe_dir=low
+            polarity=re4c-active-high
+            ;;
+        *)
+            echo "ERROR: refuse GPIO437 SafeOff without proven board identity (unproven default 0 engages am3-s19k rails)" >&2
+            exit 1
+            ;;
+    esac
+    echo "GPIO437 PWR_EN SafeOff (polarity=$polarity value=$safe_off) before NAND rootfs-window mutation"
+    ssh $SSH_OPTS "root@$miner_ip" "PWR_GPIO=437
+SAFE_OFF=$safe_off
+SAFE_DIR=$safe_dir
+SYS=/sys/class/gpio
+if [ ! -d \"\$SYS/gpio\$PWR_GPIO\" ]; then
+  echo \"\$PWR_GPIO\" > \"\$SYS/export\" 2>/dev/null || true
+fi
+[ -d \"\$SYS/gpio\$PWR_GPIO\" ] || { echo \"ERROR: gpio\$PWR_GPIO missing after export\" >&2; exit 1; }
+echo 0 > \"\$SYS/gpio\$PWR_GPIO/active_low\"
+echo \"\$SAFE_DIR\" > \"\$SYS/gpio\$PWR_GPIO/direction\"
+echo \"\$SAFE_OFF\" > \"\$SYS/gpio\$PWR_GPIO/value\"
+AL=\$(cat \"\$SYS/gpio\$PWR_GPIO/active_low\")
+DIR=\$(cat \"\$SYS/gpio\$PWR_GPIO/direction\")
+VAL=\$(cat \"\$SYS/gpio\$PWR_GPIO/value\")
+[ \"\$AL\" = \"0\" ] || { echo \"ERROR: gpio437 active_low=\$AL\" >&2; exit 1; }
+[ \"\$DIR\" = \"out\" ] || { echo \"ERROR: gpio437 direction=\$DIR\" >&2; exit 1; }
+[ \"\$VAL\" = \"\$SAFE_OFF\" ] || { echo \"ERROR: gpio437 value=\$VAL after SafeOff (want \$SAFE_OFF)\" >&2; exit 1; }
+echo \"gpio437 SafeOff OK polarity=$polarity active_low=\$AL direction=\$DIR value=\$VAL\"" \
+        || { echo "ERROR: GPIO437 SafeOff failed — refusing NAND mutation" >&2; exit 1; }
+    echo "GPIO437 SafeOff verified (polarity=$polarity value=$safe_off)"
+}
+
 validate_target_rootfs_geometry() {
     local miner_ip="$1"
     local mtd_name
@@ -275,6 +343,8 @@ EOF
             echo "Candidate upload SHA mismatch: local $LOCAL_SHA remote $REMOTE_SHA" >&2
             exit 1
         }
+        refuse_clear_for_flash_nand
+        require_gpio437_safe_off_before_mutation "$MINER_IP"
         ssh $SSH_OPTS "root@$MINER_IP" "flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT && nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD /tmp/dcentos_candidate.uimage"
         READBACK_SHA=$(ssh $SSH_OPTS "root@$MINER_IP" "nanddump --bb=skipbad -s $ROOTFS_OFFSET_HEX -l $IMAGE_SIZE -q -f /tmp/dcentos_candidate_readback.uimage $ROOTFS_MTD && sha256sum /tmp/dcentos_candidate_readback.uimage | awk '{print \$1}'")
         scp -O $SSH_OPTS "root@$MINER_IP:/tmp/dcentos_candidate_readback.uimage" "$ARTIFACT_DIR/write_readback.uimage"
@@ -352,6 +422,8 @@ EOF
             echo "Restore upload SHA mismatch: local $LOCAL_SHA remote $REMOTE_SHA" >&2
             exit 1
         }
+        refuse_clear_for_flash_nand
+        require_gpio437_safe_off_before_mutation "$MINER_IP"
         ssh $SSH_OPTS "root@$MINER_IP" "flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT && nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD /tmp/amlogic_restore.uimage"
         RESTORE_REMOTE_READBACK_SHA=$(ssh $SSH_OPTS "root@$MINER_IP" "nanddump --bb=skipbad -s $ROOTFS_OFFSET_HEX -l $BACKUP_SIZE -q -f /tmp/amlogic_restore_readback.uimage $ROOTFS_MTD && sha256sum /tmp/amlogic_restore_readback.uimage | awk '{print \$1}'")
         scp -O $SSH_OPTS "root@$MINER_IP:/tmp/amlogic_restore_readback.uimage" "$ARTIFACT_DIR/restore_readback.uimage"

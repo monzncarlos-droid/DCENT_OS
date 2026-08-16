@@ -123,7 +123,6 @@ pub enum BmCrcKind {
     /// FPGA side; the ASIC validates internally.
     HardwareCrc,
     /// Software CRC8, polynomial pinned at the chip-driver level.
-    /// (BM139x family — see `crate::bm1393::BM1393_CRC8_POLY_TBD`.)
     Crc8,
 }
 
@@ -208,15 +207,15 @@ mod tests {
 
     /// PR-054 — BM1391 / BM1393 vs BM1387 register-level disambiguation.
     ///
-    /// These pins encode the §1 verdict of
+    /// These pins encode the *runtime dispatch* half of
     /// :
-    /// the S9-family refinement chips (S9 SE/BM1391, S9j-S9k/BM1393, T15,
-    /// S11) are **register-compatible with BM1387** — same `0x1387` chip
-    /// ID over GetAddress, same BM1387 command-header / register / HW-CRC
-    /// surface, shared `drivers::bm1387` path. Closing the
-    /// "assumed-identical-to-BM1387" caveat with corpus evidence is itself
-    /// the deliverable; this module pins the contract so a future refactor
-    /// can't silently regress it.
+    /// the **am1-s9** path still keys on `0x1387` / `drivers::bm1387`.
+    ///
+    /// 2026-08-15: that desk note over-closed S9 SE. Stock S9 SE
+    /// (`cgminer_1393`, GitHub DCENT_OS#2) is BM1393 + CRC5 VIL, not
+    /// BM1387 HW-CRC. `0x1393` still must not enter production
+    /// `ChipRegistry` until an `am1-s9se` profile exists — fail-closed
+    /// is correct; "S9 SE enumerates as 0x1387" is not.
     ///
     /// Provenance for every assertion is in the doc §6 citations index;
     /// the load-bearing one is
@@ -224,12 +223,9 @@ mod tests {
     /// canonical BraiinsOS driver recognizes exactly one S9-family
     /// `ChipRev` — `Bm1387 = 0x1387` — with no BM1391/BM1393 value.
     mod pr054_s9_family_disambiguation {
-        /// The S9-family runtime chip ID is `0x1387` for *all* S9-family
-        /// silicon (S9 / S9i / S9j / S9 SE / S9k / T15 / S11). Mirrors
-        /// `braiins_bm1387.rs:387` (`Bm1387 = 0x1387` is the only
-        /// `ChipRev`) and `drivers::bm1387::CHIP_ID`. BM1391/BM1393 do NOT
-        /// get a distinct runtime chip ID — the caveat is closed by
-        /// confirmed register-compatibility, not by a new ID.
+        /// The **am1-s9** runtime chip ID is `0x1387` (Braiins `ChipRev`
+        /// and `drivers::bm1387::CHIP_ID`). S9 SE / S9k BM1393 is a
+        /// different stock protocol (CRC5 VIL) and is *not* admitted here.
         #[test]
         fn s9_family_runtime_chip_id_is_0x1387() {
             assert_eq!(
@@ -277,20 +273,15 @@ mod tests {
             );
         }
 
-        /// The W11.10 BM1393 CRC8 polynomial is an explicit unwired
-        /// placeholder (`bm1393.rs:149-166`, "TBD per RE2 R3 … do not rely
-        /// on the value at runtime"). It is NOT a confirmed BM1393 delta
-        /// vs BM1387. Pin that it stays the documented `0x00`/TBD sentinel
-        /// so nobody hardcodes a value and mistakes it for a real
-        /// disambiguation result.
+        /// 2026-08-15: BM1393 is CRC5 (poly 0x05, init 0x1F), not CRC8.
+        /// The old `BM1393_CRC8_POLY_TBD` placeholder is gone.
         #[test]
-        fn bm1393_crc8_poly_remains_explicit_tbd_placeholder() {
+        fn bm1393_command_crc_is_crc5_not_crc8_tbd() {
+            assert_eq!(crate::bm1393::CRC5_POLY, 0x05);
+            assert_eq!(crate::bm1393::CRC5_INIT, 0x1F);
             assert_eq!(
-                crate::bm1393::BM1393_CRC8_POLY_TBD,
-                0x00,
-                "BM1393 CRC8 poly is an unwired RE2-R3 placeholder, not a \
-                 live-confirmed BM1387 delta; pinning a value here requires \
-                 hardware evidence per the disambiguation doc §3 UNKNOWN list"
+                crate::bm1393::crc5_bits(&[0x42, 0x05, 0x78], crate::bm1393::CRC5_SHORT_BITS),
+                0x1C
             );
         }
 
@@ -300,17 +291,12 @@ mod tests {
         /// (function-local) `KNOWN_CHIP_IDS` allowlist as UART noise.
         /// That allowlist is, by contract, exactly the set the
         /// production `ChipRegistry` can drive. PR-054 closes the
-        /// BM1391/BM1393 caveat by register-compatibility (they enumerate
-        /// as `0x1387`), NOT by adding distinct runtime IDs — so
-        /// `0x1391`/`0x1393` MUST stay undriveable (hence correctly
-        /// rejected-as-noise at the chain boundary) while `0x1387` stays
-        /// driveable. The Sweep-v3 chip-survey audit flagged that this
-        /// "they report 0x1387" contract was doc-asserted but NOT
-        /// enforced at the enum boundary; this pins the enforceable half
-        /// (KNOWN_CHIP_IDS is a function-local const and cannot be
-        /// asserted directly, but the registry is the contract behind
-        /// it). A future edit that adds a 0x1391/0x1393 driver — and thus
-        /// would let chain.rs's allowlist accept them — fails here.
+        /// BM1393 S9 SE is a real distinct protocol (CRC5 VIL), but it
+        /// still has **no** production driver. `0x1391`/`0x1393` MUST stay
+        /// undriveable at the chain boundary until an `am1-s9se` profile
+        /// is admitted. `0x1387` stays the am1-s9 key. A future edit that
+        /// adds a 0x1393 driver without that profile — and thus would let
+        /// chain.rs's allowlist accept them on am1-s9 — fails here.
         #[test]
         fn chain_enum_boundary_never_drives_bm1391_or_bm1393() {
             let reg = crate::drivers::ChipRegistry::production();
@@ -320,15 +306,11 @@ mod tests {
             );
             assert!(
                 reg.detect(0x1391).is_none(),
-                "0x1391 must stay undriveable — BM1391 enumerates as \
-                 0x1387 (PR-054 register-compat); chain.rs must reject a \
-                 raw 0x1391 as noise, NOT mis-accept it"
+                "0x1391 must stay undriveable on the am1-s9 registry"
             );
             assert!(
                 reg.detect(0x1393).is_none(),
-                "0x1393 must stay undriveable — see the bm1393 \
-                 reference-only catalog pin above; do NOT add it to \
-                 driver dispatch (re-opens the caveat in the wrong way)"
+                "0x1393 must stay undriveable until am1-s9se is admitted"
             );
         }
     }

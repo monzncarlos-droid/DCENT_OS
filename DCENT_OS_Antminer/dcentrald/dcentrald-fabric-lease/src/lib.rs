@@ -116,9 +116,20 @@ pub mod topology {
     /// AM2 GPIO895/896 (AXI GPIO `0x4122_0000`) dedicated PSU SMBus.
     pub const AM2_PSU_GPIO: PhysicalI2cFabricId = PhysicalI2cFabricId::topology_defined(1);
 
+    /// Stock S9 FPGA `IIC_COMMAND` per-chain PIC fabric.
+    ///
+    /// This is deliberately not `linux_adapter(0)`: the live stock C5 capture
+    /// proves that no Linux I2C adapter is instantiated and bmminer reaches the
+    /// PICs only through `IIC_COMMAND` at register offset `0x030`. Braiins/clean
+    /// S9 instead exposes a different Xilinx AXI-IIC controller as adapter 0.
+    /// Evidence:  section 15.
+    pub const STOCK_S9_FPGA_IIC: PhysicalI2cFabricId = PhysicalI2cFabricId::topology_defined(2);
+
     /// Machine-readable registry used by collision tests and documentation.
-    pub const NAMED_PHYSICAL_I2C_FABRICS: &[(&str, PhysicalI2cFabricId)] =
-        &[("am2-psu-gpio", AM2_PSU_GPIO)];
+    pub const NAMED_PHYSICAL_I2C_FABRICS: &[(&str, PhysicalI2cFabricId)] = &[
+        ("am2-psu-gpio", AM2_PSU_GPIO),
+        ("stock-s9-fpga-iic", STOCK_S9_FPGA_IIC),
+    ];
 }
 
 /// Diagnostic classification of the cooperative owner.

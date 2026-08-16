@@ -6,8 +6,14 @@
 #
 # Usage:
 #   scripts/build_amlogic_native_install.sh --variant s19jpro-aml
+#   scripts/build_amlogic_native_install.sh --variant s19jproplus
 #   scripts/build_amlogic_native_install.sh --variant s19kpro
+#   scripts/build_amlogic_native_install.sh --variant s19xp
+#   scripts/build_amlogic_native_install.sh --variant s19jxp
 #   scripts/build_amlogic_native_install.sh --variant s21
+#   scripts/build_amlogic_native_install.sh --variant s21pro
+#   scripts/build_amlogic_native_install.sh --variant s21xp
+#   scripts/build_amlogic_native_install.sh --variant t21
 #   scripts/build_amlogic_native_install.sh --variant s21 --lab-unsigned
 #
 # The package must already exist under --output-dir (default: output/). Non-S9
@@ -20,7 +26,7 @@ OUTPUT_DIR=""
 LAB_UNSIGNED=0
 
 usage() {
-    echo "Usage: $(basename "$0") --variant s19jpro-aml|s19kpro|s21 [--output-dir DIR] [--lab-unsigned]" >&2
+    echo "Usage: $(basename "$0") --variant s19jpro-aml|s19jproplus|s19kpro|s19xp|s19jxp|s21|s21pro|s21xp|t21 [--output-dir DIR] [--lab-unsigned]" >&2
     echo "       Extracts an existing validated sysupgrade tarball; does not build one." >&2
 }
 
@@ -82,12 +88,33 @@ case "$VARIANT" in
         ROOT_MEMBER="sysupgrade-am3-s19jpro-aml/root"
         BIN_NAME="dcentos-amlogic-s19jpro-aml.bin"
         ;;
+    s19jproplus|s19j-pro-plus|s19jpro+)
+        TARGET="am3-s19jproplus"
+        BOARD_PKG_NAME="am3-s19jproplus"
+        TAR_NAME="dcentos-sysupgrade-am3-s19jproplus.tar"
+        ROOT_MEMBER="sysupgrade-am3-s19jproplus/root"
+        BIN_NAME="dcentos-amlogic-s19jproplus.bin"
+        ;;
     s19kpro|s19k)
         TARGET="am3-s19kpro"
         BOARD_PKG_NAME="am3-s19k"
         TAR_NAME="dcentos-sysupgrade-am3-s19kpro.tar"
         ROOT_MEMBER="sysupgrade-am3-s19k/root"
         BIN_NAME="dcentos-amlogic-s19kpro.bin"
+        ;;
+    s19xp)
+        TARGET="am3-s19xp"
+        BOARD_PKG_NAME="am3-s19xp"
+        TAR_NAME="dcentos-sysupgrade-am3-s19xp.tar"
+        ROOT_MEMBER="sysupgrade-am3-s19xp/root"
+        BIN_NAME="dcentos-amlogic-s19xp.bin"
+        ;;
+    s19jxp|s19j-xp)
+        TARGET="am3-s19jxp"
+        BOARD_PKG_NAME="am3-s19jxp"
+        TAR_NAME="dcentos-sysupgrade-am3-s19jxp.tar"
+        ROOT_MEMBER="sysupgrade-am3-s19jxp/root"
+        BIN_NAME="dcentos-amlogic-s19jxp.bin"
         ;;
     s21)
         TARGET="am3-s21"
@@ -96,8 +123,29 @@ case "$VARIANT" in
         ROOT_MEMBER="sysupgrade-am3-s21/root"
         BIN_NAME="dcentos-amlogic-s21.bin"
         ;;
+    s21pro)
+        TARGET="am3-s21pro"
+        BOARD_PKG_NAME="am3-s21pro"
+        TAR_NAME="dcentos-sysupgrade-am3-s21pro.tar"
+        ROOT_MEMBER="sysupgrade-am3-s21pro/root"
+        BIN_NAME="dcentos-amlogic-s21pro.bin"
+        ;;
+    s21xp)
+        TARGET="am3-s21xp"
+        BOARD_PKG_NAME="am3-s21xp"
+        TAR_NAME="dcentos-sysupgrade-am3-s21xp.tar"
+        ROOT_MEMBER="sysupgrade-am3-s21xp/root"
+        BIN_NAME="dcentos-amlogic-s21xp.bin"
+        ;;
+    t21)
+        TARGET="am3-t21"
+        BOARD_PKG_NAME="am3-t21"
+        TAR_NAME="dcentos-sysupgrade-am3-t21.tar"
+        ROOT_MEMBER="sysupgrade-am3-t21/root"
+        BIN_NAME="dcentos-amlogic-t21.bin"
+        ;;
     *)
-        echo "ERROR: unsupported Amlogic variant: $VARIANT (supported: s19jpro-aml, s19kpro, s21)" >&2
+        echo "ERROR: unsupported Amlogic variant: $VARIANT (supported: s19jpro-aml, s19jproplus, s19kpro, s19xp, s19jxp, s21, s21pro, s21xp, t21)" >&2
         exit 1
         ;;
 esac
@@ -134,6 +182,13 @@ echo "Target:  $TARGET"
 echo "Output:  $OUTPUT_DIR/$BIN_NAME"
 echo ""
 
+BIN_PATH="$OUTPUT_DIR/$BIN_NAME"
+if [ -e "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then
+    echo "ERROR: refusing to replace existing native-image output: $BIN_PATH" >&2
+    echo "       remove or relocate it explicitly after verifying it is not an alias" >&2
+    exit 1
+fi
+
 TARBALL="$OUTPUT_DIR/$TAR_NAME"
 [ -f "$TARBALL" ] || {
     echo "ERROR: expected existing tarball missing: $TARBALL" >&2
@@ -149,9 +204,10 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 tar -xf "$TARBALL" -C "$TMPDIR" "$ROOT_MEMBER"
-cp "$TMPDIR/$ROOT_MEMBER" "$OUTPUT_DIR/$BIN_NAME"
+STAGED_ROOT="$TMPDIR/native-rootfs.bin"
+cp "$TMPDIR/$ROOT_MEMBER" "$STAGED_ROOT"
 
-ROOT_SIZE=$(stat -c%s "$OUTPUT_DIR/$BIN_NAME" 2>/dev/null || stat -f%z "$OUTPUT_DIR/$BIN_NAME")
+ROOT_SIZE=$(stat -c%s "$STAGED_ROOT" 2>/dev/null || stat -f%z "$STAGED_ROOT")
 case "$ROOT_SIZE" in
     ''|*[!0-9]*) echo "ERROR: extracted rootfs size is not numeric: $ROOT_SIZE" >&2; exit 1 ;;
 esac
@@ -159,16 +215,24 @@ esac
     echo "ERROR: extracted rootfs exceeds Amlogic rootfs window: $ROOT_SIZE > $DCENT_AM3_ROOTFS_WINDOW_DEC" >&2
     exit 1
 }
-ROOT_MAGIC=$(od -An -N4 -tx1 "$OUTPUT_DIR/$BIN_NAME" 2>/dev/null | tr -d ' \n')
+ROOT_MAGIC=$(od -An -N4 -tx1 "$STAGED_ROOT" 2>/dev/null | tr -d ' \n')
 [ "$ROOT_MAGIC" = "27051956" ] || {
     echo "ERROR: extracted rootfs is not a uImage payload (magic=$ROOT_MAGIC)" >&2
     exit 1
 }
-ROOT_SHA=$(sha256sum "$OUTPUT_DIR/$BIN_NAME" | awk '{print $1}')
+ROOT_SHA=$(sha256sum "$STAGED_ROOT" | awk '{print $1}')
+
+# Publish with a no-replace hard-link operation. Unlike cp/redirection, ln
+# fails atomically if a regular file, hard link, or symlink appeared at the
+# destination after the preflight check, so an alias can never be followed.
+ln "$STAGED_ROOT" "$BIN_PATH" || {
+    echo "ERROR: native-image output appeared during publication; refusing: $BIN_PATH" >&2
+    exit 1
+}
 
 echo ""
 echo "Flashable rootfs image:"
-echo "  Path:   $OUTPUT_DIR/$BIN_NAME"
+echo "  Path:   $BIN_PATH"
 echo "  Size:   $ROOT_SIZE bytes"
 echo "  Magic:  $ROOT_MAGIC"
 echo "  SHA256: $ROOT_SHA"

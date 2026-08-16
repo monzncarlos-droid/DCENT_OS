@@ -512,7 +512,18 @@ fn chip_voltage_ranges(chip: ChipFamily) -> &'static [(f32, f32)] {
         // Range covers the safe S9 envelope 7.94..9.44 V plus a small
         // 0.5 V margin on either end for autotuner overshoot.
         Bm1387 => &[(7.5, 10.0)],
-        // Scrypt L3+/L7/L9 chain-rail.
+        // Scrypt L3+/L7 chain-rail.
+        //
+        // ⚠ Round 16 B3: this comment previously read "L3+/L7/L9". The **L9 is
+        // not in this arm** — it is BM1491 (`"asic_id":"BM1491"` /
+        // `"chip_type":"0x1491"` in its own stock `etc/topol.conf`), which falls
+        // through to the `Bm1360 | Bm1491` arm below. The (7.5, 13.5) envelope
+        // itself is UNCHANGED and still fail-closed; only the falsified L9
+        // attribution is removed. Do not widen this range, and do not move
+        // `Bm1491` into it: the L9's stock-stated 1330 mV is its **ASIC/domain**
+        // rail, not a chain rail, and no chain-rail figure for the L9 exists in
+        // any held artifact. Pinned by
+        // `chip_voltage_range_chain_for_bm1485_and_bm1489`.
         Bm1485 | Bm1489 => &[(7.5, 13.5)],
         // SHA-256 BM139x/BM136x: dual envelope (chain-rail OR chip-rail).
         // chain-rail 7.5..15.0 V covers APW PSU operating window
@@ -882,11 +893,48 @@ mod tests {
         // BM1485 / BM1489 are scrypt chain-rail. W7-D widened the
         // BM1489 ceiling to cover L7 baked rows (12.5..13.4 V) which
         // the previous (7.5, 10.5) envelope rejected.
+        //
+        // Round 16 B3: tightened from loose bounds to an EXACT pin. The old
+        // `vmin >= 7.0 && vmax <= 14.0` form would silently accept a widened
+        // envelope (e.g. 7.0..14.0), which is a real safety loosening on a
+        // chain rail. The exact values are the refusal.
         for chip in [ChipFamily::Bm1485, ChipFamily::Bm1489] {
-            let (vmin, vmax) = chip_voltage_range(chip);
-            assert!(vmin >= 7.0, "{:?} vmin = {}", chip, vmin);
-            assert!(vmax <= 14.0, "{:?} vmax = {}", chip, vmax);
+            let envelopes = chip_voltage_ranges(chip);
+            assert_eq!(
+                envelopes.len(),
+                1,
+                "{:?} must carry exactly ONE (chain-rail) envelope — a second \
+                 envelope would admit sub-2V chip-rail rows on a scrypt chain",
+                chip
+            );
+            let (vmin, vmax) = envelopes[0];
+            assert_eq!(vmin, 7.5, "{:?} chain-rail vmin must stay 7.5 V", chip);
+            assert_eq!(vmax, 13.5, "{:?} chain-rail vmax must stay 13.5 V", chip);
         }
+    }
+
+    /// **Round 16 B3 — the L9/BM1491 must NOT join the scrypt chain-rail arm.**
+    ///
+    /// Round 15 established the Antminer L9 is BM1491, not BM1489. The tempting
+    /// follow-up edit is to "fix" the registry by moving `Bm1491` into the
+    /// `Bm1485 | Bm1489` scrypt arm. That would be **fabrication**: the only
+    /// voltage the L9's stock image states is `"bitmain-voltage": 1330` (mV),
+    /// which is its **ASIC/domain** rail, not the chain rail this arm models.
+    /// No held artifact gives the L9 a chain-rail figure.
+    ///
+    /// This test refuses that edit in both directions.
+    #[test]
+    fn negative_bm1491_is_not_in_the_scrypt_chain_rail_arm() {
+        let scrypt = chip_voltage_ranges(ChipFamily::Bm1485);
+        let l9 = chip_voltage_ranges(ChipFamily::Bm1491);
+        assert_ne!(
+            l9, scrypt,
+            "BM1491 (Antminer L9) must not be given the BM1485/BM1489 scrypt \
+             chain-rail envelope — its stock-stated 1330 mV is the ASIC rail, \
+             and no chain-rail figure for the L9 exists in any held artifact"
+        );
+        // It stays on the NAMED-ONLY dual envelope it shares with BM1360.
+        assert_eq!(l9, chip_voltage_ranges(ChipFamily::Bm1360));
     }
 
     #[test]

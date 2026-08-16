@@ -165,10 +165,16 @@ const MAX_CMD_FRAME: usize = 16;
 const MAX_RESP_FRAME: usize = 11;
 
 /// Default response body length (after preamble). 7 for BM1387, 9 for BM139X.
+/// : this default is **not** the BM1366 UART body. S19k/BM1366
+/// must use [`BM1366_UART_RESP_BODY_LEN`] (9) so the wire is 11 bytes.
 const DEFAULT_RESP_BODY_LEN: usize = 7;
 
 /// BM139X response body length (after preamble).
 pub const BM139X_RESP_BODY_LEN: usize = 7;
+
+/// BM1366 UART body after `AA 55` (ESP 11-byte wire). Do **not** pass
+/// [`crate` wire total 11] into `set_response_len` as a body.
+pub const BM1366_UART_RESP_BODY_LEN: usize = 9;
 
 /// BM1387 response body length (after preamble).
 pub const BM1387_RESP_BODY_LEN: usize = 5;
@@ -456,6 +462,15 @@ impl SerialChainBackend {
         })
     }
 
+    /// S19k/BM1366 passthrough: fail-closed body 9. Generic `open_passthrough`
+    /// still constructs at HAL DEFAULT 7 (BM139X). Do not first-read BM1366
+    /// on that default.
+    pub fn open_passthrough_bm1366(chain_id: u8, device: &str) -> Result<Self> {
+        let s = Self::open_passthrough(chain_id, device)?;
+        s.set_response_len(BM1366_UART_RESP_BODY_LEN);
+        Ok(s)
+    }
+
     /// Check if a device path requires devmem bypass (PL UARTs on Zynq).
     ///
     /// Zynq PL UARTs at 0x4100x000 share IRQs with UIO FPGA devices,
@@ -604,6 +619,24 @@ impl SerialChainBackend {
             body_len,
             "Set response body length"
         );
+    }
+
+    /// Current response body length after preamble.
+    pub fn response_body_len(&self) -> usize {
+        self.resp_body_len.load(Ordering::Relaxed)
+    }
+
+    /// Fail-closed: BM1366 first-read must be body 9. Generic
+    /// `open_passthrough` constructs at DEFAULT 7.
+    pub fn require_bm1366_response_body(&self) -> Result<()> {
+        let n = self.response_body_len();
+        if n != BM1366_UART_RESP_BODY_LEN {
+            return Err(HalError::Platform(format!(
+                "BM1366 first-read body must be {}, not {} (skipped open_passthrough_bm1366 or set_response_len(9))",
+                BM1366_UART_RESP_BODY_LEN, n
+            )));
+        }
+        Ok(())
     }
 
     /// Set VTIME on the underlying serial port.
@@ -1013,6 +1046,13 @@ impl SerialChainBackend {
         self.send_cmd(&[0x52, 0x05, 0x00, 0x00])
     }
 
+    /// Broadcast `read_register(reg)` (BM1397+/BM136x). GetAddress is `reg=0`.
+    /// FastUART is `reg=0x28` → `55 AA 52 05 00 28 CRC5`.
+    /// Not single-chip `42 05`.
+    pub fn send_read_reg_broadcast_bm1397plus(&self, reg: u8) -> Result<()> {
+        self.send_cmd(&[0x52, 0x05, 0x00, reg])
+    }
+
     /// Send Chain Inactive broadcast command (BM1397+ format).
     ///
     /// BM1397/BM1398/BM1362+ use header 0x53 instead of BM1387's 0x55.
@@ -1224,8 +1264,8 @@ fn hex_str(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RxBuffer, SerialChainBackend, BM1387_RESP_BODY_LEN, BM139X_RESP_BODY_LEN,
-        DEFAULT_RESP_BODY_LEN,
+        RxBuffer, SerialChainBackend, BM1366_UART_RESP_BODY_LEN, BM1387_RESP_BODY_LEN,
+        BM139X_RESP_BODY_LEN, DEFAULT_RESP_BODY_LEN,
     };
 
     // -----------------------------------------------------------------------
@@ -1250,6 +1290,16 @@ mod tests {
             DEFAULT_RESP_BODY_LEN, BM139X_RESP_BODY_LEN,
             "default body length must match BM139X (7)"
         );
+        assert_eq!(
+            BM1366_UART_RESP_BODY_LEN, 9,
+            "BM1366 UART body is 9 (11-byte wire); not HAL default 7"
+        );
+        assert_ne!(DEFAULT_RESP_BODY_LEN, BM1366_UART_RESP_BODY_LEN);
+        let src = include_str!("serial_chain.rs");
+        assert!(src.contains("fn open_passthrough_bm1366"));
+        assert!(src.contains("set_response_len(BM1366_UART_RESP_BODY_LEN)"));
+        assert!(src.contains("fn require_bm1366_response_body"));
+        assert!(src.contains("fn response_body_len"));
     }
 
     /// (a) A complete BM139X (7-byte body) frame at the correct length is
@@ -1280,6 +1330,88 @@ mod tests {
         let n = rx.try_extract_frame(BM1387_RESP_BODY_LEN, &mut out);
         assert_eq!(n, BM1387_RESP_BODY_LEN);
         assert_eq!(out, [0xA1, 0xB2, 0xC3, 0xD4, 0xE5]);
+    }
+
+    /// BM1366 11-byte wire (`AA 55` + 9). Track-1 GetAddress / nonce hunt.
+    #[test]
+    fn rx_buffer_extracts_complete_bm1366_frame() {
+        let mut rx = RxBuffer::new();
+        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        let mut out = [0u8; BM1366_UART_RESP_BODY_LEN];
+        let n = rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out);
+        assert_eq!(n, BM1366_UART_RESP_BODY_LEN);
+        assert_eq!(out, [0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        assert_eq!(rx.len, 0);
+    }
+
+    /// Body-7 on an 11-byte BM1366 wire cuts version+trailer off. Not Silence.
+    #[test]
+    fn rx_buffer_body7_on_bm1366_wire_leaves_trailer() {
+        let wire = [
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E,
+        ];
+        let mut rx = RxBuffer::new();
+        rx.push(&wire);
+        let mut out7 = [0u8; BM139X_RESP_BODY_LEN];
+        let n7 = rx.try_extract_frame(BM139X_RESP_BODY_LEN, &mut out7);
+        assert_eq!(n7, BM139X_RESP_BODY_LEN);
+        assert_eq!(out7, [0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00]);
+        assert_eq!(rx.len, 2, "version+trailer must remain after body-7 cut");
+        let mut out9 = [0u8; BM1366_UART_RESP_BODY_LEN];
+        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out9), 0);
+    }
+
+    /// `set_response_len(11)` hunts a 13-byte frame. Incomplete on 11-byte wire.
+    #[test]
+    fn rx_buffer_body11_on_bm1366_wire_is_incomplete() {
+        let mut rx = RxBuffer::new();
+        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        let mut out = [0u8; 11];
+        assert_eq!(rx.try_extract_frame(11, &mut out), 0);
+        assert_eq!(rx.len, 11);
+    }
+
+    /// Two back-to-back ChipAddress frames extract as two 9-byte bodies.
+    #[test]
+    fn rx_buffer_two_bm1366_frames() {
+        let mut rx = RxBuffer::new();
+        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x02]);
+        let mut a = [0u8; BM1366_UART_RESP_BODY_LEN];
+        let mut b = [0u8; BM1366_UART_RESP_BODY_LEN];
+        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut a), 9);
+        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut b), 9);
+        assert_eq!(a[3], 0x00);
+        assert_eq!(b[3], 0x02);
+        assert_eq!(rx.len, 0);
+    }
+
+    /// Mid-stream body-len change: extract(7) of first 11-byte wire, then
+    /// extract(9) after the next 11-byte wire is pushed. Recovers the next
+    /// frame. First cut stays 7 bytes.
+    #[test]
+    fn rx_buffer_body7_then_body9_recovers_next() {
+        let first = [
+            0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x80,
+        ];
+        let next = [
+            0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x80,
+        ];
+        let mut rx = RxBuffer::new();
+        rx.push(&first);
+        let mut cut7 = [0u8; BM139X_RESP_BODY_LEN];
+        assert_eq!(rx.try_extract_frame(BM139X_RESP_BODY_LEN, &mut cut7), 7);
+        assert_eq!(cut7, [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00]);
+        assert_eq!(rx.len, 2);
+        rx.push(&next);
+        assert_eq!(rx.len, 13);
+        let mut rec9 = [0u8; BM1366_UART_RESP_BODY_LEN];
+        assert_eq!(
+            rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut rec9),
+            9
+        );
+        assert_eq!(rec9, next[2..]);
+        assert_eq!(rx.len, 0);
     }
 
     /// Fuzz: the ASIC-nonce framing layer must NEVER panic and must stay

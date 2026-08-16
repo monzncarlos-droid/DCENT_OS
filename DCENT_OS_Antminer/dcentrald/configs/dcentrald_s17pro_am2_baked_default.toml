@@ -99,8 +99,8 @@ serial_device = "/dev/ttyS1"
 # UNCONFIRMED: S17 Pro = 3 chains x 48 chips. This field is chips PER CHAIN,
 # not total chips; 48 is the serial address-assignment denominator.
 serial_chip_count = 48
-# UNCONFIRMED: "BM1397" = S17 / S17 Pro / T17. S17+ / T17+ are BM1396 and
-# must not silently borrow this driver.
+# Exact family boundary: BM1397 covers S17 / S17 Pro / S17+ / T17 / T17+.
+# S17e / T17e are BM1396 and must not silently borrow this driver.
 serial_chip_type = "BM1397"
 
 fpga_chain_base = "0x43C00000"
@@ -127,8 +127,9 @@ circuit_amperage_a = 20
 
 # --- PSU OVERRIDE ("Loki bypass") -------------------------------------------
 # DISABLED by default — the baked image assumes a stock APW-class PSU in the
-# chassis. S17 / S17 Pro stock PSU is APW3++ / APW9-class with PMBus telemetry
-# (revert_to_stock_s17.sh header). The Loki bypass is a per-unit power
+# chassis. Held S17 / S17 Pro jig bytes identify APW9's proprietary framed-I2C
+# path at address 0x10; DCENT_OS exposes no APW9 telemetry or control backend.
+# The Loki bypass is a per-unit power
 # configuration, not a control-board variant
 #.
 [power.psu_override]

@@ -42,6 +42,18 @@ static SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
 const CONSOLE_DEV: &str = "/dev/console";
 const EARLY_INIT: &str = "/etc/dcentos-early-init.sh";
 const INIT_D: &str = "/etc/init.d";
+const EXTERNAL_MEDIA_MARKER: &str = "/etc/dcentos/external-media-ephemeral-root";
+// This is an execution order, not a lexical inventory. S45persistent proves
+// the volatile-root readiness token before any other service is admitted.
+const EXTERNAL_MEDIA_SERVICES: &[&str] = &[
+    "S45persistent",
+    "S01syslogd",
+    "S02klogd",
+    "S40network",
+    "S41ntp",
+    "S43logrotate",
+    "S50dropbear",
+];
 const GETTY_TTY: &str = "ttyPS0";
 const GETTY_BAUD: &str = "115200";
 /// Upper bound for an orderly shutdown before PID 1 invokes the kernel's
@@ -49,6 +61,26 @@ const GETTY_BAUD: &str = "115200";
 /// teardown, so the former 30-second global deadline could kill the machine
 /// while the hardware owner was still producing its SafeOff evidence.
 const SHUTDOWN_WATCHDOG_MS: u64 = 60_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalMediaMarkerState {
+    Absent,
+    Exact,
+    Unsafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServicePosture {
+    Normal,
+    ExternalRestricted,
+    ConsoleOnly,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ServicePassResult {
+    succeeded: Vec<String>,
+    external_gate_admitted: bool,
+}
 
 fn main() {
     // Safety check: we MUST be PID 1
@@ -64,6 +96,17 @@ fn main() {
 
     // Set up signal handlers before anything else
     install_signal_handlers();
+
+    // The external-media marker is part of the immutable initramfs input. Read
+    // it before early-init overlays /etc so the service policy cannot drift
+    // during boot. An object at this path is authoritative only when it is an
+    // exact empty regular file; every other object fails closed.
+    let external_media_marker = external_media_marker_state(Path::new(EXTERNAL_MEDIA_MARKER));
+    if external_media_marker == ExternalMediaMarkerState::Unsafe {
+        eprintln!(
+            "dcentos-init: unsafe external-media marker; service startup will remain console-only"
+        );
+    }
 
     // Create /dev/console early so we can print (kernel may have already done this)
     // On BraiinsOS 4.4.0-xilinx without devtmpfs, /dev might be empty
@@ -84,11 +127,32 @@ fn main() {
     // Phase 2: Run early init script
     // This creates /dev nodes, mounts /tmp, /run, persistent storage, GPIO setup
     println!("[init] Phase 2: Running early init...");
-    run_early_init();
+    let early_init_succeeded =
+        run_early_init(external_media_marker != ExternalMediaMarkerState::Absent);
+    let mut service_posture = service_posture(external_media_marker, early_init_succeeded);
+    let mut external_started_services = Vec::new();
 
     // Phase 3: Run S## init scripts in order
-    println!("[init] Phase 3: Running init scripts...");
-    run_init_scripts("start");
+    match service_posture {
+        ServicePosture::ConsoleOnly => {
+            eprintln!(
+                "[init] Phase 3: External-media safety gate refused all service startup; console only"
+            );
+        }
+        ServicePosture::Normal => {
+            println!("[init] Phase 3: Running init scripts...");
+            let _ = run_init_scripts("start", service_posture);
+        }
+        ServicePosture::ExternalRestricted => {
+            println!("[init] Phase 3: Running restricted init scripts...");
+            let result = run_init_scripts("start", service_posture);
+            external_started_services = result.succeeded;
+            if !result.external_gate_admitted {
+                eprintln!("[init] Phase 3: External-media readiness gate failed; console only");
+                service_posture = ServicePosture::ConsoleOnly;
+            }
+        }
+    }
 
     // Phase 4: Spawn getty for serial console
     println!("[init] Phase 4: Spawning getty on {}...", GETTY_TTY);
@@ -146,7 +210,7 @@ fn main() {
                     "reboot"
                 }
             );
-            do_shutdown();
+            do_shutdown(service_posture, &external_started_services);
             // After shutdown scripts complete, perform the real kernel action.
             unsafe {
                 libc::sync();
@@ -365,14 +429,50 @@ fn mount_virtual_fs() {
     }
 }
 
+fn external_media_marker_state(path: &Path) -> ExternalMediaMarkerState {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0 => {
+            ExternalMediaMarkerState::Exact
+        }
+        Ok(_) => ExternalMediaMarkerState::Unsafe,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ExternalMediaMarkerState::Absent,
+        Err(error) => {
+            eprintln!(
+                "dcentos-init: cannot inspect external-media marker {}: {}; failing closed",
+                path.display(),
+                error
+            );
+            ExternalMediaMarkerState::Unsafe
+        }
+    }
+}
+
+fn service_posture(marker: ExternalMediaMarkerState, early_init_succeeded: bool) -> ServicePosture {
+    match marker {
+        ExternalMediaMarkerState::Absent => ServicePosture::Normal,
+        ExternalMediaMarkerState::Exact if early_init_succeeded => {
+            ServicePosture::ExternalRestricted
+        }
+        ExternalMediaMarkerState::Exact | ExternalMediaMarkerState::Unsafe => {
+            ServicePosture::ConsoleOnly
+        }
+    }
+}
+
 /// Run the early init script that sets up /dev, /tmp, /run, persistent storage,
-/// GPIO pins, fan control, I2C, hostname, etc.
-fn run_early_init() {
+/// GPIO pins, fan control, I2C, hostname, etc. External-media boot must not use
+/// the generic fallback: an absent, failed, or unexecutable early-init leaves
+/// PID 1 in its already-mounted recovery console posture with no service pass.
+fn run_early_init(external_media_posture: bool) -> bool {
     if !Path::new(EARLY_INIT).exists() {
         eprintln!("  [WARN] {} not found — skipping early init", EARLY_INIT);
+        if external_media_posture {
+            eprintln!("  [FAIL] External-media early init is mandatory; fallback refused");
+            return false;
+        }
         // Fallback: do minimal /dev/tmpfs + /tmp + /run setup ourselves
         fallback_early_init();
-        return;
+        return true;
     }
 
     // Find a working shell to execute the script
@@ -382,11 +482,22 @@ fn run_early_init() {
     let status = Command::new(&shell).arg(EARLY_INIT).status();
 
     match status {
-        Ok(s) if s.success() => println!("  [OK] Early init complete"),
-        Ok(s) => eprintln!("  [WARN] Early init exited with code {:?}", s.code()),
+        Ok(s) if s.success() => {
+            println!("  [OK] Early init complete");
+            true
+        }
+        Ok(s) => {
+            eprintln!("  [WARN] Early init exited with code {:?}", s.code());
+            false
+        }
         Err(e) => {
             eprintln!("  [FAIL] Cannot run early init: {}", e);
+            if external_media_posture {
+                eprintln!("  [FAIL] External-media early-init fallback refused");
+                return false;
+            }
             fallback_early_init();
+            true
         }
     }
 }
@@ -451,13 +562,25 @@ fn fallback_early_init() {
     println!("  [FALLBACK] Minimal environment ready");
 }
 
-/// Run all S## scripts in /etc/init.d/ in sorted order.
-/// This mimics BusyBox init's `::sysinit:/etc/init.d/rcS` behavior.
-fn run_init_scripts(action: &str) {
-    let init_d = Path::new(INIT_D);
+/// Run S## scripts in /etc/init.d/ in sorted order. Normal boots preserve the
+/// existing permissive S-prefixed selection. External-media boots use only the
+/// fixed artifact set whose script bytes are hash-pinned by the host producer;
+/// unknown, mining-owner, update, and verification scripts never execute.
+fn run_init_scripts(action: &str, posture: ServicePosture) -> ServicePassResult {
+    run_init_scripts_from(Path::new(INIT_D), action, posture)
+}
+
+fn run_init_scripts_from(
+    init_d: &Path,
+    action: &str,
+    posture: ServicePosture,
+) -> ServicePassResult {
     if !init_d.is_dir() {
-        eprintln!("  [WARN] {} not found — no init scripts to run", INIT_D);
-        return;
+        eprintln!(
+            "  [WARN] {} not found — no init scripts to run",
+            init_d.display()
+        );
+        return ServicePassResult::default();
     }
 
     // Read and sort entries
@@ -467,8 +590,8 @@ fn run_init_scripts(action: &str) {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect(),
         Err(e) => {
-            eprintln!("  [FAIL] Cannot read {}: {}", INIT_D, e);
-            return;
+            eprintln!("  [FAIL] Cannot read {}: {}", init_d.display(), e);
+            return ServicePassResult::default();
         }
     };
     // Select + order the S##-prefixed boot scripts via a pure, host-tested
@@ -476,16 +599,66 @@ fn run_init_scripts(action: &str) {
     // scripts run here — there is NO K## pass (BusyBox runs K## only from a
     // separate rc level this init does not use), so the earlier "K## or S##"
     // comment was unreachable.
-    let scripts = select_and_order_scripts(names, action);
+    let scripts = select_and_order_scripts(names, action, posture);
 
+    if posture == ServicePosture::ExternalRestricted {
+        println!(
+            "  [RESTRICTED] External-media service set active ({} scripts)",
+            scripts.len()
+        );
+    }
+
+    // Before starting anything, prove that the complete pinned external-media
+    // set is present and executable. In particular, a missing/non-executable
+    // S45persistent must not let the later network and Dropbear entries run.
+    if posture == ServicePosture::ExternalRestricted && action == "start" {
+        let complete_set = scripts.len() == EXTERNAL_MEDIA_SERVICES.len()
+            && scripts
+                .iter()
+                .map(String::as_str)
+                .eq(EXTERNAL_MEDIA_SERVICES.iter().copied());
+        let all_executable = complete_set
+            && scripts
+                .iter()
+                .all(|script| is_executable(init_d.join(script).to_string_lossy().as_ref()));
+        if !all_executable {
+            eprintln!(
+                "  [FAIL] External-media startup preflight refused service pass; exact executable policy set is required"
+            );
+            return ServicePassResult::default();
+        }
+    }
+
+    let fail_fast = posture == ServicePosture::ExternalRestricted && action == "start";
+    let succeeded = execute_init_scripts(init_d, &scripts, action, fail_fast);
+    let external_gate_admitted = posture != ServicePosture::ExternalRestricted
+        || action != "start"
+        || succeeded.first().map(String::as_str) == Some("S45persistent");
+
+    ServicePassResult {
+        succeeded,
+        external_gate_admitted,
+    }
+}
+
+fn execute_init_scripts(
+    init_d: &Path,
+    scripts: &[String],
+    action: &str,
+    fail_fast: bool,
+) -> Vec<String> {
     let shell = find_shell();
+    let mut succeeded_scripts = Vec::new();
 
-    for script in &scripts {
-        let path = format!("{}/{}", INIT_D, script);
+    for script in scripts {
+        let path = init_d.join(script);
 
         // Check if executable
-        if !is_executable(&path) {
+        if !is_executable(path.to_string_lossy().as_ref()) {
             println!("  [SKIP] {} (not executable)", script);
+            if fail_fast {
+                break;
+            }
             continue;
         }
 
@@ -493,14 +666,33 @@ fn run_init_scripts(action: &str) {
 
         let status = Command::new(&shell).arg(&path).arg(action).status();
 
-        match status {
-            Ok(s) if s.success() => println!("  [OK] {}", script),
-            Ok(s) => eprintln!("  [WARN] {} exited {:?}", script, s.code()),
-            Err(e) => eprintln!("  [FAIL] {} error: {}", script, e),
+        let succeeded = match status {
+            Ok(s) if s.success() => {
+                println!("  [OK] {}", script);
+                true
+            }
+            Ok(s) => {
+                eprintln!("  [WARN] {} exited {:?}", script, s.code());
+                false
+            }
+            Err(e) => {
+                eprintln!("  [FAIL] {} error: {}", script, e);
+                false
+            }
+        };
+        if succeeded {
+            succeeded_scripts.push(script.clone());
+        } else if fail_fast {
+            eprintln!(
+                "  [FAIL] External-media service startup halted at {}; later services remain barred",
+                script
+            );
+            break;
         }
     }
 
     println!("  Init scripts {} complete", action);
+    succeeded_scripts
 }
 
 /// Spawn the serial-console login terminal. Returns the child PID.
@@ -749,7 +941,7 @@ fn fork_exec_with_tty(program: &str, args: &[&str], tty: &str) -> io::Result<i32
 /// The caller arms the emergency watchdog before entering this function or
 /// performing any shutdown logging. Its deadline includes service-specific
 /// stop, residual-process cleanup, and filesystem teardown.
-fn do_shutdown() {
+fn do_shutdown(service_posture: ServicePosture, external_started_services: &[String]) {
     println!("[init] Running shutdown sequence...");
 
     // Give each service its typed shutdown path before the global kill sweep.
@@ -758,8 +950,20 @@ fn do_shutdown() {
     // still alive.  The old order SIGTERM'd everything, waited only 3 seconds,
     // SIGKILL'd survivors, and *then* called S82dcentrald stop, making the stop
     // script incapable of obtaining any in-process hardware disposition.
-    println!("[init] Running stop scripts...");
-    run_init_scripts("stop");
+    match service_posture {
+        ServicePosture::ConsoleOnly => {
+            println!("[init] Console-only posture: no service stop pass was admitted");
+        }
+        ServicePosture::ExternalRestricted => {
+            println!("[init] Running restricted stop scripts...");
+            let scripts = external_shutdown_scripts(external_started_services);
+            let _ = execute_init_scripts(Path::new(INIT_D), &scripts, "stop", false);
+        }
+        ServicePosture::Normal => {
+            println!("[init] Running stop scripts...");
+            let _ = run_init_scripts("stop", service_posture);
+        }
+    }
 
     // Terminate only processes left behind after service-specific teardown.
     println!("[init] Sending SIGTERM to remaining processes...");
@@ -789,6 +993,16 @@ fn do_shutdown() {
         libc::sync();
     }
     println!("[init] Shutdown complete.");
+}
+
+fn external_shutdown_scripts(started: &[String]) -> Vec<String> {
+    let mut scripts: Vec<String> = started
+        .iter()
+        .filter(|name| EXTERNAL_MEDIA_SERVICES.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    scripts.reverse();
+    scripts
 }
 
 /// Spawn a detached watchdog thread that forces the kernel reboot/poweroff
@@ -1024,12 +1238,28 @@ fn relative_sleep_ms(ms: u64) {
 /// and PURELY ADDITIVE versus the old filter (it never excludes anything the old
 /// one ran); non-scripts that slip through (e.g. `Sfoo.bak`) are still skipped
 /// downstream by the executable check, so the prefilter need not be stricter.
-/// Boot order is lexical (the zero-padded `S##` prefix sorts numerically);
-/// shutdown ("stop") runs the reverse. Only `S##` scripts run — there is no
+/// Normal boot order is lexical (the zero-padded `S##` prefix sorts
+/// numerically). External-media boot uses its explicit readiness-first order.
+/// Shutdown ("stop") runs the reverse. Only `S##` scripts run — there is no
 /// `K##` pass. (gap-swarm no-HAL hunt #6)
-fn select_and_order_scripts(mut names: Vec<String>, action: &str) -> Vec<String> {
+fn select_and_order_scripts(
+    mut names: Vec<String>,
+    action: &str,
+    posture: ServicePosture,
+) -> Vec<String> {
     names.retain(|name| name.starts_with('S') && name.len() >= 2);
     names.sort();
+    if posture == ServicePosture::ExternalRestricted {
+        names.retain(|name| EXTERNAL_MEDIA_SERVICES.contains(&name.as_str()));
+        names.sort_by_key(|name| {
+            EXTERNAL_MEDIA_SERVICES
+                .iter()
+                .position(|allowed| *allowed == name)
+                .unwrap_or(usize::MAX)
+        });
+    } else if posture == ServicePosture::ConsoleOnly {
+        names.clear();
+    }
     if action == "stop" {
         names.reverse();
     }
@@ -1039,6 +1269,47 @@ fn select_and_order_scripts(mut names: Vec<String>, action: &str) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_DIR.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "dcentos-init-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create isolated dcentos-init test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(directory: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write test init script");
+        let mut permissions = fs::metadata(&path)
+            .expect("stat test init script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make test init script executable");
+    }
 
     #[test]
     fn select_and_order_scripts_includes_short_and_orders_numerically() {
@@ -1052,7 +1323,7 @@ mod tests {
             "README".to_string(), // not S-prefixed → excluded
             "S".to_string(),      // len 1 → excluded
         ];
-        let start = select_and_order_scripts(names.clone(), "start");
+        let start = select_and_order_scripts(names.clone(), "start", ServicePosture::Normal);
         assert_eq!(
             start,
             vec![
@@ -1065,10 +1336,275 @@ mod tests {
             "boot pass must include bare S01/S05 (the len()>3 bug) + order numerically; exclude non-S and bare 'S'"
         );
         // Shutdown runs the exact reverse of the boot order.
-        let stop = select_and_order_scripts(names, "stop");
+        let stop = select_and_order_scripts(names, "stop", ServicePosture::Normal);
         let mut expected_stop = start.clone();
         expected_stop.reverse();
         assert_eq!(stop, expected_stop);
+    }
+
+    #[test]
+    fn external_media_service_set_is_exact_and_shutdown_is_its_reverse() {
+        let mut names: Vec<String> = EXTERNAL_MEDIA_SERVICES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        names.extend(
+            [
+                "S01seedrng",
+                "S10udevd",
+                "S15pic_boot",
+                "S46evil",
+                "S81mcp",
+                "S82dcentrald",
+                "S99upgrade",
+                "S99verify",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        let start =
+            select_and_order_scripts(names.clone(), "start", ServicePosture::ExternalRestricted);
+        let expected: Vec<String> = EXTERNAL_MEDIA_SERVICES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(start, expected);
+
+        let stop = select_and_order_scripts(names, "stop", ServicePosture::ExternalRestricted);
+        let mut expected_stop = expected;
+        expected_stop.reverse();
+        assert_eq!(stop, expected_stop);
+    }
+
+    #[test]
+    fn external_shutdown_is_limited_to_successfully_admitted_services() {
+        let started = vec![
+            "S45persistent".to_string(),
+            "S01syslogd".to_string(),
+            "S02klogd".to_string(),
+            "S40network".to_string(),
+            "S82dcentrald".to_string(),
+        ];
+        assert_eq!(
+            external_shutdown_scripts(&started),
+            vec![
+                "S40network".to_string(),
+                "S02klogd".to_string(),
+                "S01syslogd".to_string(),
+                "S45persistent".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_readiness_gate_runs_first_before_remaining_services() {
+        let directory = TestDir::new("external-gate-order");
+        let witness = directory.path().join("execution-order");
+        let witness_text = witness.to_string_lossy();
+        assert!(!witness_text.contains('\''));
+
+        for name in EXTERNAL_MEDIA_SERVICES {
+            write_executable_script(
+                directory.path(),
+                name,
+                &format!("printf '%s\\n' '{name}' >> '{witness_text}'"),
+            );
+        }
+
+        let result = run_init_scripts_from(
+            directory.path(),
+            "start",
+            ServicePosture::ExternalRestricted,
+        );
+        assert!(result.external_gate_admitted);
+        assert_eq!(
+            result.succeeded,
+            EXTERNAL_MEDIA_SERVICES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fs::read_to_string(witness).expect("read service execution witness"),
+            EXTERNAL_MEDIA_SERVICES
+                .iter()
+                .map(|name| format!("{name}\n"))
+                .collect::<String>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_nonzero_readiness_gate_bars_every_later_service() {
+        let directory = TestDir::new("external-gate-failure");
+        let witness = directory.path().join("later-service-ran");
+        let witness_text = witness.to_string_lossy();
+        assert!(!witness_text.contains('\''));
+
+        write_executable_script(directory.path(), "S45persistent", "exit 23");
+        for name in EXTERNAL_MEDIA_SERVICES.iter().skip(1) {
+            write_executable_script(
+                directory.path(),
+                name,
+                &format!("printf '%s\\n' '{name}' >> '{witness_text}'"),
+            );
+        }
+
+        let result = run_init_scripts_from(
+            directory.path(),
+            "start",
+            ServicePosture::ExternalRestricted,
+        );
+        assert!(!result.external_gate_admitted);
+        assert!(result.succeeded.is_empty());
+        assert!(
+            !witness.exists(),
+            "network/Dropbear/later services must remain barred after gate failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_nonexecutable_readiness_gate_refuses_the_whole_pass() {
+        let directory = TestDir::new("external-gate-nonexec");
+        let witness = directory.path().join("service-ran");
+        let witness_text = witness.to_string_lossy();
+        assert!(!witness_text.contains('\''));
+
+        fs::write(
+            directory.path().join("S45persistent"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("write non-executable gate");
+        for name in EXTERNAL_MEDIA_SERVICES.iter().skip(1) {
+            write_executable_script(
+                directory.path(),
+                name,
+                &format!("printf '%s\\n' '{name}' >> '{witness_text}'"),
+            );
+        }
+
+        let result = run_init_scripts_from(
+            directory.path(),
+            "start",
+            ServicePosture::ExternalRestricted,
+        );
+        assert!(!result.external_gate_admitted);
+        assert!(result.succeeded.is_empty());
+        assert!(!witness.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_missing_readiness_gate_refuses_the_whole_pass() {
+        let directory = TestDir::new("external-gate-missing");
+        let witness = directory.path().join("service-ran");
+        let witness_text = witness.to_string_lossy();
+        assert!(!witness_text.contains('\''));
+
+        for name in EXTERNAL_MEDIA_SERVICES.iter().skip(1) {
+            write_executable_script(
+                directory.path(),
+                name,
+                &format!("printf '%s\\n' '{name}' >> '{witness_text}'"),
+            );
+        }
+
+        let result = run_init_scripts_from(
+            directory.path(),
+            "start",
+            ServicePosture::ExternalRestricted,
+        );
+        assert!(!result.external_gate_admitted);
+        assert!(result.succeeded.is_empty());
+        assert!(!witness.exists());
+    }
+
+    #[test]
+    fn console_only_posture_admits_no_start_or_stop_scripts() {
+        let names = vec![
+            "S01syslogd".to_string(),
+            "S50dropbear".to_string(),
+            "S82dcentrald".to_string(),
+        ];
+        assert!(
+            select_and_order_scripts(names.clone(), "start", ServicePosture::ConsoleOnly)
+                .is_empty()
+        );
+        assert!(select_and_order_scripts(names, "stop", ServicePosture::ConsoleOnly).is_empty());
+    }
+
+    #[test]
+    fn marker_must_be_an_exact_empty_regular_file() {
+        let directory = TestDir::new("marker");
+        let marker = directory.path().join("external-media-ephemeral-root");
+
+        assert_eq!(
+            external_media_marker_state(&marker),
+            ExternalMediaMarkerState::Absent
+        );
+
+        fs::write(&marker, []).expect("create empty marker");
+        assert_eq!(
+            external_media_marker_state(&marker),
+            ExternalMediaMarkerState::Exact
+        );
+
+        fs::write(&marker, b"not-empty").expect("replace marker content");
+        assert_eq!(
+            external_media_marker_state(&marker),
+            ExternalMediaMarkerState::Unsafe
+        );
+
+        fs::remove_file(&marker).expect("remove regular marker");
+        fs::create_dir(&marker).expect("create marker directory");
+        assert_eq!(
+            external_media_marker_state(&marker),
+            ExternalMediaMarkerState::Unsafe
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_symlink_is_unsafe_even_when_target_is_empty() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new("marker-symlink");
+        let target = directory.path().join("target");
+        let marker = directory.path().join("external-media-ephemeral-root");
+        fs::write(&target, []).expect("create empty symlink target");
+        symlink(&target, &marker).expect("create marker symlink");
+        assert_eq!(
+            external_media_marker_state(&marker),
+            ExternalMediaMarkerState::Unsafe
+        );
+    }
+
+    #[test]
+    fn external_early_init_failure_and_unsafe_marker_are_console_only() {
+        assert_eq!(
+            service_posture(ExternalMediaMarkerState::Absent, false),
+            ServicePosture::Normal,
+            "normal NAND boot retains its existing service pass after early-init failure"
+        );
+        assert_eq!(
+            service_posture(ExternalMediaMarkerState::Exact, true),
+            ServicePosture::ExternalRestricted
+        );
+        assert_eq!(
+            service_posture(ExternalMediaMarkerState::Exact, false),
+            ServicePosture::ConsoleOnly
+        );
+        assert_eq!(
+            service_posture(ExternalMediaMarkerState::Unsafe, true),
+            ServicePosture::ConsoleOnly
+        );
+        assert_eq!(
+            service_posture(ExternalMediaMarkerState::Unsafe, false),
+            ServicePosture::ConsoleOnly
+        );
     }
 
     // --- Serial-console getty argument-order regression -------------------
@@ -1195,7 +1731,7 @@ mod tests {
             .expect("bounded do_shutdown body")
             .0;
         let stop = shutdown
-            .find("run_init_scripts(\"stop\");")
+            .find("run_init_scripts(\"stop\", service_posture);")
             .expect("service stop pass");
         let global_term = shutdown
             .find("libc::kill(-1, libc::SIGTERM)")
@@ -1299,7 +1835,7 @@ mod tests {
             .find("println!(")
             .expect("shutdown request log");
         let orderly = shutdown_entry
-            .find("do_shutdown();")
+            .find("do_shutdown(service_posture, &external_started_services);")
             .expect("orderly shutdown");
         assert!(arm < log && log < orderly);
     }

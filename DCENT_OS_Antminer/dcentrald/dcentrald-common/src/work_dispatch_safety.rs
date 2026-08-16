@@ -49,6 +49,8 @@ pub enum ThermalSafetyState {
     NotReady,
     /// Emergency / cutoff already asserted.
     Emergency,
+    /// Track-1 Braiins handoff: cooling stays with bosminer. Not DCENT Ready.
+    HandoffUnowned,
 }
 
 /// Classify a fresh process generation from a real pre-energize temperature
@@ -191,6 +193,7 @@ pub enum DispatchRevocationCause {
     WatchdogLost,
     HeartbeatFailure,
     ThermalCutoff,
+    HardwareIoFailure,
     OperatorSafeOff,
 }
 
@@ -204,6 +207,7 @@ pub fn revocation_stops_watchdog_feed(cause: DispatchRevocationCause) -> bool {
         // choose terminal disarm. Default: stop feed to fail closed.
         DispatchRevocationCause::HeartbeatFailure => true,
         DispatchRevocationCause::ThermalCutoff => true,
+        DispatchRevocationCause::HardwareIoFailure => true,
         DispatchRevocationCause::OperatorSafeOff => true,
     }
 }
@@ -227,7 +231,7 @@ pub fn admit_work_dispatch(
     }
 
     match inputs.thermal {
-        ThermalSafetyState::Ready => {}
+        ThermalSafetyState::Ready | ThermalSafetyState::HandoffUnowned => {}
         state => {
             return Err(WorkDispatchSafetyError::ThermalNotReady { state });
         }
@@ -286,6 +290,10 @@ pub fn revoke_work_dispatch(
             cut_hash_before_noise: true,
         },
         DispatchRevocationCause::ThermalCutoff => PowerCut::thermal_emergency(),
+        DispatchRevocationCause::HardwareIoFailure => PowerCut {
+            reason: PowerCutReason::Other,
+            cut_hash_before_noise: true,
+        },
         DispatchRevocationCause::OperatorSafeOff => PowerCut {
             reason: PowerCutReason::OperatorSafeOff,
             cut_hash_before_noise: true,
@@ -718,6 +726,15 @@ mod tests {
         let receipt = admit_work_dispatch(&inputs).unwrap();
         assert_eq!(receipt.controller_count, 0);
         assert_eq!(receipt.heartbeat_cycle_id, None);
+    }
+
+    #[test]
+    fn s19k_track1_handoff_unowned_admits_but_is_not_ready() {
+        let mut inputs = green_inputs();
+        inputs.thermal = ThermalSafetyState::HandoffUnowned;
+        let receipt = admit_work_dispatch(&inputs).unwrap();
+        assert_eq!(receipt.thermal, ThermalSafetyState::HandoffUnowned);
+        assert_ne!(receipt.thermal, ThermalSafetyState::Ready);
     }
 
     #[test]

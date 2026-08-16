@@ -1,7 +1,9 @@
 # DCENT_OS Mining Daemon Configuration — Antminer S19K Pro NoPic (am3-aml)
 # D-Central Technologies — Phase H baseline
 #
-# Baked baseline for am3-aml-s19k (Amlogic A113D, BM1366, 3 chains × 77 chips).
+# Baked baseline for am3-aml-s19k (Amlogic A113D, BM1366 NoPic, 3 chains × 77 chips).
+# Aligns with dcentrald/dcentrald_s19k.toml for host-driven /tmp trial (Bench HOLD).
+# Identity markers: /etc/dcentos/board_target=am3-s19k (plus typed toml [platform]).
 # Values are sourced from the .78 live capture of /etc/bosminer_model.json
 # (
 # bosminer_model.json) but tightened to D-Central home-mining defaults:
@@ -9,20 +11,7 @@
 #   - thermal envelope below industrial extremes (75/88 hot/dangerous)
 #   - fan_max_pwm = 30 ( B3 — home-mining default, matches S21 overlay)
 #   - [mode] active = "home" (matches the conservative thermal envelope)
-#   - rambo_mode_max_bad_responses = 0 (operator can raise to 8 to mine
-#     past the .78 chain-1 bad-response fault)
-#
-# Industrial opt-in: edit /data/dcentrald.toml (survives sysupgrade) and set
-#   [thermal] fan_max_pwm = 80
-#   [mode]    active = "standard"
-# This raises noise considerably; verify the unit is in a non-residential
-# environment before doing so. The 30-cap is enforced by the runtime safety
-# rules; even with this baseline change,
-# emergency / fan-failure / stale-temp paths still cap fans at PWM 30 to
-# protect users from acoustic shock.
-#
-#
-# for the regression note.
+#   - rambo_mode_max_bad_responses = 0 (via /etc/dcentrald-experimental.toml)
 #
 # Override order: /data/dcentrald.toml > /etc/dcentrald.toml
 # Persistent custom config goes in /data/ (survives firmware updates).
@@ -33,18 +22,31 @@ log_level = "info"
 
 [mining]
 enabled = false
-chip = "BM1366"
-chips_per_chain = 77
-chains = 3
+# Schema-valid identity (serial_*); topology chains=3 lives in BoardDesc/HAL.
+serial_chip_type = "BM1366"
+serial_chip_count = 77
 frequency_mhz = 670
 voltage_mv = 13900
 model = "s19k"
 suggest_difficulty = 8192
 passthrough = false
 version_rolling = true
+# /tmp trial + host dcentrald_s19k.toml serial path (pick populated slot).
+serial_device = "/dev/ttyS2"
+
+# Identity is via /etc/dcentos/board_target (content am3-s19k) and
+# /etc/dcentos/platform (am3-aml-s19k) — plus typed toml [platform].
+
+# Typed [platform] identity for /tmp trials (target + board_target only — no
+# safety flags). Runtime prefers /etc/dcentos/{platform,board_target} when
+# present; config fills gaps. Unknown [platform] keys fail closed. CE #1 banned
+# phantom kitchen-sink flags, not this typed identity section.
+# Trial helper also stages /etc/dcentos/board_target=am3-s19k and
+# /etc/dcentos/platform=am3-aml-s19k (authoritative when present).
 
 [platform]
 target = "am3-aml-s19k"
+board_target = "am3-s19k"
 
 [pool]
 url = ""
@@ -52,13 +54,10 @@ worker = ""
 password = "d=1"
 
 [thermal]
-target_temp_c = 65.0
-hot_temp_c = 75.0
-dangerous_temp_c = 88.0
-die_dangerous_c = 105.0
-cooldown_temp_c = 45.0
-min_fan_rpm = 2000
-#  B3: home-mining default. Industrial users opt-in via [mode] / [modes.standard].
+target_temp_c = 65
+hot_temp_c = 75
+dangerous_temp_c = 88
+#  B3: home-mining default. Industrial users opt-in via [mode].
 fan_max_pwm = 30
 fan_min_pwm = 10
 
@@ -73,24 +72,17 @@ hashrate_step_ths = 11.0
 eeprom_parser = "x21_aes"
 decoded_reference_file = "/etc/dcentos/hashboard_decoded.json"
 
-[experimental]
-rambo_mode_max_bad_responses = 0
+# [experimental] is NOT part of DcentraldConfig — load via /etc/dcentrald-experimental.toml
 
 [api]
 cgminer_port = 4028
 http_port = 8080
 websocket = true
 cgminer_bind_lan = false
-# API-1 (security): allow MUTATING CGMiner/LuxOS verbs (addpool/switchpool/
-# config changes) from NON-loopback LAN peers. DEFAULT false (fail-closed):
-# even with cgminer_bind_lan=true, remote mutating verbs stay blocked unless
-# this is ALSO true (loopback writes always work). Set true ONLY on a trusted LAN.
 cgminer_lan_writes = false
 metrics_require_auth = true
 
 [donation]
-# Voluntary 2% donation supports open-source firmware development.
-# Set enabled = false to disable, or adjust percent between 0 and 5.
 enabled = true
 percent = 2.0
 pool_url = "stratum+tcp://pool.d-central.tech:3333"
@@ -103,14 +95,6 @@ fallback_password = "x"
 cycle_duration_s = 3600
 
 [watchdog]
-# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
-# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
-# hang would otherwise leave the boards energized indefinitely (thermal risk on a
-# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
-# bring-up window can't trip it) and degrades gracefully (warns + continues) if
-# the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
-# zynq/am1 production config; restores the struct default (enabled=true) these
-# overlays previously overrode.
 enabled = true
 timeout_s = 30
 kick_interval_s = 5
@@ -119,9 +103,6 @@ kick_interval_s = 5
 enabled = true
 
 [mode]
-#  B3: home is the default to match the 30 PWM thermal cap above.
-# Operator can switch to "standard" or "hacker" at runtime via
-# `dcent config set mode=standard`.
 active = "home"
 
 [led]

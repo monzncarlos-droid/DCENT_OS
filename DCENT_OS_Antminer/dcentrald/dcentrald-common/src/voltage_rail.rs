@@ -143,6 +143,10 @@ pub enum VoltageOwnership {
     ChipDriverPic,
     /// AM2 S19j Pro class: dsPIC33EP hashboard rail — never ChipDriver.
     HashboardDspic,
+    /// BM1396: an exact framed hashboard endpoint is known, but the populated
+    /// controller silicon and a live-safe adapter are not. ASIC identity alone
+    /// must never promote this to the generic dsPIC mutation path.
+    HashboardFramedEndpointEvidenceOnly,
     /// S21 NoPic class: external DAC / PMIC (e.g. TAS5782M) — ChipDriver unsupported.
     ExternalDacNoPic,
     /// Identity not enough to choose a rail; must not mutate via ChipDriver.
@@ -169,16 +173,20 @@ pub fn voltage_ownership_for_asic(
     use crate::board_desc::AsicProtocolIdentity;
     match identity {
         AsicProtocolIdentity::Bm1387 => VoltageOwnership::ChipDriverPic,
+        AsicProtocolIdentity::Bm1396 => VoltageOwnership::HashboardFramedEndpointEvidenceOnly,
         AsicProtocolIdentity::Bm1362
         | AsicProtocolIdentity::Bm1391
-        | AsicProtocolIdentity::Bm1396
         | AsicProtocolIdentity::Bm1397
         | AsicProtocolIdentity::Bm1398 => VoltageOwnership::HashboardDspic,
-        // BM1366 can sit behind PIC on some industrial boards (S17-class path
-        // still uses PicController today) OR NoPic DAC on home/ESP designs.
-        // ChipDriver::set_voltage via PIC is the historical industrial path —
-        // admit it as ChipDriverPic until a BoardDesc-scoped refinement lands.
-        AsicProtocolIdentity::Bm1366 => VoltageOwnership::ChipDriverPic,
+        // BM1366 spans PIC industrial boards and Amlogic/NoPic S19k-class
+        // boards (Has_Pic:false, BHB5690x). Identity alone must not admit the
+        // ChipDriver PIC path — BoardDesc must scope NoPic vs PIC before any
+        // voltage owner is selected (RE-4A / S19k BETA fail-closed).
+        AsicProtocolIdentity::Bm1366 | AsicProtocolIdentity::Bm1393 => {
+            // S9 SE dsPIC IIC map is pinned in `s9se_gauntlet` / `bm1393.rs`.
+            // Identity alone must not select ChipDriverPic or AM2 framed dsPIC.
+            VoltageOwnership::RuntimeDiscovered
+        }
         AsicProtocolIdentity::Bm1368 | AsicProtocolIdentity::Bm1370 => {
             VoltageOwnership::ExternalDacNoPic
         }
@@ -215,6 +223,9 @@ pub enum VoltageRailAdapterKind {
     Pic16ChipDriver,
     /// AM2 hashboard dsPIC33EP (framing depends on fw identity at runtime).
     DsPic33Ep,
+    /// Exact BM1396 framed I2C 0x11 ABI. Pure codec evidence exists, but no
+    /// live rail adapter is admitted yet.
+    Bm1396I2c11EvidenceOnly,
     /// PIC1704 family (protocol-sealed boards).
     Pic1704,
     /// NoPic external DAC / PMIC (e.g. TAS5782M on S21-class).
@@ -226,7 +237,10 @@ pub enum VoltageRailAdapterKind {
 impl VoltageRailAdapterKind {
     /// Whether a live adapter may mutate voltage without further discovery.
     pub const fn admits_mutation(self) -> bool {
-        !matches!(self, Self::RuntimeDiscovered)
+        !matches!(
+            self,
+            Self::Bm1396I2c11EvidenceOnly | Self::RuntimeDiscovered
+        )
     }
 
     /// Map adapter kind → ChipDriver set_voltage ownership class.
@@ -234,6 +248,7 @@ impl VoltageRailAdapterKind {
         match self {
             Self::Pic16ChipDriver => VoltageOwnership::ChipDriverPic,
             Self::DsPic33Ep | Self::Pic1704 => VoltageOwnership::HashboardDspic,
+            Self::Bm1396I2c11EvidenceOnly => VoltageOwnership::HashboardFramedEndpointEvidenceOnly,
             Self::ExternalDacNoPic => VoltageOwnership::ExternalDacNoPic,
             Self::RuntimeDiscovered => VoltageOwnership::RuntimeDiscovered,
         }
@@ -251,6 +266,9 @@ pub fn voltage_rail_adapter_for_controller(
     match class {
         VoltageControllerClass::Pic16F1704 => VoltageRailAdapterKind::Pic16ChipDriver,
         VoltageControllerClass::DsPic33Ep => VoltageRailAdapterKind::DsPic33Ep,
+        VoltageControllerClass::Bm1396FramedI2c11 => {
+            VoltageRailAdapterKind::Bm1396I2c11EvidenceOnly
+        }
         VoltageControllerClass::Pic1704 => VoltageRailAdapterKind::Pic1704,
         VoltageControllerClass::NoPic => VoltageRailAdapterKind::ExternalDacNoPic,
         VoltageControllerClass::RuntimeDiscovered => VoltageRailAdapterKind::RuntimeDiscovered,
@@ -273,6 +291,9 @@ pub fn resolve_voltage_rail_adapter(
     match voltage_ownership_for_asic(asic) {
         VoltageOwnership::ChipDriverPic => VoltageRailAdapterKind::Pic16ChipDriver,
         VoltageOwnership::HashboardDspic => VoltageRailAdapterKind::DsPic33Ep,
+        VoltageOwnership::HashboardFramedEndpointEvidenceOnly => {
+            VoltageRailAdapterKind::Bm1396I2c11EvidenceOnly
+        }
         VoltageOwnership::ExternalDacNoPic => VoltageRailAdapterKind::ExternalDacNoPic,
         VoltageOwnership::RuntimeDiscovered => VoltageRailAdapterKind::RuntimeDiscovered,
     }
@@ -285,10 +306,10 @@ pub fn admit_voltage_rail_mutation(
     if adapter.admits_mutation() {
         return Ok(());
     }
-    Err(unsupported_voltage_path(
-        "VoltageRail mutation refused: adapter=RuntimeDiscovered \
-         (refine BoardDesc / topology before set_mv/enable)",
-    ))
+    Err(unsupported_voltage_path(format!(
+        "VoltageRail mutation refused: adapter={adapter:?} \
+         (refine BoardDesc / topology before set_mv/enable)"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -908,16 +929,28 @@ mod tests {
     }
 
     #[test]
-    fn bm1366_industrial_pic_path_still_admitted_on_chip_driver() {
-        // S17-class BM1366 still uses PicController in the industrial driver;
-        // home/ESP NoPic refinement is BoardDesc-scoped (not identity alone).
+    fn bm1366_identity_alone_is_runtime_discovered_not_chip_driver_pic() {
+        // S19k Amlogic NoPic (Has_Pic:false) forbids inheriting BM1362/PIC
+        // voltage fabrics from chip identity alone. Industrial PIC BM1366
+        // must be BoardDesc-scoped (Pic16/Pic1704) before ChipDriver admits.
         assert_eq!(
             voltage_ownership_for_asic(AsicProtocolIdentity::Bm1366),
-            VoltageOwnership::ChipDriverPic
+            VoltageOwnership::RuntimeDiscovered
         );
-        assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1366).is_ok());
+        assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1366).is_err());
+        use crate::board_desc::VoltageControllerClass;
+        let amlogic_nopic = resolve_voltage_rail_adapter(
+            VoltageControllerClass::NoPic,
+            AsicProtocolIdentity::Bm1366,
+        );
+        assert_eq!(amlogic_nopic, VoltageRailAdapterKind::ExternalDacNoPic);
+        let industrial_pic = resolve_voltage_rail_adapter(
+            VoltageControllerClass::Pic16F1704,
+            AsicProtocolIdentity::Bm1366,
+        );
+        assert_eq!(industrial_pic, VoltageRailAdapterKind::Pic16ChipDriver);
+        assert!(industrial_pic.admits_mutation());
     }
-
     #[test]
     fn bm1387_allows_chip_driver_pic_path() {
         assert_eq!(
@@ -928,10 +961,9 @@ mod tests {
     }
 
     #[test]
-    fn industrial_bm139x_are_hashboard_dspic() {
+    fn industrial_bm139x_with_proven_controller_identity_are_hashboard_dspic() {
         for id in [
             AsicProtocolIdentity::Bm1391,
-            AsicProtocolIdentity::Bm1396,
             AsicProtocolIdentity::Bm1397,
             AsicProtocolIdentity::Bm1398,
         ] {
@@ -941,6 +973,25 @@ mod tests {
             );
             assert!(chip_driver_set_voltage_admission(id).is_err());
         }
+    }
+
+    #[test]
+    fn bm1396_identity_only_fallback_cannot_promote_voltage_mutation() {
+        use crate::board_desc::VoltageControllerClass;
+
+        assert_eq!(
+            voltage_ownership_for_asic(AsicProtocolIdentity::Bm1396),
+            VoltageOwnership::HashboardFramedEndpointEvidenceOnly
+        );
+        assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1396).is_err());
+
+        let fallback = resolve_voltage_rail_adapter(
+            VoltageControllerClass::RuntimeDiscovered,
+            AsicProtocolIdentity::Bm1396,
+        );
+        assert_eq!(fallback, VoltageRailAdapterKind::Bm1396I2c11EvidenceOnly);
+        assert!(!fallback.admits_mutation());
+        assert!(admit_voltage_rail_mutation(fallback).is_err());
     }
 
     #[test]
@@ -987,6 +1038,10 @@ mod tests {
             VoltageRailAdapterKind::DsPic33Ep
         );
         assert_eq!(
+            voltage_rail_adapter_for_controller(VoltageControllerClass::Bm1396FramedI2c11),
+            VoltageRailAdapterKind::Bm1396I2c11EvidenceOnly
+        );
+        assert_eq!(
             voltage_rail_adapter_for_controller(VoltageControllerClass::NoPic),
             VoltageRailAdapterKind::ExternalDacNoPic
         );
@@ -995,6 +1050,7 @@ mod tests {
             VoltageRailAdapterKind::RuntimeDiscovered
         );
         assert!(!VoltageRailAdapterKind::RuntimeDiscovered.admits_mutation());
+        assert!(!VoltageRailAdapterKind::Bm1396I2c11EvidenceOnly.admits_mutation());
         assert!(VoltageRailAdapterKind::DsPic33Ep.admits_mutation());
     }
 
@@ -1263,7 +1319,7 @@ mod tests {
         assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1397).is_err());
         assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1398).is_err());
         assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1387).is_ok());
-        assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1366).is_ok());
+        assert!(chip_driver_set_voltage_admission(AsicProtocolIdentity::Bm1366).is_err());
     }
 
     #[test]

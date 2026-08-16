@@ -1,0 +1,7 @@
+# DCENTos Buildroot override - Antminer S19j XP, Amlogic A113D.
+# Exact held identity: fw-info model=s19j-xp/platform=aml/install_type=nand.
+BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19jxp"
+BR2_TARGET_GENERIC_ISSUE="DCENTos Experimental package for exact S19j XP Amlogic identity"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19jxp/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s21/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/amlogic/am3-s19jxp/post-image.sh"

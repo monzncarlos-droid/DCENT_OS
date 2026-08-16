@@ -58,10 +58,10 @@ pub struct PvtTableResponse {
     /// `true` ⇒ per-chain `mix_levels` is supported (BHB42611 only).
     /// W13 ships symmetric-only dispatch.
     pub mix_levels: bool,
-    /// `true` ⇒ requires APW12+ register-based PSU protocol (high-bin
-    /// + repair-class). The dashboard MUST surface a PSU-class warning
-    ///   before any cold-boot when this is set against an APW12 SMBus PSU.
-    pub requires_apw12_plus: bool,
+    /// Three-state PSU binding. `Some(true)` requires APW12+,
+    /// `Some(false)` rules that requirement out, and `None` means the held
+    /// evidence does not settle the PSU. Unknown remains a cold-boot blocker.
+    pub requires_apw12_plus: Option<bool>,
     /// `true` ⇒ inverted curve (freq↓ ⇒ volt↑). BHB42841 only. Autotuner
     /// heuristics MUST consult this before walking the table.
     pub inverted_curve: bool,
@@ -81,7 +81,7 @@ impl Default for PvtTableResponse {
             grade: "standard".to_string(),
             voltage_fixed: false,
             mix_levels: false,
-            requires_apw12_plus: false,
+            requires_apw12_plus: None,
             inverted_curve: false,
             chain_count: 0,
             asics_per_chain: 0,
@@ -101,7 +101,7 @@ mod tests {
         assert_eq!(r.grade, "standard");
         assert!(!r.voltage_fixed);
         assert!(!r.mix_levels);
-        assert!(!r.requires_apw12_plus);
+        assert_eq!(r.requires_apw12_plus, None);
         assert!(!r.inverted_curve);
         assert_eq!(r.chain_count, 0);
         assert_eq!(r.asics_per_chain, 0);
@@ -115,7 +115,7 @@ mod tests {
             grade: "standard".to_string(),
             voltage_fixed: false,
             mix_levels: false,
-            requires_apw12_plus: false,
+            requires_apw12_plus: Some(false),
             inverted_curve: false,
             chain_count: 4,
             asics_per_chain: 126,
@@ -154,7 +154,7 @@ mod tests {
             grade: "standard".to_string(),
             voltage_fixed: false,
             mix_levels: false,
-            requires_apw12_plus: false,
+            requires_apw12_plus: Some(false),
             inverted_curve: false,
             chain_count: 4,
             asics_per_chain: 126,
@@ -197,7 +197,7 @@ mod tests {
             grade: "single-voltage".to_string(),
             voltage_fixed: true,
             mix_levels: false,
-            requires_apw12_plus: true,
+            requires_apw12_plus: None,
             inverted_curve: false,
             chain_count: 3,
             asics_per_chain: 84,

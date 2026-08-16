@@ -17,10 +17,22 @@
 //!   - FB_DIV range: 160-239 (vs 144-235 on BM1368)
 //!   - PLL postdiv encoding: (postdiv1-1)<<4 | (postdiv2-1) (subtract 1)
 //!   - CTRL_REG: BM139X mode (bit4=1)
-//!   - Register 0xB9: BM1370-only mystery register (0x00004480)
+//!   - Register 0xB9: ADC-control register (adc_ctrl1), NOT a "mystery register".
+//!     The S21-family jigs RMW 0xB9 during the temp-diode-connect path
+//!     (set_chain_reg_connect_left_diode_to_temp@CC368). Our 0x00004480 is the
+//!     data-table default (byte1 0x44 = ADC enable bits 0x40+0x04). Cross-check
+//!     2026-08-05: base value is .data-resident, neither confirmed nor
+//!     contradicted by the decompiled .c across S21pro/xp/hydro/U3.
 //!   - Core register 0x3C: 0x80008B00, 0x8000800C (different from BM1368)
 //!   - Core register 0x0D (0x80008DEE): BM1370-only, written at end of init
-//!   - Analog Mux 0x54: 0x00000002 (vs 0x00000003 on BM1366/BM1368)
+//!   - Analog Mux 0x54: 0x00000002 = diode/Vdd mux SELECTOR, board/context-specific
+//!     (NOT a clean chip-family constant). Cross-check 2026-08-05 across the held
+//!     S21-family jigs: S21xp tail-writes 2, but S21pro/S21xp-hydro/U3S21EXPH and
+//!     S21(BM1368) tail-write 3; every jig forces the low nibble to 2 on the
+//!     diode-to-temp path (set_chain_reg_connect_left_diode_to_temp). Telemetry-only
+//!     (selects the temp/voltage-ADC diode input); 0x02 is defensible for the
+//!     diode-to-temp path. Disambiguating the correct on-die-temp input on an
+//!     S21 Pro/XP board needs a bench unit — do NOT blind-flip to 3.
 //!   - IO Driver 0x58: 0x00011111 (vs 0x02111111 on BM1366/BM1368)
 //!   - Hash Counting 0x10: 0x00001EB5 (S21 Pro stock default)
 //!   - Misc Control 0x18: 0xF000C100 (S21 Pro, vs 0xFF0FC100 on S21)
@@ -293,10 +305,15 @@ const CORE_REG_EXTRA: u32 = 0x8000_8DEE;
 /// IO Driver Strength (S21 Pro, different from BM1366/BM1368).
 const IO_DRIVER_VALUE: u32 = 0x0001_1111;
 
-/// Mystery register 0xB9 value (BM1370-only, written twice during init).
+/// ADC-control register 0xB9 (adc_ctrl1) value (written twice during init).
+/// Not a "mystery register": the S21-family jigs RMW 0xB9 in the temp-diode-connect
+/// path; 0x00004480 is the data-table default (ADC enable bits 0x40+0x04). See the
+/// module header for the 2026-08-05 cross-check provenance.
 const MISC_SETTINGS_B9_VALUE: u32 = 0x0000_4480;
 
-/// Analog Mux Control (BM1370: 0x02, vs 0x03 on BM1366/BM1368).
+/// Analog Mux Control 0x54 = diode/Vdd mux SELECTOR (board/context-specific, NOT a
+/// clean chip-family constant — see module header cross-check). 0x02 matches the
+/// S21xp tail-write and the universal diode-to-temp path; do NOT blind-flip to 0x03.
 const ANALOG_MUX_VALUE: u32 = 0x0000_0002;
 
 /// Hash Counting Number (S21 Pro stock default).
@@ -589,7 +606,7 @@ impl Bm1370Driver {
 
         // Step 12: BM1370-specific registers.
 
-        // Mystery register 0xB9 (written twice, purpose unknown).
+        // ADC-control register 0xB9 (adc_ctrl1; written twice during init).
         Self::write_reg_broadcast(chain, regs::MISC_SETTINGS_B9, MISC_SETTINGS_B9_VALUE);
         std::thread::sleep(Duration::from_millis(10));
         tracing::debug!(
@@ -605,7 +622,7 @@ impl Bm1370Driver {
             "Analog Mux Control (0x02, BM1370-specific)",
         );
 
-        // Mystery register 0xB9 (second write, duplicate).
+        // ADC-control register 0xB9 (adc_ctrl1; second write, duplicate).
         Self::write_reg_broadcast(chain, regs::MISC_SETTINGS_B9, MISC_SETTINGS_B9_VALUE);
         std::thread::sleep(Duration::from_millis(10));
         tracing::debug!(

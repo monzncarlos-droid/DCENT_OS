@@ -4986,6 +4986,16 @@ impl PicVariant {
 /// 0x48–0x4B (AM2 sensor map; Agent 5 probe confirmed on .139) or
 /// 0x72–0x75 (older S19/S19j probe) — the exact subaddress is set per board
 /// by the sensor bank arg.
+/// One sweep of the four per-board LM75A sensors, reported per sensor as
+/// measured-or-absent. Positionally aligned with the `sensor_addrs` argument
+/// that produced it, so slot `i` is always sensor `sensor_addrs[i]`.
+///
+/// `None` means the sensor did not deliver a usable reading this sweep — the
+/// read errored, or the controller answered with a non-finite value. There is
+/// deliberately no in-band sentinel: `-999.0` and `NaN` are exactly the values
+/// that made partial coverage invisible to the existing max-folding callers.
+pub type Lm75aSweepReadings = [Option<f32>; 4];
+
 pub trait Lm75aViaVoltageController {
     /// Read temperature in degrees Celsius from the given on-board sensor
     /// sub-address (0x48..=0x4B on S19j Pro am2, 0x72..=0x75 on older S19/S19j).
@@ -4999,6 +5009,71 @@ pub trait Lm75aViaVoltageController {
         for (i, &a) in sensor_addrs.iter().enumerate() {
             if let Ok(t) = self.lm75a_read_temp(a) {
                 out[i] = t;
+            }
+        }
+        out
+    }
+
+    /// Sweep every per-board LM75A sensor and report each one SEPARATELY as
+    /// measured (`Some`) or absent (`None`) — with **no sentinel value**.
+    ///
+    /// This is the coverage-honest counterpart to
+    /// [`lm75a_read_all`](Self::lm75a_read_all). That method folds a failed
+    /// read into `f64::NAN`, and the inherent `read_all_temperatures` methods
+    /// fold it into `-999.0`; every live caller then takes a max over whatever
+    /// survives a plausibility filter. A max cannot distinguish
+    ///
+    ///   * "all four sensors answered and the hottest is 62 °C", from
+    ///   * "three sensors are silent and the one corner that answered is 62 °C"
+    ///
+    /// — which is the difference between a monitored hash board and a board
+    /// with one live corner and three unwatched ones. Keeping each sensor's
+    /// outcome separate makes that difference observable; the *policy* over
+    /// the outcome stays with the caller
+    /// (`dcentrald_silicon_profiles::sensor_topology::SensorSweep`).
+    ///
+    /// `Some(t)` requires both that the device answered and that `t` is
+    /// finite. A finite reading is deliberately **not** range-checked here:
+    /// the two live call sites apply different plausibility windows (the
+    /// AM2 hybrid path uses `[-20, 125]` inclusive, the daemon heartbeat path
+    /// uses `(-40, 125)` exclusive), and this method must not silently change
+    /// either one. Apply the call site's own window to the returned readings
+    /// before folding, so coverage and temperature agree at that site.
+    ///
+    /// Bare-protocol dsPICs (fw 0x82 / 0x86) answer `Ok(NAN)` by design — bare
+    /// firmware never delivers LM75 data, only a one-byte firmware echo. That
+    /// is a miss, not a reading, and the `is_finite` requirement classifies it
+    /// as one..
+    ///
+    /// Costs exactly one read per sensor — the same bus traffic as
+    /// `lm75a_read_all`. Never call this *in addition to* a sentinel-based
+    /// read on the same poll: an LM75A passthrough transaction costs ~290 ms
+    /// and this bus has a documented parser-corruption hazard, so a second
+    /// pass would both double the un-serviced window and add avoidable
+    /// transactions. Fold both the temperature and the coverage from this one
+    /// sweep.
+    fn lm75a_sweep(&mut self, sensor_addrs: [u8; 4]) -> Lm75aSweepReadings {
+        let mut out: Lm75aSweepReadings = [None; 4];
+        for (slot, &sensor_addr) in sensor_addrs.iter().enumerate() {
+            match self.lm75a_read_temp(sensor_addr) {
+                Ok(t) if t.is_finite() => out[slot] = Some(t as f32),
+                Ok(_) => {
+                    tracing::debug!(
+                        target: "lm75a_sweep",
+                        sensor = format_args!("0x{:02X}", sensor_addr),
+                        "LM75A sweep: controller answered with a non-finite value \
+                         (bare-protocol firmware echo) — counted as NOT covered",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "lm75a_sweep",
+                        sensor = format_args!("0x{:02X}", sensor_addr),
+                        error = %e,
+                        "LM75A sweep: read failed — sensor may not be present; \
+                         counted as NOT covered",
+                    );
+                }
             }
         }
         out
@@ -5461,6 +5536,19 @@ impl Pic0x89Service {
 impl Lm75aViaVoltageController for Pic0x89Service {
     fn lm75a_read_temp(&mut self, sensor_addr: u8) -> Result<f64> {
         self.inner.read_temperature(sensor_addr)
+    }
+}
+
+// `DspicService` is the service-backed sibling of `DspicController` and is what
+// the daemon's runtime heartbeat constructs per hash board. It read LM75A
+// sensors through its own inherent `read_all_temperatures` and so was the one
+// LM75A consumer outside this capability — which is why the coverage-blind fold
+// had to be fixed twice instead of once. Implementing the trait routes it
+// through the same abstraction; `lm75a_read_temp` is the exact call
+// `read_all_temperatures` already makes per sensor, so no transaction changes.
+impl Lm75aViaVoltageController for DspicService {
+    fn lm75a_read_temp(&mut self, sensor_addr: u8) -> Result<f64> {
+        self.read_temperature(sensor_addr)
     }
 }
 
@@ -7396,5 +7484,554 @@ mod pic0x89_tests {
         assert_eq!(decode_voltage_dac_reply(&[0x18, 0x00, 0x06]), None); // short
         assert_eq!(decode_voltage_dac_reply(&[]), None);
         assert_eq!(decode_voltage_dac_reply(&[0xFF, 0xFF]), None); // bus noise
+    }
+
+    // -----------------------------------------------------------------------
+    //  LM75A coverage-honest sweep (campaign rank 21 / SG-2)
+    // -----------------------------------------------------------------------
+
+    /// Scripted `Lm75aViaVoltageController` — one canned outcome per sensor
+    /// address, so a sweep can be driven through partial-coverage states that
+    /// no host test can reach through a real I²C bus.
+    struct ScriptedLm75a {
+        /// Outcome for `LM75A_ADDRS[i]`, in the same order.
+        outcomes: [std::result::Result<f64, ()>; 4],
+        reads: std::cell::RefCell<Vec<u8>>,
+    }
+
+    impl ScriptedLm75a {
+        fn new(outcomes: [std::result::Result<f64, ()>; 4]) -> Self {
+            Self {
+                outcomes,
+                reads: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Lm75aViaVoltageController for ScriptedLm75a {
+        fn lm75a_read_temp(&mut self, sensor_addr: u8) -> Result<f64> {
+            self.reads.borrow_mut().push(sensor_addr);
+            let slot = LM75A_ADDRS
+                .iter()
+                .position(|a| *a == sensor_addr)
+                .expect("scripted sweep asked for an address outside LM75A_ADDRS");
+            match self.outcomes[slot] {
+                Ok(t) => Ok(t),
+                Err(()) => Err(crate::AsicError::Pic {
+                    addr: 0x20,
+                    detail: "scripted sensor absent".to_string(),
+                }),
+            }
+        }
+    }
+
+    /// The whole point of the sweep: 4-of-4, 3-of-4, 1-of-4 and 0-of-4 must be
+    /// four DISTINGUISHABLE outcomes. Under the sentinel-folding readers they
+    /// collapse to a single number (or to nothing), which is what let a hash
+    /// board with three silent corners report a healthy board temperature.
+    #[test]
+    fn lm75a_sweep_reports_partial_coverage_instead_of_collapsing_it() {
+        // 4 of 4.
+        let mut all = ScriptedLm75a::new([Ok(50.0), Ok(62.0), Ok(58.0), Ok(61.0)]);
+        let readings = all.lm75a_sweep(LM75A_ADDRS);
+        assert_eq!(readings.iter().filter(|r| r.is_some()).count(), 4);
+        assert_eq!(readings[1], Some(62.0));
+
+        // 3 of 4 — one sensor absent. The hottest measured value is IDENTICAL
+        // to the 4-of-4 case, which is exactly why a max alone cannot tell
+        // these two boards apart.
+        let mut three = ScriptedLm75a::new([Ok(50.0), Ok(62.0), Err(()), Ok(61.0)]);
+        let readings_three = three.lm75a_sweep(LM75A_ADDRS);
+        assert_eq!(readings_three.iter().filter(|r| r.is_some()).count(), 3);
+        assert_eq!(readings_three[2], None);
+
+        // 1 of 4 — the single live corner.
+        let mut one = ScriptedLm75a::new([Err(()), Ok(62.0), Err(()), Err(())]);
+        let readings_one = one.lm75a_sweep(LM75A_ADDRS);
+        assert_eq!(readings_one.iter().filter(|r| r.is_some()).count(), 1);
+
+        // 0 of 4 — a fully blind board.
+        let mut none = ScriptedLm75a::new([Err(()), Err(()), Err(()), Err(())]);
+        let readings_none = none.lm75a_sweep(LM75A_ADDRS);
+        assert!(readings_none.iter().all(|r| r.is_none()));
+    }
+
+    /// Both historical in-band sentinels must count as MISSES, never coverage.
+    ///
+    /// `-999.0` is what `read_all_temperatures` substitutes for a failed read,
+    /// and `NaN` is what a bare-protocol (fw 0x82 / 0x86) dsPIC returns as
+    /// `Ok` by design. A sweep that counted either as a reading would report
+    /// full coverage on a board that measured nothing at all.
+    #[test]
+    fn lm75a_sweep_counts_both_legacy_sentinels_as_not_covered() {
+        let mut sentinels =
+            ScriptedLm75a::new([Ok(f64::NAN), Ok(-999.0), Ok(f64::INFINITY), Ok(55.0)]);
+        let readings = sentinels.lm75a_sweep(LM75A_ADDRS);
+
+        // NaN and +inf are non-finite → miss.
+        assert_eq!(readings[0], None, "NaN must not count as coverage");
+        assert_eq!(readings[2], None, "infinity must not count as coverage");
+        // -999.0 IS finite, so the sweep reports it verbatim. It is the call
+        // site's plausibility window that must reject it — pinned here so the
+        // division of responsibility stays explicit.
+        assert_eq!(readings[1], Some(-999.0));
+        assert!(!(-20.0..=125.0).contains(&readings[1].unwrap()));
+        assert!(!(readings[1].unwrap() > -40.0 && readings[1].unwrap() < 125.0));
+        assert_eq!(readings[3], Some(55.0));
+    }
+
+    /// One read per sensor and no more. An LM75A passthrough transaction costs
+    /// ~290 ms on a bus with a documented parser-corruption hazard, so a
+    /// coverage report must be folded from the SAME sweep that produces the
+    /// temperature — never from a second pass.
+    #[test]
+    fn lm75a_sweep_costs_exactly_one_transaction_per_sensor() {
+        let mut probe = ScriptedLm75a::new([Ok(50.0), Err(()), Ok(58.0), Ok(61.0)]);
+        let _ = probe.lm75a_sweep(LM75A_ADDRS);
+        assert_eq!(
+            probe.reads.borrow().as_slice(),
+            LM75A_ADDRS.as_slice(),
+            "the sweep must read each sensor exactly once, in address order",
+        );
+    }
+
+    /// Slot `i` of the result is sensor `sensor_addrs[i]` — the caller relies
+    /// on that alignment to name which corner went dark.
+    #[test]
+    fn lm75a_sweep_is_positionally_aligned_with_its_address_argument() {
+        let mut probe = ScriptedLm75a::new([Err(()), Err(()), Ok(58.0), Err(())]);
+        let readings = probe.lm75a_sweep(LM75A_ADDRS);
+        let measured: Vec<u8> = readings
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, r)| r.map(|_| LM75A_ADDRS[slot]))
+            .collect();
+        assert_eq!(measured, vec![LM75A_ADDRS[2]]);
+    }
+}
+
+/// Rank 5 (Hardware Enablement Constitution) — frame-builder equivalence.
+///
+/// The live dsPIC frame builders (`dspic_set_voltage_frame`,
+/// `dspic_enable_voltage_frame`, `dspic_disable_voltage_frame`,
+/// `dspic_heartbeat_frame`, `dspic_read_temp_frame`) produce the bytes that
+/// actually reach a voltage controller at runtime. Every call site selects
+/// their wire form the same way: `use_bare = firmware.protocol() ==
+/// DspicProtocol::Bare` and `encoding = dspic_enable_disable_encoding(firmware)`
+/// (see mod.rs:1514/1939/2088/4189/4359 …).
+///
+/// The `fw82`/`fw86`/`fw89`/`fw8a` submodules encode the same per-firmware wire
+/// forms as standalone, self-documenting builders — but nothing linked them to
+/// the live path. Each side has only its own unit tests, so an edit to either
+/// (a changed LEN, a flipped Canonical/VnishPadded choice, a dropped fw=0x86
+/// SET_VOLTAGE special-case) would drift silently while both stayed green.
+/// These are ENERGIZATION frames: a divergence is a live voltage-command bug we
+/// currently cannot see.
+///
+/// This module makes the four orphan modules load-bearing. For every
+/// (firmware, operation) pair it drives the live builder exactly as production
+/// does and asserts byte-for-byte equality with the corresponding submodule
+/// builder. Test-only — it changes no shipped bytes. Per the queue's rank-5
+/// sequencing constraint, this equivalence must report before any consolidation
+/// deletes the inline builders (H4 queue #11).
+#[cfg(test)]
+mod frame_builder_equivalence_tests {
+    use super::*;
+
+    /// The runtime's own bare-vs-framed derivation (mod.rs:1514 et al).
+    fn runtime_use_bare(fw: DspicFirmware) -> bool {
+        fw.protocol() == DspicProtocol::Bare
+    }
+
+    // A spread of voltages so a match cannot be a single-value coincidence;
+    // each exercises a different DAC byte / big-endian millivolt pair.
+    const SAMPLE_MV: [u16; 4] = [13_700, 13_800, 14_500, 12_000];
+    // Every AM2 board LM75A subaddress (0x48–0x4B) plus the older S19/S19j map.
+    const SAMPLE_ADDRS: [u8; 6] = [0x48, 0x49, 0x4A, 0x4B, 0x72, 0x75];
+
+    #[test]
+    fn fw82_live_builders_match_the_fw82_module() {
+        let fw = DspicFirmware::Fw82;
+        let bare = runtime_use_bare(fw);
+        assert!(bare, "fw=0x82 is a bare-protocol firmware");
+        let enc = dspic_enable_disable_encoding(fw);
+
+        for &mv in &SAMPLE_MV {
+            assert_eq!(
+                dspic_set_voltage_frame(fw, bare, mv),
+                fw82::set_voltage_frame(mv),
+                "fw82 SET_VOLTAGE drift at {mv} mV",
+            );
+        }
+        assert_eq!(
+            dspic_enable_voltage_frame(bare, enc),
+            fw82::enable_voltage_frame(),
+        );
+        assert_eq!(
+            dspic_disable_voltage_frame(bare, enc),
+            fw82::disable_voltage_frame(),
+        );
+        assert_eq!(dspic_heartbeat_frame(bare), fw82::heartbeat_frame());
+        for &addr in &SAMPLE_ADDRS {
+            assert_eq!(
+                dspic_read_temp_frame(bare, addr),
+                fw82::read_temp_frame(addr),
+            );
+        }
+    }
+
+    #[test]
+    fn fw89_live_builders_match_the_fw89_module() {
+        let fw = DspicFirmware::Fw89;
+        let bare = runtime_use_bare(fw);
+        assert!(!bare, "fw=0x89 is a framed-protocol firmware");
+        let enc = dspic_enable_disable_encoding(fw);
+        assert_eq!(enc, EnableFrameEncoding::VnishPadded);
+
+        for &mv in &SAMPLE_MV {
+            assert_eq!(
+                dspic_set_voltage_frame(fw, bare, mv),
+                fw89::set_voltage_frame(mv),
+                "fw89 SET_VOLTAGE drift at {mv} mV",
+            );
+        }
+        assert_eq!(
+            dspic_enable_voltage_frame(bare, enc),
+            fw89::enable_voltage_frame(),
+        );
+        assert_eq!(
+            dspic_disable_voltage_frame(bare, enc),
+            fw89::disable_voltage_frame(),
+        );
+        assert_eq!(dspic_heartbeat_frame(bare), fw89::heartbeat_frame());
+        for &addr in &SAMPLE_ADDRS {
+            assert_eq!(
+                dspic_read_temp_frame(bare, addr),
+                fw89::read_temp_frame(addr),
+            );
+        }
+    }
+
+    #[test]
+    fn fw8a_live_builders_match_the_fw8a_module() {
+        let fw = DspicFirmware::Fw8A;
+        let bare = runtime_use_bare(fw);
+        assert!(!bare, "fw=0x8A is a framed-protocol firmware");
+        let enc = dspic_enable_disable_encoding(fw);
+        assert_eq!(
+            enc,
+            EnableFrameEncoding::Canonical,
+            "fw=0x8A keeps the canonical 6-byte enable form (VNish RE incomplete for it)",
+        );
+
+        for &mv in &SAMPLE_MV {
+            assert_eq!(
+                dspic_set_voltage_frame(fw, bare, mv),
+                fw8a::set_voltage_frame(mv),
+                "fw8a SET_VOLTAGE drift at {mv} mV",
+            );
+        }
+        assert_eq!(
+            dspic_enable_voltage_frame(bare, enc),
+            fw8a::enable_voltage_frame(),
+        );
+        assert_eq!(
+            dspic_disable_voltage_frame(bare, enc),
+            fw8a::disable_voltage_frame(),
+        );
+        assert_eq!(dspic_heartbeat_frame(bare), fw8a::heartbeat_frame());
+        for &addr in &SAMPLE_ADDRS {
+            assert_eq!(
+                dspic_read_temp_frame(bare, addr),
+                fw8a::read_temp_frame(addr),
+            );
+        }
+    }
+
+    /// fw=0x86 is the interesting one: a bare-protocol firmware whose
+    /// SET_VOLTAGE is nonetheless ALWAYS framed (bare `[55 AA 10 DAC]` was
+    /// live-proven insufficient on `a lab unit`), and whose ENABLE/DISABLE has both a
+    /// live bare form and a forced-framed VnishPadded form. Pin all of it, so a
+    /// future edit that drops the special-case or flips the framed form can't
+    /// slip past on an energization path born of the `a lab unit` corruption incident.
+    #[test]
+    fn fw86_live_builders_match_the_fw86_module_bare_and_framed() {
+        let fw = DspicFirmware::Fw86;
+        let bare = runtime_use_bare(fw);
+        assert!(bare, "fw=0x86 negotiates the bare protocol on the wire");
+        let enc = dspic_enable_disable_encoding(fw);
+        assert_eq!(
+            enc,
+            EnableFrameEncoding::VnishPadded,
+            "if fw=0x86 is ever forced framed it must use the VNish form, not Canonical",
+        );
+
+        // SET_VOLTAGE: the live builder special-cases fw=0x86 to the framed DAC
+        // form even though the firmware negotiates 'bare'. The module agrees —
+        // and it must genuinely be the 6-byte framed form, not the 5-byte bare.
+        for &mv in &SAMPLE_MV {
+            let framed = fw86::set_voltage_frame(mv);
+            assert_eq!(
+                dspic_set_voltage_frame(fw, bare, mv),
+                framed,
+                "fw86 SET_VOLTAGE must stay framed on the live path at {mv} mV",
+            );
+            assert_eq!(
+                framed.len(),
+                6,
+                "fw86 SET_VOLTAGE must be the framed 6-byte form"
+            );
+            assert_eq!(&framed[..4], &[0x55, 0xAA, 0x04, CMD_SET_VOLTAGE]);
+        }
+
+        // ENABLE/DISABLE — the live bare path (what actually ships for fw=0x86).
+        assert_eq!(
+            dspic_enable_voltage_frame(bare, enc),
+            fw86::enable_voltage_frame_bare(),
+        );
+        assert_eq!(
+            dspic_disable_voltage_frame(bare, enc),
+            fw86::disable_voltage_frame_bare(),
+        );
+        // ENABLE/DISABLE — the forced-framed path (use_bare = false).
+        assert_eq!(
+            dspic_enable_voltage_frame(false, enc),
+            fw86::enable_voltage_frame_framed(),
+        );
+        assert_eq!(
+            dspic_disable_voltage_frame(false, enc),
+            fw86::disable_voltage_frame_framed(),
+        );
+
+        assert_eq!(dspic_heartbeat_frame(bare), fw86::heartbeat_frame_bare());
+        for &addr in &SAMPLE_ADDRS {
+            assert_eq!(
+                dspic_read_temp_frame(bare, addr),
+                fw86::read_temp_frame_bare(addr),
+            );
+        }
+    }
+
+    /// A guard on the derivation itself: the encoding selector must route only
+    /// fw=0x86 and fw=0x89 down the VnishPadded path, everything else Canonical.
+    /// If this drifts, the per-firmware assertions above would start comparing
+    /// the wrong forms — so pin the selector explicitly as well.
+    #[test]
+    fn enable_disable_encoding_selector_is_stable() {
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::Fw86),
+            EnableFrameEncoding::VnishPadded,
+        );
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::Fw89),
+            EnableFrameEncoding::VnishPadded,
+        );
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::Fw82),
+            EnableFrameEncoding::Canonical,
+        );
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::Fw8A),
+            EnableFrameEncoding::Canonical,
+        );
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::FwB9),
+            EnableFrameEncoding::Canonical,
+        );
+        assert_eq!(
+            dspic_enable_disable_encoding(DspicFirmware::FwFE),
+            EnableFrameEncoding::Canonical,
+        );
+    }
+}
+
+/// Rank 4 (Hardware Enablement Constitution) — cross-layer PIC catalog pin.
+///
+/// Two layers independently encode the *same* dsPIC safety semantics and were
+/// linked by nothing:
+///   - the **catalog** `dcentrald_api_types::pic_firmware::KNOWN_VARIANTS` — the
+///     HAL-free `wire_form`/`reset_safe`/`voltage_trusted` metadata the REST
+///     `/api/hardware/pic_info` endpoint serves, and
+///   - the **driver** in this module — `decode_dspic_firmware`,
+///     [`DspicFirmware::protocol`], [`DspicFirmware::legacy_bootloader_commands_allowed`],
+///     and [`dspic_voltage_command_allowed`] — the code that actually energizes
+///     (or refuses to energize) a chip rail.
+///
+/// Each side had only its own tests, so a catalog edit (or a driver edit) could
+/// silently disagree about whether a firmware permits RESET, prefers the bare or
+/// framed wire form, or may be voltage-commanded — the SG-6 blind spot. This
+/// test cross-checks every dsPIC catalog row against the driver, encoding the
+/// two hard safety invariants exactly and the two legitimate divergences
+/// (fw=0x86 wire form; fw=0x88 voltage trust) as *named* exceptions, so a third
+/// divergence — or a regression in either safety invariant — fails loudly.
+///
+/// **Result: no live drift today** (rank 4 is pure measurement). PIC16 catalog
+/// rows (fw 0x03/0x56/0x5A/0x5E and the 0x89-PIC16 overlap) are out of scope:
+/// they are a different chip family with no dsPIC driver counterpart, so the pin
+/// scopes strictly to `architecture == Dspic33Ep16Gs202`.
+#[cfg(test)]
+mod cross_layer_pic_catalog_pin_tests {
+    use super::*;
+    use dcentrald_api_types::pic_firmware::{PicArchitecture, WireForm, KNOWN_VARIANTS};
+
+    /// The single dsPIC firmware byte whose catalog `wire_form` legitimately
+    /// diverges from the driver's [`DspicFirmware::protocol`]. fw=0x86 is a
+    /// bare-protocol firmware (ENABLE/DISABLE bare) whose SET_VOLTAGE is
+    /// *always framed*; the catalog encodes `FramedSum` to reflect the
+    /// energizing frame, while `protocol()` reports `Bare` for the base wire
+    /// form. Both are correct — see `dspic/fw86.rs` and the rank-5 equivalence
+    /// module. This divergence is expected; a *new* wire-form divergence is not.
+    const WIRE_FORM_DIVERGENCE_FW: u8 = 0x86;
+
+    /// The single dsPIC firmware byte whose catalog `voltage_trusted`
+    /// legitimately diverges from [`dspic_voltage_command_allowed`]. The catalog
+    /// labels 0x88 a trusted "dsPIC AM2 variant", but the driver has no
+    /// first-class `Fw88` — `decode_dspic_firmware(0x88)` yields `Other(0x88)`,
+    /// which fails closed for voltage commands (no proven protocol / energizing
+    /// bytes). The driver's fail-closed refusal is the safe direction and wins;
+    /// the catalog row is informational only until 0x88 is modeled with its own
+    /// evidence. A *new* voltage-trust divergence is not expected.
+    const VOLTAGE_TRUST_DIVERGENCE_FW: u8 = 0x88;
+
+    /// The dsPIC catalog rows, decoded the way production decodes a live byte
+    /// (env-free: no `DCENT_AM2_FORCE_FW89_ENCODING`).
+    fn dspic_catalog_rows() -> Vec<(u8, WireForm, bool, bool, DspicFirmware)> {
+        KNOWN_VARIANTS
+            .iter()
+            .filter(|v| v.architecture == PicArchitecture::Dspic33Ep16Gs202)
+            .map(|v| {
+                (
+                    v.fw_byte,
+                    v.wire_form,
+                    v.reset_safe,
+                    v.voltage_trusted,
+                    decode_dspic_firmware(Some(v.fw_byte)),
+                )
+            })
+            .collect()
+    }
+
+    fn wire_form_matches(catalog: WireForm, driver: DspicProtocol) -> bool {
+        matches!(
+            (catalog, driver),
+            (WireForm::Bare, DspicProtocol::Bare) | (WireForm::FramedSum, DspicProtocol::Framed)
+        )
+    }
+
+    /// HARD INVARIANT (no exception): the driver must NEVER energize a rail the
+    /// catalog marks untrusted. `driver_allows ⟹ catalog.voltage_trusted` for
+    /// every dsPIC row, at the production default `trust_degraded_fw = false`.
+    /// This is the load-bearing safety direction born of the `a lab unit` incident.
+    #[test]
+    fn driver_never_energizes_a_catalog_untrusted_dspic_firmware() {
+        for (fw, _wire, _reset, voltage_trusted, decoded) in dspic_catalog_rows() {
+            let driver_allows = dspic_voltage_command_allowed(decoded, false);
+            if driver_allows {
+                assert!(
+                    voltage_trusted,
+                    "driver allows voltage for fw=0x{fw:02X} ({decoded:?}) but the catalog marks it \
+                     voltage_trusted=false — the runtime must never exceed catalog trust"
+                );
+            }
+        }
+    }
+
+    /// HARD INVARIANT (no exception): RESET/JUMP safety is identical on both
+    /// layers. `catalog.reset_safe == driver.legacy_bootloader_commands_allowed`
+    /// for every dsPIC row. Only fw=0x82 (the legitimate cold-boot bootloader)
+    /// may permit bootloader control; every framed S19j/Pic0x89 family firmware
+    /// must refuse it on both layers.
+    #[test]
+    fn reset_safety_agrees_exactly_across_layers() {
+        for (fw, _wire, reset_safe, _voltage, decoded) in dspic_catalog_rows() {
+            assert_eq!(
+                reset_safe,
+                decoded.legacy_bootloader_commands_allowed(),
+                "reset-safety divergence on fw=0x{fw:02X} ({decoded:?}): catalog reset_safe={reset_safe} \
+                 but driver legacy_bootloader_commands_allowed={}",
+                decoded.legacy_bootloader_commands_allowed()
+            );
+        }
+    }
+
+    /// Wire form agrees for every dsPIC row EXCEPT the one documented
+    /// dual-protocol firmware (fw=0x86). Any other mismatch is a real drift.
+    #[test]
+    fn wire_form_agrees_except_the_documented_fw86_dual_protocol() {
+        for (fw, catalog_wire, _reset, _voltage, decoded) in dspic_catalog_rows() {
+            let agrees = wire_form_matches(catalog_wire, decoded.protocol());
+            if fw == WIRE_FORM_DIVERGENCE_FW {
+                assert!(
+                    !agrees,
+                    "fw=0x{fw:02X} is the documented wire-form exception (bare base, framed \
+                     SET_VOLTAGE) but the layers now agree — update the pin if fw86 was unified"
+                );
+            } else {
+                assert!(
+                    agrees,
+                    "NEW wire-form divergence on fw=0x{fw:02X} ({decoded:?}): catalog {catalog_wire:?} \
+                     vs driver protocol() {:?}",
+                    decoded.protocol()
+                );
+            }
+        }
+    }
+
+    /// Voltage trust agrees for every dsPIC row EXCEPT the one catalog-overclaim
+    /// the driver fails closed on (fw=0x88 → `Other(0x88)`). Any other mismatch
+    /// is a real drift.
+    #[test]
+    fn voltage_trust_agrees_except_the_documented_fw88_fail_closed() {
+        for (fw, _wire, _reset, catalog_trusted, decoded) in dspic_catalog_rows() {
+            let driver_allows = dspic_voltage_command_allowed(decoded, false);
+            if fw == VOLTAGE_TRUST_DIVERGENCE_FW {
+                assert!(
+                    catalog_trusted && !driver_allows,
+                    "fw=0x{fw:02X} is the documented voltage-trust exception (catalog trusts it, \
+                     driver fails closed as {decoded:?}) but that no longer holds — update the pin \
+                     if 0x88 was modeled or the catalog row was corrected"
+                );
+            } else {
+                assert_eq!(
+                    catalog_trusted, driver_allows,
+                    "NEW voltage-trust divergence on fw=0x{fw:02X} ({decoded:?}): catalog \
+                     voltage_trusted={catalog_trusted} vs driver voltage_command_allowed={driver_allows}"
+                );
+            }
+        }
+    }
+
+    /// The fw=0x86 degraded-refusal predicate agrees across layers: the catalog
+    /// marks 0x86 untrusted and the driver's [`dspic_requires_degraded_fw_voltage_refusal`]
+    /// is the single source of the `a lab unit`-incident refusal.
+    #[test]
+    fn fw86_degraded_refusal_is_consistent_on_both_layers() {
+        let fw86 = decode_dspic_firmware(Some(0x86));
+        assert!(dspic_requires_degraded_fw_voltage_refusal(fw86));
+        // Default (untrusted) refuses; only the auditable lab override permits it.
+        assert!(!dspic_voltage_command_allowed(fw86, false));
+        assert!(dspic_voltage_command_allowed(fw86, true));
+        let catalog_fw86 = KNOWN_VARIANTS
+            .iter()
+            .find(|v| v.fw_byte == 0x86 && v.architecture == PicArchitecture::Dspic33Ep16Gs202)
+            .expect("catalog must carry the dsPIC fw=0x86 row");
+        assert!(
+            !catalog_fw86.voltage_trusted,
+            "catalog dsPIC fw=0x86 must stay voltage_trusted=false"
+        );
+    }
+
+    /// Sanity: the scope is exactly the five dsPIC rows we reason about, so a
+    /// future catalog row can't silently escape the cross-check by being added
+    /// with a byte the pin never anticipated.
+    #[test]
+    fn dspic_catalog_scope_is_the_known_five_bytes() {
+        let mut bytes: Vec<u8> = dspic_catalog_rows().iter().map(|r| r.0).collect();
+        bytes.sort_unstable();
+        assert_eq!(
+            bytes,
+            vec![0x82, 0x86, 0x88, 0x89, 0x8A],
+            "dsPIC catalog membership changed — re-adjudicate the cross-layer pin against the new row"
+        );
     }
 }

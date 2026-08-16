@@ -120,6 +120,15 @@ pub const BM1397_CHIPS_PER_CHAIN_S17_PRO: u32 = 48;
 /// Standard S17 Pro chain count (3).
 pub const BM1397_CHAIN_COUNT_S17_PRO: u32 = 3;
 
+/// S17+ BM1397 chips per hashboard, first-party maintenance guide p.4.
+pub const BM1397_CHIPS_PER_CHAIN_S17_PLUS: u32 = 65;
+
+/// S17+ voltage domains per hashboard, first-party maintenance guide p.4.
+pub const BM1397_DOMAINS_PER_CHAIN_S17_PLUS: u32 = 13;
+
+/// S17+ BM1397 chips per voltage domain, first-party guide p.4.
+pub const BM1397_CHIPS_PER_DOMAIN_S17_PLUS: u32 = 5;
+
 /// Operational baud after baud-upgrade per `baud-switching-analysis.md`.
 pub const BM1397_OPERATIONAL_BAUD: u32 = 6_250_000;
 
@@ -176,6 +185,17 @@ mod tests {
             (40.0..=43.0).contains(&eff),
             "S17 Pro nameplate efficiency {} W/TH outside [40, 43]",
             eff
+        );
+    }
+
+    #[test]
+    fn s17_plus_topology_is_first_party_and_self_consistent() {
+        assert_eq!(BM1397_CHIPS_PER_CHAIN_S17_PLUS, 65);
+        assert_eq!(BM1397_DOMAINS_PER_CHAIN_S17_PLUS, 13);
+        assert_eq!(BM1397_CHIPS_PER_DOMAIN_S17_PLUS, 5);
+        assert_eq!(
+            BM1397_DOMAINS_PER_CHAIN_S17_PLUS * BM1397_CHIPS_PER_DOMAIN_S17_PLUS,
+            BM1397_CHIPS_PER_CHAIN_S17_PLUS
         );
     }
 

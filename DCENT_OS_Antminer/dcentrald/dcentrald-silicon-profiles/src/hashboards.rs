@@ -123,6 +123,11 @@ pub struct HashboardCatalogEntry {
     /// ASIC chip mounted on this hashboard (chip name string;
     /// references `asics::AsicChip::name()`).
     pub chip_name: &'static str,
+    /// Exact scope of the evidence behind `sku` + `chip_name`.
+    ///
+    /// This is identity provenance only. No value authorizes transport,
+    /// voltage, clocks, mining, recovery, or installation.
+    pub identity_evidence: HashboardIdentityEvidence,
     /// Number of chips per chain when this SKU is fitted to its
     /// canonical product. 0 when not pinned.
     pub chips_per_chain: u8,
@@ -130,6 +135,25 @@ pub struct HashboardCatalogEntry {
     pub eeprom_preamble: EepromPreamble,
     /// Antminer products that fit this hashboard.
     pub used_in: &'static [&'static str],
+}
+
+/// Evidence ceiling for one hashboard catalog identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashboardIdentityEvidence {
+    /// Exact deployed page was observed on a D-Central unit.
+    LiveDeployedPage,
+    /// Exact deployed page is held in the bounded offline corpus.
+    HeldDeployedPage,
+    /// Exact SKU is corroborated by independent held catalog/PVT/topology sources,
+    /// but no deployed page for this exact SKU is held.
+    MultiSourceCatalog,
+    /// Chip family is evidenced, but the `BHB-*` name is only a generic placeholder.
+    NonSkuChipEvidence,
+    /// Sources conflict; the row is telemetry-only and must not admit hardware.
+    Disputed,
+    /// Neither a printed SKU nor exact chip identity is established.
+    Placeholder,
 }
 
 /// Cross-chip hashboard SKU enum.
@@ -141,7 +165,8 @@ pub enum Hashboard {
     /// `bm1362::BHB42601_FREQ_VOLT_TABLE` (5 rows, 545→465 MHz @
     /// 1320..1380 mV).
     Bhb42601,
-    /// **BHB42801** — S19 Pro+ higher-grade. BM1362. EEPROM `0x04 0x11`.
+    /// **BHB42801** — exact BM1362 high-bin SKU. EEPROM `0x04 0x11`.
+    /// Marketing-model and PSU bindings are unresolved.
     /// Per-SKU freq/voltage table: `bm1362::BHB42801_FREQ_VOLT_TABLE`
     /// (4 rows, 675→585 MHz @ 1530..1600 mV).
     Bhb42801,
@@ -170,18 +195,19 @@ pub enum Hashboard {
     Bhb42632,
     /// **BHB42651** — Extended-low family alias of BHB42631.
     Bhb42651,
-    /// **BHB42811** — High-bin family alias of BHB42801. Requires APW12+.
+    /// **BHB42811** — High-bin family alias of BHB42801; catalog-only identity.
     Bhb42811,
-    /// **BHB42821** — High-bin family alias of BHB42801. Requires APW12+.
+    /// **BHB42821** — High-bin family alias of BHB42801; catalog-only identity.
     Bhb42821,
-    /// **BHB42831** — High-bin extended (+585 MHz row). Requires APW12+.
+    /// **BHB42831** — High-bin extended (+585 MHz row); exact held page.
     Bhb42831,
-    /// **BHB42803** — Single-voltage repair-class. 84 ASICs × **3 chains**.
-    /// `voltage_fixed=true`. Requires APW12+.
+    /// **BHB42803** — Single-voltage preset. 84 ASICs × **3 chains**.
+    /// `voltage_fixed=true`; catalog-only identity.
     Bhb42803,
     /// **BHB42701** — Efficiency-optimised. 1220-1260 mV floor.
     Bhb42701,
-    /// **BHB42841** — Low-power salvage. Inverted curve (freq↓ ⇒ volt↑).
+    /// **BHB42841** — High-voltage/low-frequency preset. Inverted curve
+    /// (freq↓ ⇒ volt↑); catalog-only identity.
     Bhb42841,
     /// **BHB56902** — S19k Pro. BM1366. EEPROM **`0x05 0x11`** (NEW
     /// family preamble, distinct from BHB42xxx). APW121215f fw=0x76.
@@ -206,10 +232,14 @@ pub enum Hashboard {
     /// the old "4 chains × ~72 BM1387" was a stale RE2 §2.4 guess. SKU string
     /// unknown.
     BhbS17,
-    /// **BHB-T15** — Antminer T15 hashboard. BM1391 (7 nm), 63 chips/chain
-    /// per the RE Dev Kit (findings/s20-devkit-re.md F22/IC-1; XC7Z020
-    /// control board, distinct AXI/NAND geometry). SKU string unknown.
-    /// Catalog/identity placeholder — no active T15 in the fleet.
+    /// **BHB-S15** — generic S15 hashboard identity placeholder. Bitmain's
+    /// official S15 guide proves BM1391 but conflicts internally on 60 versus
+    /// implied 72 chips/chain; no EEPROM preamble or printed PCB SKU is held.
+    BhbS15,
+    /// **BHB-T15** — generic T15 hashboard identity placeholder. The held
+    /// cgminer proves BM1391, but its `60`-named test-pattern selector is not
+    /// independent physical geometry authority.
+    /// `catalog().chips_per_chain` therefore uses this schema's `0 = unpinned`.
     BhbT15,
 }
 
@@ -220,6 +250,7 @@ impl Hashboard {
             Hashboard::Bhb42601 => HashboardCatalogEntry {
                 sku: "BHB42601",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::LiveDeployedPage,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro"],
@@ -227,17 +258,19 @@ impl Hashboard {
             Hashboard::Bhb42801 => HashboardCatalogEntry {
                 sku: "BHB42801",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 // BHB42801 is high-bin: 88 chips/chain (`pvt_tables.h`, matching
                 // bm1362::Bm1362HashboardSku::Bhb42801.asics_per_chain() and the 88
                 // that runtime API surfaces serve). Was 126 in W11; the W13.C2 pass
                 // corrected sibling 42611 (126->120) but missed this one.
                 chips_per_chain: 88,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19 Pro+", "S19j Pro+"],
+                used_in: &[],
             },
             Hashboard::Bhb42611 => HashboardCatalogEntry {
                 sku: "BHB42611",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 // BHB42611 is mid-band mixable: 120 chips/chain
                 // (`pvt_tables.h` line 253). Was 126 in W11; corrected
                 // to match the RE4 levels.json table.
@@ -249,6 +282,7 @@ impl Hashboard {
             Hashboard::Bhb42603 => HashboardCatalogEntry {
                 sku: "BHB42603",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (standard alias)"],
@@ -256,6 +290,7 @@ impl Hashboard {
             Hashboard::Bhb42621 => HashboardCatalogEntry {
                 sku: "BHB42621",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (standard alias)"],
@@ -263,6 +298,7 @@ impl Hashboard {
             Hashboard::Bhb42641 => HashboardCatalogEntry {
                 sku: "BHB42641",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (standard alias)"],
@@ -271,6 +307,7 @@ impl Hashboard {
             Hashboard::Bhb42631 => HashboardCatalogEntry {
                 sku: "BHB42631",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (extended-low)"],
@@ -278,6 +315,7 @@ impl Hashboard {
             Hashboard::Bhb42632 => HashboardCatalogEntry {
                 sku: "BHB42632",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (extended-low alias)"],
@@ -285,59 +323,67 @@ impl Hashboard {
             Hashboard::Bhb42651 => HashboardCatalogEntry {
                 sku: "BHB42651",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
                 used_in: &["S19j Pro (extended-low alias)"],
             },
-            // --- W13.C2 high-bin family (REQUIRES APW12+) ---
+            // --- W13.C2 high-bin preset family; model/PSU binding unresolved ---
             Hashboard::Bhb42811 => HashboardCatalogEntry {
                 sku: "BHB42811",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 88,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19 Pro+ (high-bin alias)"],
+                used_in: &[],
             },
             Hashboard::Bhb42821 => HashboardCatalogEntry {
                 sku: "BHB42821",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 88,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19 Pro+ (high-bin alias)"],
+                used_in: &[],
             },
             Hashboard::Bhb42831 => HashboardCatalogEntry {
                 sku: "BHB42831",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 88,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19 Pro+ (high-bin extended)"],
+                used_in: &[],
             },
-            // --- W13.C2 fixed-voltage repair-class (3-chain) ---
+            // --- W13.C2 fixed-voltage preset (3-chain) ---
             Hashboard::Bhb42803 => HashboardCatalogEntry {
                 sku: "BHB42803",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 84,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19j Pro (repair-class, fixed-V, 3-chain)"],
+                used_in: &[],
             },
             // --- W13.C2 efficiency-optimised ---
             Hashboard::Bhb42701 => HashboardCatalogEntry {
                 sku: "BHB42701",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::HeldDeployedPage,
                 chips_per_chain: 108,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19j Pro (efficiency)"],
+                used_in: &[],
             },
-            // --- W13.C2 low-power salvage (inverted curve) ---
+            // --- W13.C2 high-voltage/low-frequency preset (inverted curve) ---
             Hashboard::Bhb42841 => HashboardCatalogEntry {
                 sku: "BHB42841",
                 chip_name: "BM1362",
+                identity_evidence: HashboardIdentityEvidence::MultiSourceCatalog,
                 chips_per_chain: 126,
                 eeprom_preamble: Some([0x04, 0x11]),
-                used_in: &["S19j Pro (low-power salvage)"],
+                used_in: &[],
             },
             Hashboard::Bhb56902 => HashboardCatalogEntry {
                 sku: "BHB56902",
                 chip_name: "BM1366",
+                identity_evidence: HashboardIdentityEvidence::LiveDeployedPage,
                 // 77 here is INTENTIONAL — it matches (a) the live driver
                 // default `dcentrald-asic::drivers::bm1366::DEFAULT_CHIPS_PER_CHAIN_S19K
                 // = 77` (the actual mining path) and (b) the live probe of `a lab unit`
@@ -361,18 +407,37 @@ impl Hashboard {
             Hashboard::BhbS9 { .. } => HashboardCatalogEntry {
                 sku: "BHB-S9",
                 chip_name: "BM1387",
+                identity_evidence: HashboardIdentityEvidence::Placeholder,
                 chips_per_chain: 63,
                 eeprom_preamble: None,
                 used_in: &["S9", "S9i"],
             },
             Hashboard::BhbS11 => HashboardCatalogEntry {
                 sku: "BHB-S11",
+                // ⚠️ DISPUTED — do not treat either field below as settled.
+                // Round 15 (A1) read Bitmain's own signed S11 image and found
+                // its production `bmminer` is byte-identical to our held copy
+                // and is the S9-family `driver-btm-c5.c` build, in which
+                // `is_S11()` and `is_S9_plus()` BOTH return 1 and there are
+                // ZERO BM139x tokens. So `84` is a fact about an S9+-flavoured
+                // binary, not an established fact about the S11 product, and
+                // three in-tree sources name three different chips for it.
+                // `board_desc::am1_s11()` therefore refuses to name any ASIC
+                // family (`AsicProtocolIdentity::RuntimeDiscovered`) and a
+                // mutation test pins that it can be set to neither `Bm1391`
+                // nor `Bm1387`.
+                //
+                // These values are left AS-IS deliberately, but the typed
+                // `Disputed` evidence ceiling prevents callers from mistaking
+                // them for settled identity while the row remains telemetry-only.
+                // NOTHING may promote this row to an energization path on the
+                // strength of these two fields. Adjudication:
+                // `dcentrald-silicon-profiles/src/bm1391_stock_fw.rs`.
                 chip_name: "BM1391",
-                // 84 chips/chain — byte-exact from the S11 single-board-test
-                // jig (`board_init@1338C.c` loops until count == 84).
-                // The previous 63 was a copy-paste from the BM1387 BhbS9
-                // entry (S9 = 63). HashSource goldmine 2026-06-10. No active
-                // S11 in the fleet, so this is catalog/telemetry-only today.
+                identity_evidence: HashboardIdentityEvidence::Disputed,
+                // 84 chips/chain — from the S11 single-board-test jig
+                // (`board_init@1338C.c` loops until count == 84).
+                // HashSource goldmine 2026-06-10. See the dispute note above.
                 chips_per_chain: 84,
                 eeprom_preamble: None,
                 used_in: &["S11"],
@@ -387,17 +452,30 @@ impl Hashboard {
                 // ("S17: Same Zynq ... 3x48 BM1397") + bm1397.rs. (S17 Pro
                 // binning may differ; this catalog row is telemetry-only.)
                 chip_name: "BM1397",
+                identity_evidence: HashboardIdentityEvidence::NonSkuChipEvidence,
                 chips_per_chain: 48,
                 eeprom_preamble: None,
                 used_in: &["S17", "S17 Pro"],
             },
+            Hashboard::BhbS15 => HashboardCatalogEntry {
+                sku: "BHB-S15",
+                chip_name: "BM1391",
+                identity_evidence: HashboardIdentityEvidence::NonSkuChipEvidence,
+                // 0 is the explicit unknown sentinel. The guide says 12x5=60
+                // twice but also six/domain (12x6=72); the exact stock binary
+                // requires 72 replies. Physical geometry is unresolved.
+                chips_per_chain: 0,
+                eeprom_preamble: None,
+                used_in: &["S15"],
+            },
             Hashboard::BhbT15 => HashboardCatalogEntry {
                 sku: "BHB-T15",
                 chip_name: "BM1391",
-                // 63 chips/chain per the RE Dev Kit T15 board config
-                // (findings/s20-devkit-re.md F22). Distinct geometry from
-                // the BhbS11 BM1391 board (84/chain). Catalog-only.
-                chips_per_chain: 63,
+                identity_evidence: HashboardIdentityEvidence::NonSkuChipEvidence,
+                // 0 is this catalog schema's explicit "not pinned" sentinel.
+                // The T15 image selects a 60-named pattern file, but the S15
+                // guide proves that selector labels need not equal chip count.
+                chips_per_chain: 0,
                 eeprom_preamble: None,
                 used_in: &["T15"],
             },
@@ -484,11 +562,7 @@ pub const ALL_HASHBOARDS: &[Hashboard] = &[
     Hashboard::Bhb56902,
     Hashboard::BhbS11,
     Hashboard::BhbS17,
-    // A55 (BhbT15, BM1391 @ 63 chips/chain — findings/s20-devkit-re.md F22/IC-1).
-    // Landed 2026-06-10 together with the matching `| Hashboard::BhbT15` arms in
-    // `dcentrald-autotuner::pvt_envelope::hashboard_to_bm1362_sku` (→ None, not a
-    // BM1362 board) and `dcentrald::runtime::hardware_info::
-    // pic_type_for_classified_sku` (→ None, placeholder like BhbS11).
+    Hashboard::BhbS15,
     Hashboard::BhbT15,
     // BhbS9 is parameterized by chain index; pin chain 0 here for
     // catalog completeness.
@@ -638,6 +712,62 @@ mod tests {
     }
 
     #[test]
+    fn hashboard_identity_evidence_ceiling_is_explicit() {
+        for hb in [Hashboard::Bhb42601, Hashboard::Bhb56902] {
+            assert_eq!(
+                hb.catalog().identity_evidence,
+                HashboardIdentityEvidence::LiveDeployedPage
+            );
+        }
+        for hb in [
+            Hashboard::Bhb42603,
+            Hashboard::Bhb42631,
+            Hashboard::Bhb42641,
+            Hashboard::Bhb42651,
+            Hashboard::Bhb42701,
+            Hashboard::Bhb42801,
+            Hashboard::Bhb42831,
+        ] {
+            assert_eq!(
+                hb.catalog().identity_evidence,
+                HashboardIdentityEvidence::HeldDeployedPage,
+                "{hb:?} has an exact page in the bounded held corpus"
+            );
+        }
+        for hb in [
+            Hashboard::Bhb42611,
+            Hashboard::Bhb42621,
+            Hashboard::Bhb42632,
+            Hashboard::Bhb42803,
+            Hashboard::Bhb42811,
+            Hashboard::Bhb42821,
+            Hashboard::Bhb42841,
+        ] {
+            assert_eq!(
+                hb.catalog().identity_evidence,
+                HashboardIdentityEvidence::MultiSourceCatalog,
+                "{hb:?} must not overclaim a deployed page"
+            );
+        }
+        assert_eq!(
+            Hashboard::BhbS11.catalog().identity_evidence,
+            HashboardIdentityEvidence::Disputed
+        );
+        assert_eq!(
+            Hashboard::BhbS9 { chain_index: 0 }
+                .catalog()
+                .identity_evidence,
+            HashboardIdentityEvidence::Placeholder
+        );
+        for hb in [Hashboard::BhbS17, Hashboard::BhbS15, Hashboard::BhbT15] {
+            assert_eq!(
+                hb.catalog().identity_evidence,
+                HashboardIdentityEvidence::NonSkuChipEvidence
+            );
+        }
+    }
+
+    #[test]
     fn bhb56902_uses_bm1366_77_chips() {
         // Per the S19k Pro probe (memory rule
         // ): BHB56902
@@ -649,12 +779,13 @@ mod tests {
 
     #[test]
     fn legacy_hashboards_have_no_pinned_preamble() {
-        // BHB-S9 / BHB-S11 / BHB-S17 — RE2 doesn't pin preambles, so
-        // the catalog must not lie about them.
+        // Generic legacy placeholders have no exact EEPROM preamble.
         for hb in [
             Hashboard::BhbS9 { chain_index: 0 },
             Hashboard::BhbS11,
             Hashboard::BhbS17,
+            Hashboard::BhbS15,
+            Hashboard::BhbT15,
         ] {
             assert_eq!(hb.catalog().eeprom_preamble, None);
         }
@@ -662,9 +793,8 @@ mod tests {
 
     #[test]
     fn all_hashboards_present() {
-        // W13.C2: 15 BHB42xxx + BHB56902 + 3 legacy = 19; +BhbT15 (A55,
-        // goldmine 2026-06-10) = 20 catalog entries.
-        assert_eq!(ALL_HASHBOARDS.len(), 20);
+        // 15 BHB42xxx + BHB56902 + S9/S11/S17/S15/T15 placeholders.
+        assert_eq!(ALL_HASHBOARDS.len(), 21);
     }
 
     #[test]
@@ -696,5 +826,24 @@ mod tests {
                 hb.sku()
             );
         }
+    }
+
+    /// Both S15 and T15 retain the catalog's explicit unknown sentinel rather
+    /// than collapsing stock response counts into physical geometry.
+    #[test]
+    fn bm1391_hashboard_geometry_matches_exact_evidence() {
+        let s15 = Hashboard::BhbS15.catalog();
+        assert_eq!(s15.chips_per_chain, 0);
+        assert_eq!(crate::bm1391_stock_fw::S15_CHIPS_PER_CHAIN, None);
+        assert_eq!(s15.chip_name, "BM1391");
+
+        let t15 = Hashboard::BhbT15.catalog();
+        assert_eq!(t15.chips_per_chain, 0);
+        assert_eq!(
+            crate::bm1391_stock_fw::T15_CHIPS_PER_CHAIN,
+            None,
+            "a T15 pattern label is not physical geometry authority"
+        );
+        assert_eq!(t15.chip_name, "BM1391");
     }
 }

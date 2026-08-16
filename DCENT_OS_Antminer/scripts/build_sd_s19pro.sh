@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# build_sd_s19pro.sh — Build DCENT_OS lab SD boot image for Antminer S19 Pro (am2-s17)
+# build_sd_s19pro.sh — Build DCENT_OS lab SD boot media for AM2 S17 Pro / S19 Pro
 # D-Central Technologies, 2026
 #
 # Creates a bootable SD card for AM2 lab bring-up and SD boot validation.
-# It does NOT imply a safe public NAND install path for S19 Pro.
+# It does NOT imply a safe public NAND install path for either miner variant.
 # Uses BraiinsOS boot chain (FSBL, U-Boot, FPGA, kernel) + DCENT_OS rootfs.
 #
 # *** 2026-06-10 SD BOOT DEFECT FIX (squashfs-root model) ***
@@ -25,26 +25,151 @@
 #
 set -euo pipefail
 
+VARIANT="s19pro"
+VERIFY_DONOR_ONLY=0
+
+usage() {
+    echo "Usage: $(basename "$0") [--variant s19pro|s17p]" >&2
+    echo "       Builds experimental, management-only AM2 Zynq SD boot media." >&2
+    echo "       --verify-donor-only checks the held boot image and exits." >&2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --variant)
+            VARIANT="${2:-}"
+            shift 2
+            ;;
+        --variant=*)
+            VARIANT="${1#--variant=}"
+            shift
+            ;;
+        --verify-donor-only)
+            VERIFY_DONOR_ONLY=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+case "$VARIANT" in
+    s19pro)
+        BOARD_TARGET="am2-s19pro"
+        ARTIFACT_TARGET="am2-s19pro-sd"
+        MODEL_LABEL="S19 Pro"
+        CONFIG_NAME="dcentrald_s19pro_am2_baked_default.toml"
+        IMAGE_NAME="dcentos-s19pro-sd.img"
+        ;;
+    s17p|s17pro|s17)
+        VARIANT="s17p"
+        BOARD_TARGET="am2-s17p"
+        ARTIFACT_TARGET="am2-s17p-sd"
+        MODEL_LABEL="S17 Pro"
+        CONFIG_NAME="dcentrald_s17pro_am2_baked_default.toml"
+        IMAGE_NAME="dcentos-s17pro-sd.img"
+        ;;
+    *)
+        echo "ERROR: unsupported AM2 SD variant: $VARIANT (supported: s19pro, s17p)" >&2
+        exit 2
+        ;;
+esac
+
 # Auto-derive the repo root from this script's location (scripts/ -> dcentos -> projects -> ROOT),
 # so it works under WSL (/mnt/c/...) AND Docker (/work) without a hardcoded path.
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 # sudo only when NOT already root (Docker-as-root has no sudo and needs none).
 SUDO="sudo"; [ "$(id -u)" = "0" ] && SUDO=""
-# Writable work dir: WSL $HOME if usable, else /tmp (Docker).
-WORKDIR="${WORKDIR:-${HOME:-/tmp}/dcentos_sd_s19pro}"; case "$WORKDIR" in /root/*|/home/*) [ -w "$(dirname "$WORKDIR")" ] || WORKDIR=/tmp/dcentos_sd_s19pro;; esac
-BRAIINS_IMG="$PROJ/knowledge-base/firmware-archive/braiins-os_am2-s17_sd.img"
+BRAIINS_IMG="${BRAIINS_IMG:-$PROJ/knowledge-base/firmware-archive/braiins-os_am2-s17_sd.img}"
+BRAIINS_IMG_SIZE=112197632
+BRAIINS_IMG_SHA256=b0444ad2a5e9b9e2b021ec756a40cb1448128545a42c77bdabb4363617d03579
 DCENTOS_ROOTFS="$PROJ/DCENT_OS_Antminer/dcentos_rootfs.squashfs"
 NEW_BINARY="$PROJ/DCENT_OS_Antminer/dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald"
-S19PRO_TOML="$PROJ/DCENT_OS_Antminer/dcentrald/dcentrald-s19pro.toml"
+DCENTOS_CONFIG="$PROJ/DCENT_OS_Antminer/dcentrald/configs/$CONFIG_NAME"
 OVERLAY="$PROJ/DCENT_OS_Antminer/br2_external_dcentos/board/zynq/rootfs-overlay"
-SD_IMAGE="$PROJ/DCENT_OS_Antminer/output/dcentos-s19pro-sd.img"
+SD_IMAGE="$PROJ/DCENT_OS_Antminer/output/$IMAGE_NAME"
 export MTOOLS_SKIP_CHECK=1
+
+# The donor is executable boot-chain input, not merely descriptive evidence.
+# Validate its canonical identity before clearing any prior work directory or
+# extracting a single byte. A modified or symlink-substituted donor must never
+# produce media that looks evidence-backed.
+validate_braiins_donor() {
+    if [ ! -f "$BRAIINS_IMG" ] || [ -L "$BRAIINS_IMG" ]; then
+        echo "ERROR: held Braiins AM2 donor must be a regular non-symlink file: $BRAIINS_IMG" >&2
+        return 1
+    fi
+
+    local actual_size actual_sha256
+    actual_size="$(stat -c '%s' -- "$BRAIINS_IMG")"
+    if [ "$actual_size" != "$BRAIINS_IMG_SIZE" ]; then
+        echo "ERROR: held Braiins AM2 donor size mismatch: expected $BRAIINS_IMG_SIZE, got $actual_size" >&2
+        return 1
+    fi
+
+    command -v sha256sum >/dev/null 2>&1 || {
+        echo "ERROR: sha256sum is required to verify the held Braiins AM2 donor" >&2
+        return 1
+    }
+    actual_sha256="$(sha256sum -- "$BRAIINS_IMG")"
+    actual_sha256="${actual_sha256%% *}"
+    if [ "$actual_sha256" != "$BRAIINS_IMG_SHA256" ]; then
+        echo "ERROR: held Braiins AM2 donor SHA256 mismatch" >&2
+        echo "  expected: $BRAIINS_IMG_SHA256" >&2
+        echo "  actual:   $actual_sha256" >&2
+        return 1
+    fi
+    echo "  Held Braiins AM2 donor verified: $actual_size bytes, SHA256 $actual_sha256"
+}
+
+validate_braiins_donor
+if [ "$VERIFY_DONOR_ONLY" = "1" ]; then
+    exit 0
+fi
+
+if [ ! -f "$NEW_BINARY" ] || [ -L "$NEW_BINARY" ]; then
+    echo "ERROR: current regular non-symlink armv7 dcentrald is required: $NEW_BINARY" >&2
+    echo "       Cross-compile dcentrald before building AM2 SD media." >&2
+    exit 1
+fi
 
 # Shared SD helpers (squashfs-root partition writer + magic check).
 # shellcheck source=lib/sd_common.sh
 . "$PROJ/DCENT_OS_Antminer/scripts/lib/sd_common.sh"
 
-$SUDO rm -rf "$WORKDIR"
+# The fixed output is later opened with truncating `dd`. Refuse direct,
+# resolved-parent, symlink, and hard-link aliases to every executable/input
+# artifact before clearing work state or opening an output.
+sd_common::refuse_unsafe_output_alias "$SD_IMAGE" \
+    "$BRAIINS_IMG" "$DCENTOS_ROOTFS" "$NEW_BINARY" "$DCENTOS_CONFIG"
+sd_common::refuse_unsafe_output_alias "$SD_IMAGE.manifest.json" \
+    "$SD_IMAGE" "$BRAIINS_IMG" "$DCENTOS_ROOTFS" "$NEW_BINARY" "$DCENTOS_CONFIG"
+
+# Never accept a caller-selected recursive-cleanup target.  A private directory
+# is allocated for this invocation only; the ownership sentinel keeps cleanup
+# fail-closed if the path is unexpectedly replaced while the build is running.
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/dcentos_sd_${VARIANT}.XXXXXX")" || {
+    echo "ERROR: unable to allocate private AM2 SD build directory" >&2
+    exit 1
+}
+WORKDIR_SENTINEL="$WORKDIR/.dcentos-private-am2-workdir"
+: > "$WORKDIR_SENTINEL"
+cleanup_private_workdir() {
+    if [ -n "${WORKDIR:-}" ] && [ -f "${WORKDIR_SENTINEL:-}" ]; then
+        $SUDO rm -rf -- "$WORKDIR"
+    fi
+}
+trap cleanup_private_workdir EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 mkdir -p "$WORKDIR"/boot
 
 # ============================================================
@@ -72,45 +197,43 @@ echo "=== Step 3: Build DCENT_OS rootfs with new binary + fixes ==="
 # Unsquash existing rootfs
 $SUDO unsquashfs -d "$WORKDIR/rootfs_new" "$DCENTOS_ROOTFS"
 
-# Replace dcentrald with a freshly cross-compiled binary IF present; otherwise keep
-# the rootfs's existing dcentrald (lets the SD build + structural validation run
-# without a fresh armv7 build on hand).
-if [ -f "$NEW_BINARY" ]; then
-    $SUDO cp "$NEW_BINARY" "$WORKDIR/rootfs_new/usr/local/bin/dcentrald"
-    $SUDO chmod 755 "$WORKDIR/rootfs_new/usr/local/bin/dcentrald"
-    echo "  Replaced dcentrald binary ($(stat -c%s "$NEW_BINARY") bytes)"
-else
-    echo "  [WARN] ============================================================"
-    echo "  [WARN] $NEW_BINARY not found."
-    echo "  [WARN] Keeping the shared base rootfs's EXISTING dcentrald, which may be"
-    echo "  [WARN] MONTHS OLD (pass-2 NEW-1: Mar-2026 v0.8.0, predating .25/safety work)."
-    echo "  [WARN] For a PRODUCTION flash, cross-compile dcentrald first so the card"
-    echo "  [WARN] ships the CURRENT daemon, not stale firmware."
-    echo "  [WARN] ============================================================"
-fi
+# A structurally complete boot image with a stale daemon is not an installable
+# DCENT_OS artifact.  Require the current cross-compiled runtime and bind its
+# digest into the sidecar manifest; there is intentionally no warning-only
+# fallback to the shared base rootfs binary.
+$SUDO cp "$NEW_BINARY" "$WORKDIR/rootfs_new/usr/local/bin/dcentrald"
+$SUDO chmod 755 "$WORKDIR/rootfs_new/usr/local/bin/dcentrald"
+echo "  Installed current dcentrald binary ($(stat -c%s "$NEW_BINARY") bytes)"
 
-# Copy S19 Pro config as default
-[ -f "$S19PRO_TOML" ] && { $SUDO cp "$S19PRO_TOML" "$WORKDIR/rootfs_new/etc/dcentrald.toml"; echo "  Installed S19 Pro config"; }
+# Install the selected idle-first, safety-clamped board config. Missing target
+# identity is a hard failure; silently retaining a shared/rootfs default could
+# select the wrong ASIC profile.
+[ -f "$DCENTOS_CONFIG" ] || {
+    echo "ERROR: selected $MODEL_LABEL config is missing: $DCENTOS_CONFIG" >&2
+    exit 1
+}
+$SUDO cp "$DCENTOS_CONFIG" "$WORKDIR/rootfs_new/etc/dcentrald.toml"
+echo "  Installed idle-first $MODEL_LABEL config"
 
 # Fix dropbear — enable password auth
 [ -f "$OVERLAY/etc/default/dropbear" ] && { $SUDO cp "$OVERLAY/etc/default/dropbear" "$WORKDIR/rootfs_new/etc/default/dropbear"; echo "  Fixed dropbear config (password auth enabled)"; }
 
-# Copy updated init scripts (am2-s17 platform detection)
+# Copy updated init scripts (AM2 control-board family detection)
 for s in S10modules S15pic_boot S82dcentrald; do
     [ -f "$OVERLAY/etc/init.d/$s" ] && $SUDO cp "$OVERLAY/etc/init.d/$s" "$WORKDIR/rootfs_new/etc/init.d/$s"
 done
-echo "  Updated init scripts (am2-s17 platform detection)"
+echo "  Updated init scripts (AM2 control-board family detection)"
 
 # CRITICAL (pass-2 fix P2-2): bake the am2 platform STAMPS into the rootfs. The
 # shared dcentos_rootfs.squashfs base lacks them, so S82dcentrald (which keys
-# IS_AM2 ONLY off these files) would land IS_AM2=0 on real am2-s17 silicon ->
+# IS_AM2 ONLY off these files) would land IS_AM2=0 on a real AM2 board ->
 # the am2 UIO-mmap persistent fan custodian is never used, falling back to the
 # unreliable devmem fan path. The kernel-cmdline dcent.platform= is NOT parsed
 # into these, so the stamp MUST be baked here (not passed via bootargs).
 $SUDO mkdir -p "$WORKDIR/rootfs_new/etc/dcentos"
 echo "zynq-bm3-am2" | $SUDO tee "$WORKDIR/rootfs_new/etc/dcentos/platform" >/dev/null
-echo "am2-s17"      | $SUDO tee "$WORKDIR/rootfs_new/etc/dcentos/board_target" >/dev/null
-echo "  Baked am2 platform stamps: platform=zynq-bm3-am2 board_target=am2-s17 (IS_AM2=1)"
+echo "$BOARD_TARGET" | $SUDO tee "$WORKDIR/rootfs_new/etc/dcentos/board_target" >/dev/null
+echo "  Baked AM2 platform stamps: platform=zynq-bm3-am2 board_target=$BOARD_TARGET (IS_AM2=1)"
 
 # CRITICAL (pass-3 fix NEW-5): arch-guard the rootfs before re-squashing. The
 # historical AArch64-init-in-ARMv7 PID-1 brick (PROJECT_LOG: shipped BB card
@@ -118,7 +241,7 @@ echo "  Baked am2 platform stamps: platform=zynq-bm3-am2 board_target=am2-s17 (I
 # leaking an aarch64 /sbin/init into an armv7 card. Hard-fail on any non-ARMv7 PID1.
 # shellcheck source=lib/buildroot_rootfs_arch_guard.sh
 . "$PROJ/DCENT_OS_Antminer/scripts/lib/buildroot_rootfs_arch_guard.sh"
-dcent_require_armv7_eabi_elf_paths "$WORKDIR/rootfs_new" "S19Pro rootfs" \
+dcent_require_armv7_eabi_elf_paths "$WORKDIR/rootfs_new" "$MODEL_LABEL rootfs" \
     sbin/init bin/busybox usr/local/bin/dcentrald
 echo "  Arch guard OK: /sbin/init + busybox + dcentrald are ARMv7 EABI ELF"
 
@@ -183,7 +306,7 @@ cp "$WORKDIR/fdt.dtb" "$WORKDIR/devicetree.dtb"
 # Write DCENT_OS uEnv.txt that boots our kernel + p2 squashfs root from SD
 # The BraiinsOS U-Boot loads u-boot.img which then reads uEnv.txt
 cat > "$WORKDIR/uEnv.txt" << 'UENV'
-# DCENT_OS lab SD boot for S19 Pro (am2-s17)
+# DCENT_OS lab SD boot for AM2 Zynq S17 Pro / S19 Pro control boards
 # FIX (2026-06-10, SD boot defect session): squashfs IS the root partition
 # (root=/dev/mmcblk0p2 rootfstype=squashfs ro), matching the proven
 # .25/.109 NAND runtime model. No ramdisk (`bootm kernel - fdt`).
@@ -238,18 +361,32 @@ dd if="$BOOTPART" of="$SD_IMAGE" bs=1M seek=$P1_OFFSET_MB conv=notrunc 2>/dev/nu
 # the "No init found" boot-loop defect.
 sd_common::write_squashfs_root_partition "$SD_IMAGE" "$WORKDIR/rootfs_dcentos.squashfs" "$P2_OFFSET_MB" "$P2_SIZE_MB"
 
+# Bind the exact image and held AM2/S17 donor evidence to an explicit support
+# scope. This is experimental external-media boot for the AM2 control-board
+# family, not authorization to mutate NAND and not a native-mining claim.
+python3 "$PROJ/DCENT_OS_Antminer/scripts/write_sd_boot_media_manifest.py" \
+    --image "$SD_IMAGE" \
+    --target "$ARTIFACT_TARGET" \
+    --board-target "$BOARD_TARGET" \
+    --control-board-family zynq-bm3-am2 \
+    --native-runtime-support management_only \
+    --donor "$BRAIINS_IMG" \
+    --runtime "$NEW_BINARY" \
+    --complete-zynq-boot-set
+
 echo ""
 echo "============================================"
 echo "  DCENT_OS SD Card Image: LAB-ONLY"
 echo "============================================"
 echo "  Image: $SD_IMAGE"
+echo "  Manifest: $SD_IMAGE.manifest.json"
 echo "  Size:  $(stat -c%s "$SD_IMAGE") bytes ($(stat -c%s "$SD_IMAGE" | awk '{print int($1/1024/1024)}') MB)"
 echo ""
 echo "  Write to SD card:"
-echo "    balenaEtcher: select dcentos-s19pro-sd.img"
-echo "    Or: dd if=dcentos-s19pro-sd.img of=/dev/sdX bs=4M"
+echo "    balenaEtcher: select $IMAGE_NAME"
+echo "    Or: dd if=$IMAGE_NAME of=/dev/sdX bs=4M"
 echo ""
-echo "  Boot: Insert SD + power on S19 Pro (JP4 jumper to SD position)"
+echo "  Boot: Insert SD + power on $MODEL_LABEL (JP4 jumper to SD position)"
 echo "  NOTE: This image is for AM2 SD boot validation only. Do NOT treat it as a safe NAND installer yet."
 echo "  SSH:  root@<IP> password: dcentral"
 echo "============================================"

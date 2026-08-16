@@ -159,40 +159,12 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-# Probe order for the am3-aml kernel uImage. Same set the S21 + S19k Pro
-# variants use; S19j Pro Amlogic kernel extraction is hardware-gated until
-# a bench unit lands. Until then we fall back to the verified-working AXG
-# S21 kernel (same A113D SoC, same 4.9.113 base).
-KERNEL=""
-KERNEL_SRC=""
-if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
-    KERNEL="${DCENT_AM3_AML_KERNEL}"
-    KERNEL_SRC="env override (DCENT_AM3_AML_KERNEL)"
-elif [ -f "${PROJECT_ROOT}/extractions/s19j-aml/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s19j-aml/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s19j-aml"
-elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s21 (verified AXG fallback)"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s19j-aml/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s19j-aml/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s19j-aml"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s21 (verified AXG fallback)"
-fi
-
-if [ -z "$KERNEL" ]; then
-    echo "ERROR: no kernel_uimage.bin found for am3-s19jpro-aml sysupgrade packaging." >&2
-    echo "  Expected one of (in probe order):" >&2
-    echo "    \$DCENT_AM3_AML_KERNEL" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s19j-aml/kernel_uimage.bin" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s19j-aml/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
-    echo "  Refusing to package am3-s19jpro-aml without a verified am3-family kernel." >&2
-    exit 1
-fi
+# Only the target-selected, manifest-pinned snapshot is admissible. The exact
+# fw-info is part of the gate so shared kernel/DTB bytes cannot imply identity.
+. "${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/require-exact-build-inputs.sh"
+dcent_require_exact_amlogic_build_inputs "${TARGET:-}"
+KERNEL="$DCENT_AM3_AML_KERNEL"
+KERNEL_SRC="exact model-bound build-input snapshot (s19jpro/aml)"
 
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
@@ -266,7 +238,10 @@ EOF
 # Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
 # are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
 DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s19jpro-aml.tar --artifact-dir <restore_verified_dir>"
-DCENT_TOOLBOX_UPDATE_COMMAND=""
+# OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
+# rail accepts the amlogic_rootfs_window method; identical root SSH +
+# restore-verified + signed-package gates; write+readback, NO auto-reboot).
+DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19jpro-aml.tar --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
 DCENT_TARGET_SIDE_SYSUPGRADE=false

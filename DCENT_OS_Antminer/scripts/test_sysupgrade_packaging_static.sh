@@ -181,6 +181,175 @@ EOF
     (cd "$pkgdir" && sha256sum kernel root METADATA > SHA256SUMS)
 }
 
+make_test_s9_package() {
+    pkgdir=$1
+    manifest_board=$2
+    kernel_kind=$3
+    requested_kernel_size=$4
+    package_prefix=$(basename "$pkgdir")
+
+    mkdir -p "$pkgdir"
+    case "$kernel_kind" in
+        fit)
+            printf '\320\015\376\355kernel\n' > "$pkgdir/kernel"
+            ;;
+        bare-zimage)
+            printf '\000\000\240\341kernel\n' > "$pkgdir/kernel"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    current_kernel_size=$(wc -c < "$pkgdir/kernel" | tr -d ' ')
+    [ "$requested_kernel_size" -ge "$current_kernel_size" ] || return 1
+    if command -v truncate >/dev/null 2>&1; then
+        truncate -s "$requested_kernel_size" "$pkgdir/kernel"
+    else
+        dd if=/dev/zero of="$pkgdir/kernel" bs=1 count=1 seek=$((requested_kernel_size - 1)) conv=notrunc >/dev/null 2>&1
+    fi
+    printf 'hsqs' > "$pkgdir/root"
+    printf 'board=%s\n' "$manifest_board" > "$pkgdir/METADATA"
+
+    kernel_size=$(wc -c < "$pkgdir/kernel" | tr -d ' ')
+    root_size=$(wc -c < "$pkgdir/root" | tr -d ' ')
+    metadata_size=$(wc -c < "$pkgdir/METADATA" | tr -d ' ')
+    kernel_sha=$(sha256sum "$pkgdir/kernel" | awk '{ print $1 }')
+    root_sha=$(sha256sum "$pkgdir/root" | awk '{ print $1 }')
+    metadata_sha=$(sha256sum "$pkgdir/METADATA" | awk '{ print $1 }')
+
+    cat > "$pkgdir/MANIFEST.json" <<EOF
+{
+  "schema": 1,
+  "manifest_profile": "dcentos.sysupgrade-unsigned-lab/v1",
+  "product": "DCENT_OS",
+  "package_type": "sysupgrade",
+  "installable": true,
+  "artifact_maturity": "experimental",
+  "board": "$manifest_board",
+  "board_target": "$manifest_board",
+  "version": "test",
+  "status": "lab_unsigned",
+  "payloads": {
+    "kernel": { "path": "$package_prefix/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
+    "rootfs": { "path": "$package_prefix/root", "size": $root_size, "sha256": "$root_sha" },
+    "metadata": { "path": "$package_prefix/METADATA", "size": $metadata_size, "sha256": "$metadata_sha" }
+  }
+}
+EOF
+    (cd "$pkgdir" && sha256sum kernel root METADATA > SHA256SUMS)
+}
+
+s9_expect_package_rejection() {
+    package_archive=$1
+    expected_reason=$2
+    rejection_output=$3
+
+    if DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 sh scripts/pre_flash_validate.sh \
+        --package-only "$package_archive" am1-s9 >"$rejection_output" 2>&1; then
+        return 1
+    fi
+    grep -F -- "$expected_reason" "$rejection_output" >/dev/null 2>&1
+}
+
+s9_export_validation_selftest() {
+    tmpdir=$(mktemp -d 2>/dev/null || echo "/tmp/dcentos-s9-export-selftest.$$")
+    rm -rf "$tmpdir"
+    mkdir -p "$tmpdir"
+
+    valid_case="$tmpdir/valid"
+    make_test_s9_package "$valid_case/sysupgrade-am1-s9" am1-s9 fit 16 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    (cd "$valid_case" && tar cf s9.tar sysupgrade-am1-s9)
+    if ! DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 sh scripts/pre_flash_validate.sh \
+        --package-only "$valid_case/s9.tar" am1-s9 >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    wrong_prefix_case="$tmpdir/wrong-prefix"
+    make_test_s9_package "$wrong_prefix_case/sysupgrade-am2-s19j" am2-s19j fit 16 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    (cd "$wrong_prefix_case" && tar cf wrong-prefix.tar sysupgrade-am2-s19j)
+    s9_expect_package_rejection \
+        "$wrong_prefix_case/wrong-prefix.tar" \
+        "wrong package for this validation" \
+        "$wrong_prefix_case/rejection.out" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    wrong_board_case="$tmpdir/wrong-board"
+    make_test_s9_package "$wrong_board_case/sysupgrade-am1-s9" am2-s19j fit 16 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    (cd "$wrong_board_case" && tar cf wrong-board.tar sysupgrade-am1-s9)
+    s9_expect_package_rejection \
+        "$wrong_board_case/wrong-board.tar" \
+        "MANIFEST.json board does not match am1-s9" \
+        "$wrong_board_case/rejection.out" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    bare_kernel_case="$tmpdir/bare-kernel"
+    make_test_s9_package "$bare_kernel_case/sysupgrade-am1-s9" am1-s9 bare-zimage 16 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    (cd "$bare_kernel_case" && tar cf bare-kernel.tar sysupgrade-am1-s9)
+    s9_expect_package_rejection \
+        "$bare_kernel_case/bare-kernel.tar" \
+        "a bare zImage will brick the unit" \
+        "$bare_kernel_case/rejection.out" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    bad_binding_case="$tmpdir/bad-binding"
+    make_test_s9_package "$bad_binding_case/sysupgrade-am1-s9" am1-s9 fit 16 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    bound_kernel_sha=$(sha256sum "$bad_binding_case/sysupgrade-am1-s9/kernel" | awk '{ print $1 }')
+    zero_sha=0000000000000000000000000000000000000000000000000000000000000000
+    sed "s/$bound_kernel_sha/$zero_sha/" \
+        "$bad_binding_case/sysupgrade-am1-s9/MANIFEST.json" \
+        > "$bad_binding_case/sysupgrade-am1-s9/MANIFEST.json.tmp"
+    mv "$bad_binding_case/sysupgrade-am1-s9/MANIFEST.json.tmp" \
+        "$bad_binding_case/sysupgrade-am1-s9/MANIFEST.json"
+    (cd "$bad_binding_case" && tar cf bad-binding.tar sysupgrade-am1-s9)
+    s9_expect_package_rejection \
+        "$bad_binding_case/bad-binding.tar" \
+        "MANIFEST.json kernel payload object does not match the exact file" \
+        "$bad_binding_case/rejection.out" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    oversized_kernel_case="$tmpdir/oversized-kernel"
+    make_test_s9_package \
+        "$oversized_kernel_case/sysupgrade-am1-s9" am1-s9 fit 4063233 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    (cd "$oversized_kernel_case" && tar cf oversized-kernel.tar sysupgrade-am1-s9)
+    s9_expect_package_rejection \
+        "$oversized_kernel_case/oversized-kernel.tar" \
+        "am1-s9 kernel payload exceeds zynq kernel window (4063233B > 4063232B)" \
+        "$oversized_kernel_case/rejection.out" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    rm -rf "$tmpdir"
+    return 0
+}
+
 signing_policy_selftest() {
     tmpdir=$(mktemp -d 2>/dev/null || echo "/tmp/dcentos-signing-selftest.$$")
     rm -rf "$tmpdir"
@@ -474,6 +643,58 @@ toolbox_install_contract_selftest() {
     return 0
 }
 
+# 2026-08-15: update_command metadata may advertise the fleet OTA rail
+# (`dcent ota update-fleet`, toolbox S21 rootfs-window acceptance) as the
+# update form of the SAME guarded route. The install contract stays strict
+# (install_command must remain `dcent install ...`); the update contract
+# accepts either form with identical safety-gate requirements.
+toolbox_update_contract_selftest() {
+    helper='scripts/lib/sysupgrade_package_common.sh'
+
+    # Accepted: fleet OTA form with the restore-verified artifact gate.
+    if ! BOARD_NAME=am3-s21 sh -c \
+        '. "$1"; dcent_require_toolbox_update_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>' \
+        host_driven_rootfs_window_lab >/dev/null 2>&1; then
+        return 1
+    fi
+    # Accepted: legacy single-unit install form as update (back-compat).
+    if ! BOARD_NAME=am3-s21 sh -c \
+        '. "$1"; dcent_require_toolbox_update_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>' \
+        host_driven_rootfs_window_lab >/dev/null 2>&1; then
+        return 1
+    fi
+
+    for bad_command in \
+        'dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21.tar' \
+        'dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir> --yes' \
+        'dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir> --accept-vnish-aml-rootfs-window' \
+        'dcent flash <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>'
+    do
+        if BOARD_NAME=am3-s21 sh -c \
+            '. "$1"; dcent_require_toolbox_update_contract "$2" "$3"' \
+            sh "$helper" "$bad_command" \
+            host_driven_rootfs_window_lab >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+
+    # The strict INSTALL contract must still refuse the OTA-only form:
+    # install_command metadata remains single-unit `dcent install`.
+    if BOARD_NAME=am3-s21 sh -c \
+        '. "$1"; dcent_require_toolbox_install_contract "$2" "$3"' \
+        sh "$helper" \
+        'dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>' \
+        host_driven_rootfs_window_lab >/dev/null 2>&1; then
+        return 1
+    fi
+
+    return 0
+}
+
 # CE-374: exercise AM2's strict plan validator here. AM1's stricter Python
 # evidence suite is wired into the Python safety gate and Zynq integration gate.
 nand_backup_identity_selftest() {
@@ -527,6 +748,10 @@ MANIFEST_JSON='scripts/lib/sysupgrade_manifest_json.py'
 AM2_POST_IMAGE='br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh'
 AM3_S19K_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh'
 AM3_S21_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21/post-image.sh'
+AM3_S21PRO_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21pro/post-image.sh'
+AM3_S21XP_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21xp/post-image.sh'
+AM3_T21_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-t21/post-image.sh'
+AM3_S19JPRO_AML_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s19jpro-aml/post-image.sh'
 AMLOGIC_S99UPGRADE='br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade'
 AM3_GEOMETRY='scripts/lib/am3_geometry.sh'
 SYSUPGRADE_COMMON='scripts/lib/sysupgrade_package_common.sh'
@@ -582,6 +807,10 @@ require_pattern "$ARCHIVE_ADMISSION" 'fpga_bitstream.bit' 'archive admission pre
 require_pattern "$ARCHIVE_ADMISSION" "grep -F '\\'" 'archive admission rejects all JSON escape aliases before byte-oriented authority readers'
 require_pattern "$MANIFEST_JSON" 'object_pairs_hook=_unique_object' 'semantic manifest admission rejects decoded duplicate keys at every object depth'
 require_pattern "$MANIFEST_JSON" 'compare-version' 'semantic manifest authority exposes the deterministic version comparator'
+require_pattern "$MANIFEST_JSON" 'require_payload_binding' 'semantic manifest authority binds path, size, and digest inside one exact payload object'
+require_pattern "$PRE_FLASH" 'verify-payload "$MANIFEST" kernel' 'package-only validator uses typed kernel payload-object binding'
+require_pattern "$PRE_FLASH" 'verify-payload "$MANIFEST" rootfs' 'package-only validator uses typed rootfs payload-object binding'
+reject_pattern "$PRE_FLASH" 'manifest_payload_block()' 'package-only validator removes substring-based JSON object splitting'
 
 require_pattern "$PACKAGE" 'infer_package_version' 'packager infers package version'
 require_pattern "$PACKAGE" 'Package version is required for fail-closed release manifests' 'packager fails closed if version cannot be set'
@@ -600,11 +829,19 @@ require_pattern "$PRE_FLASH" 'assert_payload_fits_window "$board kernel" "$kerne
 require_pattern "$PRE_FLASH" 'assert_payload_fits_window "$board root" "$root_size" "$ZYNQ_ROOTFS_MAX_BYTES" "zynq rootfs window"' 'package-only validator rejects oversized Zynq rootfs payloads'
 require_pattern "$PRE_FLASH" 'am1-s9|am2-s19j|am2-s19jpro|am2-s19pro|am2-s17p)' 'package-only validator covers all admitted Zynq board identities'
 require_pattern "$PRE_FLASH" 'validate_package_only "$TARBALL" "am1-s9"' 'am1-s9 live pre-flash validates the package before declaring backup-floor success (CE-352)'
-require_pattern "$BUILD_DOCKER" 'am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro|am2-s17pro)' 'build_in_docker package-validates every Amlogic and AM2 tarball lane when present'
+require_pattern "$BUILD_DOCKER" 'BOARD_PKG_NAME="am1-s9"' 'S9 build target retains exact am1-s9 package identity'
+require_exact_line "$BUILD_DOCKER" '            s9|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro)' 'build_in_docker package-validates exactly S9 and the install-authorized Amlogic/AM2 tarballs in this branch'
+require_exact_line "$BUILD_DOCKER" '            am3-bb|am3-bb-s19jpro)' 'build_in_docker keeps BB targets on their distinct SD-card validation branch'
+require_pattern "$BUILD_DOCKER" 'SD-card payload validation:' 'BB export validation remains SD-card-specific, not sysupgrade package validation'
+require_pattern "$BUILD_DOCKER" 'Package-only non-installable validation:' 'build_in_docker gives am2-s17pro a distinct non-installable validation lane'
+require_pattern "$BUILD_DOCKER" 'trap "rm -rf -- \"$PACKAGE_ONLY_TMP\"" EXIT HUP INT TERM' 'am2-s17pro package validator cleanup stays inside the container-script quoting boundary'
+require_pattern "$BUILD_DOCKER" 'S17 package-only manifest must declare installable=false' 'am2-s17pro wrapper preserves package-only denial'
+require_pattern "$BUILD_DOCKER" 'extract_am2_s17_kernel.py verify-fit' 'am2-s17pro wrapper re-admits the exact model-bound FIT after export'
 require_pattern "$SYSUPGRADE_COMMON" 'dcent_require_toolbox_install_contract "$install_command" "$install_mode"' 'manifest writer validates its operator install command'
 require_pattern "$SYSUPGRADE_COMMON" 'must preserve interactive confirmation' 'package metadata never pre-acknowledges --yes'
 require_pattern "$SYSUPGRADE_COMMON" 'must not pre-acknowledge the VNish-source safety gate' 'generic Amlogic package metadata does not pre-acknowledge a source-specific route'
 require_pattern "$BUILD_DOCKER" '--artifact-dir <restore_verified_dir> --plan' 'Amlogic build handoff supplies the restore-verified artifact directory'
+require_pattern "$BUILD_AMLOGIC_NATIVE" 'ln "$STAGED_ROOT" "$BIN_PATH"' 'Amlogic native extractor publishes without replacing an existing alias'
 require_pattern "$S9_SYSUPGRADE" 'payload_fits_ubi_volume' 'S9 sysupgrade validates payload byte fit before UBI writes'
 require_pattern "$AM2_SYSUPGRADE" 'payload_fits_ubi_volume' 'am2-s19j sysupgrade validates payload byte fit before UBI writes'
 require_pattern "$AM2_S19PRO_SYSUPGRADE" 'payload_fits_ubi_volume' 'am2-s19pro sysupgrade validates payload byte fit before UBI writes'
@@ -762,7 +999,16 @@ require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3
 require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s21 metadata disables target-side sysupgrade'
 require_pattern "$AM3_S19K_POST_IMAGE" 'host_driven_rootfs_window_lab' 'am3-s19k metadata marks host-driven lab install'
 require_pattern "$AM3_S21_POST_IMAGE" 'host_driven_rootfs_window_lab' 'am3-s21 metadata marks host-driven lab install'
-require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05700000}"' 'am3 geometry centralizes rootfs offset'
+# 2026-08-15: every manifest-bearing Amlogic package advertises the fleet OTA
+# update command for the same guarded rootfs-window rail (the packaging-side
+# update contract selftest above enforces the safety shape of this string).
+require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"' 'am3-s21 metadata advertises the fleet OTA update command'
+require_pattern "$AM3_S21PRO_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>"' 'am3-s21pro metadata advertises the fleet OTA update command'
+require_pattern "$AM3_S21XP_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>"' 'am3-s21xp metadata advertises the fleet OTA update command'
+require_pattern "$AM3_T21_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"' 'am3-t21 metadata advertises the fleet OTA update command'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>"' 'am3-s19kpro metadata advertises the fleet OTA update command'
+require_pattern "$AM3_S19JPRO_AML_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19jpro-aml.tar --artifact-dir <restore_verified_dir>"' 'am3-s19jpro-aml metadata advertises the fleet OTA update command'
+require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05100000}"' 'am3 geometry centralizes rootfs offset'
 require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_WINDOW_HEX="${DCENT_AM3_ROOTFS_WINDOW_HEX:-0x02800000}"' 'am3 geometry centralizes rootfs window'
 require_pattern "$AM3_S21_REVERT" 'ROOTFS_OFFSET="$DCENT_AM3_ROOTFS_OFFSET_HEX"' 'am3-s21 revert uses shared rootfs offset'
 require_pattern "$RESTORE_ROUTE" '.arg(&post_dwell_fp.sha256)' 'restore route passes post-dwell SHA into revert helper'
@@ -992,6 +1238,16 @@ require_pattern "$AMLOGIC_S99UPGRADE" 'AMLOGIC_RAW_NAND_RECOVERY_FLAG_EXCEPTION'
 require_pattern "$AMLOGIC_S99UPGRADE" 'NEW=$(read_recovery_flag)' 'amlogic S99upgrade reads back the recovery flag after nandwrite'
 require_pattern "$AMLOGIC_S99UPGRADE" '[ "$NEW" != "0x03" ]' 'amlogic S99upgrade fails when recovery-flag readback is not 0x03'
 require_pattern "$AMLOGIC_S99UPGRADE" 'recovery flag readback = $NEW (expected 0x03)' 'amlogic S99upgrade reports the exact recovery-flag readback mismatch'
+require_pattern "$AMLOGIC_S99UPGRADE" 'require_amlogic_ota08_identity' 'amlogic S99upgrade scopes OTA-08 to sealed board_target'
+require_pattern "$AMLOGIC_S99UPGRADE" 'missing live $BOARD_TARGET_FILE' 'amlogic S99upgrade refuses missing live board_target'
+require_pattern "$AMLOGIC_S99UPGRADE" 'OLD=$(read_recovery_flag)' 'amlogic S99upgrade pre-reads 0x02 before flash_erase'
+require_pattern "$AMLOGIC_S99UPGRADE" 'ERROR: recovery flag readback' 'amlogic S99upgrade post-write mismatch is ERROR not WARN'
+require_pattern "$AMLOGIC_S99UPGRADE" 'ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace' 'amlogic S99upgrade leftover 0x01 is ERROR not WARN'
+reject_pattern "$AMLOGIC_S99UPGRADE" '[WARN] recovery flag = 0x01' 'amlogic S99upgrade leftover 0x01 is not WARN'
+require_pattern "$AMLOGIC_S99UPGRADE" 'ERROR: could not read recovery flag' 'amlogic S99upgrade unread flag is ERROR not WARN'
+require_pattern "$AMLOGIC_S99UPGRADE" 'ERROR: unexpected recovery flag value' 'amlogic S99upgrade unexpected flag is ERROR not WARN'
+reject_pattern "$AMLOGIC_S99UPGRADE" '[WARN] could not read recovery flag' 'amlogic S99upgrade unread flag is not WARN'
+reject_pattern "$AMLOGIC_S99UPGRADE" '[WARN] unexpected recovery flag value:' 'amlogic S99upgrade unexpected flag is not WARN'
 require_pattern "$AMLOGIC_S99UPGRADE" 'fw_setenv firstboot 0' 'amlogic S99upgrade keeps firstboot env clearing on fw_setenv, not raw NAND'
 # --- end amlogic S99upgrade raw-NAND exception -------------------------------
 
@@ -1232,6 +1488,11 @@ if zynq_payload_window_selftest; then
 else
     fail "zynq package-only selftest failed"
 fi
+if s9_export_validation_selftest; then
+    pass "S9 export validation accepts a bound package and rejects wrong prefix/board, bare zImage, bad binding, and oversized kernel"
+else
+    fail "S9 export validation behavioral selftest failed"
+fi
 if zynq_target_payload_authority_selftest; then
     pass "Zynq target payload authority validates canonical bindings and rejects malformed paths, sizes, hashes, and extracted leaves"
 else
@@ -1251,6 +1512,11 @@ if toolbox_install_contract_selftest; then
     pass "toolbox install metadata accepts complete contracts and rejects missing or pre-acknowledged gates"
 else
     fail "toolbox install metadata contract selftest failed"
+fi
+if toolbox_update_contract_selftest; then
+    pass "toolbox update metadata accepts the fleet OTA form with identical gates; install metadata stays single-unit"
+else
+    fail "toolbox update metadata contract selftest failed"
 fi
 
 for phrase in \

@@ -283,6 +283,28 @@ pub struct ModelSpec {
     pub family_key: &'static str,
     pub chip_label: &'static str,
     pub chip_id: Option<u16>,
+    /// Chips on ONE hash board.
+    ///
+    /// **Provenance (2026-08-06 audit).** The BM1385/BM1387-era values are not
+    /// guesses — every one matches Bitmain's own factory jig configs in
+    /// *`, which declare
+    /// `AsicType` + `AsicNum` per model:
+    ///
+    /// | config | `AsicType` | `AsicNum` | row here |
+    /// |---|---|---|---|
+    /// | `Config.ini-S9`    | 1387 | 63 | `s9`  = 63 |
+    /// | `Config.ini-S9+`   | 1387 | 84 | `s9+` = 84 |
+    /// | `Config.ini-T9`    | 1387 | 57 | `t9`  = 57 |
+    /// | `Config.ini-T9+`   | 1387 | **18** | `t9+` = 18 |
+    /// | `Config.ini-S7-45` / `-S7-54` | 1385 | 45 / 54 | (no row yet) |
+    /// | `Config.ini-V11-S` | 1390 | 60 | (no row yet) |
+    ///
+    /// Two consequences worth keeping written down:
+    /// - `t9+` = 18 is **correct**. `research/models/:26`
+    ///   claims "3 | 63" for T9+, but 63 is exactly S9's `AsicNum` — an
+    ///   S9 copy-across, not a measurement.
+    /// - These counts are **per hash board**. They are NOT a board count, so
+    ///   they never on their own establish a chain topology.
     pub chips_per_chain_hint: Option<u8>,
     pub pic_type_hint: Option<ModelPicTypeHint>,
     pub pic_addrs_hint: Option<&'static [u8]>,
@@ -314,6 +336,10 @@ pub fn td003_management_only_model(model: &str) -> Option<&'static str> {
         "t17e" | "antminert17e" => Some("Antminer T17e"),
         "t19" | "antminert19" => Some("Antminer T19"),
         "s19xp" | "antminers19xp" => Some("Antminer S19 XP"),
+        "s19jxp" | "antminers19jxp" => Some("Antminer S19j XP"),
+        "s19jpro+" | "s19jproplus" | "antminers19jpro+" | "antminers19jproplus" => {
+            Some("Antminer S19j Pro+")
+        }
         _ => None,
     }
 }
@@ -336,6 +362,8 @@ pub fn td003_management_only_board_target(board_target: &str) -> Option<&'static
         "am2s19xp" | "am3s19xp" | "amlogicxps19" | "cv1835s19xp" | "cv183xs19xp" => {
             Some("Antminer S19 XP")
         }
+        "am3s19jxp" | "amlogics19jxp" | "cv1835s19jxp" | "cv183xs19jxp" => Some("Antminer S19j XP"),
+        "am3s19jproplus" | "amlogics19jproplus" => Some("Antminer S19j Pro+"),
         _ => None,
     }
 }
@@ -344,6 +372,36 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
     let normalized = normalize_model_token(model);
 
     let spec = match normalized.as_str() {
+        // Antminer S7 (BM1385). Registered for IDENTITY ONLY.
+        //
+        // Evidence: Bitmain's own AMTC jig configs
+        //  and
+        // `-S7-54` (`Name=S7 HASH board`, `AsicType=1385`, `CoreNum=50`), which
+        // corroborate `dcentrald-silicon-profiles::bm1385`'s independently
+        // jig-decompiled `BM1385_CORES_PER_CHIP = 50`.
+        //
+        // `chips_per_chain_hint: None` is deliberate and NOT laziness: the jig
+        // ships **two** S7 board variants — `AsicNum=45` and `AsicNum=54` — and
+        // nothing in the held corpus says which one a given S7 carries.
+        // Declaring either would be a coin flip on enumeration geometry, the
+        // same error that put a false "63" on T9+ in MASTER_MODEL_CATALOG.
+        //
+        // There is deliberately NO `SUPPORT_MATRIX.md` row and no
+        // `board_target`: we hold no S7 firmware and no S7 control-board
+        // evidence, and `AsicProtocolIdentity` has no `Bm1385` variant, so a
+        // board row could not be spelled honestly. See the matching
+        // `model-rs-key-without-matrix-row:s7` entry in
+        // `scripts/check_support_matrix_drift.py`.
+        "s7" => ModelSpec {
+            model_key: "s7",
+            family_key: "bm1385",
+            chip_label: "BM1385",
+            chip_id: Some(0x1385),
+            chips_per_chain_hint: None,
+            pic_type_hint: None,
+            pic_addrs_hint: None,
+            support_tier: SupportTier::Experimental,
+        },
         "s9" => ModelSpec {
             model_key: "s9",
             family_key: "bm1387",
@@ -353,6 +411,50 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
             pic_type_hint: None,
             pic_addrs_hint: None,
             support_tier: SupportTier::Validated,
+        },
+        // Antminer S9++ (BM1387, 54 chips/board). Identity-only.
+        //
+        // Evidence: the unstripped AMTC `single-board-test` binary exports
+        // `set_Voltage_S9_plus_plus_BM1387_54` — chip family and chip count are
+        // both encoded in the symbol, so unlike S7 (which the jig ships at BOTH
+        // 45 and 54) this count is unambiguous and IS declared.
+        //:217,470-471`.
+        //
+        // No `SUPPORT_MATRIX.md` row / `board_target` for the same reason as S7:
+        // no S9++ firmware or control-board evidence is held. Paired with
+        // `model-rs-key-without-matrix-row:s9++` in the drift gate.
+        "s9++" | "s9plusplus" => ModelSpec {
+            model_key: "s9++",
+            family_key: "bm1387",
+            chip_label: "BM1387",
+            chip_id: Some(0x1387),
+            chips_per_chain_hint: Some(54),
+            pic_type_hint: None,
+            pic_addrs_hint: None,
+            support_tier: SupportTier::Experimental,
+        },
+        // Antminer S9k (BM1393, ~13.5 TH/s SHA-256, 7nm). Identity-only.
+        //
+        // Evidence: the held S9k jig `bitmain-antminer-binaries/S9k/cgminer` —
+        // chip family from its `open_core_bm1393` / `enable_core_clock_BM1393`
+        // paths (`chip_id` 0x1393), and **60 chips/chain** triple-byte-stated by
+        // its own `soc_config.asic_num = 60` (`bitmain_soc_prepare`) plus two
+        // `== 60` validators (`check_asic_num`, `check_asic_num_without_power_off`).
+        // 2026-08-06, hardware-enablement Round 25.
+        //
+        // No `SUPPORT_MATRIX.md` row / `board_target`: `AsicProtocolIdentity` has
+        // no `Bm1393` variant, and S9k is a dual-arch board (Zynq control + a
+        // BM1880 vision SoC) whose control-board bring-up is unheld. Paired with
+        // `model-rs-key-without-matrix-row:s9k` in the drift gate.
+        "s9k" => ModelSpec {
+            model_key: "s9k",
+            family_key: "bm1393",
+            chip_label: "BM1393",
+            chip_id: Some(0x1393),
+            chips_per_chain_hint: Some(60),
+            pic_type_hint: None,
+            pic_addrs_hint: None,
+            support_tier: SupportTier::Experimental,
         },
         "s9+" | "s9plus" => ModelSpec {
             model_key: "s9+",
@@ -510,7 +612,7 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
             pic_addrs_hint: None,
             support_tier: SupportTier::Experimental,
         },
-        "s19jpro" | "s19jpro+" | "s19jproplus" => ModelSpec {
+        "s19jpro" => ModelSpec {
             model_key: "s19jpro",
             family_key: "bm1362",
             chip_label: "BM1362",
@@ -542,6 +644,26 @@ pub fn lookup_model(model: &str) -> Option<ModelSpec> {
             chips_per_chain_hint: Some(110),
             // Live-confirmed BHB56xxx hashboards are NoPic (BraiinsOS+
             // model-list shows only the NoPic-class entry for this model).
+            pic_type_hint: Some(ModelPicTypeHint::NoPic),
+            pic_addrs_hint: Some(&[]),
+            support_tier: SupportTier::Experimental,
+        },
+        "s19jxp" => ModelSpec {
+            model_key: "s19jxp",
+            family_key: "bm1366",
+            chip_label: "BM1366",
+            chip_id: Some(0x1366),
+            chips_per_chain_hint: Some(110),
+            pic_type_hint: Some(ModelPicTypeHint::NoPic),
+            pic_addrs_hint: Some(&[]),
+            support_tier: SupportTier::Experimental,
+        },
+        "s19jpro+" | "s19jproplus" => ModelSpec {
+            model_key: "s19jproplus",
+            family_key: "bm1362",
+            chip_label: "BM1362",
+            chip_id: Some(0x1362),
+            chips_per_chain_hint: Some(120),
             pic_type_hint: Some(ModelPicTypeHint::NoPic),
             pic_addrs_hint: Some(&[]),
             support_tier: SupportTier::Experimental,
@@ -682,7 +804,8 @@ pub fn board_target_chip_label(board_target: &str) -> Option<&'static str> {
         // am3-aml — Amlogic A113D. Disambiguated by the model suffix.
         "am3s21" | "am3t21" => "BM1368",
         "am3s21pro" | "am3s21xp" => "BM1370",
-        "am3s19k" | "am3s19kpro" | "am3s19xp" => "BM1366",
+        "am3s19k" | "am3s19kpro" | "am3s19xp" | "am3s19jxp" => "BM1366",
+        "am3s19jproplus" => "BM1362",
         "am3s19jproaml" => "BM1362",
         // am3-bb — BeagleBone S19j Pro (BM1362).
         "am3bbs19jpro" => "BM1362",
@@ -801,6 +924,8 @@ mod tests {
         assert_eq!(board_target_chip_label("am3-s21xp"), Some("BM1370"));
         assert_eq!(board_target_chip_label("am3-s19k"), Some("BM1366"));
         assert_eq!(board_target_chip_label("am3-s19xp"), Some("BM1366"));
+        assert_eq!(board_target_chip_label("am3-s19jxp"), Some("BM1366"));
+        assert_eq!(board_target_chip_label("am3-s19jproplus"), Some("BM1362"));
         assert_eq!(board_target_chip_label("am3-s19jpro-aml"), Some("BM1362"));
         assert_eq!(board_target_chip_label("am3-bb-s19jpro"), Some("BM1362"));
         assert_eq!(board_target_chip_label("cv1835-s19jpro"), Some("BM1362"));
@@ -858,11 +983,91 @@ mod tests {
         );
     }
 
+    /// S7 is identity-only, from Bitmain's AMTC jig configs.
+    ///
+    /// The `None` chip-count is the load-bearing assertion, not an oversight:
+    /// `Config.ini-S7-45` and `Config.ini-S7-54` describe two different S7
+    /// boards (`AsicNum` 45 vs 54) and nothing in the held corpus says which a
+    /// given unit carries. Pinning either would fabricate enumeration geometry.
+    /// Mutation-check: setting `chips_per_chain_hint: Some(45)` fails here.
     #[test]
-    fn model_spec_chip_ids_match_skus_conf_for_all_20_target_skus() {
+    fn s7_is_identity_only_and_never_declares_a_chip_count() {
+        assert_eq!(model_key("S7"), Some("s7"));
+        assert_eq!(model_chip_id("S7"), Some(0x1385));
+        assert_eq!(model_family_key("s7"), Some("bm1385"));
+        assert_eq!(
+            model_chip_count_hint("s7"),
+            None,
+            "jig ships S7 at BOTH 45 and 54 chips; declaring one fabricates geometry"
+        );
+
+        // The chip label is the whole point of the row: an S7 stops resolving
+        // to nothing and reports its jig-evidenced silicon instead.
+        assert_eq!(model_chip_label("S7"), Some("BM1385"));
+
+        // Identity must not leak into geometry or controller assumptions.
+        assert_eq!(model_pic_type_hint("s7"), None);
+        assert_eq!(model_pic_addrs_hint("s7"), None);
+    }
+
+    /// S9++ is identity-only too, but — unlike S7 — its chip count IS declared.
+    ///
+    /// The contrast is the point: the AMTC symbol
+    /// `set_Voltage_S9_plus_plus_BM1387_54` encodes exactly one count, whereas
+    /// the S7 configs ship two. Evidence quality, not convenience, decides
+    /// whether a geometry field may be filled in.
+    #[test]
+    fn s9pp_declares_its_jig_symbol_chip_count_unlike_s7() {
+        assert_eq!(model_key("S9++"), Some("s9++"));
+        assert_eq!(model_key("s9plusplus"), Some("s9++"));
+        assert_eq!(model_chip_id("S9++"), Some(0x1387));
+        assert_eq!(model_chip_label("S9++"), Some("BM1387"));
+        assert_eq!(
+            model_chip_count_hint("s9++"),
+            Some(54),
+            "set_Voltage_S9_plus_plus_BM1387_54 names exactly one count"
+        );
+
+        // S9++ must not be confused with S9+ (84) or S9 (63).
+        assert_ne!(model_chip_count_hint("s9++"), model_chip_count_hint("s9+"));
+        assert_ne!(model_chip_count_hint("s9++"), model_chip_count_hint("s9"));
+
+        // The evidence-quality contrast with S7 is itself load-bearing.
+        assert!(
+            model_chip_count_hint("s7").is_none() && model_chip_count_hint("s9++").is_some(),
+            "one jig source names a single count, the other names two"
+        );
+    }
+
+    /// S9k is the first BM1393 model — identity-only, from the held S9k jig.
+    /// Its 60-chip count is triple-byte-stated in that jig, so it IS declared;
+    /// its chip is the first `bm1393` family entry among the model rows.
+    #[test]
+    fn s9k_is_registered_as_bm1393_with_the_jig_stated_60_chips() {
+        assert_eq!(model_key("S9k"), Some("s9k"));
+        assert_eq!(model_chip_id("s9k"), Some(0x1393));
+        assert_eq!(model_chip_label("S9k"), Some("BM1393"));
+        assert_eq!(model_family_key("s9k"), Some("bm1393"));
+        assert_eq!(
+            model_chip_count_hint("s9k"),
+            Some(60),
+            "soc_config.asic_num=60 + two ==60 validators in the S9k jig"
+        );
+
+        // S9k is NOT any of the BM1387 S9-family SKUs — distinct silicon.
+        assert_ne!(model_chip_id("s9k"), model_chip_id("s9"));
+        assert_ne!(model_chip_label("s9k"), model_chip_label("s9"));
+
+        // Identity must not leak into a controller or install claim.
+        assert_eq!(model_pic_type_hint("s9k"), None);
+        assert_eq!(model_pic_addrs_hint("s9k"), None);
+    }
+
+    #[test]
+    fn model_spec_chip_ids_match_skus_conf_for_all_21_target_skus() {
         // Cross-source pin: the daemon's ModelSpec chip_id (which drives
         // registry.detect() -> driver dispatch) MUST match skus.conf (the
-        // acceptance-harness 20-SKU source of truth) for every confirmed target, or a
+        // acceptance-harness 21-SKU source of truth) for every confirmed target, or a
         // board would dispatch to the wrong driver at first-light. S15 is the ONE
         // intentional exception: chip_id stays None (SupportTier::Planned
         // scaffold-gate — dispatch gated until confirmed) while its label is BM1391.
@@ -885,6 +1090,8 @@ mod tests {
         assert_eq!(id("s19kpro"), Some(0x1366)); // am3-s19k
         assert_eq!(id("t19"), Some(0x1398)); // am2-t19
         assert_eq!(id("s19xp"), Some(0x1366)); // am3-s19xp
+        assert_eq!(id("s19jxp"), Some(0x1366)); // am3-s19jxp
+        assert_eq!(id("s19jproplus"), Some(0x1362)); // am3-s19jproplus
         assert_eq!(id("s21"), Some(0x1368)); // am3-s21
         assert_eq!(id("t21"), Some(0x1368)); // am3-t21
         assert_eq!(id("s21pro"), Some(0x1370)); // am3-s21pro
@@ -1003,6 +1210,22 @@ mod tests {
     }
 
     #[test]
+    fn s19jpro_plus_resolves_to_its_distinct_nopic_profile() {
+        let base = lookup_model("s19jpro").expect("s19jpro spec");
+        assert_eq!(base.model_key, "s19jpro");
+        assert_eq!(base.chips_per_chain_hint, Some(126));
+        assert_eq!(base.pic_type_hint, None);
+
+        for alias in ["s19jpro+", "s19jproplus"] {
+            let plus = lookup_model(alias).expect("s19jpro+ spec");
+            assert_eq!(plus.model_key, "s19jproplus");
+            assert_eq!(plus.chips_per_chain_hint, Some(120));
+            assert_eq!(plus.pic_type_hint, Some(ModelPicTypeHint::NoPic));
+            assert_eq!(plus.pic_addrs_hint, Some(&[][..]));
+        }
+    }
+
+    #[test]
     fn td003_management_only_gate_is_exact_to_expanded_matrix() {
         for model in [
             "s15",
@@ -1026,6 +1249,10 @@ mod tests {
             "Antminer T19",
             "s19xp",
             "Antminer S19 XP",
+            "s19jxp",
+            "Antminer S19j XP",
+            "s19jproplus",
+            "Antminer S19j Pro+",
         ] {
             assert!(
                 td003_management_only_model(model).is_some(),
@@ -1063,6 +1290,8 @@ mod tests {
             ("am3-t19", "Antminer T19"),
             ("am2-s19xp", "Antminer S19 XP"),
             ("am3-s19xp", "Antminer S19 XP"),
+            ("am3-s19jxp", "Antminer S19j XP"),
+            ("am3-s19jproplus", "Antminer S19j Pro+"),
             ("cv1835-s19xp", "Antminer S19 XP"),
         ] {
             assert_eq!(

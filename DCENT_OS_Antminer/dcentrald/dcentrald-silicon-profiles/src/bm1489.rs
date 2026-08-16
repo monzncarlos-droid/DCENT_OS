@@ -1,6 +1,37 @@
 ﻿//! BM1489 silicon characterization table (Antminer L7 â€” Litecoin
 //! scrypt mining, large-scale).
 //!
+//! # ⚠ CORRECTION (Round 15, 2026-08-07) — this table is **L7-only**
+//!
+//! Earlier revisions of this file, of `dcentrald-asic/src/drivers/bm1489.rs`,
+//! and of `registry.rs:516`'s "Scrypt L3+/L7/L9 chain-rail" comment described
+//! BM1489 as the ASIC of **both** the L7 and the L9. The L9 half is wrong.
+//!
+//! The authentic Bitmain L9 stock image `FR-1.19(260302-L9).bmu`
+//! (sha256 `2af05a3465ae8f3bdb32a74058f8beb0c4f9246da409441e09d922f05c3aa827`)
+//! unpacks to a plaintext CVitek rootfs whose `etc/topol.conf` states
+//! `"asic_id": "BM1491"` / `"chip_type": "0x1491"`, and whose
+//! `etc/cgminer.conf.factory` selects `"algo": "ltc_1491"`. Its miner binary
+//! carries a dedicated `backend/backend_ltc_1491/` source tree. The L9 is
+//! **BM1491**, 3 chains × 110 chips, not BM1489.
+//!
+//! Nothing below is edited on that basis, because none of it was ever L9
+//! evidence: every row here derives from L7 repair-doc / vendor-listing
+//! figures. The full transcription of the authentic bytes lives in
+//! [`crate::scrypt_stock_topology`] (see `L9_BSL41601`), and the write-up is
+//! .
+//!
+//! # ⚠ The L7 attribution itself is NOT stock-proven
+//!
+//! The stock L7 image `Antminer-L7-release-202301300939.bmu` was also opened
+//! this round. Its boot chain is plaintext (Zynq-7000), but `minerfs.image.gz`,
+//! `update.image.gz` and `miner.btm.tar.gz` are **encrypted** (Shannon
+//! entropy 7.98 / 7.98 / 7.88, no container magic, no held key). So no
+//! Bitmain artifact we hold names the L7's ASIC. "L7 = BM1489" rests solely
+//! on third-party VNish binaries (`drivers/bm1489.rs:40`). Treat the
+//! identity as third-party-sourced, and the numbers below as
+//! `Reconstructed`/`OperatorConfirmed` exactly as their `source` fields say.
+//!
 //! 5 discrete steps from `-2` (eco-low) to `+2` (overclock). Source
 //! provenance:
 //! - **`SCRYPT_ASIC_CHIPS.md` Â§2 lines 69-93** (live-confirmed from
@@ -73,7 +104,10 @@ pub const BM1489_TABLE: SiliconTable = SiliconTable {
     profiles: &BM1489_PROFILES,
     default_step: 0,
     sweet_spot_step: -2,
-    // L7/L9 silicon profile only — no live first-hash on dcentrald.
+    // L7 silicon profile only — no live first-hash on dcentrald.
+    // NOT L9: the L9 is BM1491 per its own stock topol.conf (Round 15
+    // correction, see this module's header and
+    // `crate::scrypt_stock_topology::L9_BSL41601`).
     // Register set partially lifted from VNish hwscan strings
     // ( §9), full register addresses
     // still `[GAP]`. Driver is scaffold-only.
@@ -157,6 +191,45 @@ mod tests {
                 window[1].step
             );
         }
+    }
+
+    /// Round 15 (2026-08-07) NEGATIVE pin: BM1489 must never re-absorb the L9.
+    ///
+    /// The authentic L9 stock image states `asic_id = BM1491` /
+    /// `chip_type = 0x1491`. If a future wave re-widens this table to "L7/L9",
+    /// the geometry below would silently mis-describe a 3 × 110 BM1491
+    /// machine as a 4 × 120 BM1489 one.
+    #[test]
+    fn l9_is_bm1491_and_this_table_does_not_describe_it() {
+        use crate::scrypt_stock_topology::L9_BSL41601;
+
+        // The L9 is a different chip entirely.
+        assert_eq!(L9_BSL41601.asic_id, Some("BM1491"));
+        assert_eq!(L9_BSL41601.chip_type, Some(0x1491));
+
+        // ...with geometry that contradicts every BM1489 constant here.
+        assert_ne!(L9_BSL41601.chain_count, Some(BM1489_CHAIN_COUNT_L7));
+        assert_ne!(L9_BSL41601.chips_per_chain, Some(BM1489_CHIPS_PER_CHAIN_L7));
+        assert_eq!(L9_BSL41601.total_chips(), Some(330));
+        assert_ne!(
+            L9_BSL41601.total_chips(),
+            Some(BM1489_CHIPS_PER_CHAIN_L7 * BM1489_CHAIN_COUNT_L7),
+            "L9 must never be described by the BM1489 480-chip geometry"
+        );
+
+        // This table's scope statement must stay L7-only.
+        assert_eq!(BM1489_TABLE.chip_family, "BM1489");
+    }
+
+    /// Round 15 NEGATIVE pin: the stock L7 image does not identify its ASIC,
+    /// so nothing may treat "L7 = BM1489" as Bitmain-sourced.
+    #[test]
+    fn l7_stock_image_does_not_name_an_asic() {
+        use crate::scrypt_stock_topology::L7_STOCK;
+        assert_eq!(L7_STOCK.asic_id, None);
+        assert_eq!(L7_STOCK.chip_type, None);
+        // Only the plaintext boot chain is usable.
+        assert_eq!(L7_STOCK.control_board, Some("Zynq-7000"));
     }
 
     #[test]

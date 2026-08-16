@@ -26,7 +26,7 @@
 //! |---|---|---|
 //! | [`crate::hashboards::Hashboard::catalog`] | DCENT (live-probe / DCENT-RE) | `chip_name` + `chips_per_chain` for the 16 overlapping SKUs. **Wins any conflict.** |
 //! | [`crate::hashboard_topology`] (ePIC UMC OS v1.22.0 jig DB) | [`DescriptorProvenance::DeskJigDbExperimental`] | `chip_name` + `chips_per_chain` for the other 34; `observed_eeprom_preambles` for all 50 |
-//! | [`crate::vnish_thermal`] (VNish 1.2.7 `hwscan` model JSONs) | [`DescriptorProvenance::DeskVnishFirmwareExperimental`] | [`HashboardIdentityRow::used_in`] (the marketing product) on 36 of 50; independent corroboration of `chips_per_chain` |
+//! | [`crate::vnish_thermal`] (VNish 1.2.7 `hwscan` model JSONs) | [`DescriptorProvenance::DeskVnishFirmwareExperimental`] | candidate [`HashboardIdentityRow::used_in`] values and independent `chips_per_chain` corroboration; ambiguous unified-firmware BHB427/BHB428 bindings are suppressed |
 //!
 //! Because the join is computed, a corrected JSON row propagates here with no
 //! second edit — the class of drift that a hand-copied second table invites
@@ -45,10 +45,12 @@
 //!    independently agree. An ePIC-transcribed row can supply identity and
 //!    geometry; it is never the sole authority for anything that energizes
 //!    silicon, and it never outranks a DCENT measurement.
-//! 3. **Unknown ⇒ `None`, never a sibling's value.** 14 of 50 SKUs have no
-//!    product name in any held corpus and carry `used_in: None` — including
+//! 3. **Unknown ⇒ `None`, never a sibling's value.** Rows without a unique
+//!    model binding carry `used_in: None` — including
 //!    `A3HB70605`/`70606`/`70607`, whose six `A3HB706xx` siblings are all
-//!    "Antminer S21 Pro". Inheriting that would be a fabrication. Pinned by
+//!    "Antminer S21 Pro", and the corrected BHB42701/BHB428 rows whose VNish
+//!    names come from a unified multi-model roster. Inheriting or promoting
+//!    either would be a fabrication. Pinned by
 //!    `used_in_is_absent_rather_than_inherited_from_a_sibling`.
 //! 4. **No voltage, frequency, PLL, PSU or tuning field lives here.** Those
 //!    stay in the per-chip PVT modules (`bm1362::BHB42601_FREQ_VOLT_TABLE`
@@ -248,7 +250,26 @@ fn catalog() -> &'static Catalog {
                     corroborating.push(DescriptorProvenance::DeskVnishFirmwareExperimental);
                 }
 
-                let used_in = vnish.map(|v| v.marketing_name.clone());
+                // VNish's BHB42701/BHB428 names are emitted by a unified
+                // multi-model firmware roster, not a unique deployed
+                // SKU-to-product observation. Exact held jig/pages prove
+                // BM1362 identity only, so suppress those candidate marketing
+                // names rather than converting co-location into authority.
+                let model_binding_retracted = matches!(
+                    d.sku.as_str(),
+                    "BHB42701"
+                        | "BHB42801"
+                        | "BHB42803"
+                        | "BHB42811"
+                        | "BHB42821"
+                        | "BHB42831"
+                        | "BHB42841"
+                );
+                let used_in = if model_binding_retracted {
+                    None
+                } else {
+                    vnish.map(|v| v.marketing_name.clone())
+                };
                 let used_in_provenance = used_in
                     .as_ref()
                     .map(|_| DescriptorProvenance::DeskVnishFirmwareExperimental);
@@ -441,20 +462,13 @@ mod tests {
             1,
             true,
         ),
-        ("BHB42701", "BM1362", 108, Some("Antminer S19j"), 1, true),
-        ("BHB42801", "BM1362", 88, Some("Antminer S19 (88)"), 1, true),
+        ("BHB42701", "BM1362", 108, None, 1, true),
+        ("BHB42801", "BM1362", 88, None, 1, true),
         ("BHB42803", "BM1362", 84, None, 0, true),
         ("BHB42811", "BM1362", 88, None, 0, true),
-        ("BHB42821", "BM1362", 88, Some("Antminer S19 (88)"), 0, true),
-        ("BHB42831", "BM1362", 88, Some("Antminer S19 (88)"), 1, true),
-        (
-            "BHB42841",
-            "BM1362",
-            126,
-            Some("Antminer S19 (126)"),
-            0,
-            true,
-        ),
+        ("BHB42821", "BM1362", 88, None, 0, true),
+        ("BHB42831", "BM1362", 88, None, 1, true),
+        ("BHB42841", "BM1362", 126, None, 0, true),
         // --- BM1366 / BHB56xxx — 11 rows, 10 NEW + BHB56902 legacy ---
         ("BHB56801", "BM1366", 110, Some("Antminer S19 XP"), 2, false),
         ("BHB56802", "BM1366", 110, Some("Antminer S19 XP"), 0, false),
@@ -703,7 +717,9 @@ mod tests {
     /// Rule 3, the sharpest form: `A3HB70605`/`70606`/`70607` sit between six
     /// siblings all recorded as "Antminer S21 Pro", and every geometry field
     /// they have is identical to those siblings — yet no held corpus names
-    /// their product, so they stay `None`. Same for the other 11.
+    /// their product, so they stay `None`. The corrected BHB42701/BHB428 rows
+    /// also stay `None` because their VNish names are unified-roster
+    /// co-location, not unique product observations.
     #[test]
     fn used_in_is_absent_rather_than_inherited_from_a_sibling() {
         let mut unnamed: Vec<&str> = all_hashboard_identities()
@@ -721,8 +737,13 @@ mod tests {
                 "A3HB70607",
                 "BHB42611",
                 "BHB42632",
+                "BHB42701",
+                "BHB42801",
                 "BHB42803",
                 "BHB42811",
+                "BHB42821",
+                "BHB42831",
+                "BHB42841",
                 "BHB56807",
                 "BHB56814",
                 "BHB56901",
@@ -936,12 +957,15 @@ mod tests {
     }
 
     /// The catalog authorizes nothing. It is not, and must not become, an
-    /// admission gate: the runtime bridge stays narrower than this table.
+    /// admission gate: the runtime bridge stays narrower than this table and
+    /// admits only SKUs independently listed in its held-page policy.
     #[test]
     fn identity_rows_do_not_widen_the_runtime_admission_gate() {
         use dcentrald_api_types::hashboard_eeprom::observed_protocol_for_deployed_board_name;
-        // Catalogued here, still refused by the deployed-page bridge (not
-        // dump-validated / contradicted / no policy row).
+        use dcentrald_common::board_desc::AsicProtocolIdentity;
+
+        // Catalogued here, still refused by the deployed-page bridge because
+        // no exact held-page policy row exists.
         for sku in [
             "BHB68601",
             "BHB68701",
@@ -950,7 +974,6 @@ mod tests {
             "BHB68707",
             "BHB68709",
             "BHB56801",
-            "BHB42801",
             "BHB42803",
             "A3HB70601",
             "NBP1901",
@@ -964,6 +987,17 @@ mod tests {
                 observed_protocol_for_deployed_board_name(sku),
                 None,
                 "{sku}: an identity row must never widen admission"
+            );
+        }
+        // These two rows are admitted by the separate exact held-page policy,
+        // not by membership in this 50-row catalog. Both remain identity-only:
+        // no runtime, voltage, or write authority follows from this result.
+        for sku in ["BHB42701", "BHB42801", "BHB42831"] {
+            assert!(hashboard_identity(sku).is_some());
+            assert_eq!(
+                observed_protocol_for_deployed_board_name(sku),
+                Some(AsicProtocolIdentity::Bm1362),
+                "{sku}: exact held-page policy must resolve only BM1362"
             );
         }
     }

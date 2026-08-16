@@ -222,18 +222,6 @@ pub fn admit_native_experimental(
 // admission — the piece that lets a decoded REAL board feed
 // [`admit_native_experimental`].
 
-/// SKU prefix whose chip family is CONTRADICTED between the source-of-truth
-/// tables, and is therefore never minted here.
-///
-/// `dcentrald-silicon-profiles::bm1362` carries per-SKU BM1362 freq/voltage
-/// tables for `BHB42801`/`BHB42803`/`BHB42811`/`BHB42821`/`BHB42831`/`BHB42841`,
-/// while [`crate::eeprom_record::BHB_SKU_CATALOG`] catalogs `BHB428xx` as BM1366.
-/// Either mint could route the board into the wrong voltage tables
-/// (brick/thermal), so it stays fail-closed until a real BHB428xx dump resolves
-/// the family. Checked explicitly, ABOVE the policy table and before any catalog
-/// lookup, so neither a future policy edit nor a catalog change can re-open it.
-const CONTRADICTED_SKU_PREFIX_BHB428: &str = "BHB428";
-
 /// How one [`DEPLOYED_SKU_IDENTITY_POLICY`] row matches a deployed `board_name`.
 #[derive(Debug, Clone, Copy)]
 enum DeployedSkuMatch {
@@ -280,6 +268,12 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
     // would trade that for refusing real sibling boards with no evidence they
     // differ, so the prefix stays.
     //
+    // STILL OPEN after the 2026-08-02 `chip_marking` work (W5-RANK-13). The lot-code
+    // corroborator below (`CHIP_MARKING_FAMILY_LETTERS` / `corroborate_marking`) does
+    // NOT close this: we hold no BM1398 page, so BM1398's letter is unknown, and BM1398
+    // plausibly shares BM1362's `C` (same generation, same `0x04 0x11` preamble). Do not
+    // delete these lines on the strength of the corroborator.
+    //
     // NOTE (corrected): this bridge DOES have a production caller now —
     // `serial_mining.rs` folds the retained hashboard pages through
     // `admit_native_experimental` on the non-passthrough BM1366 path, behind an
@@ -290,6 +284,26 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
     // re-adjudicate this before relying on two-source agreement.
     (
         DeployedSkuMatch::Family("BHB426"),
+        AsicProtocolIdentity::Bm1362,
+    ),
+    // BHB427/BHB428 BM1362 efficiency/high-bin boards. EXACT page-backed SKUs
+    // only: the held ePIC matched corpus contains format-4 pages for 42701,
+    // 42801, and 42831; all three decrypt with lot-code family letter `C`, and
+    // their factory V/F values agree with the independent BM1362 PVT/topology
+    // catalogs. The four roster-only BHB428 siblings are catalogued BM1362 but
+    // have no held deployed page, so they do not appear in this admission
+    // policy. Never replace these with a BHB427/BHB428 prefix: unknown suffixes
+    // remain unobserved and must fail closed.
+    (
+        DeployedSkuMatch::Exact("BHB42701"),
+        AsicProtocolIdentity::Bm1362,
+    ),
+    (
+        DeployedSkuMatch::Exact("BHB42801"),
+        AsicProtocolIdentity::Bm1362,
+    ),
+    (
+        DeployedSkuMatch::Exact("BHB42831"),
         AsicProtocolIdentity::Bm1362,
     ),
     // S19k Pro NoPic, validated vs the S19k `BHB56903` dump. Deliberately
@@ -326,16 +340,11 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
 
 /// Map a *deployed* hashboard `board_name` (SKU) to an exact observed ASIC identity.
 ///
-/// **Conservative + fail-closed by design.** Three checks run, in order:
+/// **Conservative + fail-closed by design.** Two checks run, in order:
 ///
-/// 1. The CONTRADICTED `BHB428xx` prefix returns `None` immediately
-///    ([`CONTRADICTED_SKU_PREFIX_BHB428`]). Redundant with step (2) today — no
-///    policy row matches `BHB428*`, so step (2) already refuses — and kept as
-///    defence in depth so a future policy-table edit alone cannot re-open the
-///    contradiction without also removing this guard.
-/// 2. The SKU must match a [`DEPLOYED_SKU_IDENTITY_POLICY`] row. Everything else
+/// 1. The SKU must match a [`DEPLOYED_SKU_IDENTITY_POLICY`] row. Everything else
 ///    — unvalidated, unknown, empty, or merely catalog-known — returns `None`.
-/// 3. [`crate::eeprom_record::chip_family_for_sku`] must independently resolve
+/// 2. [`crate::eeprom_record::chip_family_for_sku`] must independently resolve
 ///    that SKU to the SAME family. The catalog stays the single source of truth
 ///    for SKU→family; this function only decides which SKUs are trusted enough
 ///    to mint. Any divergence (catalog correction, row removal, pattern reorder)
@@ -345,6 +354,9 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
 ///
 /// - `BHB426xx` → [`AsicProtocolIdentity::Bm1362`] (S19j Pro; validated vs the
 ///   `a lab unit` BHB42601 dump — consistent in `hashboards.rs` and `eeprom_record`).
+/// - exact `BHB42701` / `BHB42801` / `BHB42831` →
+///   [`AsicProtocolIdentity::Bm1362`] (held format-4 pages + BM1362
+///   lot-code/PVT/topology agreement; sibling and unknown names remain refused).
 /// - `BHB569xx` → [`AsicProtocolIdentity::Bm1366`] (S19k Pro; validated vs the
 ///   S19k BHB56903 dump — the unique `0x05` NoPic family).
 /// - `BHB68603` / `BHB68603-` / `BHB68606` → [`AsicProtocolIdentity::Bm1368`]
@@ -358,16 +370,12 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
 /// `deployed_policy_table_can_never_declare_bm1398`.
 pub fn observed_protocol_for_deployed_board_name(board_name: &str) -> Option<AsicProtocolIdentity> {
     let name = board_name.trim();
-    // (1) Contradiction guard, applied ON TOP of the delegation below.
-    if name.starts_with(CONTRADICTED_SKU_PREFIX_BHB428) {
-        return None;
-    }
-    // (2) Admission policy: only validated/exact SKUs may mint at all.
+    // (1) Admission policy: only validated/exact SKUs may mint at all.
     let expected = DEPLOYED_SKU_IDENTITY_POLICY
         .iter()
         .find(|(matcher, _)| matcher.matches(name))
         .map(|(_, identity)| *identity)?;
-    // (3) Two-table agreement: the catalog owns SKU→family, so a divergence
+    // (2) Two-table agreement: the catalog owns SKU→family, so a divergence
     // fails closed instead of minting this table's stale opinion.
     let cataloged = crate::eeprom_record::chip_family_for_sku(name)
         .and_then(AsicProtocolIdentity::from_chip_label)?;
@@ -378,17 +386,104 @@ pub fn observed_protocol_for_deployed_board_name(board_name: &str) -> Option<Asi
     }
 }
 
+/// Character 2 of a deployed page's factory lot code, per ASIC family.
+///
+/// **Held evidence, 22 pages, zero exceptions** — 17 from
+///
+/// plus 5 DCENT-held real dumps (`a lab unit` `0x50`/`0x52`, s19k `0x50`/`0x52`, s21 `0x51`).
+/// Full byte table: `deliverables/W5-RANK-13.md` §2.
+///
+/// This is a **corroborator**, not an authority. It may only ever cause a REFUSAL;
+/// nothing may mint a family from it. Two families are deliberately absent and must
+/// stay absent until a page is held:
+///
+/// * **BM1398** — the family in the `:271-276` blind spot. No held page. Guessing
+///   `C` here (same generation as BM1362) would manufacture agreement inside the
+///   very blind spot this table is mistakenly credited with closing.
+/// * **BM1370** — `A3HB7xxxx` pages are format 1 and never reach this code path.
+///
+/// Adding a row requires a held page, not a DB row: the ePIC capability DB is
+/// ePIC-*transcribed* (CONTEXT §3 caveat 3) and carries no lot codes at all.
+pub const CHIP_MARKING_FAMILY_LETTERS: &[(AsicProtocolIdentity, char)] = &[
+    (AsicProtocolIdentity::Bm1362, 'C'),
+    (AsicProtocolIdentity::Bm1366, 'G'),
+    (AsicProtocolIdentity::Bm1368, 'V'),
+];
+
+/// Outcome of comparing a page's lot-code letter against its name-derived family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkingCorroboration {
+    /// The letter is the one this family always shows on held pages.
+    Agrees,
+    /// The letter belongs to a DIFFERENT family, or is unknown, or is absent.
+    /// All three are refusals — see [`corroborate_marking`].
+    Refuses(&'static str),
+}
+
+/// Fail-closed lot-code corroboration for an identity already minted from
+/// `board_name`.
+///
+/// Refuses on **disagreement**, on an **unknown letter**, and on an **absent
+/// marking**. The unknown/absent cases are refusals rather than pass-throughs
+/// because this runs only for SKUs already admitted by
+/// [`DEPLOYED_SKU_IDENTITY_POLICY`], and every family in that table has a row in
+/// [`CHIP_MARKING_FAMILY_LETTERS`] (pinned by
+/// `every_admissible_family_has_a_marking_letter`). A page in that narrow set with
+/// an unrecognised letter is anomalous, and the only production consumer is an
+/// operator-opt-in Experimental lane whose refusal path is the pre-existing
+/// `NOT IMPLEMENTED` bail — so refusing costs an experiment, while admitting costs
+/// a wrong voltage table.
+///
+/// Deliberately NOT modelled on the `0x5A` end sentinel (`deployed_eeprom.rs:100`),
+/// which is advisory because it sits outside every enciphered region and
+/// authenticates nothing. Byte 23 is inside region 1 and under its CRC5, so a
+/// mismatch is real evidence of a wrong page, not a stray byte.
+pub fn corroborate_marking(
+    identity: AsicProtocolIdentity,
+    marking_letter: Option<char>,
+) -> MarkingCorroboration {
+    let Some(expected) = CHIP_MARKING_FAMILY_LETTERS
+        .iter()
+        .find(|(fam, _)| *fam == identity)
+        .map(|(_, c)| *c)
+    else {
+        return MarkingCorroboration::Refuses(
+            "no held-page lot-code letter for this family; fail-closed",
+        );
+    };
+    match marking_letter {
+        Some(c) if c == expected => MarkingCorroboration::Agrees,
+        Some(_) => MarkingCorroboration::Refuses(
+            "page lot code disagrees with the name-derived ASIC family; fail-closed",
+        ),
+        None => MarkingCorroboration::Refuses(
+            "page carries no usable lot code to corroborate identity; fail-closed",
+        ),
+    }
+}
+
 /// Decode a REAL deployed 256-byte hashboard-EEPROM page and resolve its exact
 /// observed ASIC identity.
 ///
-/// Runs [`crate::deployed_eeprom::decode_deployed_eeprom`] (fail-closed) and then
-/// [`observed_protocol_for_deployed_board_name`]. Returns `None` on any decode failure
-/// or on a contradicted/unvalidated SKU. Pure, no HAL/IO; authorizes nothing on its own
-/// — a caller still pairs this `observed` with the declared BoardDesc and applies the
-/// experimental opt-in via [`admit_native_experimental`].
+/// Runs [`crate::deployed_eeprom::decode_deployed_eeprom`] (fail-closed), then
+/// [`observed_protocol_for_deployed_board_name`], then — because only THIS entry point
+/// has the page and not merely the name — [`corroborate_marking`] as a third,
+/// page-intrinsic requirement. Returns `None` on any decode failure, on a
+/// unvalidated SKU, and on any marking disagreement. Pure, no HAL/IO;
+/// authorizes nothing on its own — a caller still pairs this `observed` with the
+/// declared BoardDesc and applies the experimental opt-in via
+/// [`admit_native_experimental`].
+///
+/// The corroborator lives here and NOT in
+/// [`observed_protocol_for_deployed_board_name`], which receives only a `&str` and
+/// therefore cannot check it. Callers that hold bytes must use this function.
 pub fn observed_protocol_from_deployed_page(raw: &[u8]) -> Option<AsicProtocolIdentity> {
     let identity = crate::deployed_eeprom::decode_deployed_eeprom(raw).ok()?;
-    observed_protocol_for_deployed_board_name(&identity.board_name)
+    let observed = observed_protocol_for_deployed_board_name(&identity.board_name)?;
+    match corroborate_marking(observed, identity.chip_marking_family_letter()) {
+        MarkingCorroboration::Agrees => Some(observed),
+        MarkingCorroboration::Refuses(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -634,39 +729,34 @@ mod tests {
         }
     }
 
-    /// LOAD-BEARING: BHB428xx is a CONTRADICTED SKU (silicon-profiles::hashboards says
-    /// BM1362, eeprom_record says BM1366). Minting either could misroute voltage tables
-    /// (brick/thermal), so this bridge must stay fail-closed (None) until a real
-    /// BHB428xx dump resolves the family. Regressing this would propagate the U7
-    /// contradiction into the admission path.
-    ///
-    /// The catalog value is asserted below as a TRIPWIRE on `eeprom_record`, not as
-    /// proof the guard is load-bearing: with the guard removed, step (2) already
-    /// refuses `BHB428*` because no policy row matches it. The guard is deliberate
-    /// defence in depth against a future policy-table edit.
+    /// The three exact BHB427/BHB428 SKUs with held deployed pages admit BM1362.
+    /// The four catalogued BHB428 siblings and every unknown suffix remain closed:
+    /// a roster/PVT row without a page is not sufficient to mint a
+    /// runtime-observed identity.
     #[test]
-    fn deployed_bhb428_is_fail_closed_pending_u7_resolution() {
-        for sku in [
-            "BHB42801", "BHB42811", "BHB42821", "BHB42831", "BHB42841", "BHB42803",
-        ] {
-            // Tripwire on the catalog, not a proof of the guard: if this fails the
-            // catalog changed — re-adjudicate U7 (Bitmain's own `topol.conf`,
-            // bosminer's held model list, and silicon-profiles all say BM1362)
-            // before touching either the catalog row or the guard.
+    fn deployed_bhb428_admits_only_exact_page_backed_skus() {
+        for sku in ["BHB42701", "BHB42801", "BHB42831"] {
             assert_eq!(
                 crate::eeprom_record::chip_family_for_sku(sku),
-                Some("BM1366"),
-                "{sku}: catalog mapping changed; re-adjudicate the U7 contradiction \
-                 before weakening this fail-closed guard"
+                Some("BM1362"),
+                "{sku}: exact catalog row must agree with held page evidence"
             );
             assert_eq!(
                 observed_protocol_for_deployed_board_name(sku),
-                None,
-                "contradicted SKU {sku} must not mint an observed identity"
+                Some(AsicProtocolIdentity::Bm1362),
+                "page-backed SKU {sku} must mint only BM1362"
             );
         }
-        // The bare prefix and any BHB428 superstring stay closed too.
-        for sku in ["BHB428", "BHB428xx", "BHB4289999"] {
+        for sku in [
+            "BHB42803",
+            "BHB42811",
+            "BHB42821",
+            "BHB42841",
+            "BHB428",
+            "BHB428xx",
+            "BHB42899",
+            "BHB4289999",
+        ] {
             assert_eq!(observed_protocol_for_deployed_board_name(sku), None);
         }
     }
@@ -702,6 +792,44 @@ mod tests {
                 *expected,
                 AsicProtocolIdentity::Bm1398,
                 "no deployed SKU may ever be admitted as BM1398"
+            );
+        }
+    }
+
+    /// Every family a page can be admitted as (`DEPLOYED_SKU_IDENTITY_POLICY`) must
+    /// have a lot-code letter, or `corroborate_marking` would silently refuse it as
+    /// "no held-page lot-code letter for this family". Stops the two tables drifting
+    /// into an all-refuse regression when a new admissible family is added without a
+    /// held page.
+    #[test]
+    fn every_admissible_family_has_a_marking_letter() {
+        for (_, identity) in DEPLOYED_SKU_IDENTITY_POLICY {
+            assert!(
+                CHIP_MARKING_FAMILY_LETTERS
+                    .iter()
+                    .any(|(fam, _)| fam == identity),
+                "admissible family {identity:?} has no lot-code letter — the corroborator \
+                 would silently refuse every page of it"
+            );
+        }
+    }
+
+    /// Negative pin: NO BM1398 or BM1370 row may enter the letter table. We hold no
+    /// deployed page for either, and a guessed BM1398 letter (plausibly BM1362's `C`)
+    /// would manufacture agreement inside the very `:271-276` blind spot. Deleting
+    /// this pin to "complete the table" must be a conscious act.
+    #[test]
+    fn marking_letter_table_has_no_bm1398_or_bm1370_row() {
+        for (fam, _) in CHIP_MARKING_FAMILY_LETTERS {
+            assert_ne!(
+                *fam,
+                AsicProtocolIdentity::Bm1398,
+                "no held BM1398 lot code — do not guess one into the corroborator"
+            );
+            assert_ne!(
+                *fam,
+                AsicProtocolIdentity::Bm1370,
+                "BM1370 (A3HB7xxxx) is format-1 and never reaches this code path"
             );
         }
     }

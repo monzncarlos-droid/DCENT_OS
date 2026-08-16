@@ -66,6 +66,12 @@ require_uint() {
 }
 
 cleanup() {
+    # The default worker exits only after this sentinel disappears. Remove it
+    # before waiting, otherwise cleanup deadlocks while the worker keeps
+    # observing the still-present file.
+    if [ -n "$TMP_DIR" ] && [ -f "$TMP_DIR/keep-running" ]; then
+        rm -f "$TMP_DIR/keep-running"
+    fi
     if [ -n "$PID" ] && kill -0 "$PID" >/dev/null 2>&1; then
         kill "$PID" >/dev/null 2>&1 || true
         wait "$PID" >/dev/null 2>&1 || true

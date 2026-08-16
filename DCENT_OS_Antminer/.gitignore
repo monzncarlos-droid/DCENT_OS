@@ -34,3 +34,29 @@ boot_log_*.txt
 docs/dcentrald_log_*.txt
 docs/dcentrald_coldboot_*.txt
 docs/RE_BRAIINS_LIVE_DUMP_*.txt
+
+# QA 2026-08-11: stock FPGA RE bins /
+dcentrald/pic-recovery/firmware/stock_fpga*.bin
+dcentrald/pic-recovery/firmware/hash_s8_app.txt
+releases/private-beta/
+
+
+# Operator-supplied SoC boot blobs (keep README tracked)
+vendor/soc-boot/**
+!vendor/soc-boot/README.md
+!vendor/soc-boot/**/
+!vendor/soc-boot/**/README.md
+
+# Accidental junction that breaks pytest rootdir detection
+/Claude
+
+# Session one-shot Track-1 / WSL prove-and-build helpers (kept on disk)
+_*.sh
+_*.py
+_*.toml
+dcentrald/_*.log
+scripts/_bench_alt_http.sh
+
+# Private live-trial evidence (summaries live in public campaign docs)
+docs/dev/**/evidence-private*/
+

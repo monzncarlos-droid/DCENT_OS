@@ -18,7 +18,7 @@
 //! - `drivers`  - Per-chip driver implementations (BM1387, BM1397, etc.)
 //! - `bm1362`   - BM1362 cold-boot orchestration (W2.5, byte-sequence-tested)
 //! - `bm1387`   - BM1387 protocol reference catalog (W11.10, RE2 §8.1 / §4.1) — reference only
-//! - `bm1393`   - BM1393 protocol reference catalog (W11.10, RE2 §8.3 / §8.5) — reference only
+//! - `bm1393`   - BM1393 protocol reference (S9k/S9 SE CRC5 VIL; FPGA offsets are not UART opcodes) — reference only, not in ChipRegistry
 
 // ASIC drivers intentionally retain reverse-engineered register constants,
 // alternate firmware frame builders, and gated scaffold paths ahead of live

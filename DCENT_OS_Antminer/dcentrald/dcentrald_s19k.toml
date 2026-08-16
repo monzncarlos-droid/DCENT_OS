@@ -26,6 +26,25 @@ serial_device = "/dev/ttyS2"
 serial_chip_count = 77
 serial_chip_type = "BM1366"
 
+# /tmp trial alignment with am3-s19kpro overlay identity (Bench HOLD).
+# Near-term beta transport: Braiins (SSH) /tmp copy. Stock Bitmain first-install
+# is separate — this config must stay valid for both; do not bake Braiins-only
+# assumptions into stock restore/install code.
+# Host-driven: stage binary + this config under a unique /tmp/dcentrald_bench_t1_*/
+# and run REMOTE_BIN --config REMOTE_CFG (see scripts/dcentrald_s19k_tmp_trial.sh).
+# Mining stays disabled; NoPic / BM1366 / 77 chips must match the overlay.
+#
+# Typed [platform] identity for /tmp trials (target + board_target only — no
+# safety flags). Runtime prefers /etc/dcentos/{platform,board_target} when
+# present; config fills gaps. Unknown [platform] keys fail closed. CE #1 banned
+# phantom kitchen-sink flags, not this typed identity section.
+# Trial helper also stages /etc/dcentos/board_target=am3-s19k and
+# /etc/dcentos/platform=am3-aml-s19k (authoritative when present).
+
+[platform]
+target = "am3-aml-s19k"
+board_target = "am3-s19k"
+
 [power]
 mode = "bypass"
 target_watts = 1400

@@ -164,12 +164,15 @@ pub fn admit_protocol_over_transport(
         ) => true,
         // S15/T15 catalog identity — management transport only until serial layout
         // is admitted (BoardDesc uses None today); refuse active chain transports.
-        (AsicProtocolIdentity::Bm1391, _) => false,
+        (
+            AsicProtocolIdentity::Bm1391
+            | AsicProtocolIdentity::Bm1393
+            | AsicProtocolIdentity::Bm1396,
+            _,
+        ) => false,
         // BM139x AM2 hybrid / serial / uart_trans family
         (
-            AsicProtocolIdentity::Bm1396
-            | AsicProtocolIdentity::Bm1397
-            | AsicProtocolIdentity::Bm1398,
+            AsicProtocolIdentity::Bm1397 | AsicProtocolIdentity::Bm1398,
             ChainTransportKind::ZynqHybrid
             | ChainTransportKind::Serial
             | ChainTransportKind::UartTrans,
@@ -254,6 +257,15 @@ pub fn protocol_capabilities(protocol: AsicProtocolIdentity) -> ProtocolCapabili
             frequency_program: false,
             version_rolling_work: false,
         },
+        // Desk-proven CRC5 VIL frames exist; work/freq stay refused until
+        // am1-s9se has an executor. Transport admit is still false.
+        AsicProtocolIdentity::Bm1393 => ProtocolCapabilities {
+            get_address_enumerate: true,
+            assign_chip_addresses: true,
+            work_submit: false,
+            frequency_program: false,
+            version_rolling_work: false,
+        },
         AsicProtocolIdentity::Bm1387 => ProtocolCapabilities {
             get_address_enumerate: true,
             assign_chip_addresses: true,
@@ -261,11 +273,20 @@ pub fn protocol_capabilities(protocol: AsicProtocolIdentity) -> ProtocolCapabili
             frequency_program: true,
             version_rolling_work: false,
         },
+        // Exact signed BM1396 binaries prove pure enumeration, address, and
+        // PLL contracts. Work-frame/nonce semantics and carrier execution are
+        // not complete, so work and version rolling remain refused.
+        AsicProtocolIdentity::Bm1396 => ProtocolCapabilities {
+            get_address_enumerate: true,
+            assign_chip_addresses: true,
+            work_submit: false,
+            frequency_program: true,
+            version_rolling_work: false,
+        },
         AsicProtocolIdentity::Bm1362
         | AsicProtocolIdentity::Bm1366
         | AsicProtocolIdentity::Bm1368
         | AsicProtocolIdentity::Bm1370
-        | AsicProtocolIdentity::Bm1396
         | AsicProtocolIdentity::Bm1397
         | AsicProtocolIdentity::Bm1398 => ProtocolCapabilities {
             get_address_enumerate: true,
@@ -430,6 +451,37 @@ mod tests {
     }
 
     #[test]
+    fn bm1396_pure_contract_does_not_admit_an_active_carrier_or_work() {
+        for transport in [
+            ChainTransportKind::FpgaUio,
+            ChainTransportKind::StockFpga,
+            ChainTransportKind::ZynqHybrid,
+            ChainTransportKind::Serial,
+            ChainTransportKind::UartTrans,
+        ] {
+            assert!(
+                admit_protocol_over_transport(AsicProtocolIdentity::Bm1396, transport).is_err(),
+                "BM1396 must refuse active transport {transport:?}"
+            );
+        }
+        let caps = protocol_capabilities(AsicProtocolIdentity::Bm1396);
+        assert!(caps.get_address_enumerate);
+        assert!(caps.assign_chip_addresses);
+        assert!(caps.frequency_program);
+        assert!(!caps.work_submit);
+        assert!(!caps.version_rolling_work);
+
+        for target in ["am2-s17e", "am2-t17e"] {
+            let desc = BoardDesc::lookup(target).expect("exact BM1396 descriptor");
+            assert!(desc.admit_protocol_transport().is_err(), "{target}");
+            assert!(
+                desc.admit_protocol_transport_and_work_engine().is_err(),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
     fn work_engine_matrix_matches_transports() {
         assert!(admit_work_engine_over_transport(
             ChainTransportKind::FpgaUio,
@@ -515,10 +567,16 @@ mod tests {
                         desc.board_target
                     );
                 }
-                _ if matches!(desc.asic_protocol, AsicProtocolIdentity::Bm1391) => {
+                _ if matches!(
+                    desc.asic_protocol,
+                    AsicProtocolIdentity::Bm1391
+                        | AsicProtocolIdentity::Bm1393
+                        | AsicProtocolIdentity::Bm1396
+                ) =>
+                {
                     assert!(
                         proto.is_err(),
-                        "{} BM1391 catalog must refuse active mutation admit",
+                        "{} pure-only protocol must refuse active mutation admit",
                         desc.board_target
                     );
                 }

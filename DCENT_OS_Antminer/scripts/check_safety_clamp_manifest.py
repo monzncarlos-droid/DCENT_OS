@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-EXPECTED_SAFETY_CLAMP_COUNT = 93
+EXPECTED_SAFETY_CLAMP_COUNT = 97
 # G30: BM1368 ramp clamp site content/line drift after pure plan thin-wrap;
 # classified count unchanged (91). Digest re-pin only.
 # G42: BM1391 open-coded freq/25 clamp removed; pure-pin ban string replaces site.
@@ -41,7 +41,25 @@ EXPECTED_SAFETY_CLAMP_COUNT = 93
 # up, behaviour did not change. Re-pinned rather than exempted, for the same reason
 # as G43: the manifest classifies by pattern, and hand-carving exceptions would put
 # the count at the mercy of a judgement it cannot check.
-EXPECTED_SAFETY_CLAMP_DIGEST = "b6e29dd913f79eb6fc0f20d8a7549af2544436098bb674743b6ec72b330c48d8"
+# G45 (2026-08-06, hardware-enablement campaign): 93 -> 94. ONE new classified
+# clamp, `bm1491.rs:202` `freq_mhz.clamp(50, 800)`, bounding the PLL divider
+# SEARCH target in the BM1491 Scaffold driver. Same shape as G43's BM1485 case:
+# a frequency clamp by pattern, NOT a live safety clamp — the driver's
+# `init_chain`/`set_frequency`/`set_voltage`/`send_work` all return `Err` and it
+# cannot energize (pinned by its own `init_chain_fails_closed` test).
+# Re-pinned rather than exempted, for the same reason as G43/G44: the manifest
+# classifies by pattern, not reachability, and carving out "unreachable" clamps
+# would make the count depend on a judgement this gate cannot verify.
+# G46 (2026-08-15/16 S19k + S9 SE desk wave): 94 -> 97. Three additional
+# classified `.clamp(` sites in the tree-scanning walk (pattern, not a new
+# live PWM/voltage actuator). Digest re-pin only; do not exempt.
+#
+# PROCESS NOTE (why this drifted silently): `bm1491.rs` was an UNTRACKED file,
+# so `git diff HEAD -- '*.rs'` showed zero added `.clamp(` while this gate,
+# which walks `source_root.rglob("*.rs")`, saw it immediately. A tree-scanning
+# gate and an index diff look at different sets — check
+# `git status --porcelain | grep '^??'` before concluding the gate is wrong.
+EXPECTED_SAFETY_CLAMP_DIGEST = "5295c06e0c5d700eeaf9b501b4cbf4f6ce36d9f578b70af209c259c260287de3"
 
 CLAMP_RE = re.compile(r"\.clamp\s*\(")
 COMMENT_PREFIXES = ("//", "///", "//!","/*", "*")

@@ -3,21 +3,26 @@
 //! Source-cite: `DCENT_OS_DEVELOPMENT_KITRE2/DCENT_OS_DEVELOPMENT_KIT/`
 //! `DCENT_OS_HARDWARE_CATALOG.md` §6 (lines 531-561).
 //!
-//! Two PIC families are deployed across the Antminer line:
+//! Two PIC families are represented by this catalog:
 //!
 //! - **dsPIC33EP16GS202** — 16-bit dsPIC33E core, 16 KB program / 2 KB
-//!   RAM. Used on S9 / T9 / S11 / S15 / T17. I²C address `0x20`.
+//!   RAM. Cataloged on S17 / S17 Pro / S17e / T17. Canonical chain-0 I²C
+//!   address `0x20`.
 //! - **PIC1704** — PIC16F1704 (8-bit) per gpdasm. Used on S19 / S19j
-//!   Pro / S19i / S19 XP and the S21 family. I²C address `0x20`.
+//!   Pro / S19i / S19 XP / T19 and physically populated on T17e.
+//!   Canonical chain-0 I²C address `0x20`.
 //!   (A43 — goldmine 2026-06-10: corrected from the earlier RE2 guess of
 //!   "likely dsPIC33CH/PIC24F"; gpdasm of the on-disk image proves an
 //!   8-bit PIC16F1704.)
 //!
-//! Both PICs **share the same register map** (RE2 §6.2) — DCENT_OS treats
-//! them as protocol-compatible at the register level, with platform
-//! routing in `dcentrald-asic::pic1704` deciding which sealed-trait
-//! marker (CV1835 / AM335x BB / Amlogic S19j Pro) is allowed to drive
-//! the chip.
+//! They are **not runtime-protocol-compatible**. `dcentrald-asic::dspic`
+//! revision-dispatches framed/bare command streams, while
+//! `dcentrald-asic::pic1704` uses short register access. The dsPIC fw=0x86
+//! bootloader reuses only the `REG_VERSION`/`REG_CONTROL` unlock-and-jump
+//! subset. A shared catalog address or that bootloader subset must never
+//! authorize an application-mode transaction. T17e is a second explicit
+//! exception to routing by physical part: its PIC16F1704 runs the separately
+//! recovered BM1396 framed application ABI in `dcentrald-common::bm1396_pic`.
 //!
 //! ## Critical exception: S21 Amlogic NoPic
 //!
@@ -34,13 +39,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Architecture of a PIC family. dsPIC33E/CH and PIC24F all expose the
-/// same I²C register map per RE2 §6.2; the architecture distinction is
-/// recorded for tooling that fingerprints a PIC by program-memory dump.
+/// Architecture of a PIC family. The architecture distinction is recorded
+/// for tooling that fingerprints a PIC by program-memory dump; it does not
+/// imply a shared application-mode wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PicArchitecture {
-    /// dsPIC33E — 16-bit DSP-enhanced core (S9 / T9 / S11 / S15 / T17).
+    /// dsPIC33E — 16-bit DSP-enhanced core (S17 / S17 Pro / T17 catalog).
     DsPic33E,
     /// PIC16F1704 — 8-bit baseline-enhanced PIC core. Used for the
     /// `Pic1704` voltage controller on S19 / S19j Pro / S19i / S19 XP.
@@ -78,14 +83,42 @@ pub struct PicCatalogEntry {
     pub used_in: &'static [&'static str],
 }
 
+/// Source-level capability ceiling for one [`Pic`] catalog identity.
+///
+/// These states describe implementation that exists somewhere in the source
+/// tree. They do not prove that every model in `used_in` has the exact
+/// controller, address topology, firmware revision, electrical envelope, or
+/// safe runtime composition needed to send a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PicCapabilityState {
+    /// A family-specific driver exists, but catalog membership alone is not a
+    /// model/runtime admission proof.
+    DriverPresentCompositionModelScoped,
+    /// A physical no-controller sentinel. No PIC transaction is possible.
+    PhysicalNoPic,
+}
+
+/// Exact, non-authorizing capability record for one [`Pic`] identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PicCapability {
+    pub pic: Pic,
+    pub state: PicCapabilityState,
+    pub application_protocol: &'static str,
+    pub implementation: &'static str,
+    pub catalog_dispatch_authorized: bool,
+    pub recovery_authorized: bool,
+    pub mutation_authorized: bool,
+}
+
 /// PIC enum — catalog key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pic {
-    /// dsPIC33EP16GS202 — S9 / T9 / S11 / S15 / T17.
+    /// dsPIC33EP16GS202 — S17 / S17 Pro / S17e / T17 catalog.
     Dspic33Ep16Gs202,
-    /// PIC1704 — S19 / S19j Pro / S19i / S19 XP / S21 (NOT S21
-    /// Amlogic).
+    /// Physical PIC16F1704 family. Application firmware and ABI remain
+    /// model-scoped; T17e must not inherit the S19/S9 short-register driver.
     Pic1704,
     /// **NOT A PIC** — sentinel for the S21 Amlogic NoPic exception.
     /// Voltage is handled by TAS5782M DACs; routing code MUST refuse
@@ -113,7 +146,7 @@ impl Pic {
                 // dsPIC. Removed S11/S15 — the S11 factory jig (BM1391) shows a
                 // PIC16-class I2C DAC + AT24C02, not this dsPIC (S15's PIC is
                 // UNCONFIRMED pending a live gpdasm dump).
-                used_in: &["S17", "S17 Pro", "T17"],
+                used_in: &["S17", "S17 Pro", "S17e", "T17"],
             },
             Pic::Pic1704 => PicCatalogEntry {
                 part_number: "PIC1704",
@@ -138,7 +171,7 @@ impl Pic {
                 // per-chain map above). It is handled in the S9 platform path,
                 // not enumerated as a catalog row here — its absence from this
                 // list does NOT mean "S9 has no PIC".
-                used_in: &["S19", "S19i", "S19j Pro", "S19 XP", "T19"],
+                used_in: &["S19", "S19i", "S19j Pro", "S19 XP", "T19", "T17e"],
             },
             Pic::S21AmlogicNoPic => PicCatalogEntry {
                 part_number: "<S21 Amlogic NoPic>",
@@ -151,17 +184,23 @@ impl Pic {
         }
     }
 
-    /// Whether routing code is allowed to dispatch a PIC sequence
-    /// against this catalog entry. False for the S21 Amlogic NoPic
-    /// exception.
+    /// Whether this catalog identity, by itself, authorizes dispatching a PIC
+    /// sequence.
+    ///
+    /// Always false. Exact runtime paths use family-specific, model-scoped
+    /// constructors and endpoint evidence; a catalog row is never sufficient
+    /// authority. This also makes the S21 Amlogic NoPic sentinel fail closed.
     pub const fn is_pic_sequence_allowed(self) -> bool {
-        !matches!(self, Pic::S21AmlogicNoPic)
+        false
     }
 }
 
-/// Shared register map (RE2 §6.2 lines 542-550). **Identical between
-/// dsPIC33EP16GS202 and PIC1704** — that's the load-bearing fact for
-/// the W11.3 PIC1704 driver.
+/// PIC1704 short-form application register map (RE2 §6.2 lines 542-550).
+///
+/// The dsPIC fw=0x86 bootloader reuses `REG_VERSION`, `REG_CONTROL`, and the
+/// unlock/jump values, but dsPIC application firmware uses its separate
+/// revision-dispatched command protocol. Do not apply the remaining register
+/// constants to a dsPIC application.
 pub mod registers {
     /// 0x00 — VERSION. Reads:
     /// - `0x86` = bootloader (post-RESET corruption state on am2 Zynq;
@@ -253,23 +292,55 @@ pub const S21_PIC_RESET_POST_UNLOCK_MS: u32 = 500;
 /// Every PIC catalog entry, including the S21 Amlogic NoPic sentinel.
 pub const ALL_PICS: &[Pic] = &[Pic::Dspic33Ep16Gs202, Pic::Pic1704, Pic::S21AmlogicNoPic];
 
+/// Exhaustive source capability ceiling for [`ALL_PICS`].
+pub const PIC_CAPABILITIES: &[PicCapability] = &[
+    PicCapability {
+        pic: Pic::Dspic33Ep16Gs202,
+        state: PicCapabilityState::DriverPresentCompositionModelScoped,
+        application_protocol: "revision-dispatched framed/bare command protocol",
+        implementation: "dcentrald_asic::dspic",
+        catalog_dispatch_authorized: false,
+        recovery_authorized: false,
+        mutation_authorized: false,
+    },
+    PicCapability {
+        pic: Pic::Pic1704,
+        state: PicCapabilityState::DriverPresentCompositionModelScoped,
+        application_protocol: "model-scoped: short register access or BM1396 framed",
+        implementation: "dcentrald_asic::pic1704 / dcentrald_common::bm1396_pic",
+        catalog_dispatch_authorized: false,
+        recovery_authorized: false,
+        mutation_authorized: false,
+    },
+    PicCapability {
+        pic: Pic::S21AmlogicNoPic,
+        state: PicCapabilityState::PhysicalNoPic,
+        application_protocol: "none",
+        implementation: "physical no-controller sentinel",
+        catalog_dispatch_authorized: false,
+        recovery_authorized: false,
+        mutation_authorized: false,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn pic1704_and_dspic33ep_share_register_map() {
-        // Pin: RE2 §6.2 — register map is IDENTICAL across the two
-        // families. Both share I²C address 0x20.
+    fn pic1704_and_dspic33ep_share_address_not_runtime_protocol() {
+        // The canonical chain-0 address is shared, but the application
+        // protocols are deliberately distinct.
         let dspic = Pic::Dspic33Ep16Gs202.catalog();
         let pic1704 = Pic::Pic1704.catalog();
         assert_eq!(dspic.i2c_address, 0x20);
         assert_eq!(pic1704.i2c_address, 0x20);
-        // Architecture distinction is real (dsPIC33E vs 8-bit PIC16F1704);
-        // both still expose the same I²C register map. A38 (goldmine
-        // 2026-06-10): PIC1704 is a PIC16F1704 per gpdasm, not dsPIC33CH/PIC24F.
         assert_eq!(dspic.architecture, PicArchitecture::DsPic33E);
         assert_eq!(pic1704.architecture, PicArchitecture::Pic16F);
+        assert_ne!(
+            PIC_CAPABILITIES[0].application_protocol,
+            PIC_CAPABILITIES[1].application_protocol
+        );
     }
 
     #[test]
@@ -291,13 +362,11 @@ mod tests {
 
     #[test]
     fn s21_amlogic_nopic_blocks_pic_dispatch() {
-        //: GPIO-mediated PIC
-        // RESET on S21 Amlogic kills the TAS5782M DAC voltage output.
-        // The catalog must flag this so routing refuses dispatch.
-        let nopic = Pic::S21AmlogicNoPic;
-        assert!(!nopic.is_pic_sequence_allowed());
-        assert!(Pic::Dspic33Ep16Gs202.is_pic_sequence_allowed());
-        assert!(Pic::Pic1704.is_pic_sequence_allowed());
+        // Catalog membership never authorizes a transaction. Exact runtime
+        // paths must use their model-scoped construction gates.
+        for pic in ALL_PICS {
+            assert!(!pic.is_pic_sequence_allowed());
+        }
     }
 
     #[test]
@@ -359,6 +428,25 @@ mod tests {
     }
 
     #[test]
+    fn pic_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        assert_eq!(PIC_CAPABILITIES.len(), ALL_PICS.len());
+        let identities: std::collections::BTreeSet<String> = PIC_CAPABILITIES
+            .iter()
+            .map(|capability| format!("{:?}", capability.pic))
+            .collect();
+        assert_eq!(identities.len(), PIC_CAPABILITIES.len());
+
+        for capability in PIC_CAPABILITIES {
+            assert!(!capability.catalog_dispatch_authorized);
+            assert!(!capability.recovery_authorized);
+            assert!(!capability.mutation_authorized);
+        }
+
+        assert_eq!(PIC_CAPABILITIES[2].state, PicCapabilityState::PhysicalNoPic);
+        assert_eq!(PIC_CAPABILITIES[2].application_protocol, "none");
+    }
+
+    #[test]
     fn dspic33ep_used_in_s17_class_not_s9() {
         // CORRECTED 2026-07-02: dsPIC33EP16GS202 is the S17-class voltage
         // controller (AMTC S17 PIC-update path). The S9 uses a PIC16F1704 @
@@ -375,5 +463,20 @@ mod tests {
         );
         let pic1704 = Pic::Pic1704.catalog();
         assert!(pic1704.used_in.iter().any(|m| *m == "S19j Pro"));
+    }
+
+    #[test]
+    fn exact_bm1396_payloads_pin_s17e_t17e_physical_part_split_without_dispatch() {
+        let dspic = Pic::Dspic33Ep16Gs202.catalog();
+        let pic16 = Pic::Pic1704.catalog();
+        assert!(dspic.used_in.contains(&"S17e"));
+        assert!(!dspic.used_in.contains(&"T17e"));
+        assert!(pic16.used_in.contains(&"T17e"));
+        assert!(!pic16.used_in.contains(&"S17e"));
+        assert!(!Pic::Dspic33Ep16Gs202.is_pic_sequence_allowed());
+        assert!(!Pic::Pic1704.is_pic_sequence_allowed());
+        assert!(PIC_CAPABILITIES[1]
+            .application_protocol
+            .contains("BM1396 framed"));
     }
 }

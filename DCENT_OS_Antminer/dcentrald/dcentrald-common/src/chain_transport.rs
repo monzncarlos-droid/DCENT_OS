@@ -217,8 +217,7 @@ pub fn admit_transport_op(
 pub fn protocol_speaks_bm1397plus_commands(protocol: AsicProtocolIdentity) -> bool {
     matches!(
         protocol,
-        AsicProtocolIdentity::Bm1396
-            | AsicProtocolIdentity::Bm1397
+        AsicProtocolIdentity::Bm1397
             | AsicProtocolIdentity::Bm1398
             | AsicProtocolIdentity::Bm1362
             | AsicProtocolIdentity::Bm1366

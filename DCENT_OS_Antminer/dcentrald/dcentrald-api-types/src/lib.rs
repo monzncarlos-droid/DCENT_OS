@@ -22,7 +22,7 @@ pub mod autotune_phase;
 pub mod autotune_policy;
 ///  baud-A: per-chip baud-upgrade plan + triple-write rule (HAL-free).
 pub mod baud_switch;
-/// BHB56902 (BM1366 / S19k Pro) hashboard-EEPROM block — the BHB56xxx sibling of
+/// BHB56902 (BM1366 / S19k Pro) hashboard-EEPROM block â€” the BHB56xxx sibling of
 /// `zhiju_eeprom`, byte-exact from the AMTC S19k Pro jig. Same CRC5 + identity layout,
 /// 6-byte-longer block. Unblocks native-BM1366 identity-gated admission.
 pub mod bm1366_eeprom;
@@ -30,6 +30,10 @@ pub mod bm1366_eeprom;
 pub mod bm1368_temperature;
 /// Evidence-scoped BM1398 chip, NBP1901 chain, and FPGA FIFO contracts.
 pub mod bm1398_protocol;
+pub mod bm1398_get_address;
+pub mod xil_dual_chain_desk_map;
+/// BM1397/BM1398-class GetAddress (0x52 dialect) sealed NBP1901 admission (RE-4A, host-testable).
+pub mod bm139x_get_address;
 /// Deterministic evidence-parameterized BM13xx four-divider PLL search.
 pub mod bm13xx_pll;
 ///  boot-A: boot-flow phase timeline DTO (HAL-free).
@@ -88,7 +92,7 @@ pub mod frequency_scaling;
 pub mod hashboard_diagnostics;
 /// Capability-first hashboard-EEPROM identity bridge over `zhiju_eeprom` +
 /// `bm1366_eeprom`: dispatch on the family byte and, where the evidence is EXACT
-/// (unique 0x05 family → BM1366), produce the observed `AsicProtocolIdentity` for
+/// (unique 0x05 family â†’ BM1366), produce the observed `AsicProtocolIdentity` for
 /// two-source admission. The ambiguous 0x04 family is deliberately never disambiguated.
 pub mod hashboard_eeprom;
 /// PH-3 (): pure default-OFF hashrate auto-recovery ladder FSM (HAL-free, host-tested).
@@ -115,7 +119,7 @@ pub mod luxos_rest_command;
 pub mod luxos_rest_envelope;
 ///  luxos-G: LuxOS thermal sensor topology + threshold hierarchy (HAL-free).
 pub mod luxos_sensor_topology;
-///  luxos-L: LuxOS system architecture catalog — MTD layout + init scripts (HAL-free).
+///  luxos-L: LuxOS system architecture catalog â€” MTD layout + init scripts (HAL-free).
 pub mod luxos_system_architecture;
 ///  luxos-F: LuxOS firmware-update flow DTOs (HAL-free).
 pub mod luxos_update;
@@ -127,13 +131,13 @@ pub mod metrics_csv;
 pub mod mining_loop_state;
 ///  sec-A: OTA rollback-protection policy (HAL-free).
 pub mod ota_rollback_protection;
-/// W9.4 perf-A: J/TH efficiency contract DTOs (HAL-free) — operator
+/// W9.4 perf-A: J/TH efficiency contract DTOs (HAL-free) â€” operator
 /// wattmeter calibration source-of-truth, PMBus-derived live, model-only
 /// fallback.
 pub mod perf_efficiency;
 ///  pic-A: PIC firmware version catalog (HAL-free).
 pub mod pic_firmware;
-///  pwr-B: V²f power estimation model (HAL-free).
+///  pwr-B: VÂ²f power estimation model (HAL-free).
 pub mod power_model;
 ///  prof-A: per-model power-profile preset catalog (HAL-free).
 pub mod power_profile_preset;
@@ -149,6 +153,11 @@ pub mod prometheus_metrics;
 pub mod psu_apw_protocol;
 ///  bypass-A: PSU + hashboard bypass policy (HAL-free).
 pub mod psu_bypass;
+/// Round 17 B2: first-party Bitmain maintenance-guide facts for
+/// APW7/APW8/APW9/APW9+ (control-interface classification incl. the
+/// first-party "APW7 has none", dual-output specs, protection latch
+/// semantics). Data only, HAL-free.
+pub mod psu_maintenance;
 ///  psu-A: APW PSU family catalog (HAL-free).
 pub mod psu_model;
 /// W13.D1: PVT (Process-Voltage-Temperature) table contract for
@@ -156,8 +165,8 @@ pub mod psu_model;
 pub mod pvt_table;
 ///  ramp-A: LuxOS 10-min boot-to-mining ramp curve (HAL-free).
 pub mod ramp_curve;
-/// LM90-family remote-diode temp-sensor decoder (TMP451/ADT7461/NCT218) — pure
-/// register-bytes→temperature logic, so S9 board-temp can read a real sensor instead of
+/// LM90-family remote-diode temp-sensor decoder (TMP451/ADT7461/NCT218) â€” pure
+/// register-bytesâ†’temperature logic, so S9 board-temp can read a real sensor instead of
 /// falling back to the XADC die temp.
 pub mod remote_temp_sensor;
 ///  thm-B: MAD-based bad-sensor outlier detector (HAL-free).
@@ -692,11 +701,11 @@ impl MiningPipelineSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// I²C write denylist — EEPROM protection contract ( B4)
+// IÂ²C write denylist â€” EEPROM protection contract ( B4)
 // ---------------------------------------------------------------------------
 //
 // Hashboard EEPROMs on am2 (S19j Pro / S19 Pro Zynq) and am3-aml (S21 / S19k
-// Pro) sit at I²C addresses 0x50..=0x57 on `/dev/i2c-0`. Writing to these
+// Pro) sit at IÂ²C addresses 0x50..=0x57 on `/dev/i2c-0`. Writing to these
 // addresses corrupts the board identity and (per the 2026-04-29 .74 incident)
 // cannot be recovered without physical EEPROM replacement.
 //
@@ -704,7 +713,7 @@ impl MiningPipelineSnapshot {
 // am2/am3-aml platform startup. This crate re-exports the same address range
 // as a host-safe constant so REST/MCP/web routes that *might* expose raw
 // `i2cset`-style helpers can short-circuit at the API boundary BEFORE the
-// request reaches HAL — defense in depth. S9 (am1-zynq) has PIC voltage
+// request reaches HAL â€” defense in depth. S9 (am1-zynq) has PIC voltage
 // controllers (NOT EEPROMs) at 0x55..=0x57, so the S9 denylist stays empty.
 //
 // See:  + B4 regression note at
@@ -712,7 +721,7 @@ impl MiningPipelineSnapshot {
 pub const EEPROM_WRITE_DENYLIST: &[u16] = &[0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57];
 
 /// Platforms that MUST register `EEPROM_WRITE_DENYLIST` on startup. S9
-/// (am1-zynq) is intentionally absent — its 0x55-0x57 are PIC controllers.
+/// (am1-zynq) is intentionally absent â€” its 0x55-0x57 are PIC controllers.
 pub const EEPROM_DENYLIST_PLATFORMS: &[&str] = &["am2-zynq", "am3-aml", "am3-bb"];
 
 /// Returns true if writes to `addr` on the given platform must be rejected.
@@ -1161,7 +1170,7 @@ mod tests {
     #[test]
     fn normalize_freshness_keeps_age_for_stale_status() {
         // Stale snapshots must report their age so dashboards can show
-        // "last updated N seconds ago" — the snapshot is unavailable but
+        // "last updated N seconds ago" â€” the snapshot is unavailable but
         // age should still be derivable. Stale is the boundary case: status
         // is not Live (so snapshot_available is false) yet the publisher
         // timestamp is real and trustworthy for age reporting.
@@ -1183,7 +1192,7 @@ mod tests {
     #[test]
     fn operating_mode_round_trips_all_three_modes_through_json() {
         // Pin every mode's JSON contract in both directions so a regression
-        // can't silently rename one (e.g. "Hacker" → "advanced") without
+        // can't silently rename one (e.g. "Hacker" â†’ "advanced") without
         // breaking the wire format clients depend on.
         for (mode, expected) in [
             (OperatingMode::Home, "\"home\""),
@@ -1407,7 +1416,7 @@ mod tests {
 
     #[test]
     fn mining_pipeline_freshness_classifier_status_serializes_in_snake_case() {
-        // Five variants — pin each. `future_clock_skew` is a multi-word
+        // Five variants â€” pin each. `future_clock_skew` is a multi-word
         // variant that must serialize with the underscore.
         assert_eq!(
             serde_json::to_string(&MiningPipelineFreshnessClassifierStatus::Unavailable).unwrap(),
@@ -1450,7 +1459,7 @@ mod tests {
 
     #[test]
     fn freshness_classifier_default_is_unavailable() {
-        // Default is unavailable — fail-closed. A refactor that flipped
+        // Default is unavailable â€” fail-closed. A refactor that flipped
         // the default to Live would silently make every freshly-instantiated
         // snapshot appear as live telemetry.
         assert_eq!(
@@ -1487,7 +1496,7 @@ mod tests {
 
     #[test]
     fn recent_share_row_default_initializes_safely() {
-        // Default produces a minimal valid row with no share data — used
+        // Default produces a minimal valid row with no share data â€” used
         // when an event has not been observed yet. Pin the default state.
         let default = RecentShareRow::default();
         assert_eq!(default.timestamp_ms, 0);
@@ -1508,7 +1517,7 @@ mod tests {
 
     #[test]
     fn mining_pipeline_snapshot_default_safety_invariants() {
-        // The default state must be safe — read-only with no control
+        // The default state must be safe â€” read-only with no control
         // actions or hardware writes. Already partially pinned by Wave
         // 9 but explicitly redundant here to make the contract obvious.
         let snapshot = MiningPipelineSnapshot::default();
@@ -1534,7 +1543,7 @@ mod tests {
 
     #[test]
     fn eeprom_denylist_covers_full_am2_am3_range() {
-        // The 0x50..=0x57 range is ALL eight addresses inclusive — drop one and
+        // The 0x50..=0x57 range is ALL eight addresses inclusive â€” drop one and
         // the EEPROM corruption window opens. This pin makes that explicit.
         assert_eq!(EEPROM_WRITE_DENYLIST.len(), 8);
         for addr in 0x50..=0x57u16 {
@@ -1550,7 +1559,7 @@ mod tests {
     fn eeprom_denylist_excludes_pic_and_dac_addresses() {
         // 0x20/0x21/0x22 = dsPIC on am2/am3
         // 0x49/0x4A/0x4B = TAS5782M voltage DACs on S21
-        // 0x55/0x56/0x57 are PICs on S9 — the per-platform helper covers that.
+        // 0x55/0x56/0x57 are PICs on S9 â€” the per-platform helper covers that.
         for addr in [0x20u16, 0x21, 0x22, 0x49, 0x4A, 0x4B] {
             assert!(
                 !EEPROM_WRITE_DENYLIST.contains(&addr),

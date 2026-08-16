@@ -96,6 +96,30 @@ impl ImmersionConfig {
             ImmersionDecision::RefusedAirCooled
         }
     }
+
+    /// Decide immersion activation from a **declared cooling medium**
+    /// (Round-15 A3 cooling-medium axis). Pure additive bridge over
+    /// [`Self::decide`] — the existing platform-heuristic path is unchanged.
+    ///
+    /// Mapping is FAIL-CLOSED in the only safe direction
+    /// (`dcentrald_common::cooling_medium::fan_bypass_permitted`):
+    ///
+    /// - `Some(Hydro)` / `Some(Immersion)` — an explicitly declared
+    ///   external-loop medium — maps to "does not look air-cooled", so an
+    ///   `enabled` config activates without the air-cooled override.
+    /// - `Some(Air)` and **`None` (undeclared)** map to "looks air-cooled":
+    ///   the fan-management bypass is REFUSED unless the operator sets the
+    ///   explicit `acknowledge_air_cooled_override`. An undeclared medium
+    ///   must never silently earn the bypass — bypassing fan management on a
+    ///   real air-cooled board cooks it, while keeping fans managed on a
+    ///   fanless board is a harmless no-op.
+    pub fn decide_for_declared_medium(
+        &self,
+        declared: Option<dcentrald_common::cooling_medium::CoolingMedium>,
+    ) -> ImmersionDecision {
+        let looks_air_cooled = !dcentrald_common::cooling_medium::fan_bypass_permitted(declared);
+        self.decide(looks_air_cooled)
+    }
 }
 
 /// Outcome of [`ImmersionConfig::decide`]. The controller maps each variant to
@@ -183,6 +207,57 @@ mod tests {
         assert!(cfg.decide(true).fans_bypassed());
         // The acknowledgement does NOT change the non-air-cooled path.
         assert_eq!(cfg.decide(false), ImmersionDecision::Activated);
+    }
+
+    #[test]
+    fn declared_medium_bridge_fails_closed_on_undeclared_and_air() {
+        use dcentrald_common::cooling_medium::CoolingMedium;
+        let cfg = ImmersionConfig {
+            enabled: true,
+            acknowledge_air_cooled_override: false,
+        };
+        // Declared external-loop medium → activates (a genuine hydro rig).
+        assert_eq!(
+            cfg.decide_for_declared_medium(Some(CoolingMedium::Hydro)),
+            ImmersionDecision::Activated
+        );
+        assert_eq!(
+            cfg.decide_for_declared_medium(Some(CoolingMedium::Immersion)),
+            ImmersionDecision::Activated
+        );
+        // Declared Air → refused without the explicit acknowledgement.
+        assert_eq!(
+            cfg.decide_for_declared_medium(Some(CoolingMedium::Air)),
+            ImmersionDecision::RefusedAirCooled
+        );
+        // LOAD-BEARING: UNDECLARED medium → refused. An unknown medium must
+        // never silently earn the fan-management bypass.
+        assert_eq!(
+            cfg.decide_for_declared_medium(None),
+            ImmersionDecision::RefusedAirCooled
+        );
+        assert!(!cfg.decide_for_declared_medium(None).fans_bypassed());
+    }
+
+    #[test]
+    fn declared_medium_bridge_default_config_is_disabled_for_all_media() {
+        use dcentrald_common::cooling_medium::CoolingMedium;
+        // Air-cooled boards run the default (disabled) config: the bridge
+        // must be a no-op for every declared value — byte-identical to the
+        // pre-axis behaviour.
+        let cfg = ImmersionConfig::default();
+        for declared in [
+            None,
+            Some(CoolingMedium::Air),
+            Some(CoolingMedium::Hydro),
+            Some(CoolingMedium::Immersion),
+        ] {
+            assert_eq!(
+                cfg.decide_for_declared_medium(declared),
+                ImmersionDecision::Disabled
+            );
+            assert!(!cfg.decide_for_declared_medium(declared).fans_bypassed());
+        }
     }
 
     #[test]

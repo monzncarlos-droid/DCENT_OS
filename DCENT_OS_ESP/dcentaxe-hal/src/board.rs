@@ -1883,6 +1883,209 @@ pub enum TempSensorKind {
     Tmp451,
 }
 
+/// Source-level capability ceiling for a power, fan, or temperature kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentKindCapabilityState {
+    /// A driver exists, but the exact board revision and safe runtime
+    /// composition are admitted by the board profile/runtime path, not by the
+    /// enum identity.
+    SourceDriverModelScoped,
+    /// A driver exists only as optional per-revision enrichment; no shipping
+    /// row may treat the component as universally populated.
+    SourceDriverRevisionOptional,
+    /// Typed absence/fallback identity.
+    NoComponentFallback,
+}
+
+/// Exact, non-authorizing source capability record for one component kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentKindCapability {
+    pub component_kind: &'static str,
+    pub state: ComponentKindCapabilityState,
+    pub implementation: &'static str,
+    pub exact_board_revision_verified: bool,
+    pub catalog_runtime_authorized: bool,
+    pub catalog_mutation_authorized: bool,
+    pub catalog_thermal_trust_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for [`PowerControllerKind`].
+pub const POWER_CONTROLLER_KIND_CAPABILITIES: &[ComponentKindCapability] = &[
+    ComponentKindCapability {
+        component_kind: "None",
+        state: ComponentKindCapabilityState::NoComponentFallback,
+        implementation: "typed absence",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Tps546",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "power::Tps546",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Ds4432u",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "power::Ds4432u",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Tps5364x",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "power::Tps5364x",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+];
+
+/// Exhaustive capability ceiling for [`FanControllerKind`].
+pub const FAN_CONTROLLER_KIND_CAPABILITIES: &[ComponentKindCapability] = &[
+    ComponentKindCapability {
+        component_kind: "None",
+        state: ComponentKindCapabilityState::NoComponentFallback,
+        implementation: "typed absence",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Emc2101",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "fan::Emc2101",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Emc2103",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "fan::Emc2103",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Emc2302",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "fan::Emc2302",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+];
+
+/// Exhaustive capability ceiling for [`TempSensorKind`].
+pub const TEMP_SENSOR_KIND_CAPABILITIES: &[ComponentKindCapability] = &[
+    ComponentKindCapability {
+        component_kind: "None",
+        state: ComponentKindCapabilityState::NoComponentFallback,
+        implementation: "typed absence",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Emc2101",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "temp::Emc2101",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Tmp1075",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "temp::Tmp1075",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Emc2103",
+        state: ComponentKindCapabilityState::SourceDriverModelScoped,
+        implementation: "temp::Emc2103",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+    ComponentKindCapability {
+        component_kind: "Tmp451",
+        state: ComponentKindCapabilityState::SourceDriverRevisionOptional,
+        implementation: "tmp451_convert plus runtime mux enrichment",
+        exact_board_revision_verified: false,
+        catalog_runtime_authorized: false,
+        catalog_mutation_authorized: false,
+        catalog_thermal_trust_authorized: false,
+    },
+];
+
+#[cfg(test)]
+mod component_kind_capability_tests {
+    use super::*;
+
+    fn assert_non_authorizing(rows: &[ComponentKindCapability], expected_len: usize) {
+        assert_eq!(rows.len(), expected_len);
+        let kinds: std::collections::BTreeSet<&str> =
+            rows.iter().map(|row| row.component_kind).collect();
+        assert_eq!(kinds.len(), rows.len());
+        for row in rows {
+            assert!(!row.exact_board_revision_verified);
+            assert!(!row.catalog_runtime_authorized);
+            assert!(!row.catalog_mutation_authorized);
+            assert!(!row.catalog_thermal_trust_authorized);
+        }
+    }
+
+    #[test]
+    fn component_kind_capability_tables_are_exhaustive_and_non_authorizing() {
+        assert_non_authorizing(POWER_CONTROLLER_KIND_CAPABILITIES, 4);
+        assert_non_authorizing(FAN_CONTROLLER_KIND_CAPABILITIES, 4);
+        assert_non_authorizing(TEMP_SENSOR_KIND_CAPABILITIES, 5);
+
+        let tmp451 = TEMP_SENSOR_KIND_CAPABILITIES
+            .iter()
+            .find(|row| row.component_kind == "Tmp451")
+            .unwrap();
+        assert_eq!(
+            tmp451.state,
+            ComponentKindCapabilityState::SourceDriverRevisionOptional
+        );
+        for rows in [
+            POWER_CONTROLLER_KIND_CAPABILITIES,
+            FAN_CONTROLLER_KIND_CAPABILITIES,
+            TEMP_SENSOR_KIND_CAPABILITIES,
+        ] {
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.component_kind == "None")
+                    .unwrap()
+                    .state,
+                ComponentKindCapabilityState::NoComponentFallback
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DisplayKind {
     None,

@@ -320,6 +320,7 @@ pub fn hashboard_to_bm1362_sku(hb: Hashboard) -> Option<Bm1362HashboardSku> {
         | Hashboard::BhbS9 { .. }
         | Hashboard::BhbS11
         | Hashboard::BhbS17
+        | Hashboard::BhbS15
         | Hashboard::BhbT15 => return None,
     })
 }

@@ -318,7 +318,11 @@ fn pic_type_for_classified_sku(sku: Hashboard) -> Option<PicType> {
         // S9 hashboards — PIC16F1704.
         Hashboard::BhbS9 { .. } => Some(PicType::Pic16F1704),
         // Voltage-controller family not pinned by preamble alone.
-        Hashboard::Bhb42601 | Hashboard::BhbS11 | Hashboard::BhbS17 | Hashboard::BhbT15 => None,
+        Hashboard::Bhb42601
+        | Hashboard::BhbS11
+        | Hashboard::BhbS17
+        | Hashboard::BhbS15
+        | Hashboard::BhbT15 => None,
     }
 }
 
@@ -454,15 +458,15 @@ pub fn resolve_is_nopic_from_eeprom(declarative_nopic: bool, chain_slots: usize)
 /// [`dcentrald_api_types::hashboard_eeprom::observed_protocol_from_deployed_page`]
 /// (XXTEA + 3-region decode, proven byte-exact against four held real dumps).
 /// The daemon-side seam intentionally does NOT re-implement the SKU→identity
-/// mapping: a second resolver could drift from the two load-bearing invariants —
+/// mapping: a second resolver could drift from the load-bearing invariants —
 /// the `0x04`/BHB42xxx family (which spans BM1398 and BM1362) must never mint
-/// [`AsicProtocolIdentity::Bm1398`], and the cross-table-contradicted `BHB428xx`
-/// SKU must stay `None` (minting either family would route the board into the
-/// wrong voltage tables). Delegation keeps those invariants in one place.
+/// [`AsicProtocolIdentity::Bm1398`], and BHB428 may mint BM1362 only for the
+/// exact held-page-backed SKUs admitted upstream. Delegation keeps those
+/// invariants in one place.
 ///
 /// Read-only and side-effect free: it consumes bytes already read from the
 /// write-denylisted (`0x50..=0x57`) EEPROM, commands no hardware, and grants no
-/// admission by itself. A weak, absent, malformed, contradicted, or unvalidated
+/// admission by itself. A weak, absent, malformed, or unvalidated
 /// page yields `None`, which callers MUST treat as "do not admit" — never as a
 /// default family. The experimental opt-in + two-source `observed == required`
 /// check is applied separately by
@@ -1080,8 +1084,8 @@ mod tests {
     /// C1-U5 (2026-07-25): the daemon-side deployed-EEPROM identity seam
     /// delegates to the fail-closed api-types bridge and never mints an identity
     /// from a weak, absent, malformed, or garbage page. The positive SKU→identity
-    /// mapping (BHB426→Bm1362, BHB569→Bm1366, contradicted BHB428→None, and the
-    /// structural "never Bm1398") is authoritatively pinned upstream in
+    /// mapping (BHB426→Bm1362, exact page-backed BHB42701/42801/42831→Bm1362,
+    /// BHB569→Bm1366, and the structural "never Bm1398") is pinned upstream in
     /// `dcentrald_api_types::{deployed_eeprom, hashboard_eeprom}` and delegated —
     /// not re-implemented here — so this seam only re-verifies fail-closure.
     #[test]

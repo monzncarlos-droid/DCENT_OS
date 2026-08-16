@@ -41,7 +41,7 @@ for required_fixture in \
     log_s17_enumerated_144.txt \
     log_t17plus_enumerated_132.txt \
     status_enumerated_342.json \
-    status_s15_capture_84.json \
+    status_s15_held_guide_60.json \
     status_s17plus_enumerated_195.json \
     status_t17_enumerated_90.json \
     summary_accepted7.json \
@@ -120,15 +120,15 @@ assert_eq "enumerated: 342 (REST chips_enumerated)" \
     "342" "$(accept_parse_enumerated < "$FIX/status_enumerated_342.json")"
 assert_eq "enumerated: 189 (dcentrald log line)" \
     "189" "$(accept_parse_enumerated < "$FIX/log_enumerated_189.txt")"
-assert_eq "enumerated: 84 (S15 capture-first fixture)" \
-    "84" "$(accept_parse_enumerated < "$FIX/status_s15_capture_84.json")"
+assert_eq "enumerated: 60 (S15 held-guide host fixture)" \
+    "60" "$(accept_parse_enumerated < "$FIX/status_s15_held_guide_60.json")"
 assert_eq "enumerated: 144 (S17 fixture)" \
     "144" "$(accept_parse_enumerated < "$FIX/log_s17_enumerated_144.txt")"
-assert_eq "enumerated: 195 (S17+ BM1396 fixture)" \
+assert_eq "enumerated: 195 (S17+ BM1397 fixture)" \
     "195" "$(accept_parse_enumerated < "$FIX/status_s17plus_enumerated_195.json")"
 assert_eq "enumerated: 90 (T17 fixture)" \
     "90" "$(accept_parse_enumerated < "$FIX/status_t17_enumerated_90.json")"
-assert_eq "enumerated: 132 (T17+ BM1396 fixture)" \
+assert_eq "enumerated: 132 (T17+ BM1397 fixture)" \
     "132" "$(accept_parse_enumerated < "$FIX/log_t17plus_enumerated_132.txt")"
 assert_eq "enumerated: assignment-only AM3-BB total is not an observation" \
     "" "$(accept_parse_enumerated < "$FIX/log_am3_bb_enumerated_378.txt")"
@@ -187,7 +187,7 @@ v=$(accept_enum_verdict 340 342); rc=$?; assert_eq "enum 340~342 (in band)" "PAS
 v=$(accept_enum_verdict 28 342); rc=$?; assert_eq "enum 28<<342 (partial chain, FAIL)" "FAIL" "$v"; assert_rc "enum 28 rc" 1 "$rc"
 v=$(accept_enum_verdict 96 0); rc=$?; assert_eq "enum 96 vs UNCONFIRMED->CAPTURE" "CAPTURE" "$v"; assert_rc "enum capture rc" 0 "$rc"
 v=$(accept_enum_verdict 0 0); rc=$?; assert_eq "enum 0 vs UNCONFIRMED->FAIL" "FAIL" "$v"; assert_rc "enum 0/0 rc" 1 "$rc"
-v=$(accept_enum_verdict "$(accept_parse_enumerated < "$FIX/status_s15_capture_84.json")" 0); rc=$?; assert_eq "enum S15 capture fixture" "CAPTURE" "$v"; assert_rc "enum S15 capture rc" 0 "$rc"
+v=$(accept_enum_verdict "$(accept_parse_enumerated < "$FIX/status_s15_held_guide_60.json")" 0); rc=$?; assert_eq "enum S15 held-guide fixture" "CAPTURE" "$v"; assert_rc "enum S15 held-guide rc" 0 "$rc"
 v=$(accept_enum_verdict "$(accept_parse_enumerated < "$FIX/log_s17_enumerated_144.txt")" 144); rc=$?; assert_eq "enum S17 144 fixture" "PASS" "$v"; assert_rc "enum S17 fixture rc" 0 "$rc"
 v=$(accept_enum_verdict "$(accept_parse_enumerated < "$FIX/status_s17plus_enumerated_195.json")" 195); rc=$?; assert_eq "enum S17+ 195 fixture" "PASS" "$v"; assert_rc "enum S17+ fixture rc" 0 "$rc"
 v=$(accept_enum_verdict "$(accept_parse_enumerated < "$FIX/status_t17_enumerated_90.json")" 90); rc=$?; assert_eq "enum T17 90 fixture" "PASS" "$v"; assert_rc "enum T17 fixture rc" 0 "$rc"

@@ -152,16 +152,20 @@ else
     exit 1
 fi
 
-# Install dcentos-init as /sbin/init if present
+# A single, known PID 1 contract is required for AM2 artifacts.  BusyBox init
+# follows a different runlevel path and must never be an implicit fallback.
 DCENTOS_INIT="${BR2_EXTERNAL_DCENTOS_PATH}/../dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentos-init"
 if [ -f "$DCENTOS_INIT" ]; then
     rm -f "${TARGET_DIR}/sbin/init" 2>/dev/null || true
     cp "$DCENTOS_INIT" "${TARGET_DIR}/sbin/init"
     chmod 755 "${TARGET_DIR}/sbin/init"
     echo "DCENTos post-build (am2-s19pro): installed dcentos-init as /sbin/init"
+    mkdir -p "${TARGET_DIR}/etc/dcentos"
+    sha256sum "$DCENTOS_INIT" | cut -d' ' -f1 > "${TARGET_DIR}/etc/dcentos/dcentos-init.sha256"
 else
-    echo "DCENTos post-build (am2-s19pro): WARNING: dcentos-init not found at $DCENTOS_INIT"
-    echo "  BusyBox init will be used (requires CONFIG_INIT=y in busybox.config)"
+    echo "DCENTos post-build (am2-s19pro): ERROR: dcentos-init not found at $DCENTOS_INIT" >&2
+    echo "  Refusing to ship an AM2 image with an unstaged PID 1." >&2
+    exit 1
 fi
 
 # -----------------------------------------------------------------------------

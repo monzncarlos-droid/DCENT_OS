@@ -14,23 +14,17 @@ protocol = "sv1"
 [mining]
 enabled = false
 model = "t15"
-frequency_mhz = 500
-voltage_mv = 12000
+# Exact T15 geometry, setpoints, and controller endpoint are unheld.
+frequency_mhz = 0
+voltage_mv = 0
 version_rolling = false
 passthrough = false
 suggest_difficulty = 256
-serial_device = "/dev/ttyS1"
-serial_chip_count = 63
 serial_chip_type = "BM1391"
 
 [power]
 mode = "bypass"
-target_watts = 900
-
-[power.psu_override]
-enabled = false
-model = "APW3"
-voltage_v = 12.8
+target_watts = 0
 
 [thermal]
 target_temp_c = 60

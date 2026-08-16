@@ -48,6 +48,8 @@ BR2_TARGET_ROOTFS_SQUASHFS=y
 BR2_TARGET_ROOTFS_SQUASHFS_BS_1024K=y
 BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
 BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
 # Drop eudev's desktop hardware database (~1.34 MiB) — USB/PCI/input metadata that
 # no miner uses; zero references in overlays/scripts; udevd itself keeps running.
 # BR2_PACKAGE_EUDEV_ENABLE_HWDB is not set

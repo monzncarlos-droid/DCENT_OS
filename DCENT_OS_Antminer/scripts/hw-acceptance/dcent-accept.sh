@@ -375,7 +375,7 @@ artifact_install_contract_for() {
     _install_contract=$(printf '%s\n' "$_producer_row" |
         sed -n 's/^.*"install_contract":"\([^"]*\)"}.*$/\1/p')
     case "$_install_contract" in
-        managed_s9_install|guarded_am2_self_update|guarded_amlogic_rootfs_window|external_media)
+        managed_s9_install|guarded_am2_self_update|guarded_amlogic_rootfs_window|external_media|package_only_denied)
             printf '%s\n' "$_install_contract"
             ;;
         *)
@@ -399,9 +399,31 @@ install_hint_policy_allows() {
     fi
     _policy_row=$(grep -F "$_policy_needle" "$ENABLEMENT_MATRIX")
     case "$_policy_row" in
-        *'"install_authorization":"denied"'*|*'"artifact_kind":"none"'*)
+        *'"install_authorization":"denied"'*)
             info "PERSISTENT INSTALL REFUSED for $SKU ($BOARD_TARGET)"
-            say "  The typed hardware matrix denies install and declares no artifact for $_policy_target."
+            _denied_contract=$(artifact_install_contract_for "$_policy_target" 2>/dev/null || true)
+            if [ "$_denied_contract" = "package_only_denied" ]; then
+                _denied_artifact=$(artifact_filename_for "$_policy_target") || return $?
+                say "  Offline package-only artifact: output/$_denied_artifact"
+                say "  Contract: package_only_denied; no dcent install, update, upload, reboot, or device write is authorized."
+                say "  Validate the package on the host only; cold boot, rollback, and accepted-share proof remain required."
+            else
+                case "$_policy_row" in
+                    *'"artifact_kind":"none"'*)
+                        say "  The typed hardware matrix denies install and declares no artifact for $_policy_target."
+                        say "  This route is management/diagnostic only; do not infer an install image from its SoC family."
+                        ;;
+                    *)
+                        say "  The typed hardware matrix denies install for $_policy_target."
+                        say "  This route is management/diagnostic only; do not infer install authority from an artifact kind or SoC family."
+                        ;;
+                esac
+            fi
+            return 1
+            ;;
+        *'"artifact_kind":"none"'*)
+            info "PERSISTENT INSTALL REFUSED for $SKU ($BOARD_TARGET)"
+            say "  The typed hardware matrix declares no artifact for $_policy_target."
             say "  This route is management/diagnostic only; do not infer an install image from its SoC family."
             return 1
             ;;

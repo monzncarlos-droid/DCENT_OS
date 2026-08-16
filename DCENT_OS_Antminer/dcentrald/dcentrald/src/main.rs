@@ -28,6 +28,7 @@ mod am2_chain_plan;
 mod am3_bb_mining;
 mod asic_identity_publication;
 mod autotune;
+mod board_sensor_coverage;
 mod bounded_nonblocking_probe;
 mod bridge_glue;
 mod bringup;
@@ -45,6 +46,7 @@ mod logging;
 mod metrics_export;
 mod model;
 mod persistent_log_ring;
+mod pic_firmware_snapshot;
 mod restart;
 mod runtime;
 mod runtime_execution;
@@ -53,6 +55,7 @@ mod s19j_hybrid_admission;
 mod s19j_hybrid_mining;
 mod s19j_tap_mining;
 mod serial_mining;
+mod s19k_braiins_wire_try;
 #[cfg(feature = "sim-hal")]
 mod sim_runtime;
 mod solar;
@@ -67,7 +70,7 @@ mod work_ledger;
 use anyhow::{Context, Result};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::DcentraldConfig;
 use crate::daemon::Daemon;
@@ -75,7 +78,6 @@ use crate::logging::init_logging;
 use crate::s19j_hybrid_mining::S19jHybridMiner;
 use crate::s19j_tap_mining::S19jTapMiner;
 use crate::serial_mining::SerialMiner;
-use crate::stock_mining::StockMiner;
 
 /// Default configuration file path (persistent storage).
 const DEFAULT_CONFIG_PATH: &str = "/data/dcentrald.toml";
@@ -1428,6 +1430,44 @@ fn selected_runtime_dispatch(
     }
 }
 
+/// Build declaration-only authority for the exact stock S9 candidate lane.
+///
+/// This function is intentionally not called by `run_main`: the top-level
+/// `RuntimeDispatchKind::StockFpga` route remains fail-closed until the HAL can
+/// mint a retained-lease live carrier receipt and the runtime gains real
+/// thermal ownership. Keeping this wrapper here pins the selected-dispatch
+/// provenance instead of allowing a Boolean in lower-level code to stand in
+/// for `RuntimeDispatchKind`.
+fn admit_stock_fpga_declared_route(
+    board_desc: Option<&dcentrald_common::BoardDesc>,
+    dispatch: RuntimeDispatchKind,
+    configured_or_observed_asic: Option<dcentrald_common::AsicProtocolIdentity>,
+    nonce2_beta_enabled: bool,
+    all_pool_routes_v1: bool,
+    passthrough_enabled: bool,
+) -> std::result::Result<
+    dcentrald_common::stock_fpga_carrier_preflight::StockFpgaDeclaredRouteAdmission,
+    String,
+> {
+    use dcentrald_common::stock_fpga_carrier_preflight::{
+        admit_stock_fpga_declared_route as admit_declared_route, StockFpgaDeclaredRouteRequest,
+    };
+
+    let board_desc = board_desc
+        .ok_or_else(|| "stock FPGA declared route requires a registered BoardDesc".to_string())?;
+    admit_declared_route(StockFpgaDeclaredRouteRequest {
+        explicit_stock_fpga_dispatch: dispatch == RuntimeDispatchKind::StockFpga,
+        board_desc,
+        configured_or_observed_asic,
+        requested_transport: dcentrald_common::ChainTransportKind::StockFpga,
+        requested_work_engine: dcentrald_common::WorkEngineKind::StockDma,
+        nonce2_beta_enabled,
+        all_pool_routes_v1,
+        passthrough_enabled,
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn admit_board_desc_runtime_dispatch(
     board_desc: Option<&dcentrald_common::BoardDesc>,
     dispatch: RuntimeDispatchKind,
@@ -1580,9 +1620,21 @@ mod board_desc_runtime_dispatch_tests {
                 recovery_maturity: dcentrald_common::RecoveryMaturity::NotImplemented,
                 artifact_kind: dcentrald_common::ArtifactKind::RuntimeBundle,
                 artifact_maturity: dcentrald_common::ArtifactMaturity::Experimental,
+                external_media_mode: dcentrald_common::ExternalMediaMode::None,
+                external_media_maturity: dcentrald_common::ExternalMediaMaturity::NotImplemented,
+                external_media_authorization: dcentrald_common::InstallAuthorization::Denied,
             },
             public_beta_install: false,
             mining_default_enabled: false,
+            // Round-16 B5: cooling medium is undeclared (fail-closed — never
+            // earns the fan-management bypass) and the ladder is the
+            // forced-air canonical one, so fans stay managed on a board whose
+            // medium nobody has evidenced.
+            cooling_medium: None,
+            cut_ladder: dcentrald_common::cooling_medium::CANONICAL_FORCED_AIR_LADDER,
+            // Fail-closed: a fabricated capture-first row must never borrow
+            // another SKU's thermal-supervisor lane.
+            supervisor_class: dcentrald_common::board_desc::SupervisorClass::Unclassified,
             // Fail-closed placeholder for fabricated future targets: nothing
             // is captured, so nothing may claim a lane.
             runtime_status: dcentrald_common::RuntimeStatus::CaptureFirst {
@@ -1800,9 +1852,17 @@ mod board_desc_runtime_dispatch_tests {
                 recovery_maturity: dcentrald_common::RecoveryMaturity::NotImplemented,
                 artifact_kind: dcentrald_common::ArtifactKind::RuntimeBundle,
                 artifact_maturity: dcentrald_common::ArtifactMaturity::Experimental,
+                external_media_mode: dcentrald_common::ExternalMediaMode::None,
+                external_media_maturity: dcentrald_common::ExternalMediaMaturity::NotImplemented,
+                external_media_authorization: dcentrald_common::InstallAuthorization::Denied,
             },
             public_beta_install: false,
             mining_default_enabled: false,
+            // Round-16 B5: undeclared medium + forced-air ladder (fans stay
+            // managed); no borrowed thermal-supervisor lane.
+            cooling_medium: None,
+            cut_ladder: dcentrald_common::cooling_medium::CANONICAL_FORCED_AIR_LADDER,
+            supervisor_class: dcentrald_common::board_desc::SupervisorClass::Unclassified,
             // Fail-closed placeholder for a fabricated future target.
             runtime_status: dcentrald_common::RuntimeStatus::CaptureFirst {
                 unconfirmed: &["test-only scaffold row; no datums captured"],
@@ -1918,6 +1978,46 @@ mod board_desc_runtime_dispatch_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stock_declared_route_is_exact_but_never_opens_top_level_runtime() {
+        use dcentrald_common::{AsicProtocolIdentity, ChainTransportKind, WorkEngineKind};
+
+        let s9 = dcentrald_common::BoardDesc::lookup("am1-s9").expect("registered S9");
+        let declared = admit_stock_fpga_declared_route(
+            Some(s9),
+            RuntimeDispatchKind::StockFpga,
+            Some(AsicProtocolIdentity::Bm1387),
+            true,
+            true,
+            true,
+        )
+        .expect("exact declaration-only stock overlay");
+        assert_eq!(declared.board_target(), "am1-s9");
+        assert_eq!(declared.asic_protocol(), AsicProtocolIdentity::Bm1387);
+        assert_eq!(declared.transport(), ChainTransportKind::StockFpga);
+        assert_eq!(declared.work_engine(), WorkEngineKind::StockDma);
+
+        // Declaration evidence is not a live carrier receipt. The actual
+        // top-level ownership gate remains closed for the same exact row.
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(s9),
+            RuntimeDispatchKind::StockFpga,
+            true,
+            Some(AsicProtocolIdentity::Bm1387),
+        )
+        .is_err());
+
+        assert!(admit_stock_fpga_declared_route(
+            Some(s9),
+            RuntimeDispatchKind::StandardDaemon,
+            Some(AsicProtocolIdentity::Bm1387),
+            true,
+            true,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
@@ -2086,7 +2186,6 @@ mod board_desc_runtime_dispatch_tests {
             "S19jTapMiner::new(",
             "S19jHybridMiner::new(",
             "SerialMiner::new(",
-            "StockMiner::new(",
             "Daemon::new(",
         ] {
             let constructor = run_body
@@ -2097,6 +2196,24 @@ mod board_desc_runtime_dispatch_tests {
                 "admission must precede {constructor}"
             );
         }
+        assert!(
+            !run_body.contains("StockMiner::new("),
+            "top-level stock construction stays impossible until HAL can mint the live retained-lease receipt"
+        );
+        assert!(
+            !run_body.contains("admit_stock_fpga_declared_route("),
+            "declaration-only stock admission must not be wired into run_main"
+        );
+        assert!(STOCK_SOURCE.contains("StockFpgaDeclaredRouteAdmission"));
+        assert!(STOCK_SOURCE.contains("StockFpgaCarrierPreflightReceipt"));
+        let stock_constructor = &STOCK_SOURCE[STOCK_SOURCE
+            .find("pub fn new(")
+            .expect("StockMiner constructor")
+            ..STOCK_SOURCE
+                .find("pub async fn run")
+                .expect("StockMiner run")];
+        assert!(stock_constructor.contains("StockFpgaDeclaredRouteAdmission"));
+        assert!(stock_constructor.contains("StockFpgaCarrierPreflightReceipt"));
 
         let identity_capture = run_body
             .find("capture_system_platform_identity()")
@@ -2390,7 +2507,7 @@ async fn run_main() -> Result<()> {
     // `am3-bb-s19jpro` or the device-tree model is an `S19J_IO_BOARD`.
     // See DCENT_OS_Antminer/dcentrald/dcentrald/src/am3_bb_mining.rs.
     let am3_bb_cli = args.iter().any(|a| a == "--am3-bb-mining");
-    let platform_identity = crate::daemon::capture_system_platform_identity()?;
+    let mut platform_identity = crate::daemon::capture_system_platform_identity()?;
     let am3_bb_auto = platform_identity.board_target() == "am3-bb-s19jpro";
     let am3_bb_mode = am3_bb_cli || am3_bb_auto;
 
@@ -2460,6 +2577,9 @@ async fn run_main() -> Result<()> {
             }
         }
     };
+    platform_identity.apply_config_platform_declaration(&config.platform);
+    crate::daemon::exercise_s19k_nopic_config_admission(&platform_identity, &config);
+
     // Runtime-only acceptance is a process policy. Redirect the operator's
     // configured autotuner root as well as its default so no opted-in tuner can
     // persist profiles beneath /data while the ephemeral launcher is active.
@@ -2479,6 +2599,10 @@ async fn run_main() -> Result<()> {
     if let Err(e) = init_logging(&config.general.log_level) {
         eprintln!("dcentrald: logging init failed ({e:#}) — continuing without configured logging");
     }
+
+    // Braiins Track-1 mining-off wire try: env-gated, after logging so
+    // S19K_BRAIINS_WIRE_TRY lines are visible. Does not flip engine CURRENT.
+    crate::s19k_braiins_wire_try::maybe_run_s19k_braiins_wire_try(&platform_identity, &config);
 
     // W1.4: install the process-wide log-tail mask flag from [logging].
     // Default (true) masks wallet addresses on `/api/debug/log` responses.
@@ -3407,50 +3531,41 @@ async fn run_main() -> Result<()> {
     } else if stock_fpga_mode {
         // Stock Bitmain FPGA mining path — uses /dev/axi_fpga_dev + /dev/fpga_mem
         // No BraiinsOS boot components or UIO devices required
-        info!("Entering STOCK FPGA mining mode (--stock-fpga)");
+        info!("Stock FPGA mode requested; live mining remains admission-gated (--stock-fpga)");
 
-        // F5 parity (no-brick first-boot): a fresh/unconfigured unit must NOT
-        // energize the hash-board voltage rail. StockMiner::run() drives
-        // i2c.set_voltage()/enable_voltage() on every detected chain with no
-        // internal gate, so apply the SAME mining_start_enabled() gate the
-        // s19j-hybrid / serial / am3-bb / default-daemon arms already use:
-        // bring the dashboard/CGMiner API up and park management-only when
-        // mining is not explicitly enabled with a configured pool. When mining
-        // IS enabled the gate passes and the energize path below is unchanged.
-        if !config.mining_start_enabled() {
-            let (_runtime_health_tx, runtime_health_rx) =
-                tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
-                    dcentrald_api::RuntimeHealthMode::Native,
-                ));
-            let _api_handles = crate::runtime::api::spawn_proxy_mode_api(
-                config.clone(),
+        // F5 no-brick posture: this branch remains management-only whether or
+        // not mining was requested. Declaration evidence alone must never
+        // reach the dormant rail-owning StockMiner implementation.
+        // The declaration-only am1-s9/BM1387/StockDma token is implemented,
+        // but it is not live carrier authority. HAL intentionally exposes no
+        // issuer for StockFpgaCarrierPreflightReceipt until one retained
+        // stock-S9 FPGA-IIC fabric lease, a read-only C5 probe, exact
+        // conflicting clean-image chain-UIO exclusion, and inherited
+        // DMA-layout validation are wired. Thermal
+        // supervision is also not owned by this lane. Keep every API mutation
+        // closed and do not construct StockMiner.
+        warn!(
+            "stock FPGA runtime remains NOT-ADMITTED: offline declared-route policy exists, but live retained-lease carrier and thermal receipts cannot be minted"
+        );
+        let (_runtime_health_tx, runtime_health_rx) =
+            tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
                 dcentrald_api::RuntimeHealthMode::Native,
-                Some(runtime_health_rx),
-                shutdown_token.clone(),
-            )
-            .await?;
-            // stock-fpga is am1-s9 class — no am2 quiet-idle tuple (None).
-            return enter_management_only_idle(
-                "stock-fpga",
-                config.mining.enabled,
-                config.has_configured_pool(),
-                shutdown_token.clone(),
-            )
-            .await;
-        }
-
-        let mut miner = StockMiner::new(config, shutdown_token.clone());
-
-        match miner.run().await {
-            Ok(()) => {
-                info!("dcentrald (stock FPGA) stopped cleanly");
-                Ok(())
-            }
-            Err(e) => {
-                error!(error = %e, "dcentrald (stock FPGA) exited with error");
-                Err(e)
-            }
-        }
+            ));
+        let _api_handles = crate::runtime::api::spawn_proxy_mode_api_with_hardware_mutation_gate(
+            config.clone(),
+            dcentrald_api::RuntimeHealthMode::Native,
+            Some(runtime_health_rx),
+            dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+            shutdown_token.clone(),
+        )
+        .await?;
+        enter_management_only_idle(
+            "stock-fpga-not-admitted",
+            config.mining.enabled,
+            config.has_configured_pool(),
+            shutdown_token.clone(),
+        )
+        .await
     } else {
         // BraiinsOS FPGA mining path — uses UIO devices + per-chain FIFOs
         // (S9/am1 + am2-s17 Zynq). The typed lifecycle returns an opaque

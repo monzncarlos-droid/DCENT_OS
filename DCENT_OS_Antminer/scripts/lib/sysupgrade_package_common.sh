@@ -167,6 +167,14 @@ dcent_require_toolbox_install_contract() {
     _dcent_toolbox_command=$1
     _dcent_toolbox_install_mode=$2
 
+    if [ "$_dcent_toolbox_install_mode" = "package_only_denied" ]; then
+        if [ -n "$_dcent_toolbox_command" ]; then
+            echo "ERROR: package-only denied metadata must not advertise an install command" >&2
+            return 1
+        fi
+        return 0
+    fi
+
     case "$_dcent_toolbox_command" in
         "dcent install <ip> -f "*) ;;
         *)
@@ -216,10 +224,77 @@ dcent_require_toolbox_install_contract() {
     return 0
 }
 
+dcent_require_toolbox_update_contract() {
+    _dcent_toolbox_command=$1
+    _dcent_toolbox_install_mode=$2
+
+    if [ "$_dcent_toolbox_install_mode" = "package_only_denied" ]; then
+        if [ -n "$_dcent_toolbox_command" ]; then
+            echo "ERROR: package-only denied metadata must not advertise an update command" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    # An update command is either the single-unit install form or the fleet
+    # OTA form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
+    # rail fans out over create_install_plan/execute_install with identical
+    # gates). Anything else is not target-bound toolbox metadata.
+    case "$_dcent_toolbox_command" in
+        "dcent install <ip> -f "*|"dcent ota update-fleet <ip> -f "*) ;;
+        *)
+            echo "ERROR: toolbox update metadata is not a target-bound dcent install/ota update-fleet command" >&2
+            return 1
+            ;;
+    esac
+    if dcent_toolbox_command_has_token "$_dcent_toolbox_command" "--yes"; then
+        echo "ERROR: toolbox update metadata must preserve interactive confirmation" >&2
+        return 1
+    fi
+
+    case "$_dcent_toolbox_install_mode" in
+        host_driven_rootfs_window_lab)
+            if ! dcent_toolbox_command_has_token "$_dcent_toolbox_command" "--artifact-dir"; then
+                echo "ERROR: Amlogic update metadata must require restore-verified --artifact-dir evidence" >&2
+                return 1
+            fi
+            if dcent_toolbox_command_has_token \
+                "$_dcent_toolbox_command" "--accept-vnish-aml-rootfs-window"; then
+                echo "ERROR: package metadata must not pre-acknowledge the VNish-source safety gate" >&2
+                return 1
+            fi
+            ;;
+        target_sysupgrade)
+            case "${BOARD_NAME:-}" in
+                am2-*)
+                    for _dcent_toolbox_required_arg in \
+                        --artifact-dir \
+                        --accept-am2-persistent-lab \
+                        --i-have-recovery
+                    do
+                        if ! dcent_toolbox_command_has_token \
+                            "$_dcent_toolbox_command" "$_dcent_toolbox_required_arg"; then
+                            echo "ERROR: AM2 update metadata omits required $_dcent_toolbox_required_arg gate" >&2
+                            return 1
+                        fi
+                    done
+                    ;;
+            esac
+            ;;
+        *)
+            echo "ERROR: unsupported toolbox install mode: $_dcent_toolbox_install_mode" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 dcent_write_sysupgrade_manifest() {
     dcent_require_release_image_hardening
     dcent_release_provenance_init
-    install_command="${DCENT_TOOLBOX_INSTALL_COMMAND:-dcent install <ip> -f dcentos-sysupgrade.tar}"
+    # `-` (not `:-`) intentionally preserves an explicit empty value for
+    # package-only artifacts whose hardware installation authority is denied.
+    install_command="${DCENT_TOOLBOX_INSTALL_COMMAND-dcent install <ip> -f dcentos-sysupgrade.tar}"
     update_command="${DCENT_TOOLBOX_UPDATE_COMMAND-$install_command}"
     upload_endpoint="${DCENT_TOOLBOX_UPLOAD_ENDPOINT:-null}"
     board_target_header="${DCENT_TOOLBOX_BOARD_TARGET_HEADER:-null}"
@@ -227,10 +302,30 @@ dcent_write_sysupgrade_manifest() {
     install_mode="${DCENT_TOOLBOX_INSTALL_MODE:-target_sysupgrade}"
     target_side_sysupgrade="${DCENT_TARGET_SIDE_SYSUPGRADE:-true}"
     package_status="${DCENT_PACKAGE_STATUS:-release}"
+    installable="${DCENT_PACKAGE_INSTALLABLE:-true}"
+    case "$installable" in
+        true|false) ;;
+        *)
+            echo "ERROR: DCENT_PACKAGE_INSTALLABLE must be true or false" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$install_mode" = "package_only_denied" ] && [ "$installable" != "false" ]; then
+        echo "ERROR: package_only_denied requires DCENT_PACKAGE_INSTALLABLE=false" >&2
+        exit 1
+    fi
     manifest_profile=$(dcent_sysupgrade_manifest_profile) || exit 1
     dcent_require_toolbox_install_contract "$install_command" "$install_mode" || exit 1
     if [ -n "$update_command" ]; then
-        dcent_require_toolbox_install_contract "$update_command" "$install_mode" || exit 1
+        dcent_require_toolbox_update_contract "$update_command" "$install_mode" || exit 1
+    fi
+    install_command_json=null
+    update_command_json=null
+    if [ -n "$install_command" ]; then
+        install_command_json="\"${install_command}\""
+    fi
+    if [ -n "$update_command" ]; then
+        update_command_json="\"${update_command}\""
     fi
 
     verification_block=""
@@ -265,7 +360,7 @@ dcent_write_sysupgrade_manifest() {
   "product": "DCENT_OS",
   "family": "antminer",
   "package_type": "sysupgrade",
-  "installable": true,
+  "installable": ${installable},
   "artifact_maturity": "experimental",
   "board_family": "${BOARD_FAMILY}",
   "board": "${BOARD_NAME}",
@@ -301,8 +396,8 @@ dcent_write_sysupgrade_manifest() {
     }${verification_block}${extra_payload_block}
   },
   "toolbox": {
-    "install_command": "${install_command}",
-    "update_command": "${update_command}",
+    "install_command": ${install_command_json},
+    "update_command": ${update_command_json},
     "upload_endpoint": ${upload_endpoint},
     "board_target_header": ${board_target_header},
     "requires_inactive_slot": ${requires_inactive_slot},

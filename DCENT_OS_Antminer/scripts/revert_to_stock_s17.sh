@@ -16,7 +16,8 @@
 #     with 3 physical hashboard slots populated)
 #   - ASIC: BM1397+ (3 chains × 48 chips × 672 cores)
 #   - Voltage: dsPIC33EP16GS202 framed protocol at I2C 0x20/0x21/0x22
-#   - PSU: APW-class with PMBus telemetry
+#   - PSU: APW9-class proprietary framed I2C at address 0x10; no DCENT_OS
+#     telemetry/control backend (stock restore does not exercise that path)
 #
 # Sysupgrade NAND layout (DCENT_OS Buildroot, mirrors S9 am1):
 #   /dev/mtd4 = U-Boot env

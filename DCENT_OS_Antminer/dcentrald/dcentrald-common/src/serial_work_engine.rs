@@ -300,6 +300,13 @@ impl AsicJobIdCursor {
         Self::with_mask(0, step, 0x7F)
     }
 
+    /// S19k Braiins fill: midstates=1 ⇒ log 0 ⇒ UART registry `0x100>>0=256`,
+    /// job_id=work_id identity (can emit 2). ESP `+8`/`0xF8` is a different
+    /// dialect (`S19K_WIRE_JOB_ID_STEP`); do not shrink this cursor to 16 slots.
+    pub fn s19k_braiins_fill() -> Self {
+        Self::with_mask(0, 1, 0xFF)
+    }
+
     pub fn current(self) -> u8 {
         self.current
     }
@@ -428,6 +435,15 @@ impl SerialMiningEngineBookkeeping {
     pub fn serial_mining(job_id_step: u8) -> Self {
         Self {
             job_ids: AsicJobIdCursor::serial_mining(job_id_step),
+            seen: GenerationSeenShareSet::serial_mining_defaults(),
+            dispatch_generation: 0,
+        }
+    }
+
+    /// Braiins Track-1 fill: sequential work_id 0..255 (`0x100 >> log0`).
+    pub fn s19k_braiins_fill() -> Self {
+        Self {
+            job_ids: AsicJobIdCursor::s19k_braiins_fill(),
             seen: GenerationSeenShareSet::serial_mining_defaults(),
             dispatch_generation: 0,
         }
@@ -771,7 +787,8 @@ pub fn plan_serial_bring_up(
     use crate::asic_protocol::admit_protocol_over_transport;
     use crate::chain_transport::{
         admit_transport_op, plan_bm1397plus_chain_inactive_burst,
-        plan_bm1397plus_full_population_address_ladder, protocol_speaks_bm1397plus_commands,
+        plan_bm1397plus_full_population_address_ladder, plan_bm1397plus_set_address_ladder,
+        protocol_speaks_bm1397plus_commands,
         TransportOp,
     };
 
@@ -820,9 +837,16 @@ pub fn plan_serial_bring_up(
 
     // Full-population address ladder when chip_count known.
     if params.chip_count > 0 {
-        ops.extend(plan_bm1397plus_full_population_address_ladder(
-            params.chip_count,
-        ));
+        if plugin == SerialBringUpPluginKind::AmlogicBm1366 {
+            ops.extend(plan_bm1397plus_set_address_ladder(
+                params.chip_count,
+                crate::s19k_bm1366_wire_b::S19K_AML_ADDR_INTERVAL,
+            ));
+        } else {
+            ops.extend(plan_bm1397plus_full_population_address_ladder(
+                params.chip_count,
+            ));
+        }
     }
 
     // PLL is intentionally not expanded offline.
@@ -1177,6 +1201,27 @@ mod tests {
     }
 
     #[test]
+    fn job_cursor_s19k_braiins_fill_is_sequential_u8() {
+        let mut c = AsicJobIdCursor::s19k_braiins_fill();
+        assert_eq!(c.step(), 1);
+        assert_eq!(c.mask(), 0xFF);
+        assert_eq!(c.take_and_advance(), 0);
+        assert_eq!(c.take_and_advance(), 1);
+        assert_eq!(c.take_and_advance(), 2);
+        let mut wrap = AsicJobIdCursor::with_mask(255, 1, 0xFF);
+        assert_eq!(wrap.take_and_advance(), 255);
+        assert_eq!(wrap.take_and_advance(), 0);
+        let mut bk = SerialMiningEngineBookkeeping::s19k_braiins_fill();
+        assert_eq!(bk.take_dispatch().job_id, 0);
+        assert_eq!(bk.take_dispatch().job_id, 1);
+        assert_ne!(
+            c.step(),
+            crate::s19k_bm1366_wire_b::S19K_WIRE_JOB_ID_STEP,
+            "ESP/wire step-8 is not the Braiins fill cursor"
+        );
+    }
+
+    #[test]
     fn clean_jobs_resets_bookkeeping() {
         let mut bk = SerialWorkBookkeeping::hybrid_defaults();
         bk.history.push(
@@ -1466,6 +1511,40 @@ mod tests {
                 Some(&TransportOp::SendSetAddressBm1397Plus { addr: 3 })
             );
         }
+    }
+
+    #[test]
+    fn amlogic_bm1366_bring_up_uses_aml_interval_2_not_public_floor_3() {
+        use crate::board_desc::ChainTransportKind;
+        use crate::chain_transport::TransportOp;
+
+        let plan = plan_serial_bring_up(
+            SerialBringUpPluginKind::AmlogicBm1366,
+            ChainTransportKind::Serial,
+            &SerialBringUpPlanParams {
+                chip_count: 77,
+                frequency_mhz: 0,
+                chain_inactive_count: 1,
+                inactive_dwell_ms: 0,
+                post_enum_delay_ms: 0,
+            },
+        )
+        .expect("s19k plan");
+        let addrs: Vec<u8> = plan
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                TransportOp::SendSetAddressBm1397Plus { addr } => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs.len(), 77);
+        assert_eq!(addrs[0], 0);
+        assert_eq!(addrs[1], 2);
+        assert_ne!(addrs[1], 3);
+        assert_eq!(addrs[76], 152);
+        assert_eq!(crate::s19k_bm1366_wire_b::S19K_AML_ADDR_INTERVAL, 2);
+        assert_eq!(crate::s19k_bm1366_wire_b::S19K_PUBLIC_ADDR_INTERVAL, 3);
     }
 
     #[test]
@@ -1897,12 +1976,17 @@ mod tests {
             .expect("read stock_fpga_work");
         let dispatch = {
             let start = hal.find("pub fn dispatch_work(").expect("dispatch_work");
-            &hal[start..start + 2_500]
+            let end = hal[start..]
+                .find("pub fn dispatch_work_asicboost")
+                .map(|offset| start + offset)
+                .expect("dispatch_work_asicboost");
+            &hal[start..end]
         };
         assert!(
-            dispatch.contains("self.job_id = self.job_id.wrapping_add(1)")
-                && dispatch.contains("write_reg(REG_JOB_ID, self.job_id)"),
-            "HAL dispatch_work must post-inc then write REG_JOB_ID"
+            dispatch.contains("let next_job_id = self.job_id.wrapping_add(1)")
+                && dispatch.contains("write_reg(REG_JOB_ID, next_job_id)")
+                && dispatch.contains("self.job_id = next_job_id"),
+            "HAL dispatch_work must derive, publish, then retain the next REG_JOB_ID"
         );
         // Return value is bare `self.job_id` (not a different counter).
         let return_idx = dispatch
@@ -1916,10 +2000,10 @@ mod tests {
         );
         // Ordering pin: wrapping_add before write_reg(REG_JOB_ID).
         let add_pos = dispatch
-            .find("self.job_id = self.job_id.wrapping_add(1)")
+            .find("let next_job_id = self.job_id.wrapping_add(1)")
             .expect("post-inc");
         let write_pos = dispatch
-            .find("write_reg(REG_JOB_ID, self.job_id)")
+            .find("write_reg(REG_JOB_ID, next_job_id)")
             .expect("REG_JOB_ID write");
         assert!(
             add_pos < write_pos,

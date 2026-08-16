@@ -103,30 +103,6 @@ manifest_integer_field() {
     sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*[,}].*/\1/p' "$file" | head -n 1
 }
 
-manifest_payload_block() {
-    path=$1
-    file=$2
-    awk -v path="$path" '
-        BEGIN { RS = "}" }
-        index($0, "\"path\"") && index($0, "\"" path "\"") {
-            print $0 "}"
-            found = 1
-            exit
-        }
-        END { exit found ? 0 : 1 }
-    ' "$file"
-}
-
-manifest_payload_number_matches() {
-    path=$1
-    field=$2
-    expected=$3
-    file=$4
-    block=$(manifest_payload_block "$path" "$file") || return 1
-    printf '%s\n' "$block" \
-        | grep -Eq '"'$field'"[[:space:]]*:[[:space:]]*'"$expected"'([[:space:]]*[,}])'
-}
-
 payload_magic() {
     od -An -N4 -tx1 "$1" 2>/dev/null | tr -d ' \n'
 }
@@ -152,7 +128,11 @@ validate_board_payload_profile() {
     kernel_size=$5
 
     case "$board" in
-        am3-s19k|am3-s21)
+        # Every Amlogic package emitted by the current Buildroot targets uses
+        # the same host-driven rootfs-window payload contract.  This gate is
+        # deliberately capability-scoped: admitting the package shape does
+        # not authorize a live NAND write or weaken per-board identity gates.
+        am3-s19jpro-aml|am3-s19jproplus|am3-s19k|am3-s19xp|am3-s19jxp|am3-s21|am3-s21pro|am3-s21xp|am3-t21)
             ROOT_MAGIC=$(payload_magic "$root_path")
             KERNEL_MAGIC=$(payload_magic "$kernel_path")
             [ "$ROOT_MAGIC" = "27051956" ] || fail "AM3 root payload is not a uImage (magic=$ROOT_MAGIC)"
@@ -365,29 +345,24 @@ validate_package_only() {
     KERNEL_SHA=$(sha256sum "$SUP_DIR/kernel" | awk '{ print $1 }')
     ROOT_SHA=$(sha256sum "$SUP_DIR/root" | awk '{ print $1 }')
     METADATA_SHA=$(sha256sum "$SUP_DIR/METADATA" | awk '{ print $1 }')
-    grep -F "\"path\": \"$EXPECTED_PREFIX/kernel\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json kernel path does not match $EXPECTED_PREFIX/kernel"
-    grep -F "\"path\": \"$EXPECTED_PREFIX/root\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json rootfs path does not match $EXPECTED_PREFIX/root"
-    grep -F "\"path\": \"$EXPECTED_PREFIX/METADATA\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json metadata path does not match $EXPECTED_PREFIX/METADATA"
-    manifest_payload_number_matches "$EXPECTED_PREFIX/kernel" size "$KERNEL_SIZE" "$SUP_DIR/MANIFEST.json" \
-        || fail "MANIFEST.json kernel size does not match ${KERNEL_SIZE}"
-    manifest_payload_number_matches "$EXPECTED_PREFIX/root" size "$ROOT_SIZE" "$SUP_DIR/MANIFEST.json" \
-        || fail "MANIFEST.json rootfs size does not match ${ROOT_SIZE}"
-    grep -F "\"sha256\": \"$KERNEL_SHA\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json kernel sha256 does not match $KERNEL_SHA"
-    grep -F "\"sha256\": \"$ROOT_SHA\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json rootfs sha256 does not match $ROOT_SHA"
-    grep -F "\"sha256\": \"$METADATA_SHA\"" "$SUP_DIR/MANIFEST.json" >/dev/null 2>&1 \
-        || fail "MANIFEST.json metadata sha256 does not match $METADATA_SHA"
+    METADATA_SIZE=$(stat -c%s "$SUP_DIR/METADATA" 2>/dev/null || stat -f%z "$SUP_DIR/METADATA" 2>/dev/null || echo 0)
+    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" kernel \
+        "$EXPECTED_PREFIX/kernel" "$KERNEL_SIZE" "$KERNEL_SHA" \
+        || fail "MANIFEST.json kernel payload object does not match the exact file"
+    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" rootfs \
+        "$EXPECTED_PREFIX/root" "$ROOT_SIZE" "$ROOT_SHA" \
+        || fail "MANIFEST.json rootfs payload object does not match the exact file"
+    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" metadata \
+        "$EXPECTED_PREFIX/METADATA" "$METADATA_SIZE" "$METADATA_SHA" \
+        || fail "MANIFEST.json metadata payload object does not match the exact file"
     pass "MANIFEST.json payload paths/sizes/hashes match actual files"
 
     case "$MANIFEST_PROFILE" in
         dcentos.sysupgrade-authority/v1)
             [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] \
                 || fail "DCENT_RELEASE_PUBKEY_FILE is required for authority-v1 package validation"
-            sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" "$PACKAGE_TARBALL" "$DCENT_RELEASE_PUBKEY_FILE" "$EXPECTED_BOARD" >/dev/null \
+            sh "$SCRIPT_DIR/verify_sysupgrade_signature.sh" \
+                "$PACKAGE_TARBALL" "$DCENT_RELEASE_PUBKEY_FILE" "$EXPECTED_BOARD" >/dev/null \
                 || fail "release signature verification failed"
             pass "release signature verified against trusted key"
             ;;

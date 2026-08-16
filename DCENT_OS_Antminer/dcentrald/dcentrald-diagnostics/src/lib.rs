@@ -44,7 +44,14 @@ pub mod chip_health;
 /// Honest snapshot vs active-stim labels (P2-5).
 pub mod diagnostic_mode;
 pub mod evidence;
+/// First-party fault/diagnostic knowledge layer transcribed from the Bitmain ATA
+/// maintenance-training corpus. Pure, declarative, read-only reference data
+/// (symptom→suspect→test→remedy chains + reference measurement values). Never a
+/// runtime threshold and never a hardware path — see the module docs.
+pub mod fault_knowledge;
 pub mod hashreport;
+/// Exhaustive, non-authorizing manufacturing-interface capability ceiling.
+pub mod manufacturing_interface;
 /// Offline factory pattern-test parser/grader (default-OFF `pattern-selftest`).
 ///
 /// Pure only: parses held AMTC pattern blobs and grades per-core nonce maps.
@@ -68,8 +75,13 @@ pub use diagnostic_mode::{
     DiagnosticModeError, DiagnosticRunMode,
 };
 pub use evidence::{DiagnosticEvidence, EvidenceKind, EvidenceQuality};
+pub use fault_knowledge::{
+    diagnostic_chain, signal_reference, training_domain_topologies, DiagnosticStep, DomainTopology,
+    Guide, GuideRef, Repairability, SignalReference, SymptomClass,
+};
 pub use repair_advisor::{
-    analyze_chipmap, RepairConfidence, RepairContext, RepairRecommendation, SuspectedComponent,
+    analyze_chipmap, repair_mode_capability, RepairConfidence, RepairContext, RepairModeCapability,
+    RepairModeCapabilityState, RepairRecommendation, SuspectedComponent, REPAIR_MODE_CAPABILITIES,
 };
 
 use std::collections::{HashMap, VecDeque};
@@ -84,7 +96,10 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::board_health::BoardHealthResult;
+use crate::chip_health::ChipHealthSnapshot;
 use crate::progress::{DiagnosticProgress, ProgressTracker};
+use crate::troubleshoot::AsicCommSnapshot;
 
 /// Diagnostic subsystem error type.
 #[derive(Debug, Error)]
@@ -96,6 +111,29 @@ pub enum DiagnosticError {
     /// Test already running.
     #[error("a test of type {test_type} is already running")]
     TestAlreadyRunning { test_type: String },
+
+    /// A caller tried to reuse a lifecycle identity that is already recorded.
+    #[error("diagnostic test ID already exists: {test_id}")]
+    TestIdAlreadyExists { test_id: Uuid },
+
+    /// The public test label does not match the typed job configuration.
+    #[error("diagnostic test/config mismatch: requested {requested:?}, config is {configured:?}")]
+    TestConfigMismatch {
+        requested: TestType,
+        configured: TestType,
+    },
+
+    /// The asynchronous engine was requested without an active Tokio runtime.
+    #[error("diagnostic runtime unavailable for {test_type:?}")]
+    RuntimeUnavailable { test_type: TestType },
+
+    /// Internal lifecycle state could not be locked safely.
+    #[error("diagnostic lifecycle state unavailable")]
+    StateUnavailable,
+
+    /// A prepared snapshot failed the narrow typed-publication contract.
+    #[error("diagnostic snapshot admission failed: {reason}")]
+    SnapshotAdmission { reason: String },
 
     /// HAL error during diagnostic test.
     #[error("HAL error: {0}")]
@@ -125,7 +163,7 @@ pub type Result<T> = std::result::Result<T, DiagnosticError>;
 pub enum TestType {
     /// 15-minute comprehensive test drive.
     HashReport,
-    /// Per-chip health scoring (5 min).
+    /// Publication of an already-prepared, typed per-chip health snapshot.
     ChipHealth,
     /// Per-board health test (2 min).
     BoardHealth,
@@ -139,6 +177,161 @@ pub enum TestType {
     AsicCommTest,
     /// I2C bus scan.
     I2cScan,
+}
+
+impl TestType {
+    /// Canonical public test identities.  Exhaustiveness is enforced by
+    /// [`diagnostic_interface_capability`]'s compiler-checked match below.
+    pub const ALL: [Self; 8] = [
+        Self::HashReport,
+        Self::ChipHealth,
+        Self::BoardHealth,
+        Self::NetworkTest,
+        Self::PsuProbe,
+        Self::FpgaStatus,
+        Self::AsicCommTest,
+        Self::I2cScan,
+    ];
+}
+
+/// Source implementation ceiling for one public [`TestType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticInterfaceCapabilityState {
+    /// A timed snapshot/report engine is wired, but its current producer cannot
+    /// mint typed measured-pass or manufacturing-grade authority.
+    RuntimeSnapshotEngineNoMeasuredPass,
+    /// A production route persists a prepared typed snapshot before recording
+    /// its synchronous, ungraded lifecycle completion.
+    PersistedSnapshotPublisherProductionRouteNoMeasuredPass,
+    /// A production route publishes an immediate typed snapshot derived from
+    /// already-retained daemon telemetry, without active hardware commands.
+    ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+    /// The public type is declared, but no matching [`DiagnosticJobConfig`]
+    /// engine is implemented.
+    DeclaredNoJobEngine,
+}
+
+/// Exact, non-authorizing capability record for one diagnostic interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticInterfaceCapability {
+    pub test_type: TestType,
+    pub state: DiagnosticInterfaceCapabilityState,
+    pub evidence: &'static str,
+    /// A typed lifecycle/publisher implementation exists. This does not imply
+    /// runtime capture or a production route.
+    pub runtime_job_engine_implemented: bool,
+    /// A production caller can construct and dispatch the matching config.
+    pub production_route_integrated: bool,
+    pub typed_measured_pass_authorized: bool,
+    pub manufacturing_grade_authorized: bool,
+    pub hardware_mutation_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for every public diagnostic test identity.
+pub const DIAGNOSTIC_INTERFACE_CAPABILITIES: &[DiagnosticInterfaceCapability] = &[
+    DiagnosticInterfaceCapability {
+        test_type: TestType::HashReport,
+        state: DiagnosticInterfaceCapabilityState::RuntimeSnapshotEngineNoMeasuredPass,
+        evidence: "timed HashReport job plus snapshot finalizer; direct measured receipts absent",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::ChipHealth,
+        state:
+            DiagnosticInterfaceCapabilityState::PersistedSnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "production REST route persists a typed ChipHealthSnapshot before synchronous lifecycle publication; publisher has no hardware access",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::BoardHealth,
+        state:
+            DiagnosticInterfaceCapabilityState::PersistedSnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "production REST route persists typed BoardHealth results before synchronous lifecycle publication; publisher has no hardware access",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::NetworkTest,
+        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
+        evidence: "public TestType only; no DiagnosticJobConfig engine",
+        runtime_job_engine_implemented: false,
+        production_route_integrated: false,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::PsuProbe,
+        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
+        evidence: "public TestType only; no DiagnosticJobConfig engine",
+        runtime_job_engine_implemented: false,
+        production_route_integrated: false,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::FpgaStatus,
+        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
+        evidence: "public TestType only; no DiagnosticJobConfig engine",
+        runtime_job_engine_implemented: false,
+        production_route_integrated: false,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::AsicCommTest,
+        state:
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "production REST route publishes a typed snapshot from retained state_rx chain telemetry; no live GetAddress command or hardware access",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+    DiagnosticInterfaceCapability {
+        test_type: TestType::I2cScan,
+        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
+        evidence: "public TestType only; no DiagnosticJobConfig engine",
+        runtime_job_engine_implemented: false,
+        production_route_integrated: false,
+        typed_measured_pass_authorized: false,
+        manufacturing_grade_authorized: false,
+        hardware_mutation_authorized: false,
+    },
+];
+
+/// Return the canonical capability row for a public diagnostic identity.
+///
+/// The explicit match is intentional: adding a [`TestType`] cannot compile
+/// until its source capability is classified.  This prevents a new enum
+/// variant from being omitted from both a hand-maintained table and its test.
+pub const fn diagnostic_interface_capability(
+    test_type: TestType,
+) -> &'static DiagnosticInterfaceCapability {
+    match test_type {
+        TestType::HashReport => &DIAGNOSTIC_INTERFACE_CAPABILITIES[0],
+        TestType::ChipHealth => &DIAGNOSTIC_INTERFACE_CAPABILITIES[1],
+        TestType::BoardHealth => &DIAGNOSTIC_INTERFACE_CAPABILITIES[2],
+        TestType::NetworkTest => &DIAGNOSTIC_INTERFACE_CAPABILITIES[3],
+        TestType::PsuProbe => &DIAGNOSTIC_INTERFACE_CAPABILITIES[4],
+        TestType::FpgaStatus => &DIAGNOSTIC_INTERFACE_CAPABILITIES[5],
+        TestType::AsicCommTest => &DIAGNOSTIC_INTERFACE_CAPABILITIES[6],
+        TestType::I2cScan => &DIAGNOSTIC_INTERFACE_CAPABILITIES[7],
+    }
 }
 
 /// Persisted lifecycle state for a diagnostic job.
@@ -200,7 +393,7 @@ pub struct TestResult {
     pub recommendations: Vec<String>,
 }
 
-/// Async finalizer invoked after the timed test window ends.
+/// Async injected snapshot/report finalizer invoked by a runtime job.
 ///
 /// Report rendering/persistence may use a bounded blocking owner. Returning a
 /// future keeps that work off the Tokio worker that drives diagnostic progress.
@@ -217,9 +410,141 @@ pub struct HashReportJobConfig {
     pub finalize: FinalizeTestFn,
 }
 
+/// Prepared input for the synchronous ChipHealth snapshot publisher.
+///
+/// Its field and constructor remain private. Production publication is exposed
+/// only through [`DiagnosticService::record_persisted_chip_health_snapshot`],
+/// which preserves the already-persisted report identity and rejects drift.
+pub struct ChipHealthJobConfig {
+    snapshot: ChipHealthSnapshot,
+}
+
+impl ChipHealthJobConfig {
+    #[cfg(test)]
+    fn from_snapshot(snapshot: ChipHealthSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        let mut snapshot = self.snapshot;
+        snapshot.report_id = test_id;
+        snapshot.report_type = "chip_health".to_string();
+        let warnings = snapshot.warnings.clone();
+        let recommendations = snapshot.recommendations.clone();
+        let data = serde_json::to_value(snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize prepared ChipHealthSnapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::ChipHealth,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings,
+            recommendations,
+        })
+    }
+}
+
+/// Prepared input for the synchronous BoardHealth snapshot publisher.
+///
+/// Its field and constructor remain private. Production publication is exposed
+/// only through [`DiagnosticService::record_persisted_board_health_snapshot`],
+/// which binds the lifecycle record to the durable artifact identity.
+pub struct BoardHealthJobConfig {
+    boards: Vec<BoardHealthResult>,
+}
+
+impl BoardHealthJobConfig {
+    #[cfg(test)]
+    fn from_results(boards: Vec<BoardHealthResult>) -> Self {
+        Self { boards }
+    }
+
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        let data = serde_json::to_value(self.boards).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize persisted BoardHealth results: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::BoardHealth,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings: Vec::new(),
+            recommendations: Vec::new(),
+        })
+    }
+}
+
+/// Prepared input for the synchronous passive ASIC-communication snapshot.
+///
+/// Production construction is exposed only through
+/// [`DiagnosticService::publish_asic_comm_snapshot`]. The typed value is
+/// validated before lifecycle insertion and carries no active probe result.
+pub struct AsicCommSnapshotJobConfig {
+    snapshot: AsicCommSnapshot,
+}
+
+impl AsicCommSnapshotJobConfig {
+    #[cfg(test)]
+    fn from_snapshot(snapshot: AsicCommSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        self.snapshot
+            .validate()
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        let data = serde_json::to_value(self.snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize passive ASIC communication snapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::AsicCommTest,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings: Vec::new(),
+            recommendations: Vec::new(),
+        })
+    }
+}
+
 /// Per-test start configuration.
 pub enum DiagnosticJobConfig {
     HashReport(HashReportJobConfig),
+    ChipHealth(ChipHealthJobConfig),
+    BoardHealth(BoardHealthJobConfig),
+    AsicCommTest(AsicCommSnapshotJobConfig),
+}
+
+impl DiagnosticJobConfig {
+    /// Exact public test identity implemented by this configuration.
+    pub const fn test_type(&self) -> TestType {
+        match self {
+            Self::HashReport(_) => TestType::HashReport,
+            Self::ChipHealth(_) => TestType::ChipHealth,
+            Self::BoardHealth(_) => TestType::BoardHealth,
+            Self::AsicCommTest(_) => TestType::AsicCommTest,
+        }
+    }
+}
+
+enum PreparedDiagnosticJob {
+    HashReport {
+        config: HashReportJobConfig,
+        runtime: tokio::runtime::Handle,
+    },
+    SynchronousSnapshot {
+        result: TestResult,
+    },
 }
 
 /// Top-level diagnostic service.
@@ -253,48 +578,205 @@ impl DiagnosticService {
     /// Returns the test ID if started successfully, or an error if a test
     /// of the same type is already running.
     pub fn start_test(&mut self, test_type: TestType, config: DiagnosticJobConfig) -> Result<Uuid> {
-        // Check if a test of this type is already running
-        if let Ok(jobs) = self.jobs.lock() {
-            for test in jobs.values() {
-                if test.test_type == test_type && test.status == TestStatus::Running {
-                    return Err(DiagnosticError::TestAlreadyRunning {
-                        test_type: format!("{:?}", test_type),
-                    });
-                }
-            }
+        let configured_test_type = config.test_type();
+        if configured_test_type != test_type {
+            return Err(DiagnosticError::TestConfigMismatch {
+                requested: test_type,
+                configured: configured_test_type,
+            });
+        }
+        self.start_test_with_id(Uuid::new_v4(), test_type, config)
+    }
+
+    /// Record lifecycle completion for a ChipHealth snapshot that the caller
+    /// has already persisted durably.
+    ///
+    /// The canonical REST route persists and descriptor-readbacks the typed
+    /// artifact before calling this method. The diagnostics crate cannot prove
+    /// that external side effect itself, so it admits only the exact non-nil
+    /// report identity and `chip_health` type carried by the persisted value.
+    /// Publication is synchronous, callback-free, and grants no measurement,
+    /// manufacturing, hardware-access, or mutation authority.
+    pub fn record_persisted_chip_health_snapshot(
+        &mut self,
+        snapshot: ChipHealthSnapshot,
+    ) -> Result<Uuid> {
+        if snapshot.report_id.is_nil() {
+            return Err(DiagnosticError::SnapshotAdmission {
+                reason: "persisted ChipHealthSnapshot report_id is nil".to_string(),
+            });
+        }
+        if snapshot.report_type != "chip_health" {
+            return Err(DiagnosticError::SnapshotAdmission {
+                reason: format!(
+                    "persisted ChipHealthSnapshot report_type is {:?}, expected \"chip_health\"",
+                    snapshot.report_type
+                ),
+            });
+        }
+        let test_id = snapshot.report_id;
+        self.start_test_with_id(
+            test_id,
+            TestType::ChipHealth,
+            DiagnosticJobConfig::ChipHealth(ChipHealthJobConfig { snapshot }),
+        )
+    }
+
+    /// Record lifecycle completion for BoardHealth results that the caller has
+    /// already persisted durably and descriptor-readback.
+    ///
+    /// The results retain their per-board, evidence-capped grades in `data`,
+    /// while the outer diagnostic result remains ungraded. This method is
+    /// synchronous and callback-free and confers no hardware or mutation
+    /// authority.
+    pub fn record_persisted_board_health_snapshot(
+        &mut self,
+        test_id: Uuid,
+        boards: Vec<BoardHealthResult>,
+    ) -> Result<Uuid> {
+        if test_id.is_nil() {
+            return Err(DiagnosticError::SnapshotAdmission {
+                reason: "persisted BoardHealth report ID is nil".to_string(),
+            });
+        }
+        self.start_test_with_id(
+            test_id,
+            TestType::BoardHealth,
+            DiagnosticJobConfig::BoardHealth(BoardHealthJobConfig { boards }),
+        )
+    }
+
+    /// Publish a passive ASIC communication snapshot from retained telemetry.
+    ///
+    /// This synchronous path validates the typed aggregate and records a
+    /// lifecycle result. It does not issue GetAddress, open a transport, or
+    /// grant measured-pass, manufacturing, or mutation authority.
+    pub fn publish_asic_comm_snapshot(&mut self, snapshot: AsicCommSnapshot) -> Result<Uuid> {
+        self.start_test(
+            TestType::AsicCommTest,
+            DiagnosticJobConfig::AsicCommTest(AsicCommSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    fn start_test_with_id(
+        &mut self,
+        test_id: Uuid,
+        test_type: TestType,
+        config: DiagnosticJobConfig,
+    ) -> Result<Uuid> {
+        let configured_test_type = config.test_type();
+        if configured_test_type != test_type {
+            return Err(DiagnosticError::TestConfigMismatch {
+                requested: test_type,
+                configured: configured_test_type,
+            });
         }
 
-        let test_id = Uuid::new_v4();
+        let prepared = match config {
+            DiagnosticJobConfig::HashReport(config) => {
+                let runtime = tokio::runtime::Handle::try_current()
+                    .map_err(|_| DiagnosticError::RuntimeUnavailable { test_type })?;
+                PreparedDiagnosticJob::HashReport { config, runtime }
+            }
+            DiagnosticJobConfig::ChipHealth(config) => PreparedDiagnosticJob::SynchronousSnapshot {
+                result: config.into_result(test_id)?,
+            },
+            DiagnosticJobConfig::BoardHealth(config) => {
+                PreparedDiagnosticJob::SynchronousSnapshot {
+                    result: config.into_result(test_id)?,
+                }
+            }
+            DiagnosticJobConfig::AsicCommTest(config) => {
+                PreparedDiagnosticJob::SynchronousSnapshot {
+                    result: config.into_result(test_id)?,
+                }
+            }
+        };
         let cancel_token = CancellationToken::new();
         let started_at_epoch_s = unix_now_s();
 
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.insert(
-                test_id,
-                StoredTest {
-                    test_id,
-                    test_type,
-                    status: TestStatus::Running,
-                    phase_name: "queued".to_string(),
-                    progress_pct: 0,
-                    detail: "Diagnostic job created".to_string(),
-                    elapsed_s: 0,
-                    started_at_epoch_s,
-                    completed_at_epoch_s: None,
-                    result: None,
-                    error: None,
-                    cancel_token: cancel_token.clone(),
-                },
-            );
+        let terminal_progress = match &prepared {
+            PreparedDiagnosticJob::SynchronousSnapshot { result } => {
+                Some(DiagnosticProgress::completed(test_id, result.test_type, 0))
+            }
+            PreparedDiagnosticJob::HashReport { .. } => None,
+        };
+        let mut completed_tests = if terminal_progress.is_some() {
+            Some(
+                self.completed_tests
+                    .lock()
+                    .map_err(|_| DiagnosticError::StateUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| DiagnosticError::StateUnavailable)?;
+        if jobs.contains_key(&test_id) {
+            return Err(DiagnosticError::TestIdAlreadyExists { test_id });
+        }
+        if jobs
+            .values()
+            .any(|test| test.test_type == test_type && test.status == TestStatus::Running)
+        {
+            return Err(DiagnosticError::TestAlreadyRunning {
+                test_type: format!("{:?}", test_type),
+            });
         }
 
-        match config {
-            DiagnosticJobConfig::HashReport(config) => {
+        let stored = match (&prepared, terminal_progress.as_ref()) {
+            (PreparedDiagnosticJob::HashReport { .. }, None) => StoredTest {
+                test_id,
+                test_type,
+                status: TestStatus::Running,
+                phase_name: "queued".to_string(),
+                progress_pct: 0,
+                detail: "Diagnostic job created".to_string(),
+                elapsed_s: 0,
+                started_at_epoch_s,
+                completed_at_epoch_s: None,
+                result: None,
+                error: None,
+                cancel_token: cancel_token.clone(),
+            },
+            (PreparedDiagnosticJob::SynchronousSnapshot { result }, Some(progress)) => StoredTest {
+                test_id,
+                test_type,
+                status: TestStatus::Completed,
+                phase_name: progress.phase_name.clone(),
+                progress_pct: progress.progress_pct,
+                detail: progress.detail.clone(),
+                elapsed_s: progress.elapsed_s,
+                started_at_epoch_s,
+                completed_at_epoch_s: Some(started_at_epoch_s),
+                result: Some(result.clone()),
+                error: None,
+                cancel_token: cancel_token.clone(),
+            },
+            _ => return Err(DiagnosticError::StateUnavailable),
+        };
+        jobs.insert(test_id, stored);
+
+        if let Some(completed_tests) = completed_tests.as_mut() {
+            completed_tests.push_back(test_id);
+            if completed_tests.len() > self.max_completed {
+                if let Some(oldest_id) = completed_tests.pop_front() {
+                    jobs.remove(&oldest_id);
+                }
+            }
+        }
+        drop(jobs);
+        drop(completed_tests);
+
+        match prepared {
+            PreparedDiagnosticJob::HashReport { config, runtime } => {
                 let jobs = Arc::clone(&self.jobs);
                 let completed_tests = Arc::clone(&self.completed_tests);
                 let progress_tx = self.progress_tx.clone();
                 let max_completed = self.max_completed;
-                tokio::spawn(async move {
+                runtime.spawn(async move {
                     run_hashreport_job(
                         test_id,
                         config,
@@ -306,6 +788,11 @@ impl DiagnosticService {
                     )
                     .await;
                 });
+            }
+            PreparedDiagnosticJob::SynchronousSnapshot { .. } => {
+                if let Some(progress) = terminal_progress {
+                    let _ = self.progress_tx.send(progress);
+                }
             }
         }
 
@@ -324,12 +811,11 @@ impl DiagnosticService {
 
     /// Cancel a running test.
     pub fn cancel_test(&mut self, test_id: &Uuid) -> bool {
-        let Some(cancel_token) = self
-            .jobs
-            .lock()
-            .ok()
-            .and_then(|jobs| jobs.get(test_id).map(|test| test.cancel_token.clone()))
-        else {
+        let Some(cancel_token) = self.jobs.lock().ok().and_then(|jobs| {
+            jobs.get(test_id).and_then(|test| {
+                (test.status == TestStatus::Running).then(|| test.cancel_token.clone())
+            })
+        }) else {
             return false;
         };
 
@@ -664,4 +1150,461 @@ fn unix_now_s() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_interface_capability_ceiling_is_exhaustive() {
+        assert_eq!(DIAGNOSTIC_INTERFACE_CAPABILITIES.len(), TestType::ALL.len());
+        for test_type in TestType::ALL {
+            let matches: Vec<_> = DIAGNOSTIC_INTERFACE_CAPABILITIES
+                .iter()
+                .filter(|capability| capability.test_type == test_type)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let capability = matches[0];
+            assert_eq!(
+                *capability,
+                *diagnostic_interface_capability(test_type),
+                "compiler-exhaustive resolver and canonical table drifted"
+            );
+            assert_eq!(
+                capability.runtime_job_engine_implemented,
+                matches!(
+                    test_type,
+                    TestType::HashReport
+                        | TestType::ChipHealth
+                        | TestType::BoardHealth
+                        | TestType::AsicCommTest
+                )
+            );
+            assert_eq!(
+                capability.production_route_integrated,
+                matches!(
+                    test_type,
+                    TestType::HashReport
+                        | TestType::ChipHealth
+                        | TestType::BoardHealth
+                        | TestType::AsicCommTest
+                )
+            );
+            assert!(!capability.typed_measured_pass_authorized);
+            assert!(!capability.manufacturing_grade_authorized);
+            assert!(!capability.hardware_mutation_authorized);
+        }
+    }
+
+    fn prepared_snapshot() -> ChipHealthSnapshot {
+        ChipHealthSnapshot {
+            report_id: Uuid::new_v4(),
+            generated_at: "2026-08-09T00:00:00Z".to_string(),
+            report_type: "untrusted-fixture-type".to_string(),
+            source: "prepared-test-snapshot".to_string(),
+            total_boards: 0,
+            total_chips: 0,
+            warnings: vec!["snapshot warning".to_string()],
+            recommendations: vec!["snapshot recommendation".to_string()],
+            chains: Vec::new(),
+        }
+    }
+
+    fn passive_asic_comm_snapshot() -> AsicCommSnapshot {
+        AsicCommSnapshot::from_chains(vec![
+            crate::troubleshoot::AsicCommChainSnapshot {
+                chain_id: 6,
+                responding_chips: 63,
+                comm_ok: true,
+                crc_errors: 2,
+                status: "Alive".to_string(),
+            },
+            crate::troubleshoot::AsicCommChainSnapshot {
+                chain_id: 7,
+                responding_chips: 0,
+                comm_ok: false,
+                crc_errors: 9,
+                status: "Degraded".to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn job_config_admission_is_exact_in_both_directions() {
+        let (progress_tx, _progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        let hashreport_config = DiagnosticJobConfig::HashReport(HashReportJobConfig {
+            duration: Duration::from_secs(1),
+            progress_interval: Duration::from_secs(1),
+            finalize: Arc::new(|_, _| Box::pin(async { unreachable!("mismatch must refuse") })),
+        });
+
+        let error = service
+            .start_test(TestType::BoardHealth, hashreport_config)
+            .expect_err("a declared-no-engine TestType must not borrow HashReport");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::BoardHealth,
+                configured: TestType::HashReport,
+            }
+        ));
+
+        let chip_health_config = DiagnosticJobConfig::ChipHealth(
+            ChipHealthJobConfig::from_snapshot(prepared_snapshot()),
+        );
+        let error = service
+            .start_test(TestType::HashReport, chip_health_config)
+            .expect_err("HashReport must not borrow ChipHealth snapshot configuration");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::HashReport,
+                configured: TestType::ChipHealth,
+            }
+        ));
+
+        let board_health_config =
+            DiagnosticJobConfig::BoardHealth(BoardHealthJobConfig::from_results(Vec::new()));
+        let error = service
+            .start_test(TestType::ChipHealth, board_health_config)
+            .expect_err("ChipHealth must not borrow BoardHealth snapshot configuration");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::ChipHealth,
+                configured: TestType::BoardHealth,
+            }
+        ));
+
+        let asic_comm_config = DiagnosticJobConfig::AsicCommTest(
+            AsicCommSnapshotJobConfig::from_snapshot(passive_asic_comm_snapshot()),
+        );
+        let error = service
+            .start_test(TestType::BoardHealth, asic_comm_config)
+            .expect_err("BoardHealth must not borrow passive ASIC telemetry configuration");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::BoardHealth,
+                configured: TestType::AsicCommTest,
+            }
+        ));
+    }
+
+    #[test]
+    fn prepared_chip_health_snapshot_publishes_synchronously_without_runtime() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let snapshot = prepared_snapshot();
+        let mut expected_snapshot = snapshot.clone();
+        let expected_warnings = snapshot.warnings.clone();
+        let expected_recommendations = snapshot.recommendations.clone();
+        let config = DiagnosticJobConfig::ChipHealth(ChipHealthJobConfig::from_snapshot(snapshot));
+
+        let test_id = service
+            .start_test(TestType::ChipHealth, config)
+            .expect("prepared snapshot publication needs no Tokio runtime");
+        expected_snapshot.report_id = test_id;
+        expected_snapshot.report_type = "chip_health".to_string();
+        let expected_data =
+            serde_json::to_value(&expected_snapshot).expect("fixture must serialize");
+        let stored = service
+            .get_test_status(&test_id)
+            .expect("synchronous publication must be immediately visible");
+        let progress = progress_rx
+            .try_recv()
+            .expect("publisher must emit one canonical completion event");
+
+        assert_eq!(stored.status, TestStatus::Completed);
+        assert_eq!(stored.phase_name, progress.phase_name);
+        assert_eq!(stored.progress_pct, progress.progress_pct);
+        assert_eq!(stored.detail, progress.detail);
+        assert_eq!(stored.elapsed_s, progress.elapsed_s);
+        assert_eq!(progress.test_id, test_id);
+        assert_eq!(progress.test_type, TestType::ChipHealth);
+        assert_eq!(progress.phase_name, "completed");
+        assert_eq!(progress.progress_pct, 100);
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let result = stored
+            .result
+            .expect("completed publication must retain a result");
+        assert_eq!(result.test_id, test_id);
+        assert_eq!(result.test_type, TestType::ChipHealth);
+        assert_eq!(result.duration_s, 0);
+        assert_eq!(result.data, expected_data);
+        assert_eq!(result.data["report_id"], test_id.to_string());
+        assert_eq!(result.data["report_type"], "chip_health");
+        assert_eq!(result.warnings, expected_warnings);
+        assert_eq!(result.recommendations, expected_recommendations);
+        assert!(
+            result.grade.is_none(),
+            "prepared snapshots can never mint a top-level diagnostic grade"
+        );
+        assert!(
+            !service.cancel_test(&test_id),
+            "terminal publication is not cancellable"
+        );
+
+        let capability = diagnostic_interface_capability(TestType::ChipHealth);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::PersistedSnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn persisted_chip_health_snapshot_keeps_exact_identity_and_refuses_replay_or_type_drift() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let mut snapshot = prepared_snapshot();
+        snapshot.report_type = "chip_health".to_string();
+        let expected = snapshot.clone();
+
+        let test_id = service
+            .record_persisted_chip_health_snapshot(snapshot)
+            .expect("persisted typed snapshot must publish under its exact identity");
+        assert_eq!(test_id, expected.report_id);
+        let result = service
+            .get_result(&test_id)
+            .expect("persisted publication must retain its result");
+        assert_eq!(result.data, serde_json::to_value(expected).unwrap());
+        assert_eq!(progress_rx.try_recv().unwrap().test_id, test_id);
+
+        let replay = serde_json::from_value(result.data.clone()).unwrap();
+        let error = service
+            .record_persisted_chip_health_snapshot(replay)
+            .expect_err("an existing persisted lifecycle identity must not be overwritten");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestIdAlreadyExists { test_id: duplicate } if duplicate == test_id
+        ));
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut wrong_type = prepared_snapshot();
+        wrong_type.report_type = "hashreport".to_string();
+        let error = service
+            .record_persisted_chip_health_snapshot(wrong_type)
+            .expect_err("persisted report-type drift must fail before insertion");
+        assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+
+        let mut nil_id = prepared_snapshot();
+        nil_id.report_id = Uuid::nil();
+        nil_id.report_type = "chip_health".to_string();
+        let error = service
+            .record_persisted_chip_health_snapshot(nil_id)
+            .expect_err("nil persisted report identities must fail before insertion");
+        assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+    }
+
+    #[test]
+    fn persisted_board_health_results_publish_synchronously_ungraded_and_refuse_replay() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let test_id = Uuid::new_v4();
+
+        let published = service
+            .record_persisted_board_health_snapshot(test_id, Vec::new())
+            .expect("persisted typed BoardHealth results must publish synchronously");
+        assert_eq!(published, test_id);
+        let stored = service
+            .get_test_status(&test_id)
+            .expect("BoardHealth publication must be immediately visible");
+        assert_eq!(stored.status, TestStatus::Completed);
+        let result = stored.result.expect("BoardHealth result must be retained");
+        assert_eq!(result.test_type, TestType::BoardHealth);
+        assert_eq!(result.duration_s, 0);
+        assert_eq!(result.data, serde_json::json!([]));
+        assert!(result.grade.is_none());
+        assert!(result.warnings.is_empty());
+        assert!(result.recommendations.is_empty());
+        let progress = progress_rx.try_recv().unwrap();
+        assert_eq!(progress.test_id, test_id);
+        assert_eq!(progress.test_type, TestType::BoardHealth);
+        assert_eq!(progress.progress_pct, 100);
+
+        let error = service
+            .record_persisted_board_health_snapshot(test_id, Vec::new())
+            .expect_err("an existing BoardHealth lifecycle identity must not be overwritten");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestIdAlreadyExists { test_id: duplicate } if duplicate == test_id
+        ));
+        let error = service
+            .record_persisted_board_health_snapshot(Uuid::nil(), Vec::new())
+            .expect_err("nil persisted BoardHealth identities must fail before insertion");
+        assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let capability = diagnostic_interface_capability(TestType::BoardHealth);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::PersistedSnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn passive_asic_comm_snapshot_publishes_immediately_and_rejects_aggregate_drift() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let snapshot = passive_asic_comm_snapshot();
+        let expected = serde_json::to_value(&snapshot).expect("fixture must serialize");
+
+        let test_id = service
+            .publish_asic_comm_snapshot(snapshot)
+            .expect("passive retained telemetry must publish without a runtime");
+        let stored = service
+            .get_test_status(&test_id)
+            .expect("ASIC communication publication must be immediately visible");
+        assert_eq!(stored.status, TestStatus::Completed);
+        let result = stored
+            .result
+            .expect("ASIC communication result must be retained");
+        assert_eq!(result.test_id, test_id);
+        assert_eq!(result.test_type, TestType::AsicCommTest);
+        assert_eq!(result.duration_s, 0);
+        assert_eq!(result.data, expected);
+        assert!(result.grade.is_none());
+        assert!(result.warnings.is_empty());
+        assert!(result.recommendations.is_empty());
+        let progress = progress_rx
+            .try_recv()
+            .expect("publisher must emit one terminal lifecycle event");
+        assert_eq!(progress.test_id, test_id);
+        assert_eq!(progress.test_type, TestType::AsicCommTest);
+        assert_eq!(progress.progress_pct, 100);
+        assert!(!service.cancel_test(&test_id));
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let capability = diagnostic_interface_capability(TestType::AsicCommTest);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+
+        for mutate in [
+            |snapshot: &mut AsicCommSnapshot| snapshot.chain_count += 1,
+            |snapshot: &mut AsicCommSnapshot| snapshot.chains[0].comm_ok = false,
+            |snapshot: &mut AsicCommSnapshot| snapshot.chains[1].chain_id = 6,
+        ] {
+            let mut invalid = passive_asic_comm_snapshot();
+            mutate(&mut invalid);
+            let error = service
+                .publish_asic_comm_snapshot(invalid)
+                .expect_err("inconsistent passive telemetry must fail before insertion");
+            assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+        }
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn poisoned_job_store_refuses_publication_without_progress() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        let jobs = Arc::clone(&service.jobs);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = jobs.lock().expect("fixture must acquire job store");
+            panic!("poison diagnostic job store");
+        });
+
+        let config = DiagnosticJobConfig::ChipHealth(ChipHealthJobConfig::from_snapshot(
+            prepared_snapshot(),
+        ));
+        let error = service
+            .start_test(TestType::ChipHealth, config)
+            .expect_err("poisoned state must fail closed");
+        assert!(matches!(error, DiagnosticError::StateUnavailable));
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn poisoned_completed_store_refuses_publication_without_insertion_or_progress() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        let completed_tests = Arc::clone(&service.completed_tests);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = completed_tests
+                .lock()
+                .expect("fixture must acquire completed store");
+            panic!("poison diagnostic completed store");
+        });
+
+        let config = DiagnosticJobConfig::ChipHealth(ChipHealthJobConfig::from_snapshot(
+            prepared_snapshot(),
+        ));
+        let error = service
+            .start_test(TestType::ChipHealth, config)
+            .expect_err("poisoned completion state must fail closed");
+        assert!(matches!(error, DiagnosticError::StateUnavailable));
+        assert!(service
+            .jobs
+            .lock()
+            .expect("job store must remain available")
+            .is_empty());
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn hashreport_without_tokio_runtime_is_rejected_before_insertion() {
+        let (progress_tx, _progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        let config = DiagnosticJobConfig::HashReport(HashReportJobConfig {
+            duration: Duration::from_secs(1),
+            progress_interval: Duration::from_secs(1),
+            finalize: Arc::new(|_, _| Box::pin(async { unreachable!("must not spawn") })),
+        });
+
+        let error = service
+            .start_test(TestType::HashReport, config)
+            .expect_err("async engine requires an active Tokio runtime");
+        assert!(matches!(
+            error,
+            DiagnosticError::RuntimeUnavailable {
+                test_type: TestType::HashReport
+            }
+        ));
+        assert!(service
+            .jobs
+            .lock()
+            .expect("job store must remain available")
+            .is_empty());
+    }
 }

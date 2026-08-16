@@ -121,18 +121,36 @@ pub fn response_length_for_family(family: ChipFamily) -> Option<AsicResponseLeng
     })
 }
 
+/// Map a detected chip family onto its baud-plan family, **fail-closed**.
+///
+/// A `Some(..)` here is what [`AsicProtocolSpec::for_family`] turns into a
+/// concrete [`BaudPlan`] (target rate, ASIC register address, register value,
+/// FPGA divider). Any family whose baud row is not evidence-backed must not
+/// reach that constructor, so the result is filtered through
+/// [`crate::baud_switch::baud_row_is_evidence_backed`].
+///
+/// `Bm1485` is refused there even though its descriptive fields now match exact
+/// 2017 stock: the one-value generic plan cannot encode the full release-bound
+/// three-write MISC_CONTROL spine. The other three mappers in this module —
+/// [`chip_id_for_family`],
+/// [`response_length_for_family`], [`work_transport_for_family`] — already
+/// return `None` for `Bm1485`; this closes the fourth so all four agree.
 pub fn baud_family_for_chip_family(family: ChipFamily) -> Option<BaudChipFamily> {
-    match family {
-        ChipFamily::Bm1387 => Some(BaudChipFamily::Bm1387),
-        ChipFamily::Bm1397 => Some(BaudChipFamily::Bm1397),
-        ChipFamily::Bm1398 => Some(BaudChipFamily::Bm1398),
-        ChipFamily::Bm1362 => Some(BaudChipFamily::Bm1362),
-        ChipFamily::Bm1366 => Some(BaudChipFamily::Bm1366),
-        ChipFamily::Bm1368 => Some(BaudChipFamily::Bm1368),
-        ChipFamily::Bm1370 => Some(BaudChipFamily::Bm1370),
-        ChipFamily::Bm1485 => Some(BaudChipFamily::Bm1485),
-        ChipFamily::Bm1489 | ChipFamily::Bm1360 | ChipFamily::Bm1491 => None,
+    let baud_family = match family {
+        ChipFamily::Bm1387 => BaudChipFamily::Bm1387,
+        ChipFamily::Bm1397 => BaudChipFamily::Bm1397,
+        ChipFamily::Bm1398 => BaudChipFamily::Bm1398,
+        ChipFamily::Bm1362 => BaudChipFamily::Bm1362,
+        ChipFamily::Bm1366 => BaudChipFamily::Bm1366,
+        ChipFamily::Bm1368 => BaudChipFamily::Bm1368,
+        ChipFamily::Bm1370 => BaudChipFamily::Bm1370,
+        ChipFamily::Bm1485 => BaudChipFamily::Bm1485,
+        ChipFamily::Bm1489 | ChipFamily::Bm1360 | ChipFamily::Bm1491 => return None,
+    };
+    if !crate::baud_switch::baud_row_is_evidence_backed(baud_family) {
+        return None;
     }
+    Some(baud_family)
 }
 
 pub fn work_transport_for_family(family: ChipFamily) -> Option<WorkTransportShape> {
@@ -269,6 +287,45 @@ mod tests {
         assert!(AsicProtocolSpec::for_detected_chip_id(0xFFFF).is_none());
         assert!(AsicProtocolSpec::for_family(ChipFamily::Bm1360).is_none());
         assert!(AsicProtocolSpec::for_family(ChipFamily::Bm1491).is_none());
+    }
+
+    #[test]
+    fn bm1485_fails_closed_in_all_four_spec_mappers_not_three_of_four() {
+        // Before this pin, `baud_family_for_chip_family` was the only mapper in
+        // this module that answered `Some(..)` for Bm1485, exposing a historical
+        // row that targeted GENERAL_IIC at 0x1c. The corrected descriptive row
+        // targets MISC_CONTROL at 0x18 but remains refused because the generic
+        // plan cannot encode the full exact-stock spine.
+        assert!(chip_id_for_family(ChipFamily::Bm1485).is_none());
+        assert!(response_length_for_family(ChipFamily::Bm1485).is_none());
+        assert!(work_transport_for_family(ChipFamily::Bm1485).is_none());
+        assert!(
+            baud_family_for_chip_family(ChipFamily::Bm1485).is_none(),
+            "the BM1485 exact-stock description is not an admitted generic plan"
+        );
+        assert!(AsicProtocolSpec::for_family(ChipFamily::Bm1485).is_none());
+    }
+
+    #[test]
+    fn every_evidence_backed_family_still_maps_to_its_baud_family() {
+        // The refusal above must not have collateral damage: every family whose
+        // row IS evidence-backed still resolves.
+        for (chip, baud) in [
+            (ChipFamily::Bm1387, BaudChipFamily::Bm1387),
+            (ChipFamily::Bm1397, BaudChipFamily::Bm1397),
+            (ChipFamily::Bm1398, BaudChipFamily::Bm1398),
+            (ChipFamily::Bm1362, BaudChipFamily::Bm1362),
+            (ChipFamily::Bm1366, BaudChipFamily::Bm1366),
+            (ChipFamily::Bm1368, BaudChipFamily::Bm1368),
+            (ChipFamily::Bm1370, BaudChipFamily::Bm1370),
+        ] {
+            assert_eq!(
+                baud_family_for_chip_family(chip),
+                Some(baud),
+                "{chip:?} must still resolve to its baud family"
+            );
+            assert!(crate::baud_switch::baud_row_is_evidence_backed(baud));
+        }
     }
 
     #[test]

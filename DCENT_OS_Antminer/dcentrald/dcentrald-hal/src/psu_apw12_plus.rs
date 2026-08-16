@@ -1,10 +1,10 @@
-//! APW12+ register-based PSU driver — I2C `/dev/i2c-N` @ 0x10.
+//! Quarantined APW12+ register-model evidence plus framed-protocol builders.
 //!
-//! Used on **S21, S21 Pro, S21 XP** (Amlogic A113D, 4000W+ class). The S21
-//! family is **NoPic**: chip voltage is set by TAS5782M audio DACs, NOT by
-//! a PIC1704 or dsPIC. APW12+ controls the **rail-side power** (12 V bulk
-//! supply, on/off, telemetry, fault clearing, AC power-limit ceiling). It
-//! does NOT set per-chain ASIC voltage.
+//! The original implementation associated this register model with S21,
+//! S21 Pro, and S21 XP. Three later held-code sources refute that association:
+//! they show GPIO enable plus `55 AA` framed traffic for the observed
+//! APW121215a/f paths, not this register map. The register backend therefore
+//! has no production constructor and grants no S21 PSU authority.
 //!
 //! Three PSU drivers coexist in `dcentrald-hal`. They are NOT
 //! interchangeable — picking the wrong one will silently EIO at best and
@@ -14,12 +14,12 @@
 //! |--------|----------------|-----------|--------|
 //! | `Apw121215a` | `[55 AA LEN CMD ... SUM]` framed | Zynq am2 (S19 / S19j Pro / S19j XP) | [`crate::psu`] |
 //! | `Apw12SmbusBackend` | SMBus opcode + payload (17 opcodes) | CV1835 / AM335x BB / Amlogic S19j Pro | [`crate::psu_apw12_smbus`] |
-//! | `Apw12PlusBackend` | I2C register read/write (this module) | S21 / S21 Pro / S21 XP (Amlogic A113D) | THIS FILE |
+//! | `Apw12PlusBackend` | historical I2C register hypothesis | no admitted platform | THIS FILE (tests only) |
 //!
-//! All three sit at slave address 0x10 — that's the trap. The slave address
-//! alone tells you nothing about which protocol speaks behind it. The
-//! authoritative gate is platform classification (subtype string + i2cdetect
-//! probe) plus the sealed-trait whitelist on `Apw12PlusBackend::new`.
+//! The compared protocols use the same nominal slave address, which cannot
+//! identify a wire protocol or platform. The historical backend has no
+//! production constructor; exact platform classification alone must not
+//! resurrect it.
 //!
 //! # Reference
 //!
@@ -49,7 +49,7 @@
 //!
 //! # Construction is sealed-trait gated
 //!
-//! [`Apw12PlusBackend::new`] requires a marker type implementing
+//! In tests, `Apw12PlusBackend::new` requires a marker type implementing
 //! [`Apw12PlusAuthorized`]. The trait is sealed and only the markers in
 //! [`platforms`] satisfy it. This is defense-in-depth on top of the
 //! runtime gate (`dcentrald_hal::platform::subtype::classify_with_probe`
@@ -63,19 +63,16 @@ use crate::Result;
 //  Constants — RE2 §5.3 register catalog
 // ===========================================================================
 
-/// I2C slave address for APW12+ (RE2 §5.3 — `0x10`). Same nominal address as
-/// APW12 SMBus and as `Apw121215a`. Address alone DOES NOT identify the
-/// protocol; platform classification + sealed-trait gate is mandatory.
+/// Historical I2C slave-address hypothesis (RE2 §5.3 — `0x10`). Same
+/// nominal address as APW12 SMBus and `Apw121215a`; it confers no model or
+/// protocol identity and is reachable only through the test constructor.
 pub const APW12_PLUS_I2C_ADDR: u8 = 0x10;
 
-/// Sysfs GPIO line for PSU enable on **S21 family** (RE2 §5.1 line 475 —
-/// `GPIO 907`).
+/// Historical sysfs GPIO hypothesis (RE2 §5.1 line 475 — `GPIO 907`).
 ///
-/// **Platform-specific.** S21 Amlogic boards route the PSU enable through
-/// GPIO 907; that line is asserted by [`crate::psu_gpio_gate::PsuGpioGate`]
-/// before APW12+ register I/O is attempted. This driver itself does not
-/// touch GPIO — caller is responsible for GPIO sysfs export / direction /
-/// value writes.
+/// Later evidence does not authorize this line for the S21 family through
+/// this backend. This driver never touches GPIO, and production code cannot
+/// construct it.
 pub const GPIO_PSU_ENABLE: u32 = 907;
 
 /// Settle delay between writing CONTROL=0x01 (power on) and the first
@@ -213,14 +210,14 @@ impl Apw12PlusReg {
 }
 
 // ===========================================================================
-//  Sealed trait — platform whitelist for `Apw12PlusBackend::new`
+//  Sealed trait — test-only historical backend markers
 // ===========================================================================
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// Sealed-trait whitelist for [`Apw12PlusBackend::new`].
+/// Sealed-trait whitelist for the test-only historical backend constructor.
 ///
 /// Implementors are limited to the marker types in [`platforms`]. The
 /// trait is sealed via `sealed::Sealed`, so adding a new platform requires
@@ -237,12 +234,8 @@ pub trait Apw12PlusAuthorized: sealed::Sealed {}
 
 /// Marker types for platforms that own APW12+-protocol PSUs.
 ///
-/// All three markers are S21-family (NoPic) variants. `S21AmlogicNoPic` is
-/// the actively shipped target (live fleet unit `s21` at .135);
-/// `S21ProAmlogic` and `S21XpAmlogic` are forward-looking placeholders for
-/// when those SKUs land on the fleet — register protocol is identical per
-/// RE2 §5.3, so the markers exist to widen the whitelist with one
-/// import-site change.
+/// These markers preserve the historical S21-family test cases only. They do
+/// not authorize a production platform, protocol, or constructor.
 pub mod platforms {
     /// S21 base SKU on Amlogic A113D, NoPic (TAS5782M DACs).
     ///: never GPIO-reset S21
@@ -475,15 +468,14 @@ pub fn decode_deciamp(buf: &[u8]) -> Option<f32> {
 }
 
 // ===========================================================================
-//  Apw12PlusBackend — runtime controller
+//  Apw12PlusBackend — test-constructible historical register model
 // ===========================================================================
 
-/// Service-thread-backed APW12+ register-protocol PSU controller for the
-/// S21 family.
+/// Historical APW12+ register-protocol controller retained for host tests.
 ///
 /// All I/O routes through a shared [`I2cServiceHandle`] (single-owner I2C
-/// architecture). Construction is gated by [`Apw12PlusAuthorized`] at
-/// compile time — only the markers in [`platforms`] satisfy that bound.
+/// architecture). Production builds expose no constructor; tests additionally
+/// require one of the sealed markers in [`platforms`].
 ///
 /// `M` is a phantom marker type carrying the platform proof; it is
 /// optimised away.
@@ -497,14 +489,15 @@ pub struct Apw12PlusBackend<M: Apw12PlusAuthorized> {
 }
 
 impl<M: Apw12PlusAuthorized> Apw12PlusBackend<M> {
-    /// Construct an APW12+ controller for one of the whitelisted S21
-    /// markers. Address defaults to [`APW12_PLUS_I2C_ADDR`] (0x10); use
-    /// [`Self::new_at`] to pin a different slave.
+    /// Construct the historical register model in tests only. Address defaults
+    /// to [`APW12_PLUS_I2C_ADDR`] (0x10).
+    #[cfg(test)]
     pub fn new(handle: I2cServiceHandle, _marker: M) -> Self {
         Self::new_at(handle, APW12_PLUS_I2C_ADDR, _marker)
     }
 
-    /// Construct at a specific slave address (rare — most boards use 0x10).
+    /// Construct at a specific slave address in tests only.
+    #[cfg(test)]
     pub fn new_at(handle: I2cServiceHandle, address: u8, _marker: M) -> Self {
         Self {
             i2c: handle,

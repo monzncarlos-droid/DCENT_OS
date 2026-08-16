@@ -970,7 +970,12 @@ pub trait Platform: Send + Sync {
     /// Open a chain access interface for the given chain ID.
     fn open_chain(&self, chain_id: u8) -> Result<Box<dyn ChainAccess>>;
 
-    /// Open an I2C bus.
+    /// Open a legacy mutation-capable I2C bus.
+    ///
+    /// A platform whose evidence permits discovery reads but not writes must
+    /// fail closed here and expose a board-specific opaque read-only
+    /// capability instead. Returning [`I2cBus`] inherently exposes raw writes,
+    /// compound write-read transactions, timeout changes, and recovery.
     fn open_i2c(&self, bus: u8) -> Result<I2cBus>;
 
     /// Open the fan controller.
@@ -1008,11 +1013,118 @@ impl BoardType {
     }
 }
 
+/// Reads the concatenated Device-Tree `compatible` list (NUL-separated) as a
+/// lossy UTF-8 string, trying the procfs node first and the sysfs node second.
+///
+/// Returns an empty string when neither node is readable (host tests, or a
+/// platform that exposes no flattened device tree). An empty string yields no
+/// SoC opinion, never a refusal — see [`classify_soc_evidence`].
+fn read_soc_compatible() -> String {
+    for path in [
+        "/proc/device-tree/compatible",
+        "/sys/firmware/devicetree/base/compatible",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            if !bytes.is_empty() {
+                // `compatible` is a NUL-separated list; flatten to spaces.
+                return String::from_utf8_lossy(&bytes).replace('\0', " ");
+            }
+        }
+    }
+    String::new()
+}
+
+/// Declarative SoC-family evidence: map the `/proc/cpuinfo` `Hardware:` string
+/// and the Device-Tree `compatible` list to the [`BoardType`] their silicon
+/// implies.
+///
+/// This is **corroboration only** and is deliberately fail-closed: a SoC we
+/// hold no on-disk evidence for returns `None` ("no opinion"), never a guess.
+/// Every arm is backed by a real observed string — AM335x `am33xx`/`am335x`
+/// (the same discriminator `detect_platform` already keys the BeagleBone
+/// tiebreaker on), Amlogic A113D `amlogic`/`a113`, Xilinx `zynq`, and STM32MP15
+/// `stm32mp15` (see the fixture tests). CVitek CV1835 has **no** confirmed
+/// `cpuinfo`/`compatible` signature held on disk, so it is intentionally absent
+/// (returns `None`) rather than invented.
+///
+/// This ports the one genuinely more-general thing ePIC's `bms-miner` does —
+/// read `/proc/cpuinfo Hardware:` on every platform — generalising the
+/// pre-existing STM32MP15-only
+/// [`stm32mp15::compatible_bytes_look_like_stm32mp15`] check into one shared
+/// classifier (queue rank 29 / H1 GAP-6).
+pub fn classify_soc_evidence(cpuinfo: &str, compatible: &str) -> Option<BoardType> {
+    let hay = format!("{cpuinfo}\n{compatible}").to_ascii_lowercase();
+    // Most specific / least ambiguous strings first.
+    if hay.contains("stm32mp15") {
+        return Some(BoardType::Stm32Mp15);
+    }
+    if hay.contains("am33xx") || hay.contains("am335x") {
+        return Some(BoardType::BeagleBone);
+    }
+    if hay.contains("amlogic") || hay.contains("a113") {
+        return Some(BoardType::Amlogic);
+    }
+    if hay.contains("zynq") {
+        return Some(BoardType::Zynq);
+    }
+    None
+}
+
+/// Advisory cross-check: given the [`BoardType`] chosen by hardware-signature
+/// detection, return `Some(observed)` when the SoC evidence names a *different*
+/// family, else `None`.
+///
+/// Strictly advisory. `detect_platform` only **logs** on `Some(_)` and never
+/// refuses on it, so a unit whose live DTB/cpuinfo string differs from what we
+/// hold on disk (classifier returns `None`) is still admitted on its
+/// device-node signature. Absent evidence can never manufacture a contradiction.
+pub fn soc_evidence_contradiction(
+    selected: BoardType,
+    cpuinfo: &str,
+    compatible: &str,
+) -> Option<BoardType> {
+    match classify_soc_evidence(cpuinfo, compatible) {
+        Some(observed) if observed != selected => Some(observed),
+        _ => None,
+    }
+}
+
+/// Emit a loud, non-fatal warning when the SoC evidence contradicts the
+/// hardware-signature detection. Instrument, never gate — the platform the
+/// hardware signatures selected is always the one returned.
+fn warn_if_soc_contradicts(selected: BoardType, cpuinfo: &str, compatible: &str) {
+    if let Some(observed) = soc_evidence_contradiction(selected, cpuinfo, compatible) {
+        tracing::warn!(
+            selected = ?selected,
+            soc_evidence = ?observed,
+            "platform hardware-signature detection disagrees with SoC evidence; \
+             proceeding on the hardware signature (SoC evidence is advisory only)"
+        );
+    }
+}
+
+/// Attach the advisory SoC cross-check to a freshly detected platform, then
+/// return it unchanged. Centralises the warn so every detection branch shares
+/// one instrumentation point via the platform's own [`Platform::board_type`].
+fn finalize_detection(
+    platform: Box<dyn Platform>,
+    cpuinfo: &str,
+    compatible: &str,
+) -> Result<Box<dyn Platform>> {
+    warn_if_soc_contradicts(platform.board_type(), cpuinfo, compatible);
+    Ok(platform)
+}
+
 /// Auto-detect the current platform.
 ///
 /// Checks hardware signatures to determine which control board we're running on.
 /// For Zynq boards, further distinguishes S9 (am1-s9) vs S19 (am2-s17) via UIO
 /// device naming patterns — see `zynq::detect_zynq_variant()`.
+///
+/// After the hardware signatures select a platform, the SoC evidence
+/// (`/proc/cpuinfo Hardware:` + Device-Tree `compatible`) is attached as an
+/// advisory cross-check via [`finalize_detection`] — it logs a warning on a
+/// family mismatch but never changes or refuses the selection.
 ///
 /// Detection order matters when multiple signatures coexist (e.g. stock Bitmain
 /// BB has both `/dev/ttyO1` AND `/sys/module/uart_trans` loaded — BB must win
@@ -1030,9 +1142,16 @@ pub fn detect_platform() -> Result<Box<dyn Platform>> {
         return Ok(Box::new(sim::SimPlatform::from_env()?));
     }
 
+    // SoC evidence is read once up front (the procfs `Hardware:` string plus
+    // the Device-Tree `compatible` list) and attached as an advisory
+    // cross-check to whichever platform the hardware signatures select below.
+    // It never gates detection — see `finalize_detection`/`warn_if_soc_contradicts`.
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let compatible = read_soc_compatible();
+
     // 1. Zynq — UIO devices (covers both S9 and S19/am2-s17)
     if std::path::Path::new("/dev/uio0").exists() {
-        return Ok(Box::new(zynq::ZynqPlatform::new()?));
+        return finalize_detection(Box::new(zynq::ZynqPlatform::new()?), &cpuinfo, &compatible);
     }
 
     // 2. BeagleBone — TI AM335x SoC + a chain-0 UART node.
@@ -1051,32 +1170,42 @@ pub fn detect_platform() -> Result<Box<dyn Platform>> {
     //    `a lab unit`-class LuxOS/DCENT_OS BB (ttyS1, no ttyO1) skips the BB branch
     //    and falls through to the Amlogic `/dev/ttyS1` branch — constructing
     //    the wrong (aarch64 Amlogic) HAL on an armv7 AM335x board.
-    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let is_am335x =
         cpuinfo.contains("AM33XX") || cpuinfo.contains("AM335x") || cpuinfo.contains("am33xx");
     if is_am335x
         && (std::path::Path::new("/dev/ttyO1").exists()
             || std::path::Path::new("/dev/ttyS1").exists())
     {
-        return Ok(Box::new(beaglebone::BeagleBonePlatform::new()?));
+        return finalize_detection(
+            Box::new(beaglebone::BeagleBonePlatform::new()?),
+            &cpuinfo,
+            &compatible,
+        );
     }
 
     // 3. Braiins BCB100 / STM32MP15. The constructor is lab-gated until
     // the GPIO, fan, PSU, and PIC maps are live-verified.
     if stm32mp15::looks_like_bcb100_host() {
-        return Ok(Box::new(stm32mp15::Bcb100Platform::new()?));
+        return finalize_detection(
+            Box::new(stm32mp15::Bcb100Platform::new()?),
+            &cpuinfo,
+            &compatible,
+        );
     }
 
     // 4. CVitek uart_trans kernel module (CV1835 SoC, NOT BeagleBone).
     //
-    // The reverse-engineered HAL remains available to host tests, but it is
-    // not a runtime admission surface. The constructor is itself a typed,
-    // non-mutating refusal; detection repeats that refusal before construction.
+    // Fail-closed by default. `CViTekPlatform::new()` itself enforces the
+    // operator-authorized opt-in (`DCENT_CV1835_EXPERIMENTAL_RUNTIME=1`,
+    // 2026-08-05): unset => the same typed refusal as before (propagated via
+    // `?`); set => the Experimental lane is admitted. Construction does no
+    // hardware I/O; the mining lifecycle enforces the fail-safe envelope.
     if std::path::Path::new("/sys/module/uart_trans").exists() {
-        return Err(HalError::Platform(
-            "CV1835 runtime NOT IMPLEMENTED: automatic CVitek HAL construction and pinmux mutation are disabled"
-                .to_string(),
-        ));
+        return finalize_detection(
+            Box::new(cvitek::CViTekPlatform::new()?),
+            &cpuinfo,
+            &compatible,
+        );
     }
 
     // 4. Amlogic UART (must come after CVitek — both may have /dev/ttyS).
@@ -1084,10 +1213,80 @@ pub fn detect_platform() -> Result<Box<dyn Platform>> {
         .iter()
         .any(|path| std::path::Path::new(path).exists())
     {
-        return Ok(Box::new(amlogic::AmlogicPlatform::new()?));
+        return finalize_detection(
+            Box::new(amlogic::AmlogicPlatform::new()?),
+            &cpuinfo,
+            &compatible,
+        );
     }
 
     Err(HalError::Platform(
         "unable to detect platform: no known hardware signatures found".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod soc_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn classifier_maps_every_evidenced_soc_string() {
+        // AM335x (BeagleBone) — the same discriminator detect_platform keys the
+        // BeagleBone tiebreaker on.
+        assert_eq!(
+            classify_soc_evidence("Hardware\t: Generic AM33XX (Flattened Device Tree)", ""),
+            Some(BoardType::BeagleBone)
+        );
+        // Amlogic A113D — from the held restore-to-stock cpuinfo fixtures.
+        assert_eq!(
+            classify_soc_evidence("Hardware\t: Amlogic A113D", ""),
+            Some(BoardType::Amlogic)
+        );
+        // Xilinx Zynq — from the held Zynq cpuinfo fixtures.
+        assert_eq!(
+            classify_soc_evidence("Hardware\t: Xilinx Zynq Platform", ""),
+            Some(BoardType::Zynq)
+        );
+        // STM32MP15 — via the Device-Tree `compatible` list (procfs empty).
+        assert_eq!(
+            classify_soc_evidence("", "st,stm32mp157c-ii1 st,stm32mp157"),
+            Some(BoardType::Stm32Mp15)
+        );
+    }
+
+    #[test]
+    fn classifier_returns_none_for_unheld_or_unknown_soc() {
+        // CVitek CV1835 has no held cpuinfo/compatible signature -> no guess.
+        assert_eq!(classify_soc_evidence("Hardware\t: cvitek", ""), None);
+        // Empty / unreadable -> no opinion (host tests, or no flattened DT).
+        assert_eq!(classify_soc_evidence("", ""), None);
+        // A completely unknown SoC -> no opinion, never a wrong guess.
+        assert_eq!(
+            classify_soc_evidence("Hardware\t: Raspberry Pi 4", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn contradiction_never_fires_without_positive_evidence() {
+        // No SoC evidence -> never contradicts, so a unit whose live DTB/cpuinfo
+        // differs from what we hold on disk is never refused.
+        assert_eq!(soc_evidence_contradiction(BoardType::Amlogic, "", ""), None);
+        assert_eq!(soc_evidence_contradiction(BoardType::Zynq, "", ""), None);
+        // Matching evidence -> no contradiction.
+        assert_eq!(
+            soc_evidence_contradiction(BoardType::Amlogic, "Hardware\t: Amlogic A113D", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn contradiction_flags_a_genuine_soc_mismatch() {
+        // Selected Amlogic but the silicon reports Xilinx Zynq -> flagged
+        // (warn-only; the selection is still returned by detect_platform).
+        assert_eq!(
+            soc_evidence_contradiction(BoardType::Amlogic, "Hardware\t: Xilinx Zynq Platform", ""),
+            Some(BoardType::Zynq)
+        );
+    }
 }

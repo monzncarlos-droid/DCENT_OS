@@ -5,6 +5,11 @@ edition = "2021"
 description = "Shared no-HAL contract utilities for dcentrald (wallet masking, log sanitization, etc.)"
 license = "GPL-3.0"
 
+[features]
+default = []
+# Destructive PIC command symbols must not link into normal firmware.
+recovery-tool = []
+
 # This crate is intentionally HAL-free, OS-free, and async-runtime-free, in the
 # same spirit as `dcentrald-api-types`. It must compile cleanly on Windows host
 # for fast unit-test cycles.

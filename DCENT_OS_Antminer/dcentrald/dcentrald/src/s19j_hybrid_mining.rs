@@ -148,10 +148,12 @@ use dcentrald_hal::glitch_monitor::{
 
 use dcentrald_asic::dspic::{
     bosminer_warmup, dspic_fw86_trust_degraded_override_enabled, dspic_voltage_command_allowed,
-    dspic_voltage_refusal_detail, pic0x89_firmware_from_observed_fw_byte, Pic0x89EndpointSession,
-    Pic0x89Service,
+    dspic_voltage_refusal_detail, pic0x89_firmware_from_observed_fw_byte,
+    Lm75aViaVoltageController, Pic0x89EndpointSession, Pic0x89Service, LM75A_ADDRS,
 };
+use dcentrald_silicon_profiles::sensor_topology::SensorSweep;
 
+use crate::board_sensor_coverage;
 use crate::config::DcentraldConfig;
 
 const HW_DIFFICULTY: u64 = 256;
@@ -1739,20 +1741,31 @@ impl Am2ThermalSupervisor {
     /// [`Self::maybe_capture_die_baseline`] seed the calibration and lets
     /// [`Self::poll_max_temp`] apply it to the die alone.
     fn read_board_and_die(&mut self) -> (Option<f32>, Option<f32>) {
-        let mut board_max = f32::NEG_INFINITY;
+        let mut board = None;
         if let Some(pic) = self.pic.as_mut() {
-            for t in pic.read_all_temperatures() {
-                let t = t as f32;
-                if t.is_finite() && (-20.0..=125.0).contains(&t) {
-                    board_max = board_max.max(t);
-                }
-            }
+            let controller_addr = pic.address();
+            // ONE sweep feeds BOTH the board temperature and the coverage
+            // report. Never add a second read pass here: each LM75A
+            // passthrough transaction costs ~290 ms on a bus with a documented
+            // parser-corruption hazard, and this poll is heartbeat-adjacent on
+            // `a lab unit`-class hardware.
+            //
+            // Selection is byte-equivalent to the previous `max` over
+            // `read_all_temperatures`: a failed read was the `-999.0` sentinel
+            // and is now `None`, and the surviving set is the same finite
+            // readings inside the same inclusive `[-20, 125]` window.
+            let readings =
+                board_sensor_coverage::filter_hybrid_window(pic.lm75a_sweep(LM75A_ADDRS));
+            let sweep = SensorSweep::from_readings(&readings, LM75A_ADDRS.len() as u16);
+            board_sensor_coverage::report_board_sensor_coverage(
+                "am2-hybrid",
+                controller_addr,
+                LM75A_ADDRS,
+                &readings,
+                &sweep,
+            );
+            board = sweep.hottest_c;
         }
-        let board = if board_max.is_finite() {
-            Some(board_max)
-        } else {
-            None
-        };
         let die = match Xadc::read_temp() {
             Ok(die_c) if die_c.is_finite() && (0.0..125.0).contains(&die_c) => Some(die_c),
             _ => None,

@@ -28,7 +28,7 @@ from mining evidence and should match DCENT_Toolbox readiness output; help from 
 | **Zynq (am1/am2)** | Xilinx Zynq-7000 (ARMv7) | S9, S17, T17, S19, S19 Pro, S19j Pro (Zynq) | FPGA chain via UIO + `/dev/mem`, no kernel modules |
 | **CVITEK (cv183x)** | CVITEK CV183x (Cortex-A53/AArch64) | T19, S19j Pro CV1835 | ARM32 compatibility analysis is in development; runtime ownership and persistent installation are `NOT_IMPLEMENTED`, with no executable install route |
 | **Amlogic (am3)** | Amlogic A113D (aarch64) | S19j Pro (AML), S19 XP, S19k Pro, S21 | Serial UART chains, sysfs PWM/GPIO, no FPGA |
-| **BeagleBone (am3-bb)** | TI AM335x (ARMv7) | S19j Pro on `S19J_IO_BOARD_V2` | Serial UART chains via the IO board |
+| **BeagleBone (am3-bb)** | TI AM335x (ARMv7) | S19j Pro on `S19J_IO_BOARD_V2` | Experimental exact route: serial UART chains plus retained raw-LOW GPIO59/watchdog ownership via the IO board; installed default remains management-only |
 
 ## Per-model status
 
@@ -37,7 +37,7 @@ from mining evidence and should match DCENT_Toolbox readiness output; help from 
 | **Antminer S9** | BM1387 | Zynq | **Mining achieved** — sustained standalone cold-boot mining with accepted pool shares | Lab-gated: Toolbox route exists, public artifact + witnessed live-install capstone still required |
 | **Antminer S19 Pro** | BM1398 | Zynq | Hashing achieved (cold boot, full chain enumeration, clean nonce flow); accepted shares untested on latest binaries | Lab-gated: dedicated signed package/runbook/live capstone pending |
 | **Antminer S19j Pro** | BM1362 | Zynq | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Guarded DCENT_OS-source self-update only; vendor-source first install remains evidence-gap |
-| **Antminer S19j Pro** | BM1362 | BeagleBone | **Mining achieved** — accepted pool shares, all chains enumerated (runtime path); untested on latest binaries | Lab-gated: SD/runtime path only, not a general NAND/sysupgrade production install |
+| **Antminer S19j Pro** | BM1362 | BeagleBone | Historical accepted-share/all-chain proof; current retained-GPIO59/watchdog lifecycle is **EXPERIMENTAL**, host-validated, and not bench-revalidated | Lab-gated: installed profile has watchdog disabled and is management-only; authorized temporary-config SD/runtime validation required, not a general NAND/sysupgrade production install |
 | **Antminer S21** | BM1368 | Amlogic | **Mining achieved** — sustained hashing with accepted pool shares (runtime path); untested on latest binaries | Lab-gated: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
 | **Antminer S17 / S17 Pro** | BM1397 | Zynq | Bring-up: drivers in place; validation expanding | Evidence gap: no public install route |
 | **Antminer T17** | BM1397 | Zynq | In development: explicit model profile and X17 runtime identity exist; validation expanding | Evidence gap: no public install route |

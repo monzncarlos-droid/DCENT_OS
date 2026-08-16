@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 /// Version 2 adds explicit absent-artifact wire values (`none` and
 /// `not_implemented`). Version 3 separates public first-install eligibility
 /// from the broader install authorization used by an already-running target's
-/// persistent-update API; strict older consumers must reject rather than
-/// silently reinterpret either change.
-pub const HARDWARE_ENABLEMENT_SCHEMA_VERSION: u8 = 3;
+/// persistent-update API. Version 4 adds an independent external-media facet,
+/// so an SD boot image can no longer inherit sysupgrade/NAND authority merely
+/// because both capabilities belong to the same board target. Strict older
+/// consumers must reject rather than silently reinterpret any schema change.
+pub const HARDWARE_ENABLEMENT_SCHEMA_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageTopology {
@@ -118,6 +120,82 @@ impl InstallAuthorization {
 
     pub const fn allows_any_install(self) -> bool {
         !matches!(self, Self::Denied)
+    }
+}
+
+/// What an external removable-medium artifact does for this target.
+///
+/// This is deliberately orthogonal to [`UpdateMechanism`]. A board may have a
+/// working A/B sysupgrade lane and only an experimental SD *boot* image; the
+/// former must never authorize the latter to write NAND.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExternalMediaMode {
+    #[serde(rename = "none")]
+    None,
+    /// Boot the supplied operating system while leaving onboard storage
+    /// untouched. Removing the medium restores the prior boot source.
+    #[serde(rename = "boot_only")]
+    BootOnly,
+    /// Boot removable media whose declared purpose includes installing to
+    /// onboard storage. No current Antminer row earns this mode yet.
+    #[serde(rename = "installer")]
+    Installer,
+    /// Vendor/DCENT recovery media, not a normal product install artifact.
+    #[serde(rename = "recovery")]
+    Recovery,
+}
+
+impl ExternalMediaMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BootOnly => "boot_only",
+            Self::Installer => "installer",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    pub const fn is_implemented(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Evidence/proof rung reached by an external-media lane.
+///
+/// These values distinguish host-side construction from physical-media and
+/// cold-boot evidence. Hardware validation advances maturity; it does not
+/// prevent an artifact generator from existing at `artifact_generated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExternalMediaMaturity {
+    #[serde(rename = "not_implemented")]
+    NotImplemented,
+    #[serde(rename = "artifact_generated")]
+    ArtifactGenerated,
+    #[serde(rename = "media_written")]
+    MediaWritten,
+    #[serde(rename = "boot_witnessed")]
+    BootWitnessed,
+    #[serde(rename = "production")]
+    Production,
+}
+
+impl ExternalMediaMaturity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotImplemented => "not_implemented",
+            Self::ArtifactGenerated => "artifact_generated",
+            Self::MediaWritten => "media_written",
+            Self::BootWitnessed => "boot_witnessed",
+            Self::Production => "production",
+        }
+    }
+
+    pub const fn is_implemented(self) -> bool {
+        !matches!(self, Self::NotImplemented)
+    }
+
+    pub const fn has_boot_witness(self) -> bool {
+        matches!(self, Self::BootWitnessed | Self::Production)
     }
 }
 
@@ -384,12 +462,40 @@ pub struct HardwareEnablementPolicy {
     pub recovery_maturity: RecoveryMaturity,
     pub artifact_kind: ArtifactKind,
     pub artifact_maturity: ArtifactMaturity,
+    /// Removable-media behavior, proof rung, and writer authorization are
+    /// independent of the primary sysupgrade/runtime artifact above.
+    pub external_media_mode: ExternalMediaMode,
+    pub external_media_maturity: ExternalMediaMaturity,
+    pub external_media_authorization: InstallAuthorization,
 }
 
 impl HardwareEnablementPolicy {
     /// Whether kind and maturity agree on the existence of an artifact lane.
     pub const fn artifact_contract_is_consistent(self) -> bool {
         self.artifact_kind.is_implemented() == self.artifact_maturity.is_implemented()
+    }
+
+    /// Whether the removable-media mode, maturity, and authorization form a
+    /// coherent fail-closed contract. Artifact generation may exist while
+    /// writes remain denied, but an absent lane may never carry authority.
+    pub const fn external_media_contract_is_consistent(self) -> bool {
+        let exists = self.external_media_mode.is_implemented();
+        let implemented = self.external_media_maturity.is_implemented();
+        exists == implemented
+            && (exists
+                || matches!(
+                    self.external_media_authorization,
+                    InstallAuthorization::Denied
+                ))
+    }
+
+    /// Whether a caller may write the declared image to removable media.
+    /// This grants no onboard-storage mutation, even for `Installer` mode;
+    /// target-side installation requires its own route-specific admission.
+    pub const fn allows_external_media_write(self) -> bool {
+        self.external_media_contract_is_consistent()
+            && self.external_media_maturity.is_implemented()
+            && self.external_media_authorization.allows_any_install()
     }
 
     /// Whether a persistent-update API is representable for this target.
@@ -412,7 +518,7 @@ mod tests {
 
     #[test]
     fn schema_version_is_pinned() {
-        assert_eq!(HARDWARE_ENABLEMENT_SCHEMA_VERSION, 3);
+        assert_eq!(HARDWARE_ENABLEMENT_SCHEMA_VERSION, 4);
     }
 
     #[test]
@@ -425,6 +531,9 @@ mod tests {
             recovery_maturity: RecoveryMaturity::NotImplemented,
             artifact_kind: ArtifactKind::None,
             artifact_maturity: ArtifactMaturity::NotImplemented,
+            external_media_mode: ExternalMediaMode::None,
+            external_media_maturity: ExternalMediaMaturity::NotImplemented,
+            external_media_authorization: InstallAuthorization::Denied,
         };
 
         assert!(!policy.allows_persistent_update());
@@ -443,6 +552,9 @@ mod tests {
             recovery_maturity: RecoveryMaturity::NotImplemented,
             artifact_kind: ArtifactKind::SysupgradeBundle,
             artifact_maturity: ArtifactMaturity::Experimental,
+            external_media_mode: ExternalMediaMode::None,
+            external_media_maturity: ExternalMediaMaturity::NotImplemented,
+            external_media_authorization: InstallAuthorization::Denied,
         };
 
         assert!(baseline.allows_persistent_update());
@@ -542,7 +654,49 @@ mod tests {
             recovery_maturity: RecoveryMaturity::NotImplemented,
             artifact_kind: ArtifactKind::None,
             artifact_maturity: ArtifactMaturity::Experimental,
+            external_media_mode: ExternalMediaMode::None,
+            external_media_maturity: ExternalMediaMaturity::NotImplemented,
+            external_media_authorization: InstallAuthorization::Denied,
         };
         assert!(!policy.artifact_contract_is_consistent());
+    }
+
+    #[test]
+    fn external_media_does_not_inherit_persistent_update_authority() {
+        let policy = HardwareEnablementPolicy {
+            storage_topology: StorageTopology::RedundantSlots,
+            update_mechanism: UpdateMechanism::ZynqUbiFwSetenv,
+            update_maturity: ImplementationMaturity::Experimental,
+            install_authorization: InstallAuthorization::PublicBeta,
+            recovery_maturity: RecoveryMaturity::NotImplemented,
+            artifact_kind: ArtifactKind::SysupgradeBundle,
+            artifact_maturity: ArtifactMaturity::Experimental,
+            external_media_mode: ExternalMediaMode::BootOnly,
+            external_media_maturity: ExternalMediaMaturity::ArtifactGenerated,
+            external_media_authorization: InstallAuthorization::Denied,
+        };
+
+        assert!(policy.allows_persistent_update());
+        assert!(policy.external_media_contract_is_consistent());
+        assert!(!policy.allows_external_media_write());
+    }
+
+    #[test]
+    fn absent_external_media_cannot_carry_writer_authority() {
+        let policy = HardwareEnablementPolicy {
+            storage_topology: StorageTopology::Unknown,
+            update_mechanism: UpdateMechanism::None,
+            update_maturity: ImplementationMaturity::NotImplemented,
+            install_authorization: InstallAuthorization::Denied,
+            recovery_maturity: RecoveryMaturity::NotImplemented,
+            artifact_kind: ArtifactKind::None,
+            artifact_maturity: ArtifactMaturity::NotImplemented,
+            external_media_mode: ExternalMediaMode::None,
+            external_media_maturity: ExternalMediaMaturity::NotImplemented,
+            external_media_authorization: InstallAuthorization::LabOnly,
+        };
+
+        assert!(!policy.external_media_contract_is_consistent());
+        assert!(!policy.allows_external_media_write());
     }
 }

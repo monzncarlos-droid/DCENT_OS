@@ -192,19 +192,7 @@ pub fn fifo_cmd_write_reg_full(chip_addr: u8, reg: u8, value: u32) -> (u32, u32)
 /// Polynomial: 0x05, initial value: 0x1F.
 /// Used for all CMD-type packets.
 pub fn crc5(data: &[u8]) -> u8 {
-    let mut crc: u8 = 0x1F;
-    for &byte in data {
-        for i in (0..8).rev() {
-            let bit = (byte >> i) & 1;
-            let crc_bit = (crc >> 4) & 1;
-            crc <<= 1;
-            if bit ^ crc_bit != 0 {
-                crc ^= 0x05;
-            }
-            crc &= 0x1F;
-        }
-    }
-    crc
+    dcentrald_common::bm1396_command_crc5(data)
 }
 
 // ---------------------------------------------------------------------------

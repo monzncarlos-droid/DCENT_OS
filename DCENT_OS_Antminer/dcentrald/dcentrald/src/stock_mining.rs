@@ -46,6 +46,7 @@ use dcentrald_common::{
 };
 use dcentrald_hal::stock_fpga::*;
 use dcentrald_hal::stock_fpga_iic::StockFpgaI2c;
+use dcentrald_hal::stock_fpga_preflight::StockFpgaCarrierPreflightReceipt;
 use dcentrald_hal::stock_fpga_work::{StockFpgaDma, StockFpgaWorkEngine};
 
 use crate::config::DcentraldConfig;
@@ -97,6 +98,32 @@ fn stock_fpga_nonce2_beta_enabled_value(raw: Option<&str>) -> bool {
 
 fn stock_fpga_nonce2_beta_enabled() -> bool {
     stock_fpga_nonce2_beta_enabled_value(std::env::var(STOCK_FPGA_NONCE2_BETA_ENV).ok().as_deref())
+}
+
+/// Resolve the same V1/V2 endpoint choice as the Stratum router without
+/// constructing or opening a client. The recovered stock FPGA DMA ABI needs
+/// V1 coinbase/extranonce2 jobs and cannot represent SV2 Standard templates
+/// that carry only a precomputed merkle root.
+fn stock_fpga_pool_route_is_v1(protocol: Option<&str>, sv2_url_present: bool) -> bool {
+    match protocol
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("v1" | "sv1") => true,
+        Some("v2" | "sv2") => false,
+        // Router Auto (including absent/unrecognized) chooses V2 whenever an
+        // SV2 endpoint is present, otherwise falls back to V1.
+        _ => !sv2_url_present,
+    }
+}
+
+/// Pure work-domain gate for the recovered S9 DMA job carrier.
+fn stock_fpga_dma_job_domain_admitted(
+    has_precomputed_merkle_root: bool,
+    extranonce2_size: usize,
+) -> bool {
+    !has_precomputed_merkle_root && (1..=8).contains(&extranonce2_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -395,11 +422,30 @@ impl Drop for StockRunSafetyGuard {
 pub struct StockMiner {
     config: DcentraldConfig,
     shutdown: CancellationToken,
+    _declared_route_admission:
+        dcentrald_common::stock_fpga_carrier_preflight::StockFpgaDeclaredRouteAdmission,
+    _carrier_preflight_receipt: StockFpgaCarrierPreflightReceipt,
 }
 
 impl StockMiner {
-    pub fn new(config: DcentraldConfig, shutdown: CancellationToken) -> Self {
-        Self { config, shutdown }
+    /// Construct only after consuming both declaration policy and a live,
+    /// retained-lease carrier receipt.
+    ///
+    /// The HAL intentionally exposes no receipt issuer yet. Consequently this
+    /// constructor is structurally complete but cannot be called by the
+    /// top-level runtime while passive C5/DMA preflight remains unimplemented.
+    pub fn new(
+        config: DcentraldConfig,
+        shutdown: CancellationToken,
+        declared_route_admission: dcentrald_common::stock_fpga_carrier_preflight::StockFpgaDeclaredRouteAdmission,
+        carrier_preflight_receipt: StockFpgaCarrierPreflightReceipt,
+    ) -> Self {
+        Self {
+            config,
+            shutdown,
+            _declared_route_admission: declared_route_admission,
+            _carrier_preflight_receipt: carrier_preflight_receipt,
+        }
     }
 
     /// Run the stock FPGA mining pipeline.
@@ -421,6 +467,33 @@ impl StockMiner {
                  schema and wrap boundary are not yet hardware-validated. Set \
                  {STOCK_FPGA_NONCE2_BETA_ENV}=1 only during the documented instrumented beta."
             );
+        }
+        let primary_v1 = stock_fpga_pool_route_is_v1(
+            self.config.pool.protocol.as_deref(),
+            self.config.pool.sv2_url.is_some(),
+        );
+        let failover1_v1 = self.config.pool.failover1.as_ref().is_none_or(|endpoint| {
+            stock_fpga_pool_route_is_v1(endpoint.protocol.as_deref(), endpoint.sv2_url.is_some())
+        });
+        let failover2_v1 = self.config.pool.failover2.as_ref().is_none_or(|endpoint| {
+            stock_fpga_pool_route_is_v1(endpoint.protocol.as_deref(), endpoint.sv2_url.is_some())
+        });
+        if !(primary_v1 && failover1_v1 && failover2_v1) {
+            bail!(
+                "stock FPGA DHASH mining is refused before device access: the recovered DMA ABI requires V1 coinbase/extranonce2 jobs, but at least one configured pool route can select SV2 Standard work"
+            );
+        }
+        self._carrier_preflight_receipt
+            .validate_current_process()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "stock FPGA retained fabric lease is stale or belongs to another process: {error}"
+                )
+            })?;
+        if self._carrier_preflight_receipt.fabric()
+            != dcentrald_hal::stock_fpga_preflight::STOCK_FPGA_MANAGEMENT_FABRIC
+        {
+            bail!("stock FPGA live receipt does not retain the canonical stock-s9-fpga-iic fabric");
         }
         warn!(
             env = STOCK_FPGA_NONCE2_BETA_ENV,
@@ -683,17 +756,23 @@ impl StockMiner {
             info!("ASIC response timeout set (0x80009C40)");
         }
 
-        if passthrough {
+        let effective_nonce_difficulty = if passthrough {
             // Read and preserve bmminer's ticket mask
             let existing_mask = fpga.read_reg(REG_TICKET_MASK);
             info!(
                 ticket_mask = format_args!("0x{:02X}", existing_mask),
                 "PASSTHROUGH: preserving bmminer's ticket mask 0x{:02X}", existing_mask,
             );
+            warn!(
+                ticket_mask = format_args!("0x{:08X}", existing_mask),
+                "PASSTHROUGH nonce-derived hashrate is suppressed: the effective ASIC+FPGA return difficulty was not recovered from the inherited masks"
+            );
+            None
         } else {
             fpga.set_ticket_mask(0xFF);
             info!("Ticket mask set to 0xFF (hardware difficulty 256)");
-        }
+            Some(HW_DIFFICULTY)
+        };
 
         // Flush nonce FIFO (safe in both modes — just clears stale nonces)
         fpga.write_reg(
@@ -882,14 +961,14 @@ impl StockMiner {
             self.config.watchdog.enabled,
             legacy_watchdog_feed_owner.is_some(),
         );
-        // Stock FPGA path does not yet run the full thermal supervisor loop;
-        // Ready here means "no thermal emergency latched before mining." Full
-        // ThermalController wire on stock remains a residual (engines share
-        // this same ThermalSafetyState enum when that lands).
+        // No stock thermal supervisor currently owns fresh sensor evidence.
+        // Absence of a latched emergency is not positive readiness, so even a
+        // future carrier receipt must fail work admission until a real thermal
+        // owner supplies a measured state.
         let dispatch_inputs = stock_fpga_work_dispatch_inputs(
             wd_state,
             &controller_heartbeats,
-            ThermalSafetyState::Ready,
+            ThermalSafetyState::NotReady,
         );
         match stock_fpga_admit_standard_work_dispatch(&mut dispatch_life, &dispatch_inputs) {
             Ok(receipt) => {
@@ -938,6 +1017,9 @@ impl StockMiner {
                     error = %err,
                     "Inherited stock FPGA DMA registers do not match the admitted layout — cutting hash before any work commit"
                 );
+                if !work_engine.stop() {
+                    error!("Inherited DHASH/nullwork stop was not acknowledged; proceeding directly to rail-safe teardown");
+                }
                 if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
                     owner.close_terminal();
                 }
@@ -950,7 +1032,22 @@ impl StockMiner {
                 ));
             }
         } else {
-            work_engine.init(total_chips);
+            if let Err(error) = work_engine.init() {
+                error!(%error, "Stock FPGA DHASH init was not acknowledged; cutting hash");
+                if !work_engine.stop() {
+                    error!("Ambiguous full-init DHASH/nullwork stop was not acknowledged; proceeding directly to rail-safe teardown");
+                }
+                if let Some(owner) = legacy_watchdog_feed_owner.as_mut() {
+                    owner.close_terminal();
+                }
+                let heartbeat_stop = runtime_threads.stop_and_join(Duration::from_secs(3)).await;
+                run_safety.heartbeat_stop_observed(&heartbeat_stop);
+                let evidence = run_safety.teardown("full-init-dhash-refused");
+                warn!(?evidence, "Stock full-init-refused teardown evidence");
+                return Err(anyhow::anyhow!(
+                    "stock FPGA DHASH init was not acknowledged: {error}"
+                ));
+            }
         }
         info!(
             total_chips,
@@ -1061,7 +1158,8 @@ impl StockMiner {
         let mut nonce_poll_timer = tokio::time::interval(Duration::from_millis(1));
         let mut hashrate_timer = tokio::time::interval(Duration::from_secs(5));
 
-        loop {
+        let mut dispatch_io_failure: Option<String> = None;
+        'mining: loop {
             // Terminal revoke on mid-run PIC heartbeat failure — cut hash
             // before noise via the shared lifecycle latch (not fan blast).
             if pic_heartbeat_failed.load(Ordering::SeqCst) && dispatch_life.is_admitted() {
@@ -1124,6 +1222,21 @@ impl StockMiner {
 
                 // Receive new job from Stratum
                 Some(job) = job_rx.recv() => {
+                    if !stock_fpga_dma_job_domain_admitted(
+                        job.merkle_root != [0u8; 32],
+                        job.extranonce2_size,
+                    ) {
+                        error!(
+                            has_precomputed_merkle_root = job.merkle_root != [0u8; 32],
+                            extranonce2_size = job.extranonce2_size,
+                            "Pool job is outside the recovered stock FPGA V1 coinbase/extranonce2 domain; entering rail-safe teardown"
+                        );
+                        dispatch_io_failure = Some(
+                            "pool job is not representable by the recovered stock FPGA V1 DMA carrier"
+                                .to_owned(),
+                        );
+                        break 'mining;
+                    }
                     if job.clean_jobs {
                         info!(
                             job_id = %job.job_id,
@@ -1148,7 +1261,7 @@ impl StockMiner {
                     if let Some(ref job) = current_job {
                         // NOTE: BUFFER_SPACE register reads 0 during normal mining
                         // (bmminer also shows 0). It does NOT gate work dispatch.
-                        // The FPGA picks up work via JOB_DATA_READY regardless.
+                        // The final DHASH control RMW commits a verified job.
 
                         // Generate new work
                         let stratum_work = match work_builder.next_work(job) {
@@ -1162,10 +1275,11 @@ impl StockMiner {
 
                         // Convert prev_block_hash from pool byte order to 8 x u32 words.
                         // The FPGA uses this to construct block headers internally.
-                        // Pool sends prev_hash with each 4-byte word byte-swapped.
+                        // Exact S9-family and BM1396 dispatchers assemble each
+                        // four-byte packet word little-endian before raw MMIO.
                         let mut prev_hash_words = [0u32; 8];
                         for (i, word) in prev_hash_words.iter_mut().enumerate() {
-                            *word = u32::from_be_bytes([
+                            *word = u32::from_le_bytes([
                                 job.prev_block_hash[i * 4],
                                 job.prev_block_hash[i * 4 + 1],
                                 job.prev_block_hash[i * 4 + 2],
@@ -1201,14 +1315,6 @@ impl StockMiner {
                             job_data.extend_from_slice(branch);
                         }
 
-                        // Set lengths for DHASH accelerator
-                        work_engine.set_lengths(
-                            coinbase_len as u16,
-                            en2_len as u8,
-                            nonce2_offset as u8,
-                        );
-                        work_engine.set_merkle_count(job.merkle_branches.len() as u32);
-
                         // Build header tail for share validation
                         let mut header_tail = [0u8; 12];
                         header_tail[0..4].copy_from_slice(&stratum_work.merkle4);
@@ -1220,11 +1326,12 @@ impl StockMiner {
                         //   prev_hash (registers) + coinbase (DMA) + merkle (DMA)
                         // G15: REG_JOB_ID (return value) is the correlation spine —
                         // push history AFTER dispatch using the low byte nonces echo.
-                        // G17: when BIP-310 mask is non-zero, use pure 4-way AsicBoost
-                        // packing + multi-midstate DHASH (stock/bmminer path).
+                        // Four-way AsicBoost remains fail-closed until the
+                        // page-tail lane map and nonce/version correlation are
+                        // admitted for an exact board/firmware profile.
                         let use_asicboost =
                             stock_asicboost_admitted(stratum_work.version_mask);
-                        let fpga_job_id = if use_asicboost {
+                        let dispatch_result = if use_asicboost {
                             work_engine.dispatch_work_asicboost(
                                 &job_data,
                                 &prev_hash_words,
@@ -1232,6 +1339,10 @@ impl StockMiner {
                                 stratum_work.version_mask,
                                 stratum_work.ntime,
                                 stratum_work.nbits,
+                                coinbase_len,
+                                en2_len,
+                                nonce2_offset,
+                                job.merkle_branches.len(),
                             )
                         } else {
                             work_engine.dispatch_work(
@@ -1240,7 +1351,19 @@ impl StockMiner {
                                 stratum_work.version,
                                 stratum_work.ntime,
                                 stratum_work.nbits,
+                                coinbase_len,
+                                en2_len,
+                                nonce2_offset,
+                                job.merkle_branches.len(),
                             )
+                        };
+                        let fpga_job_id = match dispatch_result {
+                            Ok(job_id) => job_id,
+                            Err(error) => {
+                                error!(%error, "Stock FPGA job commit failed; entering rail-safe teardown");
+                                dispatch_io_failure = Some(error.to_string());
+                                break 'mining;
+                            }
                         };
                         let work_id = (fpga_job_id & 0xFF) as u8;
                         // Up to 4 midstates for AsicBoost solution_idx validation;
@@ -1427,8 +1550,9 @@ impl StockMiner {
                 _ = hashrate_timer.tick() => {
                     watchdog_liveness.fetch_add(1, Ordering::Relaxed);
                     let elapsed = last_hashrate_time.elapsed().as_secs_f64();
-                    if elapsed > 0.0 && hashrate_nonces > 0 {
-                        let hashes = hashrate_nonces as f64 * HW_DIFFICULTY as f64 * 4_294_967_296.0;
+                    if elapsed > 0.0 && hashrate_nonces > 0 && effective_nonce_difficulty.is_some() {
+                        let difficulty = effective_nonce_difficulty.expect("checked some");
+                        let hashes = hashrate_nonces as f64 * difficulty as f64 * 4_294_967_296.0;
                         let hashrate_ghs = hashes / elapsed / 1e9;
                         let hashrate_ths = hashrate_ghs / 1000.0;
 
@@ -1446,9 +1570,9 @@ impl StockMiner {
                             hashrate_ths, hashrate_ghs, total_nonces, shares_submitted,
                         );
 
-                        hashrate_nonces = 0;
-                        last_hashrate_time = Instant::now();
                     }
+                    hashrate_nonces = 0;
+                    last_hashrate_time = Instant::now();
                 }
             }
         }
@@ -1467,7 +1591,11 @@ impl StockMiner {
                 .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
             let (action, stop_feed) = stock_fpga_revoke_work_dispatch(
                 &mut dispatch_life,
-                DispatchRevocationCause::OperatorSafeOff,
+                if dispatch_io_failure.is_some() {
+                    DispatchRevocationCause::HardwareIoFailure
+                } else {
+                    DispatchRevocationCause::OperatorSafeOff
+                },
                 home_pwm,
             );
             info!(
@@ -1486,7 +1614,11 @@ impl StockMiner {
         }
 
         // Stop DHASH accelerator
-        work_engine.stop();
+        if !work_engine.stop() {
+            error!(
+                "Stock FPGA DHASH stop was not acknowledged; continuing directly to rail-safe teardown"
+            );
+        }
 
         // Quiesce the heartbeat owner before reopening the shared FPGA I2C
         // transport. All workers consume one total deadline. If the worker is
@@ -1494,7 +1626,11 @@ impl StockMiner {
         // remove hash power instead of risking a concurrent register sequence.
         let heartbeat_stop = runtime_threads.stop_and_join(Duration::from_secs(3)).await;
         run_safety.heartbeat_stop_observed(&heartbeat_stop);
-        let voltage_evidence = run_safety.teardown("normal-shutdown");
+        let voltage_evidence = run_safety.teardown(if dispatch_io_failure.is_some() {
+            "stock-dispatch-io-failure"
+        } else {
+            "normal-shutdown"
+        });
 
         // Post-mining cooldown fan. The chips were just mining and are still hot.
         // Software disable commands may have completed, or a degraded teardown
@@ -1529,6 +1665,11 @@ impl StockMiner {
                 ?voltage_evidence,
                 "Stock FPGA mining shutdown degraded; PIC watchdog cutoff is required before warm restart"
             );
+        }
+        if let Some(error) = dispatch_io_failure {
+            return Err(anyhow::anyhow!(
+                "stock FPGA dispatch failed after rail-safe teardown: {error}"
+            ));
         }
         Ok(())
     }
@@ -1606,6 +1747,46 @@ mod work_dispatch_admission_tests {
         for enabled in [Some("1"), Some("true"), Some("YES"), Some(" on ")] {
             assert!(stock_fpga_nonce2_beta_enabled_value(enabled));
         }
+    }
+
+    #[test]
+    fn stock_pool_route_and_job_domain_refuse_sv2_standard_before_work() {
+        assert!(stock_fpga_pool_route_is_v1(None, false));
+        assert!(stock_fpga_pool_route_is_v1(Some("v1"), true));
+        assert!(stock_fpga_pool_route_is_v1(Some("sv1"), false));
+        assert!(!stock_fpga_pool_route_is_v1(Some("v2"), false));
+        assert!(!stock_fpga_pool_route_is_v1(Some("auto"), true));
+        assert!(!stock_fpga_pool_route_is_v1(None, true));
+
+        assert!(stock_fpga_dma_job_domain_admitted(false, 1));
+        assert!(stock_fpga_dma_job_domain_admitted(false, 8));
+        assert!(!stock_fpga_dma_job_domain_admitted(true, 4));
+        assert!(!stock_fpga_dma_job_domain_admitted(false, 0));
+        assert!(!stock_fpga_dma_job_domain_admitted(false, 9));
+    }
+
+    #[test]
+    fn stock_v1_route_refusal_precedes_all_device_access() {
+        let src = include_str!("stock_mining.rs");
+        let route_gate = src
+            .find("if !(primary_v1 && failover1_v1 && failover2_v1)")
+            .expect("V1 route gate");
+        let device_open = src.find("StockFpga::open()").expect("stock FPGA open");
+        assert!(route_gate < device_open);
+    }
+
+    #[test]
+    fn retained_live_receipt_is_revalidated_before_any_device_access() {
+        let src = include_str!("stock_mining.rs");
+        let run = &src[src.find("pub async fn run").expect("StockMiner::run")..];
+        let process_validation = run
+            .find("validate_current_process()")
+            .expect("retained lease process validation");
+        let exact_fabric = run
+            .find("STOCK_FPGA_MANAGEMENT_FABRIC")
+            .expect("canonical fabric validation");
+        let device_open = run.find("StockFpga::open()").expect("stock FPGA open");
+        assert!(process_validation < exact_fabric && exact_fabric < device_open);
     }
 
     #[test]

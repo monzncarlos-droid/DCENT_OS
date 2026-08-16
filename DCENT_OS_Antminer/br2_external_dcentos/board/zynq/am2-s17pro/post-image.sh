@@ -8,18 +8,21 @@
 # hashboard family. Produces a sysupgrade tarball with the
 # "sysupgrade-am2-s17p/" prefix.
 #
-# ## RUNTIME-ONLY — NO COLD-BOOT PROOF ########################################
-# There is NO live Antminer S17 / S17 Pro on the D-Central fleet, and there is
-# NO extracted S17 kernel in the knowledge base. This script therefore CANNOT
-# produce a flashable sysupgrade tarball today — it builds the rootfs and, if a
-# kernel is supplied via $DCENT_AM2_S17_KERNEL, packages a regression-coverage
-# tarball. With no kernel it exits cleanly with a WARN (the squashfs is still
-# valid for deploy-only / package-validator workflows). Do NOT claim cold-boot
-# proof. See the board README.md.
+# ## EXACT DONOR, MODEL-BOUND FIT; PACKAGE-ONLY / INSTALL DENIED ################
+# The exact held Braiins AM2 S17 SD image proves the existing DCENT AM2 A/B UBI
+# contract for this board family: 95 MiB firmware1/firmware2 partitions selected
+# as mtd7/mtd8, with U-Boot loading the `kernel` UBI volume and booting a FIT.
+# Its exact Linux-4.4.0-xilinx kernel carries UBI/ubiblock/SquashFS and the S17
+# generic-UIO bindings. Its exact DTB model is "Antminer S17 Miner Control Board".
+# We rebuild only kernel+DTB (never the donor ramdisk) and prove that FIT against
+# the canonical 23 x 126,976-byte inactive `kernel` volume. The donor image,
+# source FIT, kernel, DTB, U-Boot, MBR/FAT layout, model and output FIT contract
+# are all exact-admitted offline. This creates an Experimental package artifact,
+# not stock first-install or Toolbox/device authorization. No live S17 witness
+# exists, and all install/update metadata therefore remains denied.
 #
-# ## UNCONFIRMED (v2 open question → R11) #####################################
-# S17 (BM1396) vs S17 Pro (BM1397) chip-driver dispatch is code-only and never
-# live-validated.
+# S17/S17 Pro are BM1397. The separate S17e/T17e catalog-BM1396 versus
+# wire-BM1397 identity split does not authorize those models on this target.
 #############################################################################
 #
 # CRITICAL — :
@@ -36,7 +39,7 @@ BOARD_FAMILY="am2"
 OUTPUT_TAR="${BINARIES_DIR}/dcentos-sysupgrade-am2-s17pro.tar"
 
 echo "=== DCENTos Post-Image Builder (am2-s17pro) ==="
-echo "    RUNTIME-ONLY scaffold — no live S17 / S17 Pro on the fleet."
+echo "    Exact S17 donor; model-bound UBI FIT; package-only/install-denied."
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -55,16 +58,11 @@ echo "Rootfs:  $(basename "$ROOTFS") ($((ROOTFS_SIZE / 1024)) KB)"
 echo "  SHA256: ${ROOTFS_SHA256}"
 
 # -----------------------------------------------------------------------------
-# Locate a kernel for the am2-s17p sysupgrade package.
-# Probe order (most-specific to least):
-#   1. $DCENT_AM2_S17_KERNEL (env override)
-#   2. <repo>/
-#   S9 / s19j fallback is deliberately banned for an am2-s17 production package.
-#
-# RUNTIME-ONLY reality: there is no extracted S17 kernel in the knowledge base
-# (no live unit was ever probed). With no kernel this script emits a WARN and
-# exits 0 — the rootfs.squashfs is still produced for package-validator
-# regression coverage and deploy-only workflows.
+# Admit only the exact held Braiins S17 SD image. Stock archives and arbitrary
+# kernel/DTB overrides are deliberately not inputs: the stock uImage follows a
+# different raw-MTD+ramdisk boot contract and is too large for the canonical
+# UBI kernel volume. The donor helper proves the disk/FAT/U-Boot/source-FIT,
+# extracts the exact S17 UBI kernel and model-bound DTB, and refuses all drift.
 # -----------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "${BR2_EXTERNAL_DCENTOS_PATH}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
@@ -120,46 +118,112 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-KERNEL=""
-if [ -n "${DCENT_AM2_S17_KERNEL:-}" ] && [ -f "${DCENT_AM2_S17_KERNEL}" ]; then
-    KERNEL="${DCENT_AM2_S17_KERNEL}"
-    KERNEL_SRC="env override"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin"
-    KERNEL_SRC="knowledge-base/extractions/s17"
+KERNEL_ADMISSION_TOOL="${PROJECT_ROOT}/scripts/extract_am2_s17_kernel.py"
+[ -r "$KERNEL_ADMISSION_TOOL" ] || {
+    echo "ERROR: S17 kernel admission helper is missing: $KERNEL_ADMISSION_TOOL" >&2
+    exit 1
+}
+if [ -z "${DCENT_AM2_S17_BRAIINS_SD_IMAGE:-}" ] || [ ! -f "${DCENT_AM2_S17_BRAIINS_SD_IMAGE}" ]; then
+    echo "ERROR: exact held S17 donor is required; refusing package creation" >&2
+    echo "  set DCENT_AM2_S17_BRAIINS_SD_IMAGE to braiins-os_am2-s17_sd.img" >&2
+    exit 1
 fi
 
-if [ -z "$KERNEL" ]; then
-    echo "WARNING: no kernel.bin found for am2-s17p sysupgrade packaging." >&2
-    echo "  Expected one of:" >&2
-    echo "    \$DCENT_AM2_S17_KERNEL" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s17/kernel.bin" >&2
-    echo "" >&2
-    echo "  RUNTIME-ONLY: there is no live S17 / S17 Pro on the fleet and no" >&2
-    echo "  extracted S17 kernel in the knowledge base. Skipping sysupgrade" >&2
-    echo "  tarball — the rootfs.squashfs is still produced for package-" >&2
-    echo "  validator regression coverage and deploy-only workflows." >&2
-    echo "  An S17 kernel extraction (via a bench unit) is required before a" >&2
-    echo "  flashable am2-s17p package can be built. See README.md." >&2
-    cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
-=== DCENTos am2-s17pro Build Info (RUNTIME-ONLY, NO KERNEL) ===
-Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-Board:      ${BOARD_NAME} (S17 / S17 Pro Zynq am2-s17 variant)
-Board family: ${BOARD_FAMILY}
-Status:     ROOTFS-ONLY — no S17 kernel available, no sysupgrade tarball.
-            No live S17 / S17 Pro on the fleet. BM1396 vs BM1397 chip-driver
-            dispatch UNCONFIRMED (v2 open question -> R11).
+if [ -n "${DCENT_AM2_S17_KERNEL:-}${DCENT_AM2_S17_DTB:-}${DCENT_AM2_S17_VENDOR_ARCHIVE:-}${DCENT_AM2_S17_CROSSCHECK_ARCHIVE:-}" ]; then
+    echo "ERROR: stock archives and kernel/DTB overrides are not admitted by the S17 UBI FIT path" >&2
+    exit 1
+fi
 
-Rootfs: rootfs.squashfs
-  Size:   ${ROOTFS_SIZE} bytes
-  SHA256: ${ROOTFS_SHA256}
+MKIMAGE=""
+if [ -n "${HOST_DIR:-}" ] && [ -x "${HOST_DIR}/bin/mkimage" ]; then
+    MKIMAGE="${HOST_DIR}/bin/mkimage"
+else
+    MKIMAGE=$(command -v mkimage || true)
+fi
+[ -n "$MKIMAGE" ] && [ -x "$MKIMAGE" ] || {
+    echo "ERROR: host mkimage with FIT support is required" >&2
+    exit 1
+}
+
+KERNEL_ADMISSION_DIR=$(mktemp -d)
+cleanup_s17_admission() {
+    rm -rf -- "$KERNEL_ADMISSION_DIR"
+}
+trap cleanup_s17_admission EXIT HUP INT TERM
+python3 "$KERNEL_ADMISSION_TOOL" extract \
+    --donor "${DCENT_AM2_S17_BRAIINS_SD_IMAGE}" \
+    --kernel-output "${KERNEL_ADMISSION_DIR}/kernel.bin" \
+    --dtb-output "${KERNEL_ADMISSION_DIR}/s17.dtb" \
+    --receipt "${KERNEL_ADMISSION_DIR}/donor-admission.json" >/dev/null || {
+        echo "ERROR: S17 Braiins donor failed exact admission" >&2
+        exit 1
+    }
+
+cat > "${KERNEL_ADMISSION_DIR}/s17-ubi-kernel.its" << 'EOF'
+/dts-v1/;
+
+/ {
+    description = "DCENT_OS S17 model-bound UBI kernel FIT";
+    #address-cells = <1>;
+
+    images {
+        kernel@1 {
+            description = "DCENT_OS S17 UBI kernel";
+            data = /incbin/("kernel.bin");
+            type = "kernel";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            load = <0x00008000>;
+            entry = <0x00008000>;
+            hash@1 { algo = "crc32"; };
+            hash@2 { algo = "sha1"; };
+        };
+
+        fdt@1 {
+            description = "Antminer S17 model-bound device tree";
+            data = /incbin/("s17.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash@1 { algo = "crc32"; };
+            hash@2 { algo = "sha1"; };
+        };
+    };
+
+    configurations {
+        default = "config@1";
+        config@1 {
+            description = "DCENT_OS S17 kernel plus exact S17 DTB";
+            kernel = "kernel@1";
+            fdt = "fdt@1";
+        };
+    };
+};
 EOF
-    echo ""
-    echo "=== Build Complete (am2-s17pro — rootfs only, no flashable package) ==="
-    exit 0
-fi
 
-cp "$KERNEL" "${BINARIES_DIR}/kernel"
+# Bind generated FIT timestamps to the exact donor source FIT timestamp. This
+# keeps the host artifact reproducible without changing release provenance.
+S17_FIT_SOURCE_DATE_EPOCH=1740171698
+(
+    cd "$KERNEL_ADMISSION_DIR"
+    SOURCE_DATE_EPOCH="$S17_FIT_SOURCE_DATE_EPOCH" "$MKIMAGE" \
+        -f s17-ubi-kernel.its s17-ubi-kernel.itb >/dev/null
+)
+python3 "$KERNEL_ADMISSION_TOOL" verify-fit \
+    --fit "${KERNEL_ADMISSION_DIR}/s17-ubi-kernel.itb" \
+    > "${KERNEL_ADMISSION_DIR}/fit-admission.json" || {
+        echo "ERROR: rebuilt S17 UBI FIT failed exact model/geometry admission" >&2
+        exit 1
+    }
+
+cp "${KERNEL_ADMISSION_DIR}/s17-ubi-kernel.itb" "${BINARIES_DIR}/kernel"
+cp "${KERNEL_ADMISSION_DIR}/donor-admission.json" "${BINARIES_DIR}/am2-s17-donor-admission.json"
+cp "${KERNEL_ADMISSION_DIR}/fit-admission.json" "${BINARIES_DIR}/am2-s17-fit-admission.json"
+rm -rf -- "$KERNEL_ADMISSION_DIR"
+KERNEL_ADMISSION_DIR=""
+trap - EXIT HUP INT TERM
+KERNEL_SRC="exact held Braiins AM2 S17 donor (model-bound kernel+DTB FIT)"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
 KERNEL_SHA256=$(sha256sum "${BINARIES_DIR}/kernel" | awk '{print $1}')
 dcent_zynq_geometry_require_payload_fit "$BOARD_NAME" kernel "$KERNEL_SIZE" || exit 1
@@ -183,7 +247,7 @@ DCENT_OS
 D-Central Technologies
 Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board: ${BOARD_NAME}
-Kernel: BraiinsOS 4.4.x (am2-s17 / S17 / S17 Pro Zynq variant) — RUNTIME-ONLY
+Kernel: exact-donor Linux 4.4.0-xilinx + model-bound S17 DTB FIT — EXPERIMENTAL
 Rootfs: DCENTos (Buildroot)
 EOF
 METADATA_SHA256=$(sha256sum "$SUP_DIR/METADATA" | awk '{print $1}')
@@ -225,8 +289,8 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s17pro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am2-s17pro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery",
+    "install_command": null,
+    "update_command": null,
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": true
@@ -234,12 +298,14 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
 }
 EOF
 
-# Final manifest/signature rewrite through shared AM2/AM3 helper.
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am2-s17pro.tar --artifact-dir <restore_verified_dir> --accept-am2-persistent-lab --i-have-recovery"
-DCENT_TOOLBOX_UPDATE_COMMAND="$DCENT_TOOLBOX_INSTALL_COMMAND"
+# Final manifest/signature rewrite through the shared helper. This is a
+# package-validation artifact only: no Toolbox install/update route is emitted.
+DCENT_TOOLBOX_INSTALL_COMMAND=""
+DCENT_TOOLBOX_UPDATE_COMMAND=""
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=true
-DCENT_TOOLBOX_INSTALL_MODE=target_sysupgrade
+DCENT_TOOLBOX_INSTALL_MODE=package_only_denied
 DCENT_TARGET_SIDE_SYSUPGRADE=true
+DCENT_PACKAGE_INSTALLABLE=false
 DCENT_PACKAGE_STATUS="${DCENT_PACKAGE_STATUS:-unvalidated_target_sysupgrade}"
 dcent_stage_release_key
 dcent_write_sysupgrade_manifest
@@ -266,15 +332,15 @@ tar tf "$OUTPUT_TAR" | sed 's/^/  /'
 # Build info file
 # -----------------------------------------------------------------------------
 cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
-=== DCENTos am2-s17pro Build Info (RUNTIME-ONLY scaffold) ===
+=== DCENTos am2-s17pro Build Info (EXPERIMENTAL package) ===
 Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board:      ${BOARD_NAME} (S17 / S17 Pro Zynq am2-s17 variant)
 Board family: ${BOARD_FAMILY}
-Status:     NO live S17 / S17 Pro on the fleet. Kernel supplied via
-            ${KERNEL_SRC}. BM1396 vs BM1397 chip-driver dispatch UNCONFIRMED
-            (v2 open question -> R11). Do NOT flash a live unit until a bench
-            S17 / S17 Pro is acquired and accepted-share + round-trip proof
-            is captured.
+Status:     Exact S17 UBI boot donor admitted via ${KERNEL_SRC}.
+            Package-only artifact: stock first-install and all Toolbox install/
+            update routing remain denied.
+            No live S17 / S17 Pro cold-boot, rollback, thermal, or accepted-
+            share proof exists. Persistent use remains explicit lab-only.
 
 Sysupgrade tarball:
   File:   $(basename "${OUTPUT_TAR}")
@@ -294,4 +360,4 @@ Target fleet:
 EOF
 
 echo ""
-echo "=== Build Complete (am2-s17pro — RUNTIME-ONLY) ==="
+echo "=== Build Complete (am2-s17pro — EXPERIMENTAL package, no live proof) ==="

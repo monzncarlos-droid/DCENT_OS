@@ -319,6 +319,14 @@ def write_stage_manifest(
         artifacts[output_name] = entry
     value = {
         "artifacts": artifacts,
+        # This staging tool feeds only the AM2 S19j-Pro external-media lane.
+        # The binding is an inventory claim, not a hardware allowlist: source
+        # compatibility still requires independent evidence and live boot is
+        # required before maturity can advance beyond Experimental.
+        "board_target": "am2-s19j",
+        "control_board_family": "zynq-bm3-am2",
+        "media_target": "am2-s19jpro-sd",
+        "provenance_scope": "local-snapshot-integrity-only",
         "ready_for_complete_build": True,
         "schema": "dcentos.am2_sd_artifacts_stage.v2",
         "validation": {

@@ -44,8 +44,7 @@ for route in \
     "S17Plus am2-s17plus" \
     "T17 am2-t17" \
     "T17Plus am2-t17plus" \
-    "T19 am2-t19" \
-    "S19XP am3-s19xp"
+    "T19 am2-t19"
 do
     set -- $route
     output=$(sh "$harness" install-hint "$1" 192.0.2.1 2>&1)
@@ -68,12 +67,11 @@ fi
 
 for route in \
     "S9 am1-s9 dcentos-sysupgrade-118.tar managed_s9_install" \
-    "S17 am2-s17p dcentos-sysupgrade-am2-s17pro.tar guarded_am2_self_update" \
-    "S17Pro am2-s17p dcentos-sysupgrade-am2-s17pro.tar guarded_am2_self_update" \
     "S19 am2-s19pro dcentos-sysupgrade-am2-s19pro.tar guarded_am2_self_update" \
     "S19Pro am2-s19pro dcentos-sysupgrade-am2-s19pro.tar guarded_am2_self_update" \
     "S19jPro am2-s19j dcentos-sysupgrade-am2-s19jpro.tar guarded_am2_self_update" \
     "S19kPro am3-s19k dcentos-sysupgrade-am3-s19kpro.tar guarded_amlogic_rootfs_window" \
+    "S19XP am3-s19xp dcentos-sysupgrade-am3-s19xp.tar guarded_amlogic_rootfs_window" \
     "S21 am3-s21 dcentos-sysupgrade-am3-s21.tar guarded_amlogic_rootfs_window" \
     "T21 am3-t21 dcentos-sysupgrade-am3-t21.tar guarded_amlogic_rootfs_window" \
     "S21Pro am3-s21pro dcentos-sysupgrade-am3-s21pro.tar guarded_amlogic_rootfs_window" \
@@ -146,6 +144,30 @@ do
         *"atomic bootslot flip"*|*"fw_setenv bootcmd \"run storeboot\""*)
             bad "$1 hint still advertises an unproven generic rollback"
             ;;
+    esac
+done
+
+for route in \
+    "S17 am2-s17p dcentos-sysupgrade-am2-s17pro.tar" \
+    "S17Pro am2-s17p dcentos-sysupgrade-am2-s17pro.tar"
+do
+    set -- $route
+    output=$(sh "$harness" install-hint "$1" 192.0.2.1 2>&1)
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+        bad "$1 package-only hint returned $rc instead of refusal rc=1"
+    fi
+    case "$output" in
+        *"Offline package-only artifact: output/$3"*'package_only_denied'*) : ;;
+        *) bad "$1 package-only refusal omitted its typed artifact/contract" ;;
+    esac
+    case "$output" in
+        *"dcent install "*) bad "$1 package-only refusal printed an install command" ;;
+    esac
+    producer_row=$(grep -F "\"board_target\":\"$2\"" "$producer_manifest")
+    case "$producer_row" in
+        *"\"artifact_filename\":\"$3\""*'"install_contract":"package_only_denied"'*) : ;;
+        *) bad "$1 package-only producer identity/contract drifted" ;;
     esac
 done
 

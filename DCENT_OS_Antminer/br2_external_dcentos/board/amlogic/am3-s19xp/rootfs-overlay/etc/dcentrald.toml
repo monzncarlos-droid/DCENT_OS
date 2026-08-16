@@ -1,0 +1,19 @@
+# Package-only A113D identity. Hardware install and mining remain denied.
+[general]
+hostname = "dcentos-s19xp"
+log_level = "info"
+
+[mining]
+enabled = false
+model = "s19xp"
+chip = "BM1366"
+chips_per_chain = 110
+chains = 3
+
+[platform]
+target = "am3-aml-s19xp"
+
+[pool]
+url = ""
+worker = ""
+password = "x"

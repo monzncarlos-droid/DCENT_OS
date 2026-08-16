@@ -75,6 +75,7 @@ use dcentrald_diagnostics::snapshot::{
     SnapshotChain, SnapshotChipHealth, SnapshotContext, SnapshotHistorySample, SnapshotProfile,
     SnapshotProfileChip,
 };
+use dcentrald_diagnostics::troubleshoot::{AsicCommChainSnapshot, AsicCommSnapshot};
 use dcentrald_diagnostics::{
     DiagnosticJobConfig, HashReportJobConfig, TestResult, TestStatus, TestType,
 };
@@ -3943,13 +3944,13 @@ const API_COMPATIBILITY_DCENT_ROUTES: &[ApiCompatibilityRouteEntry] = &[
     ApiCompatibilityRouteEntry {
         method: "GET",
         path: "/api/hardware/pic_info",
-        support: "implemented_catalog_with_live_snapshot_seam",
+        support: "implemented_catalog_with_runtime_global_snapshot",
         mutates: false,
         compatibility: &["DCENT diagnostics", "PIC/dsPIC planning"],
-        provenance: "mounted in rest::build_router and backed by dcentrald-api-types::pic_firmware",
-        unsupported_fields: &["live_pic_service_handle"],
+        provenance: "mounted in rest::build_router; standard runtime publishes its already-retained PIC16 dispatch classification through AppState",
+        unsupported_fields: &["per_endpoint_exact_firmware_byte"],
         limitations: &[
-            "Returns explicit not_wired live_per_slot status until a daemon-owned PicService snapshot handle is added.",
+            "The standard runtime snapshot is a global classification, not an exact firmware-byte observation for every initialized endpoint.",
             "REST does not issue PIC I2C reads or writes.",
         ],
     },

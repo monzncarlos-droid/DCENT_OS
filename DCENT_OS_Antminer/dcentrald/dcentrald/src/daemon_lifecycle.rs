@@ -69,6 +69,41 @@ impl PlatformIdentitySnapshot {
     pub(crate) fn psu_hardware_variant(&self) -> Option<&str> {
         self.declared_psu_hardware_variant.as_deref()
     }
+
+    /// Fill identity gaps from typed TOML `[platform]` (overlay / /tmp trial).
+    ///
+    /// `/etc/dcentos/*` markers already captured remain authoritative — this
+    /// never overwrites a non-empty declared board_target or platform marker.
+    pub(crate) fn apply_config_platform_declaration(
+        &mut self,
+        platform: &crate::config::PlatformIdentityConfig,
+    ) {
+        let declared_bt_empty = self
+            .declared_board_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none();
+        if declared_bt_empty {
+            if let Some(bt) = platform.board_target() {
+                self.declared_board_target = Some(bt.to_string());
+                if self.board_desc.is_none() {
+                    self.board_desc = dcentrald_common::BoardDesc::lookup(bt);
+                }
+            }
+        }
+        let marker_empty = self
+            .declared_platform_marker
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none();
+        if marker_empty {
+            if let Some(target) = platform.target() {
+                self.declared_platform_marker = Some(target.to_string());
+            }
+        }
+    }
 }
 
 /// Read-only capability that captures platform identity evidence once.

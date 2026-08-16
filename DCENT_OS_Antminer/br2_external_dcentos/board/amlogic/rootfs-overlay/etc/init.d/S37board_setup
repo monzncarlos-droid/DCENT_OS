@@ -2,12 +2,14 @@
 #
 # S37board_setup - checked Amlogic A113D safe baseline and board pinmux
 #
-# GPIO437 is PWR_EN and is active HIGH: 1=ON, 0=OFF.  Linux starts from an
+# GPIO437 is PWR_EN and is active HIGH: 1=ON, 0=OFF.
+# Exception: board_target=am3-s19k uses SafeOff=1 (T6 2026-08-12: sysfs 0
+# engages the rail). S21-class images keep SafeOff=0. Linux starts from an
 # UnknownInherited power state because U-Boot may have touched APW bus 1 and a
 # warm reset may preserve GPIO state.  The first safety-critical Linux
-# mutation is therefore the sysfs ABI's glitch-free `direction=low`, followed
-# by direction and value readback.  Readback is software evidence only; it is
-# not a measurement of the physical rail.
+# mutation is therefore a glitch-free direction write, followed by direction
+# and value readback.  Readback is software evidence only; it is not a
+# measurement of the physical rail.
 
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
@@ -127,10 +129,29 @@ force_psu_safe_low() {
         return 1
     }
 
-    # Kernel GPIO sysfs ABI: writing `low` selects output with an initial LOW
-    # value without the out-then-value glitch of two separate operations.
-    set_gpio_direction_checked "$PWR_GPIO" low out || return 1
-    set_gpio_value_checked "$PWR_GPIO" 0 || return 1
+    # start_board() historically cut GPIO437 before read_identity. Peek the
+    # overlay marker so am3-s19k cannot inherit the S21 SafeOff=0 write.
+    if [ -z "$BOARD_TARGET" ]; then
+        BOARD_TARGET=$(read_trimmed "$IDENTITY_ROOT/board_target") || BOARD_TARGET=
+    fi
+
+    # Kernel GPIO sysfs ABI: writing `low`/`high` selects output with an
+    # initial level without the out-then-value glitch of two operations.
+    # S21-class / RE-4C: SafeOff drives 0. am3-s19k: SafeOff drives 1.
+    case "$BOARD_TARGET" in
+        am3-s19k|am3-s19kpro|am3-aml-s19kpro)
+            set_gpio_direction_checked "$PWR_GPIO" high out || return 1
+            set_gpio_value_checked "$PWR_GPIO" 1 || return 1
+            ;;
+        am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp|am3-t21)
+            set_gpio_direction_checked "$PWR_GPIO" low out || return 1
+            set_gpio_value_checked "$PWR_GPIO" 0 || return 1
+            ;;
+        *)
+            log_error "GPIO437 refuse: missing or unsealed board_target='$BOARD_TARGET'"
+            return 1
+            ;;
+    esac
 }
 
 configure_input_gpio() {
@@ -250,8 +271,16 @@ write_receipt() {
         printf 'resource=amlogic-gpio437-power-gate\n'
         printf 'gpio_direction=out\n'
         printf 'gpio_active_low=0\n'
-        printf 'commanded_value=0\n'
-        printf 'readback_value=0\n'
+        case "$BOARD_TARGET" in
+            am3-s19k|am3-s19kpro|am3-aml-s19kpro)
+                printf 'commanded_value=1\n'
+                printf 'readback_value=1\n'
+                ;;
+            *)
+                printf 'commanded_value=0\n'
+                printf 'readback_value=0\n'
+                ;;
+        esac
         printf 'fan0_duty_ns=%s\n' "$FAN_BOOT_DUTY_NS"
         printf 'fan0_period_ns=%s\n' "$FAN_PERIOD_NS"
         printf 'fan0_enabled=1\n'
@@ -296,8 +325,18 @@ verify_safe_receipt() {
     receipt_field_is resource amlogic-gpio437-power-gate || return 1
     receipt_field_is gpio_direction out || return 1
     receipt_field_is gpio_active_low 0 || return 1
-    receipt_field_is commanded_value 0 || return 1
-    receipt_field_is readback_value 0 || return 1
+    case "$BOARD_TARGET" in
+        am3-s19k|am3-s19kpro|am3-aml-s19kpro)
+            receipt_field_is commanded_value 1 || return 1
+            receipt_field_is readback_value 1 || return 1
+            SAFE_OFF_VALUE=1
+            ;;
+        *)
+            receipt_field_is commanded_value 0 || return 1
+            receipt_field_is readback_value 0 || return 1
+            SAFE_OFF_VALUE=0
+            ;;
+    esac
     receipt_field_is fan0_duty_ns "$FAN_BOOT_DUTY_NS" || return 1
     receipt_field_is fan0_period_ns "$FAN_PERIOD_NS" || return 1
     receipt_field_is fan0_enabled 1 || return 1
@@ -314,8 +353,8 @@ verify_safe_receipt() {
     DIRECTION=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/direction") || return 1
     VALUE=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/value") || return 1
     ACTIVE_LOW=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/active_low") || return 1
-    [ "$DIRECTION" = out ] && [ "$VALUE" = 0 ] && [ "$ACTIVE_LOW" = 0 ] || {
-        log_error "GPIO$PWR_GPIO revalidation failed direction=$DIRECTION value=$VALUE active_low=$ACTIVE_LOW"
+    [ "$DIRECTION" = out ] && [ "$VALUE" = "$SAFE_OFF_VALUE" ] && [ "$ACTIVE_LOW" = 0 ] || {
+        log_error "GPIO$PWR_GPIO revalidation failed direction=$DIRECTION value=$VALUE want=$SAFE_OFF_VALUE active_low=$ACTIVE_LOW"
         return 1
     }
     for CHANNEL in 0 1; do
@@ -350,7 +389,9 @@ pinmux_init() {
         configure_output_low_gpio "$GPIO" || return 1
     done
 
-    # Status LEDs default LOW.
+    # Status LEDs default LOW. Identity is LED_GREEN=453 / LED_RED=438
+    # (S21 Braiins names). Ash cannot resolve gpio-line-names; HAL
+    # write_amlogic_status_led does name-first at runtime.
     for GPIO in 453 438; do
         configure_output_low_gpio "$GPIO" || return 1
     done
@@ -361,8 +402,9 @@ pinmux_init() {
         set_optional_attribute_checked "$GPIO" edge falling || return 1
     done
 
-    # GPIO476/477 are I2C-1 SDA/SCL pinmux guards.  Verified stock S21 and the
+    # I2C_SCL=476 / I2C_SDA=477 pinmux guards. Verified stock S21 and the
     # retained runtime both require input, not the old output-high sequence.
+    # HAL prepare_management_i2c_pinmux resolves those names first.
     for GPIO in 476 477; do
         configure_input_gpio "$GPIO" || return 1
     done
@@ -406,7 +448,13 @@ mark_runtime_handoff() {
     # supervisor publishes the runtime owner.
     DIRECTION=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/direction") || return 1
     VALUE=$(read_trimmed "$GPIO_ROOT/gpio$PWR_GPIO/value") || return 1
-    [ "$DIRECTION" = out ] && [ "$VALUE" = 0 ] || return 1
+    # Boot-safe is SafeOff. S21-class SafeOff=0; am3-s19k SafeOff=1 (0 engages).
+    read_identity || return 1
+    case "$BOARD_TARGET" in
+        am3-s19k|am3-s19kpro|am3-aml-s19kpro) WANT_SAFE_OFF=1 ;;
+        *) WANT_SAFE_OFF=0 ;;
+    esac
+    [ "$DIRECTION" = out ] && [ "$VALUE" = "$WANT_SAFE_OFF" ] || return 1
     write_receipt runtime-handoff
 }
 
@@ -424,7 +472,7 @@ case "${1:-start}" in
     start)
         printf '  Establishing checked Amlogic boot-safe baseline...\n'
         if start_board; then
-            printf '  [OK] GPIO437 software readback LOW; fan PWM <=30; pinmux checked\n'
+            printf '  [OK] GPIO437 software readback SafeOff; fan PWM <=30; pinmux checked\n'
         else
             log_error 'safe baseline incomplete; dcentrald admission must remain blocked'
             exit 1

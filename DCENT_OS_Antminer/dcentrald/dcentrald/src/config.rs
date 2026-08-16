@@ -322,6 +322,11 @@ pub struct DcentraldConfig {
     /// See `dcentrald_bridge::BridgeConfig`.
     #[serde(default)]
     pub bridge: dcentrald_bridge::BridgeConfig,
+
+    /// Typed `[platform]` identity (`target`, `board_target`) for /tmp trial + overlay.
+    /// Identity-only — no safety flags (CE #1). `/etc/dcentos/*` markers remain authoritative.
+    #[serde(default)]
+    pub platform: PlatformIdentityConfig,
 }
 
 impl DcentraldConfig {
@@ -1334,6 +1339,29 @@ fn endpoint_uses_sv2_primary(protocol: Option<&str>, sv2_url: Option<&str>) -> b
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
     matches!(protocol.as_str(), "sv2" | "v2") && sv2_url.is_none()
+}
+
+// ---------------------------------------------------------------------------
+// Platform identity (tmp-trial / overlay declaration)
+// ---------------------------------------------------------------------------
+
+/// Typed `[platform]` section: identity strings only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformIdentityConfig {
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub board_target: Option<String>,
+}
+
+impl PlatformIdentityConfig {
+    pub fn board_target(&self) -> Option<&str> {
+        self.board_target.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3685,6 +3713,37 @@ eeprom_parser = "hidden_luxos_key"
     }
 
     #[test]
+    fn s19k_platform_section_parses_under_deny_unknown_fields() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[platform]
+target = "am3-aml-s19k"
+board_target = "am3-s19k"
+"#,
+        )
+        .expect("S19k [platform] section must deserialize");
+        assert_eq!(config.platform.target.as_deref(), Some("am3-aml-s19k"));
+        assert_eq!(config.platform.board_target.as_deref(), Some("am3-s19k"));
+        let host = include_str!("../../dcentrald_s19k.toml");
+        let mut cfg: DcentraldConfig = toml::from_str(host).expect("host toml parse");
+        cfg.normalize_legacy_fields().unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.platform.target.as_deref(), Some("am3-aml-s19k"));
+        assert_eq!(cfg.platform.board_target.as_deref(), Some("am3-s19k"));
+        assert!(!cfg.mining_start_enabled());
+        let err = toml::from_str::<DcentraldConfig>(
+            r#"
+[platform]
+target = "am3-aml-s19k"
+bogus_safety_flag = true
+"#,
+        )
+        .expect_err("unknown platform keys fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("bogus_safety_flag") || msg.contains("unknown field"));
+    }
+
+    #[test]
     fn s19k_psu_template_fields_are_schema_valid() {
         let config: DcentraldConfig = toml::from_str(
             r#"
@@ -3707,6 +3766,109 @@ hashrate_step_ths = 11.0
     }
 
     // -------------------------------------------------------------------
+    /// Track 1 hard host parse gate: `dcentrald_s19k.toml` must load through
+    /// the STRICT loader with typed identity-only `[platform]`
+    /// (`target`/`board_target`) plus FS markers at runtime. Mining stays off.
+    #[test]
+    fn dcentrald_s19k_toml_parses_without_platform() {
+        const S19K: &str = include_str!("../../dcentrald_s19k.toml");
+        assert!(
+            S19K.lines().any(|l| l.trim() == "[platform]"),
+            "dcentrald_s19k.toml must ship typed [platform] identity"
+        );
+        let mut cfg: DcentraldConfig =
+            toml::from_str(S19K).expect("dcentrald_s19k.toml must parse as DcentraldConfig");
+        cfg.normalize_legacy_fields()
+            .expect("dcentrald_s19k.toml normalize");
+        cfg.validate().expect("dcentrald_s19k.toml validate");
+        assert_eq!(cfg.mining.model.as_deref(), Some("s19k"));
+        assert_eq!(cfg.mining.serial_chip_type.as_deref(), Some("BM1366"));
+        assert_eq!(cfg.mining.serial_chip_count, Some(77));
+        assert!(!cfg.mining.enabled);
+        assert!(!cfg.mining_start_enabled());
+        assert!(!cfg.autotuner.enabled);
+        assert_eq!(cfg.platform.target(), Some("am3-aml-s19k"));
+        assert_eq!(cfg.platform.board_target(), Some("am3-s19k"));
+    }
+
+    /// am3-s19kpro overlay `/etc/dcentrald.toml` must also parse with typed
+    /// identity-only `[platform]` (same schema gate as the host trial template).
+    #[test]
+    fn am3_s19kpro_overlay_dcentrald_toml_parses_without_platform_mining_disabled() {
+        const OVERLAY: &str = include_str!(
+            "../../../br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentrald.toml"
+        );
+        assert!(
+            OVERLAY.lines().any(|l| l.trim() == "[platform]"),
+            "am3-s19kpro overlay must ship typed [platform] identity"
+        );
+        let mut cfg: DcentraldConfig =
+            toml::from_str(OVERLAY).expect("am3-s19kpro overlay etc/dcentrald.toml must parse");
+        cfg.normalize_legacy_fields()
+            .expect("overlay normalize");
+        cfg.validate().expect("overlay validate");
+        assert_eq!(cfg.mining.model.as_deref(), Some("s19k"));
+        assert_eq!(cfg.mining.serial_chip_type.as_deref(), Some("BM1366"));
+        assert_eq!(cfg.mining.serial_chip_count, Some(77));
+        assert!(!cfg.mining.enabled);
+        assert!(!cfg.mining_start_enabled());
+        assert!(!cfg.autotuner.enabled);
+        assert_eq!(cfg.platform.target(), Some("am3-aml-s19k"));
+        assert_eq!(cfg.platform.board_target(), Some("am3-s19k"));
+    }
+
+    /// Unknown keys under typed `[platform]` still fail closed (CE finding #1:
+    /// no phantom safety flags). Identity-only target/board_target remain valid.
+    #[test]
+    fn platform_section_unknown_keys_fail_closed() {
+        let err = toml::from_str::<DcentraldConfig>(
+            r#"
+[platform]
+target = "am3-aml-s19k"
+board_target = "am3-s19k"
+phantom_safety_flag = true
+"#,
+        )
+        .expect_err("unknown keys under [platform] must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("phantom_safety_flag") || msg.contains("unknown field"),
+            "unexpected error for unknown [platform] key: {msg}"
+        );
+    }
+
+    /// Track 1 host parse: both S19k trial + am3-s19kpro overlay tomls must
+    /// deserialize under deny_unknown_fields with mining.enabled = false and
+    /// typed identity-only `[platform]` (target/board_target).
+    #[test]
+    fn s19k_host_and_overlay_tomls_parse_with_mining_disabled() {
+        const HOST: &str = include_str!("../../dcentrald_s19k.toml");
+        const OVERLAY: &str = include_str!(
+            "../../../br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentrald.toml"
+        );
+        assert!(
+            HOST.lines().any(|l| l.trim() == "[platform]"),
+            "host toml must contain typed [platform] section"
+        );
+        assert!(
+            OVERLAY.lines().any(|l| l.trim() == "[platform]"),
+            "overlay toml must contain typed [platform] section"
+        );
+        let host: DcentraldConfig =
+            toml::from_str(HOST).expect("dcentrald_s19k.toml must parse as DcentraldConfig");
+        assert!(!host.mining.enabled, "host mining.enabled must stay false for Track 1");
+        assert_eq!(host.platform.target(), Some("am3-aml-s19k"));
+        assert_eq!(host.platform.board_target(), Some("am3-s19k"));
+        host.validate().expect("dcentrald_s19k.toml should validate after parse");
+        let overlay: DcentraldConfig =
+            toml::from_str(OVERLAY).expect("am3-s19kpro overlay dcentrald.toml must parse");
+        assert!(!overlay.mining.enabled, "overlay mining.enabled must stay false");
+        assert_eq!(overlay.platform.target(), Some("am3-aml-s19k"));
+        assert_eq!(overlay.platform.board_target(), Some("am3-s19k"));
+        overlay.validate().expect("am3-s19kpro overlay dcentrald.toml should validate after parse");
+    }
+
+
     // Phase 4C / EE Finding 5 #4 — am2 voltage clamp tests (2026-05-15)
     //
     // The 14_500 mV ceiling on am2-class boards (Zynq am2 S19 Pro /
@@ -4124,14 +4286,14 @@ voltage_mv = 14800
                 include_str!("../../configs/dcentrald_s15.toml"),
                 "s15",
                 "BM1391",
-                Some(84),
+                Some(60),
             ),
             (
                 "t15",
                 include_str!("../../configs/dcentrald_t15.toml"),
                 "t15",
                 "BM1391",
-                Some(63),
+                None,
             ),
             (
                 "s17",
@@ -4192,6 +4354,14 @@ voltage_mv = 14800
             assert_eq!(config.mining.model.as_deref(), Some(model));
             assert_eq!(config.mining.serial_chip_type.as_deref(), Some(chip_type));
             assert_eq!(config.mining.serial_chip_count, chip_count);
+            if matches!(label, "s15" | "t15") {
+                assert_eq!(config.mining.frequency_mhz, 0);
+                assert_eq!(config.mining.voltage_mv, 0);
+                assert_eq!(
+                    config.mining.serial_device, None,
+                    "BM1391 control-board endpoint is not held"
+                );
+            }
             assert!(
                 !config.mining_start_enabled(),
                 "{label} template must stay management-only"

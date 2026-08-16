@@ -103,6 +103,106 @@ pub struct AsicCommTest {
     pub error: Option<String>,
 }
 
+/// Read-only per-chain communication observation from daemon mining telemetry.
+///
+/// This is deliberately not [`AsicCommTest`]: it issues no GetAddress command,
+/// measures no response latency, and does not independently identify silicon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsicCommChainSnapshot {
+    pub chain_id: u8,
+    pub responding_chips: u8,
+    pub comm_ok: bool,
+    pub crc_errors: u32,
+    pub status: String,
+}
+
+/// Immediate ASIC communication snapshot published by the production REST
+/// route from daemon-owned telemetry only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsicCommSnapshot {
+    pub schema: String,
+    pub source: String,
+    pub chain_count: usize,
+    pub chains_with_comm: usize,
+    pub total_responding_chips: u32,
+    pub chains: Vec<AsicCommChainSnapshot>,
+}
+
+impl AsicCommSnapshot {
+    pub const SCHEMA: &'static str = "diagnostics.asic_comm v1";
+    pub const SOURCE: &'static str =
+        "live mining telemetry (state_rx); no live GetAddress broadcast issued";
+
+    /// Build a canonical aggregate from already-retained daemon telemetry.
+    pub fn from_chains(chains: Vec<AsicCommChainSnapshot>) -> Self {
+        let chain_count = chains.len();
+        let chains_with_comm = chains.iter().filter(|chain| chain.comm_ok).count();
+        let total_responding_chips = chains
+            .iter()
+            .map(|chain| u32::from(chain.responding_chips))
+            .sum();
+        Self {
+            schema: Self::SCHEMA.to_string(),
+            source: Self::SOURCE.to_string(),
+            chain_count,
+            chains_with_comm,
+            total_responding_chips,
+            chains,
+        }
+    }
+
+    /// Validate the canonical aggregate without probing or mutating hardware.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != Self::SCHEMA {
+            return Err(format!(
+                "unexpected ASIC communication schema {:?}",
+                self.schema
+            ));
+        }
+        if self.source != Self::SOURCE {
+            return Err(format!(
+                "unexpected ASIC communication source {:?}",
+                self.source
+            ));
+        }
+        if self.chain_count != self.chains.len() {
+            return Err("ASIC communication chain_count does not match chains".to_string());
+        }
+
+        let mut chain_ids = std::collections::HashSet::new();
+        let mut chains_with_comm = 0usize;
+        let mut total_responding_chips = 0u32;
+        for chain in &self.chains {
+            if !chain_ids.insert(chain.chain_id) {
+                return Err(format!(
+                    "duplicate ASIC communication chain ID {}",
+                    chain.chain_id
+                ));
+            }
+            let expected_comm_ok = chain.responding_chips > 0;
+            if chain.comm_ok != expected_comm_ok {
+                return Err(format!(
+                    "chain {} comm_ok disagrees with responding_chips",
+                    chain.chain_id
+                ));
+            }
+            chains_with_comm += usize::from(chain.comm_ok);
+            total_responding_chips = total_responding_chips
+                .checked_add(u32::from(chain.responding_chips))
+                .ok_or_else(|| "ASIC communication responding-chip total overflow".to_string())?;
+        }
+        if self.chains_with_comm != chains_with_comm {
+            return Err("ASIC communication chains_with_comm does not match chains".to_string());
+        }
+        if self.total_responding_chips != total_responding_chips {
+            return Err(
+                "ASIC communication total_responding_chips does not match chains".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// I2C bus scan result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct I2cScan {

@@ -9,15 +9,18 @@
 //! - `dcentrald-asic::psu::Apw121215a` — am2 Zynq dsPIC-coupled PSU.
 //! - `dcentrald-hal` W11.2 `Apw12SmbusBackend` — APW12 SMBus opcode-based
 //!   driver (CV1835 / BB / AML S19j Pro).
-//! - `dcentrald-hal` W11.4 `Apw12PlusBackend` — APW12+ register-based
-//!   driver (S21 family).
+//! - `dcentrald-hal::psu_apw12_plus` retains host-testable historical
+//!   register-model evidence and exact framed-protocol builders. Its register
+//!   backend is test-only because three later RE sources refuted that model for
+//!   real S21 APW121215f hardware.
 //!
 //! Two distinct families are easy to confuse:
 //! - **APW12** (S19j Pro / S19 / T19) is **opcode-based SMBus** at I²C
 //!   `0x10` with 16+ opcodes (RE2 §5.2). Enable via GPIO 412.
-//! - **APW12+** (S21 / S21 Pro / S21 XP) is **register-based** at I²C
-//!   `0x10` (different protocol, NOT interchangeable with APW12 — RE2
-//!   §5.3 line 527). Enable via GPIO 907.
+//! - **APW12+** is a legacy catalog label whose earlier register-at-`0x10`,
+//!   GPIO-907, and S21-family binding is contradicted by later held Bitmain,
+//!   VNish, and PSU-firmware evidence. It remains explicitly unresolved and
+//!   cannot select a production backend.
 //!
 //! and
 //!  for the routing
@@ -30,9 +33,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsuProtocol {
-    /// PMBus 1.2+ standard. APW3++ / APW7 / APW9 at I²C 0x58/0x59.
+    /// Conflicting evidence does not settle a production wire protocol.
+    /// This is a mandatory fail-closed catalog state, never a probe fallback.
+    Unresolved,
+    /// PMBus 1.2+ standard. APW3++ at I²C 0x58/0x59; APW10/APW11 remain
+    /// partial catalog rows. APW9 is explicitly NOT in this family.
     /// Standard PMBus opcodes (READ_VOUT, READ_IOUT, etc.).
     PmBus,
+    /// APW9 proprietary framed I²C interface at 7-bit address `0x10`.
+    ///
+    /// Exact held S17/S17 Pro factory-jig bytes use bus 1, register `0x11`,
+    /// and framed command/reply traffic. This tag is descriptive only:
+    /// DCENT_OS ships no APW9 backend, telemetry reader, or voltage-command
+    /// encoder. Consumers must fail closed.
+    Apw9FramedI2c,
     /// Bitmain proprietary v1 — opcode-based SMBus on the older Zynq
     /// boards. Used by APW111721b/c, APW11A1216-1a, APW11Go, NBS1902.
     BitmainProtoV1,
@@ -43,8 +57,9 @@ pub enum PsuProtocol {
     /// on S19j Pro / S19 / T19. Implemented by W11.2
     /// `Apw12SmbusBackend`.
     Apw12Smbus,
-    /// APW12+ register-based protocol (RE2 §5.3). Used on S21 family.
-    /// Implemented by W11.4 `Apw12PlusBackend`.
+    /// Historical APW12+ register-based hypothesis. Retained for serialized
+    /// compatibility and host-side evidence tests; no production catalog row
+    /// currently selects it.
     Apw12PlusRegister,
     /// am2 Zynq APW121215a — dsPIC-coupled, no PMBus telemetry on
     /// fw=0x71. Implemented by `dcentrald-asic::psu::Apw121215a`. Per
@@ -52,6 +67,9 @@ pub enum PsuProtocol {
     /// / GET_POWER are not available; use multimeter or chain-byte-count
     /// probes for rail engagement evidence.
     Apw121215a,
+    /// No control or telemetry interface is physically exposed. APW7's
+    /// first-party guide shows only AC input and fixed DC output terminals.
+    NoControlInterface,
 }
 
 /// GPIO line that asserts the PSU enable / chassis power-good signal.
@@ -76,14 +94,18 @@ pub struct PsuEnableGpio {
 pub struct PsuCatalogEntry {
     /// Vendor model string as it appears in firmware / labels.
     pub model: &'static str,
-    /// 7-bit I²C slave address.
-    pub i2c_address: u8,
+    /// 7-bit I²C slave address, or `None` when the physical unit exposes no
+    /// signal/control terminal.
+    pub i2c_address: Option<u8>,
     /// Control protocol family.
     pub protocol: PsuProtocol,
     /// Maximum continuous output power in watts. 0 if not pinned by
     /// RE2 (see `verification_partial`).
     pub max_power_w: u32,
-    /// Output rail nominal voltage in volts. 12 for every Bitmain APW.
+    /// Legacy single-rail nominal voltage in volts. `0` means that flattening
+    /// the physical topology to one integer would be false. APW9 uses `0`
+    /// because it has a 14.5-21 V adjustable main rail plus a fixed 12.3 V
+    /// auxiliary rail; use the cross-catalog APW/maintenance-guide spec.
     pub nominal_voltage_v: u8,
     /// GPIO that gates the PSU output (for register/opcode-based PSUs).
     /// `None` for PMBus-only PSUs that turn on at AC apply.
@@ -101,9 +123,9 @@ pub struct PsuCatalogEntry {
 pub enum Psu {
     /// APW3++ — first-gen S9 PSU. PMBus at 0x58/0x59, ~1600 W.
     Apw3PlusPlus,
-    /// APW7 — S9 / T9+ / S11 / S17 PSU, PMBus, ~2500 W.
+    /// APW7 — fixed-output PSU with no signal/control terminal.
     Apw7,
-    /// APW9 — S15 / S17 / T17 / S19j PSU, PMBus, ~3000 W.
+    /// APW9 — S17 / S17 Pro, proprietary framed I²C, 3600 W.
     Apw9,
     /// APW10 — transitional, PMBus, ~3300 W. Catalog placeholder; RE2
     /// confidence = PARTIAL.
@@ -123,8 +145,8 @@ pub enum Psu {
     /// APW12 — S19j Pro / S19 / T19. SMBus opcode-based at I²C 0x10,
     /// GPIO 412 enable. Implemented by W11.2 `Apw12SmbusBackend`.
     Apw12,
-    /// APW12+ — S21 / S21 Pro / S21 XP. Register-based at I²C 0x10,
-    /// GPIO 907 enable. Implemented by W11.4 `Apw12PlusBackend`.
+    /// APW12+ label from the earlier catalog. Exact S21 PSU model/protocol,
+    /// GPIO polarity, and power envelope remain unresolved.
     Apw12Plus,
     /// APW17 — S17 / T17 transitional, Bitmain proto v2, ~1700 W.
     Apw17,
@@ -144,7 +166,7 @@ impl Psu {
         match self {
             Psu::Apw3PlusPlus => PsuCatalogEntry {
                 model: "APW3++",
-                i2c_address: 0x58,
+                i2c_address: Some(0x58),
                 protocol: PsuProtocol::PmBus,
                 max_power_w: 1600,
                 nominal_voltage_v: 12,
@@ -154,27 +176,38 @@ impl Psu {
             },
             Psu::Apw7 => PsuCatalogEntry {
                 model: "APW7",
-                i2c_address: 0x58,
-                protocol: PsuProtocol::PmBus,
-                max_power_w: 2500,
+                i2c_address: None,
+                protocol: PsuProtocol::NoControlInterface,
+                max_power_w: 1800,
                 nominal_voltage_v: 12,
                 enable_gpio: None,
-                used_in: &["S9", "T9+", "S11", "S17"],
+                used_in: &["S9", "S9i", "L3+", "D3", "T9+", "Z9"],
                 verification_partial: false,
             },
             Psu::Apw9 => PsuCatalogEntry {
                 model: "APW9",
-                i2c_address: 0x58,
-                protocol: PsuProtocol::PmBus,
-                max_power_w: 3000,
-                nominal_voltage_v: 12,
-                enable_gpio: None,
-                used_in: &["S15", "S17", "T17", "S19j"],
+                // Exact S17/S17 Pro factory-jig bytes emit the FPGA-I2C word
+                // shape `0x052011xx`: 7-bit address 0x10, bus 1, register
+                // 0x11. The T17-path cgminer previously cited here is a
+                // misfiled BM1391/S11-era binary and provides no provenance.
+                i2c_address: Some(0x10),
+                protocol: PsuProtocol::Apw9FramedI2c,
+                // APW9 maintenance guide pp.3/5: 14.5-21 V, 170 A, 3600 W
+                // main rail plus 12.3 V / 12 A auxiliary rail.
+                max_power_w: 3600,
+                nominal_voltage_v: 0,
+                // Guide p.5: EN is active low. Held S17/S17 Pro jig
+                // `open_power_control@1AA54` drives gpio907 low.
+                enable_gpio: Some(PsuEnableGpio {
+                    pin: 907,
+                    canonical_platform: "zynq-7007s",
+                }),
+                used_in: &["S17", "S17 Pro"],
                 verification_partial: false,
             },
             Psu::Apw10 => PsuCatalogEntry {
                 model: "APW10",
-                i2c_address: 0x58,
+                i2c_address: Some(0x58),
                 protocol: PsuProtocol::PmBus,
                 max_power_w: 3300,
                 nominal_voltage_v: 12,
@@ -184,7 +217,7 @@ impl Psu {
             },
             Psu::Apw11 => PsuCatalogEntry {
                 model: "APW11",
-                i2c_address: 0x58,
+                i2c_address: Some(0x58),
                 protocol: PsuProtocol::PmBus,
                 max_power_w: 3500,
                 nominal_voltage_v: 12,
@@ -194,7 +227,7 @@ impl Psu {
             },
             Psu::Apw111721b => PsuCatalogEntry {
                 model: "APW111721b",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV1,
                 max_power_w: 1200,
                 nominal_voltage_v: 12,
@@ -207,7 +240,7 @@ impl Psu {
             },
             Psu::Apw111721c => PsuCatalogEntry {
                 model: "APW111721c",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV1,
                 max_power_w: 1200,
                 nominal_voltage_v: 12,
@@ -220,7 +253,7 @@ impl Psu {
             },
             Psu::Apw11A1216_1a => PsuCatalogEntry {
                 model: "APW11A1216-1a",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV1,
                 max_power_w: 1600,
                 nominal_voltage_v: 12,
@@ -233,7 +266,7 @@ impl Psu {
             },
             Psu::Apw11Go => PsuCatalogEntry {
                 model: "APW11Go",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV1,
                 max_power_w: 1200,
                 nominal_voltage_v: 12,
@@ -246,7 +279,7 @@ impl Psu {
             },
             Psu::Apw12 => PsuCatalogEntry {
                 model: "APW12",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 // RE2 §5.2 lines 480-503 — 17 opcodes (0x00..=0x10),
                 // SMBus opcode-based. Catalog tag is `Apw12Smbus`.
                 protocol: PsuProtocol::Apw12Smbus,
@@ -261,20 +294,17 @@ impl Psu {
             },
             Psu::Apw12Plus => PsuCatalogEntry {
                 model: "APW12+",
-                i2c_address: 0x10,
-                protocol: PsuProtocol::Apw12PlusRegister,
-                max_power_w: 4000,
-                nominal_voltage_v: 12,
-                enable_gpio: Some(PsuEnableGpio {
-                    pin: 907,
-                    canonical_platform: "amlogic-s905",
-                }),
-                used_in: &["S21", "S21 Pro", "S21 XP"],
-                verification_partial: false,
+                i2c_address: None,
+                protocol: PsuProtocol::Unresolved,
+                max_power_w: 0,
+                nominal_voltage_v: 0,
+                enable_gpio: None,
+                used_in: &[],
+                verification_partial: true,
             },
             Psu::Apw17 => PsuCatalogEntry {
                 model: "APW17",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV2,
                 max_power_w: 1700,
                 nominal_voltage_v: 12,
@@ -287,7 +317,7 @@ impl Psu {
             },
             Psu::Nbs1902 => PsuCatalogEntry {
                 model: "NBS1902",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV1,
                 max_power_w: 1900,
                 nominal_voltage_v: 12,
@@ -300,7 +330,7 @@ impl Psu {
             },
             Psu::Pw380X12 => PsuCatalogEntry {
                 model: "PW380X12",
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::BitmainProtoV2,
                 max_power_w: 4560,
                 nominal_voltage_v: 12,
@@ -320,7 +350,7 @@ impl Psu {
                 // ).
                 // am2 Zynq APW + dsPIC fw=0x71. No PMBus telemetry per
                 // .
-                i2c_address: 0x10,
+                i2c_address: Some(0x10),
                 protocol: PsuProtocol::Apw121215a,
                 max_power_w: 3000,
                 nominal_voltage_v: 12,
@@ -402,32 +432,28 @@ mod tests {
         // enable.
         let cat = Psu::Apw12.catalog();
         assert_eq!(cat.protocol, PsuProtocol::Apw12Smbus);
-        assert_eq!(cat.i2c_address, 0x10);
+        assert_eq!(cat.i2c_address, Some(0x10));
         let gpio = cat.enable_gpio.expect("APW12 must have GPIO enable");
         assert_eq!(gpio.pin, 412, "APW12 canonical enable pin is GPIO 412");
     }
 
     #[test]
-    fn apw12_plus_uses_register_protocol() {
-        // RE2 §5.3 — APW12+ is register-based at I²C 0x10, GPIO 907
-        // enable. Critically NOT interchangeable with APW12.
+    fn apw12_plus_stays_unresolved_and_unroutable() {
+        // Later Bitmain jig, VNish, and PSU-firmware RE all refute the old
+        // register abstraction for real APW121215f hardware.
         let cat = Psu::Apw12Plus.catalog();
-        assert_eq!(cat.protocol, PsuProtocol::Apw12PlusRegister);
-        assert_ne!(
-            cat.protocol,
-            Psu::Apw12.catalog().protocol,
-            "APW12+ MUST NOT alias APW12 — protocols are not interchangeable"
-        );
-        assert_eq!(cat.i2c_address, 0x10);
-        let gpio = cat.enable_gpio.expect("APW12+ must have GPIO enable");
-        assert_eq!(gpio.pin, 907, "APW12+ canonical enable pin is GPIO 907");
+        assert_eq!(cat.protocol, PsuProtocol::Unresolved);
+        assert_eq!(cat.i2c_address, None);
+        assert_eq!(cat.enable_gpio, None);
+        assert_eq!(cat.max_power_w, 0);
+        assert!(cat.used_in.is_empty());
+        assert!(cat.verification_partial);
     }
 
     #[test]
     fn pmbus_psus_have_no_gpio_enable() {
-        // RE2 §5.1 column "GPIO Enable" = None for APW3++/APW7/APW9 —
-        // these are PMBus-only and turn on at AC apply.
-        for psu in [Psu::Apw3PlusPlus, Psu::Apw7, Psu::Apw9] {
+        // PMBus rows turn on at AC apply and expose no separate GPIO enable.
+        for psu in [Psu::Apw3PlusPlus, Psu::Apw10, Psu::Apw11] {
             let cat = psu.catalog();
             assert_eq!(cat.protocol, PsuProtocol::PmBus);
             assert!(
@@ -440,11 +466,51 @@ mod tests {
 
     #[test]
     fn apw_pmbus_address_pinned_to_058() {
-        // RE2 §5.1 — APW3++/APW7/APW9 sit at I²C 0x58 (with 0x59
-        // alias). Pin so a future refactor doesn't drift.
-        for psu in [Psu::Apw3PlusPlus, Psu::Apw7, Psu::Apw9] {
-            assert_eq!(psu.catalog().i2c_address, 0x58);
+        // APW9 is deliberately excluded; held stock code pins it to the
+        // proprietary framed-I²C path at 0x10 instead.
+        for psu in [Psu::Apw3PlusPlus, Psu::Apw10, Psu::Apw11] {
+            assert_eq!(psu.catalog().i2c_address, Some(0x58));
         }
+    }
+
+    #[test]
+    fn apw9_contract_is_exact_and_has_no_shipped_control_authority() {
+        use dcentrald_api_types::psu_maintenance::{GuideControlInterface, GuidePsuFamily};
+
+        let cat = Psu::Apw9.catalog();
+        let guide = GuidePsuFamily::Apw9.spec();
+
+        assert_eq!(cat.i2c_address, Some(0x10));
+        assert_eq!(cat.protocol, PsuProtocol::Apw9FramedI2c);
+        assert_eq!(cat.max_power_w, 3600);
+        assert_eq!(cat.nominal_voltage_v, 0);
+        assert_eq!(cat.used_in, &["S17", "S17 Pro"]);
+        assert_eq!(guide.main_output.volts_min, 14.5);
+        assert_eq!(guide.main_output.volts_max, 21.0);
+        assert_eq!(guide.main_output.rated_current_a, Some(170));
+        let aux = guide
+            .aux_output
+            .expect("APW9 guide pins the auxiliary rail");
+        assert_eq!((aux.volts_min, aux.volts_max), (12.2, 12.4));
+        assert_eq!(aux.rated_current_a, Some(12));
+        assert_eq!(
+            guide.control_interface,
+            GuideControlInterface::I2cPicWithEnActiveLow
+        );
+        let gpio = cat.enable_gpio.expect("held stock code pins APW9 enable");
+        assert_eq!(gpio.pin, 907);
+    }
+
+    #[test]
+    fn apw7_has_no_bus_or_control_protocol() {
+        // First-party APW7 guide pp.2-4: no signal terminal is present; the
+        // fixed 12 V output appears at AC apply. Never synthesize an address.
+        let cat = Psu::Apw7.catalog();
+        assert_eq!(cat.i2c_address, None);
+        assert_eq!(cat.protocol, PsuProtocol::NoControlInterface);
+        assert!(cat.enable_gpio.is_none());
+        assert_eq!(cat.max_power_w, 1800);
+        assert_eq!(cat.used_in, &["S9", "S9i", "L3+", "D3", "T9+", "Z9"]);
     }
 
     #[test]
@@ -456,12 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn s21_psu_routes_to_apw12_plus() {
+    fn s21_psu_does_not_route_from_the_apw12_plus_label() {
         let cat = Psu::Apw12Plus.catalog();
-        assert!(
-            cat.used_in.iter().any(|m| m.starts_with("S21")),
-            "APW12+ must list at least one S21 family member"
-        );
+        assert!(cat.used_in.is_empty());
+        assert_eq!(cat.protocol, PsuProtocol::Unresolved);
     }
 
     #[test]

@@ -65,10 +65,11 @@
 //! - `Psu::Apw17` (routing catalog: "APW17", S17/T17, 1700 W, proto-v2)
 //!   vs `ApwModel::Apw17_1215` (spec catalog: "APW17 (1215)", S21 family,
 //!   3600 W). Same name stem, contradictory hardware claims → unmapped.
-//! - `Psu::Apw12Plus` ("APW12+", S21/S21 Pro/S21 XP, register protocol)
-//!   vs `ApwModel::Apw17_1215` (also claims S21/S21 Pro/S21 XP). No held
-//!   evidence pins them as the same unit → unmapped. Both empty mappings
-//!   are pinned by tests so they cannot be "fixed" without new evidence.
+//! - `Psu::Apw12Plus` is a legacy unresolved label with no model, fleet,
+//!   address, GPIO, or protocol authority. `ApwModel::Apw17_1215` separately
+//!   claims the S21 family, but no held evidence pins the two as the same
+//!   physical unit → unmapped. Both empty mappings are pinned by tests so
+//!   they cannot be "fixed" without new evidence.
 //! - `ApwModel::Apw9Plus`, `Apw12_1417`, `Apw12A` and the seven `1215*`
 //!   revision letters have no dedicated routing-catalog rows; the
 //!   APW121215f UART-tunnel driver (`dcentrald-hal::psu_apw_uart_tunnel`)
@@ -96,10 +97,13 @@ use dcentrald_api_types::psu_model::ApwModel;
 #[serde(rename_all = "snake_case")]
 pub enum HalControlBinding {
     /// No shipped control driver; the PSU output turns on at AC apply
-    /// (PMBus-class APW3++/APW7/APW9/APW10/APW11). The only applicable
+    /// (PMBus-class APW3++/APW10/APW11). The only applicable
     /// software layer is the read-only PMBus telemetry module
     /// (`dcentrald-hal::pmbus`), which is default-OFF and mutates nothing.
     NoneAcApply,
+    /// Fixed output at AC apply with no physical control/telemetry terminal.
+    /// APW7 must never be routed into a bus probe from this binding.
+    NoneAcApplyNoControl,
     /// Proprietary Bitmain proto-v1/v2 dialect with **no shipped DCENT_OS
     /// backend**. Rows with this binding cannot be driven; a dispatch site
     /// consuming this descriptor must fail closed for them.
@@ -108,9 +112,9 @@ pub enum HalControlBinding {
     /// opcode dialect (CV1835 / AM335x BB / Amlogic S19j Pro), sealed-trait
     /// platform whitelist at construction.
     Apw12Smbus,
-    /// `dcentrald-hal::psu_apw12_plus::Apw12PlusBackend` — APW12+
-    /// register dialect (S21 family), sealed-trait platform whitelist at
-    /// construction.
+    /// Historical APW12+ register dialect retained for serialized-output
+    /// compatibility. No protocol, including the legacy tag, resolves to
+    /// this binding; the old backend constructor is test-only.
     Apw12PlusRegister,
     /// `dcentrald-hal::psu::Apw121215a` — am2 Zynq framed-I²C dsPIC-coupled
     /// dialect (fw=0x71 exact-identity adapter).
@@ -122,12 +126,14 @@ pub enum HalControlBinding {
 pub const fn binding_for_protocol(protocol: PsuProtocol) -> HalControlBinding {
     match protocol {
         PsuProtocol::PmBus => HalControlBinding::NoneAcApply,
-        PsuProtocol::BitmainProtoV1 | PsuProtocol::BitmainProtoV2 => {
-            HalControlBinding::NoneUnimplemented
-        }
+        PsuProtocol::Unresolved
+        | PsuProtocol::Apw9FramedI2c
+        | PsuProtocol::BitmainProtoV1
+        | PsuProtocol::BitmainProtoV2
+        | PsuProtocol::Apw12PlusRegister => HalControlBinding::NoneUnimplemented,
         PsuProtocol::Apw12Smbus => HalControlBinding::Apw12Smbus,
-        PsuProtocol::Apw12PlusRegister => HalControlBinding::Apw12PlusRegister,
         PsuProtocol::Apw121215a => HalControlBinding::Apw121215aFramed,
+        PsuProtocol::NoControlInterface => HalControlBinding::NoneAcApplyNoControl,
     }
 }
 
@@ -136,7 +142,7 @@ pub const fn binding_for_protocol(protocol: PsuProtocol) -> HalControlBinding {
 ///
 /// Descriptive only: the layer itself stays default-OFF behind
 /// `DCENT_PMBUS_TELEMETRY=1` and this crate cannot enable it. Membership
-/// mirrors `dcentrald-hal::pmbus::PmbusPsuFamily` (the five `PmBus` rows at
+/// mirrors `dcentrald-hal::pmbus::PmbusPsuFamily` (the three `PmBus` rows at
 /// I²C `0x58`); the mirror is pinned by test below so the two rosters cannot
 /// drift silently.
 pub const fn pmbus_read_only_telemetry_applicable(protocol: PsuProtocol) -> bool {
@@ -282,12 +288,14 @@ mod tests {
             let topology = psu.power_topology();
             let expected = match topology.catalog.protocol {
                 PsuProtocol::PmBus => HalControlBinding::NoneAcApply,
-                PsuProtocol::BitmainProtoV1 | PsuProtocol::BitmainProtoV2 => {
-                    HalControlBinding::NoneUnimplemented
-                }
+                PsuProtocol::Unresolved
+                | PsuProtocol::Apw9FramedI2c
+                | PsuProtocol::BitmainProtoV1
+                | PsuProtocol::BitmainProtoV2
+                | PsuProtocol::Apw12PlusRegister => HalControlBinding::NoneUnimplemented,
                 PsuProtocol::Apw12Smbus => HalControlBinding::Apw12Smbus,
-                PsuProtocol::Apw12PlusRegister => HalControlBinding::Apw12PlusRegister,
                 PsuProtocol::Apw121215a => HalControlBinding::Apw121215aFramed,
+                PsuProtocol::NoControlInterface => HalControlBinding::NoneAcApplyNoControl,
             };
             assert_eq!(
                 topology.control_binding,
@@ -299,16 +307,16 @@ mod tests {
     }
 
     #[test]
-    fn shipped_driver_rows_bind_to_their_documented_backends() {
-        // Mirrors the driver table documented in `crate::psus` module docs
-        // and in `dcentrald-hal::psu_apw12_plus` header comments.
+    fn shipped_driver_rows_and_quarantined_apw12_plus_are_explicit() {
+        // APW12 and APW121215a have production bindings. The refuted
+        // APW12+ register model must remain unimplemented.
         assert_eq!(
             Psu::Apw12.power_topology().control_binding,
             HalControlBinding::Apw12Smbus
         );
         assert_eq!(
             Psu::Apw12Plus.power_topology().control_binding,
-            HalControlBinding::Apw12PlusRegister
+            HalControlBinding::NoneUnimplemented
         );
         assert_eq!(
             Psu::Apw121215a.power_topology().control_binding,
@@ -340,18 +348,20 @@ mod tests {
     #[test]
     fn pmbus_applicability_mirrors_the_hal_pmbus_family_roster() {
         // `dcentrald-hal::pmbus::PmbusPsuFamily` covers exactly APW3++ /
-        // APW7 / APW9 / APW10 / APW11 at I²C 0x58. This crate cannot import
+        // APW10 / APW11 at I²C 0x58. APW9 is proprietary framed I²C at
+        // 0x10 with no shipped backend. This crate cannot import
         // the HAL, so the roster is mirrored literally; if either side
         // changes, one of these two pins breaks.
         let applicable: Vec<&'static str> = all_power_topologies()
             .filter(|t| t.pmbus_read_only_telemetry)
             .map(|t| t.catalog.model)
             .collect();
-        assert_eq!(applicable, ["APW3++", "APW7", "APW9", "APW10", "APW11"]);
+        assert_eq!(applicable, ["APW3++", "APW10", "APW11"]);
         for topology in all_power_topologies() {
             if topology.pmbus_read_only_telemetry {
                 assert_eq!(
-                    topology.catalog.i2c_address, 0x58,
+                    topology.catalog.i2c_address,
+                    Some(0x58),
                     "{} is PMBus-applicable but not at the PMBus catalog address",
                     topology.catalog.model
                 );
@@ -360,6 +370,17 @@ mod tests {
                 assert_ne!(topology.catalog.protocol, PsuProtocol::PmBus);
             }
         }
+        let apw7 = Psu::Apw7.power_topology();
+        assert_eq!(apw7.catalog.i2c_address, None);
+        assert_eq!(
+            apw7.control_binding,
+            HalControlBinding::NoneAcApplyNoControl
+        );
+        let apw9 = Psu::Apw9.power_topology();
+        assert_eq!(apw9.catalog.i2c_address, Some(0x10));
+        assert_eq!(apw9.catalog.protocol, PsuProtocol::Apw9FramedI2c);
+        assert_eq!(apw9.control_binding, HalControlBinding::NoneUnimplemented);
+        assert!(!apw9.pmbus_read_only_telemetry);
     }
 
     // -- Cross-catalog identity evidence ----------------------------------
@@ -476,7 +497,7 @@ mod tests {
         assert!(json.contains("\"model\":\"APW12\""));
 
         let json = serde_json::to_string(&Psu::Apw9.power_topology()).expect("serialize");
-        assert!(json.contains("\"control_binding\":\"none_ac_apply\""));
-        assert!(json.contains("\"pmbus_read_only_telemetry\":true"));
+        assert!(json.contains("\"control_binding\":\"none_unimplemented\""));
+        assert!(json.contains("\"pmbus_read_only_telemetry\":false"));
     }
 }

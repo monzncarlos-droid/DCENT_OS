@@ -67,78 +67,33 @@
 //!   `%s: chain %d has %d ASIC, and addrInterval is %d` — chain-length based
 //!   detection, never a register-0x00 identity read. See [`CHIP_ID`].
 //!
-//! # ⚠ THE BAUD ADJUDICATION (queue-flagged landmine) — see [`operational_baud_plan`]
+//! # Exact-stock baud correction and generic-driver boundary
 //!
-//! The queue flags "MEDIUM risk **if the 115,384-vs-1,562,500 baud conflict is
-//! resolved by guessing**". Adjudicated below from sources, NOT guessed.
+//! A 2026-08-11 instruction-level Ghidra pass supersedes the earlier
+//! string-only adjudication. In the exact 2017 stock L3+ binary,
+//! `FUN_0004285c` supplies host baud 115,200, and the sole MISC_CONTROL writer
+//! `FUN_0003e158` preserves `bt8d=26`. That release has no high-speed
+//! post-enumeration transition. It also computes `floor(256/72)=3` for address
+//! assignment. The pure exact-release record is
+//! `dcentrald_common::bm1485_l3plus_stock`; see
+//! `phase6/BM1485_L3PLUS_STOCK_BAUD_ADDRESS_RE_20260811.md`.
 //!
-//! **They are not the same quantity.** 115,384 is a *boot/enumeration* rate and
-//! 1,562,500 is a *post-upgrade operational* rate — the same two-phase split
-//! every BM13xx chip has (`dcentrald-api-types/src/baud_switch.rs:6-12`). Both
-//! numbers come from ONE table, `bm1485.md:176-183`:
+//! The generic L3/L3+/L3++ driver still has no authenticated release/board
+//! selector, so [`operational_baud_plan`] and [`addr_stride_plan`] remain
+//! fail-closed rather than silently applying the 2017 tuple to VNish or another
+//! hardware revision. The transcribed 390,625 and 1,562,500 candidates are
+//! retained as cross-release evidence, not claimed as this stock binary's
+//! lifecycle phases.
 //!
-//! ```text
-//! BaudRate = 25 MHz / ((bt8d + 1) * 8)
-//!   bt8d = 26 → 115384  (boot)
-//!   bt8d = 7  → 390625
-//!   bt8d = 1  → 1,562,500
-//! ```
+//! # Shared baud API correction
 //!
-//! So the "conflict" the queue names is a **category error in the ledger**, not
-//! a contradiction in the evidence. Root 's "BM1485 at 1.5625 Mbaud"
-//! and `baud_switch.rs:112`'s `target_baud(Bm1485) = 1_562_500` are both
-//! describing the *operational* rate; `bm1485.md:165`'s `bt8d = 26` is the
-//! *boot* rate. Nothing needs to "win".
-//!
-//! **But two REAL defects fall out of the same table, and they are NOT
-//! resolved here:**
-//!
-//! 1. **`115,384` is arithmetically impossible.** The doc's own formula at
-//!    §8 gives `25e6 / (27 * 8) = 115,740.74` for `bt8d = 26`, and no integer
-//!    `bt8d` yields 115,384 (`25e6/(8·x) = 115384 ⇒ x = 27.083`). Our own
-//!    `baud_switch.rs:7-8` already documents the correct 115,740. So
-//!    `bm1485.md:165`'s "115384" is a transcription slip for the boot rate.
-//!    Pinned by `doc_claimed_115384_is_not_producible_by_the_doc_formula`.
-//! 2. **The OPERATIONAL rate is genuinely UNRESOLVED**, and the queue did not
-//!    name this one. `bm1485.md:183` says "L3+ runs at 1.5625 Mbps after
-//!    upgrade" (`bt8d = 1`), but the SAME document's init sequence at
-//!    §10 step 6 writes `bt8d = 7` and switches the host to **390,625**. Two
-//!    different operational rates, one document, no reconciliation.
-//!
-//! Held-byte evidence does **not** break the tie, and leans against 1,562,500:
-//!
-//! - The stock L3+ binary contains **no** 32-bit literal and **no** ASCII
-//!   occurrence of `1562500`, `390625`, `115384`, or `115740`. The only
-//!   baud-shaped literal present is `115200`. (The `1500000`/`3000000` ASCII
-//!   hits are inside scrypt test-vector hex blobs, not baud strings.)
-//! - The whole `--bitmain-*` option set is `core-temp`, `fan-ctrl`, `fan-pwm`,
-//!   `freq`, `voltage`. There is **no baud option**, and
-//!   `etc/cgminer.conf.factory` sets only `"bitmain-freq":"384"`.
-//! - `tty_init` drives `/dev/ttyO%d` (AM335x kernel UART) through a termios
-//!   mapper whose failure arm is `Unrecognized baud rate: %d,set default baud`.
-//!   Neither 1,562,500 nor 390,625 is a standard termios `Bxxxx` rate, and an
-//!   AM335x 48 MHz UART cannot divide to either exactly (`48e6/16 = 3e6`;
-//!   `3e6/1562500 = 1.92`, `3e6/390625 = 7.68`).
-//!
-//! **Therefore: FAIL-CLOSED.** [`OPERATIONAL_BAUD`] is `None`,
-//! [`operational_baud_plan`] returns `Err`, and [`ChipDriver::max_baud`]
-//! returns the *enumeration* rate — this driver refuses to raise baud at all.
-//! Both candidates are retained side by side in
-//! [`UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES`] so a bench session can measure
-//! rather than re-litigate. This honours the standing repo rule: **never raise
-//! a driver baud without bench proof** (`MEMORY.md`, BM1366/BM1370 edit-bait).
-//!
-//! # Known DEFECT in a neighbouring crate (reported, NOT edited here)
-//!
-//! `dcentrald-api-types/src/baud_switch.rs:131-144` returns `0x1C` from
-//! `baud_register(Bm1485)`, grouping BM1485 with BM1387. Per `bm1485.md:128`
-//! the BM1485 baud divisor (`bt8d`) lives in **MISC_CONTROL @ `0x18`**;
-//! `0x1C` on BM1485 is **`GENERAL_IIC`** (the TMP451 I²C master, `bm1485.md:129`).
-//! Writing a baud word to `0x1C` would drive the temperature-sensor I²C master.
-//! That file is outside this wave's file grant, so it is reported rather than
-//! edited; [`regs::MISC_CONTROL`] / [`regs::GENERAL_IIC`] here are the
-//! corrected reference and `baud_register_0x1c_is_the_general_iic_register`
-//! pins why.
+//! `dcentrald-api-types::baud_switch` now describes the exact stock tuple as
+//! 115200, no FPGA divider, MISC_CONTROL `0x18`, and broadcast word
+//! `0x103a4041`. Its admission predicate deliberately remains false because
+//! the generic one-value plan cannot represent the two addressed follow-up
+//! writes or authenticate the release/board. [`regs::MISC_CONTROL`] /
+//! [`regs::GENERAL_IIC`] and `baud_register_0x1c_is_the_general_iic_register`
+//! continue to pin the critical register boundary.
 //!
 //! # References
 //!
@@ -266,24 +221,25 @@ pub const BT8D_BOOT_TRUE_BAUD: u32 = bt8d_to_baud(BT8D_BOOT);
 /// boot rate; the correct value is [`BT8D_BOOT_TRUE_BAUD`].
 pub const DOC_CLAIMED_BOOT_BAUD_115384: u32 = 115_384;
 
-/// The two mutually exclusive **operational** baud candidates our evidence
-/// base carries, as `(bt8d, baud)`. Deliberately kept side by side.
+/// Two documented high-speed candidates carried as `(bt8d, baud)`.
 ///
 /// - `(7, 390_625)` — `bm1485.md:180` and the §10 step-6 init sequence, which
 ///   writes `bt8d = 7` and switches the host UART to 390,625.
 /// - `(1, 1_562_500)` — `bm1485.md:181` and `:183` ("L3+ runs at 1.5625 Mbps
-///   after upgrade"), carried into `baud_switch.rs:112` and root .
+///   after upgrade"), formerly carried into the shared baud row and root
+///   context before the exact-stock correction.
 ///
-/// Held L3+ binaries contain **neither** value as a literal, so they do not
-/// break the tie. Resolving this requires a bench UART capture on live L3/L3+
-/// hardware, or a `tty_init` disassembly of the stock `cgminer`.
+/// The exact 2017 stock binary's initializer has now been disassembled and
+/// selects neither: it remains at nominal 115,200 / `bt8d=26`. These values
+/// remain unresolved only for other L3/L3++/VNish release profiles.
 pub const UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES: [(u8, u32); 2] = [(7, 390_625), (1, 1_562_500)];
 
-/// **UNRESOLVED** — `None` by construction.
+/// **UNRESOLVED GENERIC PROFILE** — `None` by construction.
 ///
 /// See [`UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES`] and the module header. Do
-/// not replace this with a value without a bench capture landing in the same
-/// commit; `operational_baud_is_unresolved_and_fails_closed` pins it.
+/// not replace this with a release-specific value without also binding the
+/// corresponding artifact and board; the 2017 stock tuple is separately
+/// available in `dcentrald_common::bm1485_l3plus_stock`.
 pub const OPERATIONAL_BAUD: Option<u32> = None;
 
 /// Fail-closed accessor for the post-enumeration mining baud.
@@ -294,11 +250,11 @@ pub fn operational_baud_plan() -> Result<u32> {
     match OPERATIONAL_BAUD {
         Some(baud) => Ok(baud),
         None => Err(crate::AsicError::InvalidParameter(format!(
-            "BM1485 operational baud is UNRESOLVED — bm1485.md gives TWO \
-             irreconcilable post-upgrade rates (bt8d=7 -> {} and bt8d=1 -> {}), \
-             and no held L3/L3+ binary contains either as a literal. The chain \
-             stays at the {} enumeration rate until a bench UART capture \
-             settles it. [rank-44 fail-closed]",
+            "BM1485 generic operational baud is UNRESOLVED — the exact 2017 \
+             stock profile stays at 115200/bt8d=26, while unbound documentation \
+             carries high-speed candidates bt8d=7 -> {} and bt8d=1 -> {}. The \
+             generic chain stays at {} until a release-and-board-bound profile \
+             is admitted. [rank-44 fail-closed]",
             UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES[0].1,
             UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES[1].1,
             ENUM_BAUD_NOMINAL,
@@ -534,7 +490,7 @@ pub const fn misc_control_with_bt8d(base: u32, bt8d: u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Chain address assignment — also unresolved
+// Chain address assignment — exact stock known, generic profile unresolved
 // ---------------------------------------------------------------------------
 
 /// Address stride `bm1485.md:206-208` claims for L3+ chain enumeration.
@@ -545,7 +501,8 @@ pub const DOC_ADDR_STRIDE_L3PLUS: u8 = 1;
 
 /// Fail-closed accessor for the chain address stride.
 ///
-/// Always `Err` today. Two in-tree sources disagree for a 72-chip L3+ chain:
+/// Always `Err` today because this generic driver has no authenticated release
+/// selector. Two older sources disagree for a 72-chip L3+ chain:
 ///
 /// - `bm1485.md:206-208` → stride **1**.
 /// - The Bitmain chip-count **bucket** rule
@@ -553,16 +510,16 @@ pub const DOC_ADDR_STRIDE_L3PLUS: u8 = 1;
 ///   four AMTC jig binaries: `>128→1`, `64<N≤128→2`, `32<N≤64→4`, `≤32→refuse`)
 ///   → 72 chips falls in `64 < N ≤ 128`, giving stride **2**.
 ///
-/// The held stock L3+ binary proves the concept is live
-/// (`addrInterval = '%d'`, `%s: chain %d has %d ASIC, and addrInterval is %d`)
-/// but the emitted value is only visible at runtime, so it does not arbitrate.
-/// Guessing wrong collapses chain addressing, so this refuses.
+/// Exact 2017 stock `FUN_0003db34` does arbitrate its own release: it computes
+/// `floor(256/72)=3`. That release-scoped value is preserved in
+/// `dcentrald_common::bm1485_l3plus_stock`; applying it to an unbound generic
+/// L3/L3++/VNish target remains refused.
 pub fn addr_stride_plan(_chips_per_chain: u8) -> Result<u8> {
     Err(crate::AsicError::InvalidParameter(
-        "BM1485 chain address stride is UNRESOLVED — bm1485.md:206 says stride 1 \
-         while the four-jig addrInterval bucket rule gives stride 2 for a \
-         72-chip L3+ chain. The held stock cgminer logs addrInterval at runtime \
-         only. Refusing rather than collapsing chain addressing. [rank-44 fail-closed]"
+        "BM1485 generic chain address stride is UNRESOLVED — exact 2017 stock \
+         uses floor(256/72)=3, while unbound documentation says 1 and unrelated \
+         jig projection says 2. Refusing without release-and-board binding. \
+         [rank-44 fail-closed]"
             .into(),
     ))
 }
@@ -705,10 +662,9 @@ impl ChipDriver for Bm1485Driver {
     }
 
     fn max_baud(&self) -> u32 {
-        // FAIL-CLOSED: equal to default_baud() — this driver refuses to raise
-        // baud at all while the operational rate is unresolved. See
-        // `operational_baud_plan`. Standing repo rule: never raise a driver
-        // baud without bench proof.
+        // FAIL-CLOSED: equal to default_baud(). This matches exact 2017 stock,
+        // but the generic driver still lacks an authenticated release/board
+        // selector and therefore refuses every high-speed candidate.
         ENUM_BAUD_NOMINAL
     }
 
@@ -716,14 +672,14 @@ impl ChipDriver for Bm1485Driver {
         tracing::warn!(
             chip_count = chip_count,
             freq_mhz = freq_mhz,
-            "BM1485 init_chain: SCAFFOLD — refuses to energize. Operational baud, \
-             chain address stride, and PLL register encoding are all unresolved; \
+            "BM1485 init_chain: SCAFFOLD — refuses to energize. Exact 2017 stock \
+             baud/stride are recovered but not board-bound; PLL encoding remains unresolved; \
              L3+ also has no FPGA (AM335x kernel /dev/ttyO UARTs), so the \
              FpgaChain transport does not model it."
         );
         Err(crate::AsicError::InvalidParameter(
             "BM1485 (L3/L3+/L3++) driver is a fail-closed scaffold. Blocked on: \
-             operational baud (bt8d=7 vs bt8d=1), chain address stride (1 vs 2), \
+             release-and-board binding for the recovered stock baud/stride, \
              PLL register bit layout, and the AM335x kernel-UART transport port. \
              [rank-44 SCAFFOLD]"
                 .into(),
@@ -963,14 +919,12 @@ mod tests {
     }
 
     #[test]
-    fn boot_and_operational_baud_are_different_lifecycle_phases() {
-        // The core adjudication: 115,384/115,740 (bt8d=26) is enumeration and
-        // 1,562,500 (bt8d=1) is post-upgrade mining. They were never rival
-        // answers to one question — same two-phase split as every other
-        // BM13xx chip (baud_switch.rs:6-12).
+    fn documented_high_speed_candidates_are_not_selected_by_the_generic_driver() {
+        // These are arithmetically valid documented divider values, but the
+        // exact 2017 stock initializer selects neither one.
         assert!(
             BT8D_BOOT_TRUE_BAUD < UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES[0].1,
-            "boot rate must be below every operational candidate"
+            "stock rate must be below every documented high-speed candidate"
         );
         assert!(BT8D_BOOT_TRUE_BAUD < UNRESOLVED_OPERATIONAL_BAUD_CANDIDATES[1].1);
         // Both candidates are real divider values, not invented numbers.
@@ -984,12 +938,11 @@ mod tests {
     }
 
     #[test]
-    fn operational_baud_is_unresolved_and_fails_closed() {
+    fn generic_operational_baud_is_unresolved_and_fails_closed() {
         assert!(
             OPERATIONAL_BAUD.is_none(),
-            "bm1485.md gives TWO post-upgrade rates (bt8d=7 -> 390625 at :216, \
-             bt8d=1 -> 1562500 at :181/:183) and no held L3+ binary contains \
-             either literal. Do not pick one without a bench capture."
+            "the generic driver has no authenticated release selector; exact \
+             2017 stock stays at 115200 while other profiles remain unbound"
         );
         let err = operational_baud_plan().expect_err("must fail closed");
         let msg = err.to_string();
@@ -1001,7 +954,8 @@ mod tests {
     fn driver_refuses_to_raise_baud_above_enumeration() {
         let d = Bm1485Driver::new();
         assert_eq!(d.default_baud(), 115_200);
-        // The fail-closed encoding of the unresolved conflict: max == default.
+        // Exact 2017 stock also stays here, while the generic driver refuses
+        // to project any unbound high-speed profile.
         assert_eq!(
             d.max_baud(),
             d.default_baud(),
@@ -1181,9 +1135,12 @@ mod tests {
     // ---- FAIL-CLOSED SURFACES ----
 
     #[test]
-    fn addr_stride_is_unresolved_and_fails_closed() {
+    fn generic_addr_stride_is_unresolved_while_exact_stock_is_three() {
         assert_eq!(DOC_ADDR_STRIDE_L3PLUS, 1, "bm1485.md:206 claims stride 1");
-        // ...but the four-jig bucket rule gives stride 2 for a 72-chip chain.
+        assert_eq!(
+            dcentrald_common::bm1485_l3plus_stock::BM1485_L3PLUS_STOCK_ADDRESS_INTERVAL,
+            3
+        );
         let err = addr_stride_plan(DEFAULT_CHIPS_PER_CHAIN_L3PLUS).expect_err("must fail closed");
         assert!(err.to_string().contains("UNRESOLVED"));
     }

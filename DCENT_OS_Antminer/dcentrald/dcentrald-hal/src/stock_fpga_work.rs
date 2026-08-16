@@ -3,20 +3,20 @@
 //! The stock Bitmain FPGA uses a fundamentally different work dispatch model
 //! from BraiinsOS's per-chain FIFO approach:
 //!
-//! 1. **CPU computes midstate** (SHA-256 first block hash of the 80-byte header)
-//! 2. **CPU writes midstate + job metadata** to FPGA registers (0x130-0x15C)
-//! 3. **CPU writes full job data** to DMA buffer at admitted base + 0x200000/0x210000
-//! 4. **CPU signals FPGA** via JOB_DATA_READY register
-//! 5. **FPGA distributes work** to all 3 chains simultaneously via DMA
-//! 6. **FPGA collects nonces** into shared RETURN_NONCE FIFO
+//! 1. **CPU writes and verifies job data** in the inactive DMA buffer.
+//! 2. **CPU clears and polls DHASH RUN bit 6** before shared job-register writes.
+//! 3. **CPU publishes the inactive buffer address and job metadata**.
+//! 4. **CPU commits the job** with the final midstate-count + VIL/RUN/operation RMW.
+//! 5. **FPGA distributes work** to all 3 chains simultaneously via DMA.
+//! 6. **FPGA collects nonces** into the shared RETURN_NONCE FIFO.
 //!
 //! Double-buffering: two 64 KiB DDR regions alternate at offsets 0x200000 and
 //! 0x210000. The separate 2 MiB region at offset zero is reserved for the
 //! FPGA-written nonce2/job-id mapping store. Physical base is admitted from the
 //! kernel module parameter as 0x0F000000, 0x1F000000, or 0x3F000000.
 //!
-//! AsicBoost: 4 block version slots at registers 0x130-0x13C allow
-//! version-rolling AsicBoost with up to 4 midstates per job.
+//! Four-way AsicBoost remains fail-closed: exact S9j extra version lanes
+//! `0x164..0x16c` exceed the currently admitted logical aperture.
 //!
 //! Source: S9_STOCK_FPGA_REGISTER_MAP.md, S9_STOCK_BMMINER_RE.md
 
@@ -302,6 +302,36 @@ impl StockFpgaDma {
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
     }
+
+    /// Write and read back one inactive job-buffer region before it is
+    /// published to DHASH.
+    pub fn write_bytes_verified(&self, offset: usize, data: &[u8]) -> Result<()> {
+        offset
+            .checked_add(data.len())
+            .filter(|end| *end <= self.dma_size)
+            .ok_or_else(|| {
+                HalError::Other(format!(
+                    "stock FPGA DMA range 0x{offset:X}+0x{:X} exceeds mapped size 0x{:X}",
+                    data.len(),
+                    self.dma_size
+                ))
+            })?;
+        for (index, byte) in data.iter().copied().enumerate() {
+            unsafe {
+                std::ptr::write_volatile(self.ptr_at(offset + index), byte);
+            }
+        }
+        for (index, expected) in data.iter().copied().enumerate() {
+            let observed = unsafe { std::ptr::read_volatile(self.ptr_at(offset + index)) };
+            if observed != expected {
+                return Err(HalError::Other(format!(
+                    "stock FPGA DMA readback mismatch at 0x{:X}: wrote 0x{expected:02X}, read 0x{observed:02X}",
+                    offset + index
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for StockFpgaDma {
@@ -316,8 +346,8 @@ impl Drop for StockFpgaDma {
 
 /// High-level work dispatch engine for the stock Bitmain FPGA.
 ///
-/// Manages the double-buffered DMA work dispatch, DHASH accelerator control,
-/// AsicBoost version-rolling, and nonce FIFO reading.
+/// Manages double-buffered single-version DMA dispatch, DHASH control, and
+/// nonce FIFO reading. Four-way AsicBoost remains explicitly refused.
 ///
 /// This is the stock equivalent of FpgaChain's write_work() / read_nonce()
 /// methods, but operates on ALL chains simultaneously (stock FPGA does not
@@ -331,6 +361,15 @@ pub struct StockFpgaWorkEngine<'a> {
     active_buffer: u8,
     /// Current job ID counter.
     job_id: u32,
+    /// A pool clean-job transition to pulse immediately before the next final
+    /// commit. Primary S9 source and the multi-model 46e9579a... test-jig image
+    /// do this; the e5312ad1... S9j recovery image omits it, so this is an
+    /// explicit firmware-profile differential rather than universal parity.
+    pending_new_block: bool,
+    /// Set after a post-quiesce control-write failure. The requested RUN write
+    /// may have reached hardware even when readback never matched, so buffer
+    /// ownership is uncertain and this engine must never dispatch again.
+    poisoned: bool,
 }
 
 impl<'a> StockFpgaWorkEngine<'a> {
@@ -341,6 +380,8 @@ impl<'a> StockFpgaWorkEngine<'a> {
             dma,
             active_buffer: 0,
             job_id: 0,
+            pending_new_block: false,
+            poisoned: false,
         }
     }
 
@@ -349,11 +390,10 @@ impl<'a> StockFpgaWorkEngine<'a> {
     /// Sets up the DHASH control register, nonce2/jobid store address,
     /// and initial job start address. Must be called before dispatching work.
     ///
-    /// # Arguments
-    /// * `asic_count` - Number of ASIC chips per chain (e.g., 63 for S9)
-    pub fn init(&mut self, asic_count: u32) {
-        // Set hash counting number (ASIC count)
-        self.fpga.write_reg(REG_HASH_COUNTING_NUMBER, asic_count);
+    pub fn init(&mut self) -> Result<()> {
+        // Exact S9j open-core initializes this live hash-counting/liveness
+        // register to zero. It is not a topology or total-chip-count field.
+        self.fpga.write_reg(REG_HASH_COUNTING_NUMBER, 0);
 
         // Set nonce2/jobid store address
         self.fpga.write_reg(
@@ -372,17 +412,22 @@ impl<'a> StockFpgaWorkEngine<'a> {
         // Set timeout (enabled, ~40000 cycles)
         self.fpga.set_timeout(0x8000_9C40);
 
-        // Set DHASH_ACC_CONTROL to VIL mode + run
-        self.fpga.write_reg(REG_DHASH_ACC_CONTROL, DHASH_MINING_VIL);
+        // Admit the VIL/count-one/operation fields but remain quiesced until a
+        // verified job has been published. RUN is asserted only by the final
+        // per-job commit RMW.
+        let quiesced_dhash = dhash_stop_value(DHASH_MINING_VIL);
+        self.write_dhash_control_verified(quiesced_dhash)?;
 
         self.active_buffer = 0;
         self.job_id = 0;
+        self.pending_new_block = false;
+        self.poisoned = false;
 
         tracing::info!(
-            asic_count,
-            dhash = format_args!("0x{:08X}", DHASH_MINING_VIL),
-            "Stock FPGA work engine initialized (VIL mode, full init)"
+            dhash = format_args!("0x{quiesced_dhash:08X}"),
+            "Stock FPGA work engine initialized quiesced (VIL mode, full init)"
         );
+        Ok(())
     }
 
     /// Passthrough init — preserve the inherited DHASH state.
@@ -408,6 +453,8 @@ impl<'a> StockFpgaWorkEngine<'a> {
 
         // Continue from the inherited job_id
         self.job_id = job_id;
+        self.pending_new_block = false;
+        self.poisoned = false;
 
         // Determine active buffer from JOB_START_ADDRESS
         if job_start == layout.job_buffer_1() {
@@ -475,73 +522,81 @@ impl<'a> StockFpgaWorkEngine<'a> {
     /// * `ntime` - Block timestamp
     /// * `nbits` - Compact difficulty target
     pub fn write_header_fields(&self, version: u32, ntime: u32, nbits: u32) {
-        self.fpga.write_reg(REG_BLOCK_HEADER_VERSION, version);
-        self.fpga.write_reg(REG_TIME_STAMP, ntime);
-        self.fpga.write_reg(REG_TARGET_BITS, nbits);
-    }
-
-    /// Set up AsicBoost 4-way version rolling.
-    ///
-    /// Writes 4 different block versions to consecutive registers (0x130-0x13C).
-    /// Pure packing SSOT: `dcentrald_common::stock_asicboost_version_words` (G17).
-    ///
-    /// # Arguments
-    /// * `base_version` - Base block version from stratum
-    /// * `version_mask` - Allowed version-rolling bits (e.g., 0x1FFFE000)
-    pub fn set_asicboost_versions(&self, base_version: u32, version_mask: u32) {
-        let words = dcentrald_common::stock_asicboost_version_words(base_version, version_mask);
-        for (i, &version) in words.iter().enumerate() {
-            let reg = dcentrald_common::stock_asicboost_version_reg(i as u8);
-            debug_assert_eq!(reg, REG_BLOCK_HEADER_VERSION + (i as u32 * 4));
-            self.fpga.write_reg(reg, version);
-        }
-
-        tracing::debug!(
-            base = format_args!("0x{:08X}", base_version),
-            mask = format_args!("0x{:08X}", version_mask),
-            "Set 4-way AsicBoost version rolling"
+        self.fpga.write_reg(
+            REG_BLOCK_HEADER_VERSION,
+            dcentrald_common::stock_fpga_header_scalar_word(version),
+        );
+        self.fpga.write_reg(
+            REG_TIME_STAMP,
+            dcentrald_common::stock_fpga_header_scalar_word(ntime),
+        );
+        self.fpga.write_reg(
+            REG_TARGET_BITS,
+            dcentrald_common::stock_fpga_header_scalar_word(nbits),
         );
     }
 
-    /// Set the nonce2 value.
-    pub fn set_nonce2(&self, nonce2: u32) {
-        self.fpga.write_reg(REG_WORK_NONCE2, nonce2);
+    /// Set the exact 64-bit nonce2 start value.
+    pub fn set_nonce2_parts(&self, low: u32, high: u32) {
+        self.fpga.write_reg(REG_WORK_NONCE2, low);
+        self.fpga.write_reg(REG_WORK_NONCE2_HIGH, high);
     }
 
-    /// Set coinbase and nonce2 lengths.
-    ///
-    /// These tell the DHASH accelerator how to construct the full coinbase
-    /// from the template provided in the DMA buffer.
-    ///
-    /// Register 0x104 format:
-    ///   Bits [31:16] = coinbase transaction length in bytes
-    ///   Bits [15:8]  = nonce2 field length in bytes (typically 4 or 8)
-    ///   Bits [7:0]   = nonce2 offset in coinbase (coinbase1.len() + extranonce1.len())
-    ///
-    /// # Arguments
-    /// * `coinbase_len` - Full coinbase transaction length in bytes
-    /// * `nonce2_len` - Nonce2 field length in bytes (typically 4 or 8)
-    /// * `nonce2_offset` - Byte offset of nonce2 within the coinbase
-    pub fn set_lengths(&self, coinbase_len: u16, nonce2_len: u8, nonce2_offset: u8) {
-        let value =
-            ((coinbase_len as u32) << 16) | ((nonce2_len as u32) << 8) | (nonce2_offset as u32);
+    /// Write the pure planner's exact `0x104` word:
+    /// `nonce2_offset<<16 | nonce2_len<<8 | padded_coinbase_blocks`.
+    pub fn set_coinbase_layout(&self, value: u32) {
         self.fpga.write_reg(REG_COINBASE_AND_NONCE2_LENGTH, value);
-
-        tracing::debug!(
-            coinbase_len,
-            nonce2_len,
-            nonce2_offset,
-            reg = format_args!("0x{:08X}", value),
-            "DHASH lengths: coinbase={}B, nonce2={}B at offset {}",
-            coinbase_len,
-            nonce2_len,
-            nonce2_offset,
-        );
     }
 
     /// Set the number of merkle branches.
     pub fn set_merkle_count(&self, count: u32) {
         self.fpga.write_reg(REG_MERKLE_BIN_NUMBER, count);
+    }
+
+    /// Exact S9j DHASH setter: rewrite after each mismatch, sleep 2 ms, and
+    /// compare the complete requested word while ignoring self-clearing bit 7.
+    fn write_dhash_control_verified(&self, requested: u32) -> Result<()> {
+        self.fpga.write_reg(REG_DHASH_ACC_CONTROL, requested);
+        for _ in 0..DHASH_STOP_MAX_POLLS {
+            let observed = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
+            if (requested | DHASH_NEW_BLOCK) == (observed | DHASH_NEW_BLOCK) {
+                return Ok(());
+            }
+            self.fpga.write_reg(REG_DHASH_ACC_CONTROL, requested);
+            std::thread::sleep(std::time::Duration::from_millis(DHASH_STOP_POLL_DELAY_MS));
+        }
+        Err(HalError::Other(format!(
+            "stock FPGA DHASH control 0x{requested:08X} was not acknowledged after {DHASH_STOP_MAX_POLLS} readback attempts"
+        )))
+    }
+
+    /// Clear RUN and require its bounded acknowledgement before replacing
+    /// shared job MMIO. Inactive DDR may be prepared before this barrier.
+    fn quiesce_for_job_commit(&self, mode: dcentrald_common::StockDhashMidstateMode) -> Result<()> {
+        let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
+        let mut quiesced = dhash_stop_value(dhash);
+        if dcentrald_common::stock_dhash_midstate_count(dhash) != mode.count() {
+            quiesced |= DHASH_MIDSTATE_COUNT_CHANGE;
+        }
+        self.write_dhash_control_verified(quiesced)?;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(())
+    }
+
+    /// Final job-commit RMW: replace only the midstate-count nibble and assert
+    /// VIL, RUN, and operation mode. NEW_BLOCK bit 7 is FPGA-owned.
+    fn resume_after_job_commit(
+        &self,
+        mode: dcentrald_common::StockDhashMidstateMode,
+    ) -> Result<()> {
+        let current = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
+        let value = dcentrald_common::stock_dhash_with_midstate_mode(
+            current & !DHASH_MIDSTATE_COUNT_CHANGE,
+            mode,
+        ) | DHASH_VIL_MODE
+            | DHASH_RUN
+            | DHASH_OPERATION_MODE;
+        self.write_dhash_control_verified(value)
     }
 
     /// Write job data to the inactive DMA buffer and dispatch to FPGA.
@@ -568,65 +623,114 @@ impl<'a> StockFpgaWorkEngine<'a> {
         version: u32,
         ntime: u32,
         nbits: u32,
-    ) -> u32 {
-        // G18: clear sticky multi-midstate from a prior AsicBoost job so
-        // 0x134/0x138 resume ntime/nbits (single-version) semantics.
-        let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
-        let dhash_single =
-            dcentrald_common::stock_dhash_with_multi_midstate(dhash, /* enable */ false);
-        if dhash_single != dhash {
-            self.fpga.write_reg(REG_DHASH_ACC_CONTROL, dhash_single);
+        coinbase_len: usize,
+        nonce2_len: usize,
+        nonce2_offset: usize,
+        merkle_count: usize,
+    ) -> Result<u32> {
+        if self.poisoned {
+            return Err(HalError::Other(
+                "stock FPGA work engine is poisoned after an ambiguous control-write failure"
+                    .to_owned(),
+            ));
+        }
+        let plan = dcentrald_common::plan_stock_dma_job(
+            job_data,
+            coinbase_len,
+            nonce2_offset,
+            nonce2_len,
+            merkle_count,
+        )
+        .map_err(|error| HalError::Other(format!("invalid stock FPGA DMA job: {error:?}")))?;
+
+        // Exact e5312ad1... ordering verifies the SHA-padded coinbase first,
+        // then writes and verifies the merkle region separately.
+        let buf_offset = self.writable_buffer_offset();
+        let (padded_coinbase, merkle_payload) =
+            plan.buffer_payload().split_at(plan.padded_coinbase_len());
+        self.dma.write_bytes_verified(buf_offset, padded_coinbase)?;
+        if !merkle_payload.is_empty() {
+            self.dma
+                .write_bytes_verified(buf_offset + plan.padded_coinbase_len(), merkle_payload)?;
+        }
+        if let Err(error) =
+            self.quiesce_for_job_commit(dcentrald_common::StockDhashMidstateMode::Single)
+        {
+            self.poisoned = true;
+            return Err(error);
         }
 
-        // Write job data to inactive DMA buffer
-        let buf_offset = self.writable_buffer_offset();
-        self.dma.write_bytes(buf_offset, job_data);
-
-        // Write previous block hash to FPGA registers
-        // (FPGA computes midstate internally in VIL mode)
-        self.write_prev_hash(prev_hash);
-
-        // Write header fields
-        self.write_header_fields(version, ntime, nbits);
-
-        // Set job metadata
-        let job_len = job_data.len() as u32;
-        self.fpga.write_reg(REG_JOB_LENGTH, job_len);
+        // Exact S9-family order publishes the verified inactive buffer before
+        // the remaining shared job registers. The final DHASH RMW is the
+        // commit trigger; register 0x120 is not written by the exact S9j path.
+        let published_buffer = self.active_buffer ^ 1;
         self.fpga
             .write_reg(REG_JOB_START_ADDRESS, self.writable_buffer_phys() as u32);
+        // The address is now hardware-visible. Advance ownership before any
+        // later fallible control write; a failure poisons the engine.
+        self.active_buffer = published_buffer;
 
-        // Increment and set job ID
-        self.job_id = self.job_id.wrapping_add(1);
-        self.fpga.write_reg(REG_JOB_ID, self.job_id);
+        // Exact S9j scalar order publishes the correlation ID immediately
+        // after the job address (and optional ticket mask, which this lane does
+        // not mutate), before version/header fields.
+        let next_job_id = self.job_id.wrapping_add(1);
+        self.fpga.write_reg(REG_JOB_ID, next_job_id);
+        self.job_id = next_job_id;
 
-        // Signal FPGA: new job data ready
-        self.fpga.write_reg(REG_JOB_DATA_READY, 1);
+        // Exact S9j order after JOB_ID: version, previous hash,
+        // timestamp/target, then coupled coinbase/nonce2/merkle/job length.
+        self.fpga.write_reg(
+            REG_BLOCK_HEADER_VERSION,
+            dcentrald_common::stock_fpga_header_scalar_word(version),
+        );
+        self.write_prev_hash(prev_hash);
+        self.fpga.write_reg(
+            REG_TIME_STAMP,
+            dcentrald_common::stock_fpga_header_scalar_word(ntime),
+        );
+        self.fpga.write_reg(
+            REG_TARGET_BITS,
+            dcentrald_common::stock_fpga_header_scalar_word(nbits),
+        );
+        self.set_coinbase_layout(plan.coinbase_layout());
+        self.set_nonce2_parts(plan.nonce2_low(), plan.nonce2_high());
+        self.set_merkle_count(u32::from(plan.merkle_count()));
+        self.fpga
+            .write_reg(REG_JOB_LENGTH, u32::from(plan.job_length()));
 
-        // Swap active buffer for next dispatch
-        self.active_buffer ^= 1;
+        // One-millisecond publication settle precedes the final DHASH commit.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if self.pending_new_block {
+            let current = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
+            if let Err(error) = self.write_dhash_control_verified(current | DHASH_NEW_BLOCK) {
+                self.poisoned = true;
+                return Err(error);
+            }
+            self.pending_new_block = false;
+        }
+        if let Err(error) =
+            self.resume_after_job_commit(dcentrald_common::StockDhashMidstateMode::Single)
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
 
         tracing::trace!(
             job_id = self.job_id,
-            len = job_len,
-            buffer = self.active_buffer ^ 1,
+            len = plan.job_length(),
+            buffer = self.active_buffer,
             "Dispatched work to stock FPGA"
         );
 
-        self.job_id
+        Ok(self.job_id)
     }
 
-    /// Dispatch work with AsicBoost (4 version variants).
+    /// Fail-closed four-way AsicBoost entry point.
     ///
-    /// Same as dispatch_work() but also sets up 4-way version rolling.
-    ///
-    /// # Register alias (load-bearing)
-    ///
-    /// Stock map dual-uses `0x134`/`0x138` as TIME_STAMP/TARGET_BITS **and**
-    /// AsicBoost version slots 1/2 (`get_block_header_version{1,2}_ab`). In
-    /// multi-midstate mode those slots must hold packed versions at
-    /// JOB_DATA_READY — ntime/nbits are also carried in the VIL DMA job
-    /// template. Write order: ntime/nbits first, then **last** the 4 version
-    /// words so they are not clobbered (G17 critic).
+    /// Exact S9j uses version lanes `0x130,0x164,0x168,0x16c`. The latter
+    /// three exceed the current logical FPGA aperture, so no mutation is
+    /// emitted until a board/revision-specific mapping and nonce-correlation
+    /// contract are admitted.
     pub fn dispatch_work_asicboost(
         &mut self,
         job_data: &[u8],
@@ -635,49 +739,27 @@ impl<'a> StockFpgaWorkEngine<'a> {
         version_mask: u32,
         ntime: u32,
         nbits: u32,
-    ) -> u32 {
-        // Enable multi-midstate in DHASH control before version-slot programming
-        // (pure apply: stock_dhash_with_multi_midstate — G17/G18).
-        let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
-        let dhash_ab =
-            dcentrald_common::stock_dhash_with_multi_midstate(dhash, /* enable */ true);
-        if dhash_ab != dhash {
-            self.fpga.write_reg(REG_DHASH_ACC_CONTROL, dhash_ab);
-        }
-
-        // Write job data to inactive DMA buffer
-        let buf_offset = self.writable_buffer_offset();
-        self.dma.write_bytes(buf_offset, job_data);
-
-        // Write previous block hash (FPGA computes midstate internally)
-        self.write_prev_hash(prev_hash);
-
-        // ntime/nbits first (same addrs as AB slots 1/2 — will be overwritten
-        // by set_asicboost_versions for multi-midstate latch image).
-        self.fpga.write_reg(REG_TIME_STAMP, ntime);
-        self.fpga.write_reg(REG_TARGET_BITS, nbits);
-
-        // Set job metadata
-        let job_len = job_data.len() as u32;
-        self.fpga.write_reg(REG_JOB_LENGTH, job_len);
-        self.fpga
-            .write_reg(REG_JOB_START_ADDRESS, self.writable_buffer_phys() as u32);
-
-        // Increment and set job ID (G15 correlation spine)
-        self.job_id = self.job_id.wrapping_add(1);
-        self.fpga.write_reg(REG_JOB_ID, self.job_id);
-
-        // LAST: 4 packed version words at 0x130..0x13C so the post-ready
-        // image is v0..v3, not v0/ntime/nbits/v3.
-        self.set_asicboost_versions(base_version, version_mask);
-
-        // Signal FPGA
-        self.fpga.write_reg(REG_JOB_DATA_READY, 1);
-
-        // Swap buffer
-        self.active_buffer ^= 1;
-
-        self.job_id
+        coinbase_len: usize,
+        nonce2_len: usize,
+        nonce2_offset: usize,
+        merkle_count: usize,
+    ) -> Result<u32> {
+        let _ = (
+            job_data,
+            prev_hash,
+            base_version,
+            version_mask,
+            ntime,
+            nbits,
+            coinbase_len,
+            nonce2_len,
+            nonce2_offset,
+            merkle_count,
+        );
+        Err(HalError::Other(
+            "stock FPGA four-way AsicBoost is refused: exact S9j lanes 0x164..0x16c are outside the admitted aperture"
+                .to_string(),
+        ))
     }
 
     /// Check how many nonces are pending in the FIFO.
@@ -747,27 +829,39 @@ impl<'a> StockFpgaWorkEngine<'a> {
 
     /// Signal a new block (clean_jobs from pool).
     ///
-    /// Sets the new_block flag in DHASH_ACC_CONTROL to tell the FPGA to
-    /// abort current work and prepare for new block data.
-    pub fn signal_new_block(&self) {
-        let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
-        self.fpga
-            .write_reg(REG_DHASH_ACC_CONTROL, dhash | DHASH_NEW_BLOCK);
-
-        // Flush stale nonces
+    /// Primary S9 source and the multi-model 46e9579a... test-jig image map a
+    /// clean-job indication to self-clearing DHASH bit 7 immediately before
+    /// the final commit. The e5312ad1... S9j recovery image omits the pulse;
+    /// retaining it here is a conservative profile-unifying behavior paired
+    /// with the mandatory RUN-clear barrier.
+    pub fn signal_new_block(&mut self) {
+        self.pending_new_block = true;
         self.flush_nonces();
-
-        // Clear new_block flag
-        self.fpga
-            .write_reg(REG_DHASH_ACC_CONTROL, dhash & !DHASH_NEW_BLOCK);
     }
 
-    /// Stop the DHASH accelerator.
-    pub fn stop(&self) {
+    /// Stop the DHASH accelerator and require the recovered bit-six clear
+    /// acknowledgement. A false result requires the caller to continue to a
+    /// rail-safe teardown rather than claiming the work engine is quiescent.
+    pub fn stop(&self) -> bool {
+        // Signed S9j shutdown first disables BC nullwork, then clears DHASH
+        // RUN. This prevents dummy work from continuing during heartbeat join
+        // and rail teardown.
+        let bc_write = self.fpga.read_reg(REG_BC_WRITE_COMMAND);
+        self.fpga.write_reg(
+            REG_BC_WRITE_COMMAND,
+            dcentrald_common::stock_shutdown_bc_disable_nullwork(bc_write),
+        );
         let dhash = self.fpga.read_reg(REG_DHASH_ACC_CONTROL);
-        self.fpga
-            .write_reg(REG_DHASH_ACC_CONTROL, dhash & !DHASH_RUN);
-        tracing::info!("Stock FPGA DHASH accelerator stopped");
+        match self.write_dhash_control_verified(dhash_stop_value(dhash)) {
+            Ok(()) => {
+                tracing::info!("Stock FPGA DHASH accelerator stopped");
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "Stock FPGA DHASH RUN clear was not acknowledged; rail-safe teardown required");
+                false
+            }
+        }
     }
 }
 

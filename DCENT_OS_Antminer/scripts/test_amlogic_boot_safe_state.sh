@@ -50,7 +50,13 @@ require_literal "$S37" 'GPIO437 is PWR_EN and is active HIGH: 1=ON, 0=OFF' \
 require_literal "$S37" 'set_gpio_direction_checked "$PWR_GPIO" low out' \
     'S37 uses glitch-free direction=low for the first power-gate mutation'
 require_literal "$S37" 'set_gpio_value_checked "$PWR_GPIO" 0' \
-    'S37 requires checked GPIO437-low value readback'
+    'S37 requires checked GPIO437-low value readback on S21-class'
+require_literal "$S37" 'set_gpio_value_checked "$PWR_GPIO" 1' \
+    'S37 SafeOff=1 on am3-s19k (sysfs 0 engages the rail)'
+require_literal "$S37" 'am3-s19k|am3-s19kpro|am3-aml-s19kpro)' \
+    'S37 board_target-scopes S19k GPIO437 SafeOff'
+require_literal "$S37" 'GPIO437 refuse: missing or unsealed board_target=' \
+    'S37 fail-closes GPIO437 when board_target is missing or unsealed'
 require_literal "$S37" 'write_and_check "$ACTIVE_LOW_PATH" 0' \
     'S37 pins and checks GPIO437 raw active-high mode'
 require_literal "$S37" 'FAN_BOOT_DUTY_NS=30000' \
@@ -67,6 +73,8 @@ require_literal "$S37" 'gpio_active_low=0' \
     'S37 receipt records raw active-high GPIO semantics'
 require_literal "$S37" 'physical_rail_measured=false' \
     'S37 receipt does not overclaim electrical rail proof'
+require_literal "$S37" 'WANT_SAFE_OFF=1' \
+    'S37 runtime handoff accepts GPIO437=1 SafeOff on am3-s19k'
 require_literal "$S37" 'write_receipt runtime-handoff' \
     'S37 records an explicit boot-to-runtime handoff state'
 require_literal "$S37" 'verify_boot_safe_receipt || return 1' \
@@ -209,6 +217,63 @@ if grep -Fq 'Run guarded restart' "$RECOVERY" \
 else
     pass 'Amlogic web recovery does not advertise or execute forbidden restart'
 fi
+
+
+INSTALL_PERSISTENT="$PROJECT_DIR/scripts/install_amlogic_persistent.sh"
+require_literal "$INSTALL_PERSISTENT" 'Step 7b/10: GPIO437 PWR_EN SafeOff' \
+    'persistent Amlogic install requires GPIO437 SafeOff before NAND mutation'
+require_literal "$INSTALL_PERSISTENT" 'GPIO437_SAFE_OFF=1' \
+    'persistent Amlogic install SafeOff=1 on s19kpro (0 ENGAGES rails)'
+require_literal "$INSTALL_PERSISTENT" 'am3-s19k-active-low' \
+    'persistent Amlogic install documents am3-s19k GPIO437 polarity'
+require_literal "$INSTALL_PERSISTENT" 'ERROR: gpio437 value=' \
+    'persistent Amlogic install proves GPIO437 matches SKU SafeOff after write'
+require_literal "$INSTALL_PERSISTENT" 'refusing NAND mutation' \
+    'persistent Amlogic install refuses flash when SafeOff fails'
+# Ordering: SafeOff step text must appear before flash_erase invocation.
+SAFEOFF_LINE=$(grep -n -F 'Step 7b/10: GPIO437 PWR_EN SafeOff' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+# Match the real destructive flash_erase invocation, not the dry-run log line.
+FLASH_LINE=$(grep -n -F 'ssh_run "flash_erase $ROOTFS_MTD' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+if [ -n "$SAFEOFF_LINE" ] && [ -n "$FLASH_LINE" ] && [ "$SAFEOFF_LINE" -lt "$FLASH_LINE" ]; then
+    pass 'persistent Amlogic install SafeOff precedes flash_erase'
+else
+    fail 'persistent Amlogic install can flash_erase without prior GPIO437 SafeOff'
+fi
+
+S19K_RAIL="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos/rail_gpio"
+S19K_TARGET="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos/board_target"
+S19K_PLATFORM="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos-platform"
+
+LAB_ROOTFS="$ROOT/scripts/amlogic_lab_rootfs.sh"
+require_file "$LAB_ROOTFS"
+require_literal "$LAB_ROOTFS" 'require_gpio437_safe_off_before_mutation' \
+    'lab Amlogic rootfs write/restore requires GPIO437 SafeOff helper'
+require_literal "$LAB_ROOTFS" 'GPIO437 PWR_EN SafeOff (polarity=' \
+    'lab Amlogic rootfs documents SKU-scoped GPIO437 SafeOff before mutation'
+require_literal "$LAB_ROOTFS" 'am3-s19k-active-low' \
+    'lab Amlogic rootfs SafeOff=1 on am3-s19k (0 ENGAGES rails)'
+require_literal "$LAB_ROOTFS" 'ERROR: gpio437 value=' \
+    'lab Amlogic rootfs proves GPIO437 matches SKU SafeOff after write'
+require_literal "$LAB_ROOTFS" 'refusing NAND mutation' \
+    'lab Amlogic rootfs refuses flash when SafeOff fails'
+require_literal "$LAB_ROOTFS" 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' \
+    'lab Amlogic rootfs refuses NAND while FLASH-false'
+require_literal "$LAB_ROOTFS" '--lab-only is not a FLASH override' \
+    'lab Amlogic rootfs lab flags do not override FLASH'
+LAB_WRITE_FLASH=$(grep -n -F 'flash_erase $ROOTFS_MTD' "$LAB_ROOTFS" | head -n 1 | cut -d: -f1)
+LAB_RESTORE_FLASH=$(grep -n -F 'flash_erase $ROOTFS_MTD' "$LAB_ROOTFS" | tail -n 1 | cut -d: -f1)
+LAB_WRITE_CALL=$(grep -n -F 'require_gpio437_safe_off_before_mutation "$MINER_IP"' "$LAB_ROOTFS" | head -n 1 | cut -d: -f1)
+LAB_RESTORE_CALL=$(grep -n -F 'require_gpio437_safe_off_before_mutation "$MINER_IP"' "$LAB_ROOTFS" | tail -n 1 | cut -d: -f1)
+if [ -n "$LAB_WRITE_CALL" ] && [ -n "$LAB_WRITE_FLASH" ] && [ "$LAB_WRITE_CALL" -lt "$LAB_WRITE_FLASH" ] \
+   && [ -n "$LAB_RESTORE_CALL" ] && [ -n "$LAB_RESTORE_FLASH" ] && [ "$LAB_RESTORE_CALL" -lt "$LAB_RESTORE_FLASH" ]; then
+    pass 'lab Amlogic rootfs SafeOff precedes flash_erase on write and restore'
+else
+    fail 'lab Amlogic rootfs can flash_erase without prior GPIO437 SafeOff'
+fi
+
+require_literal "$S19K_RAIL" '437' 'S19k overlay rail_gpio is GPIO437'
+require_literal "$S19K_TARGET" 'am3-s19k' 'S19k overlay board_target is am3-s19k'
+require_literal "$S19K_PLATFORM" 'am3-aml-s19k' 'S19k overlay platform is am3-aml-s19k'
 
 if [ "$FAILURES" -ne 0 ]; then
     printf 'Amlogic boot-safe-state contract failed: %s failure(s)\n' "$FAILURES" >&2

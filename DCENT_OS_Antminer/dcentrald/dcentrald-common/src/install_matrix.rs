@@ -31,6 +31,9 @@ pub struct InstallMatrixRow {
     pub ab_sysupgrade: bool,
     /// The complete typed policy admits a persistent update API.
     pub persistent_update_allowed: bool,
+    /// The independent removable-media facet admits writing an image to a
+    /// card. This never implies onboard-storage mutation authority.
+    pub external_media_write_allowed: bool,
 }
 
 impl From<&BoardDesc> for InstallMatrixRow {
@@ -50,6 +53,7 @@ impl From<&BoardDesc> for InstallMatrixRow {
                 UpdateMechanism::ZynqUbiFwSetenv
             ),
             persistent_update_allowed: d.enablement.allows_persistent_update(),
+            external_media_write_allowed: d.enablement.allows_external_media_write(),
         }
     }
 }
@@ -86,11 +90,11 @@ pub fn ab_sysupgrade_board_targets() -> Vec<&'static str> {
 /// versioned JSON export so schema drift fails closed.
 pub fn install_matrix_tsv() -> String {
     let mut out = String::from(
-        "board_target\tfamily\tstorage_topology\tupdate_mechanism\tupdate_maturity\tinstall_authorization\trecovery_maturity\tartifact_kind\tartifact_maturity\tpublic_beta_install\tpersistent_update_allowed\ttransport\n",
+        "board_target\tfamily\tstorage_topology\tupdate_mechanism\tupdate_maturity\tinstall_authorization\trecovery_maturity\tartifact_kind\tartifact_maturity\texternal_media_mode\texternal_media_maturity\texternal_media_authorization\texternal_media_write_allowed\tpublic_beta_install\tpersistent_update_allowed\ttransport\n",
     );
     for row in install_matrix() {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             row.board_target,
             row.family.as_str(),
             row.enablement.storage_topology.as_str(),
@@ -100,6 +104,10 @@ pub fn install_matrix_tsv() -> String {
             row.enablement.recovery_maturity.as_str(),
             row.enablement.artifact_kind.as_str(),
             row.enablement.artifact_maturity.as_str(),
+            row.enablement.external_media_mode.as_str(),
+            row.enablement.external_media_maturity.as_str(),
+            row.enablement.external_media_authorization.as_str(),
+            row.external_media_write_allowed as u8,
             row.public_beta_install as u8,
             row.persistent_update_allowed as u8,
             row.chain_transport.as_str(),
@@ -127,7 +135,10 @@ pub fn install_matrix_json() -> String {
                 "\"storage_topology\":\"{}\",\"update_mechanism\":\"{}\",",
                 "\"update_maturity\":\"{}\",\"install_authorization\":\"{}\",",
                 "\"recovery_maturity\":\"{}\",\"artifact_kind\":\"{}\",",
-                "\"artifact_maturity\":\"{}\",\"public_beta_install\":{},",
+                "\"artifact_maturity\":\"{}\",\"external_media_mode\":\"{}\",",
+                "\"external_media_maturity\":\"{}\",",
+                "\"external_media_authorization\":\"{}\",",
+                "\"external_media_write_allowed\":{},\"public_beta_install\":{},",
                 "\"persistent_update_allowed\":{},\"transport\":\"{}\"}}"
             ),
             row.board_target,
@@ -139,6 +150,10 @@ pub fn install_matrix_json() -> String {
             row.enablement.recovery_maturity.as_str(),
             row.enablement.artifact_kind.as_str(),
             row.enablement.artifact_maturity.as_str(),
+            row.enablement.external_media_mode.as_str(),
+            row.enablement.external_media_maturity.as_str(),
+            row.enablement.external_media_authorization.as_str(),
+            row.external_media_write_allowed,
             row.public_beta_install,
             row.persistent_update_allowed,
             row.chain_transport.as_str(),
@@ -152,13 +167,31 @@ pub fn install_matrix_json() -> String {
 mod tests {
     use super::*;
     use dcent_schema::hardware::{
-        ArtifactKind, ArtifactMaturity, ImplementationMaturity, InstallAuthorization,
-        RecoveryMaturity, StorageTopology,
+        ArtifactKind, ArtifactMaturity, ExternalMediaMaturity, ExternalMediaMode,
+        ImplementationMaturity, InstallAuthorization, RecoveryMaturity, StorageTopology,
     };
 
     #[test]
     fn public_beta_first_install_is_s9_only() {
         assert_eq!(public_beta_board_targets(), vec!["am1-s9"]);
+    }
+
+    #[test]
+    fn am1_s9se_is_denied_management_only() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "am1-s9se")
+            .expect("am1-s9se must be in the install matrix");
+        assert!(!row.public_beta_install);
+        assert!(!row.mining_default_enabled);
+        assert!(!row.product_install_allowed);
+        assert!(!row.persistent_update_allowed);
+        assert!(!row.external_media_write_allowed);
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert_eq!(row.chain_transport, ChainTransportKind::None);
     }
 
     #[test]
@@ -239,17 +272,97 @@ mod tests {
         assert!(row.persistent_update_allowed);
         assert!(!row.public_beta_install);
         assert!(!row.product_install_allowed);
+        assert_eq!(
+            row.enablement.external_media_mode,
+            ExternalMediaMode::BootOnly
+        );
+        assert_eq!(
+            row.enablement.external_media_maturity,
+            ExternalMediaMaturity::ArtifactGenerated
+        );
+        assert_eq!(
+            row.enablement.external_media_authorization,
+            InstallAuthorization::LabOnly
+        );
+        assert!(row.external_media_write_allowed);
+    }
+
+    #[test]
+    fn s17_package_only_artifact_grants_no_update_or_media_authority() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "am2-s17p")
+            .expect("registered AM2 S17 row");
+        assert_eq!(
+            row.enablement.update_maturity,
+            ImplementationMaturity::NotImplemented
+        );
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert_eq!(row.enablement.artifact_kind, ArtifactKind::SysupgradeBundle);
+        assert_eq!(
+            row.enablement.artifact_maturity,
+            ArtifactMaturity::Experimental
+        );
+        assert_eq!(row.enablement.external_media_mode, ExternalMediaMode::None);
+        assert!(!row.persistent_update_allowed);
+        assert!(!row.external_media_write_allowed);
+        assert!(!row.product_install_allowed);
+        assert!(!row.public_beta_install);
+    }
+
+    #[test]
+    fn external_media_facets_distinguish_s9_am2_and_beaglebone_proof() {
+        let rows = install_matrix();
+        let s9 = rows
+            .iter()
+            .find(|row| row.board_target == "am1-s9")
+            .unwrap();
+        assert_eq!(
+            s9.enablement.external_media_mode,
+            ExternalMediaMode::BootOnly
+        );
+        assert_eq!(
+            s9.enablement.external_media_maturity,
+            ExternalMediaMaturity::BootWitnessed
+        );
+        assert_eq!(
+            s9.enablement.external_media_authorization,
+            InstallAuthorization::PublicBeta
+        );
+        assert!(s9.external_media_write_allowed);
+
+        let bb = rows
+            .iter()
+            .find(|row| row.board_target == "am3-bb-s19jpro")
+            .unwrap();
+        assert_eq!(
+            bb.enablement.external_media_mode,
+            ExternalMediaMode::BootOnly
+        );
+        assert_eq!(
+            bb.enablement.external_media_maturity,
+            ExternalMediaMaturity::MediaWritten
+        );
+        assert_eq!(
+            bb.enablement.external_media_authorization,
+            InstallAuthorization::LabOnly
+        );
+        assert!(bb.external_media_write_allowed);
+
+        let aml = rows
+            .iter()
+            .find(|row| row.board_target == "am3-s21")
+            .unwrap();
+        assert_eq!(aml.enablement.external_media_mode, ExternalMediaMode::None);
+        assert!(!aml.external_media_write_allowed);
     }
 
     #[test]
     fn metadata_only_targets_have_no_artifact_or_install_lane() {
-        for target in [
-            "am2-s17plus",
-            "am2-t17",
-            "am2-t17plus",
-            "am2-t19",
-            "am3-s19xp",
-        ] {
+        for target in ["am2-s17plus", "am2-t17", "am2-t17plus", "am2-t19"] {
             let row = install_matrix()
                 .into_iter()
                 .find(|row| row.board_target == target)
@@ -271,6 +384,38 @@ mod tests {
                 "{target}"
             );
             assert!(!row.persistent_update_allowed, "{target}");
+            assert!(!row.product_install_allowed, "{target}");
+        }
+    }
+
+    #[test]
+    fn exact_a113d_s19xp_package_has_guarded_lab_install_authority() {
+        for target in ["am3-s19xp", "am3-s19jxp", "am3-s19jproplus"] {
+            let row = install_matrix()
+                .into_iter()
+                .find(|row| row.board_target == target)
+                .unwrap_or_else(|| panic!("missing guarded Amlogic target {target}"));
+            assert_eq!(
+                row.enablement.update_maturity,
+                ImplementationMaturity::Experimental,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.install_authorization,
+                InstallAuthorization::LabOnly,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.artifact_kind,
+                ArtifactKind::SysupgradeBundle,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.artifact_maturity,
+                ArtifactMaturity::Experimental,
+                "{target}"
+            );
+            assert!(row.persistent_update_allowed, "{target}");
             assert!(!row.product_install_allowed, "{target}");
         }
     }
@@ -300,12 +445,13 @@ mod tests {
     #[test]
     fn json_is_versioned_and_contains_typed_cv_policy() {
         let json = install_matrix_json();
-        assert!(json.starts_with("{\n  \"schema\": 3,"));
+        assert!(json.starts_with("{\n  \"schema\": 4,"));
         assert!(json.contains("\"board_target\":\"cv1835-s19jpro\""));
         assert!(json.contains("\"artifact_kind\":\"none\""));
         assert!(json.contains("\"artifact_maturity\":\"not_implemented\""));
         assert!(json.contains("\"update_maturity\":\"not_implemented\""));
         assert!(json.contains("\"install_authorization\":\"denied\""));
+        assert!(json.contains("\"external_media_mode\":\"none\""));
     }
 
     /// Drift pin: committed `docs/architecture/install_matrix.tsv` must match

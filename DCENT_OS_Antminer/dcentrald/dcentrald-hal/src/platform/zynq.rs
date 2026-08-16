@@ -945,6 +945,11 @@ fn detect_zynq_variant_from_board_target(target: Option<&str>) -> Option<ZynqVar
 /// historically overloaded `am2-s17` combination, is ambiguous and cannot
 /// authorize S19-only behavior when installed target identity is absent.
 fn detect_zynq_variant_from_dt_model(model: &str) -> Option<ZynqVariant> {
+    // S9 SE / Ctrl_C43 is not the classic S9 fabric. `am1s9se` contains
+    // `am1s9` and `s9` — refuse before those substrings can map it to S9.
+    if model.contains("s9se") {
+        return None;
+    }
     if model.contains("am2") {
         if model.contains("s19") || model.contains("t19") {
             return Some(ZynqVariant::S19);
@@ -1069,6 +1074,13 @@ mod tests {
             detect_zynq_variant_from_board_target(Some("am1-s9")),
             Some(ZynqVariant::S9)
         );
+        assert_eq!(
+            detect_zynq_variant_from_board_target(Some("am1-s9se")),
+            None,
+            "S9 SE is not the classic S9 Zynq variant"
+        );
+        assert_eq!(detect_zynq_variant_from_dt_model("am1s9se"), None);
+        assert_eq!(detect_zynq_variant_from_dt_model("s9se"), None);
         assert_eq!(
             detect_zynq_variant_from_board_target(Some("am1-s17")),
             Some(ZynqVariant::S17)

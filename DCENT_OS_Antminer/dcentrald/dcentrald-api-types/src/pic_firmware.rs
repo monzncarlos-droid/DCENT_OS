@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Public response schema for `GET /api/hardware/pic_info`.
-pub const PIC_INFO_SCHEMA: &str = "dcentos.hardware.pic_info.v2";
+pub const PIC_INFO_SCHEMA: &str = "dcentos.hardware.pic_info.v3";
 
 /// Discrete PIC architecture identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,7 +111,9 @@ pub enum PicFirmwareInfoStatus {
     /// Static catalog only. This is the current REST behavior when AppState has
     /// no PIC service snapshot handle.
     CatalogOnly,
-    /// A service-owned snapshot supplied live per-slot firmware observations.
+    /// A service-owned snapshot supplied live firmware evidence. Each
+    /// observation states whether it is exact per-endpoint evidence or only a
+    /// runtime-global classification.
     LiveSnapshot,
     /// Some slot observations were present, but at least one slot was missing
     /// or errored.
@@ -126,13 +128,45 @@ pub enum PicFirmwareLiveSlotStatus {
     NotWired,
     /// A snapshot handle exists, but it has not published any slot data.
     Unavailable,
-    /// A slot has a parsed firmware byte from a service-owned snapshot.
+    /// A service-owned snapshot has an exact byte or bounded classification.
     Live,
     /// A slot exists, but the service reported an error for it.
     Error,
 }
 
-/// One future live per-slot firmware observation.
+/// Scope of one runtime firmware observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PicFirmwareObservationScope {
+    /// The producer retained an exact firmware byte for this endpoint.
+    EndpointExact,
+    /// The runtime retained one global firmware class, not an exact byte per
+    /// endpoint. No chain/address or exact byte may be inferred from it.
+    RuntimeGlobalClassification,
+}
+
+impl Default for PicFirmwareObservationScope {
+    fn default() -> Self {
+        Self::EndpointExact
+    }
+}
+
+/// Bounded class used when the runtime collapses raw states before API
+/// publication and therefore cannot honestly report an exact firmware byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PicFirmwareClassification {
+    /// Stock Bitmain PIC16F1704 application family. The runtime recognized one
+    /// of its accepted stock states, but this observation does not bind a byte
+    /// to every initialized endpoint.
+    StockBitmainPic16,
+    /// Ambiguous PIC16 class used for the runtime dispatch enum into which raw
+    /// `0x03` and app-mode `0x60` both collapse. This is not a BraiinsOS
+    /// firmware-identity claim.
+    BraiinsOsOrAppModePic16,
+}
+
+/// One live firmware evidence observation.
 ///
 /// This type is a plumbing seam: the REST handler can serialize it when some
 /// daemon-owned PicService publisher exists, but the REST handler itself must
@@ -140,6 +174,12 @@ pub enum PicFirmwareLiveSlotStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PicFirmwareLiveSlot {
+    pub observation_scope: PicFirmwareObservationScope,
+    pub classification: Option<PicFirmwareClassification>,
+    /// Count of initialized endpoints present when a runtime-global class was
+    /// captured. This is not a claim that the class or an exact byte was
+    /// observed independently at every endpoint.
+    pub initialized_endpoint_count: Option<usize>,
     pub slot: Option<String>,
     pub chain_id: Option<u8>,
     pub i2c_bus: Option<u8>,
@@ -157,6 +197,9 @@ pub struct PicFirmwareLiveSlot {
 impl Default for PicFirmwareLiveSlot {
     fn default() -> Self {
         Self {
+            observation_scope: PicFirmwareObservationScope::EndpointExact,
+            classification: None,
+            initialized_endpoint_count: None,
             slot: None,
             chain_id: None,
             i2c_bus: None,
@@ -184,6 +227,9 @@ impl PicFirmwareLiveSlot {
         source: impl Into<String>,
     ) -> Self {
         Self {
+            observation_scope: PicFirmwareObservationScope::EndpointExact,
+            classification: None,
+            initialized_endpoint_count: None,
             slot: Some(slot.into()),
             chain_id,
             i2c_bus,
@@ -199,6 +245,24 @@ impl PicFirmwareLiveSlot {
             observed_at_ms,
             source: source.into(),
             error: None,
+        }
+    }
+
+    /// Publish a runtime-global PIC16 class without inventing an exact byte or
+    /// attributing the class to any individual endpoint.
+    pub fn classified_runtime_global(
+        classification: PicFirmwareClassification,
+        initialized_endpoint_count_at_snapshot: usize,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            observation_scope: PicFirmwareObservationScope::RuntimeGlobalClassification,
+            classification: Some(classification),
+            initialized_endpoint_count: Some(initialized_endpoint_count_at_snapshot),
+            slot: Some("runtime-global-pic16-classification".to_string()),
+            status: PicFirmwareLiveSlotStatus::Live,
+            source: source.into(),
+            ..Self::default()
         }
     }
 
@@ -298,7 +362,8 @@ impl PicFirmwareInfoResponse {
                 "REST did not issue I2C reads or writes to fill the gap.".to_string(),
             ],
             PicFirmwareLiveSlotStatus::Live => vec![
-                "Firmware bytes are service-owned snapshots; REST remains read-only.".to_string(),
+                "Firmware evidence is a service-owned snapshot; every observation declares exact-endpoint or runtime-global-classification scope. REST remains read-only."
+                    .to_string(),
             ],
             PicFirmwareLiveSlotStatus::Error => vec![
                 "At least one service-owned PIC firmware observation reported an error.".to_string(),
@@ -657,5 +722,31 @@ mod tests {
             .variants
             .iter()
             .any(|variant| { variant.fw_byte_decimal == 0x86 && !variant.voltage_trusted }));
+    }
+
+    #[test]
+    fn runtime_global_classification_never_invents_endpoint_or_byte_evidence() {
+        let observation = PicFirmwareLiveSlot::classified_runtime_global(
+            PicFirmwareClassification::BraiinsOsOrAppModePic16,
+            3,
+            "test_runtime_classification",
+        );
+
+        assert_eq!(
+            observation.observation_scope,
+            PicFirmwareObservationScope::RuntimeGlobalClassification
+        );
+        assert_eq!(
+            observation.classification,
+            Some(PicFirmwareClassification::BraiinsOsOrAppModePic16)
+        );
+        assert_eq!(observation.initialized_endpoint_count, Some(3));
+        assert_eq!(observation.chain_id, None);
+        assert_eq!(observation.i2c_bus, None);
+        assert_eq!(observation.i2c_addr, None);
+        assert_eq!(observation.fw_byte, None);
+        assert_eq!(observation.fw_byte_decimal, None);
+        assert!(observation.variants.is_empty());
+        assert!(!observation.voltage_refused_by_default);
     }
 }

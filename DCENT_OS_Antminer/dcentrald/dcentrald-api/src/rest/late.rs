@@ -16371,15 +16371,24 @@ pub(super) async fn post_diag_chiphealth_start(
         Ok(persisted) => persisted,
         Err(response) => return response,
     };
+    let test_id = match state
+        .diagnostic_service
+        .lock()
+        .await
+        .record_persisted_chip_health_snapshot(report.clone())
+    {
+        Ok(test_id) => test_id,
+        Err(error) => return report_storage_error_response(&error),
+    };
     Json(serde_json::json!({
         "status": "completed",
         "measurement_type": "snapshot",
         "test_type": "chip_health",
-        "test_id": report.report_id,
+        "test_id": test_id,
         "message": "Chip-health snapshot generated from current runtime data.",
         "report": report,
         "report_available": true,
-        "report_url": format!("/api/diagnostics/chip-health/report?test_id={}", report.report_id),
+        "report_url": format!("/api/diagnostics/chip-health/report?test_id={}", test_id),
     }))
     .into_response()
 }
@@ -16479,15 +16488,24 @@ pub(super) async fn post_diag_boardhealth_start(
         Ok(persisted) => persisted,
         Err(response) => return response,
     };
+    let test_id = match state
+        .diagnostic_service
+        .lock()
+        .await
+        .record_persisted_board_health_snapshot(report_id, report.clone())
+    {
+        Ok(test_id) => test_id,
+        Err(error) => return report_storage_error_response(&error),
+    };
     Json(serde_json::json!({
         "status": "completed",
         "measurement_type": "snapshot",
         "test_type": "board_health",
-        "test_id": context.report_id,
+        "test_id": test_id,
         "message": "Board-health snapshot generated from current runtime data.",
         "report": report,
         "report_available": true,
-        "report_url": format!("/api/diagnostics/board-health/report?test_id={}", context.report_id),
+        "report_url": format!("/api/diagnostics/board-health/report?test_id={}", test_id),
     }))
     .into_response()
 }
@@ -16872,30 +16890,38 @@ async fn get_diag_fpga_recovery(State(_state): State<Arc<AppState>>) -> impl Int
 /// comm-health signal. (Replaces the prior "not yet wired" stub.)
 pub(super) async fn get_diag_asic_comm(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let miner = state.state_rx.borrow().clone();
-    let chains: Vec<serde_json::Value> = miner
+    let chains: Vec<AsicCommChainSnapshot> = miner
         .chains
         .iter()
-        .map(|c| {
-            serde_json::json!({
-                "chain_id": c.id,
-                "responding_chips": c.chips,
-                "comm_ok": c.chips > 0,
-                "crc_errors": c.errors,
-                "status": c.status,
-            })
+        .map(|chain| AsicCommChainSnapshot {
+            chain_id: chain.id,
+            responding_chips: chain.chips,
+            comm_ok: chain.chips > 0,
+            crc_errors: chain.errors,
+            status: chain.status.clone(),
         })
         .collect();
-    let total_responding: u32 = miner.chains.iter().map(|c| c.chips as u32).sum();
-    let chains_with_comm = miner.chains.iter().filter(|c| c.chips > 0).count();
+    let snapshot = AsicCommSnapshot::from_chains(chains);
+    let test_id = match state
+        .diagnostic_service
+        .lock()
+        .await
+        .publish_asic_comm_snapshot(snapshot.clone())
+    {
+        Ok(test_id) => test_id,
+        Err(error) => return report_storage_error_response(&error),
+    };
 
     Json(serde_json::json!({
-        "schema": "diagnostics.asic_comm v1",
-        "source": "live mining telemetry (state_rx); no live GetAddress broadcast issued",
-        "chain_count": miner.chains.len(),
-        "chains_with_comm": chains_with_comm,
-        "total_responding_chips": total_responding,
-        "chains": chains,
+        "test_id": test_id,
+        "schema": snapshot.schema,
+        "source": snapshot.source,
+        "chain_count": snapshot.chain_count,
+        "chains_with_comm": snapshot.chains_with_comm,
+        "total_responding_chips": snapshot.total_responding_chips,
+        "chains": snapshot.chains,
     }))
+    .into_response()
 }
 
 /// GET /api/diagnostics/troubleshoot/i2c-scan -- Retired scan compatibility surface.
@@ -17096,14 +17122,22 @@ pub(super) async fn get_diag_share_local_rejects(
 /// per-variant wire form, RESET safety flag, voltage-trust flag, and
 /// human-readable label.
 ///
-///  ships the static catalog only. A future wave can extend this
-/// to include the live per-slot firmware byte from
-/// `dcentrald-asic::pic` once the PicService handle is reachable from
-/// `AppState`.
-pub(super) async fn get_hardware_pic_info() -> impl IntoResponse {
-    Json(
-        dcentrald_api_types::pic_firmware::PicFirmwareInfoResponse::catalog_only_without_live_service(),
-    )
+/// If the runtime published a snapshot from its already-completed PIC
+/// initialization, include it. This handler never performs hardware I/O and
+/// never issues RESET, JUMP, voltage, or any other PIC command.
+pub(super) async fn get_hardware_pic_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let response = match state.pic_firmware_snapshot_rx.as_ref() {
+        Some(receiver) => {
+            let observations = receiver.borrow().clone();
+            dcentrald_api_types::pic_firmware::PicFirmwareInfoResponse::from_live_slots(
+                true,
+                observations,
+            )
+        }
+        None => dcentrald_api_types::pic_firmware::PicFirmwareInfoResponse::
+            catalog_only_without_live_service(),
+    };
+    Json(response)
 }
 
 // ───  W4: LuxOS recovery actions catalog (api-types) ─────────────
@@ -17250,8 +17284,8 @@ pub(super) async fn get_diag_recovery_actions() -> impl IntoResponse {
 
 /// GET /api/system/boot_timeline
 ///
-/// Returns the canonical `DCENT_OS_TIMELINE` (per-phase milestone
-/// schedule from `firmware_boot_timeline.rs`) plus the runtime-observed
+/// Returns the static research-reference `DCENT_OS_TIMELINE` plus the
+/// runtime-observed
 /// timestamps for each phase actually reached so far. Operators can see
 /// where their unit got stuck if it never reaches `FirstShareAccepted`.
 ///
@@ -17261,9 +17295,12 @@ pub(super) async fn get_diag_recovery_actions() -> impl IntoResponse {
 pub(super) async fn get_system_boot_timeline(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    use dcentrald_api_types::firmware_boot_timeline::{timeline_of, FirmwareBootFamily};
+    use dcentrald_api_types::firmware_boot_timeline::{
+        capability_of, timeline_of, FirmwareBootFamily,
+    };
 
     let timeline = timeline_of(FirmwareBootFamily::DcentOs);
+    let capability = capability_of(FirmwareBootFamily::DcentOs);
     let canonical: Vec<serde_json::Value> = timeline
         .iter()
         .map(|m| {
@@ -17279,6 +17316,12 @@ pub(super) async fn get_system_boot_timeline(
     Json(serde_json::json!({
         "schema": "dcentrald-api-types::firmware_boot_timeline::DCENT_OS_TIMELINE v1",
         "family": "dcent_os",
+        "reference_evidence_state": capability.evidence_state,
+        "reference_only": true,
+        "live_timing_verified": capability.live_timing_verified,
+        "runtime_deadline_authorized": capability.runtime_deadline_authorized,
+        "recovery_decision_authorized": capability.recovery_decision_authorized,
+        "competitive_claim_authorized": capability.competitive_claim_authorized,
         "canonical": canonical,
         "observed": observed,
     }))

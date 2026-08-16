@@ -1,11 +1,55 @@
-//! BM1489 ASIC driver (Antminer L7 / L9 — Litecoin Scrypt mining) — SCAFFOLD
+//! BM1489 ASIC driver (Antminer **L7 only** — Litecoin Scrypt mining) — SCAFFOLD
 //!
-//! The BM1489 is the Scrypt-mining ASIC used in:
+//! # 2026-08-10 exact-protocol supersession
+//!
+//! Exact Ghidra RE now proves that the held L7 VNish binary maps config literal
+//! `BM1489` to API selector six and recovers its register framing, ticket split,
+//! baud table, and several register addresses. The pure, no-I/O authority is
+//! `dcentrald_common::bm1489_l7_vnish`; see
+//! `BM1489_L7_VNISH_REGISTER_PROTOCOL_RE_20260810.md`. The trait methods and
+//! inferred work/nonce/topology constants below remain a fail-closed scaffold
+//! and must not be read as exact selector-six behavior.
+//!
+//! The BM1489 is believed to be the Scrypt-mining ASIC used in:
 //!   - Antminer L7 (2021): 4 boards × 120 chips, 9.5 GH/s nameplate, 3,425 W
-//!   - Antminer L9 (2024): same AML S11board (byte-identical SHA256
-//!     `bbc25a2137fd…` §1.1)
 //!
-//! Status: SIMULATOR ONLY. **No live L7/L9 unit on bench.**  will fill
+//! # ⚠ SCOPE CORRECTION 2026-08-07 (Round 16 B3) — the L9 is **NOT** BM1489
+//!
+//! This header previously also claimed the **Antminer L9 (2024)**. That is
+//! **falsified by authentic Bitmain bytes.** The L9 stock image
+//! `FR-1.19(260302-L9).bmu` (sha256 `2af05a34…05c3aa827`) ships a *plaintext*
+//! CVCtrl rootfs whose `etc/topol.conf` states:
+//!
+//! ```text
+//! "asic_id":   "BM1491"
+//! "chip_type": "0x1491"
+//! ```
+//!
+//! and whose `etc/cgminer.conf.factory` selects `"algo": "ltc_1491"`. Its miner
+//! binary carries a dedicated `backend/backend_ltc_1491/` source tree. The L9 is
+//! **BM1491**, on a **CVitek CV183x** control board, **3 chains × 110 chips**,
+//! **NoPic** (`"pic_mcu_en": false`) — none of which matches the 4 × 120 AML
+//! geometry below. See `dcentrald_silicon_profiles::scrypt_stock_topology::L9_BSL41601`
+//! and [`crate::drivers::bm1491`]. Round-15 record:
+//!  §7.1.
+//!
+//! Do **not** re-widen this driver to "L7 / L9" — the geometry constants here
+//! would silently mis-describe a BM1491 board. Pinned by
+//! `l9_is_bm1491_and_is_not_this_driver`.
+//!
+//! # ⚠ The BM1489 identity itself is THIRD-PARTY, not Bitmain-sourced
+//!
+//! No **Bitmain** artifact we hold names BM1489. The identity rests entirely on
+//! third-party VNish `libbitmain` strings (see the Chip ID row below), and the
+//! L7's own stock rootfs is **AES-encrypted with no held key**, so it cannot
+//! corroborate. Treat `CHIP_ID = 0x1489` as *unconfirmed by the vendor*.
+//!
+//! This is deliberately **not** grounds to retire the row: BM1491 was in exactly
+//! this state (named only by the same VNish chip-name enum, `0x1491` literal
+//! absent from every decoded binary) until the L9 stock drop confirmed it real.
+//! "Only third-party names it" is therefore not evidence of non-existence.
+//!
+//! Status: SIMULATOR ONLY. **No live L7 unit on bench.** A future wave will fill
 //! the register map + init sequence from a live unit and validate first hash.
 //!
 //! # Differences from BM1387 (S9) / BM1397 (S17)
@@ -18,18 +62,28 @@
 //!   `SCRYPT_ASIC_CHIPS.md:169`, NOT 144-byte multi-midstate SHA-256 work.
 //! - **Cores per chip**: 12 (matches BM1485 — `chip_init.rs:240`)
 //!   `[GAP — wave-8 live verification needed]`
-//! - **Chips per chain (L7/L9)**: 120 chips × 4 chains = 480 chips total
+//! - **Chips per chain (L7)**: 120 chips × 4 chains = 480 chips total
 //!   (`bm1489.rs:83` silicon profile constant `BM1489_CHIPS_PER_CHAIN_L7`).
+//!   NOT the L9 — the L9 is 3 × 110 = 330 BM1491 (`L9_BSL41601`).
 //! - **Default freq**: 425 MHz (L7 nameplate per
 //!   `dcentrald-silicon-profiles/src/bm1489.rs:46`).
 //! - **Default chain voltage**: 13.0 V (L7 nameplate per same file:46).
 //! - **Framing**: BM1387-era raw bytes + CRC5 poly 0x05 ASSUMED for first cut
 //!   (per `SCRYPT_ASIC_CHIPS.md:308` for BM1485; BM1489 protocol unconfirmed)
 //!   `[GAP — wave-8 live verification needed]`
-//! - **Platform**: AML S11board (Amlogic AXG/A113D) — same control board as
-//!   S19j Pro / S21 ( §1.1
-//!   byte-identity finding). 1:1 GPIO reuse: `pwr_en=437`,
-//!   `ch{0,1,2}_plug={439-441}`, `ch{0,1,2}_rst={454-456}`.
+//! - **Platform**: ⚠ **DISPUTED — was "AML S11board (Amlogic AXG/A113D)"; that
+//!   is falsified for the L7.** The authentic L7 stock image
+//!   `Antminer-L7-release-202301300939.bmu` boots a **Zynq-7000**: its
+//!   `BOOT.bin` carries the Xilinx boot-ROM magic `0x665599AA` / `XNLX`, and its
+//!   plaintext `devicetree.dtb` declares `arm,cortex-a9`,
+//!   `arm,pl353-nand-r2p1` and `cdns,uart-r1p8` under
+//!   `Linux-4.6.0-xilinx-g03c746f7`. The third-party VNish L7 build is
+//!   correspondingly named `l7-1.2.7-**xil**` (Xilinx), not `-aml`.
+//!   The old Amlogic GPIO reuse claim (`pwr_en=437`,
+//!   `ch{0,1,2}_plug={439-441}`, `ch{0,1,2}_rst={454-456}`) is therefore
+//!   **not applicable to the L7** and must not be used to energize anything.
+//!   `[GAP — the L7 rootfs is AES-encrypted with no held key, so its GPIO map
+//!   is genuinely unknown.]`
 //! - **Voltage controller**: TBD — likely NoPic (TAS5782M) like S21, but
 //!   could be dsPIC. `[GAP — wave-8 live verification needed]`
 //!
@@ -37,7 +91,7 @@
 //!
 //! | Aspect              | Status                       |
 //! |---------------------|------------------------------|
-//! | Chip ID             | 0x1489 (confirmed via VNish libbitmain `aml/chip.c`) |
+//! | Chip ID             | 0x1489 — **THIRD-PARTY ONLY** (VNish libbitmain `aml/chip.c`); no Bitmain artifact names BM1489 |
 //! | Register addresses  | `[GAP]` — placeholders mirror BM1397+ pattern |
 //! | Init sequence       | `[GAP]` — stubbed, returns Err on live call |
 //! | Work packet shape   | `[GAP]` — 76-byte assumption, send_work stubbed |
@@ -53,11 +107,18 @@
 //!   (BM1373 = S23, ALL values projected, similar `[GAP]` discipline).
 //! - Silicon profile (5-row baked): `dcentrald-silicon-profiles/src/bm1489.rs`
 //!   — operator-confirmed L7 nameplate (9.5 GH/s @ 3,425 W).
-//! - L9 = BM1489: :199-200`
-//!   (libbitmain `aml/chip.c` BM1489).
+//! - ⚠ **REFUTED** — "L9 = BM1489" from :199-200`
+//!   (libbitmain `aml/chip.c` BM1489). That inference does not survive scrutiny:
+//!   the BM1489 strings sit in the **shared** `libbitmain` blob, which both the
+//!   `l7-1.2.7-xil` and `l9-1.2.7-aml` VNish builds link, at near-identical
+//!   string offsets (26362 vs 26339). A shared library's string table present in
+//!   two products is not per-product silicon evidence. Bitmain's own L9
+//!   `topol.conf` says `BM1491`.
 //! - L7 chips/chain × chain count: `bm1489.rs:83-86` — 120 × 4 = 480.
-//! - AML S11board byte-identity:
-//!   §1.1 (`bbc25a2137fd…`).
+//! - ⚠ **NOT APPLICABLE** — AML S11board byte-identity
+//!   ( §1.1, `bbc25a2137fd…`):
+//!   the L7 is Zynq-7000 and the L9 is CVitek CV183x; neither is the AML
+//!   S11board.
 //! - PLL register pattern:  (W6
 //!   inheritance from BM1397+).
 //! -  plan: `plans/wave4-scrypt-l9-spike.md` Phase 1.A-1.B.
@@ -72,32 +133,28 @@ use dcentrald_hal::fpga_chain::{self, FpgaChain};
 /// :199-200`).
 pub const CHIP_ID: u16 = 0x1489;
 
-/// L7/L9 default chips per chain.
+/// **L7-only** default chips per chain.
 ///
 /// L7 nameplate = 4 boards × 120 chips = 480 chips total (per
 /// `dcentrald-silicon-profiles/src/bm1489.rs:83` constant
-/// `BM1489_CHIPS_PER_CHAIN_L7`). L9 inherits the same AML S11board so chip
-/// count is identical.
+/// `BM1489_CHIPS_PER_CHAIN_L7`).
+///
+/// ⚠ The previous "L9 inherits the same AML S11board so chip count is
+/// identical" rationale is **falsified**: the L9 is 3 chains × 110 BM1491 on
+/// CVitek CV183x (`L9_BSL41601`), not 4 × 120 on an AML S11board.
 pub const DEFAULT_CHIPS_PER_CHAIN: u8 = 120;
 
-/// L7/L9 default chain count (= 4, NOT the typical 3 of S9/S17/S19).
+/// **L7-only** default chain count (= 4, NOT the typical 3 of S9/S17/S19).
 ///
 /// Per silicon profile `BM1489_CHAIN_COUNT_L7` (`bm1489.rs:86`).
+/// The L9 has **3** chains — see [`DEFAULT_CHIPS_PER_CHAIN`].
 pub const DEFAULT_CHAIN_COUNT: u8 = 4;
 
-/// BM1489 response size on the wire = 7 bytes.
+/// Scaffold-only nonce-response size guess inherited from BM1485.
 ///
-/// ** W8-C:** Confirmed via inheritance from BM1485 lineage (per
-///  §4).
-/// BM1485 nonce response is 7 bytes per `mining-bible-v1/3-asic-protocol/bm1485.md`
-/// §12 (header + 4-byte nonce + chip_addr + CRC5). BM1489 uses BM1485 framing
-/// (NOT BM1397+ unified 9-byte) because:
-/// 1. L7 cgminer string `chip#%d from nonce` (l7-1.2.7-xil:26530) matches
-///    BM1485 nonce-response format.
-/// 2. `0x55 0xAA` preamble strings ABSENT from L7 binary (would be present if
-///    BM1397+ unified framing).
-/// 3. libbitmain source path `src/chip/chip.c` — Scrypt driver, not BM139X
-///    SHA-256 family driver.
+/// Exact selector-six register-command framing does not establish the nonce
+/// response ABI. This value remains non-authoritative until the L7 nonce path
+/// is recovered or captured.
 pub const RESPONSE_BYTES: usize = 7;
 
 /// Number of Scrypt cores per BM1489 chip
@@ -112,9 +169,8 @@ const NUM_CORES_ON_CHIP: u32 = 12;
 /// Scrypt work packet size in bytes
 /// `[GAP — wave-8 live verification needed]`.
 ///
-/// Per `SCRYPT_ASIC_CHIPS.md:169`: 76 bytes (block-header-minus-version).
-/// ASIC computes Scrypt internally with on-chip 128 KB scratchpad; host
-/// never allocates scratchpad RAM.
+/// The old 76-byte inheritance guess is retained only for scaffold trait
+/// shape. The exact L7 work producer/consumer remains unrecovered.
 pub const SCRYPT_WORK_BYTES: usize = 76;
 
 /// BM1489 register addresses.
@@ -152,6 +208,12 @@ pub const SCRYPT_WORK_BYTES: usize = 76;
 /// hardware confirms. The simulator path enforces this — `init_chain` returns
 /// an error rather than writing these.
 pub mod regs {
+    //! Deprecated scaffold metadata only.
+    //!
+    //! The exact selector-six map is in
+    //! `dcentrald_common::bm1489_l7_vnish`. The string-derived `0xFF`
+    //! constants below are tombstones: Ghidra showed that those names belong
+    //! to other compiled ASIC families, not proven BM1489 selector-six slots.
     /// Chip address register (contains ChipID in bits 31:16). BM1485
     /// `CHIP_ADDR` at same offset; standard across Bitmain ASICs.
     /// (Cite: cgminer-ltc driver-btm-L3.h; SCRYPT_ASIC_CHIPS.md §7.1)
@@ -182,16 +244,11 @@ pub mod regs {
 
     /// BM1489_PENDING_W27_DOC:
     ///
-    /// W27 intentionally does not assign real addresses to the eight
-    /// BM1489-only register names recovered by earlier string mining.
-    /// They remain pending an operator Ghidra pass against the L7/L9
-    /// libbitmain binary. The `REG_W27_UNKNOWN_*` values below are
-    /// deprecated `0xFF` sentinels so any future caller has to confront
-    /// the unresolved address instead of accidentally treating `0x00`
-    /// as a real register. Do not replace these with guessed BM1397,
-    /// BM136x, or BM1485 offsets.
+    /// The old string-only classification is superseded: exact selector-six
+    /// Ghidra RE proved these names were cross-family contamination. The
+    /// `0xFF` values remain only so old callers fail visibly.
     pub const BM1489_PENDING_W27_DOC: &str =
-        "BM1489 W27 register addresses pending operator Ghidra session";
+        "superseded cross-family string placeholders; never use as addresses";
 
     #[deprecated(note = "W27 placeholder; see master plan")]
     pub const REG_W27_UNKNOWN_1: u8 = 0xFF; // pending Ghidra W27
@@ -283,8 +340,10 @@ const FB_DIV_MAX: u16 = 200;
 /// Default Scrypt mining frequency for L7 nameplate (425 MHz).
 ///
 /// Per silicon profile `dcentrald-silicon-profiles/src/bm1489.rs:46`
-/// (Step 0 = OperatorConfirmed L7 nameplate). L9 likely identical given
-/// shared AML S11board.
+/// (Step 0 = OperatorConfirmed L7 nameplate). ⚠ The former "L9 likely identical
+/// given shared AML S11board" extrapolation is **withdrawn** — the L9 is a
+/// different chip on a different carrier and its stock
+/// `cgminer.conf.factory` states **1225 MHz**, not 425.
 pub const L7_NAMEPLATE_FREQ_MHZ: u16 = 425;
 
 /// Default Scrypt chain voltage for L7 nameplate (13,000 mV = 13.0 V).
@@ -466,15 +525,18 @@ impl ChipDriver for Bm1489Driver {
 
     fn set_voltage(&self, _pic: &mut PicController, voltage_mv: u16) -> Result<()> {
         // BM1489 voltage path is TBD. AML S11board is shared with S21
-        // (NoPic / TAS5782M DAC) per BIBLE byte-identity finding, so
-        // L9 likely follows the NoPic model. L7 control board may use
-        // a different DC-DC topology.
-        // [GAP — wave-8: verify L7/L9 voltage controller identity by
-        // probing /dev/i2c-0 + checking DT for tas5782 vs dspic]
+        // ⚠ The old "L9 likely follows the NoPic model, so the L7 probably does
+        // too" chain is withdrawn — it reasoned about the L7 from a board that
+        // is not the L7's. (The L9 *is* NoPic — `"pic_mcu_en": false` in its
+        // stock topol.conf, PMICs isl68127/mps2973 — but the L9 is BM1491 on
+        // CV183x, so that tells us nothing about the Zynq-based L7.)
+        // The L7's voltage-controller identity is GENUINELY UNKNOWN: its stock
+        // rootfs is AES-encrypted with no held key.
+        // [GAP — needs a live L7, or an L7 factory jig binary.]
         tracing::warn!(
             voltage_mv = voltage_mv,
-            "BM1489 set_voltage: SCAFFOLD — voltage path TBD (likely NoPic \
-             on AML S11board, but unconfirmed). [GAP — wave-8]"
+            "BM1489 set_voltage: SCAFFOLD — L7 voltage-controller identity is \
+             unknown (stock rootfs encrypted). [GAP — needs a live L7]"
         );
         Ok(()) // No-op for PIC path (matches BM1373/S21 NoPic pattern).
     }
@@ -622,16 +684,73 @@ mod tests {
 
     #[test]
     fn default_chips_per_chain_is_120() {
-        // L7/L9 share AML S11board (
-        // §1.1 byte-identity); 120 chips × 4 chains = 480 total per
-        // dcentrald-silicon-profiles/src/bm1489.rs:83.
+        // L7 ONLY: 120 chips × 4 chains = 480 total per
+        // dcentrald-silicon-profiles/src/bm1489.rs:83. (The former
+        // "L7/L9 share AML S11board" justification is falsified — see the
+        // module header scope correction.)
         assert_eq!(DEFAULT_CHIPS_PER_CHAIN, 120);
     }
 
     #[test]
     fn default_chain_count_is_4() {
-        // L7/L9 use 4 chains, NOT the 3 typical of S9/S17/S19.
+        // L7 uses 4 chains, NOT the 3 typical of S9/S17/S19 — and NOT the
+        // L9's 3 (the L9 is BM1491, not this driver).
         assert_eq!(DEFAULT_CHAIN_COUNT, 4);
+    }
+
+    /// **Round 16 B3 — the L9 is BM1491 and this driver must never claim it.**
+    ///
+    /// Authentic Bitmain bytes (`FR-1.19(260302-L9).bmu` →
+    /// `00_Antminer_L9_CVCtrl_L9` → `BOOT.bin` → `etc/topol.conf`) state
+    /// `"asic_id": "BM1491"` / `"chip_type": "0x1491"`, 3 chains × 110 chips,
+    /// `"pic_mcu_en": false`, `"processor": {"type": "CV183x"}`.
+    ///
+    /// This test is the anti-regression pin for the Round-15 finding that the
+    /// falsified "BM1489 = L7 **/ L9**" identity was corrected in only one of
+    /// four sites. If someone re-widens this driver to the L9, or aligns its
+    /// CHIP_ID with the L9's real `0x1491`, this fails.
+    #[test]
+    fn l9_is_bm1491_and_is_not_this_driver() {
+        // The L9's real chip id, from its own stock topol.conf.
+        const L9_REAL_CHIP_ID: u16 = 0x1491;
+        assert_ne!(
+            CHIP_ID, L9_REAL_CHIP_ID,
+            "BM1489 must stay distinct from the L9's real BM1491 identity"
+        );
+        // This driver's geometry is the L7's, and must not be mutated into the
+        // L9's 3 × 110.
+        assert_eq!(DEFAULT_CHAIN_COUNT, 4, "L7 geometry, not the L9's 3 chains");
+        assert_eq!(
+            DEFAULT_CHIPS_PER_CHAIN, 120,
+            "L7 geometry, not the L9's 110 chips/chain"
+        );
+        // The L9 lives in its own driver.
+        assert_eq!(crate::drivers::bm1491::CHIP_ID, L9_REAL_CHIP_ID);
+    }
+
+    /// **Round 16 B3 — BM1489's identity is third-party, and that is recorded.**
+    ///
+    /// No Bitmain artifact we hold names BM1489; the identity comes from VNish
+    /// `libbitmain` only. That is a *confidence* statement, not grounds to
+    /// retire the row — BM1491 sat in exactly this state until the L9 stock
+    /// drop confirmed it. This test pins that the driver keeps declaring the
+    /// third-party provenance in its own source, so a future reader cannot
+    /// mistake `0x1489` for a vendor-confirmed value.
+    #[test]
+    fn bm1489_identity_is_declared_third_party_not_bitmain_confirmed() {
+        let header = include_str!("bm1489.rs");
+        // Split the literals so this contract cannot self-satisfy via its own
+        // source text appearing in the include_str! haystack.
+        let third = concat!("THIRD-PARTY", " ONLY");
+        assert!(
+            header.contains(third),
+            "bm1489.rs must keep declaring that 0x1489 is third-party-only"
+        );
+        let no_bitmain = concat!("artifact we hold", " names BM1489");
+        assert!(
+            header.contains(no_bitmain),
+            "bm1489.rs must keep recording that no Bitmain artifact names BM1489"
+        );
     }
 
     #[test]
@@ -643,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn response_length_is_seven_bytes_placeholder() {
+    fn response_length_is_explicitly_scaffold_only() {
         let driver = Bm1489Driver::new();
         // Placeholder mirrors BM1485 / BM1387-era raw framing
         // (7 bytes). BM1489 may have moved to BM1397+ 9-byte format;
@@ -692,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_mask_difficulty_256_returns_255() {
+    fn scaffold_ticket_mask_placeholder_is_not_exact_selector_six() {
         let driver = Bm1489Driver::new();
         assert_eq!(driver.ticket_mask(256), 255);
     }
@@ -771,7 +890,7 @@ mod tests {
     /// not imported by any consumer): the test now imports the module so
     /// the constants are reachable, eliminating the decoration-only state.
     #[test]
-    fn bm1489_regs_pin_w8c_inheritance_and_gap_addresses() {
+    fn bm1489_scaffold_regs_keep_disproved_string_addresses_unusable() {
         // ---- W8-C: BM1485-inheritance addresses (HIGH / MEDIUM-HIGH) ----
         // Cite:  §4
         assert_eq!(regs::CHIP_ADDRESS, 0x00);
@@ -781,11 +900,8 @@ mod tests {
         assert_eq!(regs::MISC_CONTROL, 0x18);
         assert_eq!(regs::CORE_REG_CTRL, 0x3C);
 
-        // ---- W8-C/W27: 8 NEW BM1489 register names - addresses [GAP] ----
-        // When W27 Ghidra fills any of these, this test must be updated
-        // alongside the cite-doc. DO NOT silently flip a 0xFF to a real
-        // address without also updating REGISTER_MAP_DELTA.md and the
-        // module-level docstring at bm1489.rs:154-229.
+        // These names came from other compiled ASIC families. Keep the old
+        // symbols unusable; exact selector-six constants live in common.
         assert_eq!(regs::ORDERED_CLOCK_EN, 0xFF);
         assert_eq!(regs::IO_DRIVE_STRENGTH, 0xFF);
         assert_eq!(regs::PLL1_PARAMETER, 0xFF);

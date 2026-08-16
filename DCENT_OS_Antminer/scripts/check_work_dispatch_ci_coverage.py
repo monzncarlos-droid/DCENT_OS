@@ -111,6 +111,11 @@ SERIAL_MUST_WIRE_UNDER_TESTS = (
     "serial_actor_mints_commit_evidence_only_after_successful_tx",
     "serial_address_ladder_is_unchanged_for_shipped_populations_and_safe_at_one_chip",
     "serial_share_fixture_keeps_target_and_achieved_difficulty_separate",
+    # S19k Track-1 2026-08-15/16: industrial PLL policy + Braiins passthrough.
+    "industrial_serial_pll_policy_is_exact_route_bound_and_fail_closed",
+    "industrial_serial_pll_searches_enforce_vendor_vco_envelope",
+    "s19k_braiins_bm1366_passthrough_opens_both_ttys",
+    "s19k_braiins_bm1366_passthrough_uses_closed_21_36_builder",
 )
 
 EXACT_PREFIX = "sh ../scripts/run_exact_cargo_test.sh "

@@ -26,7 +26,7 @@ pub enum ProcessNode {
     /// below (the chip→node DATA map is already correct; this doc previously
     /// mis-listed those SKUs here as a BM1387-template copy-paste).
     Nm16,
-    /// 7 nm — BM1391 (S11/S15/T15) / BM1393 / BM1396 / BM1397
+    /// 7 nm — BM1391 (S15/T15; S11 unresolved) / BM1393 / BM1396 / BM1397
     /// (S17/T17) / BM1398 (S19/S19 Pro/T19).
     Nm7,
     /// 5 nm — BM1362 / BM1366 / BM1368.
@@ -70,6 +70,7 @@ pub enum WireInterface {
 /// Notes:
 /// - **HwCrc**: BM1387's hardware-computed CRC inside the chip's UART
 ///   controller — host firmware doesn't compute it explicitly.
+/// - **Crc5**: host-command polynomial `0x05`, initial state `0x1f`, MSB first.
 /// - **Crc8** (no specified poly): legacy BM139x catalog rows that don't
 ///   pin a polynomial in RE2; left as `Crc8` here pending live capture.
 /// - **Crc8Poly31**: BM1362 + BM1368 share `0x31` per RE2 §4.1 line 394
@@ -78,6 +79,7 @@ pub enum WireInterface {
 #[serde(rename_all = "snake_case")]
 pub enum CrcAlgorithm {
     HwCrc,
+    Crc5,
     Crc8,
     Crc8Poly31,
 }
@@ -149,22 +151,23 @@ pub struct AsicCatalogEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AsicChip {
-    /// BM1387 — S9 / S9i / S9 SE / T9 / T9+ / S11 / S15 / S17 / T17.
+    /// BM1387 — S9 / S9i / T9 / T9+. S9 SE is BM1393 (Ctrl_C43), not this row.
     /// 16 nm, 32 cores, custom 3-wire / UART, hardware CRC.
     Bm1387,
     /// BM1387_54 — S11 voltage-table variant. Same silicon family as
     /// BM1387 but the S11 levels.json table assigns 54 active cores
     /// instead of 32 (silicon-binning aggressively at the high end).
     Bm1387_54,
-    /// BM1391 — T15 / S11 (7 nm).
+    /// BM1391 — S15 / T15 (7 nm); exact S11 stock evidence is unresolved.
     Bm1391,
-    /// BM1393 — S9k (7 nm). Dual-arch S9k pairs Zynq with a BM1880
-    /// RISC-V coprocessor; from the chip's perspective it's still a
-    /// standard BM139x family member.
+    /// BM1393 — S9k and S9 SE (7 nm). S9 SE is Ctrl_C43 / XC7Z007S,
+    /// 3×60 chips, stock FPGA + CRC5 VIL (GitHub DCENT_OS#2 + 2026-08-15
+    /// firmware RE). Dual-arch S9k pairs Zynq with a BM1880 RISC-V
+    /// coprocessor; from the chip's perspective it's still BM139x.
     Bm1393,
-    /// BM1396 — S17+ / T17+ (7 nm).
+    /// BM1396 — S17e / T17e (7 nm; exact signed wire identity and command CRC5).
     Bm1396,
-    /// BM1397 — S17 / T17 / S17e / T17e (7 nm).
+    /// BM1397 — S17 / S17 Pro / S17+ / T17 / T17+ (7 nm).
     Bm1397,
     /// BM1398 — S19 / S19 Pro / S19+ / T19-class (7 nm).
     /// Logical ASIC work IDs remain 8-bit; some FPGA carriers extend the echo
@@ -212,7 +215,7 @@ impl AsicChip {
                 // BM1387 ships in the S9/T9 family ONLY (this file's Nm16 doc +
                 // the 2026-07-02 correction). NOT S11 (BM1391), S15, S17 (BM1397,
                 // per the BhbS17 hashboards.rs fix), or T17.
-                used_in: &["S9", "S9i", "S9 SE", "T9", "T9+"],
+                used_in: &["S9", "S9i", "T9", "T9+"],
             },
             AsicChip::Bm1387_54 => AsicCatalogEntry {
                 name: "BM1387_54",
@@ -242,16 +245,19 @@ impl AsicChip {
                 // `cores` HELD at 0 (unknown until a live S11). A12 (goldmine
                 // 2026-06-10): the two RE sources DISAGREE on BM1391 geometry,
                 // so neither populates `cores`:
-                //   - BINARY (HashSource S11 single-board-test jig,
-                //     findings/s1-bm1391-s11.md F08/F10/F42): 84 chips/chain /
-                //     114 cores / 930 mV init, BM1387-byte-identical FIL chain
-                //     with NO out-of-band model-ID (byte-exact CONFIRMS PR-054).
-                //   - AMTC ("BM1390" Config.ini): 60-ASIC / 128-core / 1060 mV.
-                // Unresolved until a live S11 unit; do not populate `cores` from
-                // either source yet. See findings/s1-bm1391-s11.md +
-                //
-                cores: 0,
-                used_in: &["T15", "S11"],
+                //   - BINARY (HashSource S11 single-board-test jig): "114 cores"
+                //     — but that jig is BM1387-lineage (it self-IDs as S9+); 114
+                //     is BM1387's count, not BM1391's.
+                //   - AMTC ("BM1390" Config.ini): "128 core" — that config's own
+                //     `AsicType` is 1390, so 128 is a BM1390 fact.
+                // BOTH were mis-attributions (2026-08-06, hardware-enablement
+                // Round 12 / 16). The real BM1391 core count is **256**, byte-
+                // stated by Bitmain's S17 jig `single_BM1391_calculate_timeout_
+                // and_baud` (`calculate_core_number(256u)`), cross-anchored by
+                // BM1385=50 and BM1397=672 in the SAME binary. Canonical:
+                // `bm1391::BM1391_CORE_NUM`; a test pins this catalog row to it.
+                cores: 256,
+                used_in: &["S15", "T15"],
             },
             AsicChip::Bm1393 => AsicCatalogEntry {
                 name: "BM1393",
@@ -259,11 +265,32 @@ impl AsicChip {
                 interface: WireInterface::Uart,
                 baud_min: 115_200,
                 baud_max: 937_500,
-                crc: CrcAlgorithm::Crc8,
+                crc: CrcAlgorithm::Crc5,
                 work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
-                cores: 0,
-                used_in: &["S9k"],
+                // 208 cores — CORRECTED from 52 in Round 17 (B1). The old `52`
+                // was an under-read of the S9k jig `open_core_bm1393` outer loop
+                // bound. Re-reading the held S9k cgminer
+                // (`bitmain-antminer-binaries/S9k/cgminer.dec/open_core_bm1393@21C12`)
+                // at source, the loop enables `core_index = 52 * slot + core_id`
+                // for `core_id 0..=51` (52) × `slot 0..=3` (4) = **208 distinct
+                // core indices (0..207)** per chip, each individually
+                // clock-enabled via `enable_core_clock_BM1393(52*slot+core_id,…)`
+                // and packed into a single wire byte. 52 is the per-bank bound,
+                // not the total. Triple-sourced:
+                //   1. Wire: the register-0 write in BOTH S9k binaries encodes
+                //      `[CHIP_ID=0x1393, CORE_NUM=0xD0=208, ADDR]` (see
+                //      `bm1390.rs` §"0xD0 = 208", the `0x00D0_9313` word).
+                //   2. Loop: `open_core_bm1393` = exactly 208 core-clock enables.
+                //   3. Bitmain first-party maintenance guide (S9K/S9SE, p.1):
+                //      "There are 208 cores on a single BM1393 chip"
+                //      (
+                //      s9__S9k_S9SE_Maintenance_Guide.txt` line 32).
+                // Metadata/identity-only: there is no BM1393 `MinerProfile`, so
+                // this feeds neither the rank-3 ghs↔nonce_attribution_cores gate
+                // nor the autotuner.
+                cores: 208,
+                used_in: &["S9k", "S9 SE"],
             },
             AsicChip::Bm1396 => AsicCatalogEntry {
                 name: "BM1396",
@@ -271,11 +298,14 @@ impl AsicChip {
                 interface: WireInterface::Uart,
                 baud_min: 115_200,
                 baud_max: 937_500,
-                crc: CrcAlgorithm::Crc8,
+                crc: CrcAlgorithm::Crc5,
                 work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
+                // Per-chip core count remains unproved. Exact signed binaries
+                // settle wire identity, command CRC5, and model chain counts,
+                // not core topology.
                 cores: 0,
-                used_in: &["S17+", "T17+"],
+                used_in: &["S17e", "T17e"],
             },
             AsicChip::Bm1397 => AsicCatalogEntry {
                 name: "BM1397",
@@ -288,8 +318,11 @@ impl AsicChip {
                 crc: CrcAlgorithm::Crc8,
                 work_id_width: WorkIdWidth::Bits8,
                 nonce_bits: 32,
-                cores: 0,
-                used_in: &["S17", "T17", "S17e", "T17e"],
+                // 672 cores — canonical `bm1397::BM1397_CORES_PER_CHIP`, matched
+                // by the S17 jig `single_BM1397(672)` and root  host
+                // metadata ("BM1397/BM1398 = 672 cores"). Was a 0 placeholder.
+                cores: 672,
+                used_in: &["S17", "S17 Pro", "S17+", "T17", "T17+"],
             },
             AsicChip::Bm1398 => AsicCatalogEntry {
                 name: "BM1398",
@@ -492,6 +525,51 @@ mod tests {
         assert_eq!(ALL_CHIPS.len(), 11);
     }
 
+    /// Jig-derived core counts filled 2026-08-06 (hardware-enablement Round 23),
+    /// and pinned against their evidence so a placeholder can't creep back and a
+    /// dedicated-module constant can't silently diverge from the catalog.
+    ///
+    /// - BM1393 = 52: S9k jig `open_core_bm1393` loop `core_id <= 51`.
+    /// - BM1391 = 256: S17 jig, canonical `crate::bm1391::BM1391_CORE_NUM`.
+    /// - BM1397 = 672: S17 jig, canonical `crate::bm1397::BM1397_CORES_PER_CHIP`.
+    #[test]
+    fn jig_derived_core_counts_match_their_evidence() {
+        // BM1393 = 208 cores/chip (Round 17 B1 correction). 52 is the per-bank
+        // outer-loop bound in `open_core_bm1393`; the loop enables
+        // `52 * slot + core_id` for slot 0..=3, i.e. 52 × 4 = 208 distinct
+        // cores. Triple-sourced: the `CORE_NUM=0xD0=208` register-0 wire byte,
+        // the 208 core-clock enables, and the S9K/S9SE maintenance guide p.1
+        // ("208 cores on a single BM1393 chip"). Pin BOTH facts as distinct so
+        // neither the total nor the per-bank bound can be silently reconciled.
+        const BM1393_PER_BANK_OPEN_CORE_LOOP: u16 = 52;
+        const BM1393_CORES_PER_CHIP: u16 = 208;
+        assert_eq!(BM1393_PER_BANK_OPEN_CORE_LOOP * 4, BM1393_CORES_PER_CHIP);
+        assert_eq!(
+            AsicChip::Bm1393.catalog().cores,
+            BM1393_CORES_PER_CHIP,
+            "S9k 208 cores = 4 banks × 52 (open_core_bm1393 + 0xD0 wire byte + maintenance guide)"
+        );
+
+        // Catalog must agree with the dedicated modules that carry the RE
+        // provenance — if either side is edited alone, this fails.
+        assert_eq!(
+            u32::from(AsicChip::Bm1391.catalog().cores),
+            crate::bm1391::BM1391_CORE_NUM,
+            "BM1391 catalog vs bm1391::BM1391_CORE_NUM"
+        );
+        assert_eq!(
+            u32::from(AsicChip::Bm1397.catalog().cores),
+            crate::bm1397::BM1397_CORES_PER_CHIP,
+            "BM1397 catalog vs bm1397::BM1397_CORES_PER_CHIP"
+        );
+
+        // None of the three is still a placeholder, and the two mis-attributed
+        // BM1391 candidates (114=BM1387, 128=BM1390) must never reappear here.
+        assert_ne!(AsicChip::Bm1391.catalog().cores, 0);
+        assert_ne!(AsicChip::Bm1391.catalog().cores, 114);
+        assert_ne!(AsicChip::Bm1391.catalog().cores, 128);
+    }
+
     #[test]
     fn each_chip_has_unique_name() {
         let mut seen = std::collections::HashSet::new();
@@ -564,6 +642,21 @@ mod tests {
         // polynomial 0x31.
         assert_eq!(AsicChip::Bm1362.catalog().crc, CrcAlgorithm::Crc8Poly31);
         assert_eq!(AsicChip::Bm1368.catalog().crc, CrcAlgorithm::Crc8Poly31);
+    }
+
+    #[test]
+    fn bm1396_uses_exact_signed_command_crc5() {
+        assert_eq!(AsicChip::Bm1396.catalog().crc, CrcAlgorithm::Crc5);
+    }
+
+    #[test]
+    fn bm1393_uses_command_crc5_not_crc8() {
+        // 2026-08-15: S9 SE cgminer_1393 + S9k CRC5(buf, 27/32/64).
+        // S9 SE is not a BM1387 CRC surface (GitHub DCENT_OS#2).
+        assert_eq!(AsicChip::Bm1393.catalog().crc, CrcAlgorithm::Crc5);
+        assert!(AsicChip::Bm1393.catalog().used_in.contains(&"S9 SE"));
+        assert!(AsicChip::Bm1393.catalog().used_in.contains(&"S9k"));
+        assert!(!AsicChip::Bm1387.catalog().used_in.contains(&"S9 SE"));
     }
 
     #[test]

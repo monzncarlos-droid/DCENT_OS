@@ -17,6 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PAYLOAD_EXTRACTOR="$SCRIPT_DIR/safe_extract_am3_bb_payload.py"
 # shellcheck source=lib/sd_common.sh
 . "$SCRIPT_DIR/lib/sd_common.sh"
 # shellcheck source=lib/am3_bb_dtb_contract.sh
@@ -231,9 +232,23 @@ if [ -n "$PAYLOAD_TAR" ]; then
     }
     PAYLOAD_TMP="$(mktemp -d)"
     CLEANUP_PATHS+=("$PAYLOAD_TMP")
-    tar -xf "$PAYLOAD_TAR" -C "$PAYLOAD_TMP"
-    ROOTFS_CPIO="$(find "$PAYLOAD_TMP" -type f -name uramdisk.image.gz | head -1)"
-    RAMDISK_UIMAGE_SRC="$(find "$PAYLOAD_TMP" -type f -name ramdisk.gz | head -1)"
+    if command -v python3 >/dev/null 2>&1; then
+        PAYLOAD_PYTHON=python3
+    elif command -v python >/dev/null 2>&1; then
+        PAYLOAD_PYTHON=python
+    else
+        echo "ERROR: python3/python is required for exact AM3-BB payload admission" >&2
+        exit 1
+    fi
+    [ -f "$PAYLOAD_EXTRACTOR" ] || {
+        echo "ERROR: exact payload extractor missing: $PAYLOAD_EXTRACTOR" >&2
+        exit 1
+    }
+    "$PAYLOAD_PYTHON" "$PAYLOAD_EXTRACTOR" \
+        --expected-target am3-bb-s19jpro \
+        "$PAYLOAD_TAR" "$PAYLOAD_TMP"
+    ROOTFS_CPIO="$PAYLOAD_TMP/dcentos-am3-bb-s19jpro-sdcard/uramdisk.image.gz"
+    RAMDISK_UIMAGE_SRC="$PAYLOAD_TMP/dcentos-am3-bb-s19jpro-sdcard/ramdisk.gz"
 elif [ -n "$PAYLOAD_DIR" ]; then
     for candidate in \
         "$PAYLOAD_DIR/uramdisk.image.gz" \

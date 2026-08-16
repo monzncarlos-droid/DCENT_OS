@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# DCENTos post-image script - am3-s21 (S21 Amlogic NoPic variant)
+# DCENTos post-image script - capability-first Amlogic A113D package builder.
 #
 # Produces dcentos-sysupgrade-am3-s21.tar with sysupgrade-am3-s21/.
 #
@@ -8,18 +8,50 @@
 set -e
 
 BINARIES_DIR="${BINARIES_DIR:-${BASE_DIR}/images}"
-BOARD_NAME="am3-s21"
+BOARD_NAME=$(sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' \
+    "${TARGET_DIR}/etc/dcentos/board_target" 2>/dev/null || true)
+case "$BOARD_NAME" in
+    am3-s21)
+        PRODUCT_LABEL="S21"
+        PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_POSTURE="lab-gated host rootfs-window target"
+        INSTALL_DETAIL="Lab-gated host installation requires restore-verified evidence."
+        ;;
+    am3-s19xp)
+        PRODUCT_LABEL="S19 XP"
+        PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
+        INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        ;;
+    am3-s19jxp)
+        PRODUCT_LABEL="S19j XP"
+        PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
+        INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        ;;
+    am3-s19jproplus)
+        PRODUCT_LABEL="S19j Pro+"
+        PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
+        INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        ;;
+    *)
+        echo "ERROR: unadmitted or missing A113D board_target: ${BOARD_NAME:-<missing>}" >&2
+        exit 1
+        ;;
+esac
 BOARD_FAMILY="am3"
-OUTPUT_TAR="${BINARIES_DIR}/dcentos-sysupgrade-am3-s21.tar"
+OUTPUT_BASENAME="dcentos-sysupgrade-${BOARD_NAME}.tar"
+OUTPUT_TAR="${BINARIES_DIR}/${OUTPUT_BASENAME}"
 
-echo "=== DCENTos Post-Image Builder (am3-s21) ==="
+echo "=== DCENTos Post-Image Builder (${BOARD_NAME}) ==="
 echo ""
 
 ROOTFS_CPIO="${BINARIES_DIR}/rootfs.cpio.gz"
 if [ ! -f "$ROOTFS_CPIO" ]; then
     echo "ERROR: rootfs.cpio.gz not found in ${BINARIES_DIR}" >&2
     echo "  Enable BR2_TARGET_ROOTFS_CPIO=y + BR2_TARGET_ROOTFS_CPIO_GZIP=y" >&2
-    echo "  in the am3-s21 defconfig." >&2
+    echo "  in the ${BOARD_NAME} defconfig." >&2
     exit 1
 fi
 
@@ -81,7 +113,7 @@ ROOTFS_UIMAGE="${BINARIES_DIR}/uImage_rootfs.bin"
     -O linux \
     -T ramdisk \
     -C gzip \
-    -n "DCENT_OS S21 rootfs" \
+    -n "DCENT_OS ${PRODUCT_LABEL} rootfs" \
     -d "$ROOTFS_CPIO" \
     "$ROOTFS_UIMAGE"
 
@@ -119,7 +151,7 @@ infer_package_version() {
 
     for candidate in \
         "${TARGET_DIR:-}/etc/dcentos-version" \
-        "${PROJECT_ROOT}/br2_external_dcentos/board/amlogic/am3-s21/rootfs-overlay/etc/dcentos-version" \
+        "${PROJECT_ROOT}/br2_external_dcentos/board/amlogic/${BOARD_NAME}/rootfs-overlay/etc/dcentos-version" \
         "${PROJECT_ROOT}/br2_external_dcentos/board/amlogic/rootfs-overlay/etc/dcentos-version" \
         "${PROJECT_ROOT}/br2_external_dcentos/board/zynq/rootfs-overlay/etc/dcentos-version"
     do
@@ -148,28 +180,12 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-KERNEL=""
-KERNEL_SRC=""
-if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
-    KERNEL="${DCENT_AM3_AML_KERNEL}"
-    KERNEL_SRC="env override (DCENT_AM3_AML_KERNEL)"
-elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s21"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s21"
-fi
-
-if [ -z "$KERNEL" ]; then
-    echo "ERROR: no S21 kernel_uimage.bin found for am3-s21 sysupgrade packaging." >&2
-    echo "  Expected one of:" >&2
-    echo "    \$DCENT_AM3_AML_KERNEL" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
-    echo "  Refusing to package S21 without a verified S21 kernel." >&2
-    exit 1
-fi
+# S21 and S19 XP share this capability implementation but never their model
+# identity evidence. The helper binds TARGET to that model's exact fw-info.
+. "${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/require-exact-build-inputs.sh"
+dcent_require_exact_amlogic_build_inputs "${TARGET:-}"
+KERNEL="$DCENT_AM3_AML_KERNEL"
+KERNEL_SRC="exact model-bound build-input snapshot (${PRODUCT_LABEL}/aml)"
 
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
@@ -190,7 +206,7 @@ DCENT_OS
 D-Central Technologies
 Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board: ${BOARD_NAME}
-Kernel: Amlogic 4.9.113 (am3-aml / S21 NoPic)
+Kernel: Amlogic 4.9.113 (shared A113D runtime / ${PRODUCT_LABEL})
 Rootfs: DCENTos (Buildroot, uImage-wrapped gzip CPIO)
 Install contract: host-driven rootfs-window only; target-side AM3 sysupgrade unsupported
 EOF
@@ -231,8 +247,8 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>",
+    "install_command": null,
+    "update_command": null,
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": false
@@ -242,12 +258,22 @@ EOF
 
 # Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
 # are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s21.tar --artifact-dir <restore_verified_dir>"
-DCENT_TOOLBOX_UPDATE_COMMAND=""
+if [ "$PACKAGE_INSTALL_AUTHORIZED" = "1" ]; then
+    DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"
+    DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
+    DCENT_PACKAGE_STATUS=host_driven_only
+    DCENT_PACKAGE_INSTALLABLE=true
+else
+    DCENT_TOOLBOX_INSTALL_COMMAND=""
+    DCENT_TOOLBOX_INSTALL_MODE=package_only_denied
+    DCENT_PACKAGE_INSTALLABLE=false
+fi
+# OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
+# rail accepts the amlogic_rootfs_window method; identical root SSH +
+# restore-verified + signed-package gates; write+readback, NO auto-reboot).
+DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
-DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
 DCENT_TARGET_SIDE_SYSUPGRADE=false
-DCENT_PACKAGE_STATUS=host_driven_only
 dcent_stage_release_key
 dcent_write_sysupgrade_manifest
 dcent_sign_sysupgrade_manifest
@@ -265,9 +291,9 @@ echo ""
 tar tf "$OUTPUT_TAR" | sed 's/^/  /'
 
 cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
-=== DCENTos am3-s21 Build Info ===
+=== DCENTos ${BOARD_NAME} Build Info ===
 Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-Board:      ${BOARD_NAME} (S21 Amlogic am3-aml NoPic variant)
+Board:      ${BOARD_NAME} (${PRODUCT_LABEL} Amlogic A113D; ${PACKAGE_POSTURE})
 Board family: ${BOARD_FAMILY}
 
 Sysupgrade tarball:
@@ -286,15 +312,14 @@ Rootfs (uImage-wrapped gzip CPIO): uImage_rootfs.bin
 Install contract:
   Host-driven rootfs-window package only. Target-side AM3 sysupgrade is not
   validated or claimed by this package.
-  scripts/build_amlogic_native_install.sh --variant s21
-  output/dcentos-amlogic-s21.bin
+  ${INSTALL_DETAIL}
   mtd=${DCENT_AM3_ROOTFS_MTD}
   rootfs_offset=${DCENT_AM3_ROOTFS_OFFSET_HEX}
   rootfs_window=${DCENT_AM3_ROOTFS_WINDOW_HEX}
 
 Target fleet:
-  s21-135 (Amlogic am3-aml, BM1368) - host-driven lab install target only
+  Exact held A113D vendor runtime identity for ${PRODUCT_LABEL}; ${PACKAGE_POSTURE}
 EOF
 
 echo ""
-echo "=== Build Complete (am3-s21) ==="
+echo "=== Build Complete (${BOARD_NAME}) ==="

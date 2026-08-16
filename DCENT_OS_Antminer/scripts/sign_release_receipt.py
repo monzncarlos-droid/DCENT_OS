@@ -108,6 +108,24 @@ def stable_state(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def open_identity_state(metadata: os.stat_result) -> tuple[int, ...]:
+    """Identity/shape fields that must survive pathname-to-handle opening.
+
+    NTFS may finish publishing a just-closed creator handle's change time on
+    the next open. The already-open Win32 pin and the descriptor identity
+    still prove the exact object; timestamp stability begins from that opened
+    descriptor and is enforced by :meth:`PinnedFile.revalidate`.
+    """
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        getattr(metadata, "st_nlink", 1),
+        metadata.st_size,
+    )
+
+
 class PinnedFile:
     """Keep one exact regular-file identity open across an OpenSSL operation."""
 
@@ -189,10 +207,13 @@ class PinnedFile:
                 not stat.S_ISREG(opened.st_mode)
                 or is_reparse(opened)
                 or getattr(opened, "st_nlink", 1) != 1
-                or stable_state(opened) != stable_state(initial)
+                or open_identity_state(opened) != open_identity_state(initial)
             ):
                 fail(f"{self.label} changed before it could be opened")
-            self.initial = initial
+            # Establish the timestamp baseline from the pinned descriptor. On
+            # Windows a just-created NTFS file may finalize ctime during this
+            # open even though dev/inode/shape stayed identical.
+            self.initial = opened
             self.sha256, self.size = self._hash_twice()
             self.revalidate()
         except BaseException:
@@ -229,11 +250,16 @@ class PinnedFile:
             current = os.lstat(self.path)
         except FileNotFoundError:
             fail(f"{self.label} pathname disappeared while pinned")
+        current_path_matches = (
+            open_identity_state(current) == open_identity_state(self.initial)
+            if os.name == "nt"
+            else stable_state(current) == stable_state(self.initial)
+        )
         if (
             digest != self.sha256
             or size != self.size
             or stable_state(opened) != stable_state(self.initial)
-            or stable_state(current) != stable_state(self.initial)
+            or not current_path_matches
         ):
             fail(f"{self.label} changed while the signature was prepared")
         if self.private_key and os.name == "nt":

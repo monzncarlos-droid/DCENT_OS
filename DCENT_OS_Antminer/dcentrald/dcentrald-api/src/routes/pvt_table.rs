@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(r.grade, "standard");
         assert!(!r.voltage_fixed);
         assert!(!r.mix_levels);
-        assert!(!r.requires_apw12_plus);
+        assert_eq!(r.requires_apw12_plus, Some(false));
         assert!(!r.inverted_curve);
         assert_eq!(r.chain_count, 4);
         assert_eq!(r.asics_per_chain, 126);
@@ -123,7 +123,7 @@ mod tests {
     fn pvt_table_voltage_fixed_sku_flagged() {
         let r = build_pvt_response("BHB42803");
         assert!(r.voltage_fixed);
-        assert!(r.requires_apw12_plus);
+        assert_eq!(r.requires_apw12_plus, None);
         assert_eq!(r.grade, "single-voltage");
         assert_eq!(r.chain_count, 3);
         assert_eq!(r.asics_per_chain, 84);
@@ -135,10 +135,10 @@ mod tests {
     }
 
     #[test]
-    fn pvt_table_high_bin_requires_apw12_plus() {
+    fn pvt_table_high_bin_psu_binding_is_unresolved() {
         let r = build_pvt_response("BHB42801");
         assert_eq!(r.grade, "high-bin");
-        assert!(r.requires_apw12_plus);
+        assert_eq!(r.requires_apw12_plus, None);
         assert!(!r.voltage_fixed);
         assert_eq!(r.asics_per_chain, 88);
     }

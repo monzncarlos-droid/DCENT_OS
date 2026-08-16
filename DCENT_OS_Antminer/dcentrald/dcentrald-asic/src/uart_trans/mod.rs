@@ -29,7 +29,13 @@ use crate::drivers::bm1362;
 use crate::drivers::MiningWork;
 use crate::protocol;
 use crate::{AsicError, Result};
+use dcentrald_common::s19k_uart_trans_job::{
+    admit_uart_trans_command_len_field, JOB_CMD_TYPE, JOB_LEN_FIELD,
+};
 use dcentrald_hal::serial::{SerialChain, BAUD_115200};
+
+/// BM1362 / ESP live-miss length field. S19k CLOSED uses [`JOB_LEN_FIELD`] `0x36`.
+pub const UART_TRANS_BM1362_LEN_FIELD: u8 = 0x56;
 
 /// Stock BB platform exposes four ASIC UARTs.
 pub const CHAIN_COUNT: usize = 4;
@@ -85,9 +91,9 @@ impl UartWork {
                 command.len()
             )));
         }
-        if command[0] != 0x21 || command[1] != 0x56 {
+        if command[0] != JOB_CMD_TYPE || admit_uart_trans_command_len_field(command[1]).is_err() {
             return Err(AsicError::InvalidParameter(format!(
-                "uart_trans BM1362 command frame has invalid header/len {:02X} {:02X}",
+                "uart_trans command frame has invalid header/len {:02X} {:02X} (want 21 56 or S19k 21 36)",
                 command[0], command[1]
             )));
         }
@@ -649,6 +655,20 @@ mod tests {
         assert_eq!(frame.asic_job_id(), 0x18);
         assert_eq!(frame.as_frame_86(), &wire[2..88]);
         assert!(frame.crc_valid());
+    }
+
+    #[test]
+    fn work_frame_from_s19k_21_36_command_is_admitted() {
+        let work = fixture_work();
+        let mut command = bm1362::build_serial_work_frame(&work, 0x18)[2..86].to_vec();
+        assert_eq!(command[1], UART_TRANS_BM1362_LEN_FIELD);
+        command[1] = JOB_LEN_FIELD;
+        let frame = UartWork::from_command_frame(&command).unwrap();
+        assert_eq!(frame.asic_job_id(), 0x18);
+        assert_eq!(frame.as_frame_86()[1], JOB_LEN_FIELD);
+        assert!(frame.crc_valid());
+        command[1] = 0x00;
+        assert!(UartWork::from_command_frame(&command).is_err());
     }
 
     #[test]

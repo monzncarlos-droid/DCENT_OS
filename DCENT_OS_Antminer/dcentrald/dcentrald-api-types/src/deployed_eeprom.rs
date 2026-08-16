@@ -5,9 +5,9 @@
 //! # Why this exists
 //!
 //! [`crate::eeprom_record::dispatch`] recognizes the `(0x04,0x11)` and `(0x05,0x11)`
-//! preambles but returns *preamble-only* records, documenting the cipher KDF as
-//! "unknown without further Ghidra work". As a result the daemon could not identify
-//! a real deployed hashboard: the `board_name`/`chip_marking` that discriminate
+//! preambles but intentionally returns *preamble-only* records. Before this decoder
+//! closed the key/framing, the daemon could not identify a real deployed hashboard:
+//! the `board_name`/`chip_marking` that discriminate
 //! BM1362 vs BM1366 vs BM1398 live **inside the ciphertext**, and
 //! [`crate::eeprom_record::scan_known_sku`] can only find a SKU that appears in
 //! *plaintext* (which never happens on an encrypted board).
@@ -45,6 +45,14 @@
 //! * **`chip_marking` is a lot code** (e.g. `L1C021CK11`, `S1GX23CM2E`), NOT an
 //!   ASIC-model string. `board_name` (`BHB42601` vs `BHB56903`) is the real
 //!   discriminator, exactly as `eeprom_record::BHB_SKU_CATALOG` already encodes.
+//!   It does, however, carry ONE reproducible bit of family signal: character 2
+//!   of the lot code (region-1 plaintext byte 23). Across all 22 held deployed
+//!   pages it is `C` on BM1362 (11), `G` on BM1366 (7), `V` on BM1368 (4), with
+//!   no exceptions. That is a **corroborator only** — see
+//!   [`DeployedHashboardIdentity::chip_marking_family_letter`] and
+//!   `hashboard_eeprom::CHIP_MARKING_FAMILY_LETTERS`. Evidence and the explicit
+//!   limits of the rule (no held BM1398/BM1370 page; it does NOT close the
+//!   `hashboard_eeprom.rs` BM1362-vs-BM1398 residual): .
 //!
 //! Cipher/key material is public: `skot/amlogic-cb-tools` (MIT) — the same source
 //! the shipped GPL toolbox already ships.
@@ -381,6 +389,30 @@ impl DeployedHashboardIdentity {
     /// callers must treat that as "do not admit", never as a default family.
     pub fn chip_family(&self) -> Option<&'static str> {
         chip_family_for_sku(&self.board_name)
+    }
+
+    /// Character 2 of the factory lot code — region-1 plaintext byte 23.
+    ///
+    /// **Corroborating evidence only. Never a primary family source.** The whole
+    /// held corpus is 22 pages over 3 families (`C`/`G`/`V`); there is no vendor
+    /// documentation, and crucially **no BM1387/BM1391/BM1397/BM1398/BM1370 page
+    /// exists to test a further letter**. BM1370 (`A3HB7xxxx`) is *structurally*
+    /// out of reach here: those pages are format 1 (`0x01 0x41`) and
+    /// [`decode_deployed_eeprom`] refuses them at
+    /// [`DeployedEepromError::UnsupportedAlgorithm`], so this accessor is never
+    /// reached for them.
+    ///
+    /// Returns `None` when the marking is absent or shorter than 3 characters —
+    /// absent evidence, never a guessed letter (CONTEXT §1.4).
+    pub fn chip_marking_family_letter(&self) -> Option<char> {
+        // ASCII by construction: `read_ascii` yields `""` for a non-ASCII field,
+        // so `chars().nth(2)` is byte 23 whenever it is `Some`.
+        let c = self.chip_marking.chars().nth(2)?;
+        if c.is_ascii_alphanumeric() {
+            Some(c)
+        } else {
+            None
+        }
     }
 }
 
@@ -1303,9 +1335,9 @@ f825543962db6d5a5bcf22b0438c6e3bad67545b71fc57a10dc0d22dae63d298";
         assert_eq!((REGION_3.1 - REGION_3.0) % 4, 0);
     }
 
-    /// End-to-end: a real deployed page decodes and resolves to the exact observed
-    /// identity via the admission bridge — for both validated families, and
-    /// fail-closed for the contradicted BHB428xx SKU.
+    /// End-to-end: a deployed page decodes and resolves to the exact observed
+    /// identity via the admission bridge for each admitted family, including an
+    /// exact page-backed BHB428 SKU.
     #[test]
     fn deployed_page_feeds_observed_identity_bridge() {
         use crate::hashboard_eeprom::{
@@ -1325,17 +1357,107 @@ f825543962db6d5a5bcf22b0438c6e3bad67545b71fc57a10dc0d22dae63d298";
             Some(AsicProtocolIdentity::Bm1366)
         );
 
-        // A decodable but CONTRADICTED SKU (BHB428xx) stays fail-closed end-to-end.
-        let bhb428_page = synth_page(0x04, "BHB42801", "L1C021CK11", 1560, 585);
-        let decoded = decode_deployed_eeprom(&bhb428_page).expect("decodes");
-        assert_eq!(decoded.board_name, "BHB42801");
-        assert_eq!(observed_protocol_from_deployed_page(&bhb428_page), None);
-        assert_eq!(
-            observed_protocol_for_deployed_board_name(&decoded.board_name),
-            None
-        );
+        // These are the three exact BHB427/BHB428 SKUs backed by held matched
+        // pages. Each name, BM1362 lot-code letter C, and exact catalog row agree.
+        for (name, marking) in [
+            ("BHB42701", "L1C021CK11"),
+            ("BHB42801", "L1C021CK11"),
+            ("BHB42831", "E1C022AR19"),
+        ] {
+            let page = synth_page(0x04, name, marking, 1560, 585);
+            let decoded = decode_deployed_eeprom(&page).expect("decodes");
+            assert_eq!(decoded.board_name, name);
+            assert_eq!(decoded.chip_family(), Some("BM1362"));
+            assert_eq!(
+                observed_protocol_from_deployed_page(&page),
+                Some(AsicProtocolIdentity::Bm1362)
+            );
+            assert_eq!(
+                observed_protocol_for_deployed_board_name(&decoded.board_name),
+                Some(AsicProtocolIdentity::Bm1362)
+            );
+        }
 
         // A malformed page yields no observed identity (fail-closed).
         assert_eq!(observed_protocol_from_deployed_page(&[0u8; 10]), None);
+    }
+
+    /// Rank-13 named case: a page whose `board_name` says `BHB426…` (BM1362) but
+    /// whose lot-code letter is `G` (BM1366's) must be refused; the same page with
+    /// the correct `C` is admitted. Exercised through the production entry point
+    /// `observed_protocol_from_deployed_page`, not `corroborate_marking` directly.
+    #[test]
+    fn marking_disagreement_refuses_the_page() {
+        use crate::hashboard_eeprom::observed_protocol_from_deployed_page;
+        use dcentrald_common::board_desc::AsicProtocolIdentity;
+
+        let lying = synth_page(0x04, "BHB42601", "S1G021CK11", 1360, 545);
+        assert_eq!(observed_protocol_from_deployed_page(&lying), None);
+
+        let honest = synth_page(0x04, "BHB42601", "S1C021CK11", 1360, 545);
+        assert_eq!(
+            observed_protocol_from_deployed_page(&honest),
+            Some(AsicProtocolIdentity::Bm1362)
+        );
+    }
+
+    /// An unrecognised lot-code letter on an otherwise-admissible SKU fails closed.
+    #[test]
+    fn unknown_marking_letter_refuses() {
+        use crate::hashboard_eeprom::observed_protocol_from_deployed_page;
+        let page = synth_page(0x04, "BHB42601", "S1Q021CK11", 1360, 545);
+        assert_eq!(observed_protocol_from_deployed_page(&page), None);
+    }
+
+    /// A marking with no byte 23 (empty, or shorter than 3 chars) fails closed —
+    /// absent evidence is a refusal, never a guessed letter.
+    #[test]
+    fn absent_marking_refuses() {
+        use crate::hashboard_eeprom::observed_protocol_from_deployed_page;
+        let short = synth_page(0x04, "BHB42601", "AB", 1360, 545);
+        assert_eq!(observed_protocol_from_deployed_page(&short), None);
+        let empty = synth_page(0x04, "BHB42601", "", 1360, 545);
+        assert_eq!(observed_protocol_from_deployed_page(&empty), None);
+    }
+
+    /// KAT: the three real-dump lot codes reduce to `C`/`G`/`V` via the accessor.
+    /// Lot codes are shared across a production batch, not per-unit serials, so
+    /// this publishes no operator hardware serial (`deployed_eeprom.rs:29-31`).
+    #[test]
+    fn held_page_letters_are_c_g_v() {
+        for (class, name, marking, expect) in [
+            (0x04u8, "BHB42601", "L1C021CK11", 'C'),
+            (0x04u8, "BHB42831", "E1C022AR19", 'C'),
+            (0x05u8, "BHB56903", "S1GX23CM2E", 'G'),
+            (0x05u8, "BHB68606", "S1VX24AW21", 'V'),
+        ] {
+            let page = synth_page(class, name, marking, 1360, 545);
+            let id = decode_deployed_eeprom(&page).expect("decodes");
+            assert_eq!(id.chip_marking, marking);
+            assert_eq!(id.chip_marking_family_letter(), Some(expect));
+        }
+    }
+
+    /// The corroborator can only ever NARROW: if a page is admitted through
+    /// `observed_protocol_from_deployed_page`, the name alone must also admit.
+    #[test]
+    fn corroboration_can_only_narrow() {
+        use crate::hashboard_eeprom::{
+            observed_protocol_for_deployed_board_name, observed_protocol_from_deployed_page,
+        };
+        for (class, name, marking) in [
+            (0x04u8, "BHB42601", "S1C021CK11"), // agrees
+            (0x04, "BHB42601", "S1G021CK11"),   // corroborator refuses
+            (0x05, "BHB56903", "S1GX23CM2E"),   // agrees
+            (0x04, "BHB42801", "S1C021CK11"),   // exact page-backed BM1362 SKU
+        ] {
+            let page = synth_page(class, name, marking, 1360, 545);
+            if observed_protocol_from_deployed_page(&page).is_some() {
+                assert!(
+                    observed_protocol_for_deployed_board_name(name).is_some(),
+                    "page-admit must imply name-admit for {name}"
+                );
+            }
+        }
     }
 }

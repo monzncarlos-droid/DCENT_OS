@@ -1,5 +1,20 @@
 # dcentrald Architecture Document
 
+> **Current-architecture correction (2026-07-18):** This long-form document
+> began as the S9 Phase-2 design and some later examples below remain
+> aspirational. `ChipDriver` is not the universal production runtime spine:
+> proven AM2 hybrid and Amlogic serial engines are full-lifecycle products;
+> BeagleBone has the same owned lifecycle shape but remains Experimental and
+> current-binary bench-pending. Driver recognition is distinct from executable maturity; BM1370 is
+> Experimental and default-inert. Native Amlogic BM1368/BM1370 execution now
+> requires exact declared/live target, UART endpoint, configured rate, parsed
+> family response, terminal mutation generation, and exact post-assignment
+> population evidence. AM3-BB now has exact platform capture, pre-energize
+> watchdog ownership, retained raw-LOW GPIO59 lanes, and exact move-only
+> closeout evidence; the current binary remains Experimental until bench
+> revalidation. See `docs/architecture/{ARCHITECTURE_MAP,COMPOSITION_MODEL,AM3_BB_SAFETY_LIFECYCLE}.md`
+> and ADR-0013 for the current normative model.
+
 > **DCENT_OS Mining Daemon** -- 100% original D-Central codebase
 > **Version:** 0.4
 > **Date:** 2026-03-11
@@ -93,7 +108,7 @@ dcentrald/
         mod.rs                     # Platform trait and detection (IMPLEMENTED)
         zynq.rs                    # Zynq (S9/S17/S19) platform (IMPLEMENTED)
         amlogic.rs                 # Amlogic (S19XP/S21) platform (stub)
-        beaglebone.rs              # BeagleBone (S19j) platform (stub)
+        beaglebone.rs              # BeagleBone (S19j) exact Experimental platform
   dcentrald-asic/                  # ASIC chip driver crate
     Cargo.toml
     src/
@@ -105,10 +120,10 @@ dcentrald/
         mod.rs                     # ChipRegistry with auto-detect (IMPLEMENTED)
         bm1387.rs                  # BM1387: PLL table, set_frequency, init (IMPLEMENTED)
         bm1397.rs                  # BM1397 driver (S17/T17) (stub)
-        bm1366.rs                  # BM1366 driver (S19XP) (stub)
-        bm1368.rs                  # BM1368 driver (S21) (stub)
-        bm1370.rs                  # BM1370 driver (S21 Pro) (stub)
-        bm1362.rs                  # BM1362 driver (S19j Pro) (stub)
+        bm1366.rs                  # BM1366 protocol driver (implemented; route maturity varies)
+        bm1368.rs                  # BM1368 protocol driver (implemented; native AML composition Experimental)
+        bm1370.rs                  # BM1370 protocol driver (implemented; Experimental exact permit)
+        bm1362.rs                  # BM1362 protocol driver (implemented; route-specific ownership applies)
   dcentrald-stratum/               # Stratum protocol client crate
     Cargo.toml
     src/
@@ -210,7 +225,12 @@ dcentrald/
 
 ### The Core Abstraction
 
-The `ChipDriver` trait is the central abstraction that makes Universal Hash Board Compatibility possible. Each ASIC chip family (BM1387, BM1397, BM1366, BM1368, BM1370, BM1362) implements this trait with its specific initialization sequence, register values, job format, and nonce decoding.
+The `ChipDriver` trait is one protocol abstraction, currently coupled to
+`FpgaChain`; it is not sufficient by itself to authorize a complete miner.
+Each executable route must additionally prove control-board, transport, rail,
+cooling, lifecycle, and driver-maturity authority. Serial/hybrid products use
+route-specific engines until transport-neutral extraction can preserve those
+proofs.
 
 ```
 trait ChipDriver: Send + Sync {
@@ -1762,8 +1782,8 @@ Phase 1: System Initialization
   3.  Initialize logging (tracing subscriber)
   4.  Establish the path-specific watchdog admission boundary
         Native BM1368/BM1370 NoPic: open/configure/initial-kick before GPIO437
-        Standard/AM3-BB/stock/hybrid/PIC-serial: migration status varies; see
-        Section 14 and do not infer pre-energization coverage from this outline
+        Standard/AM3-BB/hybrid/exact serial: owned watchdog lifecycle
+        Stock/legacy PIC-serial: migration status varies; see Section 14
   5.  Log firmware version, chip type, MAC address
 
 Phase 2: GPIO and Fan Setup
@@ -1875,8 +1895,11 @@ Coverage is intentionally mixed while migration proceeds:
 - the standard daemon has an earlier fail-closed owner but still needs migration
   to the reusable runtime owner and pre-energization admission;
 - native BM1368/BM1370 NoPic serial uses the reusable owner before GPIO437 enable;
-- AM3-BB, stock, hybrid, non-native serial, and passthrough paths still contain
-  legacy watchdog ownership and must not be described as evidence-gated;
+- AM3-BB and hybrid use pre-energize fail-closed owners, watchdog-issued exact
+  actor rosters, immutable absolute teardown budgets, and route-specific
+  move-only Disarm manifests; AM3-BB remains Experimental pending bench proof;
+- stock, legacy non-native serial, and passthrough paths still contain varying
+  watchdog ownership and must not inherit those evidence-gated claims;
 - BM1366 adopted-live and external-owner modes additionally need explicit
   adopted-power or external-supervisor leases.
 
@@ -2066,7 +2089,7 @@ trait Platform: Send + Sync {
 
 enum BoardType {
     Zynq,        // S9, S17, S19 (FPGA UART FIFOs via UIO)
-    BeagleBone,  // S19j (hardware UART /dev/ttyO1-5, no FPGA)
+    BeagleBone,  // S19j (AM335x UART /dev/ttyS1,2,4 on admitted carrier, no FPGA)
     Amlogic,     // S19XP, S21 (software UART /dev/ttyS1-3, no FPGA)
     CVitek,      // S21/T21 recent (uart_trans kernel module)
 }
@@ -2086,7 +2109,8 @@ trait ChainAccess: Send + Sync {
 ```
 
 For Zynq, `ChainAccess` is implemented by `FpgaChain` (UIO mmap + IRQ).
-For BeagleBone, it would be implemented by a UART serial device.
+For the admitted BeagleBone carrier, `ChainAccess` uses the exact
+`/dev/ttyS1`, `/dev/ttyS2`, and `/dev/ttyS4` device/base tuples.
 For Amlogic, it would be software UART or /dev/ttyS.
 
 ### Platform Auto-Detection
@@ -2095,11 +2119,13 @@ For Amlogic, it would be software UART or /dev/ttyS.
 Platform detection at startup:
   1. Read /proc/cpuinfo for "Hardware" line
   2. Check for UIO devices (/dev/uio0) -> Zynq
-  3. Check for /dev/ttyO1 -> BeagleBone
+  3. Require the exact AM3-BB board-target marker or exact admitted FDT identity -> BeagleBone
   4. Check for /dev/ttyS1 + Amlogic DTS -> Amlogic
   5. Check for uart_trans kernel module -> CVitek
 
-For Phase 1: Only Zynq is implemented. Other platforms return
+This historical phase sketch is superseded by the current composition/admission
+model: Zynq and selected serial compositions are implemented, while AM3-BB is
+executable Experimental and bench-pending. Unsupported compositions return
 "unsupported platform" error.
 ```
 

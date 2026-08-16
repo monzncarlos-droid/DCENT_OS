@@ -11,7 +11,7 @@ license = "GPL-3.0"
 # including the diagnostic-only `pic-recovery` package, enables this feature.
 # The default HAL surface exposes only the `I2cServiceHandle` family. See W2.3
 # single-I2C-owner lockdown 2026-05-07.
-recovery-tool = []
+recovery-tool = ["dcentrald-common/recovery-tool"]
 
 # Opt-in dev/debug ABI for the bitmain_axi.ko IOCTL surface
 # (`stock_fpga_axi_ioctl.rs`).

@@ -150,8 +150,9 @@ pub struct TuningProfile {
     pub hashboard_sku: Option<String>,
     /// W13.C3 (2026-05-10): denormalised per-SKU flags snapshot from
     /// `Bm1362HashboardSku::flags()` at the time the profile was tuned.
-    /// Lets the dashboard render "voltage_fixed" / "requires_apw12_plus"
-    /// indicators without re-resolving the SKU enum.
+    /// Lets the dashboard render SKU safety indicators without re-resolving
+    /// the SKU enum. `requires_apw12_plus=None` means the PSU binding was
+    /// unresolved and MUST NOT be rendered as either yes or no.
     ///
     /// Optional + serde-default for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,7 +170,7 @@ pub struct TuningProfileSkuFlags {
     #[serde(default)]
     pub voltage_fixed: bool,
     #[serde(default)]
-    pub requires_apw12_plus: bool,
+    pub requires_apw12_plus: Option<bool>,
     #[serde(default)]
     pub inverted_curve: bool,
     #[serde(default)]

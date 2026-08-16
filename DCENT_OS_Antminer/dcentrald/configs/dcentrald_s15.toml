@@ -14,23 +14,21 @@ protocol = "sv1"
 [mining]
 enabled = false
 model = "s15"
-frequency_mhz = 500
-voltage_mv = 12000
+# Exact safe setpoints are unheld. Zero keeps this management-only template
+# from carrying a fabricated PLL or rail command.
+frequency_mhz = 0
+voltage_mv = 0
 version_rolling = false
 passthrough = false
 suggest_difficulty = 256
-serial_device = "/dev/ttyS1"
-serial_chip_count = 84
+# The official S15 maintenance guide proves 3 chains x 60 BM1391, but the
+# control-board FIFO/UART endpoint remains unheld and is deliberately absent.
+serial_chip_count = 60
 serial_chip_type = "BM1391"
 
 [power]
 mode = "bypass"
-target_watts = 900
-
-[power.psu_override]
-enabled = false
-model = "APW3"
-voltage_v = 12.8
+target_watts = 0
 
 [thermal]
 target_temp_c = 60

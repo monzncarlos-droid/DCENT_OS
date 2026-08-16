@@ -27,7 +27,7 @@ use dcentrald_asic::drivers::{
     ChipDriverAdmission, ChipDriverExecutionPolicy, ChipRecognition, ChipRegistry, MinerProfile,
     PicType,
 };
-use dcentrald_asic::dspic::DspicService;
+use dcentrald_asic::dspic::{DspicService, Lm75aViaVoltageController, LM75A_ADDRS};
 use dcentrald_asic::pic::{Pic16EndpointSession, PicController, PicFirmware, PicServiceController};
 use dcentrald_hal::fan::FanController;
 use dcentrald_hal::fpga_chain::FpgaChain;
@@ -39,6 +39,7 @@ use dcentrald_hal::platform::{
 };
 use dcentrald_hal::watchdog::Watchdog;
 use dcentrald_hal::xadc::Xadc;
+use dcentrald_silicon_profiles::sensor_topology::SensorSweep;
 use dcentrald_thermal::controller::{ThermalAction, ThermalController};
 use dcentrald_thermal::profiles::ThermalProfile;
 
@@ -1051,6 +1052,41 @@ impl crate::daemon_lifecycle::PlatformIdentitySource for SystemPlatformIdentityS
             // be promoted to measured hashboard or ASIC identity.
             observed_control_board: detect_control_board(),
         })
+    }
+}
+
+pub(crate) fn exercise_s19k_nopic_config_admission(
+    identity: &crate::daemon_lifecycle::PlatformIdentitySnapshot,
+    config: &crate::config::DcentraldConfig,
+) {
+    use dcentrald_common::s19k_bm1366_nopic_beta::{
+        admit_s19k_am3_board_desc, admit_s19k_bm1366_nopic_skeleton, S19K_AM3_BOARD_TARGET,
+        S19K_BM1366_ASIC_NUM, S19K_BM1366_BAUD_HZ, S19K_BM1366_CHIP_ID,
+        S19K_BM1366_INC_FREQ_DELAY_MS, S19K_BM1366_MIDSTATE_NUMBER,
+        S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV, S19K_BM1366_VOLTAGE_ADJUST_STEP,
+        S19K_CTRLBOARD_LM75_ADDRS, S19K_GPIO_PWR_EN, S19K_GPIO_PWR_EN_SAFE_OFF_VALUE,
+    };
+    let board_target = identity.board_target().trim();
+    let _model_is_s19k = config.mining.model.as_deref().map(|m| {
+        let m = m.trim().to_ascii_lowercase();
+        m == "s19k" || m == "s19kpro" || m == "s19k-pro"
+    }).unwrap_or(false);
+    // Identity via /etc/dcentos/board_target (authoritative) and/or typed
+    // TOML [platform].board_target applied onto the snapshot before this call.
+    if board_target != S19K_AM3_BOARD_TARGET { return; }
+    if let Some(desc) = identity.board_desc {
+        match admit_s19k_am3_board_desc(desc) {
+            Ok(()) => tracing::info!(board_target = desc.board_target, "S19k NoPic BoardDesc admission OK (management-only; no energize)"),
+            Err(err) => tracing::warn!(error = %err, "S19k NoPic BoardDesc admission refused"),
+        }
+    }
+    match admit_s19k_bm1366_nopic_skeleton(
+        "BHB56903", S19K_BM1366_CHIP_ID, S19K_BM1366_ASIC_NUM, S19K_BM1366_MIDSTATE_NUMBER, false,
+        S19K_BM1366_BAUD_HZ, S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV, S19K_BM1366_INC_FREQ_DELAY_MS,
+        S19K_BM1366_VOLTAGE_ADJUST_STEP, S19K_CTRLBOARD_LM75_ADDRS, S19K_GPIO_PWR_EN, S19K_GPIO_PWR_EN_SAFE_OFF_VALUE,
+    ) {
+        Ok(()) => tracing::info!(board_name = "BHB56903", "S19k BM1366 NoPic skeleton admission OK for BHB56903 (management-only)"),
+        Err(err) => tracing::warn!(error = %err, "S19k BM1366 NoPic skeleton admission refused for BHB56903"),
     }
 }
 
@@ -5160,6 +5196,7 @@ impl Daemon {
             )),
             room_temp_c10: std::sync::atomic::AtomicU32::new(0),
             hardware_info,
+            pic_firmware_snapshot_rx: None,
             // W13.D1 boot phase tracker — default Generic(Booting), cold-boot
             // orchestrators publish into this once the W14 platform-dispatch
             // refactor lands.
@@ -7093,6 +7130,46 @@ impl Daemon {
             None
         };
 
+        // Publish only firmware/endpoints already observed and admitted during
+        // PIC16 initialization. This performs no I2C operation; REST receives
+        // a cloned watch snapshot and remains incapable of issuing PIC commands.
+        let pic_firmware_snapshot_rx = {
+            let endpoints: Vec<crate::pic_firmware_snapshot::Pic16SnapshotEndpoint> = self
+                .initialized_pic_addrs_final
+                .iter()
+                .copied()
+                .map(|i2c_addr| {
+                    let chain_id = self.miner_profile.and_then(|profile| {
+                        profile
+                            .pic_addrs
+                            .iter()
+                            .position(|candidate| *candidate == i2c_addr)
+                            .and_then(|index| profile.chain_ids.get(index).copied())
+                    });
+                    crate::pic_firmware_snapshot::Pic16SnapshotEndpoint {
+                        chain_id,
+                        i2c_bus: DEFAULT_I2C_BUS,
+                        i2c_addr,
+                    }
+                })
+                .collect();
+
+            match crate::pic_firmware_snapshot::build_pic16_snapshot(self.pic_firmware, &endpoints)
+            {
+                Ok(observations) => {
+                    let (_publisher, receiver) = watch::channel(observations);
+                    Some(receiver)
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "PIC firmware API snapshot unavailable; retaining catalog-only response"
+                    );
+                    None
+                }
+            }
+        };
+
         let app_state = Arc::new(dcentrald_api::AppState {
             state_rx: state_rx.clone(),
             mode_rx: mode_rx.clone(),
@@ -7135,6 +7212,7 @@ impl Daemon {
             )),
             room_temp_c10: std::sync::atomic::AtomicU32::new(0),
             hardware_info: hardware_info.clone(),
+            pic_firmware_snapshot_rx,
             // W13.D1 boot phase tracker — published into by cold-boot
             // orchestrators (W14+ wiring).
             boot_phase_tracker: Arc::new(dcentrald_api::boot_phase_tracker::BootPhaseTracker::new()),
@@ -10028,17 +10106,39 @@ impl Daemon {
                                 }
                                 if let Some(chain_idx) = hb_pic_chain_map.get(&addr).copied() {
                                     let mut dspic = DspicService::new(hb_i2c_svc.clone(), addr);
-                                    let hottest = dspic
-                                        .read_all_temperatures()
-                                        .into_iter()
-                                        .filter(|temp| *temp > -40.0 && *temp < 125.0)
-                                        .fold(None, |acc: Option<f64>, temp| {
-                                            Some(acc.map_or(temp, |current| current.max(temp)))
-                                        });
+                                    // ONE sweep feeds BOTH the stored board
+                                    // temperature and the coverage report. Do
+                                    // not add a second read pass — this runs
+                                    // inside the runtime heartbeat loop and
+                                    // each LM75A passthrough transaction is
+                                    // ~290 ms of un-serviced bus time.
+                                    //
+                                    // Selection is byte-equivalent to the
+                                    // previous `max`: the `-999.0` sentinel a
+                                    // failed read used to produce is now
+                                    // `None`, and the same exclusive
+                                    // `(-40, 125)` window admits the same
+                                    // finite readings.
+                                    let readings =
+                                        crate::board_sensor_coverage::filter_heartbeat_window(
+                                            dspic.lm75a_sweep(LM75A_ADDRS),
+                                        );
+                                    let sweep = SensorSweep::from_readings(
+                                        &readings,
+                                        LM75A_ADDRS.len() as u16,
+                                    );
+                                    crate::board_sensor_coverage::report_board_sensor_coverage(
+                                        "daemon-heartbeat",
+                                        addr,
+                                        LM75A_ADDRS,
+                                        &readings,
+                                        &sweep,
+                                    );
+                                    let hottest = sweep.hottest_c;
                                     if let Some(temp_c) = hottest {
                                         if chain_idx < hb_board_temps.len() {
                                             hb_board_temps[chain_idx]
-                                                .store((temp_c as f32).to_bits(), Ordering::Release);
+                                                .store(temp_c.to_bits(), Ordering::Release);
                                         }
                                         if chain_idx < hb_board_temp_seen_at.len() {
                                             hb_board_temp_seen_at[chain_idx]

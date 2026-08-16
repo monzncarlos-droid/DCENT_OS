@@ -66,7 +66,7 @@ while IFS= read -r line; do
     case "$soc/$bt" in am335x/am3-bb-*) : ;; am335x/*) bad "row $rows ($sku): AM335x board_target '$bt' must start am3-bb-" ;; esac
 done < "$tmp"
 
-[ "$rows" -eq 21 ] || bad "expected exactly 21 target SKU rows, found $rows"
+[ "$rows" -eq 22 ] || bad "expected exactly 22 target SKU rows, found $rows"
 
 if [ "$fails" -eq 0 ]; then
     echo "PASS: skus.conf structurally valid — $rows SKU rows; columns, vocabulary, and arch/soc/boot_chain consistency all OK"

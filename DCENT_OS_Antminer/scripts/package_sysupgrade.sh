@@ -275,20 +275,24 @@ fi
 
 case "$BOARD_NAME" in
     am1-s9)
-        # Probe multiple plausible locations (reorganization 2026-03-13 moved
-        # shared research + extractions to repo-root knowledge-base/).
-        # Honor DCENT_EXTRACTIONS_DIR override first, then fall through.
+        # Probe public-safe vendor boot inputs first. Private knowledge-base/
+        # paths remain a last-resort lab fallback (never documented as required).
+        # Honor DCENT_EXTRACTIONS_DIR / DCENT_VENDOR_SOC_BOOT overrides first.
         REPO_ROOT="$(dirname "$PROJECT_ROOT")"
+        VENDOR_S9="${DCENT_VENDOR_SOC_BOOT:-$PROJECT_ROOT/vendor/soc-boot}/s9"
         if [ -n "${DCENT_EXTRACTIONS_DIR:-}" ] && [ -d "$DCENT_EXTRACTIONS_DIR" ]; then
             EXTRACTIONS_DIR="$DCENT_EXTRACTIONS_DIR"
+        elif [ -d "$VENDOR_S9" ]; then
+            EXTRACTIONS_DIR="$VENDOR_S9"
         elif [ -d "$FIRMWARE_DIR/extractions/s9" ]; then
             EXTRACTIONS_DIR="$FIRMWARE_DIR/extractions/s9"
         elif [ -d "$PROJECT_ROOT/extractions/s9" ]; then
             EXTRACTIONS_DIR="$PROJECT_ROOT/extractions/s9"
         elif [ -d "$REPO_ROOT/knowledge-base/extractions/s9" ]; then
+            echo "WARN: using private lab knowledge-base/extractions/s9 (not a public build input)." >&2
             EXTRACTIONS_DIR="$REPO_ROOT/knowledge-base/extractions/s9"
         else
-            error "No extractions dir for am1-s9. Searched: \$DCENT_EXTRACTIONS_DIR, $FIRMWARE_DIR/extractions/s9, $PROJECT_ROOT/extractions/s9, $REPO_ROOT/knowledge-base/extractions/s9"
+            error "No SoC boot inputs for am1-s9. Set \$DCENT_EXTRACTIONS_DIR or populate vendor/soc-boot/s9/ (see vendor/soc-boot/README.md)."
         fi
         BOARD_FAMILY="am1"
         ;;

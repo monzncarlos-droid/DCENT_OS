@@ -140,11 +140,12 @@ pub enum ChainTransport {
     },
 }
 
-/// Verified AXG Amlogic chain-2 UART order. `/dev/ttyS4` is the documented
-/// third chain UART; `/dev/ttyS3` remains a legacy fallback for older profile
-/// drift. This is pure config data so host tests can pin it without touching
-/// live devices.
+/// S21 AXG chain-2 UART order. `/dev/ttyS4` is the documented third chain
+/// UART on the verified S21 DTB; `/dev/ttyS3` remains a fallback.
 pub const AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 2] = ["/dev/ttyS4", "/dev/ttyS3"];
+/// S19k `a lab unit` dmesg: meson ttyS1+S2+S3 are the hash UARTs. ttyS4 is the
+/// S21 AXG third port, not the S19k third hash UART.
+pub const S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 2] = ["/dev/ttyS3", "/dev/ttyS4"];
 
 /// Candidate serial devices for an Amlogic chain in priority order.
 pub fn amlogic_tty_candidate_order(chain: &ChainConfig) -> Vec<String> {
@@ -154,10 +155,14 @@ pub fn amlogic_tty_candidate_order(chain: &ChainConfig) -> Vec<String> {
     };
 
     match chain.chain_id {
-        2 => AMLOGIC_CHAIN2_TTY_CANDIDATES
-            .iter()
-            .map(|candidate| (*candidate).to_string())
-            .collect(),
+        2 => {
+            let prefs = if declared == "/dev/ttyS3" {
+                &S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES
+            } else {
+                &AMLOGIC_CHAIN2_TTY_CANDIDATES
+            };
+            prefs.iter().map(|candidate| (*candidate).to_string()).collect()
+        }
         _ => vec![declared.to_string()],
     }
 }
@@ -256,13 +261,14 @@ pub enum VoltageControllerKind {
     /// BHB42XXX hashboard family across CV1835, AM335x BB, and Amlogic
     /// (S19j Pro variants). See `dcentrald-asic::pic1704`.
     Pic1704,
-    /// dsPIC33EP16GS202 family (S19/S19j Pro am2 Zynq, S19k Pro am3-aml,
-    /// S21 family with framed-protocol DAC). The existing daemon path.
+    /// dsPIC33EP16GS202 family on exact model-scoped x17/x19 routes. This
+    /// kind does not authorize S21 or any other catalog-wide association.
     Dspic33Ep,
     /// PIC16F1704 (S9 stock + BraiinsOS BM1387 hashboards).
     Pic16f1704,
-    /// No PIC on the hashboard (S21 NoPic — voltage is frequency-controlled
-    /// via TAS5782M kernel-managed DAC).
+    /// Fail-closed no-PIC classification. Some exact Amlogic S21 routes use a
+    /// non-PIC voltage controller, but this fallback is not proof of its type,
+    /// endpoint, or mutation authority.
     NoPic,
 }
 
@@ -287,11 +293,128 @@ pub enum VoltageControl {
     DsPic,
     /// TPS546D24A PMBus buck converter (BitAxe/Mujina).
     PmBus { address: u8 },
-    /// LDO/OpAmp controlled by frequency only (S21 NoPic).
+    /// No voltage command is described by the profile; tuning may vary only
+    /// frequency. This is not a claim about the physical regulator topology.
     FrequencyOnly,
     /// Direct I2C DAC on control board (some S19 XP).
     I2cDac { address: u8 },
 }
+
+/// Source-level capability ceiling for voltage controller/method identities.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoltageCapabilityState {
+    /// An implementation/descriptor exists, but exact construction and safe
+    /// runtime composition are model-scoped elsewhere.
+    SourceAbstractionModelScoped,
+    /// A fail-closed absence/fallback identity, not a physical-controller
+    /// assertion.
+    NoControllerFallback,
+}
+
+/// Exact, non-authorizing capability record for one controller kind.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct VoltageControllerKindCapability {
+    pub kind: VoltageControllerKind,
+    pub state: VoltageCapabilityState,
+    pub implementation: &'static str,
+    pub construction_authorized: bool,
+    pub runtime_admission_authorized: bool,
+    pub mutation_authorized: bool,
+}
+
+/// Exact, non-authorizing capability record for one [`VoltageControl`] method
+/// family. Data-bearing addresses remain caller/profile values and are not
+/// admitted by this registry.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct VoltageControlMethodCapability {
+    pub method: &'static str,
+    pub state: VoltageCapabilityState,
+    pub implementation_scope: &'static str,
+    pub endpoint_identity_verified: bool,
+    pub runtime_admission_authorized: bool,
+    pub mutation_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for [`VoltageControllerKind`].
+pub const VOLTAGE_CONTROLLER_KIND_CAPABILITIES: &[VoltageControllerKindCapability] = &[
+    VoltageControllerKindCapability {
+        kind: VoltageControllerKind::Pic1704,
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation: "dcentrald_asic::pic1704",
+        construction_authorized: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControllerKindCapability {
+        kind: VoltageControllerKind::Dspic33Ep,
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation: "dcentrald_asic::dspic",
+        construction_authorized: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControllerKindCapability {
+        kind: VoltageControllerKind::Pic16f1704,
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation: "dcentrald_asic::pic",
+        construction_authorized: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControllerKindCapability {
+        kind: VoltageControllerKind::NoPic,
+        state: VoltageCapabilityState::NoControllerFallback,
+        implementation: "fail-closed fallback",
+        construction_authorized: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+];
+
+/// Exhaustive capability ceiling for the five [`VoltageControl`] variants.
+pub const VOLTAGE_CONTROL_METHOD_CAPABILITIES: &[VoltageControlMethodCapability] = &[
+    VoltageControlMethodCapability {
+        method: "PicDac",
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation_scope: "profile descriptor for PIC DAC control",
+        endpoint_identity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControlMethodCapability {
+        method: "DsPic",
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation_scope: "profile descriptor for dsPIC control",
+        endpoint_identity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControlMethodCapability {
+        method: "PmBus",
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation_scope: "data-bearing PMBus descriptor",
+        endpoint_identity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControlMethodCapability {
+        method: "FrequencyOnly",
+        state: VoltageCapabilityState::NoControllerFallback,
+        implementation_scope: "no voltage-command descriptor",
+        endpoint_identity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    VoltageControlMethodCapability {
+        method: "I2cDac",
+        state: VoltageCapabilityState::SourceAbstractionModelScoped,
+        implementation_scope: "data-bearing I2C DAC descriptor",
+        endpoint_identity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+];
 
 /// Target CPU architecture.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -669,7 +792,8 @@ impl PlatformConfig {
     /// - Model: "Antminer S19K Pro NoPic" (per `/etc/bosminer.toml`).
     /// - Chip: BM1366, 77 chips/chain × 3 chains.
     /// - 0x50/0x51/0x52 on i2c-1 are AT24 EEPROMs (NOT PICs).
-    /// - Chain UARTs are /dev/ttyS1, /dev/ttyS2, /dev/ttyS4 (ttyS3 unused).
+    /// - Chain UARTs are /dev/ttyS1, /dev/ttyS2, /dev/ttyS3 (`a lab unit` dmesg).
+    ///   `/dev/ttyS4` is the S21 AXG third port, not the S19k third hash UART.
     /// - Voltage: TAS5782M kernel-managed at i2c-0 0x49/0x4A/0x4B (DTB).
     /// - PSU: APW121215f (fw=0x76) on i2c-1.
     /// - Temp: LM75BCCnCopy on i2c-1 (inlets 0x48-0x4A, outlets 0x4C-0x4E).
@@ -700,19 +824,13 @@ impl PlatformConfig {
                     enable_gpio: Some(455),
                 },
                 // S19k Pro NoPic Amlogic chain-2 device:
-                // - HARDWARE_REFERENCE / module doc lists `/dev/ttyS1, /dev/ttyS2,
-                //   /dev/ttyS4` as the verified AXG DTB chain UARTs (ttyS3 unused).
-                // - Config historically exposed this as `/dev/ttyS3`; a wave-9-era
-                //   drift renamed it to `/dev/ttyS4` with no per-unit verification log.
-                // -  W10-E adds a runtime probe at the call site (see
-                //   `platform/amlogic.rs::open_chain`) with priority
-                //   `["/dev/ttyS4", "/dev/ttyS3"]` so the actual live device
-                //   surfaces in `tracing::info!` at boot. The static value here is
-                //   the documented expectation; the runtime probe can override.
+                // `a lab unit` dmesg: meson ttyS3 @ ff804000 irq 14 is a hash UART
+                // (bosminer 0→9600→115200). ttyS4 is the S21 AXG third port.
+                // Runtime probe still tries ttyS4 second if the node exists.
                 ChainConfig {
                     chain_id: 2,
                     transport: ChainTransport::Serial {
-                        device: "/dev/ttyS4".to_string(),
+                        device: "/dev/ttyS3".to_string(),
                         baud: 115200,
                     },
                     pic_address: None,
@@ -908,26 +1026,21 @@ impl PlatformConfig {
     /// control, or PIC bus/address ownership. Keep those destructive surfaces
     /// unset until a bench BCB100 probe captures them.
     ///
-    /// UART names are candidates from STM32MP15 Linux naming and Braiins
-    /// binary/string evidence; they are suitable for discovery and warm
-    /// passthrough experiments, not cold boot.
+    /// UART names come from the `aliases` node of Braiins' own `ii1-am2` device
+    /// tree (extracted 2026-08-12; see
+    /// `dcentrald_hal::platform::stm32mp15::BCB100_CANDIDATE_CHAIN_UARTS`).
+    /// Chains are `ttySTM1..4`; `ttySTM0` is the Linux **debug console** and must
+    /// never be opened as a chain. Still suitable for discovery and warm
+    /// passthrough experiments only, not cold boot.
+    ///
+    /// `i2c_bus: 0` is likewise the DT-confirmed Linux number for the shared
+    /// hashboard EEPROM bus (STM32 peripheral I2C1) — not peripheral number 1.
     pub fn bcb100_s19_lab() -> Self {
         Self {
             name: "Braiins BCB100 S19-family (STM32MP15, lab)".to_string(),
             chains: vec![
                 ChainConfig {
                     chain_id: 0,
-                    transport: ChainTransport::Serial {
-                        device: "/dev/ttySTM0".to_string(),
-                        baud: 115200,
-                    },
-                    pic_address: None,
-                    i2c_bus: 0,
-                    plug_detect_gpio: None,
-                    enable_gpio: None,
-                },
-                ChainConfig {
-                    chain_id: 1,
                     transport: ChainTransport::Serial {
                         device: "/dev/ttySTM1".to_string(),
                         baud: 115200,
@@ -938,7 +1051,7 @@ impl PlatformConfig {
                     enable_gpio: None,
                 },
                 ChainConfig {
-                    chain_id: 2,
+                    chain_id: 1,
                     transport: ChainTransport::Serial {
                         device: "/dev/ttySTM2".to_string(),
                         baud: 115200,
@@ -949,9 +1062,20 @@ impl PlatformConfig {
                     enable_gpio: None,
                 },
                 ChainConfig {
-                    chain_id: 3,
+                    chain_id: 2,
                     transport: ChainTransport::Serial {
                         device: "/dev/ttySTM3".to_string(),
+                        baud: 115200,
+                    },
+                    pic_address: None,
+                    i2c_bus: 0,
+                    plug_detect_gpio: None,
+                    enable_gpio: None,
+                },
+                ChainConfig {
+                    chain_id: 3,
+                    transport: ChainTransport::Serial {
+                        device: "/dev/ttySTM4".to_string(),
                         baud: 115200,
                     },
                     pic_address: None,
@@ -1041,7 +1165,12 @@ mod tests {
         for (idx, chain) in cfg.chains.iter().enumerate() {
             match &chain.transport {
                 ChainTransport::Serial { device, baud } => {
-                    assert_eq!(device, &format!("/dev/ttySTM{}", idx));
+                    // Chains are ttySTM1..4, NOT ttySTM0..3: Braiins' ii1-am2 DT
+                    // `aliases` map serial0 -> UART4 (the Linux debug console) and
+                    // serial1..4 -> USART3/UART5/UART7/UART8 (HB0..HB3). Opening
+                    // ttySTM0 as a chain would grab the console; omitting ttySTM4
+                    // would drop HB3. Regression-pins the 2026-08-12 correction.
+                    assert_eq!(device, &format!("/dev/ttySTM{}", idx + 1));
                     assert_eq!(*baud, 115200);
                 }
                 other => panic!("BCB100 chain should use direct serial, got {:?}", other),
@@ -1050,6 +1179,13 @@ mod tests {
             assert_eq!(chain.plug_detect_gpio, None);
             assert_eq!(chain.enable_gpio, None);
         }
+        assert!(
+            !cfg.chains.iter().any(|chain| matches!(
+                &chain.transport,
+                ChainTransport::Serial { device, .. } if device == "/dev/ttySTM0"
+            )),
+            "ttySTM0 is the STM32MP15 debug console (UART4) and must never be a chain port"
+        );
     }
 
     #[test]
@@ -1146,10 +1282,10 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(devices, vec!["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"]);
+        assert_eq!(devices, vec!["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"]);
         assert!(
-            !devices.contains(&"/dev/ttyS3"),
-            "ttyS3 is unused on the verified S19k/S21 AXG DTB"
+            !devices.contains(&"/dev/ttyS4"),
+            "ttyS4 is the S21 AXG third port, not the S19k third hash UART"
         );
     }
 
@@ -1174,17 +1310,59 @@ mod tests {
 
     #[test]
     fn amlogic_chain2_candidate_order_is_explicit_and_pure() {
-        for cfg in [
-            PlatformConfig::s19k_amlogic(),
-            PlatformConfig::s21_amlogic(),
-        ] {
-            let chain2 = cfg
-                .chains
-                .iter()
-                .find(|chain| chain.chain_id == 2)
-                .expect("chain 2 config");
-            let candidates = amlogic_tty_candidate_order(chain2);
-            assert_eq!(candidates, vec!["/dev/ttyS4", "/dev/ttyS3"]);
+        let s19k_chain2 = PlatformConfig::s19k_amlogic()
+            .chains
+            .into_iter()
+            .find(|chain| chain.chain_id == 2)
+            .expect("s19k chain 2");
+        assert_eq!(
+            amlogic_tty_candidate_order(&s19k_chain2),
+            vec!["/dev/ttyS3", "/dev/ttyS4"]
+        );
+        let s21_chain2 = PlatformConfig::s21_amlogic()
+            .chains
+            .into_iter()
+            .find(|chain| chain.chain_id == 2)
+            .expect("s21 chain 2");
+        assert_eq!(
+            amlogic_tty_candidate_order(&s21_chain2),
+            vec!["/dev/ttyS4", "/dev/ttyS3"]
+        );
+    }
+
+    #[test]
+    fn voltage_capability_registries_are_exhaustive_and_non_authorizing() {
+        assert_eq!(VOLTAGE_CONTROLLER_KIND_CAPABILITIES.len(), 4);
+        let kinds: std::collections::BTreeSet<&str> = VOLTAGE_CONTROLLER_KIND_CAPABILITIES
+            .iter()
+            .map(|capability| capability.kind.as_str())
+            .collect();
+        assert_eq!(kinds.len(), VOLTAGE_CONTROLLER_KIND_CAPABILITIES.len());
+        for capability in VOLTAGE_CONTROLLER_KIND_CAPABILITIES {
+            assert!(!capability.construction_authorized);
+            assert!(!capability.runtime_admission_authorized);
+            assert!(!capability.mutation_authorized);
         }
+
+        assert_eq!(VOLTAGE_CONTROL_METHOD_CAPABILITIES.len(), 5);
+        let methods: std::collections::BTreeSet<&str> = VOLTAGE_CONTROL_METHOD_CAPABILITIES
+            .iter()
+            .map(|capability| capability.method)
+            .collect();
+        assert_eq!(methods.len(), VOLTAGE_CONTROL_METHOD_CAPABILITIES.len());
+        for capability in VOLTAGE_CONTROL_METHOD_CAPABILITIES {
+            assert!(!capability.endpoint_identity_verified);
+            assert!(!capability.runtime_admission_authorized);
+            assert!(!capability.mutation_authorized);
+        }
+
+        let frequency_only = VOLTAGE_CONTROL_METHOD_CAPABILITIES
+            .iter()
+            .find(|capability| capability.method == "FrequencyOnly")
+            .unwrap();
+        assert_eq!(
+            frequency_only.state,
+            VoltageCapabilityState::NoControllerFallback
+        );
     }
 }

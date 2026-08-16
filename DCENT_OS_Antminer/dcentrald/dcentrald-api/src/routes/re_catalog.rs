@@ -675,7 +675,8 @@ async fn get_eeprom_bhb_skus() -> Json<serde_json::Value> {
             {
                 // A3HB-prefixed S21 Pro/XP boards (BM1370) are format 1, NOT
                 // format 5. 0x41 is board_name[0] ('A'), not a key selector.
-                // Not dispatched by eeprom_record::dispatch() (separate item).
+                // Dispatched by eeprom_record::dispatch() as an identity-only
+                // Format1PlaintextName partial decode (rank 20).
                 "bytes": [0x01u8, 0x41],
                 "variant": "format1_plaintext_name",
                 "families": "A3HB4xxxx, A3HB7xxxx",
@@ -1141,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eeprom_catalog_exposes_bhb428_as_bm1366() {
+    async fn eeprom_catalog_exposes_bhb428_as_bm1362() {
         let Json(body) = get_eeprom_bhb_skus().await;
         let examples = body["lookup_examples"]
             .as_array()
@@ -1151,7 +1152,7 @@ mod tests {
             .find(|entry| entry["sku"] == "BHB42801")
             .expect("BHB42801 example");
 
-        assert_eq!(bhb42801["chip_family"].as_str(), Some("BM1366"));
+        assert_eq!(bhb42801["chip_family"].as_str(), Some("BM1362"));
     }
 
     #[tokio::test]

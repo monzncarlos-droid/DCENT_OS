@@ -623,6 +623,23 @@ struct SupportedPayloadKind {
     role: PayloadRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadKindEvidenceState {
+    /// The kind and leaf are admitted only as one member of a separately
+    /// authenticated, target-bound bundle contract.
+    ManifestBoundMemberOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PayloadKindCapability {
+    manifest_kind: &'static str,
+    evidence_state: PayloadKindEvidenceState,
+    standalone_admission_authorized: bool,
+    execution_authorized: bool,
+    installation_authorized: bool,
+    writer_authorized: bool,
+}
+
 // Keep this registry deliberately small. A new hardware family may add a new
 // payload kind here, but an authenticated manifest cannot turn an arbitrary tar
 // member into an accepted image payload merely by naming it.
@@ -651,6 +668,53 @@ const SUPPORTED_PAYLOAD_KINDS: &[SupportedPayloadKind] = &[
         manifest_kind: "verification_key",
         accepted_leaves: &["release_ed25519.pub"],
         role: PayloadRole::Other,
+    },
+];
+
+// A supported manifest kind is not a standalone artifact type. The full OTA
+// verifier must still authenticate the manifest, bind target/path/size/hash,
+// and apply the package/route authority contract before any consumer can use
+// the member.
+const PAYLOAD_KIND_CAPABILITIES: &[PayloadKindCapability] = &[
+    PayloadKindCapability {
+        manifest_kind: "kernel",
+        evidence_state: PayloadKindEvidenceState::ManifestBoundMemberOnly,
+        standalone_admission_authorized: false,
+        execution_authorized: false,
+        installation_authorized: false,
+        writer_authorized: false,
+    },
+    PayloadKindCapability {
+        manifest_kind: "rootfs",
+        evidence_state: PayloadKindEvidenceState::ManifestBoundMemberOnly,
+        standalone_admission_authorized: false,
+        execution_authorized: false,
+        installation_authorized: false,
+        writer_authorized: false,
+    },
+    PayloadKindCapability {
+        manifest_kind: "metadata",
+        evidence_state: PayloadKindEvidenceState::ManifestBoundMemberOnly,
+        standalone_admission_authorized: false,
+        execution_authorized: false,
+        installation_authorized: false,
+        writer_authorized: false,
+    },
+    PayloadKindCapability {
+        manifest_kind: "bitstream",
+        evidence_state: PayloadKindEvidenceState::ManifestBoundMemberOnly,
+        standalone_admission_authorized: false,
+        execution_authorized: false,
+        installation_authorized: false,
+        writer_authorized: false,
+    },
+    PayloadKindCapability {
+        manifest_kind: "verification_key",
+        evidence_state: PayloadKindEvidenceState::ManifestBoundMemberOnly,
+        standalone_admission_authorized: false,
+        execution_authorized: false,
+        installation_authorized: false,
+        writer_authorized: false,
     },
 ];
 
@@ -4080,6 +4144,31 @@ mod tests {
             err.contains("unsupported manifest payload kind"),
             "err = {err}"
         );
+    }
+
+    #[test]
+    fn payload_kind_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        let supported: std::collections::BTreeSet<&str> = SUPPORTED_PAYLOAD_KINDS
+            .iter()
+            .map(|kind| kind.manifest_kind)
+            .collect();
+        let capabilities: std::collections::BTreeSet<&str> = PAYLOAD_KIND_CAPABILITIES
+            .iter()
+            .map(|capability| capability.manifest_kind)
+            .collect();
+        assert_eq!(supported, capabilities);
+        assert_eq!(capabilities.len(), PAYLOAD_KIND_CAPABILITIES.len());
+
+        for capability in PAYLOAD_KIND_CAPABILITIES {
+            assert_eq!(
+                capability.evidence_state,
+                PayloadKindEvidenceState::ManifestBoundMemberOnly
+            );
+            assert!(!capability.standalone_admission_authorized);
+            assert!(!capability.execution_authorized);
+            assert!(!capability.installation_authorized);
+            assert!(!capability.writer_authorized);
+        }
     }
 
     #[test]

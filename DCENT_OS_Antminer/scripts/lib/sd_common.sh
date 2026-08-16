@@ -35,6 +35,10 @@
 #     sd_common::refuse_block_device <path>
 #         Exits with an error if <path> starts with /dev/ or \\.\ (Windows
 #         device namespace). Used to safety-check the output directory.
+#     sd_common::refuse_unsafe_output_alias <output> [<protected-source> ...]
+#         Refuses output symlinks, non-regular existing outputs, and lexical,
+#         resolved, or hard-link identity with any protected source. Call
+#         before opening an image/manifest output for truncating writes.
 #
 #   FAT label handling:
 #     sd_common::validate_fat_label <label-var-name>
@@ -100,7 +104,7 @@
 #
 # Versioning: increment SD_COMMON_VERSION when the public surface changes.
 
-SD_COMMON_VERSION=2
+SD_COMMON_VERSION=4
 
 # Guard against double-sourcing. Builders typically `source` once; harmless
 # repeated sourcing is supported via this idempotency check.
@@ -167,6 +171,57 @@ sd_common::refuse_block_device() {
             exit 1
             ;;
     esac
+}
+
+# Refuse a truncating output when it aliases any executable/input evidence.
+# `readlink -m` canonicalizes even a not-yet-created final path and follows
+# symlinked parents. Bash `-ef` catches existing hard links to the same inode.
+# Builders in this tree already require GNU/Linux host tools (`stat -c`,
+# `sha256sum`, `sfdisk`), so GNU coreutils `readlink -m` is an admissible host
+# dependency here.
+sd_common::refuse_unsafe_output_alias() {
+    local output="$1"
+    shift
+
+    sd_common::refuse_block_device "$output"
+    if [ -L "$output" ]; then
+        echo "ERROR: refusing symlink output: $output" >&2
+        return 1
+    fi
+    if [ -e "$output" ] && [ ! -f "$output" ]; then
+        echo "ERROR: refusing non-regular output: $output" >&2
+        return 1
+    fi
+    if [ -e "$output" ]; then
+        local output_links
+        output_links="$(stat -c %h -- "$output")" || {
+            echo "ERROR: cannot inspect output link count safely: $output" >&2
+            return 1
+        }
+        if [ "$output_links" != "1" ]; then
+            echo "ERROR: refusing multiply-linked output: $output" >&2
+            return 1
+        fi
+    fi
+
+    local output_resolved source source_resolved
+    output_resolved="$(readlink -m -- "$output")" || {
+        echo "ERROR: cannot resolve output safely: $output" >&2
+        return 1
+    }
+    for source in "$@"; do
+        [ -n "$source" ] || continue
+        [ -e "$source" ] || continue
+        source_resolved="$(readlink -f -- "$source")" || {
+            echo "ERROR: cannot resolve protected source safely: $source" >&2
+            return 1
+        }
+        if [ "$output_resolved" = "$source_resolved" ] || \
+           { [ -e "$output" ] && [ "$output" -ef "$source" ]; }; then
+            echo "ERROR: refusing output that aliases protected source: $output -> $source" >&2
+            return 1
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,47 @@
 # D-Central Technologies — DCENTos Hacker Shell v0.2.7
 #
 
+EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+EXTERNAL_MEDIA_READY=${DCENTOS_EXTERNAL_MEDIA_READY_FILE:-/run/dcentos/external-media-ephemeral-ready}
+MOUNTS_FILE=${DCENTOS_MOUNTS_FILE:-/proc/mounts}
+DATA_DIR=${DCENTOS_EXTERNAL_MEDIA_DATA_DIR:-/data}
+
+if [ -e "$EXTERNAL_MEDIA_MARKER" ] || [ -L "$EXTERNAL_MEDIA_MARKER" ]; then
+    case "$1" in
+        start)
+            if [ ! -f "$EXTERNAL_MEDIA_READY" ] || [ -L "$EXTERNAL_MEDIA_READY" ]; then
+                echo "ERROR: external-media ephemeral-root readiness proof is absent or unsafe" >&2
+                exit 1
+            fi
+            if ! awk -v path="$DATA_DIR" '
+                $2 == path {
+                    mounts++
+                    if ($1 == "tmpfs" && $3 == "tmpfs") {
+                        count = split($4, options, ",")
+                        for (i = 1; i <= count; i++)
+                            if (options[i] == "rw")
+                                writable_tmpfs++
+                    }
+                }
+                END { exit (mounts == 1 && writable_tmpfs == 1) ? 0 : 1 }
+            ' "$MOUNTS_FILE"; then
+                echo "ERROR: external-media /data is not exactly one writable tmpfs mount" >&2
+                exit 1
+            fi
+            mkdir -p "$DATA_DIR/keys/dropbear" "$DATA_DIR/config" "$DATA_DIR/logs"
+            echo "External-media posture: persistent save/restore disabled; /data is volatile"
+            exit 0
+            ;;
+        stop)
+            echo "External-media posture: refusing persistent SSH-key or entropy-seed writes"
+            exit 0
+            ;;
+        restart)
+            exec "$0" start
+            ;;
+    esac
+fi
+
 case "$1" in
     start)
         # Start: just ensure directories exist
@@ -33,7 +74,7 @@ case "$1" in
             END {
                 exit (mounts == 1 && backends == 1 && writable) ? 0 : 1
             }
-        ' /proc/mounts; then
+        ' "$MOUNTS_FILE"; then
             echo "ERROR: /data is not the writable persistent UBIFS volume" >&2
             exit 1
         fi

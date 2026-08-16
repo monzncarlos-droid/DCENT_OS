@@ -443,6 +443,14 @@ pub struct AppState {
     pub room_temp_c10: std::sync::atomic::AtomicU32,
     /// Static hardware information (populated at startup).
     pub hardware_info: Arc<Mutex<HardwareInfo>>,
+    /// Optional runtime-owned PIC firmware snapshot receiver.
+    ///
+    /// The producer publishes exact bytes or bounded classifications already
+    /// retained during PIC initialization, with their evidence scope explicit.
+    /// REST only clones the latest value and never opens I2C or issues a PIC
+    /// command to fill an absent snapshot.
+    pub pic_firmware_snapshot_rx:
+        Option<watch::Receiver<Vec<dcentrald_api_types::pic_firmware::PicFirmwareLiveSlot>>>,
     /// W13.D1 — live cold-boot phase tracker. Cold-boot orchestrators
     /// publish into this; `/api/boot/phase` + `/api/boot/timeline` read
     /// it. See `crate::boot_phase_tracker` for the publish contract.
@@ -2411,6 +2419,7 @@ pub fn build_minimal_app_state_with_hardware_mutation_gate(
         )),
         room_temp_c10: std::sync::atomic::AtomicU32::new(0),
         hardware_info,
+        pic_firmware_snapshot_rx: None,
         // W13.D1: ships with default-Generic(Booting) phase. Cold-boot
         // orchestrators publish into this once the platform-dispatch
         // refactor lands (W14+).

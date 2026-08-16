@@ -500,33 +500,28 @@ impl Bm1387Driver {
                 None => continue,
             };
 
-            // Check if this is a known sensor
-            match man_id {
-                0x55 | 0x41 | 0x1A => {
+            // Manufacturer identity alone is not enough: a future or
+            // incompatible part can reuse a known vendor ID while exposing a
+            // different register map. Admit only the exact tuple registry.
+            match lm90::recognized_part(man_id, dev_id) {
+                Some(part) => {
                     tracing::info!(
                         chain_id = chain.chain_id,
                         addr = format_args!("0x{:02X}", addr),
                         manufacturer_id = format_args!("0x{:02X}", man_id),
                         device_id = format_args!("0x{:02X}", dev_id),
-                        sensor_type = match man_id {
-                            0x55 => match dev_id {
-                                0x21..=0x23 => "TMP42x",
-                                _ => "TMP451",
-                            },
-                            0x41 => "ADT7461",
-                            0x1A => "NCT218",
-                            _ => "Unknown",
-                        },
+                        sensor_type = lm90::refined_part_label(part),
                         "Temperature sensor detected on hash board"
                     );
                     return Some((addr, man_id, dev_id));
                 }
-                _ => {
+                None => {
                     tracing::debug!(
                         chain_id = chain.chain_id,
                         addr = format_args!("0x{:02X}", addr),
                         manufacturer_id = format_args!("0x{:02X}", man_id),
-                        "Unknown device at I2C address — skipping"
+                        device_id = format_args!("0x{:02X}", dev_id),
+                        "Unrecognized temperature-sensor tuple — skipping"
                     );
                 }
             }

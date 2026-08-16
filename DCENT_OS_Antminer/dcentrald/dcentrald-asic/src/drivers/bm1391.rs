@@ -6,18 +6,19 @@
 //! copy-paste errors (T9+ uses the 16 nm BM1387; BM1391 is 7 nm per
 //! `asics.rs` `Bm1391 = Nm7` + the Bitmain BM1391 datasheet). Unlike the
 //! `bm1373` scaffold (whose values are
-//! *projected* from BM1370), **every constant here is byte-verified** from the
-//! Bitmain S17 factory `single-board-test` jig (which carries the full,
+//! *projected* from BM1370), the command/register constants below are byte-
+//! verified from the Bitmain S17 factory `single-board-test` jig (which carries the full,
 //! unstripped BM1391 protocol: `BM1391_set_config`, `set_BM1391_freq`,
 //! `BM1391_set_baud`, `BM1391_set_TM`, `BM1391_chain_inactive`,
 //! `BM1391_set_address`, `single_BM1391{P,S}_open_core`, …) — decoded
 //! 2026-06-10 in the local Ghidra GUI.
 //!
-//! Status: **SCAFFOLD — fail-closed.** Not because the protocol is unknown
-//! (it is fully verified), but because **there is no live S11 unit on the
-//! fleet** to validate a bring-up against. `init_chain` therefore refuses to
-//! drive hardware until an operator validates it on a real S11. The verified
-//! facts are captured so that validation is a bring-up exercise, not an RE one.
+//! Status: **SCAFFOLD — fail-closed.** The S17 factory jig establishes a
+//! BM1391 ASIC command dialect, but it does not establish the S15/T15 control-
+//! board FIFO layout, reset/enable GPIOs, voltage-controller command unit, or
+//! safe energization envelope. Every mutating [`ChipDriver`] entry point
+//! therefore refuses. The host-only S17-jig observation decoder below is kept
+//! deliberately separate from the carrier-independent trait decoder.
 //!
 //! ## BM1391 baud generation (the key family fact, jig-verified)
 //! BM1391 is **Generation-1** (like BM1387/S9): the chain UART baud is set via
@@ -44,26 +45,38 @@ use dcentrald_hal::fpga_chain::FpgaChain;
 /// BM1391 chip ID. Read from the chip-address register (reg 0x00, bits 31:16).
 pub const CHIP_ID: u16 = 0x1391;
 
-/// Default chips per chain for the S11 hashboard (BHB91601/BHB91603).
-/// Sourced from the AMTC S11 (`V11-S`) Config.ini (AsicNum=60). Verify on a
-/// live S11 — the driver enumerates, this is the passthrough fallback only.
-pub const DEFAULT_CHIPS_PER_CHAIN: u8 = 60;
+/// No model-independent BM1391 chain count exists in the held corpus.
+///
+/// The S15 maintenance guide is internally inconsistent: its hashrate formula
+/// names 60 chips while its 12 voltage domains of six chips imply 72. The held
+/// S15 and T15 stock releases enumerate 72 and 60 replies respectively, but
+/// release-scoped software counts do not establish a universal physical chain
+/// fallback for S11/S15/T15. The generic driver therefore has no default.
+pub const DEFAULT_CHIPS_PER_CHAIN: Option<u8> = None;
 
-/// SHA-256 cores per BM1391 chip. **CORPUS CONFLICT (unresolved):** the AMTC
-/// S11 `Config.ini` says `CoreNum=128` (BM1390P die), but the S11
-/// `single-board-test` jig calls `open_core_onChain(114)` (docs/dev/
-/// 2026-06-10-hashsource-binaries-re/findings/bm1391-s11.md §7). Both are
-/// corpus-sourced. Kept at 128 (Config.ini) but NEEDS-LIVE-VERIFY via a live
-/// S15/S11 `open_core` count or the datasheet before this drives any real
-/// open-core loop. (Driver is fail-closed, so this never runs live today.)
-const CORES_PER_CHIP: u32 = 128;
+/// SHA-256 cores per BM1391 chip.
+///
+/// Bitmain's S17 factory jig passes `256` to every BM1391
+/// `calculate_core_number` path. The official S15 maintenance guide independently
+/// states `frequency × chip core number 256 × chip number 60` on page 11. The
+/// core-count corroboration remains useful even though the guide's chip-count
+/// statements do not establish release-independent geometry.
+const CORES_PER_CHIP: u32 = 256;
 
-/// Nonce response body length. BM1391 (Gen-1) uses the 9-byte response frame
-/// like BM1387. NEEDS-LIVE-VERIFY against `single_BM1391_check_nonce`.
+/// No BM1391 runtime mutation is authorized by this scaffold.
+pub const RUNTIME_MUTATION_AUTHORIZED: bool = false;
+
+/// Legacy scaffold placeholder for an unverified raw-ASIC response length.
+///
+/// The held S17 jig and exact S15/T15 miners consume an FPGA-normalized pair of
+/// `u32` words (8 bytes). That does not establish the pre-FPGA ASIC wire reply
+/// length. Conversely, the verified 9-byte BM1391 register-*write* command does
+/// not establish a 9-byte reply. The driver stays unregistered and fail-closed.
 pub const RESPONSE_BYTES: usize = 9;
+pub const RESPONSE_BYTES_VERIFIED: bool = false;
 
-/// 200 MHz fallback PLL value — pure SSOT (`dcentrald_common::BM1391_PLL_FALLBACK_200M`).
-const PLL_FALLBACK_200M: u32 = dcentrald_common::BM1391_PLL_FALLBACK_200M;
+/// Held S17-jig 200 MHz fallback; not the exact S15/T15 register payload.
+const S17_JIG_PLL_FALLBACK_200M: u32 = dcentrald_common::BM1391_S17_JIG_PLL_FALLBACK_200M;
 
 /// BM1391 register addresses — JIG-VERIFIED from `BM1391_set_config` call sites.
 pub mod regs {
@@ -82,8 +95,84 @@ pub mod regs {
     pub const PLL0_DIVIDER: u8 = 0x70;
 }
 
-/// BM1391 driver — jig-verified scaffold (no live S11 unit to validate against).
+/// BM1391 driver — jig-verified scaffold with no admitted S15/T15 carrier.
 pub struct Bm1391Driver;
+
+/// Host-decoded nonce observation in the exact two-word format consumed by
+/// Bitmain's held S17 `single-board-test` BM1391 jig.
+///
+/// This is evidence tooling, not an S15/T15 carrier contract. In particular,
+/// it grants no FIFO address, reset GPIO, voltage, or work-submission authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S17JigNonceObservation {
+    pub nonce: u32,
+    pub chip_index: u8,
+    pub core_index: u8,
+    pub work_id: u16,
+}
+
+/// Decode the held S17 jig's `single_BM1391_check_nonce` two-word observation.
+///
+/// The decompiled jig uses word 0 bit 31 to distinguish nonces from register
+/// replies, requires `(word0 & 0xe0) == 0x80`, extracts `work_id` from the high
+/// halfword masked with `0x7fff`, takes the raw ASIC address from word 1's high
+/// byte, divides it by the jig's chain address interval, and takes the core
+/// index from word 1's low byte. Bounds are supplied by the caller because the
+/// observation itself does not carry chain geometry.
+pub fn decode_s17_jig_nonce_observation(
+    raw: &[u32; 2],
+    address_interval: u8,
+    expected_chip_count: u8,
+) -> Result<S17JigNonceObservation> {
+    if address_interval == 0 {
+        return Err(crate::AsicError::InvalidParameter(
+            "BM1391 S17-jig decode requires a non-zero address interval".into(),
+        ));
+    }
+    if expected_chip_count == 0 {
+        return Err(crate::AsicError::InvalidParameter(
+            "BM1391 S17-jig decode requires a non-zero expected chip count".into(),
+        ));
+    }
+
+    let flags = raw[0];
+    if flags & 0x8000_0000 == 0 {
+        return Err(crate::AsicError::InvalidParameter(
+            "BM1391 S17-jig observation is a register reply, not a nonce".into(),
+        ));
+    }
+    if flags & 0x0000_00e0 != 0x0000_0080 {
+        return Err(crate::AsicError::InvalidParameter(format!(
+            "BM1391 S17-jig nonce flags are not admissible: 0x{:02x}",
+            flags & 0xff
+        )));
+    }
+
+    let raw_address = (raw[1] >> 24) as u8;
+    let chip_index = raw_address / address_interval;
+    if chip_index >= expected_chip_count {
+        return Err(crate::AsicError::InvalidParameter(format!(
+            "BM1391 S17-jig ASIC index {chip_index} is outside expected chain length {expected_chip_count}"
+        )));
+    }
+
+    Ok(S17JigNonceObservation {
+        nonce: raw[1],
+        chip_index,
+        core_index: raw[1] as u8,
+        work_id: ((raw[0] >> 16) & 0x7fff) as u16,
+    })
+}
+
+fn refuse_live_operation<T>(operation: &str) -> Result<T> {
+    tracing::warn!(
+        operation,
+        "BM1391 live operation refused: exact S15/T15 carrier and energization authority are unheld"
+    );
+    Err(crate::AsicError::InvalidParameter(format!(
+        "BM1391 {operation} is scaffold-only; exact S15/T15 carrier and energization authority are unheld"
+    )))
+}
 
 impl Default for Bm1391Driver {
     fn default() -> Self {
@@ -129,43 +218,27 @@ impl ChipDriver for Bm1391Driver {
         //   chain_inactive → set_address(interval) → set_BM1391_freq (PLL0 reg
         //   0x08 + divider reg 0x70) → enable_core_clock → set_TM (reg 0x14,
         //   bit-reversed) → set_baud (MiscControl reg 0x18 divider) → open_core.
-        // It is NOT wired to live hardware until an operator validates it on a
-        // real S11 — there is no S11 on the fleet to prove a bring-up against.
-        tracing::warn!(
-            "BM1391 init_chain: jig-verified scaffold — refusing live bring-up until \
-             validated on a real S11 (no live unit on the fleet)."
-        );
-        Err(crate::AsicError::InvalidParameter(
-            "BM1391 driver is a jig-verified scaffold; live bring-up is gated until an \
-             operator validates it on an Antminer S11."
-                .into(),
-        ))
+        // This sibling-jig sequence is not S15/T15 carrier or rail authority.
+        refuse_live_operation("init_chain")
     }
 
     fn set_frequency(&self, _chain: &mut FpgaChain, _chip_addr: u8, _freq_mhz: u16) -> Result<()> {
-        tracing::warn!("BM1391 set_frequency: scaffold (PLL0 reg 0x08 + divider reg 0x70)");
-        Err(crate::AsicError::InvalidParameter(
-            "BM1391 set_frequency gated until live S11 validation".into(),
-        ))
+        refuse_live_operation("set_frequency")
     }
 
     fn set_voltage(&self, _pic: &mut PicController, _voltage_mv: u16) -> Result<()> {
-        // S11 uses a PIC/dsPIC voltage path (BHB916xx). Voltage control gated
-        // until the controller identity is confirmed on a live unit.
-        tracing::warn!("BM1391 set_voltage: scaffold — controller identity unconfirmed");
-        Ok(())
+        // A successful no-op is unsafe here: callers could mistake it for a
+        // verified rail transition. Refuse until the exact controller, units,
+        // envelope, heartbeat, and readback contract are admitted.
+        refuse_live_operation("set_voltage")
     }
 
     fn send_work(&self, _chain: &mut FpgaChain, _work: &MiningWork) -> Result<u16> {
-        Err(crate::AsicError::InvalidParameter(
-            "BM1391 send_work gated until live S11 validation".into(),
-        ))
+        refuse_live_operation("send_work")
     }
 
     fn decode_nonce(&self, _raw: &[u32; 2]) -> Result<NonceResult> {
-        Err(crate::AsicError::InvalidParameter(
-            "BM1391 decode_nonce gated until live S11 validation".into(),
-        ))
+        refuse_live_operation("decode_nonce")
     }
 
     fn baud_reg_value(&self, target_baud: u32, fpga_clock_hz: u32) -> u32 {
@@ -193,7 +266,8 @@ impl ChipDriver for Bm1391Driver {
     }
 
     fn pll_params(&self, freq_mhz: u16) -> PllConfig {
-        // G42 pure SSOT: jig set_BM1391_freq pack + external div (not freq/25 invent).
+        // G42 S17-jig SSOT preview only. This trait remains fail-closed; exact
+        // S15/T15 stock solving/programming lives in bm1391_stock_startup.
         let sol = dcentrald_common::resolve_bm1391_pll(freq_mhz);
         PllConfig {
             fb_div: sol.fb_div,
@@ -224,7 +298,7 @@ mod tests {
         assert_eq!(regs::PLL0_DIVIDER, 0x70);
         assert_eq!(regs::TICKET_MASK, 0x14);
         assert_eq!(regs::MISC_CONTROL, 0x18);
-        assert_eq!(PLL_FALLBACK_200M, 0xC078_0111);
+        assert_eq!(S17_JIG_PLL_FALLBACK_200M, 0xC078_0111);
     }
 
     #[test]
@@ -233,19 +307,84 @@ mod tests {
         let pll = Bm1391Driver::new().pll_params(200);
         assert_eq!(pll.fb_div, 120);
         assert_eq!(pll.reg_value, 0xC078_0111);
-        assert_eq!(pll.reg_value, PLL_FALLBACK_200M);
+        assert_eq!(pll.reg_value, S17_JIG_PLL_FALLBACK_200M);
         let pure = dcentrald_common::resolve_bm1391_pll(200);
         assert_eq!(pll.reg_value, pure.pll0_register);
         assert_eq!(pure.external_div, 15);
+        assert_eq!(
+            S17_JIG_PLL_FALLBACK_200M & 0x3fff_ffff,
+            dcentrald_common::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_WORD
+        );
+        assert_eq!(
+            dcentrald_common::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_REGISTER_PAYLOAD,
+            0x4078_0111
+        );
+        assert_ne!(
+            pll.reg_value,
+            dcentrald_common::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_REGISTER_PAYLOAD
+        );
+        assert!(!dcentrald_common::BM1391_S17_JIG_PLL_AUTHORIZES_S15_T15_PROGRAMMING);
     }
 
     #[test]
     fn bm1391_init_is_fail_closed() {
-        // No live S11 unit → must refuse live bring-up.
+        // Exact S15/T15 carrier and energization authority are unheld.
         let d = Bm1391Driver::new();
         // (init_chain needs a FpgaChain; the contract is asserted by the
         // Err-return in the impl — pinned here as a doc invariant.)
-        assert_eq!(d.cores_per_chip(), 128);
-        assert_eq!(d.response_length(), 9);
+        assert!(!RUNTIME_MUTATION_AUTHORIZED);
+        assert_eq!(DEFAULT_CHIPS_PER_CHAIN, None);
+        assert_eq!(d.cores_per_chip(), 256);
+        assert_eq!(d.response_length(), RESPONSE_BYTES);
+        assert_eq!(RESPONSE_BYTES, 9, "legacy raw-ASIC placeholder only");
+        assert!(!RESPONSE_BYTES_VERIFIED);
+        assert_eq!(dcentrald_common::BM1391_STOCK_FPGA_RETURN_RECORD_LEN, 8);
+        assert_ne!(
+            RESPONSE_BYTES,
+            dcentrald_common::BM1391_STOCK_FPGA_RETURN_RECORD_LEN,
+            "raw ASIC wire replies and FPGA-normalized records are different layers"
+        );
+        for operation in [
+            "init_chain",
+            "set_frequency",
+            "set_voltage",
+            "send_work",
+            "decode_nonce",
+        ] {
+            let err = refuse_live_operation::<()>(operation).expect_err("must refuse");
+            assert!(err.to_string().contains(operation));
+        }
+    }
+
+    #[test]
+    fn s17_jig_nonce_observation_is_bounded_and_does_not_unlock_trait_decode() {
+        // Synthetic words exercise the exact held-jig bit extraction. They are
+        // not presented as a captured S15/T15 nonce.
+        let raw = [0x9234_0080, 0x3000_00a5];
+        let decoded = decode_s17_jig_nonce_observation(&raw, 0x10, 4).unwrap();
+        assert_eq!(
+            decoded,
+            S17JigNonceObservation {
+                nonce: 0x3000_00a5,
+                chip_index: 3,
+                core_index: 0xa5,
+                work_id: 0x1234,
+            }
+        );
+
+        let driver_err = match Bm1391Driver::new().decode_nonce(&raw) {
+            Ok(_) => panic!("S17 jig evidence must not authorize a carrier decoder"),
+            Err(err) => err,
+        };
+        assert!(driver_err.to_string().contains("decode_nonce"));
+    }
+
+    #[test]
+    fn s17_jig_nonce_observation_rejects_non_nonce_flags_and_bad_geometry() {
+        assert!(decode_s17_jig_nonce_observation(&[0x1234_0080, 0], 1, 1).is_err());
+        assert!(decode_s17_jig_nonce_observation(&[0x9234_00c0, 0], 1, 1).is_err());
+        assert!(decode_s17_jig_nonce_observation(&[0x9234_0080, 0], 0, 1).is_err());
+        assert!(decode_s17_jig_nonce_observation(&[0x9234_0080, 0], 1, 0).is_err());
+        assert!(decode_s17_jig_nonce_observation(&[0x9234_0080, 0x4000_0000], 0x10, 4).is_err());
     }
 }

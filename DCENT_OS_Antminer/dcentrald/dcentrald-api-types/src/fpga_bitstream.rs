@@ -417,6 +417,54 @@ pub const HELD_BITSTREAM_ARTIFACTS: &[HeldBitstreamArtifact] = &[
     },
 ];
 
+/// Evidence state for the CPLD-interface axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpldInterfaceInventoryState {
+    /// A completed binary-aware part scan, independent filename-extension
+    /// census, and source-registry scan found no CPLD device, image, or
+    /// executable interface in the held scope.
+    HeldCorpusNegativeNoDeviceOrConfigArtifact,
+}
+
+/// First-class negative capability record for the CPLD axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpldInterfaceCapability {
+    pub identifier: &'static str,
+    pub state: CpldInterfaceInventoryState,
+    pub evidence_source: &'static str,
+    pub completed_binary_part_scan: bool,
+    pub fresh_config_extension_census: bool,
+    pub fresh_source_registry_scan: bool,
+    pub independent_second_extractions_scan_complete: bool,
+    pub cpld_device_observed: bool,
+    pub cpld_config_artifact_observed: bool,
+    pub executable_interface_observed: bool,
+    pub runtime_admission_authorized: bool,
+    pub programming_authorized: bool,
+}
+
+/// Canonical CPLD-interface inventory for the held DCENT hardware scope.
+///
+/// The single row is a declared absence, not an unknown or a failed actuator.
+/// Programmable glue that does exist is FPGA soft logic and remains inventoried
+/// separately.  The incomplete independent second pass is retained explicitly
+/// rather than hidden behind the otherwise high-confidence negative.
+pub const CPLD_INTERFACE_CAPABILITIES: &[CpldInterfaceCapability] = &[CpldInterfaceCapability {
+    identifier: "held-corpus-no-cpld-device-or-config-artifact",
+    state: CpldInterfaceInventoryState::HeldCorpusNegativeNoDeviceOrConfigArtifact,
+    evidence_source: "C2-CPLD-GLUE-LOGIC plus fresh 2026-08-09 extension/source census",
+    completed_binary_part_scan: true,
+    fresh_config_extension_census: true,
+    fresh_source_registry_scan: true,
+    independent_second_extractions_scan_complete: false,
+    cpld_device_observed: false,
+    cpld_config_artifact_observed: false,
+    executable_interface_observed: false,
+    runtime_admission_authorized: false,
+    programming_authorized: false,
+}];
+
 /// **The am2 fabric, identified at the desk (2026-08-03).**
 ///
 /// The GZIP member at the head of
@@ -497,6 +545,25 @@ pub const LOADED_FABRIC_IDENTITY_IS_UNDETERMINED: bool = true;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpld_axis_is_a_typed_negative_not_an_unknown_interface() {
+        assert_eq!(CPLD_INTERFACE_CAPABILITIES.len(), 1);
+        let capability = CPLD_INTERFACE_CAPABILITIES[0];
+        assert_eq!(
+            capability.state,
+            CpldInterfaceInventoryState::HeldCorpusNegativeNoDeviceOrConfigArtifact
+        );
+        assert!(capability.completed_binary_part_scan);
+        assert!(capability.fresh_config_extension_census);
+        assert!(capability.fresh_source_registry_scan);
+        assert!(!capability.independent_second_extractions_scan_complete);
+        assert!(!capability.cpld_device_observed);
+        assert!(!capability.cpld_config_artifact_observed);
+        assert!(!capability.executable_interface_observed);
+        assert!(!capability.runtime_admission_authorized);
+        assert!(!capability.programming_authorized);
+    }
 
     /// The first 118 bytes of
     /// `DCENT_OS_Antminer/

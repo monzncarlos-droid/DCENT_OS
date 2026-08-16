@@ -49,6 +49,7 @@ pub const PLANNER_OUTCOME_VALUES: &[&str] =
 pub const PROOF_SCOPE_VALUES: &[&str] = &[
     "exact_target",
     "exact_target_lab_only",
+    "local_artifact_only",
     "passthrough_only",
     "physical_media_required",
     "upload_only_boot_pending",
@@ -187,6 +188,8 @@ pub enum ProofScope {
     ExactTarget,
     #[serde(rename = "exact_target_lab_only")]
     ExactTargetLabOnly,
+    #[serde(rename = "local_artifact_only")]
+    LocalArtifactOnly,
     #[serde(rename = "passthrough_only")]
     PassthroughOnly,
     #[serde(rename = "physical_media_required")]

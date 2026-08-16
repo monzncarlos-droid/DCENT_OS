@@ -122,14 +122,14 @@ pub fn parse_serial_chip_address_body(
         AsicProtocolIdentity::Bm1366
         | AsicProtocolIdentity::Bm1368
         | AsicProtocolIdentity::Bm1370 => 0x00,
-        // BM1391 belongs here for a stronger reason than "we have not decoded
-        // it yet": BM1391 enumerates register-compatible as `0x1387`, so a chain
-        // that answers a literal `0x1391` is reporting something we have never
-        // captured. Registering the catalog identity in `board_desc` must not
-        // become permission to decode that response — assigning it a core-count
-        // encoding (`0x03` or `0x00`) would be a fail-open on a live chain.
+        // Exact S15/T15 miners compare register 0's high word with `0x1391`, but
+        // this serial response parser has no captured BM1391 core-count layout;
+        // the sibling S11 jig supplies no model-ID frame either. Registering the
+        // catalog identity in `board_desc` must not become permission to invent
+        // that layout — assigning it `0x03` or `0x00` would fail open.
         AsicProtocolIdentity::Bm1387
         | AsicProtocolIdentity::Bm1391
+        | AsicProtocolIdentity::Bm1393
         | AsicProtocolIdentity::Bm1396
         | AsicProtocolIdentity::Bm1397
         | AsicProtocolIdentity::Bm1398 => {

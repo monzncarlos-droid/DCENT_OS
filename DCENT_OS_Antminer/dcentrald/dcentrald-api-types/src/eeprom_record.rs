@@ -12,10 +12,10 @@
 //! The crypto layer lives separately:
 //! - EDF v5 / XXTEA caller-key path: `dcent-toolbox::core::eeprom_decoder`
 //!   (Python, already shipped as -T2 partial).
-//! - x19_plain / x19_J XXTEA: KDF unknown without further Ghidra work; the
-//!   structured-record decoder here will reject these variants until live
-//!   Ghidra evidence lands. The dispatcher recognizes them so the caller
-//!   gets a clean error rather than a guess.
+//! - x19_plain / x19_J XXTEA: the deployed key and three-region framing are
+//!   closed in [`crate::deployed_eeprom`]. This module still keeps its legacy
+//!   post-cipher DTO dispatcher separate; callers holding a raw 256-byte page
+//!   must use that deployed decoder rather than treating ciphertext as plaintext.
 //!
 //! Preamble dispatch (per RE doc §2):
 //!
@@ -23,17 +23,18 @@
 //! |--------|----------|---------------|-------------------------------------|
 //! | `0x04` | `0x11`   | x19_plain/x19_J | BHB42xxx (S19/S19j Pro/T19; BM1398/BM1362) |
 //! | `0x05` | `0x11`   | edf_v5_xxtea  | BHB56xxx, BHB68xxx (BM1366/BM1368)  |
-//! | `0x01` | `0x41`   | format1 (not dispatched here) | A3HB4xxxx / A3HB7xxxx (S21 Pro/XP; BM1370) |
+//! | `0x01` | `0x41`   | format1_plaintext_name | A3HB4xxxx / A3HB7xxxx (S21 Pro/XP; BM1370) |
 //! | `'B'`  | `'r'`    | braiinsminer  | BMM100/BMM101                       |
 //! | other  | other    | UnknownPreamble | rejected with parse error         |
 //!
-//! **Format 1 note (2026-08-02):** A3HB-prefixed boards are format 1, NOT
-//! format 5. Their header is `0x01 0x41`, where `0x41` is `board_name[0]`
-//! (`'A'`), NOT a key-version selector — `board_name` sits in a 16-byte
-//! plaintext header. Format 1 is not dispatched by `dispatch()` here (the
-//! enciphered-body decode is a separate item); it currently falls to
-//! `UnknownPreamble`, but the plaintext SKU still resolves board identity via
-//! `scan_known_sku`. Evidence:
+//! **Format 1 note (2026-08-02; body decode landed rank 20, 2026-08-04):**
+//! A3HB-prefixed boards are format 1, NOT format 5. Their header is `0x01 0x41`,
+//! where `0x41` is `board_name[0]` (`'A'`), NOT a key-version selector —
+//! `board_name` sits in a 16-byte plaintext header. `dispatch()` now returns a
+//! structured, IDENTITY-ONLY [`Format1PlaintextNameRecord`] read from the known
+//! plaintext offset `raw[1..16]`; the enciphered body key is unrecovered, so
+//! every V/F/sweep/serial/CRC field stays absent (never falls back to a sibling
+//! SKU's envelope). Evidence:
 //! evidence/epic-eeprom-matched-samples-20.json` (A3HB70501/70601/70701
 //! `fmt=1|keyver=65`). **Dispatch is always on `raw[0]`; never map a SKU to a
 //! format** (`BHB56801` appears as both format 4 and 5).
@@ -51,11 +52,14 @@ pub const RAW_EEPROM_DECODE_SCHEMA: &str = "dcentos.eeprom.raw_decode.v1";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "variant", rename_all = "snake_case")]
 pub enum EepromRecord {
-    /// BHB42xxx (early S19/S19j Pro), XXTEA-encrypted. KDF unknown
-    /// without further RE; we expose the preamble + raw payload only.
+    /// BHB42xxx (early S19/S19j Pro), XXTEA-encrypted. Raw deployed-page
+    /// decryption lives in [`crate::deployed_eeprom`]; this legacy record keeps
+    /// the preamble + raw payload only.
     X19Plain(X19PlainRecord),
-    /// BHB428xx (later S19j Pro), XXTEA-encrypted with explicit PT1/PT2
-    /// + sensor rows. KDF unknown.
+    /// Exact BHB428xx BM1362 SKUs, XXTEA-encrypted with explicit PT1/PT2;
+    /// marketing-model binding unresolved.
+    /// + sensor rows. Raw deployed-page decryption lives in
+    /// [`crate::deployed_eeprom`].
     X19J(X19JRecord),
     /// BHB56xxx / BHB68xxx (BM1366/BM1368), EDF v5 header with XXTEA
     /// algorithm and explicit key index. (A3HB-prefixed S21 Pro/XP boards
@@ -66,7 +70,124 @@ pub enum EepromRecord {
     X21Aes(X21AesRecord),
     /// Braiins BMM100/101 boards.
     Braiinsminer(BraiinsminerRecord),
+    /// A3HB4xxxx / A3HB7xxxx (S21 Pro / S21 XP, BM1370) — **format 1**
+    /// `0x01 0x41`. Only the plaintext `board_name` is recoverable; the
+    /// enciphered body key is unrecovered, so this is an IDENTITY-ONLY partial
+    /// decode. See [`Format1PlaintextNameRecord`].
+    Format1PlaintextName(Format1PlaintextNameRecord),
 }
+
+/// Maturity of the host-side, read-only decoder for one [`EepromRecord`]
+/// family.
+///
+/// This is deliberately about bytes already held by the host. It is not a
+/// board-admission, tuning, runtime, or write-authority state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EepromDecodeCapabilityState {
+    /// A deployed 256-byte page is decoded by [`crate::deployed_eeprom`] using
+    /// the header-selected XXTEA key and exact three-region framing.
+    DeployedReadOnlyDecode,
+    /// Only the exact plaintext board-name field is decoded; the encrypted
+    /// body and every factory tuning field remain unavailable.
+    IdentityOnlyDecode,
+    /// The preamble is recognized and opaque bytes are retained, but no body
+    /// fields are decoded.
+    PreambleOnly,
+    /// A legacy helper accepts caller-prepared structured plaintext; there is
+    /// no raw deployed-page decoder for this variant in this crate.
+    StructuredHelperOnly,
+}
+
+/// Exact, non-authorizing capability record for one EEPROM format variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EepromFormatCapability {
+    pub variant: &'static str,
+    pub state: EepromDecodeCapabilityState,
+    pub decoder: &'static str,
+    pub integrity_scope: &'static str,
+    pub identity_fields_decoded: bool,
+    pub factory_tuning_fields_decoded: bool,
+    pub runtime_admission_authorized: bool,
+    pub tuning_authorized: bool,
+    pub write_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for the six [`EepromRecord`] variants.
+///
+/// `X19J` is kept distinct because it is a public DTO variant, even though the
+/// deployed decoder returns the common [`crate::deployed_eeprom::DeployedHashboardIdentity`]
+/// rather than constructing `EepromRecord::X19J` directly. Format 4/5 CRC5 is
+/// advisory by design and is named as such instead of being overstated as an
+/// authentication or admission gate.
+pub const EEPROM_FORMAT_CAPABILITIES: &[EepromFormatCapability] = &[
+    EepromFormatCapability {
+        variant: "X19Plain",
+        state: EepromDecodeCapabilityState::DeployedReadOnlyDecode,
+        decoder: "deployed_eeprom::decode_deployed_eeprom",
+        integrity_scope: "header-selected XXTEA plus advisory two-region CRC5",
+        identity_fields_decoded: true,
+        factory_tuning_fields_decoded: true,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+    EepromFormatCapability {
+        variant: "X19J",
+        state: EepromDecodeCapabilityState::DeployedReadOnlyDecode,
+        decoder: "deployed_eeprom::decode_deployed_eeprom (common identity DTO)",
+        integrity_scope: "header-selected XXTEA plus advisory two-region CRC5",
+        identity_fields_decoded: true,
+        factory_tuning_fields_decoded: true,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+    EepromFormatCapability {
+        variant: "EdfV5Xxtea",
+        state: EepromDecodeCapabilityState::DeployedReadOnlyDecode,
+        decoder: "deployed_eeprom::decode_deployed_eeprom",
+        integrity_scope: "header-selected XXTEA plus advisory two-region CRC5",
+        identity_fields_decoded: true,
+        factory_tuning_fields_decoded: true,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+    EepromFormatCapability {
+        variant: "Format1PlaintextName",
+        state: EepromDecodeCapabilityState::IdentityOnlyDecode,
+        decoder: "deployed_eeprom::decode_deployed_eeprom (format-1 branch)",
+        integrity_scope: "exact 256-byte page and bounded plaintext-name field only",
+        identity_fields_decoded: true,
+        factory_tuning_fields_decoded: false,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+    EepromFormatCapability {
+        variant: "Braiinsminer",
+        state: EepromDecodeCapabilityState::PreambleOnly,
+        decoder: "eeprom_record::dispatch",
+        integrity_scope: "Br preamble and opaque-byte retention only",
+        identity_fields_decoded: false,
+        factory_tuning_fields_decoded: false,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+    EepromFormatCapability {
+        variant: "X21Aes",
+        state: EepromDecodeCapabilityState::StructuredHelperOnly,
+        decoder: "eeprom_record::decode_x21_aes",
+        integrity_scope: "caller-prepared structured plaintext length/ASCII checks only",
+        identity_fields_decoded: true,
+        factory_tuning_fields_decoded: false,
+        runtime_admission_authorized: false,
+        tuning_authorized: false,
+        write_authorized: false,
+    },
+];
 
 /// Shape of an x21_aes plaintext record (post-AES decryption).
 ///
@@ -142,6 +263,32 @@ pub struct X19JRecord {
 pub struct BraiinsminerRecord {
     /// `Br!` magic + remaining payload (cipher unknown).
     pub raw_payload: Vec<u8>,
+}
+
+/// Shape of a **format-1** (`0x01 0x41`) A3HB-prefixed page (S21 Pro / S21 XP,
+/// BM1370).
+///
+/// Unlike every other variant this one carries a *readable* field:
+/// `board_name` sits in a 16-byte PLAINTEXT header at `raw[1..16]` (`raw[1]` is
+/// `board_name[0]`, the `'A'` that aliases as `0x41` — NOT a key selector). The
+/// remaining `raw[16..256]` is 240 bytes of fully-diffused ciphertext under a
+/// key D-Central does not hold, so **every enciphered field — default voltage,
+/// frequency, sweep curve, serial, CRC — is unrecoverable and stays absent.**
+///
+/// This struct deliberately has NO field that a downstream consumer could
+/// mistake for a V/F value: an S21 Pro/XP identity must never seed a voltage or
+/// PLL envelope from a sibling SKU (CONTEXT §1.2 — never inherit another board's
+/// energization envelope). Identity is all a format-1 page can honestly yield.
+///
+/// Evidence:
+/// (the `fmt == 1` branch) + `epic-eeprom-matched-samples-20.json`
+/// (A3HB70501/70601/70701, `format_version=1`, header byte-exact).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Format1PlaintextNameRecord {
+    /// The plaintext board name (`A3HB70501`, …) read from the KNOWN offset
+    /// `raw[1..16]`, NUL/space-trimmed. This is the ONLY field recoverable from
+    /// a format-1 page without the body key.
+    pub board_name: String,
 }
 
 /// Parse error returned by `dispatch()`.
@@ -262,6 +409,23 @@ pub fn dispatch(plaintext: &[u8]) -> Result<EepromRecord, EepromParseError> {
         (b'B', b'r') => Ok(EepromRecord::Braiinsminer(BraiinsminerRecord {
             raw_payload: plaintext.to_vec(), // includes the magic
         })),
+        (0x01, 0x41) => {
+            // Format 1 (A3HB4xxxx / A3HB7xxxx, S21 Pro/XP, BM1370). The header's
+            // second byte is board_name[0] = 'A' (0x41), NOT a key selector, so
+            // we only accept the exact observed (0x01, 0x41); any other second
+            // byte has no held evidence and falls through to UnknownPreamble.
+            //
+            // board_name is PLAINTEXT at raw[1..16]. Read it from that KNOWN
+            // offset — never scan the enciphered body (raw[16..256]), which is
+            // fully-diffused ciphertext that could spell a false catalog SKU by
+            // chance. The body key is unrecovered, so this is identity-only:
+            // every enciphered field is unreadable and stays absent (see
+            // `Format1PlaintextNameRecord`). Queue rank 20 / H3 #6.
+            let board_name = read_ascii_field(plaintext, 1, 15)?;
+            Ok(EepromRecord::Format1PlaintextName(
+                Format1PlaintextNameRecord { board_name },
+            ))
+        }
         (a, b) => Err(EepromParseError::UnknownPreamble { byte0: a, byte1: b }),
     }
 }
@@ -416,6 +580,24 @@ fn normalize_metadata_from_raw(
                 .push("Header 05 11 = EDF v5, XXTEA algorithm, key index 1.".to_string());
             metadata.board_sku = scan_known_sku(raw);
         }
+        Some(EepromRecord::Format1PlaintextName(rec)) => {
+            metadata.eeprom_format = Some("format1".to_string());
+            metadata.cipher = None; // body key unrecovered
+            metadata.confidence = "plaintext_name".to_string();
+            metadata.source = "eeprom_header_01_41".to_string();
+            metadata.notes.push(
+                "Header 01 41 = format 1; board_name is plaintext at raw[1..16], \
+                 enciphered body key unrecovered (V/F/sweep unreadable)."
+                    .to_string(),
+            );
+            // Identity comes from the KNOWN plaintext offset, never a full-page
+            // ciphertext scan — a diffused body could spell a false SKU.
+            metadata.board_sku = if rec.board_name.is_empty() {
+                None
+            } else {
+                Some(rec.board_name.clone())
+            };
+        }
         _ => {
             metadata.board_sku = scan_known_sku(raw);
         }
@@ -477,7 +659,6 @@ pub fn catalog_entry_for_sku(b_name: &str) -> Option<&'static BhbSkuCatalogEntry
 fn sku_matches_catalog_pattern(sku: &str, pattern: &str) -> bool {
     match pattern {
         "BHB426xx" => sku.starts_with("BHB426"),
-        "BHB428xx" => sku.starts_with("BHB428"),
         "BHB568xx / BHB569xx" => sku.starts_with("BHB568") || sku.starts_with("BHB569"),
         // W8 rank-9 (2026-08-03): there is deliberately NO `BHB68` prefix arm.
         // BHB68 SKUs resolve only through their 8 exact roster rows; an
@@ -537,15 +718,18 @@ pub struct BhbSkuCatalogEntry {
 
 /// Known BHB/A3HB SKU-to-chip-family catalog.
 ///
-/// Source anchors:
-/// -  secs 1.5-1.11
-///   classifies `BHB42801`, `BHB42811`, `BHB42821`, `BHB42831`, and
-///   `BHB42841` as S19 XP / S19j XP BM1366 profile rows.
-/// -  line 278
-///   lists the same `BHB428xx` SKUs in the BM1366 board set.
+/// Source anchors for the BHB428 correction (2026-08-09):
+/// - the exact ePIC v1.22.0 jig roster reports all six BHB428 SKUs as
+///   `BM1362` / chip address `0x1362`;
+/// - the held matched-page corpus contains exact format-4 pages for
+///   `BHB42801` and `BHB42831`; both decrypt with the BM1362 lot-code letter
+///   `C` and their factory V/F values agree with the BM1362 PVT tables;
+/// - `dcentrald-silicon-profiles::{hashboards,hashboard_catalog,bm1362}` and
+///   the exact topology JSON independently carry the same six BM1362 rows.
 ///
-/// Keep `BHB428xx -> BM1366` load-bearing; older model notes contained a
-/// stale `BHB42801 -> BM1362` line.
+/// The former `BHB428xx -> BM1366` prefix was a stale documentation inference.
+/// It is deliberately replaced by six exact rows: an unobserved future
+/// `BHB428*` suffix must resolve to `None`, never inherit a chip family.
 ///
 /// ## Prefer EXACT `model_id` rows; prefixes are the legacy shape (UB-26)
 ///
@@ -567,8 +751,9 @@ pub struct BhbSkuCatalogEntry {
 /// `-> BM1370` mis-labels the likely-BM1368 unknown, `-> BM1368` would
 /// mis-label a future genuine BM1370 `BHB68…`. Neither is evidence, so an
 /// unknown must be `None` (per-SKU evidence adds a new EXACT row). The
-/// remaining `BHB426xx`/`BHB428xx`/`BHB568xx/BHB569xx` prefixes are separate
-/// adjudications with their own evidence base and are unchanged here.
+/// remaining `BHB426xx`/`BHB568xx/BHB569xx` prefixes are separate
+/// adjudications with their own evidence base and are unchanged here. BHB428
+/// is exact-keyed for the reason above.
 ///
 /// The exact-keyed, roster-complete counterpart (50 SKUs, with per-row
 /// provenance and no prefix matching at all) is
@@ -604,13 +789,62 @@ pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
                Held page observed as format 4 (0x04 0x11); dispatch is still always on raw[0].",
     },
     BhbSkuCatalogEntry {
-        pattern: "BHB428xx",
-        chip_family: "BM1366",
-        model_family: "S19 XP / S19j XP / S19j XP Plus",
+        pattern: "BHB42801",
+        chip_family: "BM1362",
+        model_family: "S19j Pro+ / S19j+ BM1362 high-bin family",
         eeprom_variant: "x19_plain",
         confidence: "high",
-        source: " secs 1.5-1.11;  line 278",
-        note: "Corrects the stale BHB42801->BM1362 mapping; BHB428xx is BM1366.",
+        source: "held epic-eeprom-matched-samples-20.json BHB42801 format-4 page; \
+                 epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact page-backed row; no BHB428 prefix inference. Lot-code family C and \
+               factory 675 MHz/16000 cV-like value corroborate the BM1362 profile.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB42803",
+        chip_family: "BM1362",
+        model_family: "S19j Pro-A BM1362 repair-class",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "medium",
+        source: "epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact roster/PVT row; no held deployed page for this SKU and no prefix admission.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB42811",
+        chip_family: "BM1362",
+        model_family: "S19j+ BM1362 high-bin family",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "medium",
+        source: "epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact roster/PVT row; no held deployed page for this SKU and no prefix admission.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB42821",
+        chip_family: "BM1362",
+        model_family: "S19j+ BM1362 high-bin family",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "medium",
+        source: "epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact roster/PVT row; no held deployed page for this SKU and no prefix admission.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB42831",
+        chip_family: "BM1362",
+        model_family: "S19j+ BM1362 high-bin family",
+        eeprom_variant: "x19_plain",
+        confidence: "high",
+        source: "held epic-eeprom-matched-samples-20.json BHB42831 format-4 page; \
+                 epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact page-backed row; no BHB428 prefix inference. Lot-code family C and \
+               factory 645 MHz/15300 cV-like value corroborate the BM1362 profile.",
+    },
+    BhbSkuCatalogEntry {
+        pattern: "BHB42841",
+        chip_family: "BM1362",
+        model_family: "S19j+ BM1362 low-power bin",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "medium",
+        source: "epic jig DB BM1362/0x1362; silicon-profiles BM1362 PVT/topology",
+        note: "Exact roster/PVT row; no held deployed page for this SKU and no prefix admission.",
     },
     BhbSkuCatalogEntry {
         pattern: "BHB568xx / BHB569xx",
@@ -826,6 +1060,80 @@ pub fn chip_family_for_sku(b_name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_capability_registry_is_exhaustive_and_exact() {
+        let variants: std::collections::BTreeSet<&str> = EEPROM_FORMAT_CAPABILITIES
+            .iter()
+            .map(|capability| capability.variant)
+            .collect();
+        assert_eq!(EEPROM_FORMAT_CAPABILITIES.len(), 6);
+        assert_eq!(variants.len(), EEPROM_FORMAT_CAPABILITIES.len());
+        assert_eq!(
+            variants,
+            [
+                "Braiinsminer",
+                "EdfV5Xxtea",
+                "Format1PlaintextName",
+                "X19J",
+                "X19Plain",
+                "X21Aes",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let state = |variant| {
+            EEPROM_FORMAT_CAPABILITIES
+                .iter()
+                .find(|capability| capability.variant == variant)
+                .expect("every public record variant has a capability row")
+                .state
+        };
+        for variant in ["X19Plain", "X19J", "EdfV5Xxtea"] {
+            assert_eq!(
+                state(variant),
+                EepromDecodeCapabilityState::DeployedReadOnlyDecode
+            );
+        }
+        assert_eq!(
+            state("Format1PlaintextName"),
+            EepromDecodeCapabilityState::IdentityOnlyDecode
+        );
+        assert_eq!(
+            state("Braiinsminer"),
+            EepromDecodeCapabilityState::PreambleOnly
+        );
+        assert_eq!(
+            state("X21Aes"),
+            EepromDecodeCapabilityState::StructuredHelperOnly
+        );
+    }
+
+    #[test]
+    fn format_capability_registry_never_grants_hardware_authority() {
+        for capability in EEPROM_FORMAT_CAPABILITIES {
+            assert!(!capability.runtime_admission_authorized);
+            assert!(!capability.tuning_authorized);
+            assert!(!capability.write_authorized);
+            assert!(!capability.decoder.is_empty());
+            assert!(!capability.integrity_scope.is_empty());
+        }
+
+        let format1 = EEPROM_FORMAT_CAPABILITIES
+            .iter()
+            .find(|capability| capability.variant == "Format1PlaintextName")
+            .unwrap();
+        assert!(format1.identity_fields_decoded);
+        assert!(!format1.factory_tuning_fields_decoded);
+
+        let braiins = EEPROM_FORMAT_CAPABILITIES
+            .iter()
+            .find(|capability| capability.variant == "Braiinsminer")
+            .unwrap();
+        assert!(!braiins.identity_fields_decoded);
+        assert!(!braiins.factory_tuning_fields_decoded);
+    }
+
     fn synthetic_x21_payload(serial: &str, b_name: &str) -> Vec<u8> {
         let mut payload = vec![0u8; 32];
         let s = serial.as_bytes();
@@ -937,12 +1245,14 @@ mod tests {
         assert_eq!(chip_family_for_sku("BHB56902"), Some("BM1366"));
         assert_eq!(chip_family_for_sku("BHB42601"), Some("BM1362"));
         assert_eq!(chip_family_for_sku("BHB42699"), Some("BM1362"));
-        assert_eq!(chip_family_for_sku("BHB42801"), Some("BM1366"));
-        assert_eq!(chip_family_for_sku("BHB42811"), Some("BM1366"));
-        assert_eq!(chip_family_for_sku("BHB42821"), Some("BM1366"));
-        assert_eq!(chip_family_for_sku("BHB42831"), Some("BM1366"));
-        assert_eq!(chip_family_for_sku("BHB42841"), Some("BM1366"));
-        assert_eq!(chip_family_for_sku("BHB428xx"), Some("BM1366"));
+        assert_eq!(chip_family_for_sku("BHB42801"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB42803"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB42811"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB42821"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB42831"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB42841"), Some("BM1362"));
+        assert_eq!(chip_family_for_sku("BHB428xx"), None);
+        assert_eq!(chip_family_for_sku("BHB42899"), None);
         assert_eq!(chip_family_for_sku("BHB56801"), Some("BM1366"));
         assert_eq!(chip_family_for_sku("BHB68603"), Some("BM1368"));
         assert_eq!(chip_family_for_sku("BHB68603-"), Some("BM1368"));
@@ -974,24 +1284,85 @@ mod tests {
     }
 
     #[test]
-    fn a3hb40601_format1_page_resolves_identity_without_edf_v5() {
+    fn a3hb40601_format1_page_resolves_identity_via_structured_partial_decode() {
         // A real format-1 page: header 0x01 0x41 then the plaintext board name
-        // (0x41 = board_name[0] = 'A'). dispatch() does not handle 0x01 (that
-        // is a separate enciphered-body item), so the preamble reads as
-        // UnknownPreamble — but the plaintext SKU must still resolve identity.
+        // (0x41 = board_name[0] = 'A'). Queue rank 20: dispatch() now returns a
+        // structured, IDENTITY-ONLY Format1PlaintextName record (body key
+        // unrecovered), so the status is MetadataOnly, not UnknownPreamble.
         let mut raw = vec![0u8; RAW_EEPROM_BLOB_LEN];
         raw[0] = 0x01;
         raw[1] = 0x41;
         raw[1..1 + b"A3HB40601".len()].copy_from_slice(b"A3HB40601");
 
         let report = decode_raw_256_blob(&raw);
-        // 0x01 0x41 is not a dispatched preamble here.
-        assert_eq!(report.status, RawEepromDecodeStatus::UnknownPreamble);
-        // ...but the plaintext SKU resolves board identity via scan_known_sku.
+        // Recognized preamble, body enciphered ⇒ MetadataOnly (never Decoded).
+        assert_eq!(report.status, RawEepromDecodeStatus::MetadataOnly);
+        assert!(matches!(
+            report.record,
+            Some(EepromRecord::Format1PlaintextName(_))
+        ));
+        // Identity resolves from the plaintext board_name at the known offset.
         assert_eq!(report.metadata.board_sku.as_deref(), Some("A3HB40601"));
         assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1370"));
         assert!(report.metadata.read_only);
         assert!(!report.metadata.writes_performed);
+    }
+
+    #[test]
+    fn format1_dispatch_reads_plaintext_name_not_ciphertext_noise() {
+        // Robustness win over scan_known_sku: the plaintext board_name at
+        // raw[1..16] is authoritative; a real catalog SKU planted in the
+        // enciphered body (raw[16..256]) must NOT hijack identity.
+        let mut raw = vec![0u8; RAW_EEPROM_BLOB_LEN];
+        raw[0] = 0x01;
+        raw[1] = 0x41;
+        raw[1..1 + b"A3HB70501".len()].copy_from_slice(b"A3HB70501");
+        // Plant a *different* real SKU (a BM1366 board) in the ciphertext body.
+        raw[64..64 + b"BHB56902".len()].copy_from_slice(b"BHB56902");
+
+        let rec = dispatch(&raw).unwrap();
+        match rec {
+            EepromRecord::Format1PlaintextName(r) => {
+                assert_eq!(r.board_name, "A3HB70501");
+            }
+            other => panic!("expected Format1PlaintextName, got {other:?}"),
+        }
+        let report = decode_raw_256_blob(&raw);
+        // Identity is the plaintext name (BM1370), NOT the body-noise BM1366 SKU.
+        assert_eq!(report.metadata.board_sku.as_deref(), Some("A3HB70501"));
+        assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1370"));
+    }
+
+    #[test]
+    fn format1_record_carries_no_encipherable_field_hard_none() {
+        // The queue's core safety contract: a format-1 record may carry ONLY the
+        // plaintext board_name. Nothing decodable from the (unheld-key)
+        // ciphertext body — voltage, frequency, sweep, serial, CRC — may appear,
+        // or a downstream consumer could seed an S21 Pro/XP energization
+        // envelope from a value it cannot actually read. Enforced structurally:
+        // the serialized record has exactly {variant, board_name}.
+        let rec = EepromRecord::Format1PlaintextName(Format1PlaintextNameRecord {
+            board_name: "A3HB70501".to_string(),
+        });
+        let v = serde_json::to_value(&rec).unwrap();
+        let obj = v.as_object().expect("record serializes to an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["board_name", "variant"],
+            "format-1 record must expose ONLY board_name (+ the variant tag); \
+             any V/F/serial/CRC field is a forbidden envelope leak"
+        );
+        // And a decoded format-1 page never claims a full-field Decoded status.
+        let mut raw = vec![0u8; RAW_EEPROM_BLOB_LEN];
+        raw[0] = 0x01;
+        raw[1] = 0x41;
+        raw[1..1 + b"A3HB70501".len()].copy_from_slice(b"A3HB70501");
+        let report = decode_raw_256_blob(&raw);
+        assert_ne!(report.status, RawEepromDecodeStatus::Decoded);
+        assert_eq!(report.metadata.serial_number, None);
+        assert_eq!(report.metadata.cipher, None);
     }
 
     /// UB-26 + W8 rank-9. The eight `BHB68xxx` roster SKUs resolve to BM1368
@@ -1095,16 +1466,21 @@ mod tests {
         }
     }
 
-    /// The new rows are IDENTITY LABELS. None of them widens the deployed-page
-    /// admission gate: `DEPLOYED_SKU_IDENTITY_POLICY` has no row for any of
-    /// them, so `observed_protocol_for_deployed_board_name` still refuses —
-    /// and in particular native BM1398 stays refused.
+    /// The non-page-backed new rows are IDENTITY LABELS only. BHB42701 is the
+    /// deliberate exception: its exact held matched page independently admits
+    /// BM1362. Every other row remains outside the deployed-page policy, and in
+    /// particular native BM1398 stays refused.
     #[test]
     fn new_exact_rows_do_not_widen_deployed_admission() {
         use crate::hashboard_eeprom::observed_protocol_for_deployed_board_name;
+        assert_eq!(
+            observed_protocol_for_deployed_board_name("BHB42701"),
+            Some(dcentrald_common::board_desc::AsicProtocolIdentity::Bm1362),
+            "BHB42701 has an exact held page and may mint only BM1362"
+        );
         for sku in [
-            "BHB42701", "BHB68601", "BHB68701", "BHB68703", "BHB68705", "BHB68707", "BHB68709",
-            "NBP1901", "NBS1902",
+            "BHB68601", "BHB68701", "BHB68703", "BHB68705", "BHB68707", "BHB68709", "NBP1901",
+            "NBS1902",
         ] {
             assert!(
                 catalog_entry_for_sku(sku).is_some(),
@@ -1139,16 +1515,18 @@ mod tests {
     }
 
     #[test]
-    fn bhb_sku_catalog_pins_bhb428xx_to_bm1366() {
-        let entry = BHB_SKU_CATALOG
-            .iter()
-            .find(|entry| entry.pattern == "BHB428xx")
-            .expect("BHB428xx catalog entry");
-
-        assert_eq!(entry.chip_family, "BM1366");
-        assert!(entry.note.contains("BHB42801->BM1362"));
-        assert!(entry.source.contains(""));
-        assert!(entry.source.contains(""));
+    fn bhb_sku_catalog_exact_keys_bhb428_as_bm1362() {
+        for sku in [
+            "BHB42801", "BHB42803", "BHB42811", "BHB42821", "BHB42831", "BHB42841",
+        ] {
+            let entry = catalog_entry_for_sku(sku).expect("exact BHB428 catalog entry");
+            assert_eq!(entry.pattern, sku, "{sku} must match its own exact row");
+            assert_eq!(entry.chip_family, "BM1362");
+            assert!(entry.source.contains("silicon-profiles"));
+        }
+        for sku in ["BHB428", "BHB428xx", "BHB42899", "BHB4289999"] {
+            assert_eq!(catalog_entry_for_sku(sku), None, "{sku} must fail closed");
+        }
     }
 
     #[test]
@@ -1263,18 +1641,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_256_x19_bhb428_metadata_uses_correct_bm1366_catalog() {
+    fn raw_256_x19_bhb428_metadata_uses_exact_bm1362_catalog() {
         let raw = synthetic_raw_blob([0x04, 0x11], "BHB42841");
         let report = decode_raw_256_blob(&raw);
 
         assert_eq!(report.status, RawEepromDecodeStatus::MetadataOnly);
         assert_eq!(report.metadata.board_sku.as_deref(), Some("BHB42841"));
-        assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1366"));
+        assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1362"));
         assert!(report
             .metadata
             .notes
             .iter()
-            .any(|note| note.contains("BHB42801->BM1362")));
+            .any(|note| note.contains("no held deployed page")));
     }
 
     #[test]

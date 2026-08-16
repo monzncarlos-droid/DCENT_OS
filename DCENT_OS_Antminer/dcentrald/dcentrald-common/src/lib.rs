@@ -23,12 +23,132 @@
 //!   deletion with directory fsync plus explicit publication/failure evidence.
 
 pub mod am2_topology;
+/// Desk-only XIL dual-chain CMD slot map for missing-SKU bring-up (RE-4A).
+pub mod xil_dual_chain_desk;
+pub mod s19k_bm1366_nopic_beta;
+pub mod s19k_bm1366_wire_b;
+/// Amlogic /dev/uart_trans job pack (desk 11d/11e) — host-testable.
+pub mod s19k_uart_trans_job;
+/// Braiins Track-1 mining-off raw-tty set_address probe (env-gated; host-testable).
+pub mod s19k_braiins_wire_try;
+/// Braiins Track-1 CLOSED 21 36 mining-on work TX (desk 11d/11f).
+pub mod s19k_braiins_job;
+/// am3-s19k GPIO437 PWR_CONTROL polarity pin (active LOW). Do not apply to S21.
+pub mod s19k_am3_gpio437;
+/// BM1366 raw-UART GetAddress + 11-byte RX classify (T4/T5). No dispatch hook.
+pub mod s19k_bm1366_uart_rx;
+/// BM1366 UART nonce → share reconstruction (ESP-Miner process_work).
+pub mod s19k_bm1366_share;
+/// Braiins Track-1 board#↔ttyS discover policy (T8). No hardcoded map.
+pub mod s19k_braiins_chain_discover;
+/// BM1366 EXPERIMENTAL init program (GetAddress / 0x53 inactive / set_address).
+pub mod s19k_bm1366_init_seq;
+/// Amlogic NAND install architecture + SKU-scoped GPIO437 SafeOff. FLASH NOT_YET.
+pub mod s19k_am3_install;
+/// Braiins `/tmp` deploy policy (ELF32 armhf, dual tty, rails held).
+pub mod s19k_braiins_tmp_deploy;
+/// Track-1 GetAddress silence vs GPIO437 / plug-detect (not a job-shape proof).
+pub mod s19k_passthrough_preflight;
+/// `a lab unit` bosminer `read_register(reg=0x0)` enum shortfall (77 expected).
+pub mod s19k_bosminer_enum;
+/// `a lab unit` `/dev/nand_env` U-Boot env (interrupt window + BOS/stock sequencer).
+pub mod s19k_nand_env;
+/// LuxOS-captured `axg_s400_antminer.dtb` NAND plats (`nand device 1` / nvdata).
+pub mod s19k_aml_dtb;
+/// BM1397 / S17 BHB07601 bring-up skeleton (IMPLEMENT items 1-12; host-testable).
+pub mod bm1397_s17_bhb07601;
+/// BM1398 / NBP1901 identity+geometry stub (admit=false; DESK_PENDING_BINARY wire).
+pub mod bm1398_nbp1901_stub;
+/// S21 VCO / domain climb HOLD pin (jig_clamp; autotune enabled=false).
+pub mod s21_vco_hold;
+pub mod s21_domain_adc;
 /// Canonical build target and published filename for each artifact claim.
 pub mod artifact_producer;
 /// Transport-neutral ASIC protocol pure admission + init program seed (ADR-0010 / P1-3).
 pub mod asic_protocol;
 pub mod at3_rail;
 pub mod atomic_file;
+/// Offline exact-release facts and fail-closed S15/T15 BM1391 carrier gaps.
+pub mod bm1391_carrier_profile;
+/// Exact-release S15/T15 BM1391 thermal/PIC safety evidence; pure and no-I/O.
+pub mod bm1391_safety_contract;
+/// Exact S15/T15 stock nonce-consumer duplicate/age/digest gates; pure replay only.
+pub mod bm1391_share_qualification;
+/// Exact S15/T15 stock BM1391 FPGA return-record and work-binding codec.
+pub mod bm1391_stock_return;
+/// Exact-release S15/T15 BM1391 PLL/voltage startup facts; pure and no-I/O.
+pub mod bm1391_stock_startup;
+/// Exact-release S15/T15 stock job decoder and pure FPGA publication planner.
+pub mod bm1391_stock_work;
+pub mod bm1396_auto_adapt_voltage;
+/// Exact stock-module and userspace-mapping BM1396 carrier preflight facts.
+pub mod bm1396_carrier_preflight;
+/// Exact signed-firmware BM1396 identity and per-present-chain geometry contract.
+pub mod bm1396_contract;
+pub mod bm1396_domain_voltage;
+/// Exact signed-firmware BM1396 userspace-to-FPGA register ABI facts.
+pub mod bm1396_fpga_abi;
+/// Release/model-scoped BM1396 startup and enumeration retry state machine.
+pub mod bm1396_lifecycle;
+pub mod bm1396_pic;
+pub mod bm1396_submit_receiver;
+pub mod bm1396_work;
+/// Exact BM1396 outstanding-work expansion and host nonce-ring consumer.
+pub mod bm1396_work_binding;
+/// Exact held L3+ PIC application and dormant updater replay; no authority.
+pub mod bm1485_l3plus_pic_firmware;
+/// Exact 2017 stock L3+ BM1485 UART/address/MISC facts; pure and no-I/O.
+pub mod bm1485_l3plus_stock;
+/// Exact held L3+ BeagleBone software-carrier tuple; offline evidence only.
+pub mod bm1485_l3plus_stock_carrier;
+/// Exact 2017 stock L3+ fan tach, sensor calibration, and PWM replay.
+pub mod bm1485_l3plus_stock_cooling;
+/// Exact 2017 stock L3+ presence, enumeration, and startup-failure replay.
+pub mod bm1485_l3plus_stock_lifecycle;
+/// Exact 2017 stock L3+ PIC/heartbeat/thermal rail-off replay; pure and no-I/O.
+pub mod bm1485_l3plus_stock_pic;
+/// Exact 2017 stock L3+ BM1485 PLL table and write spine; pure and no-I/O.
+pub mod bm1485_l3plus_stock_pll;
+/// Exact 2017 stock L3+ process-exit weakness and shutdown assessment.
+pub mod bm1485_l3plus_stock_shutdown;
+/// Exact 2017 stock L3+ Stratum request, pending, and response replay.
+pub mod bm1485_l3plus_stock_submit;
+/// Exact 2017 stock L3+ work frame, return queue, and binding limits.
+pub mod bm1485_l3plus_stock_work;
+/// Exact L7 VNish serial return and bounded snapshot binding; pure and no-I/O.
+pub mod bm1489_l7_return;
+/// Exact L7 VNish thermal/fan/shutdown replay; pure and no-I/O.
+pub mod bm1489_l7_safety;
+/// Exact L7 VNish sensor transport words/frames/templates; pure and no-I/O.
+pub mod bm1489_l7_sensor_transport;
+/// Exact L7 VNish post-queue snapshot/duplicate/target gates; pure replay only.
+pub mod bm1489_l7_share_qualification;
+/// Exact L7 VNish Stratum send/pending/response lifecycle; pure replay only.
+pub mod bm1489_l7_submission;
+/// Exact third-party L7 VNish BM1489 selector-six register protocol; pure and no-I/O.
+pub mod bm1489_l7_vnish;
+/// Exact L7 VNish outbound work frame and Merkle planner; pure and no-I/O.
+pub mod bm1489_l7_work;
+/// Exact held-release L9 BM1491 carrier/pinmux preflight; pure and no-I/O.
+pub mod bm1491_l9_carrier_preflight;
+/// Exact held-release L9 BM1491 heartbeat/watchdog replay; pure and no-I/O.
+pub mod bm1491_l9_heartbeat;
+/// Exact held-release L9 BM1491 APW17/EEPROM/sensor IIC routing; pure and no-I/O.
+pub mod bm1491_l9_iic_routes;
+/// Exact held-release L9 BM1491 top-init and setup-all-chip plan.
+pub mod bm1491_l9_init;
+/// Exact held-release L9 BM1491 operating frequency/voltage policy replay.
+pub mod bm1491_l9_operating;
+/// Exact held-release L9 BM1491 adjustable-power voltage-wrapper replay.
+pub mod bm1491_l9_power;
+/// Exact held-release L9 BM1491 temperature/shutdown pure contract.
+pub mod bm1491_l9_safety;
+/// Exact held-release L9 BM1491 sensor-backend transport/result replay.
+pub mod bm1491_l9_sensor_transport;
+/// Exact held-release L9 BM1491 nonce-to-Stratum submission replay.
+pub mod bm1491_l9_submission;
+/// Exact held-release L9 BM1491 work-frame and nonce-return pure contract.
+pub mod bm1491_l9_work;
 /// Declarative control-board composition identity (ADR-0011). Scaffold registry.
 pub mod board_desc;
 /// Pure chain-transport op language + host recorder (ADR-0010 / P1-3 I/O seed).
@@ -36,10 +156,54 @@ pub mod chain_transport;
 pub mod chain_voltage;
 /// C52 cooling custody policy for home AM2 profiles (P1-7).
 pub mod cooling_custody;
+/// Ctrl_C43 / S9 SE: FPGA PWM is not an actuator; tach 0x04 is not evidence.
+pub mod s9se_cooling;
+/// S9 SE `BOOT.bin` identity. No fabric ABI.
+pub mod s9se_boot;
+/// S9 SE address-assignment program (60 × stride 2). Desk-only.
+pub mod s9se_enum;
+/// S9 SE EEPROM major-type pin. Write refused.
+pub mod s9se_eeprom;
+/// S9 SE stock-FPGA AXI map + DMA base. No mmap.
+pub mod s9se_fpga;
+/// S9 SE gauntlet + admit/refuse owner (GitHub DCENT_OS#2).
+pub mod s9se_gauntlet;
+/// S9 SE factory / DTB / firmware identity pins.
+pub mod s9se_identity;
+/// S9 SE FPGA `send_job` packet. Dispatch refused.
+pub mod s9se_job;
+/// S9 SE stock nonce classify. FIFO I/O refused.
+pub mod s9se_nonce;
+/// S9 SE desk bring-up planner. Execute refused.
+pub mod s9se_init;
+/// S9 SE NAND / FLASH refuse (DTB + runme.sh).
+pub mod s9se_nand;
+/// S9 SE dsPIC33EP16GS202 command catalog. I/O refused.
+pub mod s9se_pic;
+/// S9 SE / BM1393 PLL facts. Frequency program refused.
+pub mod s9se_pll;
+/// S9 SE BM1393 chip-register packers. Desk-only.
+pub mod s9se_regs;
+/// S9 SE on-chip I²C temperature path. I/O refused.
+pub mod s9se_temp;
+/// S9 SE stock timeout / working baud. FPGA write refused.
+pub mod s9se_timeout;
+/// S9 SE BM1393 VIL + CRC5 frame packers. Desk-only.
+pub mod s9se_vil;
+/// S9 SE dsPIC IIC voltage map. Conversion only — no I²C write.
+pub mod s9se_voltage;
+/// S9 SE VIL TW 13-word planner. Work dispatch refused.
+pub mod s9se_work;
+/// Cooling-medium axis (Air/Hydro/Immersion) + cut-ladder validation
+/// (Round-15 A3, hardware-enablement axis 4). Fanless boards get NO
+/// fan-raise rung — absent, not zero.
+pub mod cooling_medium;
 pub mod dspic_decode;
 pub mod dspic_heartbeat;
 /// Pure PLL frequency model + TransportOp expansion (decade P1-4 seed).
 pub mod pll_model;
+/// Offline declared-route and passive carrier-preflight policy for stock S9 FPGA.
+pub mod stock_fpga_carrier_preflight;
 /// Pure stock FPGA AsicBoost / version-slot packing (G17).
 pub mod stock_fpga_policy;
 /// Pure ASIC ticket-mask encode (G24).
@@ -52,18 +216,26 @@ pub mod diagnostic_mode;
 pub mod hashrate_geometry;
 /// Install/packaging matrix from BoardDesc (toolbox/CI/docs generators).
 pub mod install_matrix;
+/// Corpus-backed hashboard↔control-board connector/pinout/plug-detect data
+/// (Round 17 B4, Bitmain maintenance-guide corpus). Pure data, no I/O.
+pub mod interconnect;
 /// Universal measurement provenance (P2-3).
 pub mod measurement;
 /// Composed multi-chain energize + dispatch admission (strangler glue).
 pub mod mining_lifecycle;
 /// Multi-chain power-up stagger policy (P1-5 companion).
 pub mod powerup_schedule;
+/// Exact ordinary-S9 stock carrier/fan identity matcher; offline data only.
+pub mod s9_ordinary_stock_profile;
+/// Exact-release S9j stock thermal/fan pure contract; no live I/O authority.
+pub mod s9_stock_thermal;
 /// PowerCut + FanCommand policy (cut-hash-before-noise; home PWM cap).
 pub mod safety_command;
 /// Pure serial work-engine bookkeeping (history ring, dedup, job-id cursor).
 pub mod serial_work_engine;
 /// Shared serial work-history / job-id / dedup policy (mining strangler).
 pub mod serial_work_policy;
+pub mod sha256_padding;
 /// Crash-durable source-aware thermal generation lockout.
 pub mod thermal_lockout;
 pub mod time;
@@ -79,9 +251,207 @@ pub use asic_protocol::{
     protocol_capabilities, InitProgram, InitStep, ProtocolCapabilities, ProtocolTransportAdmission,
     ProtocolTransportError,
 };
+pub use bm1391_share_qualification::{
+    bm1391_stock_digest_disposition, bm1391_stock_double_sha256_from_midstate,
+    bm1391_stock_normalize_share_difficulty, bm1391_stock_pre_hash_step,
+    bm1391_stock_sha_context_words, decode_bm1391_stock_consumer_record,
+    pop_bm1391_stock_consumer_ring, Bm1391StockConsumerRecord, Bm1391StockConsumerRecordError,
+    Bm1391StockConsumerRingError, Bm1391StockConsumerRingState,
+    Bm1391StockDifficultyNormalizationError, Bm1391StockDigestDisposition, Bm1391StockDuplicateKey,
+    Bm1391StockPreHashDisposition, Bm1391StockPreHashStep, Bm1391StockPrecomputedHashInput,
+    Bm1391StockRingPop, Bm1391StockSnapshotAge, BM1391_STOCK_CURRENT_SNAPSHOT_OFFSET,
+    BM1391_STOCK_HEADER_BYTE_LEN, BM1391_STOCK_LOW_DIFFICULTY_COUNTER_INCREMENT,
+    BM1391_STOCK_LOW_DIFFICULTY_WORD_MAX, BM1391_STOCK_PREVIOUS_ONE_SNAPSHOT_OFFSET,
+    BM1391_STOCK_PREVIOUS_TWO_SNAPSHOT_OFFSET, BM1391_STOCK_RETURN_RING_HEADER_LEN,
+    BM1391_STOCK_SHA_CONTEXT_WORDS, BM1391_STOCK_SNAPSHOT_MIDSTATE_OFFSET,
+    BM1391_STOCK_SNAPSHOT_TAIL_OFFSET, BM1391_STOCK_TWO_NEGATIVE_32_F64_BITS,
+    BM1391_STOCK_TWO_POSITIVE_32_F64_BITS,
+};
+pub use bm1391_stock_return::{
+    advance_bm1391_stock_ring, bind_bm1391_stock_nonce, decode_bm1391_stock_fpga_return,
+    Bm1391StockBoundNonce, Bm1391StockFpgaReturn, Bm1391StockNonceReturn,
+    Bm1391StockRegisterReturn, Bm1391StockReturnDecodeError, Bm1391StockRingError,
+    Bm1391StockRingState, Bm1391StockWorkBindError, BM1391_STOCK_BOUND_NONCE_RECORD_LEN,
+    BM1391_STOCK_FPGA_RETURN_RECORD_LEN, BM1391_STOCK_NONCE_VALID_BIT,
+    BM1391_STOCK_OUTSTANDING_WORK_RECORD_LEN, BM1391_STOCK_REGISTER_CRC5_MASK,
+    BM1391_STOCK_REGISTER_CRC_ERROR_BIT, BM1391_STOCK_REGISTER_TYPE_MASK,
+    BM1391_STOCK_RETURN_CHAIN_MASK, BM1391_STOCK_RETURN_NONCE_BIT,
+    BM1391_STOCK_RETURN_RING_CAPACITY, BM1391_STOCK_WORK_ID_MASK,
+};
+pub use bm1396_auto_adapt_voltage::{
+    bm1396_auto_adapt_target_voltage_cv, plan_bm1396_auto_adapt_voltage, Bm1396AutoAdaptProfile,
+    Bm1396AutoAdaptVoltageError, Bm1396AutoAdaptVoltagePlan,
+    BM1396_AUTO_ADAPT_POST_PLL_ADC_THRESHOLD_MHZ, BM1396_AUTO_ADAPT_TEMPERATURE_THRESHOLDS_C,
+    BM1396_S17E_SIGNED_2020_AUTO_ADAPT_FREQUENCY_THRESHOLDS_MHZ,
+    BM1396_S17E_SIGNED_2020_AUTO_ADAPT_MATRIX_CV, BM1396_T17E_AUTO_ADAPT_FREQUENCY_THRESHOLDS_MHZ,
+    BM1396_T17E_AUTO_ADAPT_LOWER_MATRIX_CV, BM1396_T17E_AUTO_ADAPT_UPPER_MATRIX_CV,
+    BM1396_T17E_SIGNED_2020_CALIBRATION_LOWER_CV, BM1396_T17E_SIGNED_2020_CALIBRATION_UPPER_CV,
+};
+pub use bm1396_carrier_preflight::{
+    assess_bm1396_static_carrier, bm1396_stock_dma_base_for_memtotal_kib,
+    Bm1396CarrierArtifactObservation, Bm1396CarrierPreflightError, Bm1396CarrierPreflightStep,
+    Bm1396CarrierStaticAssessment, Bm1396CarrierStaticObservation, Bm1396MappedAddressObservation,
+    Bm1396StockCarrierAccessMode, Bm1396StockCarrierNotificationMode, BM1396_AXI_DEVICE_PATH,
+    BM1396_AXI_MODULE_SHA256, BM1396_AXI_MODULE_SIZE, BM1396_AXI_PHYSICAL_BASE,
+    BM1396_AXI_RESERVED_LEN, BM1396_AXI_USER_MAP_LEN, BM1396_CARRIER_PREFLIGHT_PLAN,
+    BM1396_FPGA_MEM_ALLOWED_BASES, BM1396_FPGA_MEM_DEFAULT_BASE, BM1396_FPGA_MEM_DEVICE_PATH,
+    BM1396_FPGA_MEM_LARGE_RAM_THRESHOLD_KIB, BM1396_FPGA_MEM_MAP_LEN,
+    BM1396_FPGA_MEM_MEDIUM_RAM_THRESHOLD_KIB, BM1396_FPGA_MEM_MODULE_SHA256,
+    BM1396_FPGA_MEM_MODULE_SIZE, BM1396_STOCK_CARRIER_ACCESS_MODE,
+    BM1396_STOCK_CARRIER_NOTIFICATION_MODE, BM1396_STOCK_MODULE_VERMAGIC,
+};
+pub use bm1396_contract::{
+    admit_bm1396_present_chain_enumeration, bm1396_baud_plan, bm1396_chain_watchdog_decision,
+    bm1396_command_crc5, bm1396_decode_fan_tach, bm1396_fan_sample_passes,
+    bm1396_fan_validation_policy, bm1396_hard_thermal_decision, bm1396_hard_thermal_limits,
+    bm1396_legacy_2019_thermal_limits, bm1396_legacy_2019_thermal_step, bm1396_read_register_frame,
+    bm1396_reset_address_frame, bm1396_sensor_aggregation_family,
+    bm1396_sensor_channel0_temperature, bm1396_sensor_channel1_temperature,
+    bm1396_sensor_invalid_action, bm1396_sensor_sample_is_outlier, bm1396_set_address_frame,
+    bm1396_t17e_next_retry_voltage_cv, bm1396_update_fan_state, bm1396_validate_voltage_response,
+    bm1396_vendor_can_reopen_core, bm1396_vendor_error_action, bm1396_vendor_thermal_observation,
+    bm1396_vendor_working_voltage_clamp_cv, bm1396_voltage_dac_in_vendor_envelope,
+    bm1396_voltage_request_frame, bm1396_write_register_frame, plan_bm1396_shutdown,
+    plan_bm1396_vendor_voltage_dac_ramp, Bm1396BaudPlan, Bm1396ChainWatchdogDecision,
+    Bm1396EnumerationAdmission, Bm1396EnumerationError, Bm1396FanSampleError, Bm1396FanState,
+    Bm1396FanTachReading, Bm1396FanValidationPhase, Bm1396FanValidationPolicy,
+    Bm1396HardThermalDecision, Bm1396HardThermalLimits, Bm1396HardThermalMode,
+    Bm1396Legacy2019ThermalLimits, Bm1396Legacy2019ThermalSample, Bm1396Legacy2019ThermalStep,
+    Bm1396Model, Bm1396NoActiveChainForSensorDecision, Bm1396SensorAggregationFamily,
+    Bm1396SensorInvalidAction, Bm1396SensorSamplingMode, Bm1396ShutdownStep, Bm1396UnsupportedBaud,
+    Bm1396VendorErrorAction, Bm1396VendorThermalObservation, Bm1396VoltageOutsideVendorEnvelope,
+    Bm1396VoltageResponseError, BM1396_ADDRESS_COMMAND_SPACING_MS,
+    BM1396_ADDRESS_RESET_BURST_COUNT, BM1396_ASIC_MISC_CONTROL_REGISTER, BM1396_BAUD_HIGH_CLOCK_HZ,
+    BM1396_BAUD_HIGH_CLOCK_THRESHOLD, BM1396_BAUD_LOW_CLOCK_HZ,
+    BM1396_BAUD_SWITCH_DELAY_CALL_VALUE, BM1396_CHAIN_WATCHDOG_DISABLE_AFTER_MISMATCHES,
+    BM1396_CHAIN_WATCHDOG_INTER_PHASE_DELAY_CALL_VALUES,
+    BM1396_CHAIN_WATCHDOG_TRIGGER_DELAY_CALL_VALUES, BM1396_DCDC_CONTROL_OPCODE,
+    BM1396_DCDC_DISABLE_PAYLOAD, BM1396_FAN_TACH_DEFAULT_RPM_PER_COUNT,
+    BM1396_FAN_TACH_DOUBLE_RATE_HW_ID_LOW16, BM1396_FAN_TACH_MAX_READINGS,
+    BM1396_FAN_TACH_SPECIAL_RPM_PER_COUNT, BM1396_FAN_VALIDATION_MAX_SAMPLES,
+    BM1396_FPGA_BAUD_PRESERVE_MASK, BM1396_FPGA_BAUD_REGISTER_OFFSET, BM1396_FPGA_CHAIN_SLOT_COUNT,
+    BM1396_FPGA_MAIN_CONTROL_OFFSET, BM1396_FPGA_MAIN_CONTROL_RUN_BIT,
+    BM1396_HARD_THERMAL_FATAL_ERROR_CODE, BM1396_HARD_THERMAL_FLAG_CLEAR_CHIP_MAX_C,
+    BM1396_HARD_THERMAL_FLAG_CLEAR_PCB_MAX_C, BM1396_HARD_THERMAL_FLAG_SET_CHIP_MAX_C,
+    BM1396_HARD_THERMAL_FLAG_SET_PCB_MAX_C, BM1396_HIGH_BAUD_CLOCK_PRELUDE,
+    BM1396_LEGACY_2019_FLAG_CLEAR_CHIP_DELTA_MAX_C, BM1396_LEGACY_2019_FLAG_CLEAR_PCB_DELTA_MAX_C,
+    BM1396_LEGACY_2019_FLAG_SET_CHIP_DELTA_MAX_C, BM1396_LEGACY_2019_FLAG_SET_PCB_DELTA_MAX_C,
+    BM1396_LEGACY_2019_THERMAL_FATAL_ERROR_CODE, BM1396_REQUIRED_FAN_COUNT,
+    BM1396_RUNTIME_FAN_BAD_SAMPLE_DELAY_CALL_VALUE, BM1396_RUNTIME_FAN_MIN_RPM,
+    BM1396_RUNTIME_PHASE_SET_COUNTER_VALUE, BM1396_S17E_ADDRESS_INTERVAL,
+    BM1396_S17E_CHIPS_PER_PRESENT_CHAIN, BM1396_SENSOR_INVALID_FATAL_ERROR_CODE,
+    BM1396_SENSOR_MODE0_OFFSET_F64_BITS, BM1396_SENSOR_MODE0_SLOPE_F64_BITS,
+    BM1396_SENSOR_MODE1_OFFSET_F64_BITS, BM1396_SENSOR_MODE1_SLOPE_F64_BITS,
+    BM1396_SENSOR_OUTLIER_MULTIPLIER_F32_BITS, BM1396_SENSOR_OUTLIER_VARIANCE_THRESHOLD,
+    BM1396_SENSOR_POSITIONS_PER_CHAIN, BM1396_SHUTDOWN_GPIO, BM1396_SHUTDOWN_GPIO_SETTLE_MS,
+    BM1396_STARTUP_BAUD, BM1396_STARTUP_FAN_BAD_SAMPLE_DELAY_CALL_VALUE,
+    BM1396_STARTUP_FAN_MIN_RPM, BM1396_T17E_ADDRESS_INTERVAL, BM1396_T17E_CHIPS_PER_PRESENT_CHAIN,
+    BM1396_T17E_RETRY_VOLTAGE_STEP_CV, BM1396_VENDOR_MIN_VALID_PCB_TEMP_C,
+    BM1396_VENDOR_WORKING_VOLTAGE_MAX_CV, BM1396_VENDOR_WORKING_VOLTAGE_MIN_CV,
+    BM1396_VOLTAGE_DAC_RAMP_STEP, BM1396_VOLTAGE_DAC_RAMP_STEP_FIXED_X2,
+    BM1396_VOLTAGE_I2C_ADDRESS, BM1396_VOLTAGE_RESPONSE_WAIT_US,
+    BM1396_VOLTAGE_TRANSPORT_MAX_ATTEMPTS, BM1396_WIRE_CHIP_ID,
+};
+pub use bm1396_domain_voltage::{
+    bm1396_decode_domain_adc_registers, bm1396_domain_adc_raw_to_volts,
+    bm1396_domain_adc_sample_index, bm1396_domain_voltage_acquisition_error,
+    bm1396_domain_voltage_mode_from_vendor_param, bm1396_domain_voltage_policy,
+    bm1396_evaluate_domain_voltages, bm1396_next_domain_voltage_level, bm1396_summarize_domain_adc,
+    Bm1396DomainAdcIndexError, Bm1396DomainAdcRawLanes, Bm1396DomainAdcSummary,
+    Bm1396DomainAdcSummaryError, Bm1396DomainVoltageAdaptiveLevel, Bm1396DomainVoltageDecision,
+    Bm1396DomainVoltageInputError, Bm1396DomainVoltageMode, Bm1396DomainVoltagePolicy,
+    Bm1396DomainVoltagePolicyError, BM1396_DOMAIN_ADC_LANE_COUNT,
+    BM1396_DOMAIN_ADC_LANE_SPREAD_F64_BITS, BM1396_DOMAIN_ADC_MULTIPLIER,
+    BM1396_DOMAIN_ADC_RAW_MASK, BM1396_DOMAIN_ADC_SCALE_2_NEG_12_F64_BITS,
+    BM1396_DOMAIN_MIN_0_8_F32_BITS, BM1396_DOMAIN_MIN_1_0_F32_BITS, BM1396_DOMAIN_MIN_1_1_F32_BITS,
+    BM1396_DOMAIN_MIN_1_2_F32_BITS, BM1396_DOMAIN_MIN_1_3_F32_BITS,
+    BM1396_DOMAIN_SPREAD_0_05_F32_BITS, BM1396_DOMAIN_SPREAD_0_1_F32_BITS,
+    BM1396_DOMAIN_SPREAD_0_2_F32_BITS, BM1396_DOMAIN_VOLTAGE_ACQUISITION_ERROR_BASE,
+    BM1396_S17E_CHIPS_PER_DOMAIN, BM1396_S17E_DOMAIN_COUNT, BM1396_T17E_CHIPS_PER_DOMAIN,
+    BM1396_T17E_DOMAIN_COUNT,
+};
+pub use bm1396_fpga_abi::{
+    bm1396_bc_command_requires_completion_poll, bm1396_return_control_enable,
+    bm1396_return_dispatch, bm1396_return_fifo_status, bm1396_return_record_word_count,
+    bm1396_should_reassert_return_enable, bm1396_version_lane_writes, bm1396_work_fifo_ready,
+    Bm1396FpgaRegisterWrite, Bm1396ReturnDispatch, Bm1396ReturnFifoStatus, Bm1396VersionLaneMode,
+    BM1396_FPGA_BC_COMMAND_MAX_POLLS, BM1396_FPGA_BC_COMMAND_OFFSET,
+    BM1396_FPGA_BC_COMMAND_POLL_SLEEP_US, BM1396_FPGA_JOB_BLOCK_VERSION_OFFSET,
+    BM1396_FPGA_JOB_BUFFER_A_OFFSET, BM1396_FPGA_JOB_BUFFER_B_OFFSET,
+    BM1396_FPGA_JOB_BUFFER_SELECT_OFFSET, BM1396_FPGA_JOB_COINBASE_LAYOUT_OFFSET,
+    BM1396_FPGA_JOB_ID_OFFSET, BM1396_FPGA_JOB_MAIN_CONTROL_OFFSET,
+    BM1396_FPGA_JOB_MERKLE_COUNT_OFFSET, BM1396_FPGA_JOB_NBITS_OFFSET,
+    BM1396_FPGA_JOB_NONCE2_HIGH_OFFSET, BM1396_FPGA_JOB_NONCE2_LOW_OFFSET,
+    BM1396_FPGA_JOB_NTIME_OFFSET, BM1396_FPGA_JOB_PAYLOAD_END_OFFSET,
+    BM1396_FPGA_JOB_PREVIOUS_HASH_BASE_OFFSET, BM1396_FPGA_JOB_PREVIOUS_HASH_WORDS,
+    BM1396_FPGA_RETURN_CONTROL_OFFSET, BM1396_FPGA_RETURN_COUNT_MASK,
+    BM1396_FPGA_RETURN_COUNT_OFFSET, BM1396_FPGA_RETURN_ENABLE_BIT,
+    BM1396_FPGA_RETURN_WORD1_DISPATCH_BIT, BM1396_FPGA_RETURN_WORD1_OFFSET,
+    BM1396_FPGA_RETURN_WORD2_OFFSET, BM1396_FPGA_SINGLE_COUNT_REASSERT_OBSERVATIONS,
+    BM1396_FPGA_TICKET_DIFFICULTY_OFFSET, BM1396_FPGA_TWO_WORD_RECORD_MARKER,
+    BM1396_FPGA_VERSION_LANE_1_OFFSET, BM1396_FPGA_VERSION_LANE_2_OFFSET,
+    BM1396_FPGA_VERSION_LANE_3_OFFSET, BM1396_FPGA_VERSION_LANE_4_OFFSET,
+    BM1396_FPGA_VERSION_LANE_5_OFFSET, BM1396_FPGA_VERSION_LANE_6_OFFSET,
+    BM1396_FPGA_VERSION_LANE_7_OFFSET, BM1396_FPGA_WORK_READY_DELAY_CALL_VALUE,
+    BM1396_FPGA_WORK_READY_MAX_POLLS, BM1396_FPGA_WORK_READY_OFFSET,
+};
+pub use bm1396_lifecycle::{
+    bm1396_enumeration_pass_start, bm1396_enumeration_profile, bm1396_inter_pass_transition,
+    plan_bm1396_enumeration_attempt, plan_bm1396_post_exhaustion, Bm1396EnumerationAttemptOutcome,
+    Bm1396EnumerationAttemptPlan, Bm1396EnumerationAttemptStep, Bm1396EnumerationPassStep,
+    Bm1396EnumerationProfile, Bm1396FirmwareRelease, Bm1396InterPassVoltageTargetSource,
+    Bm1396LifecyclePlanError, Bm1396PassCompletionDisposition, Bm1396PllBankSelectorSource,
+    Bm1396PostExhaustionDisposition, Bm1396PostExhaustionPlan, Bm1396PostExhaustionStep,
+    Bm1396RuntimeModeClass, Bm1396T17e2020InterPassStep,
+    BM1396_LEGACY_2019_ENUMERATION_MAXIMUM_PASSES, BM1396_LEGACY_2019_ENUMERATION_MAX_ATTEMPTS,
+    BM1396_LEGACY_2019_SHORT_COUNT_MAX_RETRIES, BM1396_S17E_SIGNED_2020_ENUMERATION_MAXIMUM_PASSES,
+    BM1396_SIGNED_2020_ENUMERATION_MAX_ATTEMPTS, BM1396_SIGNED_2020_ENUMERATION_PASS_START,
+    BM1396_SIGNED_2020_SHORT_COUNT_MAX_RETRIES, BM1396_T17E_SIGNED_2020_ENUMERATION_MAXIMUM_PASSES,
+    BM1396_T17E_SIGNED_2020_INTER_PASS_TRANSITION,
+};
+#[cfg(feature = "recovery-tool")]
+pub use bm1396_pic::{
+    bm1396_pic_application_reset_frame, bm1396_pic_jump_to_app_frame,
+    BM1396_PIC_APPLICATION_RESET_OPCODE, BM1396_PIC_JUMP_TO_APP_OPCODE,
+};
+pub use bm1396_pic::{
+    bm1396_pic_endpoint, bm1396_pic_heartbeat_frame, bm1396_pic_implementation_route,
+    bm1396_pic_implementation_route_for_model, bm1396_pic_physical_part_for_model,
+    bm1396_pic_rail_disable_frame, bm1396_pic_rail_enable_frame, bm1396_pic_response_accepted,
+    bm1396_pic_version_frame, bm1396_pic_voltage_sample_passes,
+    bm1396_pic_voltage_verification_iteration, bm1396_safe_heartbeat_failure_count,
+    Bm1396PicEndpoint, Bm1396PicFrameError, Bm1396PicImplementationRoute, Bm1396PicPhysicalPart,
+    Bm1396PicVoltageCheckError, Bm1396PicVoltageIterationDecision, Bm1396PicVoltageIterationError,
+    BM1396_PIC_CHAIN_SLOT_COUNT, BM1396_PIC_HEARTBEAT_OPCODE,
+    BM1396_PIC_HEARTBEAT_PER_CHAIN_DELAY_CALL_VALUE, BM1396_PIC_HEARTBEAT_RESPONSE_LEN,
+    BM1396_PIC_HEARTBEAT_SCAN_SLEEP_MS, BM1396_PIC_I2C_BASE_ADDRESS,
+    BM1396_PIC_INVALID_REPLY_SLEEP_MS, BM1396_PIC_MAX_ATTEMPTS, BM1396_PIC_MAX_REQUEST_PAYLOAD_LEN,
+    BM1396_PIC_POST_READ_WAIT_MS, BM1396_PIC_PREAMBLE, BM1396_PIC_RAIL_OPCODE,
+    BM1396_PIC_VERSION_OPCODE, BM1396_PIC_VERSION_RESPONSE_LEN,
+    BM1396_PIC_VOLTAGE_DIRECT_SET_SETTLE_MS, BM1396_PIC_VOLTAGE_FAILURE_ERROR_CODE,
+    BM1396_PIC_VOLTAGE_INTERCHECK_SLEEP_MS, BM1396_PIC_VOLTAGE_MAX_OUTER_ITERATIONS,
+    BM1396_PIC_VOLTAGE_TOLERANCE_V_F64_BITS, BM1396_PIC_WRITE_TO_READ_WAIT_MS,
+};
+pub use bm1396_work::{
+    bm1396_decode_nonce_record, bm1396_decode_register_record, bm1396_job_scalar_writes,
+    bm1396_job_timeout_control_value, bm1396_job_version_mode, bm1396_parse_job_packet,
+    bm1396_plan_job_fpga, bm1396_plan_ordered_job_dispatch, bm1396_previous_hash_fpga_words,
+    bm1396_sha256_pad_coinbase, Bm1396JobDispatchPlanError, Bm1396JobFpgaPlan, Bm1396JobPacket,
+    Bm1396JobParseError, Bm1396JobPlanError, Bm1396NonceDecodeError, Bm1396NonceRecord,
+    Bm1396OrderedJobOp, Bm1396OrderedJobPlan, Bm1396RegisterDecodeError, Bm1396RegisterRecord,
+    BM1396_JOB_DELAY_CALL_VALUE, BM1396_JOB_FINAL_MAIN_PRESERVE_MASK,
+    BM1396_JOB_FIRST_RETURN_ENABLE_MASK, BM1396_JOB_FIXED_LEN, BM1396_JOB_HEADER,
+    BM1396_JOB_MAIN_CONTROL_BIT7_FLAG, BM1396_JOB_MAIN_CONTROL_BIT7_MASK,
+    BM1396_JOB_MAIN_CONTROL_CLEAR_MASK, BM1396_JOB_MAIN_CONTROL_CLEAR_MAX_POLLS,
+    BM1396_JOB_MULTIVERSION_MODE_BASE, BM1396_JOB_SINGLE_MODE_WORD,
+    BM1396_JOB_TICKET_DIFFICULTY_FLAG, BM1396_JOB_TIMEOUT_CONTROL_OFFSET, BM1396_MERKLE_BRANCH_LEN,
+    BM1396_NONCE_CHIP_ADDRESS_SHIFT, BM1396_NONCE_CORE_SHIFT, BM1396_NONCE_QUEUE_CAPACITY,
+    BM1396_NONCE_VALID_BIT, BM1396_OUTSTANDING_WORK_RECORD_SIZE, BM1396_RETURN_CHAIN_MASK,
+    BM1396_RETURN_CRC_ERROR_BIT, BM1396_RETURN_RECORD_LEN, BM1396_WORK_ID_MASK,
+};
 pub use board_desc::{
-    AsicProtocolAdmission, AsicProtocolIdentity, BoardDesc, BoardFamily, ChainTransportKind,
-    SlotPolicy, VoltageControllerClass, WorkEngineKind,
+    AsicCatalogIdentity, AsicProtocolAdmission, AsicProtocolIdentity, BoardDesc, BoardFamily,
+    ChainTransportKind, SlotPolicy, VoltageControllerClass, WorkEngineKind,
 };
 pub use chain_transport::{
     admit_transport_op, am2_misc_ctrl_pre_baud_from_bosminer_cold_opt_in,
@@ -122,9 +492,10 @@ pub use cooling_custody::{
     C49_MODE_LOW_BYTE, C52_MODE_LOW_BYTE,
 };
 pub use dcent_schema::hardware::{
-    ArtifactKind, ArtifactMaturity, GenericConstruction, HardwareEnablementPolicy,
-    ImplementationMaturity, InstallAuthorization, LifecycleLane, RecoveryMaturity, RuntimeStatus,
-    StorageTopology, UpdateMechanism, HARDWARE_ENABLEMENT_SCHEMA_VERSION,
+    ArtifactKind, ArtifactMaturity, ExternalMediaMaturity, ExternalMediaMode, GenericConstruction,
+    HardwareEnablementPolicy, ImplementationMaturity, InstallAuthorization, LifecycleLane,
+    RecoveryMaturity, RuntimeStatus, StorageTopology, UpdateMechanism,
+    HARDWARE_ENABLEMENT_SCHEMA_VERSION,
 };
 pub use diagnostic_mode::{
     admit_report_kind, parse_report_kind, DiagnosticModeError, DiagnosticRunMode,
@@ -149,41 +520,63 @@ pub use pll_model::{
     bm1366_pll_reg_and_actual, bm1368_pll_reg_and_actual, bm1368_pll_table_lookup,
     bm1368_vco_in_jig_range, bm1370_pll_reg_and_actual, bm1370_vco_in_jig_range,
     bm1387_pll_frequencies, bm1391_pll_fallback_200m, bm1391_pll_pack, bm1391_pll_search,
-    bm1396_production_pure_pll_admitted, bm1396_production_pure_pll_status,
-    bm1397_pll0_lock_bit_set, bm1397_pll0_readback_matches, bm1397_pll0_verify_rewrite_admitted,
-    bm1397_pll_decode_dividers, bm1397_pll_frequencies, bm1397_pll_register_value,
-    bm1398_pll_frequencies, bm1398_pll_register_value, crystal25_pll_decode_dividers,
-    crystal25_pll_encode_reg, plan_all_pll_broadcast_writes, plan_bm1368_pll_ramp,
-    plan_bm1391_frequency_program_ops, plan_bm1391_frequency_program_ops_chip,
-    plan_bm1396_frequency_program_ops_experimental, plan_bm1397_frequency_program_ops,
-    plan_bm1397_frequency_program_ops_chip, plan_bm1397_pll0_verify_read,
-    plan_bm1397_pll0_verify_retry_rewrite, plan_frequency_program_ops, plan_pll0_broadcast_write,
-    plan_pll_broadcast_write, pll_count, pll_family_for_protocol, pll_register_addrs,
-    resolve_bm1362_pll, resolve_bm1366_pll, resolve_bm1368_pll, resolve_bm1368_pll_fallback_mhz,
-    resolve_bm1368_pll_mhz, resolve_bm1368_pll_with_policy, resolve_bm1370_pll,
-    resolve_bm1370_pll_mhz, resolve_bm1370_pll_with_policy, resolve_bm1387_pll, resolve_bm1391_pll,
+    bm1396_pll_program_register_value, bm1396_production_pure_pll_admitted,
+    bm1396_production_pure_pll_status, bm1397_pll0_lock_bit_set, bm1397_pll0_readback_matches,
+    bm1397_pll0_verify_rewrite_admitted, bm1397_pll_decode_dividers, bm1397_pll_frequencies,
+    bm1397_pll_register_value, bm1398_pll_frequencies, bm1398_pll_register_value,
+    crystal25_pll_decode_dividers, crystal25_pll_encode_reg, plan_all_pll_broadcast_writes,
+    plan_bm1368_pll_ramp, plan_bm1391_frequency_program_ops,
+    plan_bm1391_frequency_program_ops_chip, plan_bm1396_frequency_program_ops,
+    plan_bm1396_frequency_program_ops_experimental, plan_bm1396_pll_program_ops,
+    plan_bm1397_frequency_program_ops, plan_bm1397_frequency_program_ops_chip,
+    plan_bm1397_pll0_verify_read, plan_bm1397_pll0_verify_retry_rewrite,
+    plan_frequency_program_ops, plan_pll0_broadcast_write, plan_pll_broadcast_write, pll_count,
+    pll_family_for_protocol, pll_register_addrs, resolve_bm1362_pll, resolve_bm1366_pll,
+    resolve_bm1368_pll, resolve_bm1368_pll_fallback_mhz, resolve_bm1368_pll_mhz,
+    resolve_bm1368_pll_with_policy, resolve_bm1370_pll, resolve_bm1370_pll_mhz,
+    resolve_bm1370_pll_with_policy, resolve_bm1387_pll, resolve_bm1391_pll, resolve_bm1396_pll,
     resolve_bm1396_pll_experimental_family_hypothesis, resolve_bm1397_pll, resolve_bm1398_pll,
     resolve_bm1398_pll_nearest_admitted, resolve_pll, resolve_pll_for_protocol, Bm1368VcoPolicy,
-    Bm1370VcoPolicy, Bm1391PllSolution, Bm1396PurePllStatus, Bm1397PllDividers, Bm1398PllDividers,
-    Crystal25PllDividers, PllFamily, PllPlanError, PllSolution, BM1362_PLL_FREQUENCIES,
-    BM1362_PLL_TABLE, BM1368_CLKI_MHZ, BM1368_FB_DIV_MAX, BM1368_FB_DIV_MIN,
-    BM1368_PLL_RAMP_MAX_X100, BM1368_PLL_TABLE, BM1368_PLL_TABLE_MAX_X100, BM1370_CLKI_MHZ,
-    BM1370_FB_DIV_MAX, BM1370_FB_DIV_MIN, BM1370_JIG_VCO_MAX_MHZ, BM1370_JIG_VCO_MAX_REFDIV1_MHZ,
-    BM1370_JIG_VCO_MIN_MHZ, BM1370_PLL_COUNT, BM1370_PLL_REGISTER_ADDRS, BM1387_PLL_PARAMETER_REG,
-    BM1387_PLL_TABLE, BM1391_PLL0_DIVIDER_REG, BM1391_PLL0_REG, BM1391_PLL_FALLBACK_200M,
-    BM1391_PLL_FALLBACK_EXTERNAL_DIV, BM1391_PLL_PROGRAM_SPACING_MS, BM1397_CLKI_MHZ,
-    BM1397_FB_DIV_MAX, BM1397_FB_DIV_MIN, BM1397_FREQ_MAX_MHZ, BM1397_FREQ_MIN_MHZ,
-    BM1397_PLL0_DIVIDER_PRECONFIG, BM1397_PLL0_DIVIDER_REG, BM1397_PLL0_LOCK_BIT,
-    BM1397_PLL0_VERIFY_MAX_ATTEMPTS, BM1397_PLL0_VERIFY_READ_SETTLE_MS,
-    BM1397_PLL0_VERIFY_REWRITE_SETTLE_MS, BM1397_PLL_PROGRAM_SPACING_MS, BM1398_CLKI_MHZ,
-    BM1398_FB_DIV_MAX, BM1398_FB_DIV_MIN, BM1398_MAX_ERROR_MILLIMHZ_EXCLUSIVE,
-    BM1398_REFDIV_ONE_VCO_MAX_MHZ, BM1398_VCO_MAX_MHZ, BM1398_VCO_MIN_MHZ, PLL0_PARAMETER_REG,
+    Bm1370VcoPolicy, Bm1391PllSolution, Bm1396PllDividers, Bm1396PllSolution, Bm1396PurePllStatus,
+    Bm1397PllDividers, Bm1398PllDividers, Crystal25PllDividers, PllFamily, PllPlanError,
+    PllSolution, BM1362_PLL_FREQUENCIES, BM1362_PLL_TABLE, BM1368_CLKI_MHZ, BM1368_FB_DIV_MAX,
+    BM1368_FB_DIV_MIN, BM1368_PLL_RAMP_MAX_X100, BM1368_PLL_TABLE, BM1368_PLL_TABLE_MAX_X100,
+    BM1370_CLKI_MHZ, BM1370_FB_DIV_MAX, BM1370_FB_DIV_MIN, BM1370_JIG_VCO_MAX_MHZ,
+    BM1370_JIG_VCO_MAX_REFDIV1_MHZ, BM1370_JIG_VCO_MIN_MHZ, BM1370_PLL_COUNT,
+    BM1370_PLL_REGISTER_ADDRS, BM1387_PLL_PARAMETER_REG, BM1387_PLL_TABLE, BM1391_PLL0_DIVIDER_REG,
+    BM1391_PLL0_REG, BM1391_S17_JIG_PLL_AUTHORIZES_S15_T15_PROGRAMMING,
+    BM1391_S17_JIG_PLL_FALLBACK_200M, BM1391_S17_JIG_PLL_FALLBACK_EXTERNAL_DIV,
+    BM1391_S17_JIG_PLL_PROGRAM_SPACING_MS, BM1396_PLL_CLKI_MHZ, BM1396_PLL_FAILURE_REGISTER,
+    BM1396_PLL_FAILURE_SELECTOR, BM1396_PLL_FB_DIV_MAX, BM1396_PLL_FB_DIV_MIN,
+    BM1396_PLL_MAX_ERROR_MHZ_EXCLUSIVE, BM1396_PLL_PRESERVE_MASK, BM1396_PLL_PROGRAM_WRITE_COUNT,
+    BM1396_PLL_REFDIV_ONE_VCO_MAX_MHZ, BM1396_PLL_REGISTER_ADDRS, BM1396_PLL_SUCCESS_SELECTOR,
+    BM1396_PLL_VCO_MAX_MHZ, BM1396_PLL_VCO_MIN_MHZ, BM1397_CLKI_MHZ, BM1397_FB_DIV_MAX,
+    BM1397_FB_DIV_MIN, BM1397_FREQ_MAX_MHZ, BM1397_FREQ_MIN_MHZ, BM1397_PLL0_DIVIDER_PRECONFIG,
+    BM1397_PLL0_DIVIDER_REG, BM1397_PLL0_LOCK_BIT, BM1397_PLL0_VERIFY_MAX_ATTEMPTS,
+    BM1397_PLL0_VERIFY_READ_SETTLE_MS, BM1397_PLL0_VERIFY_REWRITE_SETTLE_MS,
+    BM1397_PLL_PROGRAM_SPACING_MS, BM1398_CLKI_MHZ, BM1398_FB_DIV_MAX, BM1398_FB_DIV_MIN,
+    BM1398_MAX_ERROR_MILLIMHZ_EXCLUSIVE, BM1398_REFDIV_ONE_VCO_MAX_MHZ, BM1398_VCO_MAX_MHZ,
+    BM1398_VCO_MIN_MHZ, PLL0_PARAMETER_REG,
 };
 pub use powerup_schedule::{
     inter_step_delays_ms, plan_powerup, plan_production_enable_sequence, plan_production_powerup,
     require_nonempty, schedule_duration_ms, validate_production_stagger, validate_schedule_gaps,
     PowerUpPolicyError, PowerUpStep, StaggerConfig, DEFAULT_CHAIN_STAGGER_MS,
     MIN_PRODUCTION_STAGGER_MS,
+};
+pub use s9_stock_thermal::{
+    decode_s9j_e531_local_pcb_c, decode_s9j_e531_remote_c, s9j_e531_fan_control_value,
+    summarize_s9j_e531_fan_reads, S9StockCutReason, S9StockFanTachRead, S9StockFanTachState,
+    S9StockFanTachSummary, S9StockHardCutStep, S9StockThermalObservation, S9StockThermalPlan,
+    S9StockThermalPlanner, S9StockThermalProfile, S9J_E531_BMMINER_SHA256,
+    S9J_E531_FAN_CURVE_HYSTERESIS_C, S9J_E531_FAN_CURVE_ORIGIN_C, S9J_E531_FAN_CURVE_PCT_PER_C,
+    S9J_E531_FAN_FLOOR_MAX_PCB_C, S9J_E531_FAN_SLOT_COUNT, S9J_E531_FAN_SWEEPS_PER_CYCLE,
+    S9J_E531_FAN_TACH_RPM_PER_UNIT, S9J_E531_FULL_FAN_PCB_C, S9J_E531_HARD_PCB_CUTOFF_C,
+    S9J_E531_HARD_PROTECT_CUT_STEPS, S9J_E531_HARD_PROTECT_LOOP_SLEEP_SECS,
+    S9J_E531_LOCAL_DECODE_MAX_C, S9J_E531_LOCAL_DECODE_MIN_C, S9J_E531_MAX_PWM_PERCENT,
+    S9J_E531_MIN_PWM_PERCENT, S9J_E531_MIN_WORKING_FANS, S9J_E531_SUPERVISORY_CUT_STEPS,
+    S9J_E531_SUPERVISORY_FAULT_CYCLES_TO_CUT, S9J_E531_SUPERVISORY_LOOP_SLEEP_SECS,
+    S9J_E531_TEMP_LAST_ACCEPTED_ATTEMPT, S9J_E531_TEMP_READ_ATTEMPTS,
 };
 pub use safety_command::{
     apply_safety_action, power_precedes_fan_raise, violates_home_fan_cap, FanCommand, PowerCut,
@@ -207,9 +600,10 @@ pub use serial_work_policy::{
     GENERATION_SEEN_RETAIN_WINDOW, GENERATION_SEEN_SOFT_CAP_DISPATCHER,
     GENERATION_SEEN_SOFT_CAP_SERIAL,
 };
+pub use sha256_padding::sha256_pad_message;
 pub use stock_fpga_policy::{
     plan_stock_bc_chain_inactive_vil, plan_stock_bc_set_address_vil, plan_stock_bc_set_config,
-    plan_stock_bm1387_set_freq, plan_stock_cold_boot_library_inventory,
+    plan_stock_bm1387_set_freq, plan_stock_cold_boot_library_inventory, plan_stock_dma_job,
     plan_stock_init_ticket_mask_and_hcnt_vil, plan_stock_open_core_one_chain_vil,
     plan_stock_set_asic_ticket_mask_chains_vil, plan_stock_set_asic_ticket_mask_vil,
     plan_stock_set_baud_chains_vil, plan_stock_set_baud_one_chain_vil, plan_stock_set_baud_vil,
@@ -223,28 +617,30 @@ pub use stock_fpga_policy::{
     stock_bc_write_merge_host_baud, stock_bc_write_requires_busy_wait, stock_bitmain_crc5,
     stock_buffer_space_ready, stock_buffer_space_wait_step, stock_calculate_core_number,
     stock_cold_boot_composition_is_phase4b_admitted, stock_cold_boot_inventory_counts,
-    stock_dev_timeout_auto, stock_dhash_multi_midstate_enabled, stock_dhash_with_multi_midstate,
-    stock_fan_control_full, stock_fan_control_value, stock_init_uart_bauddiv,
-    stock_open_core_bc_nullwork_enable, stock_open_core_bc_nullwork_prelude,
-    stock_open_core_buffer_timeout_continues_to_dhash_exit,
+    stock_dev_timeout_auto, stock_dhash_midstate_count, stock_dhash_with_midstate_mode,
+    stock_fan_control_full, stock_fan_control_value, stock_fpga_header_scalar_word,
+    stock_init_uart_bauddiv, stock_open_core_bc_nullwork_enable,
+    stock_open_core_bc_nullwork_prelude, stock_open_core_buffer_timeout_continues_to_dhash_exit,
     stock_open_core_buffer_timeout_skips_nullwork_enable,
     stock_open_core_buffer_timeout_skips_remaining_tw, stock_open_core_dhash_entry,
     stock_open_core_dhash_exit, stock_open_core_dummy_tw_words, stock_open_core_gateblk_misc_value,
     stock_open_core_sim_write_trace, stock_sensor_calc_offset, stock_sensor_get_local,
     stock_sensor_get_remote_c, stock_set_baud_misc_value, stock_set_pwm_percent_clamped,
-    stock_time_out_control_reg, StockBcBusyWaitStep, StockBcPreReadyStep, StockBcSetConfigPlan,
-    StockBcVilCmdPlan, StockBufferSpaceWaitStep, StockColdBootCompositionParams,
-    StockColdBootLibraryStep, StockOpenCoreOp, StockOpenCoreSimReport, StockOpenCoreSimState,
-    StockSetBaudOp, StockSoftwareSetAddressOp, StockTimeOutControlScale,
+    stock_shutdown_bc_disable_nullwork, stock_time_out_control_reg, StockBcBusyWaitStep,
+    StockBcPreReadyStep, StockBcSetConfigPlan, StockBcVilCmdPlan, StockBufferSpaceWaitStep,
+    StockColdBootCompositionParams, StockColdBootLibraryStep, StockDhashMidstateMode,
+    StockDmaJobPlan, StockDmaJobPlanError, StockOpenCoreOp, StockOpenCoreSimReport,
+    StockOpenCoreSimState, StockSetBaudOp, StockSoftwareSetAddressOp, StockTimeOutControlScale,
     STOCK_ASICBOOST_BIP320_MASK, STOCK_ASICBOOST_SLOT_BIT_SHIFT, STOCK_ASICBOOST_SLOT_COUNT,
-    STOCK_ASICBOOST_VERSION_REG_BASE, STOCK_ASICBOOST_VERSION_REG_STRIDE,
-    STOCK_ASIC_TICKET_MASK_REG, STOCK_BC_BUSY_BIT, STOCK_BC_CHAIN_FIELD_CLEAR,
-    STOCK_BC_POST_TRIGGER_POLL_MS, STOCK_BC_POST_TRIGGER_WAIT_MAX_ATTEMPTS,
-    STOCK_BC_PRE_READY_WAIT_MAX_ATTEMPTS, STOCK_BC_SET_CONFIG_SETTLE_US, STOCK_BC_WRITE_TRIGGER_OR,
-    STOCK_BM1387_MISC_CTRL_REG, STOCK_BM1387_SET_CONFIG_PLL_REG, STOCK_COLD_BOOT_INTER_STAGE_MS,
-    STOCK_COLD_BOOT_OPEN_CORE_SETTLE_MS, STOCK_DHASH_MULTI_MIDSTATE_BIT, STOCK_HCNT_REG,
-    STOCK_INIT_ASIC_TICKET_MASK, STOCK_INIT_UART_BAUDDIV_MAX, STOCK_INIT_UART_BAUD_NUMER_A,
-    STOCK_INIT_UART_BAUD_NUMER_B, STOCK_INIT_UART_BAUD_SCALE,
+    STOCK_ASICBOOST_VERSION_REGS, STOCK_ASIC_TICKET_MASK_REG, STOCK_BC_BUSY_BIT,
+    STOCK_BC_CHAIN_FIELD_CLEAR, STOCK_BC_POST_TRIGGER_POLL_MS,
+    STOCK_BC_POST_TRIGGER_WAIT_MAX_ATTEMPTS, STOCK_BC_PRE_READY_WAIT_MAX_ATTEMPTS,
+    STOCK_BC_SET_CONFIG_SETTLE_US, STOCK_BC_WRITE_TRIGGER_OR, STOCK_BM1387_MISC_CTRL_REG,
+    STOCK_BM1387_SET_CONFIG_PLL_REG, STOCK_COLD_BOOT_INTER_STAGE_MS,
+    STOCK_COLD_BOOT_OPEN_CORE_SETTLE_MS, STOCK_DHASH_MIDSTATE_COUNT_MASK,
+    STOCK_DHASH_MIDSTATE_COUNT_SHIFT, STOCK_DMA_JOB_SLOT_SIZE, STOCK_DMA_MERKLE_BRANCH_LEN,
+    STOCK_HCNT_REG, STOCK_INIT_ASIC_TICKET_MASK, STOCK_INIT_UART_BAUDDIV_MAX,
+    STOCK_INIT_UART_BAUD_NUMER_A, STOCK_INIT_UART_BAUD_NUMER_B, STOCK_INIT_UART_BAUD_SCALE,
     STOCK_OPEN_CORE_BC_NULLWORK_ENABLE_BIT, STOCK_OPEN_CORE_BC_NULLWORK_PRELUDE_BIT,
     STOCK_OPEN_CORE_BC_PRELUDE_AND, STOCK_OPEN_CORE_BC_PRELUDE_SETTLE_US,
     STOCK_OPEN_CORE_BUFFER_POLL_US, STOCK_OPEN_CORE_BUFFER_WAIT_MAX_ATTEMPTS,

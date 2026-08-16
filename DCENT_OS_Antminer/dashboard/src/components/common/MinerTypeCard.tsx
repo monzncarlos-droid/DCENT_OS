@@ -9,7 +9,7 @@
 //   • Chip count "126 × 4 chains"
 //   • voltage_fixed   → "Voltage: fixed 1530 mV (DVS unavailable)"
 //   • inverted_curve  → anomaly tooltip (marginal silicon)
-//   • requires_apw12_plus → "APW12+ required" badge
+//   • requires_apw12_plus → required / unresolved PSU-binding badge
 //
 // Cross-references:
 //   •
@@ -152,6 +152,24 @@ function PvtRow({ miner }: { miner: MinerTypeResponse | null | undefined }) {
             }}
           >
             APW12+ REQUIRED
+          </span>
+        )}
+        {hasPvt && miner!.requires_apw12_plus === null && (
+          <span
+            className="ds-chip"
+            data-testid="pvt-psu-binding-unresolved-badge"
+            title="Held hashboard evidence does not identify or authorize a PSU protocol. Installation and cold boot remain blocked."
+            style={{
+              fontSize: '0.62rem',
+              padding: '2px 8px',
+              borderRadius: 6,
+              background: 'rgba(239,68,68,0.10)',
+              color: 'var(--red, #EF4444)',
+              border: '1px solid rgba(239,68,68,0.30)',
+              fontWeight: 700,
+            }}
+          >
+            PSU BINDING UNRESOLVED
           </span>
         )}
         {hasPvt && miner!.inverted_curve && (

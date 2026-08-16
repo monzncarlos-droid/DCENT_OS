@@ -36,11 +36,12 @@
 # proved the boot.bin is a self-decrypting 4 KiB shim cascade that self-relocates
 # into a mini-U-Boot and `bootm`-boots the already-fatloaded uImage (so the SD
 # card needs NO MLO / NO TI-U-Boot — only the verbatim boot.bin + a raw `go`
-# uEnv). That decode ALSO found the body performs an RSA-2048 signature check
-# (`In RSAVerify(): Hash …`) but did NOT extract the RSA modulus/exponent. So a
-# FORKED/re-sealed boot.bin that swaps in our own kernel would fail signature
-# until R11-2 extracts (or we patch out) that RSAVerify gate. Using VNish's
-# boot.bin VERBATIM is therefore the proven, lowest-risk path (analogous to
+# uEnv). The completed decode also proves that the body locates the resident
+# mini-U-Boot RSA verifier and overwrites its first two instructions with
+# `mov r0,#0; bx lr` before boot dispatch. The decoded hash, search string,
+# entry signature, patch literals, call targets, and call ordering are checked
+# on every build. Using VNish's boot.bin VERBATIM is therefore the lowest-risk
+# Experimental path (analogous to
 # DCENT_OS already reusing BraiinsOS boot-critical FSBL/U-Boot/FPGA/kernel on
 # Zynq) — it is the sweep-v2 §6.1 first-`a lab unit`-test recipe, not a stopgap. The
 # SHA256 of the boot.bin is pinned FAIL-CLOSED below so a proof card can never
@@ -55,6 +56,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+BOOTBIN_ANALYZER="$REPO_ROOT/tools/vnish_bb_boot_bin/vnish_bootbin_decrypt.py"
+PAYLOAD_EXTRACTOR="$SCRIPT_DIR/safe_extract_am3_bb_payload.py"
 # shellcheck source=lib/sd_common.sh
 . "$SCRIPT_DIR/lib/sd_common.sh"
 # shellcheck source=lib/am3_bb_dtb_contract.sh
@@ -63,23 +67,23 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/lib/buildroot_rootfs_arch_guard.sh"
 BUILDROOT_OUTPUT="${BUILDROOT_OUTPUT:-$PROJECT_DIR/buildroot/output/images}"
 SD_OUTPUT_DIR="$BUILDROOT_OUTPUT/sd_card_am3_bb_s19jpro"
-ARTIFACT_DIR=""
+VNISH_HELD_ARTIFACT_DIR="$REPO_ROOT/knowledge-base/extractions/vnish-firmware-2026-05-14-batch/s19jpro-bb-v1.2.6/_partitions/p1_fat"
+ARTIFACT_DIR="$VNISH_HELD_ARTIFACT_DIR"
 PAYLOAD_TAR=""
 PAYLOAD_DIR=""
 UIMAGE_SRC_OVERRIDE=""
 DTB_SRC_OVERRIDE=""
 INITRAMFS_SRC_OVERRIDE=""
-DEFAULT_BOOTBIN_PATH="$PROJECT_DIR/output/vnish-extracted-artifacts/boot.bin-s19jpro-bb-v1.2.6"
+DEFAULT_BOOTBIN_PATH="$VNISH_HELD_ARTIFACT_DIR/boot.bin"
 BOOTBIN_PATH="$DEFAULT_BOOTBIN_PATH"
-DEFAULT_UENV_PATH="$PROJECT_DIR/output/vnish-extracted-artifacts/uEnv.txt-s19jpro-bb-v1.2.6"
+DEFAULT_UENV_PATH="$VNISH_HELD_ARTIFACT_DIR/uEnv.txt"
 UENV_SOURCE_PATH="$DEFAULT_UENV_PATH"
 # Reference SHA256 of the captured VNish v1.2.6 S19j Pro BB boot.bin. This
 # builder PINS this hash FAIL-CLOSED: any mismatch refuses the build. Phase 2G
 # locks the boot.bin so the live `a lab unit` reset-loop proof on a card produced by
 # this builder is an unambiguous test of the VNish boot.bin hypothesis, not a
-# test of some unknown surrogate binary. Operators who need to swap in a
-# different VNish drop must pass --accept-bootbin-mismatch and re-run the
-# audit; the override exists for future RE work, not normal proof runs.
+# test of some unknown surrogate binary. Other drops belong in the standalone
+# reverse-engineering analyzer; they cannot produce an installable artifact.
 BOOTBIN_REFERENCE_SHA256="394bd5271f25dd2a2d9939f2b5b7dd52f763a184a4ca18b9131f2544d9d846ba"
 # Reference SHA256 of the captured VNish v1.2.6 S19j Pro BB uEnv.txt
 # (verbatim copy of the file VNish ships at FAT16 P1 root). Pinned for
@@ -132,14 +136,14 @@ ALLOW_STALE_KERNEL=0
 # resident-U-Boot variants. Operators can still override with --label, but
 # Phase 2G proof runs should keep the default.
 BOOT_LABEL="${BOOT_LABEL:-ANTHILLOS}"
-# Fail-closed hash gate (default ON for proof builds). Override only when an
-# operator deliberately swaps in a different VNish boot.bin for RE work; the
-# manifest still records the actual hash either way.
+# Legacy parser compatibility only. A mismatched donor is always refused; the
+# flag cannot authorize artifact generation.
 ACCEPT_BOOTBIN_MISMATCH=0
 # This prototype is not release-signable while its vendor boot.bin remains
-# unaudited and its RSA payload-verification gate is open. --sign is retained
+# unaudited and cold boot remains unwitnessed. --sign is retained
 # as a fail-closed diagnostic so old automation cannot silently downgrade.
 SIGN_IMAGE=0
+VALIDATE_INPUTS_ONLY=0
 EXTRA_DTB_PATHS=()
 # Use the library's shared cleanup array under a local-friendly alias so
 # inline `CLEANUP_PATHS+=("$tmp")` continues to work. The library owns the
@@ -166,7 +170,7 @@ Options:
                       Loaded at 0x88000000 by uEnv.txt and entered via 'go'.
                       SHA256 is pinned FAIL-CLOSED to:
                         $BOOTBIN_REFERENCE_SHA256
-                      Override with --accept-bootbin-mismatch for RE work.
+                      No mismatch override is accepted for artifact builds.
   --uenv <path>       VNish uEnv.txt to copy verbatim onto P1.
                       Default: $DEFAULT_UENV_PATH
   --uimage <path>     uImage to copy as 'uImage' on the SD (overrides
@@ -178,8 +182,9 @@ Options:
                       initramfs for VNish's update.image.gz at the same
                       0x81000000 load address). If raw cpio.gz, mkimage
                       wraps it automatically.
-  --artifacts <dir>   Directory containing uImage and DTB. MLO/u-boot.img are
-                      intentionally ignored.
+  --artifacts <dir>   Directory containing uImage and DTB. Defaults to the
+                      exact held S19j Pro BB v1.2.6 P1 evidence directory.
+                      MLO/u-boot.img are intentionally ignored.
   --payload-tar <tar> Rootfs payload tar, e.g. dcentos-am3-bb-s19jpro-sdcard.tar.
   --payload-dir <dir> Directory containing uramdisk.image.gz / ramdisk.gz.
   --strict-kernel     ALSO abort on the stale Bitmain factory kernel
@@ -196,11 +201,13 @@ sweep-v2 §6.1 proof recipe uses VNish's carrier DTB, which passes.
                       Phase 2G proof runs MUST keep ANTHILLOS — it is the
                       load-bearing marker the VNish boot.bin expects.
   --accept-bootbin-mismatch
-                      Override the SHA256 fail-closed gate. Use only when
-                      deliberately swapping in a different VNish drop for
-                      RE work. The manifest still records the actual hash.
+                      Deprecated compatibility flag. It never authorizes a
+                      mismatched blob; use the standalone analyzer for RE.
   --sign              Request release signing. Currently fails closed while
-                      the vendor/RSA trust gates remain open.
+                      the vendor trust/cold-boot gates remain open.
+  --validate-inputs-only
+                      Verify all exact donor, RSA-bypass, payload, kernel,
+                      DTB, architecture, and size contracts; create no image.
   --extra-dtb <path>  Additional DTB to copy onto the SD as a fallback (may
                       be passed multiple times).
   --size-mb N         Override the total .img size in MiB. Defaults to the
@@ -239,6 +246,10 @@ while [ $# -gt 0 ]; do
             ;;
         --sign)
             SIGN_IMAGE=1
+            shift
+            ;;
+        --validate-inputs-only)
+            VALIDATE_INPUTS_ONLY=1
             shift
             ;;
         --uimage)
@@ -335,15 +346,13 @@ done
 
 if [ "$SIGN_IMAGE" = "1" ] || [ -n "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
     echo "ERROR: VNish prototype is not eligible for DCENT_OS release signing" >&2
-    echo "       vendor_blob_unaudited=true and boot_bin_rsa_verify_gate=OPEN" >&2
+    echo "       vendor_blob_unaudited=true and cold_boot_witnessed=false" >&2
     echo "       A future audited/closed design must use a new signing schema." >&2
     exit 1
 fi
 
 sd_common::validate_fat_label BOOT_LABEL
 sd_common::refuse_block_device "$SD_OUTPUT_DIR"
-
-mkdir -p "$SD_OUTPUT_DIR"
 
 # Thin shim wrappers around sd_common::* — preserved so existing inline
 # callers continue to work without churning every call site.
@@ -378,24 +387,36 @@ if [ "$BOOTBIN_BYTES" -ne "$BOOTBIN_EXACT_BYTES" ]; then
 fi
 BOOTBIN_SHA="$(sha256_file "$BOOTBIN_PATH")"
 if [ "$BOOTBIN_SHA" != "$BOOTBIN_REFERENCE_SHA256" ]; then
-    if [ "$ACCEPT_BOOTBIN_MISMATCH" = "1" ]; then
-        echo "[WARN] boot.bin SHA256 differs from captured VNish v1.2.6 reference" >&2
-        echo "[WARN]   actual:   $BOOTBIN_SHA" >&2
-        echo "[WARN]   expected: $BOOTBIN_REFERENCE_SHA256" >&2
-        echo "[WARN] --accept-bootbin-mismatch in effect — continuing for RE workflow." >&2
-    else
-        echo "ERROR: boot.bin SHA256 does NOT match the pinned VNish v1.2.6 reference." >&2
-        echo "       actual:   $BOOTBIN_SHA" >&2
-        echo "       expected: $BOOTBIN_REFERENCE_SHA256" >&2
-        echo "       path:     $BOOTBIN_PATH" >&2
-        echo "" >&2
-        echo "       The fail-closed hash gate ensures the live .79 reset-loop proof on a" >&2
-        echo "       Phase 2G card tests the VNish boot.bin hypothesis byte-exactly. To" >&2
-        echo "       override (e.g. when deliberately swapping in another VNish drop for" >&2
-        echo "       RE work), re-run with --accept-bootbin-mismatch." >&2
-        exit 1
-    fi
+    echo "ERROR: boot.bin SHA256 does NOT match the pinned VNish v1.2.6 reference." >&2
+    echo "       actual:   $BOOTBIN_SHA" >&2
+    echo "       expected: $BOOTBIN_REFERENCE_SHA256" >&2
+    echo "       path:     $BOOTBIN_PATH" >&2
+    echo "       --accept-bootbin-mismatch is RE-only compatibility syntax and" >&2
+    echo "       cannot authorize an artifact build. Analyze another drop separately." >&2
+    exit 1
 fi
+
+# Load-bearing clean-room behavior gate. Hash identity establishes the bytes;
+# this analyzer establishes why a substituted DCENT payload can cross the
+# resident RSA boundary. It performs no output or device I/O.
+[ -f "$BOOTBIN_ANALYZER" ] || {
+    echo "ERROR: clean-room boot.bin analyzer missing: $BOOTBIN_ANALYZER" >&2
+    exit 1
+}
+if command -v python3 >/dev/null 2>&1; then
+    BOOTBIN_PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    BOOTBIN_PYTHON=python
+else
+    echo "ERROR: python3/python is required for the boot.bin behavior gate" >&2
+    exit 1
+fi
+if ! "$BOOTBIN_PYTHON" "$BOOTBIN_ANALYZER" "$BOOTBIN_PATH" \
+        --verify --analyze-rsa-bypass; then
+    echo "ERROR: pinned boot.bin failed the exact RSA-bypass behavior gate" >&2
+    exit 1
+fi
+echo "  PASS: exact boot.bin patches RSAVerify to success before boot dispatch"
 
 # --- Validate uEnv.txt source -----------------------------------------------
 # We use VNish's verbatim uEnv.txt rather than hand-writing one. Falls back to
@@ -443,9 +464,15 @@ if [ -z "$ROOTFS_CPIO" ] && [ -z "$RAMDISK_UIMAGE_SRC" ]; then
         }
         PAYLOAD_TMP="$(mktemp -d)"
         CLEANUP_PATHS+=("$PAYLOAD_TMP")
-        tar -xf "$PAYLOAD_TAR" -C "$PAYLOAD_TMP"
-        ROOTFS_CPIO="$(find "$PAYLOAD_TMP" -type f -name uramdisk.image.gz | head -1)"
-        RAMDISK_UIMAGE_SRC="$(find "$PAYLOAD_TMP" -type f -name ramdisk.gz | head -1)"
+        [ -f "$PAYLOAD_EXTRACTOR" ] || {
+            echo "ERROR: bounded payload extractor missing: $PAYLOAD_EXTRACTOR" >&2
+            exit 1
+        }
+        "$BOOTBIN_PYTHON" "$PAYLOAD_EXTRACTOR" \
+            --expected-target am3-bb-s19jpro \
+            "$PAYLOAD_TAR" "$PAYLOAD_TMP"
+        ROOTFS_CPIO="$PAYLOAD_TMP/dcentos-am3-bb-s19jpro-sdcard/uramdisk.image.gz"
+        RAMDISK_UIMAGE_SRC="$PAYLOAD_TMP/dcentos-am3-bb-s19jpro-sdcard/ramdisk.gz"
     elif [ -n "$PAYLOAD_DIR" ]; then
         for candidate in \
             "$PAYLOAD_DIR/uramdisk.image.gz" \
@@ -654,6 +681,7 @@ mkimage -l "$RAMDISK_UIMAGE_TMP" 2>/dev/null | grep -q 'ARM Linux RAMDisk Image'
 
 # --- Partition + filesystem layout ------------------------------------------
 IMG_FILE="$SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.img"
+SIGNING_MANIFEST="$SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.manifest.json"
 P1_OFFSET_SECTORS=$VNISH_P1_START_SECTORS
 P1_OFFSET_BYTES=$((P1_OFFSET_SECTORS * 512))
 SECTOR_SIZE=512
@@ -709,6 +737,24 @@ else
     fi
 fi
 
+if [ "$VALIDATE_INPUTS_ONLY" = "1" ]; then
+    echo "VALIDATED: am3-bb-s19jpro exact inputs; no image or device written"
+    echo "proof_scope=exact-pinned-static-analysis"
+    echo "boot_bin_rsa_verify_behavior=runtime-patch-to-success-statically-proven"
+    echo "cold_boot_witnessed=false"
+    echo "persistent_install_authorized=false"
+    exit 0
+fi
+
+sd_common::refuse_unsafe_output_alias "$IMG_FILE" \
+    "$BOOTBIN_PATH" "$UENV_SOURCE_PATH" "$UIMAGE_SRC" "$DTB_SRC" \
+    "$RAMDISK_UIMAGE_TMP" "$ROOTFS_CPIO" "$PAYLOAD_TAR" "$PAYLOAD_EXTRACTOR" \
+    "$BOOTBIN_ANALYZER"
+sd_common::refuse_unsafe_output_alias "$SIGNING_MANIFEST" \
+    "$IMG_FILE" "$BOOTBIN_PATH" "$UENV_SOURCE_PATH" "$UIMAGE_SRC" \
+    "$DTB_SRC" "$RAMDISK_UIMAGE_TMP" "$ROOTFS_CPIO" "$PAYLOAD_TAR"
+mkdir -p "$SD_OUTPUT_DIR"
+
 echo "============================================================================"
 echo "[!] WARNING: This image embeds a 49 KiB CLOSED-SOURCE VNish vendor boot.bin"
 echo "[!]          as the first-stage boot executor. It is NOT Bitmain-signed,"
@@ -719,16 +765,13 @@ echo "[!]          do NOT use it where an unaudited vendor blob in the boot chai
 echo "[!]          is unacceptable. See RUNBOOK.md section 5 + manifest field"
 echo "[!]          vendor_blob_unaudited=true."
 echo "[!]"
-echo "[!] RSA-VERIFY GATE (R11-1, OPEN): the boot.bin decode found an RSA-2048"
-echo "[!]          signature check ('In RSAVerify(): Hash ...') whose modulus was"
-echo "[!]          NOT extracted. This card substitutes a DCENT_OS initramfs for"
-echo "[!]          VNish's update.image.gz (and may substitute a DCENT uImage via"
-echo "[!]          --uimage). If the boot.bin RSA-verifies the kernel and/or the"
-echo "[!]          ramdisk, the substituted DCENT payload will be REJECTED and the"
-echo "[!]          card will NOT reach DCENT_OS userspace. The proven-safe first"
-echo "[!]          test (sweep-v2 §6.1) keeps the VNish VERBATIM uImage+DTB and"
-echo "[!]          substitutes ONLY the initramfs, to isolate whether the ramdisk"
-echo "[!]          is inside the RSA envelope. Manifest: boot_bin_rsa_verify_gate."
+echo "[!] RSA-VERIFY BEHAVIOR (STATICALLY PROVEN FOR THE PINNED BLOB): clean-room"
+echo "[!]          analysis proves boot.bin locates the resident RSAVerify entry"
+echo "[!]          and patches it to 'mov r0,#0; bx lr' before boot dispatch. The"
+echo "[!]          builder re-verifies the decoded hash, entry signature, patch"
+echo "[!]          literals, call targets, and ordering on every run. This removes"
+echo "[!]          the former signature uncertainty; it does NOT witness cold boot"
+echo "[!]          or make the closed third-party boot blob trusted/Production."
 echo "============================================================================"
 echo "=== am3-bb-s19jpro VNish boot.bin SD image (Phase 2G) ==="
 echo "Image:      $IMG_FILE"
@@ -837,7 +880,7 @@ cat > "$MANIFEST_TMP" <<EOF
   "vnish_reference_source": "SD-awesome-s19jpro-bb-sd-v1.2.6-install.zip",
   "vnish_reference_inner_img_sha256": "8a7281771225be9e36f6241126482273f9cc8229190150707cb093192914f28a",
   "phase": "Preparedness Sweep v2 2026-05-15 Phase 2G",
-  "notes": "Canonical builder. Byte-exactly mirrors VNish v1.2.6 50 MiB / 3-partition / ANTHILLOS layout. DCENT_OS initramfs substituted for VNish update.image.gz at the same 0x81000000 load address; 'go 0x88000000' jump unchanged. boot.bin is a CLOSED-SOURCE third-party VNish vendor blob (NOT Bitmain-signed, NOT D-Central-audited; 2nd stage past 0x60 is encrypted/unaudited, RE blocker R10-1 OPEN). SHA256 is pinned for provenance only, NOT a trust attestation. Do not redistribute without operator awareness; see RUNBOOK.md section 5.",
+  "notes": "Canonical Experimental builder. Byte-exactly mirrors VNish v1.2.6 50 MiB / 3-partition / ANTHILLOS layout. DCENT_OS initramfs is substituted at 0x81000000; 'go 0x88000000' is unchanged. Exact static analysis proves the pinned boot.bin patches the resident RSA verifier to success before boot dispatch. The blob remains closed-source, unaudited, and cold-boot-unwitnessed; its hash is provenance, not trust attestation.",
   "partitions": {
     "p1": {
       "start_sector": ${VNISH_P1_START_SECTORS},
@@ -882,9 +925,21 @@ cat > "$MANIFEST_TMP" <<EOF
   "boot_bin_sha256": "$BOOTBIN_SHA",
   "boot_bin_reference_sha256": "$BOOTBIN_REFERENCE_SHA256",
   "boot_bin_match_reference": $([ "$BOOTBIN_SHA" = "$BOOTBIN_REFERENCE_SHA256" ] && echo true || echo false),
-  "bootbin_pin_override": $([ "$ACCEPT_BOOTBIN_MISMATCH" = "1" ] && echo true || echo false),
+  "bootbin_pin_override": false,
   "vendor_blob_unaudited": true,
-  "boot_bin_rsa_verify_gate": "OPEN (R11-1): boot.bin decode found an RSA-2048 RSAVerify() with an un-extracted modulus. This card substitutes a DCENT_OS initramfs (and possibly a DCENT uImage) for VNish's payload; if the boot.bin RSA-verifies the kernel/ramdisk the substituted DCENT payload is rejected and DCENT_OS userspace is never reached. Proven-safe first test keeps VNish-verbatim uImage+DTB and substitutes only the initramfs.",
+  "boot_bin_decoded_sha256": "0c26b7bdda17abc7b2fc53101843b23a0c142ac63b159462c37273a6a3cb0f50",
+  "boot_bin_rsa_verify_behavior": "runtime-patch-to-success-statically-proven",
+  "rsa_bypass_locator_offset": "0x06d48",
+  "rsa_bypass_patcher_offset": "0x06e78",
+  "rsa_bypass_main_call_offset": "0x040c0",
+  "rsa_bypass_boot_dispatch_call_offset": "0x040f8",
+  "rsa_bypass_matched_entry_words": ["0xe3510000", "0x13500000"],
+  "rsa_bypass_replacement_words": ["0xe3a00000", "0xe12fff1e"],
+  "rsa_bypass_patch_precedes_boot_dispatch": true,
+  "proof_scope": "exact-pinned-static-analysis",
+  "cold_boot_witnessed": false,
+  "native_runtime_support": "management-and-mining-runtime-accepted-share-proven-on-luxos-chain",
+  "persistent_install_authorized": false,
   "dcent_uimage_substituted": $([ -n "$UIMAGE_SRC_OVERRIDE" ] && echo true || echo false),
   "dcent_initramfs_substituted": true,
   "boot_bin_path": "$BOOTBIN_PATH",
@@ -919,7 +974,6 @@ sd_common::dd_write_partition "$BOOT_PART_TMP" "$IMG_FILE" "$P1_OFFSET_SECTORS"
 
 IMG_BYTES=$(total_bytes "$IMG_FILE")
 IMG_SHA="$(sha256_file "$IMG_FILE")"
-SIGNING_MANIFEST="$SD_OUTPUT_DIR/dcentos-am3-bb-s19jpro-vnish-bootbin.manifest.json"
 SIGNING_MANIFEST_BODY="$(
     sed '$d' "$MANIFEST_TMP"
     printf ',\n  "image_sha256": "%s"\n}\n' "$IMG_SHA"

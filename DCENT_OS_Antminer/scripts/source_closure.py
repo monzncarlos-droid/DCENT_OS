@@ -63,14 +63,49 @@ PREBUILT_BUILD_INPUT_SELECTION_AUTHORITY = (
     "manifest-from-same-git-authenticated-release-capsule-source-snapshot"
 )
 PREBUILT_BUILD_INPUT_MANIFEST = "DCENT_OS_Antminer/scripts/build_inputs.manifest"
+AM2_S17_DONOR_RELATIVE_PATH = (
+    ""
+)
+AM2_S17_DONOR_DISCOVERY_PREFIX = "braiins-os_am2-s17"
+AM2_S17_DONOR_SIZE = 112_197_632
+AM2_S17_DONOR_SHA256 = (
+    "b0444ad2a5e9b9e2b021ec756a40cb1448128545a42c77bdabb4363617d03579"
+)
+AMLOGIC_EXACT_MODEL_BY_TARGET = {
+    "am3-s19jpro-aml": "s19jpro",
+    "am3-s19jproplus": "s19jpro-plus",
+    "am3-s19xp": "s19xp",
+    "am3-s19jxp": "s19j-xp",
+    "am3-s19kpro": "s19kpro",
+    "am3-s21": "s21",
+    "am3-s21pro": "s21pro",
+    "am3-s21xp": "s21xp",
+    "am3-t21": "t21",
+}
+AMLOGIC_EXACT_INPUTS_BY_TARGET = {
+    target: tuple(
+        f"/"
+        "vnishfarm-1.2.6-rc5-aml-nand-install/" + suffix
+        for suffix in ("vmlinux.bin", "devicetree.dtb", "rootfs/etc/fw-info")
+    )
+    for target, model in AMLOGIC_EXACT_MODEL_BY_TARGET.items()
+}
 PREBUILT_RUST_INPUTS_BY_TARGET = {
     "s9": ("dcentos-init", "dcentrald"),
     "am2-s19jpro": ("dcentos-init", "dcentrald"),
     "am2-s19jpro-sd": ("dcentos-init", "dcentrald"),
     "am2-s19pro": ("dcentos-init", "dcentrald"),
+    "am2-s17pro": ("dcentos-init", "dcentrald"),
+    **{
+        target: ("dcentos-init", "dcentrald")
+        for target in AMLOGIC_EXACT_MODEL_BY_TARGET
+    },
 }
 PREBUILT_RUST_VARIANT_BY_TARGET = {
-    target: "zynq" for target in PREBUILT_RUST_INPUTS_BY_TARGET
+    target: (
+        "amlogic" if target in AMLOGIC_EXACT_MODEL_BY_TARGET else "zynq"
+    )
+    for target in PREBUILT_RUST_INPUTS_BY_TARGET
 }
 COMMON_CARGO_BUILD_INPUTS = ()
 TARGET_BUILD_INPUTS = {
@@ -93,6 +128,8 @@ TARGET_BUILD_INPUTS = {
         "",
         "",
     ),
+    "am2-s17pro": (AM2_S17_DONOR_RELATIVE_PATH,),
+    **AMLOGIC_EXACT_INPUTS_BY_TARGET,
 }
 # Canonical-manifest entries that are deliberately not direct inputs to the
 # currently supported release consumers. Keep these classifications disjoint
@@ -103,34 +140,6 @@ SEPARATELY_VERIFIED_BUILD_INPUTS = (
     "DCENT_OS_Antminer/buildroot/dl/toolchain-external-custom/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz",
 )
 BLOCKED_BUILD_INPUT_TARGETS = {
-    "am2-s17pro": (
-        "am2-s17pro has no pinned S17 kernel input; refusing all packaging, including lab builds, "
-        "until every optional extraction fallback is replaced by an exact manifest input"
-    ),
-    "am3-s19kpro": (
-        "am3-s19kpro consumes an unpinned s19k/s21 Amlogic kernel fallback; "
-        "refusing all packaging, including lab builds, until the selected kernel is pinned"
-    ),
-    "am3-s21": (
-        "am3-s21 consumes an unpinned S21 Amlogic kernel; refusing all packaging, "
-        "including lab builds, until that kernel is pinned"
-    ),
-    "am3-s21pro": (
-        "am3-s21pro consumes an unpinned S21 Pro Amlogic kernel; refusing all "
-        "packaging, including lab builds, until that kernel is pinned"
-    ),
-    "am3-s21xp": (
-        "am3-s21xp consumes an unpinned S21 XP Amlogic kernel; refusing all "
-        "packaging, including lab builds, until that kernel is pinned"
-    ),
-    "am3-s19jpro-aml": (
-        "am3-s19jpro-aml consumes an unpinned s19j-aml/s21 kernel fallback; "
-        "refusing all packaging, including lab builds, until the selected kernel is pinned"
-    ),
-    "am3-t21": (
-        "am3-t21 consumes an unpinned t21/s21 kernel fallback; refusing all "
-        "packaging, including lab builds, until the selected kernel is pinned"
-    ),
     "am3-bb": (
         "am3-bb boot inputs remain operator-supplied and unpinned; refusing all "
         "packaging, including lab builds, until the complete SD boot input set is pinned"
@@ -173,6 +182,35 @@ BUILD_TARGET_POLICIES = {
             "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
             "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_s19pro_defconfig",
         ),
+    },
+    "am2-s17pro": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_s17pro_zynq_defconfig",
+        ),
+    },
+    **{
+        target: {
+            "arch": "aarch64-unknown-linux-musl",
+            "configs": (
+                "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+                "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am3_aml_common.fragment",
+                "DCENT_OS_Antminer/br2_external_dcentos/configs/"
+                + {
+                    "am3-s19jpro-aml": "dcentos_am3_s19jpro_aml_defconfig",
+                    "am3-s19jproplus": "dcentos_am3_s19jproplus_defconfig",
+                    "am3-s19xp": "dcentos_am3_s19xp_defconfig",
+                    "am3-s19jxp": "dcentos_am3_s19jxp_defconfig",
+                    "am3-s19kpro": "dcentos_am3_s19kpro_defconfig",
+                    "am3-s21": "dcentos_am3_s21_defconfig",
+                    "am3-s21pro": "dcentos_am3_s21pro_defconfig",
+                    "am3-s21xp": "dcentos_am3_s21xp_defconfig",
+                    "am3-t21": "dcentos_am3_t21_defconfig",
+                }[target],
+            ),
+        }
+        for target in AMLOGIC_EXACT_MODEL_BY_TARGET
     },
 }
 
@@ -254,6 +292,57 @@ def source_file(root: pathlib.Path, path_text: str, label: str) -> Dict[str, Any
     }
 
 
+def discover_am2_s17_donor(root: pathlib.Path) -> Dict[str, Any]:
+    """Admit one canonical held S17 donor and reject ambiguous lookalikes."""
+
+    root = pathlib.Path(root).resolve(strict=True)
+    expected = pathlib.PurePosixPath(AM2_S17_DONOR_RELATIVE_PATH)
+    directory_path = root.joinpath(*expected.parent.parts)
+    try:
+        directory = ensure_inside(root, directory_path, "AM2 S17 donor directory")
+    except OSError as error:
+        fail(f"AM2 S17 donor directory is unavailable: {error}")
+    if not directory.is_dir():
+        fail(f"AM2 S17 donor directory is not a directory: {directory}")
+
+    candidates = sorted(
+        (
+            item
+            for item in directory.iterdir()
+            if item.name.startswith(AM2_S17_DONOR_DISCOVERY_PREFIX)
+            and item.name.endswith(".img")
+        ),
+        key=lambda item: item.name.encode("utf-8"),
+    )
+    if not candidates:
+        fail(
+            "am2-s17pro requires exactly one held Braiins S17 donor; "
+            f"missing {AM2_S17_DONOR_RELATIVE_PATH}"
+        )
+    if len(candidates) != 1:
+        fail(
+            "am2-s17pro donor discovery is ambiguous; expected one canonical image, "
+            f"found {[item.name for item in candidates]}"
+        )
+    candidate = candidates[0]
+    if candidate.name != expected.name:
+        fail(
+            "am2-s17pro donor discovery found a non-canonical filename; expected "
+            f"{expected.name}, found {candidate.name}"
+        )
+    evidence = source_file(root, str(candidate), "AM2 S17 Braiins donor")
+    if (
+        evidence["size"] != AM2_S17_DONOR_SIZE
+        or evidence["sha256"] != AM2_S17_DONOR_SHA256
+    ):
+        fail(
+            "AM2 S17 Braiins donor size/SHA256 mismatch: "
+            f"expected {AM2_S17_DONOR_SIZE}/{AM2_S17_DONOR_SHA256}, "
+            f"actual {evidence['size']}/{evidence['sha256']}"
+        )
+    return evidence
+
+
 def parse_build_input_manifest(
     root: pathlib.Path, manifest_text: str
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
@@ -303,6 +392,10 @@ def build_input_evidence(
     blocked = BLOCKED_BUILD_INPUT_TARGETS.get(target)
     if blocked is not None:
         fail(blocked)
+    if target == "am2-s17pro":
+        donor = discover_am2_s17_donor(root)
+        if donor["path"] != AM2_S17_DONOR_RELATIVE_PATH:
+            fail("am2-s17pro donor discovery did not resolve its canonical path")
 
     manifest, declared = parse_build_input_manifest(root, manifest_text)
     selected = TARGET_BUILD_INPUTS.get(target)

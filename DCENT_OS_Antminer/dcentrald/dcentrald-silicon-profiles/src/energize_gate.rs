@@ -888,18 +888,41 @@ mod tests {
     }
 
     // ---- env helpers ----
+    //
+    // These four read PROCESS-GLOBAL environment variables, and `cargo test`
+    // runs tests in parallel threads of ONE process. The previous
+    // `remove_var`-then-assert shape did not make them deterministic — it only
+    // narrowed the race: a sibling test can `set_var` between the remove and
+    // the assert. Measured 2026-08-06: the default suite failed
+    // `env_strict_refuse_recognizes_1` + `env_accept_degraded_default_off`
+    // (496 passed / 2 failed) while `--test-threads=1` passed 498/0 — the
+    // signature of exactly this race, and pure flake, never a real regression.
+    //
+    // `dcentrald-asic/src/lib.rs:254`
+    // (`driver_tests_do_not_mutate_process_global_environment`) already bans
+    // this pattern in that crate; this module was the outlier. The mutex below
+    // serialises the whole set so the suite is deterministic under the default
+    // parallel runner, without changing a single assertion.
+    //
+    // Note the guard deliberately ignores lock poisoning: a panicking sibling
+    // must not cascade into "all env tests fail" and hide the original failure.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn env_strict_refuse_default_off() {
+        let _g = env_guard();
         // The first-deploy rollout requires this to default OFF.
-        // Other tests in this crate may set the variable; use
-        // std::env::remove_var to be deterministic.
         std::env::remove_var("DCENT_AM2_STRICT_SKU_REFUSE");
         assert!(!strict_sku_refuse_enabled());
     }
 
     #[test]
     fn env_strict_refuse_recognizes_1() {
+        let _g = env_guard();
         std::env::set_var("DCENT_AM2_STRICT_SKU_REFUSE", "1");
         assert!(strict_sku_refuse_enabled());
         std::env::remove_var("DCENT_AM2_STRICT_SKU_REFUSE");
@@ -907,12 +930,14 @@ mod tests {
 
     #[test]
     fn env_accept_degraded_default_off() {
+        let _g = env_guard();
         std::env::remove_var("DCENT_AM2_ACCEPT_DEGRADED_HARDWARE");
         assert!(!accept_degraded_hardware_enabled());
     }
 
     #[test]
     fn env_accept_degraded_recognizes_1() {
+        let _g = env_guard();
         std::env::set_var("DCENT_AM2_ACCEPT_DEGRADED_HARDWARE", "1");
         assert!(accept_degraded_hardware_enabled());
         std::env::remove_var("DCENT_AM2_ACCEPT_DEGRADED_HARDWARE");

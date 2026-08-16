@@ -65,6 +65,22 @@ for target in policy.BLOCKED_BUILD_INPUT_TARGETS:
 
 assert policy.TARGET_BUILD_INPUTS["am2-s19jpro-sd"] == policy.TARGET_BUILD_INPUTS["am2-s19jpro"]
 assert policy.TARGET_BUILD_INPUTS["am2-s19pro"] == policy.TARGET_BUILD_INPUTS["am2-s19jpro"]
+assert policy.TARGET_BUILD_INPUTS["am2-s17pro"] == (
+    policy.AM2_S17_DONOR_RELATIVE_PATH,
+)
+assert policy.AM2_S17_DONOR_SHA256 == (
+    "b0444ad2a5e9b9e2b021ec756a40cb1448128545a42c77bdabb4363617d03579"
+)
+assert "am2-s17pro" not in policy.BLOCKED_BUILD_INPUT_TARGETS
+assert set(policy.BLOCKED_BUILD_INPUT_TARGETS) == {
+    "am3-bb",
+    "am3-bb-s19jpro",
+    "am3-bb-s19jpro-vnish",
+}
+assert 'AM2_S17_DONOR_ENV_ARGS=()' in driver
+assert '-e "DCENT_AM2_S17_BRAIINS_SD_IMAGE=/dcent-inputs/files/${AM2_S17_DONOR_RELATIVE_PATH}"' in driver
+assert "DCENT_AM2_S17_KERNEL" not in driver
+assert "DCENT_AM2_S17_VENDOR_ARCHIVE" not in driver
 
 source_closure_path = pathlib.Path(sys.argv[1]).resolve()
 repo_root = source_closure_path.parents[3]

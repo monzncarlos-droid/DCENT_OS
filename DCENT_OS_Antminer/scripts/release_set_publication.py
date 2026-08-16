@@ -1478,6 +1478,23 @@ def manifest_stage(args: argparse.Namespace) -> None:
     report_after_commit((content.decode("utf-8").removesuffix("\n"),))
 
 
+def windows_native_identity(expected_identity: tuple[int, int]) -> tuple[int, int]:
+    """Translate CPython's Windows ``stat`` identity to Win32 handle form.
+
+    ``GetFileInformationByHandle`` exposes a 32-bit volume serial plus a
+    64-bit file index. Current Windows CPython keeps the same file index in
+    ``st_ino`` but may carry additional volume identity bits above the low
+    32 bits of ``st_dev``. Comparing the raw tuples therefore rejects the
+    exact file we just opened. Keep the comparison fail-closed while comparing
+    the two APIs in their shared representation.
+    """
+
+    device, inode = expected_identity
+    if device < 0 or inode < 0:
+        fail("Windows file identity is invalid")
+    return device & 0xFFFFFFFF, inode & 0xFFFFFFFFFFFFFFFF
+
+
 def open_pinned_windows_directory(
     path: Path,
     expected_identity: tuple[int, int],
@@ -1545,7 +1562,7 @@ def open_pinned_windows_directory(
             information.volume_serial,
             (information.file_index_high << 32) | information.file_index_low,
         )
-        if identity != expected_identity:
+        if identity != windows_native_identity(expected_identity):
             fail(f"opened {label} identity changed")
         if not information.attributes & 0x10 or information.attributes & 0x400:
             fail(f"opened {label} is not a non-reparse directory")
@@ -1634,7 +1651,7 @@ def open_pinned_windows_file(
             information.volume_serial,
             (information.file_index_high << 32) | information.file_index_low,
         )
-        if identity != expected_identity:
+        if identity != windows_native_identity(expected_identity):
             fail(f"opened {label} identity changed")
         if information.attributes & (0x10 | 0x400) or information.link_count != 1:
             fail(f"opened {label} is not a single-link non-reparse file")
@@ -2873,11 +2890,13 @@ def destroy_stage_windows(
     stage_handle = -1
     try:
         parent_info = handle_information(parent_handle)
-        if handle_identity(parent_info) != expected_parent_identity:
+        if handle_identity(parent_info) != windows_native_identity(
+            expected_parent_identity
+        ):
             fail("opened stage parent identity changed before destruction")
         stage_handle = open_exact(stage, directory=True, pin_name=True)
         stage_info = handle_information(stage_handle)
-        if handle_identity(stage_info) != expected_stage_identity:
+        if handle_identity(stage_info) != windows_native_identity(expected_stage_identity):
             fail("opened stage identity changed before destruction")
         if not stage_info.attributes & 0x10 or stage_info.attributes & 0x400:
             fail("opened stage is not a non-reparse directory")

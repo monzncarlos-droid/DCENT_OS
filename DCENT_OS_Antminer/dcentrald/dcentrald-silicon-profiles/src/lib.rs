@@ -33,6 +33,14 @@ use serde::{Deserialize, Serialize};
 /// BM1387 → BM1368). Lightweight metadata only — per-SKU geometry and
 /// freq/voltage tables remain in the chip-specific `bm13xx.rs` modules.
 pub mod asics;
+/// Round-17 B3 (2026-08-08): first-party Bitmain maintenance-guide thermal
+/// corpus — per-model sensor topology, stated expected counts, placement,
+/// limits and fan counts, every fact cited to guide txt + PDF page
+///. FIRST-PARTY desk
+/// provenance, independent of the ePIC jig registry and the VNish matrix;
+/// refusals stay `None` and are test-pinned. Data only — no thermal control
+/// behaviour lives here.
+pub mod bitmain_guide_thermal;
 ///  W7-A: BM1360 silicon profile.
 ///
 /// **Status until W7.4 (2026-05-07): NAMED ONLY** placeholder (per
@@ -72,9 +80,19 @@ pub mod bm1373;
 pub mod bm1385;
 ///  tune-D: BM1387 (Antminer S9 / S9i / T9) silicon profile.
 pub mod bm1387;
+/// Round 16 B7: BM1390 / BM1390P / BM1390S held-evidence record. Settles the
+/// core count (128) from Bitmain's own per-core pattern files; refuses
+/// chips-per-chain (three inconsistent sources) and every energization
+/// datum. No rival `SiliconTable`.
+pub mod bm1390;
 ///  scaffold: BM1391 (S11/S15/T15) data-only geometry profile.
 pub mod bm1391;
-///  scaffold: BM1396 (S17+/T17+) data-only profile.
+/// Official Bitmain S11/S15/T15 evidence record for the BM1391 generation.
+/// Signed stock settles S15/T15 ASIC identity; the official S15 guide settles
+/// S15 3×60×256 topology and proves pattern labels are not chip counts. T15
+/// physical geometry and S11 ASIC identity remain refused. No rival table.
+pub mod bm1391_stock_fw;
+///  scaffold: BM1396 (S17e/T17e) data-only profile.
 pub mod bm1396;
 ///  silicon-A: BM1397 (Antminer S17 / S19 / S19j) silicon profile.
 pub mod bm1397;
@@ -109,6 +127,10 @@ pub mod efficiency;
 /// strictness (`DCENT_AM2_STRICT_SKU_REFUSE=1`, default OFF for
 /// first-deploy telemetry-only rollout).
 pub mod energize_gate;
+/// S19k Pro / BM1366 Amlogic NoPic profile admission (BETA offline gates).
+/// Fabric identity + LM75-before-probe + Has_Pic:false refuse; mining stays
+/// NOT IMPLEMENTED.
+pub mod s19k_nopic_admission;
 ///  tune-A: BraiinsOS GDTUNER state machine port.
 pub mod gdtuner;
 /// 9: per-control-board GPIO maps (CV1835 / AM335x / Amlogic /
@@ -159,6 +181,14 @@ pub mod psus;
 /// Owns the disk-backed profile catalog at `/etc/dcentrald/profiles.d/`.
 /// See `plans/wave4-profile-import-infrastructure.md` §B for the spec.
 pub mod registry;
+/// Round-15 A5 (2026-08-07): Scrypt product-line (L3+ / L7 / L9) topology
+/// transcribed byte-exactly from authentic Bitmain stock images, plus the
+/// stock L3+ chain-UART baud whitelist decoded from its own termios mapper.
+/// Every field is `Option` and is `Some` only when a held stock artifact
+/// states it literally — absent data stays `None` and is test-pinned as
+/// refused. Establishes that the Antminer **L9 is BM1491, not BM1489**.
+/// Data + refusals only — no driver behaviour lives here.
+pub mod scrypt_stock_topology;
 /// Rank-33 (2026-08-03): declarative per-SKU temperature-sensor topology
 /// (direct vs I²C-mux transports, physical positions) over the
 /// `hashboard_topology` registry, plus the shared fail-closed

@@ -388,30 +388,29 @@ pub enum Bm1362HashboardSku {
     Bhb42651,
 
     // --- High-bin family (BHB42801 freq/voltage table) ---
-    /// **BHB42801** — S19 Pro+ higher-grade. Lifted voltage envelope
+    /// **BHB42801** — exact BM1362 high-bin SKU. Lifted voltage envelope
     /// (1530-1600 mV chip-rail). Higher freq targets up to 675 MHz.
-    /// **REQUIRES APW12+** (NOT APW12 SMBus) — at 1.6 V / 4000 W+ the
-    /// SMBus rail would brown out. See
-    /// .
+    /// PSU binding is unresolved. The held ePIC record proves the SKU and
+    /// BM1362 identity, but does not identify a PSU or authorize a power
+    /// protocol.
     Bhb42801,
-    /// **BHB42811** — High-bin S19 XP variant. Requires APW12+.
+    /// **BHB42811** — high-bin alias; marketing-model binding unresolved.
     Bhb42811,
-    /// **BHB42821** — High-bin S19 XP variant. Requires APW12+.
+    /// **BHB42821** — high-bin alias; marketing-model binding unresolved.
     Bhb42821,
 
     // --- High-bin extended (BHB42831 freq/voltage table) ---
     /// **BHB42831** — high-bin + extra 585 MHz row. 88 ASICs × 4 chains.
-    /// **REQUIRES APW12+** (high-bin power class).
+    /// PSU binding is unresolved.
     Bhb42831,
 
     // --- Fixed-voltage repair-class (BHB42803 freq/voltage table) ---
-    /// **BHB42803** — single-voltage repair-class hashboard. 84 ASICs
+    /// **BHB42803** — single-voltage preset. 84 ASICs
     /// × **3 chains** (NOT 4). Fixed 1530 mV at the PCB-level VRM
     /// divider. `voltage_fixed=true` — autotuner MUST short-circuit
     /// `voltage_search` to NoOp via
     /// [`VoltageSearchState::new_with_pvt_flags`] and
-    /// . **Requires APW12+**
-    /// (4000 W class even at single voltage — current draw is high).
+    /// . PSU binding is unresolved.
     Bhb42803,
 
     // --- Mid-band mixable family (BHB42611 freq/voltage table) ---
@@ -432,7 +431,7 @@ pub enum Bm1362HashboardSku {
     Bhb42701,
 
     // --- Low-power salvage family (BHB42841 freq/voltage table) ---
-    /// **BHB42841** — low-power salvage variant for marginal chips.
+    /// **BHB42841** — high-voltage/low-frequency preset.
     /// 410-475 MHz @ 1360-1480 mV. 126 ASICs × 4 chains.
     ///
     /// **INVERTED CURVE**: lower frequency requires HIGHER voltage for
@@ -461,7 +460,7 @@ pub struct Bm1362ChainGeometry {
 }
 
 impl Bm1362ChainGeometry {
-    /// Canonical S19j Pro / S19j Pro+ / S19k Pro chain geometry.
+    /// Legacy 126-chip BM1362 geometry used by the BHB426 family.
     pub const STANDARD: Bm1362ChainGeometry = Bm1362ChainGeometry {
         chips_per_chain: chip::CHIPS_PER_CHAIN,
         chains: chip::CHAINS,
@@ -534,11 +533,11 @@ pub const BHB42601_FREQ_VOLT_GRID_FULL: &[Bm1362FreqVoltRow] = &[
     (465, 1320), (465, 1340),
 ];
 
-/// BHB42801 (S19 Pro+ higher-grade) freq/voltage levels.
+/// BHB42801 BM1362 high-bin freq/voltage levels; model binding unresolved.
 pub const BHB42801_FREQ_VOLT_TABLE: &[Bm1362FreqVoltRow] =
     &[(675, 1530), (645, 1545), (615, 1565), (585, 1600)];
 
-/// BHB42811 / BHB42821 high-bin S19 XP variant envelope.
+/// BHB42811 / BHB42821 high-bin BM1362 alias envelope.
 ///
 /// R6-2 tightened these aliases from the broader BHB42801 collapsed table
 /// to the vendor `levels.json` envelope: 615-675 MHz @ 1530-1600 mV.
@@ -646,12 +645,13 @@ pub struct Bm1362SkuFlags {
     /// a fixed-V VRM corrupts the PIC MSSP parser. See
     /// .
     pub voltage_fixed: bool,
-    /// `true` ⇒ requires the APW12+ register-based PSU protocol
-    /// (`dcentrald-hal::psu_apw12_plus`). The high-bin BHB428xx family
-    /// (BHB42801/811/821/831 and BHB42803) draws 4000 W+ at 1.6 V which
-    /// would brown out APW12 SMBus. See
-    /// .
-    pub requires_apw12_plus: bool,
+    /// Three-state PSU binding evidence.
+    ///
+    /// `Some(true)` means exact evidence requires APW12+; `Some(false)`
+    /// means exact evidence rules that requirement out; `None` means the
+    /// SKU evidence does not settle the PSU binding. Unknown MUST remain a
+    /// blocker and must never be interpreted as either PSU class.
+    pub requires_apw12_plus: Option<bool>,
     /// `true` ⇒ freq↓ implies volt↑ (inverted from every other BHB42xxx
     /// table). BHB42841 only. Autotuner heuristics MUST consult this
     /// before walking the freq/voltage table.
@@ -667,7 +667,7 @@ impl Bm1362SkuFlags {
     /// All-false flag set (the common case for standard SKUs).
     pub const STANDARD: Self = Self {
         voltage_fixed: false,
-        requires_apw12_plus: false,
+        requires_apw12_plus: Some(false),
         inverted_curve: false,
         mix_levels: false,
     };
@@ -775,19 +775,18 @@ impl Bm1362HashboardSku {
             Bm1362HashboardSku::Bhb42631
             | Bm1362HashboardSku::Bhb42632
             | Bm1362HashboardSku::Bhb42651 => Bm1362SkuFlags::STANDARD,
-            // High-bin family — REQUIRES APW12+.
+            // Exact ePIC identity does not settle a PSU binding.
             Bm1362HashboardSku::Bhb42801
             | Bm1362HashboardSku::Bhb42811
             | Bm1362HashboardSku::Bhb42821
             | Bm1362HashboardSku::Bhb42831 => Bm1362SkuFlags {
-                requires_apw12_plus: true,
+                requires_apw12_plus: None,
                 ..Bm1362SkuFlags::STANDARD
             },
-            // Fixed-voltage repair-class — voltage_fixed AND requires
-            // APW12+ (4000 W class even at single voltage).
+            // Fixed-voltage identity is exact; PSU binding is unresolved.
             Bm1362HashboardSku::Bhb42803 => Bm1362SkuFlags {
                 voltage_fixed: true,
-                requires_apw12_plus: true,
+                requires_apw12_plus: None,
                 ..Bm1362SkuFlags::STANDARD
             },
             // Mid-band mixable — supports per-chain mix_levels (W13
@@ -796,10 +795,14 @@ impl Bm1362HashboardSku {
                 mix_levels: true,
                 ..Bm1362SkuFlags::STANDARD
             },
-            // Efficiency-optimised — no flags.
-            Bm1362HashboardSku::Bhb42701 => Bm1362SkuFlags::STANDARD,
+            // Exact ePIC identity; PSU binding remains unresolved.
+            Bm1362HashboardSku::Bhb42701 => Bm1362SkuFlags {
+                requires_apw12_plus: None,
+                ..Bm1362SkuFlags::STANDARD
+            },
             // Low-power salvage — INVERTED curve.
             Bm1362HashboardSku::Bhb42841 => Bm1362SkuFlags {
+                requires_apw12_plus: None,
                 inverted_curve: true,
                 ..Bm1362SkuFlags::STANDARD
             },
@@ -915,8 +918,8 @@ pub fn default_sku_for_platform(platform: &str) -> Option<Bm1362HashboardSku> {
         // am3-aml (.133), CV1835 S19j Pro, BB AM335x S19j Pro.
         "am2-s19jpro" | "am3-aml-s19jpro" | "cv1835-s19jpro" | "am3-bb-s19jpro"
         | "bcb100-s19jpro-lab" => Some(Bm1362HashboardSku::Bhb42601),
-        // S19 Pro+ higher-grade variant.
-        "am2-s19jproplus" | "am3-aml-s19jproplus" => Some(Bm1362HashboardSku::Bhb42801),
+        // Model-bound BHB42611 row; do not default S19j Pro+ to BHB42801.
+        "am2-s19jproplus" | "am3-aml-s19jproplus" => Some(Bm1362HashboardSku::Bhb42611),
         _ => None,
     }
 }
@@ -1737,11 +1740,11 @@ mod tests {
                 plat
             );
         }
-        // S19 Pro+ → BHB42801.
+        // S19j Pro+ → model-bound BHB42611; BHB42801 is not a model witness.
         for plat in ["am2-s19jproplus", "am3-aml-s19jproplus"] {
             assert_eq!(
                 default_sku_for_platform(plat),
-                Some(Bm1362HashboardSku::Bhb42801),
+                Some(Bm1362HashboardSku::Bhb42611),
             );
         }
         // Unknown platform → None (caller must handle).
@@ -1842,7 +1845,7 @@ mod tests {
         assert_exact_roundtrip(465, 25);
     }
 
-    // --- BHB42801 (S19 Pro+ higher-grade) — 675/645/615/585 MHz @ 25 MHz ref ---
+    // --- BHB42801 BM1362 high-bin preset — 675/645/615/585 MHz @ 25 MHz ref ---
 
     #[test]
     fn pll_compute_bhb42801_675mhz_exact() {
@@ -2123,26 +2126,29 @@ mod tests {
     }
 
     #[test]
-    fn bhb42801_requires_apw12_plus_true() {
-        // High-bin family — REQUIRES APW12+ (NOT APW12 SMBus). At
-        // 1.6 V / 4000 W+ SMBus would brown out. Per
-        // .
+    fn exact_bhb427_bhb428_rows_leave_psu_binding_unresolved() {
+        // Held ePIC pages prove BM1362 identity for only BHB42701,
+        // BHB42801, and BHB42831. They prove no PSU/model/topology binding;
+        // catalog-only sibling rows inherit the same fail-closed ceiling.
         for sku in [
+            Bm1362HashboardSku::Bhb42701,
             Bm1362HashboardSku::Bhb42801,
             Bm1362HashboardSku::Bhb42811,
             Bm1362HashboardSku::Bhb42821,
             Bm1362HashboardSku::Bhb42831,
-            // BHB42803 is fixed-V repair-class but also 4000 W class —
-            // also routes to APW12+.
             Bm1362HashboardSku::Bhb42803,
+            Bm1362HashboardSku::Bhb42841,
         ] {
-            assert!(
+            assert_eq!(
                 sku.flags().requires_apw12_plus,
-                "{}: must require APW12+",
+                None,
+                "{}",
                 sku.hashboard_id()
             );
         }
-        // Non-high-bin SKUs MUST NOT request APW12+.
+
+        // The remaining stock-derived profiles explicitly carry no APW12+
+        // requirement. This is distinct from the unresolved rows above.
         for sku in [
             Bm1362HashboardSku::Bhb42601,
             Bm1362HashboardSku::Bhb42603,
@@ -2152,12 +2158,11 @@ mod tests {
             Bm1362HashboardSku::Bhb42632,
             Bm1362HashboardSku::Bhb42651,
             Bm1362HashboardSku::Bhb42611,
-            Bm1362HashboardSku::Bhb42701,
-            Bm1362HashboardSku::Bhb42841,
         ] {
-            assert!(
-                !sku.flags().requires_apw12_plus,
-                "{}: must NOT request APW12+",
+            assert_eq!(
+                sku.flags().requires_apw12_plus,
+                Some(false),
+                "{}",
                 sku.hashboard_id()
             );
         }
@@ -2370,8 +2375,8 @@ mod tests {
             assert_eq!(table.iter().map(|(f, _)| *f).max().unwrap(), 675);
             assert_eq!(table.iter().map(|(_, v)| *v).min().unwrap(), 1530);
             assert_eq!(table.iter().map(|(_, v)| *v).max().unwrap(), 1600);
-            // High-bin requires APW12+; no other flags.
-            assert!(alias.flags().requires_apw12_plus);
+            // The table is exact, but it confers no PSU binding.
+            assert_eq!(alias.flags().requires_apw12_plus, None);
             assert!(!alias.flags().voltage_fixed);
             assert!(!alias.flags().inverted_curve);
             assert!(!alias.flags().mix_levels);

@@ -41,7 +41,7 @@ pub enum ApwModel {
     Apw8MidV,
     /// APW8 16-20 V variant (S15/T15).
     Apw8HighV,
-    /// APW9 — S17 / S17 Pro / T17.
+    /// APW9 — exact held model attribution: S17 / S17 Pro.
     Apw9,
     /// APW9+ — S17+ / S17e / T17+ / T17e.
     Apw9Plus,
@@ -195,12 +195,16 @@ impl ApwModel {
                 efficiency_pct: 90,
                 has_voltage_feedback: false,
                 label: "APW9",
-                compatible_miners: "S17, S17 Pro, T17",
+                compatible_miners: "S17, S17 Pro",
             },
             ApwModel::Apw9Plus => ApwSpec {
                 voltage_min_v: 14.5,
                 voltage_max_v: 21.0,
-                max_current_a: Some(200),
+                // Bitmain APW9+ Power Supply Maintenance Guide p.6 prints
+                // 170 A rated current. This is repeated in the p.3 family
+                // description and p.16 repaired-unit load criterion; the
+                // 180-230 A row on p.6 is OCP, not sustained current.
+                max_current_a: Some(170),
                 max_wattage_220v_w: Some(3600),
                 max_wattage_110v_w: None,
                 ac_input_min_v: 200,
@@ -433,6 +437,41 @@ mod tests {
         let s = ApwModel::Apw3.spec();
         assert_eq!(s.max_wattage_220v_w, Some(1600));
         assert_eq!(s.max_wattage_110v_w, Some(1200));
+    }
+
+    #[test]
+    fn apw9_plus_current_matches_first_party_maintenance_guide() {
+        use crate::psu_maintenance::GuidePsuFamily;
+
+        // Exact positive controls in APW9+ guide p.6: 14.5-21 V, 170 A,
+        // 3600 W. The 170 A value is independently repeated on p.3 and p.16.
+        let catalog = ApwModel::Apw9Plus.spec();
+        let guide = GuidePsuFamily::Apw9Plus.spec();
+        assert_eq!(catalog.voltage_min_v, guide.main_output.volts_min);
+        assert_eq!(catalog.voltage_max_v, guide.main_output.volts_max);
+        assert_eq!(catalog.max_current_a, Some(170));
+        assert_eq!(guide.main_output.rated_current_a, Some(170));
+        assert_eq!(catalog.max_wattage_220v_w, Some(3600));
+    }
+
+    #[test]
+    fn apw9_electrical_contract_matches_first_party_maintenance_guide() {
+        use crate::psu_maintenance::{GuideControlInterface, GuidePsuFamily};
+
+        let catalog = ApwModel::Apw9.spec();
+        let guide = GuidePsuFamily::Apw9.spec();
+        assert_eq!(catalog.voltage_min_v, guide.main_output.volts_min);
+        assert_eq!(catalog.voltage_max_v, guide.main_output.volts_max);
+        assert_eq!(catalog.max_current_a, Some(170));
+        assert_eq!(guide.main_output.rated_current_a, Some(170));
+        assert_eq!(catalog.max_wattage_220v_w, Some(3600));
+        assert_eq!(catalog.compatible_miners, "S17, S17 Pro");
+        assert_eq!(catalog.ac_input_min_v, guide.ac_input_min_v as u32);
+        assert_eq!(catalog.ac_input_max_v, guide.ac_input_max_v as u32);
+        assert_eq!(
+            guide.control_interface,
+            GuideControlInterface::I2cPicWithEnActiveLow
+        );
     }
 
     #[test]

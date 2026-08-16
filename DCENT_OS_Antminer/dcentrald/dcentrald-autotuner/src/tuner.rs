@@ -1048,27 +1048,26 @@ impl AutoTuner {
         //   short-circuited by `voltage_search::new_with_pvt_flags`
         //   (W13.C1), so we mirror that contract here by suppressing the
         //   derived voltage. Frequency is still clamped to the envelope.
-        // - `requires_apw12_plus=true` (high-bin BHB428xx) — emit a
-        //   warning if the chip family is paired with an APW12 SMBus PSU.
-        //   The install preflight already blocks this; the warning is
-        //   defense-in-depth (W13.B7).
+        // - `requires_apw12_plus=None` — the held SKU evidence does not
+        //   prove a PSU binding. Emit an explicit warning; install preflight
+        //   independently blocks these identity-only rows.
         if let Some(sku) = self.chain_skus.get(&chain_id).copied() {
             let flags = sku.flags();
 
-            // Defense-in-depth APW12+ requirement check. The autotuner
-            // doesn't see PSU type directly, but the chip rail voltage
-            // ceiling acts as a proxy: APW12 SMBus tops out below the
-            // high-bin BHB428xx envelope (1530 mV+). If a high-bin SKU
-            // is registered AND the proposed voltage is within the
-            // high-bin band, log a warn so operators see the gate
-            // would have fired pre-W13.B7.
-            if flags.requires_apw12_plus && raw_mv >= 1500 {
-                warn!(
+            match flags.requires_apw12_plus {
+                None => warn!(
                     chain_id,
                     sku = sku.hashboard_id(),
                     proposed_mv = raw_mv,
-                    "Silicon profile: SKU requires APW12+ PSU; verify install preflight gate (W13.B7)."
-                );
+                    "Silicon profile: PSU binding is unresolved for this SKU; no PSU protocol or voltage authority follows from hashboard identity"
+                ),
+                Some(true) if raw_mv >= 1500 => warn!(
+                    chain_id,
+                    sku = sku.hashboard_id(),
+                    proposed_mv = raw_mv,
+                    "Silicon profile: exact evidence requires APW12+; verify install preflight gate"
+                ),
+                Some(_) => {}
             }
 
             // BHB42611 mix_levels — W13 only honours symmetric `[freq;
@@ -1738,9 +1737,8 @@ impl AutoTuner {
     ///   PVT envelope (`AutoTunerError::OutsidePvt`).
     /// - Disable the freq↓ ⇒ volt↓ heuristic for `inverted_curve` SKUs
     ///   (BHB42841 —).
-    /// - Emit a defense-in-depth warning when a `requires_apw12_plus`
-    ///   SKU is paired with an APW12 SMBus PSU (the install preflight
-    ///   already blocks this; the warning catches a bypass).
+    /// - Emit a defense-in-depth warning when PSU binding evidence is
+    ///   unresolved. Install preflight independently blocks those rows.
     pub fn set_chain_sku(&mut self, chain_id: u8, sku: Bm1362HashboardSku) {
         self.chain_skus.insert(chain_id, sku);
     }

@@ -623,10 +623,19 @@ mod tests {
 
     #[test]
     fn pll_525_matches_hand_derived_dividers() {
-        // 525 = 25 * 105 / (1 * 1 * 5), VCO = 105*25/1 = 2625 ∈ [2000,3125].
-        // refdiv=2 offers no exact 525 with a smaller-first tie, so the
-        // resolver lands the refdiv=1 solution. Pin the whole tuple.
+        // The jig searches refdiv=2 before refdiv=1, then pd1 ascending and
+        // pd2 from pd1..=7. The first strict-error winner for 525 MHz is
+        // (refdiv=2, pd1=1, pd2=4, fbdiv=168), VCO=2100 MHz.
         let p = bm1370_pll_compute(525, 25).unwrap();
+        assert_eq!(
+            p,
+            Bm1370PllParams {
+                refdiv: 2,
+                fbdiv: 168,
+                postdiv1: 1,
+                postdiv2: 4,
+            }
+        );
         assert_eq!(p.compute_freq_mhz(25), 525);
         assert_eq!(p.fbdiv as u32 * 25 / p.refdiv as u32, p.vco_mhz(25));
         // The product refdiv*pd1*pd2 with fbdiv must reproduce 525 exactly.

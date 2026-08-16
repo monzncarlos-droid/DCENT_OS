@@ -390,7 +390,9 @@ def parse_manifest_bytes(raw: bytes) -> Dict[str, str]:
     return entries
 
 
-def _load_selection_policy(target: str) -> Tuple[str, Tuple[str, ...]]:
+def _load_selection_policy(
+    target: str, payload_root: Optional[pathlib.Path] = None
+) -> Tuple[str, Tuple[str, ...]]:
     source_path = pathlib.Path(__file__).with_name("source_closure.py")
     spec = importlib.util.spec_from_file_location(
         "dcentos_source_closure_policy", source_path
@@ -402,6 +404,13 @@ def _load_selection_policy(target: str) -> Tuple[str, Tuple[str, ...]]:
     blocked = module.BLOCKED_BUILD_INPUT_TARGETS.get(target)
     if blocked is not None:
         fail(blocked)
+    if target == "am2-s17pro" and payload_root is not None:
+        try:
+            evidence = module.discover_am2_s17_donor(payload_root)
+        except module.ClosureError as error:
+            fail(f"AM2 S17 donor admission failed: {error}")
+        if evidence.get("path") != module.AM2_S17_DONOR_RELATIVE_PATH:
+            fail("AM2 S17 donor admission returned a non-canonical path")
     selected = module.TARGET_BUILD_INPUTS.get(target)
     if selected is None:
         fail(f"target {target} has no explicit release build-input policy")
@@ -825,7 +834,7 @@ def create_snapshot(
     manifest_relative = _relative_to_root(
         manifest_root, manifest_path, "build-input manifest"
     )
-    policy, selected = _load_selection_policy(target)
+    policy, selected = _load_selection_policy(target, root)
 
     parent = pathlib.Path(stage_parent or tempfile.gettempdir())
     parent = pathlib.Path(os.path.abspath(str(parent)))

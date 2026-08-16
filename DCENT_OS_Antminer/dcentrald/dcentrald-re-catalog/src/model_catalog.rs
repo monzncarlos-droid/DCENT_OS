@@ -70,6 +70,7 @@ pub static ANTMINER_MODELS: &[ModelEvidence] = &[
     model!("s19pro", 0x1398, 3, Some(114), 115_740, 7, Some(675), Some(13_000), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S19_JIG, ""]),
     model!("s19jpro", 0x1362, 3, Some(126), 115_200, 9, Some(545), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s19xp", 0x1366, 3, Some(110), 115_200, 9, Some(675), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s19jxp", 0x1366, 3, Some(110), 115_200, 9, Some(675), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, "DCENT_OS_Antminer/dcentrald/dcentrald-silicon-profiles/src/hashboard_catalog.rs:462", ""]),
     model!("s19kpro", 0x1366, 3, Some(77), 115_200, 9, Some(670), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s21", 0x1368, 3, Some(108), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s21pro", 0x1370, 3, Some(65), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]),

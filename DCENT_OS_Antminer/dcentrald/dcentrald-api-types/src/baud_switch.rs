@@ -4,9 +4,11 @@
 //!
 //! (237 lines).
 //!
-//! All BM13xx / BM14xx chips boot at **115200 8N1** (true rate 115740 bps
-//! from `25 MHz / (26+1) / 8`) and must upgrade to a higher operational
-//! baud (1.5625 / 3.125 / 6.25 Mbaud) for sustained mining. The transition
+//! All BM13xx / BM14xx chips covered here boot at **115200 8N1** (true rate
+//! 115740 bps from `25 MHz / (26+1) / 8`). Most represented SHA-256 families
+//! upgrade to a higher operational baud (1.5625 / 3.125 / 6.25 Mbaud). Exact
+//! 2017 stock BM1485 is the exception: it remains at nominal 115200. A baud
+//! transition, where present,
 //! is the single most fragile step in chain init — a single dropped
 //! MiscCtrl byte was the root cause of the 75-second zero-nonce stall on
 //! S9.
@@ -31,8 +33,10 @@
 //! - `0x40C100B7` is FORBIDDEN for BM1362 — `MISC_CONTROL_INIT | (1 << 16)`
 //!   is a no-op because bit 16 is already set; the chain stays at 115200
 //!   silently.
-//! - Single-write MiscCtrl is BANNED across all chips. Triple-write with
-//!   ≥5 ms spacing is the only safe pattern.
+//! - Single-write MiscCtrl is BANNED for the admitted upgrade rows. The
+//!   exact-stock BM1485 three-write spine uses two distinct values, addressed
+//!   writes, and 2/100-ms delays; this generic plan cannot represent it and
+//!   remains refused for BM1485.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +58,14 @@ pub enum BaudChipFamily {
     Bm1368,
     /// S21 / S21 Pro: 115200 → 3.125 Mbaud (Bitmain) or 1 Mbaud (ESP-Miner).
     Bm1370,
-    /// L3+ / L7 scrypt: 115200 → 1.5625 Mbaud, BT8D divider.
+    /// L3 / L3+ / L3++ scrypt (BM1485). This variant is **L3
+    /// family only** — the L7 is `BM1489`, a distinct Zynq-7000 platform that is
+    /// NOT represented in this enum; do not re-conflate them (the earlier
+    /// "L3+ / L7" label was wrong, and `chip_init.rs` already scopes BM1485 to
+    /// L3/L3+/L3++). The descriptive fields now match the exact 2017 stock L3+
+    /// binary, but the row remains refused via [`baud_row_is_evidence_backed`]:
+    /// the one-value [`BaudPlan`] cannot encode the stock three-write spine and
+    /// there is no authenticated release/board binding.
     Bm1485,
 }
 
@@ -95,7 +106,10 @@ pub struct BaudPlan {
     pub host_switch_settle_ms: u32,
 }
 
-/// Canonical Bitmain operational baud per chip.
+/// Canonical descriptive chain baud per chip.
+///
+/// Most rows are post-boot upgrade rates. BM1485 is the retained exact-stock
+/// rate; its row is descriptive and non-admitted.
 pub const fn target_baud(family: BaudChipFamily) -> u32 {
     match family {
         BaudChipFamily::Bm1387 => 1_562_500,
@@ -109,7 +123,8 @@ pub const fn target_baud(family: BaudChipFamily) -> u32 {
         | BaudChipFamily::Bm1366
         | BaudChipFamily::Bm1368
         | BaudChipFamily::Bm1370 => 3_125_000,
-        BaudChipFamily::Bm1485 => 1_562_500,
+        // Exact 2017 stock L3+ never raises chain baud after enumeration.
+        BaudChipFamily::Bm1485 => 115_200,
     }
 }
 
@@ -117,23 +132,26 @@ pub const fn target_baud(family: BaudChipFamily) -> u32 {
 /// UART is in the path (Zynq am1/am2). Amlogic platforms return None.
 pub const fn fpga_divider(family: BaudChipFamily) -> Option<u32> {
     match family {
-        BaudChipFamily::Bm1387 | BaudChipFamily::Bm1485 => Some(0x07),
+        BaudChipFamily::Bm1387 => Some(0x07),
         BaudChipFamily::Bm1362 => Some(0x03),
         // BM1397/BM1398 use a PLL3-derived divider not encoded as a flat
         // value — runtime adapter computes it from the PLL config.
         BaudChipFamily::Bm1397 | BaudChipFamily::Bm1398 => None,
         // BM1366/68/70 are Amlogic (kernel UART termios) — no FPGA divider.
-        BaudChipFamily::Bm1366 | BaudChipFamily::Bm1368 | BaudChipFamily::Bm1370 => None,
+        BaudChipFamily::Bm1366
+        | BaudChipFamily::Bm1368
+        | BaudChipFamily::Bm1370
+        | BaudChipFamily::Bm1485 => None,
     }
 }
 
 /// Per-chip register where the baud divisor lives (Bitmain canonical).
 pub const fn baud_register(family: BaudChipFamily) -> u8 {
     match family {
-        // BM1387 / BM1485: MiscCtrl @ 0x1C
-        BaudChipFamily::Bm1387 | BaudChipFamily::Bm1485 => 0x1C,
+        // BM1387: MiscCtrl @ 0x1C
+        BaudChipFamily::Bm1387 => 0x1C,
         // BM1397 / BM1398: MiscCtrl @ 0x18
-        BaudChipFamily::Bm1397 | BaudChipFamily::Bm1398 => 0x18,
+        BaudChipFamily::Bm1397 | BaudChipFamily::Bm1398 | BaudChipFamily::Bm1485 => 0x18,
         // BM1362: broadcast 0x28 then triple 0x18 (we surface 0x18 as the
         // register the triple-write targets — 0x28 is a separate one-shot).
         BaudChipFamily::Bm1362 => 0x18,
@@ -143,7 +161,10 @@ pub const fn baud_register(family: BaudChipFamily) -> u8 {
     }
 }
 
-/// Canonical 32-bit register value for the operational baud.
+/// Canonical 32-bit register value associated with the descriptive row.
+///
+/// For BM1485 this is only the first exact stock MISC_CONTROL word, not a
+/// complete executable baud plan.
 pub const fn register_value(family: BaudChipFamily) -> u32 {
     match family {
         // BM1387: MiscCtrl with `baud_div=1`, `not_set_baud=0` — the gate-block
@@ -158,13 +179,59 @@ pub const fn register_value(family: BaudChipFamily) -> u32 {
         BaudChipFamily::Bm1362 => 0x00C1_00B0,
         // BM1366/68/70 Bitmain 3.125 Mbaud
         BaudChipFamily::Bm1366 | BaudChipFamily::Bm1368 | BaudChipFamily::Bm1370 => 0x0000_3001,
-        // BM1485 — BT8D pattern (RE-derived)
-        BaudChipFamily::Bm1485 => 0x0000_6031,
+        // Exact 2017 stock BM1485 broadcast MISC_CONTROL word. Its complete
+        // sequence also writes 0x707a4041 to addresses 0x0c and 0xc9, which a
+        // one-value BaudPlan cannot express; the row therefore remains refused.
+        BaudChipFamily::Bm1485 => 0x103a_4041,
+    }
+}
+
+/// Whether a family's four baud-plan fields rest on evidence that survives
+/// re-derivation, and may therefore be handed to a runtime baud-upgrade path.
+///
+/// **This is a refusal, not a description.** It gates
+/// [`crate::asic_protocol_spec::baud_family_for_chip_family`], which is the
+/// only route by which a detected chip family turns into a [`BaudPlan`].
+///
+/// # `Bm1485` is `false` — exact stock facts, incomplete executable plan
+///
+/// Instruction-level RE of exact stock L3+ `cgminer` SHA-256
+/// `eb5872ea31257be343495b45d02d2d3a27756ba21b008e42d48a3dfaaa2a8889`
+/// supersedes the old transplanted row. `FUN_0004285c` selects host baud
+/// 115200; `FUN_0003e158` is the only MISC_CONTROL writer and never performs a
+/// high-speed transition. The exact register is `0x18`, the AM335x kernel UART
+/// has no FPGA divider, and its first logical word is `0x103a4041`.
+///
+/// Refusal remains load-bearing. Stock emits three *different-context* writes:
+/// broadcast `0x103a4041`, then `0x707a4041` to addresses `0x0c` and `0xc9`,
+/// with 2-ms inter-write and 100-ms final delays. [`BaudPlan`] has one value,
+/// one generic triple-write timing profile, and no exact artifact/board token.
+/// It cannot safely execute that spine. The owning BM1485 driver also lacks an
+/// authenticated release selector and refuses initialization.
+///
+/// **Do not flip this to `true` merely because the descriptive fields are now
+/// exact for one release.** First add a typed exact-release plan that models
+/// all three writes and bind it to the physical target; other L3/L3++/VNish
+/// profiles remain unproven.
+pub const fn baud_row_is_evidence_backed(family: BaudChipFamily) -> bool {
+    match family {
+        BaudChipFamily::Bm1387
+        | BaudChipFamily::Bm1397
+        | BaudChipFamily::Bm1398
+        | BaudChipFamily::Bm1362
+        | BaudChipFamily::Bm1366
+        | BaudChipFamily::Bm1368
+        | BaudChipFamily::Bm1370 => true,
+        BaudChipFamily::Bm1485 => false,
     }
 }
 
 impl BaudPlan {
-    /// Build the canonical plan for a chip family.
+    /// Build the canonical descriptive plan for a chip family.
+    ///
+    /// Construction does not imply execution authority. Runtime routing must
+    /// first require [`baud_row_is_evidence_backed`]; BM1485 deliberately fails
+    /// that gate because this structure cannot express its full stock spine.
     pub fn canonical(family: BaudChipFamily) -> Self {
         Self {
             family,
@@ -234,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn target_baud_matches_re_doc_per_family() {
+    fn target_baud_matches_evidence_per_family() {
         assert_eq!(target_baud(BaudChipFamily::Bm1387), 1_562_500);
         assert_eq!(target_baud(BaudChipFamily::Bm1397), 6_250_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1398), 3_125_000);
@@ -242,15 +309,16 @@ mod tests {
         assert_eq!(target_baud(BaudChipFamily::Bm1366), 3_125_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1368), 3_125_000);
         assert_eq!(target_baud(BaudChipFamily::Bm1370), 3_125_000);
-        assert_eq!(target_baud(BaudChipFamily::Bm1485), 1_562_500);
+        assert_eq!(target_baud(BaudChipFamily::Bm1485), 115_200);
     }
 
     #[test]
     fn fpga_divider_present_for_zynq_chips_only() {
-        // Zynq am1 (BM1387) + am2 (BM1362) + scrypt am1 (BM1485) use FPGA UART.
+        // Zynq am1 (BM1387) + am2 (BM1362) use FPGA UART.
         assert_eq!(fpga_divider(BaudChipFamily::Bm1387), Some(0x07));
         assert_eq!(fpga_divider(BaudChipFamily::Bm1362), Some(0x03));
-        assert_eq!(fpga_divider(BaudChipFamily::Bm1485), Some(0x07));
+        // Exact L3+ stock uses AM335x kernel UARTs, not an FPGA divider.
+        assert_eq!(fpga_divider(BaudChipFamily::Bm1485), None);
         // BM1397/98 use PLL3-derived (not a flat divider value).
         assert_eq!(fpga_divider(BaudChipFamily::Bm1397), None);
         assert_eq!(fpga_divider(BaudChipFamily::Bm1398), None);
@@ -263,7 +331,7 @@ mod tests {
     #[test]
     fn baud_register_matches_per_family_table() {
         assert_eq!(baud_register(BaudChipFamily::Bm1387), 0x1C);
-        assert_eq!(baud_register(BaudChipFamily::Bm1485), 0x1C);
+        assert_eq!(baud_register(BaudChipFamily::Bm1485), 0x18);
         assert_eq!(baud_register(BaudChipFamily::Bm1397), 0x18);
         assert_eq!(baud_register(BaudChipFamily::Bm1398), 0x18);
         assert_eq!(baud_register(BaudChipFamily::Bm1362), 0x18);
@@ -310,6 +378,80 @@ mod tests {
         assert_eq!(v, 0x0000_3001);
         assert_eq!(register_value(BaudChipFamily::Bm1368), v);
         assert_eq!(register_value(BaudChipFamily::Bm1370), v);
+    }
+
+    // ---- Exact 2017 stock BM1485 description; executable row refused ----
+
+    #[test]
+    fn bm1485_baud_row_is_refused_and_every_other_row_is_admitted() {
+        assert!(
+            !baud_row_is_evidence_backed(BaudChipFamily::Bm1485),
+            "the descriptive BM1485 fields match exact 2017 stock, but the \
+             generic one-value plan cannot encode its complete three-write \
+             spine and has no exact target binding"
+        );
+        for family in [
+            BaudChipFamily::Bm1387,
+            BaudChipFamily::Bm1397,
+            BaudChipFamily::Bm1398,
+            BaudChipFamily::Bm1362,
+            BaudChipFamily::Bm1366,
+            BaudChipFamily::Bm1368,
+            BaudChipFamily::Bm1370,
+        ] {
+            assert!(
+                baud_row_is_evidence_backed(family),
+                "{family:?} must stay admitted — the BM1485 refusal is not a blanket ban"
+            );
+        }
+    }
+
+    #[test]
+    fn bm1485_row_describes_exact_stock_but_stays_refused() {
+        assert_eq!(target_baud(BaudChipFamily::Bm1485), 115_200);
+        assert_eq!(fpga_divider(BaudChipFamily::Bm1485), None);
+        assert_eq!(baud_register(BaudChipFamily::Bm1485), 0x18);
+        assert_eq!(register_value(BaudChipFamily::Bm1485), 0x103a_4041);
+        // The second/third exact words and release binding are outside the
+        // single-value BaudPlan, so descriptive correctness is not authority.
+        assert!(!baud_row_is_evidence_backed(BaudChipFamily::Bm1485));
+    }
+
+    #[test]
+    fn bm1485_unbound_high_speed_candidates_are_unreachable_on_48mhz_uart() {
+        // The L3+ chain UART is an AM335x `ti,omap3-uart` at
+        // clock-frequency = 48000000 (held DTB
+        // am335x-boneblack-bitmainer.dtb, sha256 cc687f8d...b5b4af), and the
+        // live `a lab unit` AM335x dmesg reports base_baud=3000000
+        // (dcentrald-hal/src/serial.rs UART_MMIO_MAP_AM335X notes).
+        //
+        // An OMAP UART divides by an INTEGER in 16x or 13x oversampling mode.
+        // Neither unbound high-speed candidate is reachable in either mode.
+        const UARTCLK_HZ: u32 = 48_000_000;
+        for candidate in [1_562_500u32, 390_625u32] {
+            for mode in [16u32, 13u32] {
+                let exact = UARTCLK_HZ % (mode * candidate) == 0;
+                assert!(
+                    !exact,
+                    "{candidate} would be exactly reachable at {mode}x — re-derive this claim"
+                );
+                // Nearest integer divisor, and the error it produces.
+                let quot = (UARTCLK_HZ + (mode * candidate) / 2) / (mode * candidate);
+                let quot = if quot == 0 { 1 } else { quot };
+                let actual = UARTCLK_HZ / (mode * quot);
+                let err = (actual as f64 - candidate as f64).abs() / candidate as f64;
+                assert!(
+                    err > 0.02,
+                    "{candidate} at {mode}x lands within 2% ({actual} Hz) — \
+                     that would make it usable and this refusal wrong"
+                );
+            }
+        }
+        // Calibration: the nominal host rate exact stock uses is reachable
+        // within ordinary UART tolerance (integer divisor 26 gives 115384).
+        assert_eq!(UARTCLK_HZ / (16 * 26), 115_384);
+        let err = (115_384f64 - BOOT_BAUD as f64) / BOOT_BAUD as f64;
+        assert!(err.abs() < 0.01);
     }
 
     #[test]
@@ -389,10 +531,11 @@ mod tests {
 
     #[test]
     fn uses_fpga_divider_matches_zynq_chips() {
-        // Zynq am1/am2 use FPGA divider; Amlogic + PLL-derived chains do not.
+        // Zynq am1/am2 use FPGA divider; Amlogic, PLL-derived, and exact L3+
+        // AM335x kernel-UART chains do not.
         assert!(BaudPlan::canonical(BaudChipFamily::Bm1387).uses_fpga_divider());
         assert!(BaudPlan::canonical(BaudChipFamily::Bm1362).uses_fpga_divider());
-        assert!(BaudPlan::canonical(BaudChipFamily::Bm1485).uses_fpga_divider());
+        assert!(!BaudPlan::canonical(BaudChipFamily::Bm1485).uses_fpga_divider());
         assert!(!BaudPlan::canonical(BaudChipFamily::Bm1397).uses_fpga_divider());
         assert!(!BaudPlan::canonical(BaudChipFamily::Bm1366).uses_fpga_divider());
         assert!(!BaudPlan::canonical(BaudChipFamily::Bm1370).uses_fpga_divider());

@@ -300,6 +300,21 @@ pub const fn refine_part(manufacturer_id: u8, device_id: u8) -> SensorPart {
     }
 }
 
+/// Admit only a concrete part whose manufacturer/device tuple is present in
+/// the supported registry above.
+///
+/// A known manufacturer is not sufficient: future or incompatible devices can
+/// reuse the vendor ID while exposing a different register map. Runtime sensor
+/// probes must use this helper before treating register bytes as thermal proof.
+/// Unknown tuples return `None` and callers must retain their honest fallback.
+pub const fn recognized_part(manufacturer_id: u8, device_id: u8) -> Option<SensorPart> {
+    let part = refine_part(manufacturer_id, device_id);
+    match part {
+        SensorPart::UnknownForVendor { .. } | SensorPart::Unknown { .. } => None,
+        _ => Some(part),
+    }
+}
+
 /// Advisory human label for a refined part.
 pub const fn refined_part_label(part: SensorPart) -> &'static str {
     match part {
@@ -566,6 +581,37 @@ mod refine_tests {
         assert_eq!(refine_part(0x1A, 0xCA), SensorPart::Nct218);
         assert_eq!(refine_part(0x1A, 0x5A), SensorPart::Nct214);
         assert_eq!(refine_part(0x1A, 0x3F), SensorPart::Nct210);
+    }
+
+    #[test]
+    fn recognized_part_admits_exact_registry_and_refuses_unknown_ids() {
+        let exact = [
+            (0x55, 0x11), // TMP401
+            (0x55, 0x12), // TMP411A
+            (0x55, 0x13), // TMP411B
+            (0x55, 0x10), // TMP411C
+            (0x55, 0x31), // TMP431 family
+            (0x55, 0x32), // TMP432
+            (0x55, 0x35), // TMP435
+            (0x55, 0x21), // TMP421
+            (0x55, 0x22), // TMP422
+            (0x55, 0x23), // TMP423
+            (0x55, 0x00), // TMP451/TMP461
+            (0x41, 0x51), // ADT7461
+            (0x41, 0x57), // ADT7461A
+            (0x41, 0x55), // NCT72
+            (0x41, 0x54), // NCT1008
+            (0x1A, 0xCA), // NCT218
+            (0x1A, 0x5A), // NCT214
+            (0x1A, 0x3F), // NCT210
+        ];
+        for (manufacturer_id, device_id) in exact {
+            assert!(recognized_part(manufacturer_id, device_id).is_some());
+        }
+
+        assert_eq!(recognized_part(0x55, 0x99), None);
+        assert_eq!(recognized_part(0x1A, 0x99), None);
+        assert_eq!(recognized_part(0x99, 0x00), None);
     }
 
     #[test]

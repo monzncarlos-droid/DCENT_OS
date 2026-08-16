@@ -222,7 +222,9 @@ fn the_public_command_surface_is_read_only_by_code() {
 fn every_covered_family_is_pinned_to_the_catalog_address() {
     assert_eq!(PMBUS_PSU_I2C_ADDRESS, 0x58);
     let models: Vec<&str> = PmbusPsuFamily::ALL.iter().map(|f| f.model()).collect();
-    assert_eq!(models, vec!["APW3++", "APW7", "APW9", "APW10", "APW11"]);
+    assert_eq!(models, vec!["APW3++", "APW10", "APW11"]);
+    assert!(!models.contains(&"APW7"));
+    assert!(!models.contains(&"APW9"));
     for family in PmbusPsuFamily::ALL {
         assert_eq!(family.i2c_address(), PMBUS_PSU_I2C_ADDRESS);
     }

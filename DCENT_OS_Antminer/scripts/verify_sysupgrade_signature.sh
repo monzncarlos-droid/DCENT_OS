@@ -4,7 +4,7 @@
 set -eu
 
 usage() {
-    echo "Usage: $0 <dcentos-sysupgrade.tar> <release-pubkey.pem> [expected-board]" >&2
+    echo "Usage: $0 [--package-only-noninstallable] <dcentos-sysupgrade.tar> <release-pubkey.pem> [expected-board]" >&2
 }
 
 fail() {
@@ -44,6 +44,12 @@ run_manifest_python() {
         "$MANIFEST_PYTHON" "$@"
     fi
 }
+
+ALLOW_NONINSTALLABLE=0
+if [ "${1:-}" = "--package-only-noninstallable" ]; then
+    ALLOW_NONINSTALLABLE=1
+    shift
+fi
 
 [ "$#" -ge 2 ] || { usage; exit 2; }
 
@@ -262,7 +268,12 @@ MANIFEST_STATUS_TRIMMED=$(printf '%s' "$MANIFEST_STATUS" | sed 's/^[[:space:]]*/
 [ "$MANIFEST_STATUS" != "lab_unsigned" ] || fail "Manifest authority-v1 forbids status=lab_unsigned"
 [ "$PRODUCT" = "$EXPECTED_PRODUCT" ] || fail "Manifest product '$PRODUCT' does not match expected '$EXPECTED_PRODUCT'"
 [ "$PACKAGE_TYPE" = "sysupgrade" ] || fail "Manifest package_type '$PACKAGE_TYPE' is not sysupgrade"
-[ "$INSTALLABLE" = "true" ] || fail "Manifest must explicitly declare installable=true"
+if [ "$ALLOW_NONINSTALLABLE" = "1" ]; then
+    [ "$INSTALLABLE" = "false" ] \
+        || fail "Package-only signature verification requires installable=false"
+else
+    [ "$INSTALLABLE" = "true" ] || fail "Manifest must explicitly declare installable=true"
+fi
 [ "$ARTIFACT_MATURITY" = "experimental" ] || fail "Manifest artifact_maturity '$ARTIFACT_MATURITY' does not match the experimental sysupgrade policy"
 [ -n "$MANIFEST_BOARD" ] || fail "Manifest missing board"
 [ -n "$MANIFEST_BOARD_TARGET" ] || fail "Manifest missing board_target"

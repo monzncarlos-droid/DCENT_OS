@@ -17,6 +17,7 @@ from sysupgrade_manifest_json import (  # noqa: E402
     admit_manifest,
     compare_versions,
     read_version_file,
+    require_payload_binding,
 )
 
 
@@ -87,6 +88,61 @@ class ManifestAdmissionTests(unittest.TestCase):
             too_deep = self.write_manifest(directory, json.dumps(nested))
             with self.assertRaisesRegex(AdmissionError, "nesting exceeds"):
                 admit_manifest(too_deep)
+
+    def test_payload_binding_rejects_swapped_hashes_and_decoy_strings(self) -> None:
+        kernel_sha = "1" * 64
+        root_sha = "2" * 64
+        manifest = {
+            "payloads": {
+                "kernel": {
+                    "path": "sysupgrade-am3-s21/kernel",
+                    "size": 10,
+                    "sha256": root_sha,
+                    "note": kernel_sha,
+                },
+                "rootfs": {
+                    "path": "sysupgrade-am3-s21/root",
+                    "size": 20,
+                    "sha256": kernel_sha,
+                    "note": root_sha,
+                },
+            }
+        }
+        with self.assertRaisesRegex(AdmissionError, "kernel.sha256"):
+            require_payload_binding(
+                manifest,
+                "kernel",
+                "sysupgrade-am3-s21/kernel",
+                10,
+                kernel_sha,
+            )
+        with self.assertRaisesRegex(AdmissionError, "rootfs.sha256"):
+            require_payload_binding(
+                manifest,
+                "rootfs",
+                "sysupgrade-am3-s21/root",
+                20,
+                root_sha,
+            )
+
+    def test_payload_binding_requires_exact_types(self) -> None:
+        manifest = {
+            "payloads": {
+                "kernel": {
+                    "path": "sysupgrade-am3-s21/kernel",
+                    "size": "10",
+                    "sha256": "1" * 64,
+                }
+            }
+        }
+        with self.assertRaisesRegex(AdmissionError, "kernel.size"):
+            require_payload_binding(
+                manifest,
+                "kernel",
+                "sysupgrade-am3-s21/kernel",
+                10,
+                "1" * 64,
+            )
 
 
 class VersionAdmissionTests(unittest.TestCase):

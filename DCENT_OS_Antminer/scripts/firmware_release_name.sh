@@ -77,7 +77,7 @@ case "$target" in
     am2-t19)               stem="DCENTOS_XIL3_T19" ;;
     am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish) stem="DCENTOS_BB3_S19jPro" ;;
     am3-s21)               stem="DCENTOS_AML3_S21" ;;
-    am3-s19k|am3-s19kpro)  stem="DCENTOS_AML3_S19kPro" ;;
+    am3-s19k|am3-s19kpro|am3-aml-s19kpro)  stem="DCENTOS_AML3_S19kPro" ;;
     am3-s19xp)             stem="DCENTOS_AML3_S19XP" ;;
     am3-s19jpro-aml)       stem="DCENTOS_AML3_S19jPro" ;;
     am3-t21)               stem="DCENTOS_AML3_T21" ;;

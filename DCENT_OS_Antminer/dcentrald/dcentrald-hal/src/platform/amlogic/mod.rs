@@ -8,7 +8,8 @@
 //!
 //! Key differences from Zynq:
 //!   - NO FPGA — ASIC communication via standard Linux serial ports
-//!   - /dev/ttyS1, /dev/ttyS2, /dev/ttyS4 for 3 hash chains (ttyS3 unused)
+//!   - S19k: /dev/ttyS1, /dev/ttyS2, /dev/ttyS3 (`a lab unit` dmesg hash UARTs)
+//!   - S21: /dev/ttyS1, /dev/ttyS2, /dev/ttyS4 (AXG DTB; ttyS3 unused there)
 //!   - GPIO via sysfs or /dev/mem for plug detect and board reset
 //!   - Fan control via sysfs hwmon PWM
 //!   - I2C via standard /dev/i2c-N
@@ -89,6 +90,11 @@ use crate::i2c::{
 };
 use crate::serial::SerialChain;
 use crate::{HalError, Result};
+use dcentrald_common::s19k_am3_gpio437::{
+    s19k_am3_fan_tach_sysfs_n, s19k_am3_led_sysfs_n, s19k_am3_pinmux_sysfs_n,
+    s19k_am3_plug_sysfs_n, s19k_am3_pwr_control_sysfs_n, s19k_am3_reset_sysfs_n,
+};
+use dcentrald_common::s19k_am3_install::s19k_board_target_is_live_alias;
 
 /// Bus protected by [`spawn_amlogic_protected_i2c0_service`].
 ///
@@ -269,8 +275,14 @@ fn parse_amlogic_boot_safe_handoff(source: &str) -> Result<AmlogicBootSafeHandof
     require("resource", AML_BOOT_SAFE_RESOURCE)?;
     require("gpio_direction", "out")?;
     require("gpio_active_low", "0")?;
-    require("commanded_value", "0")?;
-    require("readback_value", "0")?;
+    // T6: live S19k aliases SafeOff is sysfs 1. S21-class remains 0. Use the
+    // receipt's own board_target so a lying S19k receipt cannot claim SafeOff=0.
+    let commanded = match fields.get("board_target").copied() {
+        Some(target) if s19k_board_target_is_live_alias(target) => "1",
+        _ => "0",
+    };
+    require("commanded_value", commanded)?;
+    require("readback_value", commanded)?;
     require("fan0_enabled", "1")?;
     require("fan1_enabled", "1")?;
     require("evidence_grade", "software-readback")?;
@@ -401,8 +413,13 @@ fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<S
     let fan1 = read_live("/sys/class/pwm/pwmchip0/pwm1/duty_cycle")?;
     let fan1_period = read_live("/sys/class/pwm/pwmchip0/pwm1/period")?;
     let fan1_enabled = read_live("/sys/class/pwm/pwmchip0/pwm1/enable")?;
+    let want_safe_off = if s19k_board_target_is_live_alias(board_target.as_str()) {
+        "1"
+    } else {
+        "0"
+    };
     if direction != "out"
-        || value != "0"
+        || value != want_safe_off
         || active_low != "0"
         || fan0 != AML_BOOT_FAN_DUTY_NS.to_string()
         || fan0_period != AML_BOOT_FAN_PERIOD_NS.to_string()
@@ -554,7 +571,7 @@ fn amlogic_slot_from_serial_device(serial_device: &str) -> Option<u8> {
 fn read_plug_topology_checked() -> Result<[bool; 3]> {
     let mut populated = [false; 3];
     for slot in 0..3u32 {
-        let gpio = GPIO_PLUG_BASE + slot;
+        let gpio = resolve_plug_gpio_global(slot)?;
         let root = format!("/sys/class/gpio/gpio{gpio}");
         let value_path = format!("{root}/value");
         if !Path::new(&value_path).exists() {
@@ -620,12 +637,12 @@ impl AmlogicPlatform {
     /// `dcentrald-common::board_desc` and `dcent_schema::hardware::RuntimeStatus`.
     pub fn new() -> Result<Self> {
         // Verify we're actually on Amlogic
-        if !["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS4"]
+        if !["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3", "/dev/ttyS4"]
             .iter()
             .any(|path| std::path::Path::new(path).exists())
         {
             return Err(HalError::Platform(
-                "Amlogic: no ttyS1/ttyS2/ttyS4 device found".to_string(),
+                "Amlogic: no ttyS1/ttyS2/ttyS3/ttyS4 device found".to_string(),
             ));
         }
 
@@ -1081,7 +1098,7 @@ impl AmlogicFan {
         // subset of the fans.
         let mut tach_sources: Vec<Box<dyn FanTachSource>> = Vec::with_capacity(GPIO_FAN_TACH_COUNT);
         for slot in 0..GPIO_FAN_TACH_COUNT {
-            let gpio = GPIO_FAN_TACH_BASE + slot as u32;
+            let gpio = resolve_fan_tach_gpio_global(slot)?;
             let counter = SysfsFallingEdgeCounter::export(gpio).map_err(|e| {
                 HalError::Fan(format!(
                     "Amlogic fan tach capability incomplete: slot {} gpio{} failed: {}",
@@ -1286,7 +1303,17 @@ impl GpioAccess for AmlogicGpio {
     fn read_plug_detect(&self) -> [bool; 3] {
         let mut result = [false; 3];
         for i in 0..3u32 {
-            let gpio = GPIO_PLUG_BASE + i; // 439, 440, 441
+            let gpio = match resolve_plug_gpio_global(i) {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::warn!(
+                        slot = i,
+                        error = %error,
+                        "Amlogic plug-detect name resolve failed; treating slot as empty"
+                    );
+                    continue;
+                }
+            };
             let path = format!("/sys/class/gpio/gpio{}/value", gpio);
             result[i as usize] = fs::read_to_string(&path)
                 .ok()
@@ -1298,7 +1325,17 @@ impl GpioAccess for AmlogicGpio {
     }
 
     fn set_board_reset(&self, chain: u8, assert_reset: bool) {
-        let gpio = GPIO_RESET_BASE + chain as u32; // 454, 455, 456
+        let gpio = match resolve_reset_gpio_global(chain) {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::error!(
+                    chain,
+                    error = %error,
+                    "Amlogic HB reset resolve failed; refusing write"
+                );
+                return;
+            }
+        };
         let path = format!("/sys/class/gpio/gpio{}/value", gpio);
         // Active LOW: 0 = assert reset, 1 = running
         let value = if assert_reset { "0" } else { "1" };
@@ -1370,7 +1407,10 @@ const PMBUS_STATUS_WORD: u8 = 0x79;
 /// Exporting these GPIOs changes the Amlogic pinmux away from PWM/other
 /// functions that corrupt the I2C bus. Must be done BEFORE any I2C access.
 /// Verified from BraiinsOS S37board_setup: exported as "in" direction.
+/// Legacy sysfs globals. HAL resolves `I2C_SCL`/`I2C_SDA` first.
 const GPIO_PINMUX_FIX: [u32; 2] = [476, 477];
+const GPIO_LED_RED: u32 = 438;
+const GPIO_LED_GREEN: u32 = 453;
 
 /// Retained single owner of the Amlogic management fabric. APW power commands
 /// and LM75 telemetry must use this service for the complete hardware session;
@@ -1776,43 +1816,175 @@ impl AmlogicThermalPort {
 /// Stock/VNish userspace drives gpio437 HIGH (`echo 1`) to enable hashboard
 /// power. Native DCENT_OS must also replay the APW I2C sequence because there
 /// is no bosminer/BraiinsOS rootfs in the final boot.
+/// Name-first `PWR_CONTROL`, legacy sysfs 437 only when the DT name is absent.
+pub fn resolve_psu_gpio_global() -> Result<u32> {
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(
+        "PWR_CONTROL",
+        GPIO_PSU_ENABLE,
+    )?;
+    s19k_am3_pwr_control_sysfs_n(resolved.global()).map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Name-first `CH0_PLUG`/`CH1_PLUG`/`CH2_PLUG`. Legacy 439–441 only when
+/// this kernel publishes no such name (VNish DTB). Not Zynq `HB0_PLUG`.
+pub fn resolve_plug_gpio_global(slot: u32) -> Result<u32> {
+    let name = match slot {
+        0 => "CH0_PLUG",
+        1 => "CH1_PLUG",
+        2 => "CH2_PLUG",
+        _ => {
+            return Err(HalError::Platform(format!(
+                "Amlogic plug slot {slot} out of range; S19k/S21 have 3 boards"
+            )));
+        }
+    };
+    let resolved =
+        crate::gpio_name_resolver::resolve_name_or_legacy(name, GPIO_PLUG_BASE + slot)?;
+    s19k_am3_plug_sysfs_n(slot as u8, resolved.global()).map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Name-first `HB0_RESET`/`HB1_RESET`/`HB2_RESET`. Legacy 454–456 only when
+/// the DT name is absent. `HB3_RESET` is not a fourth S19k board.
+fn resolve_reset_gpio_global(chain: u8) -> Result<u32> {
+    let name = match chain {
+        0 => "HB0_RESET",
+        1 => "HB1_RESET",
+        2 => "HB2_RESET",
+        _ => {
+            return Err(HalError::Platform(format!(
+                "Amlogic HB reset chain {chain} out of range; S19k has 3 boards (HB3_RESET is not a 4th slot)"
+            )));
+        }
+    };
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(
+        name,
+        GPIO_RESET_BASE + u32::from(chain),
+    )?;
+    s19k_am3_reset_sysfs_n(chain, resolved.global()).map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Name-first S21 Braiins tach names. Legacy 447–450 only when absent.
+/// ePIC 461–464 is a different revision — not this fallback.
+fn resolve_fan_tach_gpio_global(slot: usize) -> Result<u32> {
+    let name = match slot {
+        0 => "FAN_FRONT_SPEED0",
+        1 => "FAN_FRONT_SPEED1",
+        2 => "FAN_REAR_SPEED0",
+        3 => "FAN_REAR_SPEED1",
+        _ => {
+            return Err(HalError::Platform(format!(
+                "Amlogic fan tach slot {slot} out of range; 4 channels"
+            )));
+        }
+    };
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(
+        name,
+        GPIO_FAN_TACH_BASE + slot as u32,
+    )?;
+    s19k_am3_fan_tach_sysfs_n(slot as u8, resolved.global())
+        .map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Name-first `LED_RED`/`LED_GREEN`. Legacy 438/453 only when absent.
+fn resolve_led_gpio_global(red: bool) -> Result<u32> {
+    let (name, legacy) = if red {
+        ("LED_RED", GPIO_LED_RED)
+    } else {
+        ("LED_GREEN", GPIO_LED_GREEN)
+    };
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(name, legacy)?;
+    s19k_am3_led_sysfs_n(resolved.global()).map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Name-first `I2C_SCL`/`I2C_SDA`. Legacy 476/477 only when absent.
+fn resolve_pinmux_gpio_global(scl: bool) -> Result<u32> {
+    let (name, legacy) = if scl {
+        ("I2C_SCL", GPIO_PINMUX_FIX[0])
+    } else {
+        ("I2C_SDA", GPIO_PINMUX_FIX[1])
+    };
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(name, legacy)?;
+    s19k_am3_pinmux_sysfs_n(resolved.global()).map_err(|e| HalError::Platform(e.into()))
+}
+
+/// Best-effort status LED write after name resolve. Active HIGH.
+/// Does not change PSU or reset. Track-1 must not call this.
+pub fn write_amlogic_status_led(red: bool, on: bool) -> Result<()> {
+    let n = resolve_led_gpio_global(red)?;
+    let gpio_path = format!("/sys/class/gpio/gpio{n}/value");
+    if !Path::new(&gpio_path).exists() {
+        let _ = fs::write("/sys/class/gpio/export", n.to_string());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let dir_path = format!("/sys/class/gpio/gpio{n}/direction");
+    if Path::new(&dir_path).exists() {
+        let _ = fs::write(&dir_path, "out");
+    }
+    let value = if on { "1" } else { "0" };
+    fs::write(&gpio_path, value).map_err(|e| {
+        HalError::Platform(format!(
+            "Amlogic {} LED write failed: {e}",
+            if red { "RED" } else { "GREEN" }
+        ))
+    })?;
+    Ok(())
+}
+
 fn enable_psu_gpio() -> Result<()> {
-    let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
+    let n = resolve_psu_gpio_global()?;
+    let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
 
     // Ensure GPIO is exported
     let export_path = "/sys/class/gpio/export";
     if !std::path::Path::new(&gpio_path).exists() {
-        let _ = fs::write(export_path, format!("{}", GPIO_PSU_ENABLE));
+        let _ = fs::write(export_path, format!("{}", n));
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // Pin raw active-high mode explicitly. A stale active_low=1 would invert
     // logical sysfs readback and could turn a requested safety LOW into HIGH.
-    ensure_psu_active_low_disabled_checked()?;
-    let dir_path = format!("/sys/class/gpio/gpio{}/direction", GPIO_PSU_ENABLE);
-    fs::write(&dir_path, "low")
-        .map_err(|e| HalError::Platform(format!("PSU GPIO direction: {}", e)))?;
-    fs::write(&gpio_path, "1")
-        .map_err(|e| HalError::Platform(format!("PSU GPIO enable: {}", e)))?;
+    ensure_psu_active_low_disabled_checked(n)?;
+    let dir_path = format!("/sys/class/gpio/gpio{}/direction", n);
+    // S21-class: direction "low" is SafeOff then value "1" enables.
+    // am3-s19k T6: sysfs 0 engages — direction "low" would energize first.
+    // Glitch-free SafeOff is direction "high" (1=OFF), then value "0" (ON).
+    if amlogic_board_target_is_s19k()? {
+        fs::write(&dir_path, "high")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO direction: {}", e)))?;
+        fs::write(&gpio_path, "0")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO enable: {}", e)))?;
+    } else {
+        fs::write(&dir_path, "low")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO direction: {}", e)))?;
+        fs::write(&gpio_path, "1")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO enable: {}", e)))?;
+    }
 
     std::thread::sleep(Duration::from_millis(50));
-    if !read_psu_enabled_checked()? {
+    if !read_psu_enabled_on(n)? {
         return Err(HalError::Platform(format!(
-            "PSU GPIO {} readback stayed LOW after enable",
-            GPIO_PSU_ENABLE
+            "PSU GPIO {} readback was not engaged after enable",
+            n
         )));
     }
 
-    tracing::info!(
-        "PSU GPIO {} driven HIGH and read back HIGH (PSU enabled)",
-        GPIO_PSU_ENABLE
-    );
+    if amlogic_board_target_is_s19k()? {
+        tracing::info!(
+            "PSU GPIO {} driven 0 and read back engaged (am3-s19k T6 active-low enable)",
+            n
+        );
+    } else {
+        tracing::info!(
+            "PSU GPIO {} driven HIGH and read back HIGH (PSU enabled)",
+            n
+        );
+    }
 
     Ok(())
 }
 
-fn read_psu_active_low_disabled_checked() -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/active_low", GPIO_PSU_ENABLE);
+fn read_psu_active_low_disabled_checked(n: u32) -> Result<()> {
+    let path = format!("/sys/class/gpio/gpio{}/active_low", n);
     let value = fs::read_to_string(&path)
         .map_err(|error| HalError::Platform(format!("PSU GPIO active_low readback: {error}")))?;
     if value.trim() == "0" {
@@ -1820,17 +1992,17 @@ fn read_psu_active_low_disabled_checked() -> Result<()> {
     } else {
         Err(HalError::Platform(format!(
             "PSU GPIO {} active_low readback was {:?}, expected raw active-high mode 0",
-            GPIO_PSU_ENABLE,
+            n,
             value.trim()
         )))
     }
 }
 
-fn ensure_psu_active_low_disabled_checked() -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/active_low", GPIO_PSU_ENABLE);
+fn ensure_psu_active_low_disabled_checked(n: u32) -> Result<()> {
+    let path = format!("/sys/class/gpio/gpio{}/active_low", n);
     fs::write(&path, "0")
         .map_err(|error| HalError::Platform(format!("PSU GPIO active_low=0: {error}")))?;
-    read_psu_active_low_disabled_checked()
+    read_psu_active_low_disabled_checked(n)
 }
 
 /// Checked software safe-off evidence for GPIO437. This proves that the LOW
@@ -1853,27 +2025,78 @@ impl PsuSafeOffReceipt {
 }
 
 /// Disable the APW PSU output and require a checked LOW readback.
+fn amlogic_board_target_is_s19k() -> Result<bool> {
+    let value = fs::read_to_string("/etc/dcentos/board_target").map_err(|error| {
+        HalError::Platform(format!(
+            "GPIO437 refuse: missing /etc/dcentos/board_target ({error}); S21-default write-0 would engage am3-s19k"
+        ))
+    })?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(HalError::Platform(
+            "GPIO437 refuse: empty board_target; will not guess S21 SafeOff=0".into(),
+        ));
+    }
+    Ok(s19k_board_target_is_live_alias(trimmed))
+}
+
 pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
-    let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
-    ensure_psu_active_low_disabled_checked()?;
-    // Drive LOW to disable PSU (active HIGH,  Q10 — corrected 2026-05-21).
-    fs::write(&gpio_path, "0")
-        .map_err(|e| HalError::Platform(format!("PSU GPIO disable: {}", e)))?;
+    // Board identity first: never guess S21 SafeOff=0 on an unlabelled S19k.
+    let s19k = amlogic_board_target_is_s19k()?;
+    let n = resolve_psu_gpio_global()?;
+    let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
+    // Track-1 /tmp on Braiins never inherits enable_psu_gpio()'s export.
+    // Crash/planned-stop must export themselves; an unexported write is a miss.
+    if !std::path::Path::new(&gpio_path).exists() {
+        fs::write("/sys/class/gpio/export", format!("{}", n)).map_err(|e| {
+            HalError::Platform(format!("PSU GPIO export for SafeOff: {}", e))
+        })?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !std::path::Path::new(&gpio_path).exists() {
+        return Err(HalError::Platform(format!(
+            "PSU GPIO {} still unexported after export; SafeOff write would be a silent miss",
+            n
+        )));
+    }
+    ensure_psu_active_low_disabled_checked(n)?;
+    // S21-class SafeOff: direction "low" then value "0".
+    // am3-s19k T6 SafeOff: direction "high" (1=OFF, glitch-free) then value "1".
+    // Never direction "low" on s19k here — that would energize first.
+    let dir_path = format!("/sys/class/gpio/gpio{}/direction", n);
+    if s19k {
+        fs::write(&dir_path, "high")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO SafeOff direction: {}", e)))?;
+        fs::write(&gpio_path, "1")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO disable: {}", e)))?;
+    } else {
+        fs::write(&dir_path, "low")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO SafeOff direction: {}", e)))?;
+        fs::write(&gpio_path, "0")
+            .map_err(|e| HalError::Platform(format!("PSU GPIO disable: {}", e)))?;
+    }
 
     std::thread::sleep(Duration::from_millis(50));
-    if read_psu_enabled_checked()? {
+    if read_psu_enabled_on(n)? {
         return Err(HalError::Platform(format!(
-            "PSU GPIO {} readback stayed HIGH after disable",
-            GPIO_PSU_ENABLE
+            "PSU GPIO {} readback stayed engaged after disable",
+            n
         )));
     }
 
-    tracing::info!(
-        "PSU GPIO {} driven LOW and read back LOW (PSU disabled)",
-        GPIO_PSU_ENABLE
-    );
+    if amlogic_board_target_is_s19k()? {
+        tracing::info!(
+            "PSU GPIO {} driven 1 and read back disengaged (am3-s19k T6 SafeOff)",
+            n
+        );
+    } else {
+        tracing::info!(
+            "PSU GPIO {} driven LOW and read back LOW (PSU disabled)",
+            n
+        );
+    }
     Ok(PsuSafeOffReceipt {
-        gpio: GPIO_PSU_ENABLE,
+        gpio: n,
         completed_at: Instant::now(),
     })
 }
@@ -1885,17 +2108,30 @@ pub fn disable_psu() -> Result<()> {
 
 /// Read GPIO437 without converting I/O or parse failures into a false `off`.
 pub fn read_psu_enabled_checked() -> Result<bool> {
-    read_psu_active_low_disabled_checked()?;
-    let gpio_path = format!("/sys/class/gpio/gpio{}/value", GPIO_PSU_ENABLE);
+    let n = resolve_psu_gpio_global()?;
+    read_psu_enabled_on(n)
+}
+
+fn read_psu_enabled_on(n: u32) -> Result<bool> {
+    read_psu_active_low_disabled_checked(n)?;
+    let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
     let value = fs::read_to_string(&gpio_path)
         .map_err(|error| HalError::Platform(format!("PSU GPIO readback: {error}")))?;
-    parse_psu_gpio_enabled(&value)
+    let s19k = amlogic_board_target_is_s19k()?;
+    parse_psu_gpio_engaged(&value, s19k)
 }
 
 fn parse_psu_gpio_enabled(value: &str) -> Result<bool> {
+    parse_psu_gpio_engaged(value, false)
+}
+
+fn parse_psu_gpio_engaged(value: &str, s19k: bool) -> Result<bool> {
     match value.trim() {
-        "0" => Ok(false),
-        "1" => Ok(true),
+        "0" | "1" => Ok(if s19k {
+            value.trim() == "0"
+        } else {
+            value.trim() == "1"
+        }),
         other => Err(HalError::Platform(format!(
             "PSU GPIO readback was neither 0 nor 1: {other:?}"
         ))),
@@ -1912,7 +2148,15 @@ pub fn is_psu_enabled() -> bool {
 /// reservation, before the worker opens `/dev/i2c-1`.
 fn prepare_management_i2c_pinmux() -> std::io::Result<()> {
     let export_path = "/sys/class/gpio/export";
-    for gpio in GPIO_PINMUX_FIX {
+    let resolved = [
+        resolve_pinmux_gpio_global(true).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?,
+        resolve_pinmux_gpio_global(false).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?,
+    ];
+    for gpio in resolved {
         let gpio_dir = format!("/sys/class/gpio/gpio{}", gpio);
         let gpio_path = Path::new(&gpio_dir);
         if !gpio_path.exists() {
@@ -2217,8 +2461,20 @@ fn config_for_dcentos_platform(marker: &str) -> Result<Option<PlatformConfig>> {
         "am3-aml-s19k" | "am3-aml-s19kpro" | "am3-aml-s19xp" => {
             Ok(Some(PlatformConfig::s19k_amlogic()))
         }
-        "am3-aml" | "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp"
-        | "am3-aml-t21" => Ok(Some(PlatformConfig::s21_amlogic())),
+        // A bare, SKU-less `am3-aml` marker is a GENERIC A113D control-board
+        // token, not an SKU. It must never inherit an SKU transport/energization
+        // profile: `am3-s21`/`am3-t21` are BM1368 while `am3-s21pro`/`am3-s21xp`
+        // are BM1370 — different silicon on the same control board (verified in
+        // `dcentrald-common` BoardDesc). Fail closed and let detection fall
+        // through to the SKU-specific signals (`/etc/bosminer.toml` model, DTB),
+        // which themselves refuse a generic "Amlogic" string. This matches the
+        // descriptor's `GenericConstruction::Refused` and the sibling
+        // `nopic_profile_for_dcentos_marker` / handoff-identity layers, which
+        // already treat bare `am3-aml` as unqualified.
+        "am3-aml" => Ok(None),
+        "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp" | "am3-aml-t21" => {
+            Ok(Some(PlatformConfig::s21_amlogic()))
+        }
         // These targets use a per-hashboard controller and cannot inherit a
         // NoPic profile merely because the control board is also A113D.
         "am3-aml-s19jpro" | "am3-aml-s19jproplus" => Err(HalError::Platform(format!(
@@ -2421,6 +2677,34 @@ mod tests {
     }
 
     #[test]
+    fn boot_safe_handoff_s19k_requires_commanded_value_1() {
+        let s19k = boot_safe_handoff_fixture()
+            .replace("platform=am3-aml-s21", "platform=am3-aml-s19k")
+            .replace("board_target=am3-s21", "board_target=am3-s19k")
+            .replace("commanded_value=0", "commanded_value=1")
+            .replace("readback_value=0", "readback_value=1");
+        let receipt = parse_amlogic_boot_safe_handoff(&s19k).unwrap();
+        assert_eq!(receipt.board_target, "am3-s19k");
+        let lying = s19k
+            .replace("commanded_value=1", "commanded_value=0")
+            .replace("readback_value=1", "readback_value=0");
+        assert!(
+            parse_amlogic_boot_safe_handoff(&lying).is_err(),
+            "am3-s19k receipt must not claim SafeOff=0 (that engages the rail)"
+        );
+        let family = s19k.replace("board_target=am3-s19k", "board_target=am3-aml-s19kpro");
+        let family_receipt = parse_amlogic_boot_safe_handoff(&family).unwrap();
+        assert_eq!(family_receipt.board_target, "am3-aml-s19kpro");
+        let family_lying = family
+            .replace("commanded_value=1", "commanded_value=0")
+            .replace("readback_value=1", "readback_value=0");
+        assert!(
+            parse_amlogic_boot_safe_handoff(&family_lying).is_err(),
+            "am3-aml-s19kpro receipt must not claim SafeOff=0 (that engages the rail)"
+        );
+    }
+
+    #[test]
     fn boot_safe_handoff_parser_is_exact_and_honest_about_evidence() {
         let receipt = parse_amlogic_boot_safe_handoff(&boot_safe_handoff_fixture()).unwrap();
         assert_eq!(receipt.platform, "am3-aml-s21");
@@ -2494,6 +2778,8 @@ mod tests {
     fn checked_psu_gpio_parser_never_converts_unknown_data_to_off() {
         assert_eq!(parse_psu_gpio_enabled("0\n").unwrap(), false);
         assert_eq!(parse_psu_gpio_enabled("1\n").unwrap(), true);
+        assert_eq!(parse_psu_gpio_engaged("0\n", true).unwrap(), true);
+        assert_eq!(parse_psu_gpio_engaged("1\n", true).unwrap(), false);
         for invalid in ["", "2", "off", "read error"] {
             assert!(
                 parse_psu_gpio_enabled(invalid).is_err(),
@@ -2572,6 +2858,13 @@ mod tests {
         assert!(config_for_dcentos_platform("future-amlogic")
             .unwrap()
             .is_none());
+        // A bare, SKU-less `am3-aml` marker must fail closed: a generic A113D
+        // control-board token never inherits an SKU profile (am3-s21/am3-t21 =
+        // BM1368, am3-s21pro/am3-s21xp = BM1370). Queue rank 19 / H1 GAP-3.
+        assert!(
+            config_for_dcentos_platform("am3-aml").unwrap().is_none(),
+            "generic am3-aml marker must not inherit the S21 SKU profile"
+        );
     }
 
     #[test]
@@ -3352,8 +3645,16 @@ mod tests {
             "enable_psu_gpio must write \"1\" to enable (active HIGH, Wave 5 Q10)"
         );
         assert!(
-            src.contains("ensure_psu_active_low_disabled_checked()?;"),
+            src.contains("ensure_psu_active_low_disabled_checked(n)?;"),
             "all GPIO437 mutations must first pin and check raw active-high mode"
+        );
+        assert!(
+            src.contains("resolve_name_or_legacy"),
+            "PSU GPIO must resolve PWR_CONTROL by name before sysfs 437"
+        );
+        assert!(
+            src.contains("\"PWR_CONTROL\""),
+            "PSU GPIO name-first key is bosminer DT label PWR_CONTROL"
         );
         assert!(
             src.contains("fs::write(&dir_path, \"low\")"),
@@ -3373,6 +3674,46 @@ mod tests {
         assert!(
             !src.contains("\"0\" => Ok(true)"),
             "active-LOW readback must not be re-introduced (EE C1 regression guard)"
+        );
+        assert!(
+            src.contains("amlogic_board_target_is_s19k"),
+            "GPIO437 enable/disable must SKU-scope am3-s19k (T6 0=engaged)"
+        );
+        assert!(
+            src.contains("GPIO437 refuse: missing /etc/dcentos/board_target"),
+            "missing board_target must not default to S21 write-0"
+        );
+        assert!(
+            src.contains("s19k_board_target_is_live_alias"),
+            "boot-safe live revalidation must share the live S19k alias table (am3-aml-s19kpro is not S21)"
+        );
+        assert!(
+            src.contains("am3-s19k T6 SafeOff"),
+            "s19k disable log must not claim S21-class LOW"
+        );
+        assert!(
+            src.contains("am3-s19k T6 active-low enable"),
+            "s19k enable log must not claim S21-class HIGH"
+        );
+        assert!(
+            src.contains("fs::write(&dir_path, \"high\")"),
+            "s19k enable must SafeOff-first via direction high (1=OFF) before value 0"
+        );
+        assert!(
+            src.contains("\"CH0_PLUG\"")
+                && src.contains("\"CH1_PLUG\"")
+                && src.contains("\"CH2_PLUG\""),
+            "plug detect must resolve S21/S37 CH*_PLUG names"
+        );
+        assert!(
+            src.contains("\"HB0_RESET\"")
+                && src.contains("\"HB1_RESET\"")
+                && src.contains("\"HB2_RESET\""),
+            "board reset must resolve bosminer HB*_RESET names"
+        );
+        assert!(
+            src.contains("resolve_plug_gpio_global") && src.contains("resolve_reset_gpio_global"),
+            "plug/reset must share the PWR_CONTROL name-first resolver"
         );
     }
 }

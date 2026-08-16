@@ -42,19 +42,55 @@
 //!
 //! ## Single-I²C-owner architecture
 //!
-//! Any future CV1835 runtime lane must follow the AM2 SINGLE-I2C-OWNER rule:
-//! one process owns `/dev/i2c-0`, and PIC1704, APW PSU, and LM75A traffic
-//! shares one `I2cServiceHandle`. The retained service helper installs the
-//! same EEPROM write denylist as Amlogic, but the refused constructor does
-//! not spawn it.
+//! The CV1835 runtime lane follows the AM2 SINGLE-I2C-OWNER rule: one process
+//! owns `/dev/i2c-0`, and PIC1704, APW PSU, and LM75A traffic shares one
+//! `I2cServiceHandle`. The retained service helper installs the same EEPROM
+//! write denylist as Amlogic.
 //!
 //! ## Live verification status
 //!
-//! **Evidence only / NOT IMPLEMENTED**: no CV1835 runtime or artifact lane is
-//! admitted. Numeric register values, GPIO numbers, and sysfs paths are
-//! retained from the dev-kit reverse-engineering corpus, but the production
-//! constructor is a non-mutating refusal and no environment override can
-//! promote this evidence into hardware authority.
+//! **Default = fail-closed (NOT IMPLEMENTED); Experimental opt-in = operator-only.**
+//! By default no CV1835 runtime or artifact lane is admitted — the constructor
+//! is a non-mutating refusal (unchanged shipped behavior). Numeric register
+//! values, GPIO numbers, and sysfs paths are retained from the dev-kit
+//! reverse-engineering corpus; the bring-up is R4-CONFIRMED but **bench-unproven**.
+//! As of 2026-08-05, the operator explicitly authorized a **default-OFF**
+//! Experimental opt-in ([`CV1835_EXPERIMENTAL_RUNTIME_ENV`]) that promotes this
+//! evidence into a live runtime lane for bench bring-up. The earlier
+//! "no environment override can promote this evidence" stance is superseded by
+//! that authorization; the `board_desc` runtime status stays
+//! `EvidenceRetainedNotImplemented` (the product-facing default is unchanged).
+//!
+//! ## The Antminer L9 `godminer` binary — what it does and does NOT give us
+//!
+//! Round 15 flagged the L9 stock miner (`usr/bin/godminer`, sha256
+//! `7b088dcb…c038487`, ARM 32-bit armhf, `.symtab` stripped but **1,653 dynamic
+//! symbols retained**) as carrying "a working Bitmain `cv183x_*` HAL relevant to
+//! our unimplemented `CvitekPlatform`". **Round 16 B3 measured that claim and it
+//! is an overclaim.** Recorded here so nobody re-chases it:
+//!
+//! - `readelf --dyn-syms` on `godminer` matches **zero** symbols containing
+//!   `cv183`. The entire `cv183x` evidence is **10 source-file *path strings***
+//!   from the Jenkins build root
+//!   (`…/backend/device/hal/platform/cv183x/cv183x_{common,fan,gpio,i2c,
+//!   i2c_sim,iic,lcd,pwm,uart,ui}.c`). Those functions are file-local
+//!   (`static`), so they are absent from `.dynsym` and were removed with
+//!   `.symtab`.
+//! - So the L9 binary yields a **capability inventory** — Bitmain's CVitek HAL
+//!   abstracts GPIO, I²C (two implementations plus a simulator), UART, PWM/fan,
+//!   LCD/UI, and a common layer; thermal is *not* a cv183x file but the
+//!   product-independent `backend/device/hal/tsensor/bitmain_tsensor.c` — and
+//!   **no addresses, no register values, no function signatures.** Every
+//!   numeric CVitek constant in this module still comes from our own dev-kit
+//!   RE, not from `godminer`.
+//! - **Trap:** `backend/device/hal/drv_pic/pic_1704.c` *is* present in the L9
+//!   binary, and `pic1704_*` functions *are* in its dynsym. That does **not**
+//!   mean the L9 uses a PIC1704 — its `topol.conf` says `"pic_mcu_en": false`.
+//!   `godminer` is Bitmain's **unified multi-product** miner, so the presence of
+//!   a driver is evidence about the *binary*, never about the *product*.
+//!
+//! The one genuinely load-bearing thing the L9 drop gave this module is the
+//! independent corroboration of [`GPIO_PWR_EN`] — see that constant's docs.
 
 // clippy/dead_code: CV1835 (CViTek) is an EVIDENCE-RETAINED platform port. The
 // module is a complete RE'd bring-up path with no live fleet unit, so most of it
@@ -182,6 +218,35 @@ pub const CV1835_EEPROM_DENYLIST: [u8; 8] = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55,
 
 // ─── GPIO numbering — verbatim from s19j_init.h ───
 
+/// PSU enable GPIO on the CVitek carrier.
+///
+/// # Round 16 B3 — now DOUBLE-SOURCED (was single-source RE)
+///
+/// Originally taken only from the dev-kit RE (`s19j_init.h` +
+/// `S37bitmainer_setup`). It is now independently corroborated by an
+/// **authentic Bitmain stock artifact for a different product on the same
+/// CV183x carrier family**: the Antminer L9's `etc/topol.conf`
+/// (`FR-1.19(260302-L9).bmu` sha256 `2af05a34…05c3aa827` →
+/// `00_Antminer_L9_CVCtrl_L9` → `BOOT.bin` → plaintext rootfs) states:
+///
+/// ```text
+/// "processor": { "type": "CV183x" },
+/// "power": { "type": "APW17", "i2c_addr": 16, "gpio": 412 }
+/// ```
+///
+/// Two independent sources — our RE of the CV1835 S19j Pro carrier, and
+/// Bitmain's own shipped config for the CV183x L9 — agree that the PSU-enable
+/// line on this carrier family is GPIO **412**. That materially reduces the
+/// chance the value is a transcription error.
+///
+/// ⚠ **What this does NOT establish.** The L9 (BM1491, Scrypt, 3 chains, NoPic,
+/// `isl68127`/`mps2973` PMICs) is a *different board* from the CV1835 S19j Pro
+/// (BM1362, SHA-256, 4 chains, PIC1704 @ 0x20). Agreement on a carrier-level
+/// GPIO number is corroboration of the **numbering convention**, not proof that
+/// the two boards wire PWR_EN identically. This remains bench-unproven and the
+/// platform stays fail-closed by default.
+///
+/// Pinned by `gpio_pwr_en_is_412_double_sourced`.
 const GPIO_PWR_EN: u32 = 412;
 const GPIO_ASIC_RST0: u32 = 427;
 const GPIO_ASIC_RST1: u32 = 429;
@@ -251,24 +316,68 @@ pub struct CViTekPlatform {
     config: PlatformConfig,
 }
 
+/// Operator-authorized (2026-08-05) default-OFF opt-in that admits the
+/// Experimental CV1835 runtime lane.
+///
+/// Unset (the shipped default) = fail-closed: `CViTekPlatform::new()` refuses,
+/// exactly as before. Set to `"1"` to let an operator run the R4-CONFIRMED
+/// bring-up (`cvitek_cold_boot` Phases 1-5 + [`super::cvitek_cold_boot::CV1835_STOCK_PINMUX_REPLAY`])
+/// on a real — but **bench-unproven** — CV1835 unit. The fail-safe envelope
+/// (mining-path watchdog, PWM-30 fan cap on the `SysfsPwm` fan, EEPROM
+/// `0x50-0x57` write-denylist, and the FPGA dead-path staying gated off — CV1835
+/// has no FPGA) is enforced by the daemon mining lifecycle. Rationale + review
+/// scope: .
+pub const CV1835_EXPERIMENTAL_RUNTIME_ENV: &str = "DCENT_CV1835_EXPERIMENTAL_RUNTIME";
+
+/// Pure admission gate for [`CV1835_EXPERIMENTAL_RUNTIME_ENV`] — `true` only for
+/// the exact opt-in value `"1"`. Extracted so the decision production passes is
+/// unit-testable without mutating process env (any other value, including
+/// `"0"`, `"true"`, empty, or unset, is fail-closed).
+pub(crate) fn cv1835_experimental_opt_in_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
 impl CViTekPlatform {
-    /// Refuse CV1835 runtime construction until a reviewed runtime lane exists.
+    /// Construct the CV1835 platform. Fail-closed by default; the
+    /// operator-authorized Experimental lane is admitted only via
+    /// [`CV1835_EXPERIMENTAL_RUNTIME_ENV`].
     ///
-    /// The retained constants and trait implementation are reverse-engineering
-    /// evidence, not mutation authority. In particular, construction must not
-    /// replay pinmux, select an MMIO UART table, probe I²C, or honor an
-    /// environment override.
+    /// **Default (env unset):** refuses, exactly as the historical fail-closed
+    /// product decision (`RuntimeStatus::EvidenceRetainedNotImplemented` on the
+    /// `cv1835-s19jpro` `BoardDesc` row — unchanged; the shipped default still
+    /// does not run CV1835). It is NOT the Amlogic routing refusal
+    /// (`RuntimeStatus::SpecialisedLifecycle`), which mines via another lane.
     ///
-    /// Status classification (H7 G8): this refusal is
-    /// `RuntimeStatus::EvidenceRetainedNotImplemented` on the
-    /// `cv1835-s19jpro` `BoardDesc` row — a deliberate fail-closed product
-    /// decision with retained evidence. It is NOT the same state as the
-    /// Amlogic routing refusal (`RuntimeStatus::SpecialisedLifecycle`), which
-    /// mines via another lane. See `dcentrald-common::board_desc` and
-    /// `dcent_schema::hardware::RuntimeStatus`.
+    /// **`DCENT_CV1835_EXPERIMENTAL_RUNTIME=1` (operator opt-in, 2026-08-05):**
+    /// constructs the platform. The bring-up sequence is R4-CONFIRMED and the
+    /// `Platform` trait is fully implemented, but the lane is **unproven on
+    /// bench** — the operator explicitly authorized admitting it behind this
+    /// default-off gate (the earlier "must not honor an environment override"
+    /// stance is superseded by that authorization). Construction itself does no
+    /// hardware I/O. Fail-safe envelope (defense-in-depth): the **PWM-30 fan cap**
+    /// (`CViTekFan::set_speed` clamp) and the **EEPROM `0x50-0x57` write-denylist**
+    /// (`open_i2c` / the protected I²C service) are enforced **in this HAL itself**,
+    /// independent of the daemon; the **watchdog + PSU guard** are enforced by the
+    /// daemon mining lifecycle; the FPGA dead-path stays gated off (no FPGA on
+    /// CV1835). See `dcentrald-common::board_desc`,
+    /// `dcent_schema::hardware::RuntimeStatus`, and the 1 evidence doc.
     pub fn new() -> Result<Self> {
+        if cv1835_experimental_opt_in_enabled(
+            std::env::var(CV1835_EXPERIMENTAL_RUNTIME_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            tracing::warn!(
+                target: "cvitek",
+                env = CV1835_EXPERIMENTAL_RUNTIME_ENV,
+                "CV1835 EXPERIMENTAL runtime lane admitted (operator opt-in) — UNPROVEN on bench; fail-safe envelope enforced by the mining lifecycle"
+            );
+            return Ok(Self {
+                config: Self::cv1835_s19j_default_config(),
+            });
+        }
         Err(HalError::Platform(
-            "CV1835 runtime NOT IMPLEMENTED: reverse-engineered register evidence is retained, but no runtime mutation lane is admitted"
+            "CV1835 runtime NOT IMPLEMENTED by default: reverse-engineered bring-up is retained and R4-CONFIRMED, but the runtime lane is unproven on bench. Set DCENT_CV1835_EXPERIMENTAL_RUNTIME=1 to admit the operator-authorized Experimental lane."
                 .to_string(),
         ))
     }
@@ -870,6 +979,41 @@ mod tests {
         assert_eq!(GPIO_I2C_SDA, 461);
     }
 
+    /// **Round 16 B3 — `GPIO_PWR_EN` is double-sourced; keep it that way.**
+    ///
+    /// Source 1 (ours): dev-kit RE `s19j_init.h` / `S37bitmainer_setup`.
+    /// Source 2 (Bitmain-authentic, independent product, same CV183x carrier
+    /// family): the Antminer L9 stock `etc/topol.conf` states
+    /// `"power": { "type": "APW17", "i2c_addr": 16, "gpio": 412 }` alongside
+    /// `"processor": { "type": "CV183x" }`.
+    ///
+    /// This is a *safety-relevant* constant — it gates PSU energization. The
+    /// test records the corroboration so a future edit has to confront both
+    /// sources, and pins the EEPROM base address that the same file
+    /// independently confirms (`"eeprom": { "i2c_addr": 80 }` = 0x50).
+    #[test]
+    fn gpio_pwr_en_is_412_double_sourced() {
+        // Our RE value.
+        assert_eq!(GPIO_PWR_EN, 412);
+        assert_eq!(CViTekPlatform::psu_enable_gpio(), 412);
+        // The L9 stock topol.conf value, transcribed verbatim as a literal so
+        // the two sources are compared here rather than in prose.
+        const L9_TOPOL_CONF_POWER_GPIO: u32 = 412;
+        assert_eq!(
+            GPIO_PWR_EN, L9_TOPOL_CONF_POWER_GPIO,
+            "CV183x carrier PSU-enable GPIO disagrees between our dev-kit RE \
+             and Bitmain's own L9 stock topol.conf — do not energize until \
+             this is resolved on a bench unit"
+        );
+        // Same file states the hashboard EEPROM at decimal 80 = 0x50, which is
+        // the base of our write-protection denylist.
+        const L9_TOPOL_CONF_EEPROM_I2C_ADDR: u8 = 80;
+        assert_eq!(
+            CV1835_EEPROM_DENYLIST[0], L9_TOPOL_CONF_EEPROM_I2C_ADDR,
+            "EEPROM write-deny base must stay 0x50"
+        );
+    }
+
     #[test]
     fn cv1835_eeprom_denylist_matches_am3_aml() {
         // Same range as Amlogic + am2 hybrid path. If this drifts,
@@ -1043,11 +1187,27 @@ mod tests {
 
     #[test]
     fn cv1835_runtime_constructor_is_a_non_mutating_refusal() {
+        // Default path (opt-in env unset): construction refuses, unchanged.
         let error = match CViTekPlatform::new() {
             Err(error) => error,
-            Ok(_) => panic!("CV1835 runtime must remain unadmitted"),
+            Ok(_) => panic!("CV1835 runtime must remain unadmitted by default"),
         };
         assert!(error.to_string().contains("runtime NOT IMPLEMENTED"));
+    }
+
+    #[test]
+    fn cv1835_experimental_opt_in_gate_is_exact_and_fail_closed() {
+        // Operator-authorized Experimental opt-in (2026-08-05): ONLY the exact
+        // value "1" admits the lane; everything else (incl. unset) is fail-closed.
+        // This is the value production actually passes new() — pinned so a wiring
+        // change (e.g. accepting "true"/"yes") can't silently widen admission.
+        assert!(cv1835_experimental_opt_in_enabled(Some("1")));
+        assert!(!cv1835_experimental_opt_in_enabled(None));
+        assert!(!cv1835_experimental_opt_in_enabled(Some("0")));
+        assert!(!cv1835_experimental_opt_in_enabled(Some("true")));
+        assert!(!cv1835_experimental_opt_in_enabled(Some("yes")));
+        assert!(!cv1835_experimental_opt_in_enabled(Some("")));
+        assert!(!cv1835_experimental_opt_in_enabled(Some(" 1")));
     }
 
     /// H7 G8 drift gate: the constructor refusal and the registry

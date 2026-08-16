@@ -148,28 +148,10 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-KERNEL=""
-KERNEL_SRC=""
-if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
-    KERNEL="${DCENT_AM3_AML_KERNEL}"
-    KERNEL_SRC="env override (DCENT_AM3_AML_KERNEL)"
-elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s21"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s21"
-fi
-
-if [ -z "$KERNEL" ]; then
-    echo "ERROR: no S21 kernel_uimage.bin found for am3-s21pro sysupgrade packaging." >&2
-    echo "  Expected one of:" >&2
-    echo "    \$DCENT_AM3_AML_KERNEL" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
-    echo "  Refusing to package S21 without a verified S21 kernel." >&2
-    exit 1
-fi
+. "${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/require-exact-build-inputs.sh"
+dcent_require_exact_amlogic_build_inputs "${TARGET:-}"
+KERNEL="$DCENT_AM3_AML_KERNEL"
+KERNEL_SRC="exact model-bound build-input snapshot (s21pro/aml)"
 
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
@@ -232,7 +214,7 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
   },
   "toolbox": {
     "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>",
+    "update_command": "dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>",
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": false
@@ -243,7 +225,9 @@ EOF
 # Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
 # are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
 DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>"
-DCENT_TOOLBOX_UPDATE_COMMAND=""
+# OTA fleet form of the SAME guarded route (toolbox 2026-08-15 fleet OTA rail
+# accepts amlogic_rootfs_window; same gates; write+readback, NO auto-reboot).
+DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
 DCENT_TARGET_SIDE_SYSUPGRADE=false

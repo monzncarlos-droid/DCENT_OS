@@ -415,6 +415,11 @@ fan_safety_override() {
 
 case "$1" in
     start)
+        EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+        if [ -e "$EXTERNAL_MEDIA_MARKER" ] || [ -L "$EXTERNAL_MEDIA_MARKER" ]; then
+            echo "  [SKIP] dcentrald hardware owner: external-media boot remains safe-idle/management-only"
+            exit 0
+        fi
         if [ ! -x "$DAEMON" ]; then
             echo "  [SKIP] dcentrald: binary not found at $DAEMON"
             exit 0

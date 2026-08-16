@@ -86,7 +86,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $(basename "$0") [--target s9|am2-s19jpro|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish] [--output-dir DIR] [--lab-unsigned]"
+            echo "Usage: $(basename "$0") [--target s9|am2-s19jpro|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am3-bb|am3-bb-s19jpro|am3-bb-s19jpro-vnish] [--output-dir DIR] [--lab-unsigned]"
             echo ""
             echo "Options:"
             echo "  --lab-unsigned  Reserved for a future explicit lab capsule; direct"
@@ -97,12 +97,15 @@ while [ $# -gt 0 ]; do
             echo "  am2-s19jpro      Antminer S19j Pro Zynq am2-s19jpro (armv7) — tarball: dcentos-sysupgrade-am2-s19jpro.tar"
             # Added by Phase 2K
             echo "  am2-s19pro       Antminer S19 / S19 Pro Zynq am2 BM1398 (armv7) — tarball: dcentos-sysupgrade-am2-s19pro.tar"
-            echo "  am2-s17pro       Antminer S17 / S17 Pro Zynq am2-s17 (armv7, RUNTIME-ONLY) — tarball: dcentos-sysupgrade-am2-s17pro.tar"
+            echo "  am2-s17pro       Antminer S17 / S17 Pro Zynq am2-s17 (armv7, EXPERIMENTAL PACKAGE-ONLY) — tarball: dcentos-sysupgrade-am2-s17pro.tar"
             # End Phase 2K
             echo "  am3-s19kpro      Antminer S19k Pro Amlogic am3-aml (aarch64) — tarball: dcentos-sysupgrade-am3-s19kpro.tar"
             echo "  am3-s21          Antminer S21 Amlogic am3-aml (aarch64) — tarball: dcentos-sysupgrade-am3-s21.tar"
             echo "  am3-s21pro       Antminer S21 Pro Amlogic am3-aml (aarch64) — tarball: dcentos-sysupgrade-am3-s21pro.tar"
             echo "  am3-s21xp        Antminer S21 XP Amlogic am3-aml (aarch64) — tarball: dcentos-sysupgrade-am3-s21xp.tar"
+            echo "  am3-s19xp        Antminer S19 XP Amlogic Experimental exact-identity package"
+            echo "  am3-s19jxp       Antminer S19j XP Amlogic Experimental exact-identity package"
+            echo "  am3-s19jproplus  Antminer S19j Pro+ Amlogic Experimental exact-identity package"
             # Added by Phase 4B
             echo "  am3-s19jpro-aml  Antminer S19j Pro Amlogic am3-aml PIC1704 (aarch64) — tarball: dcentos-sysupgrade-am3-s19jpro-aml.tar"
             echo "  am3-t21          Antminer T21 Amlogic am3-aml NoPic (aarch64) — tarball: dcentos-sysupgrade-am3-t21.tar"
@@ -213,12 +216,13 @@ case "$TARGET" in
         TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/$TOOLCHAIN_FILE"
         ;;
     am2-s17pro)
-        # S17 / S17 Pro Zynq am2-s17, BM1396 / BM1397. RUNTIME-ONLY
-        # scaffold — no live S17 / S17 Pro on the fleet and no extracted
-        # S17 kernel, so the board post-image.sh emits a rootfs-only WARN
-        # build unless $DCENT_AM2_S17_KERNEL is supplied. BOARD_PKG_NAME is
-        # "am2-s17p" (NOT "am2-s17pro") to match the board post-image.sh
-        # BOARD_NAME and the sysupgrade-am2-s17p/ prefix.
+        # S17 / S17 Pro Zynq am2-s17, BM1397. The exact held Braiins SD donor
+        # is selected by source_closure.py, copied into the private build-input
+        # snapshot, and passed read-only to post-image.sh. The resulting
+        # artifact remains package_only_denied/installable=false: this lane is
+        # not stock first-install, Toolbox routing, or device/flash authority.
+        # BOARD_PKG_NAME is "am2-s17p" (NOT "am2-s17pro") to match the board
+        # post-image.sh BOARD_NAME and the sysupgrade-am2-s17p/ prefix.
         # F-2 (Sweep-v3 PR-079): the canonical defconfig file is
         # `dcentos_am2_s17pro_zynq_defconfig` (its siblings dropped the
         # `_zynq` suffix at creation time; only the S17 Pro one kept it).
@@ -241,6 +245,36 @@ case "$TARGET" in
         TARBALL_NAME="dcentos-sysupgrade-am3-s19kpro.tar"
         # am3-aml uses board-script post-image (mkimage uImage CPIO + tar
         # with sysupgrade-am3-s19k/ prefix). Phase H.9 board script.
+        BOARD_POST_IMAGE="board-script"
+        BUILD_ARCH="aarch64-unknown-linux-musl"
+        TOOLCHAIN_FILE="gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu.tar.xz"
+        TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/aarch64-linux-gnu/$TOOLCHAIN_FILE"
+        ;;
+    am3-s19xp)
+        BR_DEFCONFIG="dcentos_am3_s19xp_defconfig"
+        BR_DEFCONFIG_FRAGMENTS="dcentos-common.fragment dcentos_am3_aml_common.fragment"
+        BOARD_PKG_NAME="am3-s19xp"
+        TARBALL_NAME="dcentos-sysupgrade-am3-s19xp.tar"
+        BOARD_POST_IMAGE="board-script"
+        BUILD_ARCH="aarch64-unknown-linux-musl"
+        TOOLCHAIN_FILE="gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu.tar.xz"
+        TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/aarch64-linux-gnu/$TOOLCHAIN_FILE"
+        ;;
+    am3-s19jxp)
+        BR_DEFCONFIG="dcentos_am3_s19jxp_defconfig"
+        BR_DEFCONFIG_FRAGMENTS="dcentos-common.fragment dcentos_am3_aml_common.fragment"
+        BOARD_PKG_NAME="am3-s19jxp"
+        TARBALL_NAME="dcentos-sysupgrade-am3-s19jxp.tar"
+        BOARD_POST_IMAGE="board-script"
+        BUILD_ARCH="aarch64-unknown-linux-musl"
+        TOOLCHAIN_FILE="gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu.tar.xz"
+        TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/aarch64-linux-gnu/$TOOLCHAIN_FILE"
+        ;;
+    am3-s19jproplus)
+        BR_DEFCONFIG="dcentos_am3_s19jproplus_defconfig"
+        BR_DEFCONFIG_FRAGMENTS="dcentos-common.fragment dcentos_am3_aml_common.fragment"
+        BOARD_PKG_NAME="am3-s19jproplus"
+        TARBALL_NAME="dcentos-sysupgrade-am3-s19jproplus.tar"
         BOARD_POST_IMAGE="board-script"
         BUILD_ARCH="aarch64-unknown-linux-musl"
         TOOLCHAIN_FILE="gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu.tar.xz"
@@ -352,7 +386,7 @@ case "$TARGET" in
         TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/$TOOLCHAIN_FILE"
         ;;
     *)
-        echo "ERROR: unsupported target: $TARGET (supported: s9, am2-s19jpro, am2-s19jpro-sd, am2-s19pro, am2-s17pro, am3-s19kpro, am3-s21, am3-s21pro, am3-s21xp, am3-s19jpro-aml, am3-t21, am3-bb, am3-bb-s19jpro, am3-bb-s19jpro-vnish)" >&2
+        echo "ERROR: unsupported target: $TARGET (see --help for supported targets)" >&2
         exit 1
         ;;
 esac
@@ -364,7 +398,7 @@ BUILDROOT_COMMIT="7c8edc1b402efcd7bba2dabfe0b3be877adaed7a"
 
 dcent_target_requires_dcentos_init() {
     case "$1" in
-        s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21)
+        s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21)
             return 0
             ;;
     esac
@@ -419,7 +453,7 @@ dcent_required_prebuilt_binaries() {
 dcent_expected_build_variant() {
     case "$1" in
         s9|am2-s19jpro|am2-s19jpro-sd|am2-s19pro|am2-s17pro) printf '%s\n' zynq ;;
-        am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21) printf '%s\n' amlogic ;;
+        am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21) printf '%s\n' amlogic ;;
         # BB packaging currently stages the static musl ARMv7 artifact emitted
         # by the zynq build lane (the standalone `beaglebone` builder targets
         # glibc armv7-unknown-linux-gnueabihf and cannot satisfy BUILD_ARCH).
@@ -926,6 +960,7 @@ BUILD_INPUT_STAGE=""
 BUILD_INPUT_SNAPSHOT=""
 BUILD_INPUT_DESTROY_TOKEN=""
 BUILD_INPUT_MOUNT_ARGS=()
+AM2_S17_DONOR_ENV_ARGS=()
 BINARY_EXPORT_PARENT=""
 BINARY_EXPORT_STAGE=""
 BINARY_EXPORT_CAPABILITY=""
@@ -1064,6 +1099,17 @@ fi
 BUILD_INPUT_MOUNT_ARGS=(
     -v "${DOCKER_BUILD_INPUT_STAGE}:/dcent-inputs:ro"
 )
+if [ "$TARGET" = "am2-s17pro" ]; then
+    AM2_S17_DONOR_RELATIVE_PATH="knowledge-base/firmware-archive/braiins-os_am2-s17_sd.img"
+    AM2_S17_DONOR_SNAPSHOT_PATH="${BUILD_INPUT_STAGE}/files/${AM2_S17_DONOR_RELATIVE_PATH}"
+    [ -f "$AM2_S17_DONOR_SNAPSHOT_PATH" ] && [ ! -L "$AM2_S17_DONOR_SNAPSHOT_PATH" ] || {
+        echo "ERROR: admitted AM2 S17 donor is absent from the private build-input snapshot" >&2
+        exit 1
+    }
+    AM2_S17_DONOR_ENV_ARGS=(
+        -e "DCENT_AM2_S17_BRAIINS_SD_IMAGE=/dcent-inputs/files/${AM2_S17_DONOR_RELATIVE_PATH}"
+    )
+fi
 
 # Place the binary export beside the already Docker-shareable out-of-band
 # snapshot, but in its own private parent. The export helper owns every entry
@@ -1431,6 +1477,9 @@ docker run --rm \
                 /build/dcentos/br2_external_dcentos/board/zynq/am2-s17pro/rootfs-overlay/etc/dcentos-version \
                 /build/dcentos/br2_external_dcentos/board/amlogic/rootfs-overlay/etc/dcentos-version \
                 /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19xp/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jxp/rootfs-overlay/etc/dcentos-version \
+                /build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jproplus/rootfs-overlay/etc/dcentos-version \
                 /build/dcentos/br2_external_dcentos/board/amlogic/am3-s21/rootfs-overlay/etc/dcentos-version \
                 /build/dcentos/br2_external_dcentos/board/amlogic/am3-s21pro/rootfs-overlay/etc/dcentos-version \
                 /build/dcentos/br2_external_dcentos/board/amlogic/am3-s21xp/rootfs-overlay/etc/dcentos-version \
@@ -1450,15 +1499,34 @@ docker run --rm \
     '
 echo ""
 
-# -------- Phase 4: stage knowledge-base extractions --------
-echo "--- Phase 4: stage knowledge-base/extractions ---"
+# -------- Phase 4: admit and stage target-selected external inputs --------
+echo "--- Phase 4: admit target-selected external inputs ---"
 # Only source-closure-supported targets reach this phase. Every byte comes from
 # the exact target snapshot; unpinned fallback directories are intentionally
 # unavailable even for lab packaging.
+AMLOGIC_EXACT_MODEL=""
+case "$TARGET" in
+    am3-s19jpro-aml) AMLOGIC_EXACT_MODEL=s19jpro ;;
+    am3-s19xp) AMLOGIC_EXACT_MODEL=s19xp ;;
+    am3-s19jxp) AMLOGIC_EXACT_MODEL=s19j-xp ;;
+    am3-s19jproplus) AMLOGIC_EXACT_MODEL=s19jpro-plus ;;
+    am3-s19kpro) AMLOGIC_EXACT_MODEL=s19kpro ;;
+    am3-s21) AMLOGIC_EXACT_MODEL=s21 ;;
+    am3-s21pro) AMLOGIC_EXACT_MODEL=s21pro ;;
+    am3-s21xp) AMLOGIC_EXACT_MODEL=s21xp ;;
+    am3-t21) AMLOGIC_EXACT_MODEL=t21 ;;
+esac
+AMLOGIC_EXACT_CONTAINER_ROOT=""
+if [ -n "$AMLOGIC_EXACT_MODEL" ]; then
+    AMLOGIC_EXACT_CONTAINER_ROOT="/dcent-inputs/files/knowledge-base/extractions/vnish-farm/${AMLOGIC_EXACT_MODEL}/vnishfarm-1.2.6-rc5-aml-nand-install"
+fi
 docker run --rm \
     -v "${VOLUME_NAME}:/build" \
     "${BUILD_INPUT_MOUNT_ARGS[@]}" \
     -e TARGET="$TARGET" \
+    -e DCENT_AM3_AML_KERNEL="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/vmlinux.bin}" \
+    -e DCENT_AM3_AML_DTB="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/devicetree.dtb}" \
+    -e DCENT_AM3_AML_FW_INFO="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/rootfs/etc/fw-info}" \
     "$BUILD_CONTAINER_ID" bash -c '
         set -e
         case "$TARGET" in
@@ -1476,6 +1544,11 @@ docker run --rm \
                     /dcent-inputs/files/knowledge-base/extractions/s19j/ \
                     /build/dcentos/extractions/s19j/
                 echo "Staged s19j: $(du -sh /build/dcentos/extractions/s19j | cut -f1)"
+                ;;
+            am3-s19jpro-aml|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-t21)
+                . /build/dcentos/br2_external_dcentos/board/amlogic/require-exact-build-inputs.sh
+                dcent_require_exact_amlogic_build_inputs "$TARGET"
+                echo "Amlogic inputs remain in the private read-only snapshot for Buildroot"
                 ;;
             *)
                 echo "ERROR: target $TARGET reached Phase 4 without an exact build-input staging policy" >&2
@@ -1618,6 +1691,9 @@ docker run --rm \
             am2-s17pro) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/zynq/am2-s17pro/rootfs-overlay" ;;
             # End Phase 2K
             am3-s19kpro) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay" ;;
+            am3-s19xp) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s19xp/rootfs-overlay" ;;
+            am3-s19jxp) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jxp/rootfs-overlay" ;;
+            am3-s19jproplus) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s19jproplus/rootfs-overlay" ;;
             am3-s21) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s21/rootfs-overlay" ;;
             am3-s21pro) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s21pro/rootfs-overlay" ;;
             am3-s21xp) VERSION_TARGET_DIR="/build/dcentos/br2_external_dcentos/board/amlogic/am3-s21xp/rootfs-overlay" ;;
@@ -1893,9 +1969,8 @@ echo ""
 # -------- Phase 6: Buildroot --------
 echo "--- Phase 6: Buildroot make setup + make -j$(docker run --rm "$BUILD_CONTAINER_ID" nproc) ---"
 echo "(first build downloads ~500 MB of tarballs — expect 30–90 min)"
-# Mount knowledge-base into the container so board post-image.sh can find
-# kernel + FPGA bitstream (am2 needs this; S9 doesn't). Pass an env override
-# so post-image.sh doesn't have to compute REPO_ROOT from /build/dcentos/../..
+# Mount the private target-selected input snapshot read-only. Post-image hooks
+# receive exact snapshot paths; they cannot reopen mutable repository fallbacks.
 docker run --rm \
     -e FORCE_UNSAFE_CONFIGURE=1 \
     -e TARGET="$TARGET" \
@@ -1929,6 +2004,10 @@ docker run --rm \
     -e DCENT_AM2_S19J_BITSTREAM="/dcent-inputs/files/knowledge-base/extractions/s19j/fpga_bitstream.bit" \
     -e DCENT_AM2_S19PRO_KERNEL="/dcent-inputs/files/knowledge-base/extractions/s19j/kernel.bin" \
     -e DCENT_AM2_S19PRO_BITSTREAM="/dcent-inputs/files/knowledge-base/extractions/s19j/fpga_bitstream.bit" \
+    -e DCENT_AM3_AML_KERNEL="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/vmlinux.bin}" \
+    -e DCENT_AM3_AML_DTB="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/devicetree.dtb}" \
+    -e DCENT_AM3_AML_FW_INFO="${AMLOGIC_EXACT_CONTAINER_ROOT:+${AMLOGIC_EXACT_CONTAINER_ROOT}/rootfs/etc/fw-info}" \
+    "${AM2_S17_DONOR_ENV_ARGS[@]}" \
     "${SIGNING_MOUNT_ARGS[@]}" \
     "${BUILD_INPUT_MOUNT_ARGS[@]}" \
     "${CAPSULE_PROVENANCE_MOUNT_ARGS[@]}" \
@@ -2334,11 +2413,52 @@ docker run --rm \
             tar tf /out/'"$TARBALL_NAME"' | head -20
         fi
         case "'"$TARGET"'" in
+            am2-s17pro)
+            echo ""
+            echo "Package-only non-installable validation:"
+            cd /build/dcentos
+            PACKAGE_ONLY_TMP="$(mktemp -d)"
+            trap "rm -rf -- \"$PACKAGE_ONLY_TMP\"" EXIT HUP INT TERM
+            # shellcheck source=/dev/null
+            . ./scripts/lib/sysupgrade_archive_admission.sh
+            dcent_sysupgrade_archive_admit \
+                /out/'"$TARBALL_NAME"' am2-s17p "$PACKAGE_ONLY_TMP"
+            tar xf /out/'"$TARBALL_NAME"' -C "$PACKAGE_ONLY_TMP"
+            MANIFEST="$PACKAGE_ONLY_TMP/sysupgrade-am2-s17p/MANIFEST.json"
+            python3 ./scripts/lib/sysupgrade_manifest_json.py validate "$MANIFEST"
+            python3 - "$PACKAGE_ONLY_TMP" "$MANIFEST" <<PY
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+manifest = json.loads(Path(sys.argv[2]).read_text(encoding="ascii"))
+if manifest.get("board_target") != "am2-s17p":
+    raise SystemExit("S17 package-only manifest has the wrong board target")
+if manifest.get("installable") is not False:
+    raise SystemExit("S17 package-only manifest must declare installable=false")
+toolbox = manifest.get("toolbox")
+if not isinstance(toolbox, dict) or toolbox.get("install_mode") != "package_only_denied":
+    raise SystemExit("S17 package-only manifest must retain package_only_denied")
+if toolbox.get("install_command") is not None or toolbox.get("update_command") is not None:
+    raise SystemExit("S17 package-only manifest must not advertise Toolbox commands")
+for kind in ("kernel", "rootfs", "metadata"):
+    payload = manifest["payloads"][kind]
+    path = root / payload["path"]
+    raw = path.read_bytes()
+    if len(raw) != payload["size"] or hashlib.sha256(raw).hexdigest() != payload["sha256"]:
+        raise SystemExit(f"S17 package-only {kind} payload binding mismatch")
+PY
+            python3 ./scripts/extract_am2_s17_kernel.py verify-fit \
+                --fit "$PACKAGE_ONLY_TMP/sysupgrade-am2-s17p/kernel" >/dev/null
+            rm -rf -- "$PACKAGE_ONLY_TMP"
+            trap - EXIT HUP INT TERM
+            ;;
             # Added by Phase 4B: am3-s19jpro-aml + am3-t21 inherit the
             # same AM3 sysupgrade-shaped tarball validator wiring. TD-003
-            # adds am2-s17pro so its runtime-only tarball is still locally
-            # package-validated when a lab kernel is supplied.
-            am3-s19kpro|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro|am2-s17pro)
+            # keeps all install-authorized lanes on pre_flash_validate.sh.
+            s9|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro)
             # End Phase 4B
             # DevOps Q1 finding 4I (2026-05-15): wire pre_flash_validate.sh
             # --package-only for am2-s19jpro so the AM2 signing flow mirrors
@@ -2357,10 +2477,14 @@ docker run --rm \
                 am3-bb) SD_PREFIX="dcentos-am3-bb-sdcard" ;;
                 am3-bb-s19jpro) SD_PREFIX="dcentos-am3-bb-s19jpro-sdcard" ;;
             esac
-            tar tf /out/'"$TARBALL_NAME"' | grep -qx "${SD_PREFIX}/uramdisk.image.gz"
-            tar tf /out/'"$TARBALL_NAME"' | grep -qx "${SD_PREFIX}/README.txt"
-            tar xf /out/'"$TARBALL_NAME"' -C /tmp
-            CPIO_LIST="$(gzip -dc "/tmp/${SD_PREFIX}/uramdisk.image.gz" | cpio -it --quiet | sed "s#^\./##")"
+            PAYLOAD_ADMIT_DIR="$(mktemp -d)"
+            trap "rm -rf -- \"$PAYLOAD_ADMIT_DIR\"" EXIT HUP INT TERM
+            cd /build/dcentos
+            python3 ./scripts/safe_extract_am3_bb_payload.py \
+                /out/'"$TARBALL_NAME"' "$PAYLOAD_ADMIT_DIR" \
+                --expected-target "'"$TARGET"'"
+            PAYLOAD_ROOT="$PAYLOAD_ADMIT_DIR/$SD_PREFIX"
+            CPIO_LIST="$(gzip -dc "$PAYLOAD_ROOT/uramdisk.image.gz" | cpio -it --quiet | sed "s#^\./##")"
             if printf "%s\n" "$CPIO_LIST" \
                 | grep -E "(^|/)(uart_trans\.ko|monitor-ipsig|S65monitor-ipsig|daemons|daemonc|update-daemon|S67update-daemon|updateporc\.sh)$"; then
                 echo "ERROR: forbidden stock BB daemon/blob present"
@@ -2377,7 +2501,7 @@ docker run --rm \
             ROOTFS_CHECK_DIR="/tmp/${SD_PREFIX}-rootfs-check"
             rm -rf "$ROOTFS_CHECK_DIR"
             mkdir -p "$ROOTFS_CHECK_DIR"
-            ( cd "$ROOTFS_CHECK_DIR" && gzip -dc "/tmp/${SD_PREFIX}/uramdisk.image.gz" | cpio -idmu --quiet )
+            ( cd "$ROOTFS_CHECK_DIR" && gzip -dc "$PAYLOAD_ROOT/uramdisk.image.gz" | cpio -idmu --quiet )
             check_armv7_elf() {
                 rel="$1"
                 path="$ROOTFS_CHECK_DIR/$rel"
@@ -2404,8 +2528,9 @@ docker run --rm \
                 exit 1
             fi
             rm -rf "$ROOTFS_CHECK_DIR"
-            rm -rf "/tmp/${SD_PREFIX}"
-            echo "PASS: SD payload has uramdisk + README, no forbidden stock BB daemon/blob paths, required management files, and ARMv7 critical binaries"
+            rm -rf -- "$PAYLOAD_ADMIT_DIR"
+            trap - EXIT HUP INT TERM
+            echo "PASS: exact target-bound SD package admitted; no forbidden stock BB daemon/blob paths; required management files and ARMv7 critical binaries verified"
             ;;
         esac
     '
@@ -2905,6 +3030,30 @@ if [ "$TARGET" = "am2-s19jpro" ]; then
     echo "  DO NOT flash until: (a) am2-s19j kernel extracted, (b) dcentrald config"
     echo "                      finalized by Agent C, (c) inactive UBI slot volume"
     echo "                      counts verified (see feedback_ubi_inactive_slot_volume_mismatch.md)."
+elif [ "$TARGET" = "am3-s19xp" ]; then
+    echo "Experimental exact-identity Amlogic artifact ready for $TARGET:"
+    echo "  $OUTPUT_DIR/$TARBALL_NAME"
+    echo ""
+    echo "Prepare the native rootfs only after offline package validation:"
+    echo "  scripts/build_amlogic_native_install.sh --variant s19xp"
+    echo "Use dcent amlogic-route with exact observed PCB, lock epoch, geometry,"
+    echo "MAC, package, backup, and restore proof. Model-only installation remains denied."
+elif [ "$TARGET" = "am3-s19jxp" ]; then
+    echo "Experimental exact-identity Amlogic artifact ready for $TARGET:"
+    echo "  $OUTPUT_DIR/$TARBALL_NAME"
+    echo ""
+    echo "Prepare the native rootfs only after offline package validation:"
+    echo "  scripts/build_amlogic_native_install.sh --variant s19jxp"
+    echo "Use dcent amlogic-route with exact observed PCB, lock epoch, geometry,"
+    echo "MAC, package, backup, and restore proof. Model-only installation remains denied."
+elif [ "$TARGET" = "am3-s19jproplus" ]; then
+    echo "Experimental exact-identity Amlogic artifact ready for $TARGET:"
+    echo "  $OUTPUT_DIR/$TARBALL_NAME"
+    echo ""
+    echo "Prepare the native rootfs only after offline package validation:"
+    echo "  scripts/build_amlogic_native_install.sh --variant s19jproplus"
+    echo "Use dcent amlogic-route with exact observed PCB, lock epoch, geometry,"
+    echo "MAC, package, backup, and restore proof. Model-only installation remains denied."
 elif [ "$TARGET" = "am3-s21" ]; then
     echo "Next (Wave 0c — S21 .135 dry-run):"
     echo "  dcent install 203.0.113.135 -f \"$OUTPUT_DIR/$TARBALL_NAME\" --artifact-dir <restore_verified_dir> --plan"

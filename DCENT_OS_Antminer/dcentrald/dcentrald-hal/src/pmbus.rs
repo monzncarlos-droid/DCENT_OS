@@ -1,5 +1,9 @@
 //! Generic **read-only** PMBus telemetry for the PMBus-class Bitmain PSU
-//! families (APW3++ / APW7 / APW9 / APW10 / APW11 at I²C `0x58`).
+//! families (APW3++ / APW10 / APW11 at I²C `0x58`).
+//!
+//! APW9 is intentionally excluded. Held S17/S17 Pro factory-jig bytes pin
+//! APW9 to a proprietary framed-I²C protocol at `0x10`, not standard PMBus.
+//! This module must never probe an APW9.
 //!
 //! # Status: EXPERIMENTAL — DESK-EVIDENCE ONLY
 //!
@@ -54,8 +58,9 @@ use crate::{HalError, Result};
 
 /// Canonical 7-bit I²C address for the PMBus-class Bitmain APW families.
 ///
-/// Source: `dcentrald-silicon-profiles::psus` catalog rows for APW3++ / APW7 /
-/// APW9 / APW10 / APW11 (`i2c_address: 0x58`, `protocol: PmBus`).
+/// Source: `dcentrald-silicon-profiles::psus` catalog rows for APW3++ /
+/// APW10 / APW11 (`i2c_address: Some(0x58)`, `protocol: PmBus`). APW7 has no
+/// signal terminal; APW9 is proprietary framed I²C at `0x10`.
 pub const PMBUS_PSU_I2C_ADDRESS: u8 = 0x58;
 
 /// Secondary address some APW units answer on (RE2 §5.1 notes `0x58/0x59`).
@@ -667,10 +672,6 @@ impl PmbusTelemetryGate {
 pub enum PmbusPsuFamily {
     /// APW3++ — first-generation S9 PSU.
     Apw3PlusPlus,
-    /// APW7 — S9 / T9+ / S11 / S17.
-    Apw7,
-    /// APW9 — S15 / S17 / T17 / S19j.
-    Apw9,
     /// APW10 — catalog row marked PARTIAL upstream.
     Apw10,
     /// APW11 — catalog row marked PARTIAL upstream.
@@ -679,20 +680,12 @@ pub enum PmbusPsuFamily {
 
 impl PmbusPsuFamily {
     /// Every family this layer covers.
-    pub const ALL: &'static [Self] = &[
-        Self::Apw3PlusPlus,
-        Self::Apw7,
-        Self::Apw9,
-        Self::Apw10,
-        Self::Apw11,
-    ];
+    pub const ALL: &'static [Self] = &[Self::Apw3PlusPlus, Self::Apw10, Self::Apw11];
 
     /// Catalog model string.
     pub const fn model(self) -> &'static str {
         match self {
             Self::Apw3PlusPlus => "APW3++",
-            Self::Apw7 => "APW7",
-            Self::Apw9 => "APW9",
             Self::Apw10 => "APW10",
             Self::Apw11 => "APW11",
         }
@@ -1357,7 +1350,10 @@ mod tests {
 
     #[test]
     fn covered_families_all_sit_at_the_catalog_address() {
-        assert_eq!(PmbusPsuFamily::ALL.len(), 5);
+        assert_eq!(PmbusPsuFamily::ALL.len(), 3);
+        assert!(!PmbusPsuFamily::ALL
+            .iter()
+            .any(|family| matches!(family.model(), "APW7" | "APW9")));
         for family in PmbusPsuFamily::ALL {
             assert_eq!(family.i2c_address(), 0x58, "{}", family.model());
         }
@@ -1387,7 +1383,7 @@ mod tests {
     fn identity_block_reads_use_the_declared_length() {
         let bus = FakeBus::new(vec![(
             PmbusReadCommand::MfrId,
-            Ok(vec![0x04, b'A', b'P', b'W', b'9', 0xFF, 0xFF]),
+            Ok(vec![0x04, b'T', b'E', b'S', b'T', 0xFF, 0xFF]),
         )]);
         let reader = PmbusReader::new(
             &bus,
@@ -1396,7 +1392,7 @@ mod tests {
         );
         assert_eq!(
             reader.read_identity(PmbusReadCommand::MfrId),
-            Measured::Known("APW9".to_string())
+            Measured::Known("TEST".to_string())
         );
     }
 

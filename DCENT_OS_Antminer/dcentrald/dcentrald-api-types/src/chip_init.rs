@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 /// Chip family identifier. Mirrors the families that have shipped
 /// silicon-profile entries (BM1362, BM1387 today; more in +).
 ///
-///  W5-A: `Bm1485` (Scrypt L3+/L3++) and `Bm1489` (Scrypt L7/L9)
+///  W5-A: `Bm1485` (Scrypt L3+/L3++) and `Bm1489` (Scrypt **L7 only** —
+/// Round 16 B3 corrected this from "L7/L9"; the L9 is `Bm1491`)
 /// added to support the `dcentrald-silicon-profiles::registry`
 /// per-(model, hashboard, chip) tuple schema. They are scrypt-chain
 /// rail-voltage chips, not SHA-256 chip-rail.
@@ -70,7 +71,12 @@ pub enum ChipFamily {
     Bm1370,
     /// BM1485 — Antminer L3 / L3+ / L3++ scrypt mining ( W5-A).
     Bm1485,
-    /// BM1489 — Antminer L7 / L9 scrypt mining ( W5-A).
+    /// BM1489 — Antminer **L7** scrypt mining ( W5-A).
+    ///
+    /// ⚠ Round 16 B3: was "L7 / L9". The **L9 is [`ChipFamily::Bm1491`]** —
+    /// its authentic stock image states `"asic_id":"BM1491"` /
+    /// `"chip_type":"0x1491"`. BM1489's own identity is third-party (VNish
+    /// `libbitmain`) and is **not** confirmed by any Bitmain artifact.
     Bm1489,
     /// BM1360 — wave-6 surfaced, W7-A confirmed in 36/64 VNish 1.2.6/1.2.7
     /// cgminer ELFs + L7 hwscan binary.  W8-A: enum variant added
@@ -102,17 +108,26 @@ impl ChipFamily {
             ChipFamily::Bm1370 => [0x13, 0x70],
             //  W5-A: scrypt-chain chip families. Hex IDs sourced
             // from the cgminer-ltc / `bm1485.rs` provenance. BM1489
-            // ID (`0x14, 0x89`) is the shipping L7/L9 nameplate; not
-            // verified live yet — flagged for  confirmation.
+            // ID (`0x14, 0x89`) is the shipping **L7** nameplate (Round 16 B3
+            // removed the falsified L9 claim); it is name-derived and
+            // third-party-attested only — no Bitmain artifact states it.
             ChipFamily::Bm1485 => [0x14, 0x85],
             ChipFamily::Bm1489 => [0x14, 0x89],
             //  W8-A: name-derived PLACEHOLDER IDs. Per W7-A,
-            // the actual `chip_id` of these chips is genuinely UNKNOWN
+            // the actual `chip_id` of these chips was genuinely UNKNOWN
             // — only the enum-string name was surfaced in the wave-6
             // haul. Re-verify against a live `GetAddress` response
             // before trusting these byte pairs in any chip-detection
             // path. [GAP — wave-9 live verification needed]
             ChipFamily::Bm1360 => [0x13, 0x60],
+            // ⚠ Round 16 B3 — BM1491 is NO LONGER name-derived. The Antminer
+            // L9's authentic stock image (`FR-1.19(260302-L9).bmu` →
+            // `etc/topol.conf`) states `"chip_type": "0x1491"` verbatim, so
+            // the vendor's own chip-type identifier IS 0x1491.
+            // Still NOT proven: that a BM1491 returns these two bytes in a
+            // `GetAddress` response. `topol.conf` is a host-side config value,
+            // not a captured wire frame — the on-wire encoding remains
+            // unverified. cores_per_chip stays 0 (refuse-to-mine).
             ChipFamily::Bm1491 => [0x14, 0x91],
         }
     }
@@ -195,7 +210,7 @@ pub fn init_spec(family: ChipFamily) -> ChipInitSpec {
             requires_open_core: false,
             miscctrl_triple_write: true,
             bm1362_asic_uart_relay_reg_0x2c_write_required: false,
-            label: "BM1397 (S17 / S17 Pro / S17e)",
+            label: "BM1397 (S17 / S17 Pro / S17+ / T17 / T17+)",
         },
         ChipFamily::Bm1398 => ChipInitSpec {
             chip_id: [0x13, 0x98],
@@ -269,24 +284,24 @@ pub fn init_spec(family: ChipFamily) -> ChipInitSpec {
             bm1362_asic_uart_relay_reg_0x2c_write_required: false,
             label: "BM1370 (S21 Pro / S21 XP)",
         },
-        //  W5-A: scrypt families. Cores/baud values are derived
-        // from `dcentrald-silicon-profiles::bm1485` (12 cores/chip,
-        // chain-rail voltage). Init values are placeholders pending
-        //  live capture from L3+/L7/L9 hardware. They MUST NOT
+        //  W5-A: scrypt families. Cores are derived from
+        // `dcentrald-silicon-profiles::bm1485` (12 cores/chip). The baud
+        // description is corrected from exact 2017 stock L3+: it stays at
+        // nominal 115200. Remaining init values are placeholders. They MUST NOT
         // be consumed by the SHA-256 ASIC driver dispatch path —
         // scrypt mining is not yet wired into `dcentrald-asic`.
         ChipFamily::Bm1485 => ChipInitSpec {
             chip_id: [0x14, 0x85],
             cores_per_chip: 12,
             default_baud: 115200,
-            operational_baud: 1_562_500,
+            operational_baud: 115_200,
             response_bytes: 7,
             pll_register: 0x08,
             miscctrl_register: 0x18,
             requires_open_core: false,
             miscctrl_triple_write: true,
             bm1362_asic_uart_relay_reg_0x2c_write_required: false,
-            label: "BM1485 (L3+ / L3++ scrypt) — placeholder",
+            label: "BM1485 (L3+ / L3++ scrypt) — exact-stock baud only",
         },
         ChipFamily::Bm1489 => ChipInitSpec {
             chip_id: [0x14, 0x89],
@@ -299,7 +314,7 @@ pub fn init_spec(family: ChipFamily) -> ChipInitSpec {
             requires_open_core: false,
             miscctrl_triple_write: true,
             bm1362_asic_uart_relay_reg_0x2c_write_required: false,
-            label: "BM1489 (L7 / L9 scrypt) — placeholder",
+            label: "BM1489 (L7 scrypt, third-party identity) — placeholder",
         },
         //  W8-A: NAMED-ONLY placeholder init specs. cores=0 is
         // the deliberate refuse-to-mine sentinel — silicon-profile
@@ -471,10 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn miscctrl_triple_write_is_universal_across_families() {
-        //  +  hard rule: triple-write MiscCtrl with 5 ms
-        // spacing on all chip families per
-        // .
+    fn miscctrl_three_write_requirement_is_recorded_across_families() {
+        // This flag records three-write requirement only; it does not encode a
+        // universal value/address/timing spine. Exact stock BM1485 uses a
+        // broadcast plus two addressed writes with 2-ms delays, unlike the
+        // generic 5-ms identical-write baud-upgrade policy.
         for fam in ALL_FAMILIES {
             let s = init_spec(*fam);
             assert!(

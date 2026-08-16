@@ -1,0 +1,38 @@
+#!/bin/sh
+
+DCENTOS_EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+DCENTOS_INIT_DIR=${DCENTOS_INIT_DIR:-/etc/init.d}
+DCENTOS_EXTERNAL_MEDIA_STOP_ALLOWLIST='S50dropbear S45persistent S43logrotate S41ntp S40network S02klogd S01syslogd'
+
+run_stop_script() {
+    script=$1
+    [ -f "$script" ] || return 0
+    case "$script" in
+        *.sh)
+            (
+                trap - INT QUIT TSTP
+                set stop
+                . "$script"
+            )
+            ;;
+        *)
+            "$script" stop
+            ;;
+    esac
+}
+
+if [ -f "$DCENTOS_EXTERNAL_MEDIA_MARKER" ] && \
+   [ ! -L "$DCENTOS_EXTERNAL_MEDIA_MARKER" ] && \
+   [ ! -s "$DCENTOS_EXTERNAL_MEDIA_MARKER" ]; then
+    echo "[external-media] restricted shutdown allowlist active"
+    for name in $DCENTOS_EXTERNAL_MEDIA_STOP_ALLOWLIST; do
+        run_stop_script "$DCENTOS_INIT_DIR/$name"
+    done
+    exit 0
+fi
+
+# Normal on-board shutdown: preserve upstream reverse-order behavior.
+for script in $(ls -r "$DCENTOS_INIT_DIR"/S??*); do
+    [ -f "$script" ] || continue
+    run_stop_script "$script"
+done

@@ -87,13 +87,53 @@ pub const BM1485_TABLE: SiliconTable = SiliconTable {
 pub const BM1485_CORES_PER_CHIP: u32 = 12;
 
 /// Standard L3+ chip count per chain-board: 72 chips/board (the chip-comm
-/// chains run Chip 1 -> Chip 72), x4 chain-boards/miner = 288 total chips, per
-///  §77-81
-/// ("Chips per Board: 72 (L3+)", "Total Chips/Miner: 288 (L3+)"). Telemetry/
-/// geometry only — no PLL/voltage/safety consumer (bug-hunt HIGH 2026-05-28
-/// corrected a stale `18` that contradicted the RE doc + this file's own
-/// 504/288≈1.75 MH/s per-chip figure).
+/// chains run Chip 1 -> Chip 72), x4 chain-boards/miner = 288 total chips.
+///
+/// **FIRST-PARTY (Round 17 B5, 2026-08-08).** Previously sourced only from the
+///  §77-81 RE doc
+/// ("Chips per Board: 72 (L3+)", "Total Chips/Miner: 288 (L3+)"). It is now
+/// corroborated by a **first-party Bitmain document**: the *L3+ Maintenance
+/// Guide* (+ Maintenance
+/// Guide.pdf`, sha256
+/// `8a96cfa2034d126200b7ec711b46f9e2b4b51f987dc74e8a0b4059cfcf5e6420`) states
+/// on p.1 §III.1 "L3+ has 12 voltage domains connected in series, each domain
+/// has 6 BM1485 chips, and the entire board has 72 BM1485 chips" and repeats it
+/// on p.3 §2. See [`BM1485_VOLTAGE_DOMAINS_L3PLUS`] × [`BM1485_CHIPS_PER_DOMAIN_L3PLUS`].
+/// Telemetry/geometry only — no PLL/voltage/safety consumer (bug-hunt HIGH
+/// 2026-05-28 corrected a stale `18` that contradicted the RE doc + this file's
+/// own 504/288≈1.75 MH/s per-chip figure).
 pub const BM1485_CHIPS_PER_CHAIN_L3PLUS: u32 = 72;
+
+/// L3+ voltage domains per hashboard, wired in **series** (each domain's rail
+/// feeds the next).
+///
+/// **FIRST-PARTY (Round 17 B5).** *L3+ Maintenance Guide* p.1 §III.1 / p.3 §2:
+/// "the entire board has 12 voltage domains, and each domain has 6 chips. The 6
+/// chips in the same voltage domain are in parallel power supply, and then
+/// connect other voltage domains in series." Geometry/telemetry only — this
+/// crate has no energizing consumer for it, and the BM1485 driver refuses to
+/// energize.
+pub const BM1485_VOLTAGE_DOMAINS_L3PLUS: u32 = 12;
+
+/// BM1485 chips per voltage domain (parallel within a domain).
+///
+/// **FIRST-PARTY (Round 17 B5).** *L3+ Maintenance Guide* p.1 §III.1 / p.3 §2:
+/// "each domain has 6 BM1485 chips". `12 × 6 = 72` is pinned by
+/// [`tests::l3plus_domain_topology_is_first_party_and_internally_consistent`].
+pub const BM1485_CHIPS_PER_DOMAIN_L3PLUS: u32 = 6;
+
+/// BM1485 chip-clock crystal frequency (MHz).
+///
+/// **FIRST-PARTY (Round 17 B5).** *L3+ Maintenance Guide* p.1 §III.3 ("L3+ has
+/// 25M monocrystal oscillator on the clock, connecting in series and passing on
+/// from the 1st chip to the last chip") and p.2 ("CLK signal flow, produced by
+/// Y1 25M crystal oscillator, transmits from No. 1 chip to No. 72 chip").
+/// Corroborates the `dcentrald-asic::drivers::bm1485` PLL reference
+/// `CLKI_MHZ = 25.0`, which was previously sourced only from the cgminer-ltc RE
+/// doc `bm1485.md:189`. This is the **chip** oscillator that feeds the ASIC PLL;
+/// it is NOT the L3+ control-board UART clock (the held AM335x carrier runs its
+/// OMAP UARTs at 48 MHz). Metadata only — no register write is derived from it.
+pub const BM1485_CHIP_CLOCK_MHZ: u32 = 25;
 
 /// Standard L3+ chain count per miner.
 pub const BM1485_CHAIN_COUNT_L3PLUS: u32 = 4;
@@ -158,6 +198,39 @@ mod tests {
         // Per-chip nameplate: 504 MH/s / 288 chips ≈ 1.75 MH/s — confirms the
         // chip count is internally consistent with BM1485_PER_CHIP_HASHRATE_MHS.
         assert!((504.0_f32 / total as f32 - BM1485_PER_CHIP_HASHRATE_MHS).abs() < 0.01);
+    }
+
+    #[test]
+    fn l3plus_domain_topology_is_first_party_and_internally_consistent() {
+        // FIRST-PARTY Bitmain corroboration (Round 17 B5): the L3+ Maintenance
+        // Guide (misc/L3+ Maintenance Guide.pdf, sha256 8a96cfa2...5e6420) states
+        // p.1 §III.1 / p.3 §2: "12 voltage domains connected in series, each
+        // domain has 6 BM1485 chips, and the entire board has 72 BM1485 chips."
+        //
+        // Until Round 17 the 72-chip count rested only on the SCRYPT_ASIC_CHIPS.md
+        // RE doc. This binds the domain × chips-per-domain decomposition to the
+        // guide and pins the identity 12 × 6 = 72 so a future edit to either
+        // factor fires here.
+        assert_eq!(BM1485_VOLTAGE_DOMAINS_L3PLUS, 12);
+        assert_eq!(BM1485_CHIPS_PER_DOMAIN_L3PLUS, 6);
+        assert_eq!(
+            BM1485_VOLTAGE_DOMAINS_L3PLUS * BM1485_CHIPS_PER_DOMAIN_L3PLUS,
+            BM1485_CHIPS_PER_CHAIN_L3PLUS,
+            "L3+ Maintenance Guide p.3 §2: 12 domains x 6 chips must equal the \
+             72 chips/board this crate ships"
+        );
+        assert_eq!(BM1485_CHIPS_PER_CHAIN_L3PLUS, 72);
+    }
+
+    #[test]
+    fn l3plus_chip_clock_is_25mhz_first_party() {
+        // FIRST-PARTY (Round 17 B5): L3+ Maintenance Guide p.1 §III.3 / p.2 name
+        // a Y1 25M crystal driving the chip CLK chain. This is the chip
+        // oscillator that feeds the ASIC PLL — it must match the
+        // dcentrald-asic BM1485 PLL reference CLKI_MHZ = 25.0. It is NOT the
+        // control-board UART clock (held AM335x carrier runs OMAP UARTs at
+        // 48 MHz).
+        assert_eq!(BM1485_CHIP_CLOCK_MHZ, 25);
     }
 
     #[test]

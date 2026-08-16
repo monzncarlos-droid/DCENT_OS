@@ -158,39 +158,10 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-# T21 has no extracted kernel of its own yet; the A113D + 4.9.113 base
-# is shared with S21 so the verified S21 kernel is the right fallback
-# until a T21 bench unit lands.
-KERNEL=""
-KERNEL_SRC=""
-if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
-    KERNEL="${DCENT_AM3_AML_KERNEL}"
-    KERNEL_SRC="env override (DCENT_AM3_AML_KERNEL)"
-elif [ -f "${PROJECT_ROOT}/extractions/t21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/t21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/t21"
-elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s21 (verified AXG fallback)"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/t21"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s21 (verified AXG fallback)"
-fi
-
-if [ -z "$KERNEL" ]; then
-    echo "ERROR: no kernel_uimage.bin found for am3-t21 sysupgrade packaging." >&2
-    echo "  Expected one of (in probe order):" >&2
-    echo "    \$DCENT_AM3_AML_KERNEL" >&2
-    echo "    ${PROJECT_ROOT}/extractions/t21/kernel_uimage.bin" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/t21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
-    echo "  Refusing to package am3-t21 without a verified am3-family kernel." >&2
-    exit 1
-fi
+. "${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/require-exact-build-inputs.sh"
+dcent_require_exact_amlogic_build_inputs "${TARGET:-}"
+KERNEL="$DCENT_AM3_AML_KERNEL"
+KERNEL_SRC="exact model-bound build-input snapshot (t21/aml)"
 
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
@@ -263,7 +234,10 @@ EOF
 
 # Final manifest/signature rewrite through shared AM2/AM3 helper.
 DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"
-DCENT_TOOLBOX_UPDATE_COMMAND=""
+# OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
+# rail accepts the amlogic_rootfs_window method; identical root SSH +
+# restore-verified + signed-package gates; write+readback, NO auto-reboot).
+DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
 DCENT_TARGET_SIDE_SYSUPGRADE=false

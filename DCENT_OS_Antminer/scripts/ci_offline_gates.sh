@@ -537,10 +537,10 @@ EOF
 am3_geometry_static_selftest() {
     . scripts/lib/am3_geometry.sh || return 1
     [ "$DCENT_AM3_ROOTFS_MTD" = "/dev/mtd5" ] || return 1
-    [ "$DCENT_AM3_ROOTFS_OFFSET_HEX" = "0x05700000" ] || return 1
+    [ "$DCENT_AM3_ROOTFS_OFFSET_HEX" = "0x05100000" ] || return 1
     [ "$DCENT_AM3_ROOTFS_WINDOW_HEX" = "0x02800000" ] || return 1
     [ "$DCENT_AM3_ROOTFS_ERASE_COUNT" = "320" ] || return 1
-    [ "$DCENT_AM3_ROOTFS_END_DEC" = "133169152" ] || return 1
+    [ "$DCENT_AM3_ROOTFS_END_DEC" = "126877696" ] || return 1
 
     grep -F 'ROOTFS_OFFSET_HEX="$DCENT_AM3_ROOTFS_OFFSET_HEX"' scripts/install_amlogic_persistent.sh >/dev/null 2>&1 || return 1
     grep -F 'ROOTFS_WINDOW_HEX="$DCENT_AM3_ROOTFS_WINDOW_HEX"' scripts/install_amlogic_persistent.sh >/dev/null 2>&1 || return 1
@@ -732,6 +732,7 @@ require_file '.gitattributes'
 require_file 'scripts/package_sysupgrade.sh'
 require_file 'scripts/pre_flash_validate.sh'
 require_file 'scripts/lib/am3_geometry.sh'
+require_file 'scripts/lib/amlogic_identity_guard.sh'
 require_file 'scripts/lib/dcentrald_version_gate.sh'
 require_file 'scripts/lib/sysupgrade_package_common.sh'
 require_file 'scripts/run_wave_regressions.sh'
@@ -775,6 +776,12 @@ if am3_geometry_static_selftest; then
     pass "am3 geometry selftest proves install/lab/revert consume shared offsets"
 else
     fail "am3 geometry selftest failed"
+fi
+
+if sh scripts/test_amlogic_identity_guard.sh; then
+    pass "amlogic terminal identity guard rejects held unsupported sibling variants"
+else
+    fail "amlogic terminal identity guard selftest failed"
 fi
 
 if dcentrald_version_gate_selftest; then
@@ -1097,6 +1104,22 @@ if run_python_script scripts/check_safety_clamp_manifest.py --self-test; then
     pass "safety clamp manifest: classified thermal/voltage/frequency/PWM clamp set is pinned with negative control"
 else
     fail "safety clamp manifest: classified clamp set drifted or negative control failed"
+fi
+# no-orphan power/PIC/thermal backend gate (hardware-enablement rank 36).
+# Shipped 2026-08-03 as "not wired -- see W8-RANK-36-ORPHAN-GATE.md S6"; the
+# coordinator wiring was never applied, so the gate that exists to catch
+# unreachable code was itself unreachable for four days. Wired 2026-08-07
+# (Round-16 B6). Deliberately WITHOUT >/dev/null so FAIL reasons reach CI logs.
+require_file 'scripts/check_no_orphan_power_backends.py'
+if run_python_script scripts/check_no_orphan_power_backends.py; then
+    pass 'no-orphan power/PIC/thermal backend gate holds (34 pinned orphans, 0 new)'
+else
+    fail 'no-orphan backend gate: new orphan power/PIC/thermal backend, stale allowlist row, dead scope glob, or unreasoned allowlist entry (reasons printed above)'
+fi
+if run_python_script scripts/check_no_orphan_power_backends.py --self-test; then
+    pass 'no-orphan backend gate self-test (orphan/live/dead-glob/allowlist-reason controls)'
+else
+    fail 'no-orphan backend gate self-test failed'
 fi
 require_pattern 'scripts/run_all_gates.sh' 'dcentrald-asic' 'run_all_gates host tests execute dcentrald-asic behavioral safety tests'
 require_pattern 'scripts/run_all_gates.sh' 'dcentrald-thermal --no-default-features' 'run_all_gates host tests execute dcentrald-thermal safety tests'
@@ -1479,8 +1502,14 @@ require_pattern 'scripts/build_amlogic_native_install.sh' 'extracted rootfs is n
 require_pattern 'scripts/build_amlogic_native_install.sh' 'DCENT_AM3_ROOTFS_WINDOW_DEC' 'amlogic native image builder uses shared am3 rootfs window'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'Step 0/10: local package-only validation' 'amlogic persistent installer validates package before SSH'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'pre_flash_validate.sh" --package-only "$FIRMWARE" "$BOARD_PKG_NAME"' 'amlogic persistent installer reuses package-only validator'
-require_pattern 'scripts/install_amlogic_persistent.sh' '--variant s19kpro|s21' 'amlogic persistent installer supports S19K and S21 variants'
+require_pattern 'scripts/install_amlogic_persistent.sh' '--variant s19jpro-aml|s19jproplus|s19xp|s19jxp|s19kpro|s21|s21pro|s21xp|t21' 'amlogic persistent installer supports exact S19j Pro AML, S19j Pro+, S19 XP, S19j XP, S19K, S21, S21 Pro, S21 XP, and T21 variants'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19jpro-aml"' 'amlogic persistent installer maps S19j Pro AML package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19jproplus"' 'amlogic persistent installer maps S19j Pro+ package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19xp"' 'amlogic persistent installer maps S19 XP package prefix'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21"' 'amlogic persistent installer maps S21 package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21pro"' 'amlogic persistent installer maps S21 Pro package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21xp"' 'amlogic persistent installer maps S21 XP package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-t21"' 'amlogic persistent installer maps T21 package prefix'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'REMOTE_PREFIX="/data/sysupgrade/$PACKAGE_PREFIX"' 'amlogic persistent installer derives remote package prefix from variant'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' 'amlogic persistent installer resolves validator path from script dir'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'rm -rf /data/sysupgrade && mkdir -p /data/sysupgrade' 'amlogic persistent installer clears remote staging before extract'
@@ -1498,18 +1527,328 @@ require_pattern 'scripts/install_amlogic_persistent.sh' 'root_payload_sha256' 'a
 require_pattern 'scripts/install_amlogic_persistent.sh' 'remote_firmware_sha256' 'amlogic persistent installer records remote package hash in manifest'
 require_pattern 'scripts/install_amlogic_persistent.sh' '"package_board": "$BOARD_PKG_NAME"' 'amlogic persistent installer records dynamic package board in manifest'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'root_write_readback.uimage' 'amlogic persistent installer preserves rootfs write readback artifact'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'fw_setenv firstboot verification failed' 'amlogic persistent installer verifies firstboot env before reboot'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'root_write_readback_sha256' 'amlogic persistent installer records write readback hash in manifest'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'firstboot_after_set' 'amlogic persistent installer records firstboot proof in manifest'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'refusing firstboot-only' 'amlogic persistent installer refuses firstboot-only install commit'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'refusing firstboot-only' 'am3 s19k revert refuses firstboot-only commit'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'REVERT_COMMIT_PLAN' 'am3 s19k revert writes REVERT_COMMIT_PLAN'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'recover_env_source=nandrecovery_env.bin' 'am3 s19k revert names nandrecovery recover_env'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'does NOT arm flag 0x02' 'am3 s19k revert does not mix flag 0x02'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' '--dry-run' 'am3 s19k revert accepts --dry-run'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' '[DRY RUN] writing REVERT_COMMIT_PLAN before GPIO/nandwrite' 'am3 s19k revert dry-run writes plan before NAND'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'dry_run=true nandwrite=false gpio_write=false' 'am3 s19k revert dry-run emits plan field literals'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/nandwrite/fw_setenv' 'am3 s19k revert execute refuses NAND while FLASH-false'
+require_pattern 'scripts/dcentrald_s19k_tmp_deploy.sh' '--dry-run' 's19k tmp deploy accepts --dry-run'
+require_pattern 'scripts/dcentrald_s19k_tmp_deploy.sh' 'TMP_DEPLOY_PLAN' 's19k tmp deploy writes TMP_DEPLOY_PLAN'
+require_pattern 'scripts/dcentrald_s19k_tmp_deploy.sh' 'musl_static=true' 's19k tmp deploy admits musl-static'
+require_pattern 'scripts/dcentrald_s19k_tmp_deploy.sh' 'ld-linux' 's19k tmp deploy refuses glibc interp'
+reject_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'fw_setenv firstboot 1' 'am3 s19k revert does not execute fw_setenv firstboot 1'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'INSTALL_COMMIT_PLAN.txt' 'amlogic persistent installer writes install-commit plan'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'write_install_commit_plan()' 'amlogic persistent installer emits rust InstallArm plan via helper'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'uboot_action=FirstBosThenSetFlag2' 'amlogic persistent installer commit plan names FirstBosThenSetFlag2'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'eraseblock_index=' 'amlogic persistent installer commit plan names eraseblock_index'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'RECOVER_TO_STOCK_PLAN.txt' 'amlogic persistent installer writes recover-to-stock plan'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'recover_amlogic_to_stock.sh' 'amlogic persistent installer names recover-to-stock runner'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'sh "$RECOVER_RUNNER" --artifact-dir "$ARTIFACT_DIR" --dry-run' 'amlogic persistent installer invokes recover --dry-run'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'recover-to-stock --dry-run failed; refusing successful backup' 'amlogic persistent installer refuses backup if recover walk fails'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'RECOVER_WALK.txt' 'amlogic persistent installer requires RECOVER_WALK after dry-run'
+require_pattern 'scripts/lib/am3_geometry.sh' 'dcent_am3_extract_recovery_flag_eraseblock()' 'am3 geometry slices 128KiB recovery-flag eraseblock'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'dcent_am3_extract_recovery_flag_eraseblock' 'amlogic persistent installer slices recovery-flag eraseblock'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'sh "$FLAG_HELPER" --value 0x01' 'amlogic persistent installer walks 0x01 fixture'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'INSTALL_COMMIT_WALK.txt' 'amlogic persistent installer writes INSTALL_COMMIT_WALK'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'recovery-flag 0x01 fixture walk failed; refusing successful backup' 'amlogic persistent installer refuses backup if 0x01 fixture walk fails'
+require_pattern 'scripts/install_amlogic_persistent.sh' '0x01 fixture-out length' 'amlogic persistent installer refuses wrong 0x01 fixture length'
+require_pattern 'scripts/install_amlogic_persistent.sh' '0x01 fixture-out byte0=' 'amlogic persistent installer refuses wrong 0x01 fixture first byte'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' 'resolve_plug_gpio_global' 'amlogic HAL resolves plug GPIOs by name'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' '"CH0_PLUG"' 'amlogic HAL uses CH0_PLUG not integer-only 439'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' 'resolve_reset_gpio_global' 'amlogic HAL resolves HB reset GPIOs by name'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' '"HB0_RESET"' 'amlogic HAL uses HB0_RESET not integer-only 454'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'resolve_psu_gpio_global' 'Track-1 preflight resolves PWR_CONTROL before observe'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'resolve_plug_gpio_global' 'Track-1 preflight resolves CH*_PLUG before observe'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' 'resolve_fan_tach_gpio_global' 'amlogic HAL resolves fan tach GPIOs by name'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' '"FAN_FRONT_SPEED0"' 'amlogic HAL uses S21 FAN_FRONT_SPEED0 not integer-only 447'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' 'resolve_led_gpio_global' 'amlogic HAL resolves LED GPIOs by name'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' '"LED_RED"' 'amlogic HAL uses LED_RED not integer-only 438'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' 'resolve_pinmux_gpio_global' 'amlogic HAL resolves I2C pinmux GPIOs by name'
+require_pattern 'dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs' '"I2C_SCL"' 'amlogic HAL uses I2C_SCL not integer-only 476'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'S19kRxExpectedAfter::FastUart28' 'Track-1 classifies FastUART 0x28 read'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'send_read_reg_broadcast_bm1397plus' 'Track-1 TX is broadcast 52 05 00 28'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 's19k_track1_should_retry_115200' 'Track-1 115200 retry is gated'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 's19k_track1_retry_restore_baud' 'Track-1 115200 retry restores 3M'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'impl Drop for Track1HostBaudRestore' 'Track-1 115200 retry restores 3M on Drop'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'refuse_work_tx_if_host_not_3m_after_restore' 'Track-1 refuses work TX if restore left host off 3M'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'classify_s19k_dual_baud_silence' 'Track-1 classifies 115200 retry against GPIO437'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'ChipHeardWhileRailsDisabled' 'dual-baud class distinguishes chip-heard from GPIO437 DISABLE'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'GetAddress115200Retry' 'Track-1 classifies 115200 retry separately from 3M GetAddress'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'GetAddressSilenceAt115200' '115200 GetAddress silence is not ChipFastUartUnread'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'GetAddressSilenceAt115200' 'Track-1 maps 115200 GetAddress silence into dual-baud'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'FastUart28At115200' 'Track-1 probes FastUART 0x28 at 115200 after GetAddress silence'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'format_s19k_aml_factory_sd_plan' 'S19k AML factory SD planner exists'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_aml_factory_sd_as_nandrecovery_env' 'AML factory SD is not nandrecovery_env'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'parse_s19k_aml_upgrade_header' 'S19k AmlImagePack v2 header parser'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_aml_img_as_updateporc' 'S19k factory img is not updateporc'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'parse_s19k_aml_multi_dtb' 'S19k factory meson1 AML_ multi-DTB parser'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_uboot_gpioao3_as_gpio437' 'USB UBOOT GPIOAO_3 is not gpio437'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'parse_s19k_aml_dtb_gpio_controllers' 'S19k meson1 gpio-controller walker'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_dt_math_as_gpio437' 'DT cell math is not linux gpio437'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'parse_s19k_aml_verify_item' 'AmlImagePack VERIFY sha1sum parser'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_dtb_alias_meson1_enc' 'item4 _aml_dtb aliases meson1_ENC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'classify_s19k_aml_verify_hex' 'factory VERIFY sha1 classifier'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_verify_pair' 'VERIFY sub and sha1 must agree'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_gpio_word' 'USB UBOOT packed gpio word offset'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_bootloader_as_uboot_enc' 'item11 bootloader is not item7 UBOOT.ENC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_uboot_packed_gpioao3_seq' 'USB/SDC share packed GPIOAO_3 sequence'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_sdc_usb_uboot_suffix' 'SDC UBOOT is USB plus 49664 BL2 prefix'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_i2c_mw_1f_as_gpio437' 'i2c mw 1f is PCA9557 ledring not gpio437'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'parse_s19k_bl2_storage_classes' 'BL2 storage class table parser'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_setenv' 'USB UBOOT packed setenv boo pin'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_logo' 'USB UBOOT packed logo=${display_layer}'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_rpmb_emmc_errors' 'BL2 eMMC RPMB error strings'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_hardware' 'USB UBOOT packed hardware is Android cmdline'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_iogic_as_amlogic' 'packed Iogic is not contiguous amlogic'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_atf_plat_amlogic' 'USB UBOOT BL31 plat/amlogic ATF paths'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_scan_bbt_ecc' 'BL2 scan bbt ecc error is not live NAND ECC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_uild_expect' 'USB UBOOT packed uild.expect is Android remnant'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_packed_acmdlin' 'USB UBOOT packed acmdlin is Android cmdline remnant'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_ddr_saved_page' 'BL2 ddr saved page is DDR training not NAND'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_lock_check' 'BL2 lock check is not gpio437 SafeOff'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_cpu_clk_24mhz' 'BL2 CPU clk 24MHz is not hash clock or UART baud'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_bl2_pll_as_asic_pll' 'BL2 SYS/FIX PLL are not BM1366 ASIC PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_saradc_sample_error' 'BL2 Get saradc sample Error is not miner ADC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_bl2_saradc_as_miner_voltage_adc' 'BL2 SARADC is not INA260/dsPIC voltage'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_board_id' 'BL2 Board ID is not .78 chassis or BHB56'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_saradc_channel2' 'USB SARADC channel2 is not BL2 sample-error'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'parse_s19k_bl2_ddr_types' 'BL2 DDR3/DDR4/LPDDR table is not NAND geometry'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_ddr_table' 'BL2 rank/DDR table admit'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_bl2_ddr_as_78_nand' 'BL2 DRAM table is not .78 nandnormal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_ddr_ssc_pll' 'BL2 DDR SSC/PLL is not BM1366 hash PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_s19k_no_held_bm1366_job_nonce' 'no held S19k BM1366 job-nonce vector'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'refuse_held_s21_job_as_s19k_bm1366_nonce' 'S21 BM1368 frame is not S19k nonce'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_constructed_fill_nonce_correlates' 'constructed fill nonce correlates with 21 36'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'refuse_constructed_fill_body7_as_job_nonce' 'HAL body-7 cut of fill nonce is not JobNonce'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_bist_test' 'BL2 bist_test is DRAM BIST not NAND BIST'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_dram_chl_mhz' 'BL2 chl: MHz is DRAM channel not hash-chain'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_constructed_fill_hal_body7_wire_as_share' 'share-hunter refuses constructed fill HAL body-7 wire cut'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_ddr_reset' 'BL2 Reset after DDR init failed is not gpio437'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_hunt_uses_body9' 'production BM1366 hunt uses resp[..9] not HAL body 7'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_sdio_customer_id' 'BL2 sdio/Customer ID is not miner identity'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_sets_body_before_first_read' 'Track-1 set_response_len before first GetAddress'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_hal_default_body7_as_bm1366_first_read' 'HAL DEFAULT 7 is not BM1366 first-read'
+require_pattern 'dcentrald/dcentrald-hal/src/serial_chain.rs' 'fn open_passthrough_bm1366' 'HAL BM1366 passthrough open sets body 9'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'open_passthrough_bm1366(i as u8, path)' 'Track-1 uses BM1366 fail-closed passthrough open'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_memdump_bl2z' 'BL2 @MEMDUMP/jump to BL2z is not nandrecovery'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_fip_usb_mode' 'BL2 USB mode/FIP CHK is not AML NAND install'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_fip_tmp_bl31' 'BL2 FIP TMP HDR/BL31 is not AML NAND install'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_err_sha_table' 'BL2 Err:sha* is FIP digest error not VERIFY sha1'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_never_be_here_skip_usb' 'BL2 NEVER BE HERE/Skip usb is USB-boot not AML NAND install'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_bl2_reg_dump' 'BL2 -W[0x]/DATA/ADDR dump is not hash UART or nandrecovery'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_txfifo_speed_enum' 'USB TxFIFO FULL/SPEED ENUM is USB controller not hash FIFO/enum'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_s19k_hal_extracts_bm1366_body9' 'HAL try_extract_frame at BM1366 body 9'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_constructed_fill_hal_body7_extract_as_share' 'HAL body-7 extract of fill nonce is not a share'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_cortex_exception' 'USB Cortex-M EXCEPTION dump is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_s19k_body7_two_frame_extract_as_shares' 'body-7 two-frame extract is not dual shares'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_task_table' 'USB EC Task Ready/__wait_evt is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_s19k_body7_residue_then_body9_recovers_next' 'body-7 residue then body-9 recovers next frame'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_mutex_svc' 'USB EC mutex_lock/svc_handler is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_s19k_hal_midstream_body7_then_body9' 'HAL RxBuffer mid-stream body-7 then body-9 recovery'
+require_pattern 'dcentrald/dcentrald-hal/src/serial_chain.rs' 'rx_buffer_body7_then_body9_recovers_next' 'HAL RxBuffer body-7 then body-9 recovers next frame'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_task_set_stack' 'USB EC task_set_event/Stack overflow is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_idle' 'USB EC tasks_ready/<< idle >> is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_requires_body9_before_first_read' 'Track-1 require_bm1366_response_body before first read'
+require_pattern 'dcentrald/dcentrald-hal/src/serial_chain.rs' 'fn require_bm1366_response_body' 'HAL require_bm1366_response_body fail-closes DEFAULT 7'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'require_bm1366_response_body' 'production Track-1 requires body 9 before drain/GetAddress'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_hooks_timer' 'USB EC HOOKS/TIMERTASK is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1366_requires_body9_before_flush' 'init_bm1366_chain require body 9 before flush'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'set_response_len(BM1366_UART_RESP_BODY_LEN)' 'init_bm1366_chain sets BM1366 body 9 not generic alias'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_mailbox' 'USB EC LOWMAILBOX/HIGHMAILBOX is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_nopic_observation_refuses_bm1366' 'NoPic observation refuses BM1366 identity'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_hotstart_baud_requires_body9_before_spray' 'hot-start baud-wake requires body 9 before spray'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_sec_userlow' 'USB EC SECMAILBOX/USERLOWTASK is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_hybrid_reset_is_not_bm1366' 'AM2 hybrid reset is Zynq BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_reset_baseline_is_not_bm1366' 'AM2 reset-baseline is BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am3_bb_open_is_not_bm1366' 'am3-bb open is BeagleBone not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_user_high_secure' 'USB EC USERHIGHTASK/USERSECURETASK is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1398_is_not_bm1366' 'init_bm1398_chain is BM1398 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_timer_efuse' 'USB EC TIMERFORADCTASK/empty-chip efuse is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_empty_efuse_as_otp_decrypt' 'USB empty-chip efuse is not ENC-item decrypt'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_es_chip_dvfs' 'USB This is ES chip / is_set_dvfs_vol_first is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_companion_open_is_not_bm1366' 'AM2 companion UART is Zynq BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_phase3b1_relay_is_not_bm1366' 'AM2 Phase 3b1-relay is BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_dvfs_freq' 'USB get_init_dvfs/get_dvfs/freq_to_idx is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_freq_to_idx_as_hash_pll' 'USB freq_to_idx is not hash PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_probe_uart_is_not_bm1366' 'AM2 probe_uart_for_chips is BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_dvfs_sys_pll' 'USB set_dvfs_info/use_sys_pll is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_use_sys_pll_as_hash_pll' 'USB use_sys_pll is not hash PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_init_asic_open_is_not_bm1366' 'AM2 init_asic_chain primary open is BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_fix_clk_pll_lock' 'USB use_fix_clk / sys pll lock done is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_sys_pll_lock_as_hash_pll' 'USB sys pll lock done is not hash PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_passthrough0_is_not_bm1366' 'AM2 hybrid open_passthrough(0) is BM1362 not S19k first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_dvfs_thermal' 'USB set_dvfs/cpu clk suspend/aml_thermal is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_aml_thermal_as_hash_thermal' 'USB aml_thermal is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_cpu_clk_suspend_as_hash_pll' 'USB cpu clk suspend is not hash PLL'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_bl30_jtag_efuse' 'USB cpu clk resume / bl30:thermal / JTAG / efuse is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_thermal_as_hash_thermal' 'USB bl30:thermal is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_efuse_pw_en_as_otp_decrypt' 'USB efuse_pw_en is not ENC decrypt'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_dvfstbl_jtag_trim' 'USB high_task_init_dvfstbl / disable M3 JTAG / efuse-disabled / bl30 thermal trim is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_efuse_bits_disabled_as_otp_decrypt' 'USB WARNING efuse bits is not ENC decrypt'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_thermal_trim_as_hash_thermal' 'USB bl30:thermal disable trim is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_a53_gxl_thermal' 'USB disable A53 JTAG / Enable M3 JTAG / bl30:thermal_calib / GXL ES thermal is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_thermal_calib_as_hash_thermal' 'USB bl30:thermal_calib is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_gxl_es_thermal_as_miner_identity' 'USB GXL ES thermal is not S19k identity'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_a53_ao_untrimmed' 'USB Enable A53 JTAG / to AO / bl30 ERROR thermal_calib / untrimmed thermal is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_thermal_calib_err_as_hash_thermal' 'USB bl30:ERROR thermal_calib is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_untrimmed_as_hash_thermal' 'USB untrimmed thermal is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ee_pw_axg' 'USB to EE / Incorrect password / thermal_calibration_data / axg ver is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_incorrect_password_as_miner_auth' 'USB Incorrect password is not miner auth'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_axg_ver_as_miner_identity' 'USB bl30:axg ver is not S19k identity'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_invalid_try_thermal0' 'USB Invalid input / Please try again / axg thermal0 / thermal init err is not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_invalid_input_as_miner_auth' 'USB Invalid input is not miner auth'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_bl30_thermal_init_err_as_hash_thermal' 'USB bl30:thermal init err is not hashboard thermal'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1368_is_not_bm1366' 'init_bm1368_chain is not S19k Track-1 first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1370_is_not_bm1366' 'init_bm1370_chain is not S19k Track-1 first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1362_is_not_bm1366' 'init_bm1362_chain is not S19k Track-1 first-read'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'S19K_FACTORY_BOOT_RAMDISK_SIZE' 'factory item 9 ramdisk is 0x686800 not 20231108 0x66A000'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_20231108_ramdisk_as_factory_boot' '20231108 ramdisk is not factory item 9'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_factory_android_second_layout' 'factory ANDROID second starts at 12875776'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_78_mtd3_is_ubi_stock_config' 'mtd3_stock_config.bin is UBI not updateporc'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_mtd3_as_updateporc_source' 'mtd3 has 0 updateporc bytes'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_mtd3_as_fileparser_source' 'mtd3 has 0 FileParser bytes'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_mtd3_as_uart_trans_source' 'mtd3 has 0 uart_trans bytes'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_20231108_miner_pem' '20231108 miner.pem is 451 B BEGIN PUBLIC KEY'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_held_root_does_not_verify_pem_sig' 'held bitmain.pub does not verify 20231108 miner.pem.sig'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_unverified_pem_sig_as_nand_grant' 'unverified pem.sig is not a nandwrite grant'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'HELD_FILEPARSER_SHA256_INIT' 'FileParser imports SHA256_Init'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 's19k_fill_lookup_tx' 'fill hunt identity-first then job|small_core overlay'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'S19K_CONSTRUCTED_FILL_WORK10_CORE2_BODY' 'constructed fill work 0x10 | core 2 fixture'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_s19k_fill_overlay_f8_as_fun_0091c0a0' 'fill overlay id&0xF8 is not FUN_0091c0a0'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 's19k_fill_lookup_tx_esp_overlay_experimental' 'ESP overlay fill lookup is experimental not production'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1366_omits_esp_a4' 'init_bm1366_chain omits ESP 0xA4 VersionMask'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_bm1366_queue_covers_fill_slots' 'BM1366 UART queue must cover 256 fill slots'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'BM1366_SERIAL_WORK_QUEUE_DEPTH' 'S19k BM1366 work queue is 256 not default 16'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_track1_thermal_handoff_unowned' 'Track-1 thermal is HandoffUnowned not Ready'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'ThermalSafetyState::HandoffUnowned' 'Track-1 sets HandoffUnowned'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'let tx_before_rx = is_bm1362 || is_bm1366' 'BM1366 TX-before-RX'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'DCENT_S19K_EXPERIMENTAL_INIT_BM1366' 'leftover init_bm1366_chain is env-gated'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs' 's19k_multi_send_work_tx_required' 'Multi send_work TX is required only on ttyS1+ttyS2'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs' 'refuse_s3_rx_as_fill_hunt' 'ttyS3 RX is observe-only not fill-hunt'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'refuse_s3_rx_as_fill_hunt' 'Track-1 fill hunt skips discover ttyS3'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 's19k_multi_send_work_tx_required' 'Track-1 Multi send_work skips discover/optional UARTs'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'refuse_chip_heard_at_115200_as_restored_3m_work_tx' 'ChipHeardAt115200 is not restored-3M work TX'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'admit_s19k_dual_baud_work_tx_for_path' 'dual-baud work-TX admit skips discover ttyS3'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'refuse_silence_at_both_bauds_as_chip_proof_3m_tx' 'SilenceAtBothBauds is handoff probe not chip-proof 3M TX'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'HandoffProbe is not ChipProofAt3M' 'Track-1 logs SilenceAtBothBauds as handoff probe'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'refuse_retry_not_run_or_inconclusive_as_chip_proof_3m_tx' 'RetryNotRun/Inconclusive is not chip-proof 3M TX'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'InconclusiveProbe is not ChipProofAt3M' 'Track-1 logs RetryNotRun as inconclusive probe'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs' 'refuse_s19k_fastuart_28_write_as_leave_115200' 'held FastUART 0x28 encodings are not leave-115200 to Track-1 3M'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs' 'ESP_BM1366_MISCCTRL_DEFAULT_BAUD_VALUE' 'ESP default ~115200 is MiscCtrl 0x18 not FastUART 0x28'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'S19K_78_MTD2_ANDROID2_RAMDISK_SIZE' 'mtd2 second ANDROID ramdisk is 0x662000'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_mtd2_as_fileparser_source' 'mtd2 has 0 FileParser bytes'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'Mtd2Android1' 'mtd2 A1 AMLSECU 20211119 is not factory/20231108'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_78_mtd2_kernels_identical' 'mtd2 A1/A2 share one kernel'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_amlsecu_kind_matches_ramdisk' 'AMLSECU kind 2 ramdisk 0 / kind 3 ramdisk present'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_recovery_as_mtd2_a1' 'factory recovery is not mtd2 A1'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_recovery_item_as_78_bos_mtd3' 'factory recovery does not fit .78 BOS mtd3'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_factory_recovery_overflows_78_mtd3' 'factory recovery 6064640 overflows BOS mtd3 5242880'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_pack_as_s30v_restock' 'factory SD is not a full s30v restock'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'S19K_FACTORY_RESTOCK_MISSING' 'factory pack missing config/misc/nvdata/tpl'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_boot_item_as_78_mtd2_nandwrite' 'factory boot size-fit is not BOS mtd2 nandwrite'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_factory_boot_recovery_kernels_identical' 'factory boot/recovery share one kernel'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_recovery_second_as_meson1_enc' 'factory recovery second is not meson1_ENC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_78_mtd3_ubi_volume_name' 'mtd3 UBI volume is config_data'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_upgrade_cgi_as_updateporc_script' 'upgrade.cgi is not updateporc.sh'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_78_mtd3_vtbl_copies_identical' 'mtd3 UBI vtbl PEB3 and PEB4 copies are identical'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_upgrade_clear_as_updateporc_script' 'upgrade_clear.cgi is not updateporc.sh'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'admit_s19k_78_recover_erases_nvdata_after_recover_env' 'recover_to_stock recover_env before erase.part nvdata'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'refuse_s19k_erase_nvdata_before_recover_env' 'erase.part nvdata is not a BOS mtd name'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'admit_s19k_78_recover_env_default_before_import' 'recover_env default -a before import'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'refuse_s19k_env_default_a_as_recover_env' 'env default -a is not recover_env'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'admit_s19k_78_recover_env_import_flags' 'env import -d delete / -c CRC'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_nand_env.rs' 'refuse_s19k_dry_run_as_env_import_dash_d' 'DCENT dry-run is not U-Boot -d'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_gpio437.rs' 'admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu' 'HB reset 454/455/456 ganged after PSU'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_gpio437.rs' 'refuse_s19k_78_first_psu_engage_as_hb_reset_released' 'first GPIO437=0 is not reset released'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'refuse_s19k_rxbuf_leftover_aa_plus_tx55_as_jobnonce' 'leftover AA + TX 55 AA is not JobNonce'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'flush leftover RX after empty GetAddress' 'Track-1 flush leftover after empty GetAddress'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'flush leftover RX after empty FastUART' 'Track-1 flush leftover after empty FastUART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_s97_nanddump_02_before_write_03' 'S97 nanddump-compare 0x02 before write 0x03'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_s99_header_names_recover_to_stock' 'S99 leftover 0x02 is recover_to_stock not mtd2'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_s99_wal_block_leaves_flag_02' 'S99 WAL-block leaves flag 0x02 recover_to_stock'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_s99_identity_wal_does_not_block_03' 'S19k WAL failure must not block 0x03'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s21_s97_identical_to_78' 'held S21 S97 matches .78 S97'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s21_held_s97_as_firstboot_bootcmd' 'S21 S97 is not firstboot bootcmd'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'admit_s21_held_uart_chip_id_is_1368_not_1366' 'S21 UART capture is 0x1368 not 0x1366'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'refuse_s21_held_uart_capture_as_s19k_jobnonce' 'S21 UART capture is not S19k JobNonce'
+require_pattern 'br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade' 's19k_firstboot_is_wal_companion_only' 'S19k firstboot WAL is companion-only'
+require_pattern 'br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade' 'next reboot is recover_to_stock' 'S99 WAL-block names recover_to_stock'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'flush leftover RX after empty 115200-retry GetAddress' 'Track-1 flush leftover after empty 115200-retry'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'flush leftover RX after empty FastUART-at-115200' 'Track-1 flush leftover after empty FastUART-at-115200'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_upgrade_usb_ddr_item' 'S19k USB/DDR item 0 admit'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_upgrade_usb_uboot_enc_item' 'S19k USB/UBOOT_ENC item 3 admit'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_encrypt_reg_as_otp_decrypt_key' 'Encrypt_reg 0xff800228 is not ENC decrypt key'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_ini_erase_bootloader_as_execute' 'embedded ini erase_bootloader is not --execute'
+require_pattern 'dcentrald/dcentrald-hal/src/serial_chain.rs' 'rx_buffer_extracts_complete_bm1366_frame' 'HAL RxBuffer extracts 11-byte BM1366 wire at body 9'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_s19k_generic_passthrough0_as_track1' 'generic open_passthrough(0) is not S19k Track-1'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_refuses_generic_passthrough_for_bm1366' 'generic passthrough arm refuses BM1366 open_passthrough(0)'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'not generic open_passthrough(0)' 'S19k BM1366 cannot fall into generic passthrough(0)'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_gpioao3_offset' 'USB UBOOT GPIOAO_3 offset pin'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_scpi_ddr_gcm' 'USB post-45000 is BL30 SCPI/DDR/GCM not hash UART'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'refuse_s19k_usb_gcm_tag_as_android_decrypt' 'USB GCM Tag mismatch is not ANDROID decrypt'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_upgrade_usb_uboot_item' 'S19k USB UBOOT item 2 admit'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_aml_upgrade_meson1_item' 'S19k meson1 gzip item 14 admit'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'parse_s19k_android_amlsecu_stamp_raw' 'S19k AMLSECU stamp raw parser'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_factory_android_recovery_header' 'S19k factory recovery ramdisk_size=0'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'admit_s19k_factory_android_ramdisk_not_gzip' 'S19k factory boot ramdisk is not gzip'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_factory_android_as_s30v_full_slot' 'factory ANDROID item is not full s30v slot'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs' 'FastUart28HeardAt115200' '115200 FastUART 0x28 reply is not ChipHeardAt115200'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_wire_b.rs' 'pack_read_register_bcast_uart' 'broadcast read_register packer exists'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' '--dry-run' 'amlogic recover-to-stock accepts --dry-run'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'RECOVER_WALK.txt' 'amlogic recover-to-stock writes RECOVER_WALK'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 's19k_nand_env_crc.py' 'amlogic recover-to-stock CRC-admits nandrecovery_env.bin'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'nand_env.bak is not recover_env' 'amlogic recover-to-stock refuses nand_env.bak as recover_env'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic recover-to-stock execute refuses NAND while FLASH-false'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'missing live /etc/dcentos/board_target' 'amlogic recover-to-stock execute refuses missing live board_target'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'missing live /proc/mtd; refuse geometry-blind recover-to-stock' 'amlogic recover-to-stock execute refuses missing /proc/mtd'
+reject_pattern 'scripts/recover_amlogic_to_stock.sh' 'fw_setenv firstboot 1' 'amlogic recover-to-stock does not execute fw_setenv firstboot 1'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'schema=dcentos.amlogic-recover-to-stock/v1' 'amlogic persistent installer uses rust recover-to-stock schema'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'RECOVER_EXECUTE_REFUSE.txt' 'amlogic persistent installer writes recover execute refuse'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'recovery-flag 0x01' 'amlogic persistent installer names flag 0x01 as install arm'
+require_pattern 'scripts/install_amlogic_persistent.sh' 's19k_nand_env_crc.py' 'amlogic persistent installer CRC-admits nand_env blobs'
+require_pattern 'scripts/s19k_nand_env_crc.py' 'S19K_NAND_ENV_CRC_OK' 'nand_env CRC helper prints admit sentinel'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 's19k_nand_env_crc.py' 'amlogic restore CRC-admits nandrecovery_env.bin'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic restore execute refuses NAND while FLASH-false'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'missing live /proc/mtd; refuse geometry-blind restore' 'amlogic restore execute refuses missing /proc/mtd'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'nandrecovery_env.bin CRC32 mismatch' 'amlogic restore refuses sidecar CRC mismatch'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'recover_env_source=nandrecovery_env.bin' 'amlogic restore recover source is nandrecovery sidecar'
+reject_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'recover_env_source=nand_env.bak' 'amlogic restore does not import nand_env.bak'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'dcent_am3_extract_nandrecovery_env' 'amlogic restore slices nandrecovery_env from mtd5'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'nandrecovery_env.bin does not match mtd5 slice' 'amlogic restore refuses bak-copied sidecar'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'nandrecovery_env_matches_mtd5_slice=true' 'amlogic restore emits sidecar-slice match'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'missing nandrecovery_env_sha256' 'amlogic restore refuses missing sidecar SHA'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'nandrecovery_env.bin sha256 drift' 'amlogic restore refuses sidecar SHA drift'
+require_pattern 'scripts/restore_amlogic_mtd5_from_backup.sh' 'nandrecovery_env_sha256_ok=true' 'amlogic restore emits sidecar SHA ok'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'INSTALL_PAYLOAD_PLAN.txt' 'amlogic persistent installer writes root-window-only payload plan'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'schema=dcentos.amlogic-install-commit/v1' 'recovery-flag helper emits 0x01 InstallArm rust commit schema'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'uboot_action=FirstBosThenSetFlag2' 'recovery-flag helper 0x01 names FirstBosThenSetFlag2'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' "printf '\\001'" 'recovery-flag helper fixture writes 0x01'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'recovery flag 0x01 execute is FLASH NOT_YET' 'recovery-flag helper refuses 0x01 NAND execute'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'rewrite_recovery_flag_fixture()' 'recovery-flag helper shares one fixture rewrite'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'schema=dcentos.amlogic-successful-flag/v1' 'recovery-flag helper emits 0x03 SuccessfulKeepBos plan'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' "printf '\\003'" 'recovery-flag helper fixture writes 0x03'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'fixture_value=0x03' 'recovery-flag helper tags 0x03 fixture rewrite'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'SuccessfulKeepBos plan/fixture only' 'recovery-flag helper refuses 0x03 NAND execute'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'SUCCESSFUL_FLAG_PLAN' 'recovery-flag helper names SUCCESSFUL_FLAG_PLAN'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'recovery-flag execute refuses NAND while FLASH-false'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'missing live /etc/dcentos/board_target' 'recovery-flag execute refuses missing live board_target'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'mining services were not stopped' 'amlogic persistent installer dry-run does not stop mining services'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'after confirmation, graceful TERM' 'amlogic persistent installer stops services only after confirmation'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'Step 8/10: flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT' 'amlogic persistent installer reports variable-driven flash geometry'
 reject_pattern 'scripts/install_amlogic_persistent.sh' 'flash_erase /dev/mtd5 0x05700000 320' 'amlogic persistent installer does not hardcode flash geometry in operator output'
 require_pattern 'scripts/install_amlogic_persistent.sh' '. "$SCRIPT_DIR/lib/am3_geometry.sh"' 'amlogic persistent installer sources shared am3 geometry'
+require_pattern 'scripts/install_amlogic_persistent.sh' '. "$SCRIPT_DIR/lib/amlogic_identity_guard.sh"' 'amlogic persistent installer sources exact sibling guard'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'dcent_amlogic_sibling_rejection "$variant" "$normalized" "$identity_lower"' 'amlogic persistent installer applies exact sibling guard before positive identity matching'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'dcent_amlogic_identity_record_admit "$variant" "$identity"' 'amlogic persistent installer requires the tested positive identity-record gate'
+require_pattern 'scripts/lib/amlogic_identity_guard.sh' 'exact compatible PCB observation is missing' 'amlogic identity guard fails closed without direct compatible PCB evidence'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' '. "$SCRIPT_DIR/lib/am3_geometry.sh"' 'amlogic lab rootfs sources shared am3 geometry'
 require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' '. "$SCRIPT_DIR/lib/am3_geometry.sh"' 'am3 s19k revert sources shared am3 geometry'
 require_pattern 'scripts/revert_to_stock_am3_aml_s21.sh' '. "$SCRIPT_DIR/lib/am3_geometry.sh"' 'am3 s21 revert sources shared am3 geometry'
-require_pattern 'scripts/lib/am3_geometry.sh' 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05700000}"' 'shared am3 geometry pins rootfs offset'
+require_pattern 'scripts/lib/am3_geometry.sh' 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05100000}"' 'shared am3 geometry pins rootfs offset'
 require_pattern 'scripts/lib/am3_geometry.sh' 'DCENT_AM3_ROOTFS_WINDOW_HEX="${DCENT_AM3_ROOTFS_WINDOW_HEX:-0x02800000}"' 'shared am3 geometry pins rootfs window'
 require_pattern 'dcentrald/dcentrald-api/src/routes/restore_to_stock.rs' '.arg(&post_dwell_fp.sha256)' 'restore route passes post-dwell SHA into revert helper'
 require_pattern 'br2_external_dcentos/board/zynq/am2-s19jpro/post-build.sh' 'revert_to_stock_s19_am2.sh' 'am2 post-build ships profile revert helper'
@@ -1570,6 +1909,12 @@ require_pattern 'scripts/amlogic_lab_rootfs.sh' 'readback_manifest.json' 'amlogi
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'Restore upload SHA mismatch' 'amlogic lab rootfs verifies restore upload before flash'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'RESTORE_REMOTE_READBACK_SHA' 'amlogic lab rootfs verifies restore readback on target'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'restore_manifest.json' 'amlogic lab rootfs writes restore proof manifest'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'require_gpio437_safe_off_before_mutation' 'amlogic lab rootfs requires GPIO437 SafeOff before write/restore mutation'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic lab rootfs refuses NAND while FLASH-false'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' '--lab-only is not a FLASH override' 'amlogic lab rootfs lab flags do not override FLASH'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'am3-s19k-active-low' 'amlogic lab rootfs SKU-scopes S19k GPIO437 SafeOff=1'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'GPIO437 PWR_EN SafeOff (polarity=' 'amlogic lab rootfs documents SKU-scoped GPIO437 SafeOff before NAND mutation'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'refusing NAND mutation' 'amlogic lab rootfs refuses NAND mutation when GPIO437 SafeOff fails'
 reject_pattern 'scripts/build_rootfs_s21.sh' 'flash_erase /dev/mtd5' 'legacy S21 rootfs builder does not print raw mtd5 erase commands'
 reject_pattern 'scripts/build_rootfs_s21.sh' 'nandwrite -p -s $ROOTFS_OFFSET_HEX /dev/mtd5' 'legacy S21 rootfs builder does not print raw mtd5 write commands'
 reject_pattern 'scripts/build_rootfs_s21.sh' '0x5100000' 'legacy S21 rootfs builder does not carry stale am3 rootfs offset'
@@ -2028,6 +2373,7 @@ am2-s19jpro|br2_external_dcentos/configs/dcentos_am2_s19jpro_defconfig|output/dc
 am2-s19pro|br2_external_dcentos/configs/dcentos_am2_s19pro_defconfig|output/dcentos-sysupgrade-am2-s19pro.tar
 am2-s17pro|br2_external_dcentos/configs/dcentos_am2_s17pro_zynq_defconfig|output/dcentos-sysupgrade-am2-s17pro.tar
 am3-s19kpro|br2_external_dcentos/configs/dcentos_am3_s19kpro_defconfig|output/dcentos-sysupgrade-am3-s19kpro.tar
+am3-s19xp|br2_external_dcentos/configs/dcentos_am3_s19xp_defconfig|output/dcentos-sysupgrade-am3-s19xp.tar
 am3-s21|br2_external_dcentos/configs/dcentos_am3_s21_defconfig|output/dcentos-sysupgrade-am3-s21.tar
 am3-s21pro|br2_external_dcentos/configs/dcentos_am3_s21pro_defconfig|output/dcentos-sysupgrade-am3-s21pro.tar
 am3-s21xp|br2_external_dcentos/configs/dcentos_am3_s21xp_defconfig|output/dcentos-sysupgrade-am3-s21xp.tar
@@ -3215,7 +3561,8 @@ scaffold_driver_fail_closed_check() {
     # future live-bring-up path — DO NOT remove without wiring it in Rust).
     required_gate='DCENT_CONFIRM_SCAFFOLD_ON_LIVE_HW'
     for f in dcentrald/dcentrald-asic/src/drivers/bm1373.rs \
-             dcentrald/dcentrald-asic/src/drivers/bm1489.rs; do
+             dcentrald/dcentrald-asic/src/drivers/bm1489.rs \
+             dcentrald/dcentrald-asic/src/drivers/bm1491.rs; do
         if [ ! -f "$f" ]; then
             fail "RE-007 scaffold-fail-closed: missing $f (path drift?)"
             continue
@@ -3729,6 +4076,18 @@ commit_authority_normalization_check() {
         "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade keeps the mtd5 recovery-flag commit (commit_recovery_flag)"
     require_pattern "$aml_s99up" '!= "0x03"' \
         "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade fails closed on a 0x03 recovery-flag readback mismatch"
+    require_pattern "$aml_s99up" 'require_amlogic_ota08_identity' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade scopes OTA-08 to sealed board_target"
+    require_pattern "$aml_s99up" 'OLD=$(read_recovery_flag)' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade pre-reads 0x02 before flash_erase"
+    require_pattern "$aml_s99up" 'ERROR: recovery flag readback' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade post-write mismatch is ERROR"
+    require_pattern "$aml_s99up" 'ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade leftover 0x01 is ERROR not WARN"
+    require_pattern "$aml_s99up" 'ERROR: could not read recovery flag' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade unread flag is ERROR not WARN"
+    require_pattern "$aml_s99up" 'ERROR: unexpected recovery flag value' \
+        "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade unexpected flag is ERROR not WARN"
     require_pattern "$aml_s99up" 'replay_pending_env_clear' \
         "$tag AMLOGIC-FAIL-CLOSED: amlogic S99upgrade keeps the WAL replay_pending_env_clear path"
     # The fw_setenv-missing `return 1` must live INSIDE clear_uboot_env (scan from
@@ -4307,7 +4666,7 @@ accept_harness_check() {
 
     if [ -f "$base/skus.conf" ]; then
         missing=''
-        for want in S9 S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19jProBB S19kPro T19 S19XP S21 T21 S21Pro S21XP; do
+        for want in S9 S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19jProBB S19kPro T19 S19XP S19jXP S21 T21 S21Pro S21XP; do
             if ! grep -qE "^$want\|" "$base/skus.conf"; then
                 missing="$missing $want"
             fi
@@ -4315,7 +4674,7 @@ accept_harness_check() {
         if [ -n "$missing" ]; then
             fail "hw-acceptance: skus.conf is missing target SKU row(s):$missing (target-set drift)"
         else
-            pass "hw-acceptance: skus.conf lists all 21 target SKU rows"
+            pass "hw-acceptance: skus.conf lists all 22 target SKU rows"
         fi
     fi
     require_pattern "$base/lib/accept_parse.sh" 'AM3_BB_ENUMERATION_RECEIPT schema=v1' \
@@ -6101,6 +6460,15 @@ sim_hal_evidence_contract_gates() {
         'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_nonce2_beta_suppresses_every_uncorrelated_pool_submission --locked -p dcentrald --bin dcentrald' \
         'CI: stock nonce2 beta suppresses every uncorrelated pool submission'
     require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_pool_route_and_job_domain_refuse_sv2_standard_before_work --locked -p dcentrald --bin dcentrald' \
+        'CI: stock pool route and job domain refuse SV2 standard before work'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_v1_route_refusal_precedes_all_device_access --locked -p dcentrald --bin dcentrald' \
+        'CI: stock V1 route refusal precedes all device access'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::retained_live_receipt_is_revalidated_before_any_device_access --locked -p dcentrald --bin dcentrald' \
+        'CI: stock retained live receipt is revalidated before any device access'
+    require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh stock_mining::work_dispatch_admission_tests::stock_watchdog_state_maps_config_and_kicker_presence --locked -p dcentrald --bin dcentrald' \
         'CI: stock work-dispatch maps watchdog/kicker states'
     require_pattern "$sim_workflow" \
@@ -6345,6 +6713,18 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_share_fixture_keeps_target_and_achieved_difficulty_separate --locked -p dcentrald --bin dcentrald' \
         'CI: serial share fixture keeps target and achieved difficulty separate'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::industrial_serial_pll_policy_is_exact_route_bound_and_fail_closed --locked -p dcentrald --bin dcentrald' \
+        'CI: industrial serial PLL policy is exact-route-bound and fail-closed'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::industrial_serial_pll_searches_enforce_vendor_vco_envelope --locked -p dcentrald --bin dcentrald' \
+        'CI: industrial serial PLL searches enforce vendor VCO envelope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_braiins_bm1366_passthrough_opens_both_ttys --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Braiins BM1366 passthrough opens both ttys'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_braiins_bm1366_passthrough_uses_closed_21_36_builder --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Braiins BM1366 passthrough uses closed 21 36 builder'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_thermal_selection_preserves_effective_source_provenance --locked -p dcentrald --bin dcentrald' \
         'CI: hybrid am2 thermal selection preserves effective source provenance'
@@ -6833,6 +7213,67 @@ if sh scripts/test_zynq_sysupgrade_geometry.sh >/dev/null 2>&1 &&
     pass 'Zynq payload geometry: canonical boundaries and producer/consumer wiring are enforced'
 else
     fail 'Zynq payload geometry: canonical boundaries or producer/consumer wiring regressed'
+fi
+
+require_file 'scripts/test_am2_xilinx_legacy_ramdisk.py'
+require_file 'scripts/test_am2_xilinx_preinit_safety.py'
+require_file 'scripts/test_am2_s19jpro_sd_builder_hardening.py'
+require_file 'scripts/test_amlogic_exact_build_inputs.sh'
+require_file 'scripts/test_amlogic_native_package_targets.py'
+require_file 'scripts/test_pre_flash_validate_amlogic_profiles.sh'
+require_file 'scripts/test_bcb100_offline_boot_inputs.py'
+require_file 'scripts/test_sd_boot_media_manifest.py'
+require_file 'scripts/test_sd_common_output_safety.py'
+require_file 'scripts/test_zynq_external_media_ephemeral_policy.sh'
+if run_python_script scripts/test_am2_xilinx_legacy_ramdisk.py -q >/dev/null 2>&1; then
+    pass 'AM2 external media: deterministic ramdisk, init filtering, and output containment are pinned'
+else
+    fail 'AM2 external media: ramdisk producer or init-surface containment regressed'
+fi
+if run_python_script scripts/test_am2_xilinx_preinit_safety.py -q >/dev/null 2>&1; then
+    pass 'AM2 external pre-init: exact donor handoff and resident-chain blockers are pinned'
+else
+    fail 'AM2 external pre-init: donor handoff or resident-chain safety analysis regressed'
+fi
+if run_python_script scripts/test_am2_s19jpro_sd_builder_hardening.py -q >/dev/null 2>&1; then
+    pass 'AM2 S19j Pro media: target-bound staging, input admission, and fresh-output semantics are pinned'
+else
+    fail 'AM2 S19j Pro media: builder input or output hardening regressed'
+fi
+if sh scripts/test_amlogic_exact_build_inputs.sh >/dev/null 2>&1; then
+    pass 'Amlogic build inputs: exact model-bound kernel, DTB, and firmware identity are pinned'
+else
+    fail 'Amlogic build inputs: model-bound source closure or consumer routing regressed'
+fi
+if sh scripts/test_pre_flash_validate_amlogic_profiles.sh >/dev/null 2>&1; then
+    pass 'Amlogic package profiles: every native target validates and extracts under its exact package identity'
+else
+    fail 'Amlogic package profiles: validation, extraction, or unknown-target refusal regressed'
+fi
+if run_python_script scripts/test_amlogic_native_package_targets.py -q >/dev/null 2>&1; then
+    pass 'Amlogic native targets: package identities and exact extractor variants are pinned'
+else
+    fail 'Amlogic native targets: package identity or extractor routing regressed'
+fi
+if run_python_script scripts/test_bcb100_offline_boot_inputs.py -q >/dev/null 2>&1; then
+    pass 'BCB100 offline boot inputs: held declarations, absent dependencies, and denied write authority are pinned'
+else
+    fail 'BCB100 offline boot inputs: evidence identity or denied-authority contract regressed'
+fi
+if run_python_script scripts/test_sd_boot_media_manifest.py -q >/dev/null 2>&1; then
+    pass 'SD media manifest: target binding, source identity, and output-collision guards are pinned'
+else
+    fail 'SD media manifest: identity or source-survival guarantees regressed'
+fi
+if run_python_script scripts/test_sd_common_output_safety.py -q >/dev/null 2>&1; then
+    pass 'SD output safety: namespace, alias, and exclusive-publication guards are pinned'
+else
+    fail 'SD output safety: namespace or collision containment regressed'
+fi
+if sh scripts/test_zynq_external_media_ephemeral_policy.sh >/dev/null 2>&1; then
+    pass 'AM2 external runtime: identity, volatile root, and hardware-write suppression are pinned'
+else
+    fail 'AM2 external runtime: ephemeral or hardware-write policy regressed'
 fi
 
 # Anti-orphan meta-gate. Raw basename grep is forbidden: comments,

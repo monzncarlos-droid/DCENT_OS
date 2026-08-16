@@ -108,6 +108,57 @@ pub enum FanVariant {
     Am2Uio16,
 }
 
+/// Source evidence ceiling for one [`FanVariant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanVariantCapabilityState {
+    /// Source/held-artifact register geometry with an explicitly partial tach
+    /// topology; no live matrix-wide proof.
+    SourceImplementedPartialTach,
+    /// Register behavior was observed on one exact live AM2 unit, but the
+    /// variant identity is still not loaded-bitstream or model-wide authority.
+    LiveObservedModelScoped,
+}
+
+/// Exact, non-authorizing capability record for a fan-control variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanVariantCapability {
+    pub variant: FanVariant,
+    pub state: FanVariantCapabilityState,
+    pub evidence: &'static str,
+    pub live_register_observation: bool,
+    pub runtime_api_implemented: bool,
+    pub pwm_write_api_implemented: bool,
+    pub loaded_bitstream_verified: bool,
+    pub catalog_runtime_admission_authorized: bool,
+    pub catalog_pwm_mutation_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for the two public fan variants.
+pub const FAN_VARIANT_CAPABILITIES: &[FanVariantCapability] = &[
+    FanVariantCapability {
+        variant: FanVariant::Am1S9,
+        state: FanVariantCapabilityState::SourceImplementedPartialTach,
+        evidence: "held S9 fan-control source; physical fan 0 tach unwired",
+        live_register_observation: false,
+        runtime_api_implemented: true,
+        pwm_write_api_implemented: true,
+        loaded_bitstream_verified: false,
+        catalog_runtime_admission_authorized: false,
+        catalog_pwm_mutation_authorized: false,
+    },
+    FanVariantCapability {
+        variant: FanVariant::Am2Uio16,
+        state: FanVariantCapabilityState::LiveObservedModelScoped,
+        evidence: "exact .25 AM2 register observation plus held bosminer semantics",
+        live_register_observation: true,
+        runtime_api_implemented: true,
+        pwm_write_api_implemented: true,
+        loaded_bitstream_verified: false,
+        catalog_runtime_admission_authorized: false,
+        catalog_pwm_mutation_authorized: false,
+    },
+];
+
 /// Policy for the optional AM2 `board-control +0x04` C49 -> C52 write.
 ///
 /// Register layout and board-mode mutation are deliberately independent.
@@ -820,6 +871,22 @@ fn parse_front_fan_offset(raw: &str) -> std::result::Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fan_variant_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        assert_eq!(FAN_VARIANT_CAPABILITIES.len(), 2);
+        assert_eq!(FAN_VARIANT_CAPABILITIES[0].variant, FanVariant::Am1S9);
+        assert_eq!(FAN_VARIANT_CAPABILITIES[1].variant, FanVariant::Am2Uio16);
+        assert!(!FAN_VARIANT_CAPABILITIES[0].live_register_observation);
+        assert!(FAN_VARIANT_CAPABILITIES[1].live_register_observation);
+        for capability in FAN_VARIANT_CAPABILITIES {
+            assert!(capability.runtime_api_implemented);
+            assert!(capability.pwm_write_api_implemented);
+            assert!(!capability.loaded_bitstream_verified);
+            assert!(!capability.catalog_runtime_admission_authorized);
+            assert!(!capability.catalog_pwm_mutation_authorized);
+        }
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Compile-time check that the safety cap is below the IP ceiling.

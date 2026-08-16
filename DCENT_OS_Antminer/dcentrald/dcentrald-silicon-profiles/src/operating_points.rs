@@ -874,49 +874,49 @@ pub const S19J_PRO_PLUS_POINTS: [OperatingPoint; 4] = [
     },
 ];
 
-/// Antminer S19j Pro-A / S19j XP (BHB42801 high-bin, BM1362, 3×88). VNish
-/// §2.4 curve. Requires APW12+. freq/voltage APPROX (chip-core). The >140TH
-/// rows are immersion/OC, NOT air-cooled home territory.
+/// Antminer S19j Pro-A model-level VNish §2.4 power curve. The historical
+/// BHB42801 frequency/voltage and 88-chip geometry binding is retracted, so
+/// these rows deliberately carry no frequency or voltage authority.
 pub const S19J_PRO_A_POINTS: [OperatingPoint; 5] = [
     OperatingPoint {
         label: "VNish low-end 1740W / 65TH (most efficient air point)",
-        frequency_mhz: Some(585), voltage_mv: Some(1600), // chip-core APPROX
+        frequency_mhz: None, voltage_mv: None,
         hashrate_th_per_board: Some(65.0 / 3.0), hashrate_th_per_unit: Some(65.0),
         watts_per_board: Some(1740 / 3), watts_per_unit: Some(1740),
         j_per_th: Some(26.8), confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §2.4 (VNish S19j Pro-A; BHB42801 levels.json band APPROX, chip-CORE; 88 ASIC/chain; APW12+)",
+        source: "POWER_PROFILES_CATALOG.md §2.4 model-level watts/TH only; exact SKU, geometry, frequency, voltage, and PSU binding unresolved",
     },
     OperatingPoint {
         label: "VNish best J/TH 1850W / 76TH",
-        frequency_mhz: Some(615), voltage_mv: Some(1565),
+        frequency_mhz: None, voltage_mv: None,
         hashrate_th_per_board: Some(76.0 / 3.0), hashrate_th_per_unit: Some(76.0),
         watts_per_board: Some(1850 / 3), watts_per_unit: Some(1850),
         j_per_th: Some(24.3), confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §2.4 (24.3 J/TH best in §2.4; freq/voltage APPROX)",
+        source: "POWER_PROFILES_CATALOG.md §2.4 (24.3 J/TH best in §2.4; no model-bound frequency/voltage evidence)",
     },
     OperatingPoint {
         label: "VNish nameplate-class 3080W / 104TH",
-        frequency_mhz: Some(645), voltage_mv: Some(1545),
+        frequency_mhz: None, voltage_mv: None,
         hashrate_th_per_board: Some(104.0 / 3.0), hashrate_th_per_unit: Some(104.0),
         watts_per_board: Some(3080 / 3), watts_per_unit: Some(3080),
         j_per_th: Some(29.6), confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §2.4 (freq/voltage APPROX)",
+        source: "POWER_PROFILES_CATALOG.md §2.4 (model-level power point only)",
     },
     OperatingPoint {
-        label: "VNish high OC 4110W / 130TH (APW12+ required)",
-        frequency_mhz: Some(675), voltage_mv: Some(1530),
+        label: "VNish high OC 4110W / 130TH (PSU binding unresolved)",
+        frequency_mhz: None, voltage_mv: None,
         hashrate_th_per_board: Some(130.0 / 3.0), hashrate_th_per_unit: Some(130.0),
         watts_per_board: Some(4110 / 3), watts_per_unit: Some(4110),
         j_per_th: Some(31.6), confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §2.4 (>130TH needs APW12+; freq/voltage APPROX)",
+        source: "POWER_PROFILES_CATALOG.md §2.4 (model-level power point; PSU/frequency/voltage binding unresolved)",
     },
     OperatingPoint {
         label: "VNish extreme/immersion 7164W / 199TH (NOT air-cooled)",
-        frequency_mhz: Some(900), voltage_mv: Some(1600),
+        frequency_mhz: None, voltage_mv: None,
         hashrate_th_per_board: Some(199.0 / 3.0), hashrate_th_per_unit: Some(199.0),
         watts_per_board: Some(7164 / 3), watts_per_unit: Some(7164),
         j_per_th: Some(36.0), confidence: PointConfidence::Inferred,
-        source: "POWER_PROFILES_CATALOG.md §2.4 top (immersion/hydro OC ONLY; far above air + APW12; freq APPROX)",
+        source: "POWER_PROFILES_CATALOG.md §2.4 top (extreme model-level point; exact cooling/PSU/frequency/voltage binding unresolved)",
     },
 ];
 
@@ -992,7 +992,7 @@ pub const S19K_PRO_POINTS: [OperatingPoint; 11] = [
         source: "POWER_PROFILES_CATALOG.md §2.6 Performance top",
     },
     gap("BHB42701 levels.json Step 0 (chip-core, legacy SKU)", Some(575), Some(1240),
-        " §1.9 BHB42701 levels.json:584. 1240 mV per-CHIP CORE, NOT ~13.9V chain rail. Legacy ID; production S19k Pro is BHB56902 (levels.json GAP). No watts/TH"),
+        " §1.9 BHB42701 levels.json:584. Exact BM1362 preset; marketing model, PSU, cooling, watts, and TH bindings unresolved"),
     gap("BHB42701 levels.json Step 6 (chip-core, lowest)", Some(500), Some(1220),
         " §1.9 BHB42701 levels.json:602. Per-chip-CORE mV. No watts/TH"),
 ];
@@ -1012,8 +1012,8 @@ pub const S19_XP_POINTS: [OperatingPoint; 3] = [
         confidence: PointConfidence::Inferred,
         source: "MINER_PROFILES 0x1366 'S19 XP' (500MHz/12800mV, 140TH spec, ~3010W, ~21.5 J/TH) + HASHBOARD_DIAGNOSTICS §1/§12.1. SPEC not live-measured; 12800 is autotuner nominal not chain rail",
     },
-    gap("BHB42801 levels.json Step 0 (chip-core, shared w/ S19j XP bin)", Some(675), Some(1580),
-        " §1.5 BHB42801 levels.json:61. 1580 mV per-chip-CORE; table shared with higher-clock S19j XP. Treat as factory freq/voltage envelope, NOT the air S19 XP eff point. No watts/TH"),
+    gap("BHB42801 levels.json Step 0 (BM1362 preset; model unresolved)", Some(675), Some(1580),
+        " §1.5 BHB42801 levels.json:61. Exact BM1362 preset only; no marketing-model, cooling, PSU, watts, or TH binding"),
     gap("BHB42801 levels.json eco Step 5 (chip-core)", Some(615), Some(1530),
         " §1.5/§1.8 (615MHz @ 1530mV). Per-chip-CORE. No watts/TH"),
 ];
@@ -1288,10 +1288,9 @@ pub const S17_PLUS: ModelPowerProfile = ModelPowerProfile {
     chip_family: "BM1397",
     chip_id: 0x1397,
     hashboards: 3,
-    chips_per_board: 65, // support-matrix scaffold; live enumerate still pending
-    // Held at 0 by W8-G: BM1397 is 672 cores/chip, but populating it here is a
-    // data addition beyond the 2026-08-03 mapping correction. Follow-up.
-    cores_per_chip: 0,
+    // Bitmain S17+ maintenance guide p.4: 65 BM1397, 13 domains × 5.
+    chips_per_board: crate::bm1397::BM1397_CHIPS_PER_CHAIN_S17_PLUS as u16,
+    cores_per_chip: crate::bm1397::BM1397_CORES_PER_CHIP,
     cooling: Cooling::Air,
     points: &S17_PLUS_POINTS,
 };
@@ -1416,13 +1415,13 @@ pub const S19J_PRO_PLUS: ModelPowerProfile = ModelPowerProfile {
     points: &S19J_PRO_PLUS_POINTS,
 };
 
-/// Antminer S19j Pro-A / S19j XP (BHB42801 high-bin, BM1362). APW12+.
+/// Antminer S19j Pro-A model-level power profile; exact board geometry is unknown.
 pub const S19J_PRO_A: ModelPowerProfile = ModelPowerProfile {
-    model: "Antminer S19j Pro-A / S19j XP",
+    model: "Antminer S19j Pro-A",
     chip_family: "BM1362",
     chip_id: 0x1362,
     hashboards: 3,
-    chips_per_board: 88,
+    chips_per_board: 0,
     cores_per_chip: 65,
     cooling: Cooling::Air,
     points: &S19J_PRO_A_POINTS,

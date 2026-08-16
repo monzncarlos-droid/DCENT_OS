@@ -363,6 +363,8 @@ rm -f "$PAYLOAD_DIR/fpga_bitstream.bit"
 
 write_manifest false experimental "$BOARD" "$BOARD"
 expect_rejection "a signed installable=false bundle"
+sh "$VERIFY" --package-only-noninstallable "$PACKAGE" "$PUBLIC_KEY" "$BOARD" >/dev/null
+echo "PASS: verifier accepts signed installable=false integrity proof only with explicit package-only mode"
 
 sed 's/"installable": false/"installable": "true"/' \
     "$PAYLOAD_DIR/MANIFEST.json" > "$PAYLOAD_DIR/MANIFEST.json.tmp"

@@ -24,6 +24,9 @@ TARGETS=(
     am2-s19pro
     am2-s17pro
     am3-s19kpro
+    am3-s19xp
+    am3-s19jxp
+    am3-s19jproplus
     am3-s21
     am3-s21pro
     am3-s21xp
@@ -38,6 +41,9 @@ declare -A TARBALL_FOR_TARGET=(
     [am2-s19pro]="dcentos-sysupgrade-am2-s19pro.tar"
     [am2-s17pro]="dcentos-sysupgrade-am2-s17pro.tar"
     [am3-s19kpro]="dcentos-sysupgrade-am3-s19kpro.tar"
+    [am3-s19xp]="dcentos-sysupgrade-am3-s19xp.tar"
+    [am3-s19jxp]="dcentos-sysupgrade-am3-s19jxp.tar"
+    [am3-s19jproplus]="dcentos-sysupgrade-am3-s19jproplus.tar"
     [am3-s21]="dcentos-sysupgrade-am3-s21.tar"
     [am3-s21pro]="dcentos-sysupgrade-am3-s21pro.tar"
     [am3-s21xp]="dcentos-sysupgrade-am3-s21xp.tar"

@@ -210,8 +210,64 @@ pub enum ThermalReason {
     HydroFlowLoss,
     /// Working fan count fell below `min_fans`.
     FanPanic,
-    /// Valid sensor count fell below `min_per_board`.
+    /// Valid sensor count fell below its floor — either the PCB tier
+    /// (`min_per_board`) or, when an operator has declared per-chip diodes,
+    /// the chip tier (`min_chip_per_board`).
     SensorFailure,
+}
+
+impl SupervisorAction {
+    /// `true` for the fan-actuator requests (`RequestFansMax` /
+    /// `RequestFansCurve` / `RequestFansMin`) — the runtime analogue of the
+    /// declarative `RaiseFansToCap` / fan-curve rungs. These are the ONLY
+    /// actions [`filter_actions_for_declared_medium`] may remove.
+    pub fn is_fan_request(&self) -> bool {
+        matches!(
+            self,
+            SupervisorAction::RequestFansMax { .. }
+                | SupervisorAction::RequestFansCurve
+                | SupervisorAction::RequestFansMin
+        )
+    }
+
+    /// `true` for the hash-cut / power-cut actions — the safety floor that
+    /// no medium filtering may ever remove.
+    pub fn is_hash_cut(&self) -> bool {
+        matches!(
+            self,
+            SupervisorAction::RequestEmergencyShutdown { .. }
+                | SupervisorAction::RequestBoardPowerOff { .. }
+        )
+    }
+}
+
+/// Filter a supervisor tick's actions for a **declared cooling medium**
+/// (Round-15 A3 cooling-medium axis).
+///
+/// - Declared external-loop medium (`Hydro`/`Immersion` — no fan actuator):
+///   the fan-request actions are removed **entirely** (absent, not rewritten
+///   to PWM 0) — on a fanless board a fan request is a no-op that can stand
+///   in for a real response. Every other action — hash cuts, power-offs,
+///   step-downs, telemetry — passes through untouched, so the escalation
+///   ladder degenerates to exactly "cut hash", never to silence.
+/// - `Some(Air)` or **`None` (undeclared)**: the vector is returned
+///   UNCHANGED (identity) — an air-cooled or undeclared board keeps full fan
+///   management, byte-identical to the pre-axis behaviour.
+///
+/// This is a pure post-filter: the supervisor FSM itself is untouched, and
+/// callers that never invoke this see zero behaviour change.
+pub fn filter_actions_for_declared_medium(
+    declared: Option<dcentrald_common::cooling_medium::CoolingMedium>,
+    actions: Vec<SupervisorAction>,
+) -> Vec<SupervisorAction> {
+    if !dcentrald_common::cooling_medium::fan_bypass_permitted(declared) {
+        // Air or undeclared: identity. Fan management stays active.
+        return actions;
+    }
+    actions
+        .into_iter()
+        .filter(|a| !a.is_fan_request())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +333,21 @@ pub struct ThermalSupervisorConfig {
     /// emits `RequestBoardPowerOff` with `SensorFailure`. RE-005 default 1.
     #[serde(default = "default_min_per_board")]
     pub min_per_board: u8,
+    /// Minimum valid per-chip die sensors per board below which the supervisor
+    /// emits `RequestBoardPowerOff` with `SensorFailure` — the CHIP-tier
+    /// analogue of [`min_per_board`](Self::min_per_board).
+    ///
+    /// **Default 0**, and deliberately NOT clamped to `>= 1` (unlike
+    /// `min_per_board`). Most platforms today expose NO per-chip thermal diodes
+    /// (`BoardSensors::chip_temps_c` is empty on am1/am2/am3), so a floor of 1
+    /// would power off every such board the instant the supervisor was enabled.
+    /// With the default 0 this guard never fires and runtime behaviour is
+    /// byte-identical to the pre-rank-23 tree. Set it `> 0` ONLY on a unit that
+    /// actually carries per-chip diodes, so the chip tier fails closed when
+    /// fewer than the declared count answer — the safety this exists to make
+    /// available BEFORE anyone wires diodes, not after.
+    #[serde(default = "default_min_chip_per_board")]
+    pub min_chip_per_board: u8,
     /// Bad-average threshold (°C). A sensor is dropped if it differs from
     /// peer average by > this for `max_bad_readings` consecutive ticks.
     /// RE-005 default 2.0.
@@ -358,6 +429,7 @@ impl Default for ThermalSupervisorConfig {
             fan_min_pwm: default_fan_min_pwm(),
             min_fans: default_min_fans(),
             min_per_board: default_min_per_board(),
+            min_chip_per_board: default_min_chip_per_board(),
             bad_average_threshold_c: default_bad_avg_thresh(),
             max_bad_readings: default_max_bad_readings(),
             chip_imbalance_threshold_c: default_chip_imbalance_threshold(),
@@ -412,6 +484,14 @@ fn default_min_fans() -> u8 {
 }
 fn default_min_per_board() -> u8 {
     1
+}
+/// CHIP-tier sensor floor. **0** = no per-chip-diode requirement — the state of
+/// every platform that ships no per-chip thermal diodes — so the chip-tier
+/// `SensorFailure` guard stays inert and behaviour is byte-identical to the
+/// pre-rank-23 tree. Intentionally NOT clamped to `>= 1` (unlike
+/// `default_min_per_board`): a legitimate 0 floor means "no requirement".
+fn default_min_chip_per_board() -> u8 {
+    0
 }
 fn default_bad_avg_thresh() -> f32 {
     2.0
@@ -468,7 +548,12 @@ impl SupervisorPlatform {
     /// never default-on.
     pub fn from_board_target(marker: &str) -> Self {
         let m = marker.trim().to_ascii_lowercase();
-        if m.starts_with("am1") || m.contains("s9") {
+        // S9 SE (Ctrl_C43 / BM1393) is not classic S9. Prefix `am1` /
+        // substring `s9` would otherwise inherit Am1S9 tach/FanFailure.
+        let compact = m.replace([' ', '-', '_'], "");
+        if compact.contains("s9se") {
+            SupervisorPlatform::Unknown
+        } else if m.starts_with("am1") || m.contains("s9") {
             SupervisorPlatform::Am1S9
         } else if m.starts_with("am2") || m.contains("zynq") || m.contains("xil") {
             SupervisorPlatform::Am2Zynq
@@ -851,6 +936,32 @@ impl ThermalSupervisor {
                 // A board whose sensors failed is NOT "cool": clear the cool verdict
                 // so the aggregate never emits a fans-min / step-power-UP advisory on
                 // a blind board (the same C35 fail-open class as F-thermal-2/3).
+                max_board_was_cool = false;
+                continue;
+            }
+
+            // Chip-tier sensor failure: too few valid per-chip diodes → power off
+            // this board (rank 23 / H5 G2 — the chip-tier analogue of the PCB
+            // guard above). GATED on `min_chip_per_board > 0`, which is the
+            // default-0 state on every platform that ships no per-chip diodes, so
+            // this block is inert (byte-identical to today) until an operator
+            // declares a chip count for a unit that actually carries diodes.
+            // Deliberately NOT clamped to `>= 1`: a legitimate 0 floor means "no
+            // chip-diode requirement", unlike the PCB floor. `expected=4/covered=1`
+            // ⇒ SensorFailure; `expected=0` ⇒ never fires. `recoverable: false`
+            // because a chip-diode count shortfall is a wiring/hardware condition
+            // that must not silently auto-recover.
+            if self.config.min_chip_per_board > 0
+                && (valid_chip.len() as u8) < self.config.min_chip_per_board
+            {
+                if board.powered_on {
+                    bs.ever_thermal_off = true;
+                    actions.push(SupervisorAction::RequestBoardPowerOff {
+                        chain_id,
+                        reason: ThermalReason::SensorFailure,
+                        recoverable: false,
+                    });
+                }
                 max_board_was_cool = false;
                 continue;
             }
@@ -1340,6 +1451,106 @@ mod tests {
         );
     }
 
+    // -- rank 23 / H5 G2: chip-tier sensor floor (`min_chip_per_board`) --
+
+    /// LOAD-BEARING default. If this ever becomes non-zero, every platform that
+    /// ships no per-chip diodes (am1/am2/am3 today) powers off the instant the
+    /// supervisor is enabled. Mutation guard: flipping the default to 1 fails
+    /// here and in `chip_floor_zero_never_powers_off_a_diodeless_board`.
+    #[test]
+    fn min_chip_per_board_defaults_to_zero() {
+        assert_eq!(ThermalSupervisorConfig::default().min_chip_per_board, 0);
+    }
+
+    /// Default 0 ⇒ byte-identical to the pre-rank-23 tree: a board with valid
+    /// PCB sensors but NO per-chip diodes (the common case) is never powered
+    /// off for the absent chip tier — it reports a cool verdict as before.
+    #[test]
+    fn chip_floor_zero_never_powers_off_a_diodeless_board() {
+        let mut s = ThermalSupervisor::new(cfg_enabled()); // min_chip_per_board = 0
+        let actions = s.tick(&tick(
+            vec![board(0, vec![45.0, 45.0], vec![])],
+            vec![1000],
+            30,
+            5,
+        ));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestBoardPowerOff { .. })),
+            "a diodeless board must NEVER power off while min_chip_per_board=0: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestFansMin)),
+            "a cool diodeless board still reports a cool verdict: {actions:?}"
+        );
+    }
+
+    /// `expected=4/covered=1` ⇒ `SensorFailure`. Once an operator declares four
+    /// per-chip diodes, a board where only one answers fails closed — even
+    /// though PCB sensors and the one live diode are perfectly cool. The
+    /// power-off is `recoverable: false` (a wiring/hardware condition).
+    #[test]
+    fn chip_floor_positive_fires_on_shortfall() {
+        let cfg = ThermalSupervisorConfig {
+            min_chip_per_board: 4,
+            ..cfg_enabled()
+        };
+        let mut s = ThermalSupervisor::new(cfg);
+        // PCB fine (2 >= min_per_board 1); one cool chip diode, all below panic
+        // — the ONLY reason to power off is the chip-count shortfall.
+        let actions = s.tick(&tick(
+            vec![board(0, vec![55.0, 55.0], vec![60.0])],
+            vec![1000],
+            30,
+            5,
+        ));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestBoardPowerOff {
+                    reason: ThermalReason::SensorFailure,
+                    recoverable: false,
+                    ..
+                }
+            )),
+            "1-of-4 declared chip diodes must fail closed (SensorFailure, non-recoverable): {actions:?}"
+        );
+    }
+
+    /// `covered == expected` ⇒ satisfied. Two declared diodes, two live and
+    /// cool ⇒ no chip-tier power-off; the board classifies normally (cool).
+    /// Mutation guard: if the guard's `<` were relaxed to `<=`, a satisfied
+    /// board would power off and this test fails.
+    #[test]
+    fn chip_floor_positive_satisfied_does_not_fire() {
+        let cfg = ThermalSupervisorConfig {
+            min_chip_per_board: 2,
+            ..cfg_enabled()
+        };
+        let mut s = ThermalSupervisor::new(cfg);
+        let actions = s.tick(&tick(
+            vec![board(0, vec![45.0, 45.0], vec![60.0, 61.0])],
+            vec![1000],
+            30,
+            5,
+        ));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestBoardPowerOff { .. })),
+            "2-of-2 declared chip diodes must NOT power off: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestFansMin)),
+            "a satisfied, cool board reports a cool verdict: {actions:?}"
+        );
+    }
+
     // -- 3. Target band → fans curve --
     #[test]
     fn target_band_requests_fans_curve() {
@@ -1812,6 +2023,9 @@ mod tests {
             SupervisorPlatform::from_board_target("something-else"),
             Unknown
         );
+        // S9 SE is not classic S9 — do not inherit Am1S9 FanFailure/tach.
+        assert_eq!(SupervisorPlatform::from_board_target("am1-s9se"), Unknown);
+        assert_eq!(SupervisorPlatform::from_board_target("Antminer S9 SE"), Unknown);
     }
 
     // -- THERMAL-9: passing the FULL per-fan RPM vector avoids the spurious
@@ -2416,5 +2630,153 @@ mod tests {
             actions.is_empty(),
             "a disabled supervisor must emit no actions even with a hydro flow-loss condition"
         );
+    }
+
+    // -- Round-15 A3: cooling-medium action filter ------------------------
+
+    use dcentrald_common::cooling_medium::CoolingMedium;
+
+    /// A representative hot-board tick output: fan raise + step-down, plus a
+    /// panic power-off and an emergency shutdown from other boards.
+    fn mixed_hot_actions() -> Vec<SupervisorAction> {
+        vec![
+            SupervisorAction::RequestFansMax {
+                reason: ThermalReason::BoardHot,
+            },
+            SupervisorAction::RequestProfileStepDown {
+                reason: ThermalReason::BoardHot,
+            },
+            SupervisorAction::RequestBoardPowerOff {
+                chain_id: 1,
+                reason: ThermalReason::ChipPanic,
+                recoverable: true,
+            },
+            SupervisorAction::RequestEmergencyShutdown {
+                reason: ThermalReason::FanPanic,
+            },
+            SupervisorAction::RequestFansCurve,
+            SupervisorAction::RequestFansMin,
+        ]
+    }
+
+    #[test]
+    fn medium_filter_is_identity_for_air_and_undeclared() {
+        // LOAD-BEARING (air-board no-change proof): for Some(Air) and for an
+        // UNDECLARED medium the filter must return the vector unchanged —
+        // element-for-element — so every currently-registered air-cooled
+        // board's thermal behaviour is untouched.
+        for declared in [None, Some(CoolingMedium::Air)] {
+            let actions = mixed_hot_actions();
+            let out = filter_actions_for_declared_medium(declared, actions.clone());
+            assert_eq!(out, actions, "declared {declared:?} must be identity");
+        }
+    }
+
+    #[test]
+    fn medium_filter_strips_fan_requests_on_declared_fanless_media() {
+        // A declared external-loop medium removes the fan requests ENTIRELY
+        // (absent, not PWM 0) …
+        for declared in [Some(CoolingMedium::Hydro), Some(CoolingMedium::Immersion)] {
+            let out = filter_actions_for_declared_medium(declared, mixed_hot_actions());
+            assert!(
+                !out.iter().any(|a| a.is_fan_request()),
+                "declared {declared:?}: no fan request may survive; got {out:?}"
+            );
+            // … while every hash-cut / power-cut action survives untouched.
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    SupervisorAction::RequestBoardPowerOff {
+                        reason: ThermalReason::ChipPanic,
+                        ..
+                    }
+                )),
+                "board power-off must survive"
+            );
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    SupervisorAction::RequestEmergencyShutdown {
+                        reason: ThermalReason::FanPanic
+                    }
+                )),
+                "emergency shutdown must survive"
+            );
+            assert!(
+                out.iter().any(|a| matches!(
+                    a,
+                    SupervisorAction::RequestProfileStepDown {
+                        reason: ThermalReason::BoardHot
+                    }
+                )),
+                "profile step-down (hash reduction) must survive"
+            );
+            assert_eq!(out.len(), 3, "exactly the 3 fan requests are removed");
+        }
+    }
+
+    #[test]
+    fn fanless_board_never_reaches_a_fan_raise_end_to_end() {
+        // NEGATIVE, end-to-end: drive the REAL supervisor FSM to a hot-board
+        // tick (which emits RequestFansMax on air), then apply the declared-
+        // medium filter — a fanless board must never see the fan-raise rung,
+        // and the escalation must degenerate to hash reduction, not silence.
+        let cfg = ThermalSupervisorConfig {
+            atm_startup_grace_secs: 0,
+            ..cfg_enabled()
+        };
+        let mut s = ThermalSupervisor::new(cfg);
+        // Board at 66 C ≥ board_hot_c (65) — the FansMax + StepDown band.
+        // No fan roster (fanless rig ⇒ empty tach vec, which also keeps the
+        // FanPanic guard inert per its `total_fans > 0` gate).
+        let raw = s.tick(&tick(
+            vec![board(0, vec![66.0, 66.0], vec![80.0])],
+            vec![],
+            0,
+            5,
+        ));
+        assert!(
+            raw.iter()
+                .any(|a| matches!(a, SupervisorAction::RequestFansMax { .. })),
+            "precondition: the unfiltered air path emits a fan raise at hot; got {raw:?}"
+        );
+        let filtered = filter_actions_for_declared_medium(Some(CoolingMedium::Immersion), raw);
+        assert!(
+            !filtered.iter().any(|a| a.is_fan_request()),
+            "a declared-immersion board must never reach a fan-raise action; got {filtered:?}"
+        );
+        assert!(
+            filtered.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestProfileStepDown {
+                    reason: ThermalReason::BoardHot
+                }
+            )),
+            "the hot response must degenerate to hash reduction, not to nothing; got {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn medium_filter_never_removes_a_hash_cut() {
+        // Exhaustive over media: is_hash_cut() actions always survive.
+        let cuts = vec![
+            SupervisorAction::RequestEmergencyShutdown {
+                reason: ThermalReason::HydroFlowLoss,
+            },
+            SupervisorAction::RequestBoardPowerOff {
+                chain_id: 0,
+                reason: ThermalReason::BoardPanic,
+                recoverable: false,
+            },
+        ];
+        for declared in [
+            None,
+            Some(CoolingMedium::Air),
+            Some(CoolingMedium::Hydro),
+            Some(CoolingMedium::Immersion),
+        ] {
+            let out = filter_actions_for_declared_medium(declared, cuts.clone());
+            assert_eq!(out, cuts, "declared {declared:?}: hash cuts must survive");
+        }
     }
 }

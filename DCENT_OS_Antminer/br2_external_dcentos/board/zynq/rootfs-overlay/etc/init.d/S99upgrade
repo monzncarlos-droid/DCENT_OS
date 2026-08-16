@@ -55,6 +55,12 @@
 #     this decision for S99verify to observe.
 # ============================================================================
 
+EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+if [ -e "$EXTERNAL_MEDIA_MARKER" ] || [ -L "$EXTERNAL_MEDIA_MARKER" ]; then
+    echo "External-media posture: U-Boot environment commit is disabled"
+    exit 0
+fi
+
 HEALTH_OK=true
 
 # Boot-success window: minimum sustained healthy uptime (seconds) the daemon

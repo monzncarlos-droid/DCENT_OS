@@ -13,6 +13,44 @@
 # This script sets up writable areas for runtime data.
 #
 
+EXTERNAL_MEDIA_POLICY=/usr/libexec/dcentos/zynq-external-media-ephemeral.sh
+EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+EXTERNAL_MEDIA_EPHEMERAL=0
+# Any marker object, including an unsafe symlink, fails closed into the
+# no-MTD/no-UBI posture. The helper later requires an exact regular file before
+# it declares the volatile runtime ready.
+if [ -e "$EXTERNAL_MEDIA_MARKER" ] || [ -L "$EXTERNAL_MEDIA_MARKER" ]; then
+    EXTERNAL_MEDIA_EPHEMERAL=1
+fi
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ]; then
+    # The external-media producer binds these exact identity files.  Do not
+    # infer AM2 from a UIO probe: a missing/misnamed board-control device would
+    # otherwise fall through to the AM1 GPIO register map below.
+    for identity_file in \
+        /etc/dcentos/board_family \
+        /etc/dcentos/platform \
+        /etc/dcentos/board_target; do
+        if [ ! -f "$identity_file" ] || [ -L "$identity_file" ]; then
+            echo "[!!] External-media identity is absent or unsafe: $identity_file" >&2
+            exit 80
+        fi
+    done
+    [ "$(cat /etc/dcentos/board_family)" = "am2" ] || exit 80
+    [ "$(cat /etc/dcentos/platform)" = "zynq-bm3-am2" ] || exit 80
+    case "$(cat /etc/dcentos/board_target)" in
+        am2-s19j|am2-s19pro) ;;
+        *)
+            echo "[!!] External-media target is not an admitted AM2 identity" >&2
+            exit 80
+            ;;
+    esac
+fi
+if [ -r "$EXTERNAL_MEDIA_POLICY" ]; then
+    . "$EXTERNAL_MEDIA_POLICY"
+elif [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ]; then
+    echo "[!!] External-media policy helper is missing; persistent storage remains barred" >&2
+fi
+
 # --- Essential virtual filesystems ---
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -22,7 +60,10 @@ ip link set lo up
 ip addr add 127.0.0.1/8 dev lo 2>/dev/null
 
 # --- Writable /dev on tmpfs (NO devtmpfs in kernel!) ---
-mount -t tmpfs -o size=512k,mode=0755 tmpfs /dev
+if ! mount -t tmpfs -o size=512k,mode=0755 tmpfs /dev; then
+    echo "[!!] Writable /dev tmpfs mount failed" >&2
+    [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ] && exit 81
+fi
 
 # Essential device nodes (minimum for BusyBox init + early scripts)
 mknod -m 600 /dev/console c 5 1
@@ -31,8 +72,10 @@ mknod -m 666 /dev/zero c 1 5
 mknod -m 666 /dev/tty c 5 0
 mknod -m 444 /dev/urandom c 1 9
 mknod -m 444 /dev/random c 1 8
-mknod -m 660 /dev/mem c 1 1
-mknod -m 660 /dev/kmem c 1 2
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -ne 1 ]; then
+    mknod -m 660 /dev/mem c 1 1
+    mknod -m 660 /dev/kmem c 1 2
+fi
 mknod -m 600 /dev/kmsg c 1 11
 mkdir -p /dev/pts /dev/shm
 
@@ -50,6 +93,12 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620
 # eudev/udevd on this 4.4.0 kernel doesn't create nodes for MTD/UBI/TTY.
 # We enumerate sysfs and create them manually.
 
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ]; then
+    # /dev is a fresh tmpfs, so omitting these nodes removes the automatic
+    # userspace path to NAND/UBI for this boot. Do not probe, attach, or mount
+    # persistent flash from an external-media candidate.
+    echo "[OK] External-media posture: MTD/UBI device-node creation suppressed"
+else
 # MTD devices (NAND flash partitions)
 for mtd in /sys/class/mtd/mtd*; do
     name=$(basename "$mtd")
@@ -93,6 +142,7 @@ for blk in /sys/class/block/ubiblock*; do
         mknod -m 660 "/dev/$name" b "$major" "$minor" 2>/dev/null
     fi
 done
+fi
 
 # TTY devices (serial ports)
 for tty_dev in /sys/class/tty/ttyPS*; do
@@ -105,6 +155,10 @@ for tty_dev in /sys/class/tty/ttyPS*; do
     fi
 done
 
+# I2C/UIO nodes grant direct hardware-control access. External-media recovery
+# is SSH-only and deliberately omits them until an exact hardware witness
+# promotes this lane beyond host-artifact status.
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -ne 1 ]; then
 # I2C devices (for PIC voltage controllers, TMP75 sensors, EEPROM, PSU)
 for i2c in /sys/class/i2c-dev/i2c-*; do
     name=$(basename "$i2c")
@@ -126,6 +180,7 @@ for uio in /sys/class/uio/uio*; do
         mknod -m 666 "/dev/$name" c "$major" "$minor" 2>/dev/null
     fi
 done
+fi
 
 # --- Writable tmpfs for runtime data ---
 # /tmp: logs, temp files (squashfs /var/log -> ../tmp)
@@ -150,13 +205,20 @@ if [ -d /root ]; then
     mount --bind /tmp/root-copy /root
 fi
 
-# --- Mount persistent storage (UBIFS on rootfs_data UBI volume) ---
+# --- Mount persistent storage, or enforce external-media volatility ---
 # rootfs_data is a 72MB dynamic UBI volume on mtd8 (NAND flash).
 # UBIFS auto-creates the filesystem on first mount. Data survives reboots
 # without modifying the read-only squashfs root image.
 mkdir -p /data
-mount -t ubifs ubi0:rootfs_data /data 2>/dev/null
-if [ $? -eq 0 ]; then
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ]; then
+    if command -v dcent_external_media_prepare_ephemeral_root >/dev/null 2>&1 \
+        && dcent_external_media_prepare_ephemeral_root; then
+        :
+    else
+        echo "[!!] External-media ephemeral root is not ready; NAND/UBI remains barred" >&2
+        exit 82
+    fi
+elif mount -t ubifs ubi0:rootfs_data /data 2>/dev/null; then
     echo "[OK] Persistent storage mounted at /data"
     # Create standard directories
     mkdir -p /data/config /data/profiles /data/keys /data/logs /data/overlay
@@ -237,6 +299,14 @@ else
     echo "[OK] Tmpfs /etc overlay active (non-persistent)"
     # Ensure /etc/dropbear exists even without persistent storage
     mkdir -p /etc/dropbear 2>/dev/null
+fi
+
+if [ "$EXTERNAL_MEDIA_EPHEMERAL" -eq 1 ]; then
+    # Stop before all FPGA GPIO, reset, fan, PIC, I2C, and /dev/mem control.
+    # Networking and Dropbear are admitted later by the filtered initramfs
+    # service surface; no mining/hardware owner is auto-started.
+    echo "[OK] External-media AM2 identity and volatile root verified; hardware writes suppressed"
+    exit 0
 fi
 
 # --- Export FPGA GPIO pins (platform-dependent) ---

@@ -11,6 +11,8 @@ if [ ! -f "$S99" ]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dcent-amlogic-wal.XXXXXX")
+mkdir -p "$WORK/identity"
+printf 'am3-s19k\n' > "$WORK/identity/board_target"
 ALIVE_PID=
 cleanup() {
     if [ -n "$ALIVE_PID" ]; then
@@ -122,6 +124,7 @@ S99_TEST_ENV_STATE="$WORK/env.state" \
 DCENTOS_SYSTEM_MTD="$WORK/mtd5" \
 DCENTOS_LOCAL_RECOVERY_FLAGS_OFFSET=0 \
 DCENTOS_FIRSTBOOT_PENDING_FILE="$PENDING" \
+DCENTOS_BOARD_TARGET_FILE="$WORK/identity/board_target" \
 DCENTOS_BOOT_SUCCESS_WINDOW_S=1 \
     /bin/sh "$S99" start > "$OUT" 2>&1
 rc=$?
@@ -165,6 +168,7 @@ S99_TEST_ENV_STATE="$WORK/env.state" \
 DCENTOS_SYSTEM_MTD="$WORK/mtd5" \
 DCENTOS_LOCAL_RECOVERY_FLAGS_OFFSET=0 \
 DCENTOS_FIRSTBOOT_PENDING_FILE="$PENDING" \
+DCENTOS_BOARD_TARGET_FILE="$WORK/identity/board_target" \
 DCENTOS_BOOT_SUCCESS_WINDOW_S=1 \
     /bin/sh "$S99" start > "$OUT_AFTER_RENAME" 2>&1
 rc=$?
@@ -214,6 +218,7 @@ S99_TEST_ENV_STATE="$WORK/env.state" \
 DCENTOS_SYSTEM_MTD="$WORK/mtd5" \
 DCENTOS_LOCAL_RECOVERY_FLAGS_OFFSET=0 \
 DCENTOS_FIRSTBOOT_PENDING_FILE="$PENDING" \
+DCENTOS_BOARD_TARGET_FILE="$WORK/identity/board_target" \
 DCENTOS_BOOT_SUCCESS_WINDOW_S=1 \
     /bin/sh "$S99" start > "$OUT_SUCCESS" 2>&1
 rc=$?

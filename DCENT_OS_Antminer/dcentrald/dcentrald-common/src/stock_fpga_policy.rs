@@ -2,29 +2,27 @@
 //!
 //! # Bar
 //!
-//! Stock Bitmain / bmminer 4-way overt AsicBoost on the DHASH path:
-//! - Four block versions at `REG_BLOCK_HEADER_VERSION` slots `0x130, 0x134, 0x138, 0x13C`
+//! Exact S9j 4-way overt AsicBoost on the DHASH path:
+//! - Version 0 at `0x130`; versions 1..3 at `0x164, 0x168, 0x16c`
 //! - Packing: `version[i] = (base_version & !mask) | ((i << 13) & mask)` for `i = 0..3`
-//! - Multi-midstate bit on DHASH_ACC_CONTROL is I/O residual (HAL)
+//! - DHASH_ACC_CONTROL bits 11:8 carry the admitted midstate count
 //! - Job-id correlation remains G15 REG_JOB_ID low-byte spine (not redefined here)
 //!
 //! # Honesty
 //!
 //! Pure packing only. Does **not** invent share-dedup, nonce EXT layout changes,
-//! or pool BIP-310 negotiation. Zero mask → AsicBoost not admitted (single-version path).
+//! or pool BIP-310 negotiation. No mask currently admits runtime four-way dispatch.
 //!
-//! Register alias: stock map dual-uses `0x134`/`0x138` as TIME_STAMP/TARGET_BITS and
-//! AsicBoost version slots 1/2. HAL AB dispatch must write packed versions **last**
-//! before JOB_DATA_READY (see `dispatch_work_asicboost`).
+//! Exact S9j disproves the former timestamp/target alias theory. Runtime
+//! AsicBoost stays refused until the extra lane aperture and nonce/version
+//! correlation are admitted by board/revision policy.
 
 /// Number of stock FPGA version-rolling slots (native 4-way AsicBoost).
 pub const STOCK_ASICBOOST_SLOT_COUNT: u8 = 4;
 
-/// Register base for block header version slots (matches `stock_fpga::REG_BLOCK_HEADER_VERSION`).
-pub const STOCK_ASICBOOST_VERSION_REG_BASE: u32 = 0x130;
-
-/// Stride between version registers (bytes).
-pub const STOCK_ASICBOOST_VERSION_REG_STRIDE: u32 = 4;
+/// Exact S9j version-register addresses. Slot zero uses the ordinary version
+/// register; the three extra lanes do not alias timestamp or target.
+pub const STOCK_ASICBOOST_VERSION_REGS: [u32; 4] = [0x130, 0x164, 0x168, 0x16c];
 
 /// Slot index → mask bit shift used by stock/bmminer packing (`i << 13`).
 pub const STOCK_ASICBOOST_SLOT_BIT_SHIFT: u32 = 13;
@@ -32,40 +30,54 @@ pub const STOCK_ASICBOOST_SLOT_BIT_SHIFT: u32 = 13;
 /// Common BIP-320 / pool mask used in Braiins and stock AsicBoost paths.
 pub const STOCK_ASICBOOST_BIP320_MASK: u32 = 0x1FFF_E000;
 
-/// DHASH_ACC_CONTROL multi-midstate bit (AsicBoost). Matches HAL `DHASH_MULTI_MIDSTATE`.
-///
-/// G18: pure apply/clear so single-version dispatch cannot leave a sticky AB mode
-/// after a prior multi-version job (mask → 0 mid-session).
-pub const STOCK_DHASH_MULTI_MIDSTATE_BIT: u32 = 1 << 12;
+/// DHASH_ACC_CONTROL midstate-count field from the S9/BM1387 stock header,
+/// independently matched by the exact signed S17e/T17e job finalizers.
+pub const STOCK_DHASH_MIDSTATE_COUNT_MASK: u32 = 0x0f00;
+pub const STOCK_DHASH_MIDSTATE_COUNT_SHIFT: u32 = 8;
 
-/// Apply or clear the multi-midstate bit on a DHASH_ACC_CONTROL value (pure).
-#[inline]
-pub const fn stock_dhash_with_multi_midstate(dhash: u32, enable: bool) -> u32 {
-    if enable {
-        dhash | STOCK_DHASH_MULTI_MIDSTATE_BIT
-    } else {
-        dhash & !STOCK_DHASH_MULTI_MIDSTATE_BIT
+/// Only the one-way and four-way shapes used by this stock S9 path are
+/// admitted. This prevents the former false bit-12 boolean approximation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StockDhashMidstateMode {
+    Single,
+    FourWay,
+}
+
+impl StockDhashMidstateMode {
+    pub const fn count(self) -> u8 {
+        match self {
+            Self::Single => 1,
+            Self::FourWay => STOCK_ASICBOOST_SLOT_COUNT,
+        }
     }
 }
 
-/// Whether the multi-midstate bit is set.
 #[inline]
-pub const fn stock_dhash_multi_midstate_enabled(dhash: u32) -> bool {
-    dhash & STOCK_DHASH_MULTI_MIDSTATE_BIT != 0
+pub const fn stock_dhash_with_midstate_mode(dhash: u32, mode: StockDhashMidstateMode) -> u32 {
+    (dhash & !STOCK_DHASH_MIDSTATE_COUNT_MASK)
+        | ((mode.count() as u32) << STOCK_DHASH_MIDSTATE_COUNT_SHIFT)
+}
+
+#[inline]
+pub const fn stock_dhash_midstate_count(dhash: u32) -> u8 {
+    ((dhash & STOCK_DHASH_MIDSTATE_COUNT_MASK) >> STOCK_DHASH_MIDSTATE_COUNT_SHIFT) as u8
 }
 
 /// Whether the stock path should use 4-way AsicBoost dispatch.
 ///
-/// Non-zero negotiated mask admits multi-version packing. Mask `0` stays
-/// single-version `dispatch_work` (no multi-midstate).
+/// The recovered S9j extra lanes extend beyond the current logical aperture,
+/// and nonce/version correlation is not complete. Refuse every runtime mask
+/// until both are admitted by a typed board/revision policy.
 #[inline]
-pub const fn stock_asicboost_admitted(version_mask: u32) -> bool {
-    version_mask != 0
+pub const fn stock_asicboost_admitted(_version_mask: u32) -> bool {
+    false
 }
 
 /// Pure: pack four version words for stock FPGA `REG_BLOCK_HEADER_VERSION` slots.
 ///
-/// Matches open-coded HAL `set_asicboost_versions` / bmminer 4-way layout.
+/// Offline BIP-320 candidate packing only. The exact S9j lane values and
+/// nonce/version correlation still require a separately admitted planner;
+/// this helper is not consumed by live HAL mutation.
 #[inline]
 // clippy::indexing_slicing: `out` is `[u32; 4]` and the loop is `0u32..4`.
 #[allow(clippy::indexing_slicing)]
@@ -81,8 +93,7 @@ pub fn stock_asicboost_version_words(base_version: u32, version_mask: u32) -> [u
 /// Register address for AsicBoost version slot `i` (0..3).
 #[inline]
 pub const fn stock_asicboost_version_reg(slot: u8) -> u32 {
-    STOCK_ASICBOOST_VERSION_REG_BASE
-        + (slot as u32 % STOCK_ASICBOOST_SLOT_COUNT as u32) * STOCK_ASICBOOST_VERSION_REG_STRIDE
+    STOCK_ASICBOOST_VERSION_REGS[(slot % STOCK_ASICBOOST_SLOT_COUNT) as usize]
 }
 
 /// Map RETURN_NONCE_EXT solution index (low byte) to a stock AsicBoost slot.
@@ -108,6 +119,155 @@ pub fn stock_asicboost_version_for_solution(
 ) -> u32 {
     let words = stock_asicboost_version_words(base_version, version_mask);
     words[stock_asicboost_slot_from_solution_idx(solution_idx) as usize]
+}
+
+/// Exact stock S9/S9j merkle-branch width.
+pub const STOCK_DMA_MERKLE_BRANCH_LEN: usize = 32;
+/// Exact double-buffer slot size at offsets `0x200000` and `0x210000`.
+pub const STOCK_DMA_JOB_SLOT_SIZE: usize = 0x1_0000;
+
+/// Convert a numeric Stratum/header scalar into the stock FPGA MMIO word.
+///
+/// The V1 parser stores version, ntime, and nbits as numeric big-endian hex
+/// values, while the little-endian stock bmminer structure reaches the raw
+/// MMIO setter without another conversion. The register therefore observes
+/// the byte-swapped numeric value.
+pub const fn stock_fpga_header_scalar_word(numeric: u32) -> u32 {
+    numeric.swap_bytes()
+}
+
+/// Recovered, bounded DDR payload and scalar registers for one stock S9 job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StockDmaJobPlan {
+    buffer_payload: Vec<u8>,
+    padded_coinbase_len: usize,
+    coinbase_layout: u32,
+    nonce2_low: u32,
+    nonce2_high: u32,
+    merkle_count: u16,
+    job_length: u16,
+}
+
+impl StockDmaJobPlan {
+    pub fn buffer_payload(&self) -> &[u8] {
+        &self.buffer_payload
+    }
+
+    pub const fn padded_coinbase_len(&self) -> usize {
+        self.padded_coinbase_len
+    }
+
+    pub const fn coinbase_layout(&self) -> u32 {
+        self.coinbase_layout
+    }
+
+    pub const fn nonce2_low(&self) -> u32 {
+        self.nonce2_low
+    }
+
+    pub const fn nonce2_high(&self) -> u32 {
+        self.nonce2_high
+    }
+
+    pub const fn merkle_count(&self) -> u16 {
+        self.merkle_count
+    }
+
+    pub const fn job_length(&self) -> u16 {
+        self.job_length
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StockDmaJobPlanError {
+    CoinbaseLengthOutOfBounds,
+    MerkleLengthOverflow,
+    PayloadLengthMismatch { expected: usize, observed: usize },
+    Nonce2LengthUnsupported { observed: usize },
+    Nonce2RangeOutOfBounds,
+    CoinbasePaddingOverflow,
+    CoinbaseBlockCountOverflow,
+    MerkleCountOverflow,
+    JobSlotOverflow { required: usize, slot_size: usize },
+    JobLengthOverflow,
+}
+
+/// Build the exact S9/S9j SHA-padded DMA payload and its coupled registers.
+///
+/// `job_data` is the caller's raw `coinbase || merkle_branches` buffer. This
+/// function prevents the historical field inversion at `0x104`: high 16 bits
+/// are the nonce2 offset, not the raw coinbase length.
+#[allow(clippy::indexing_slicing)]
+pub fn plan_stock_dma_job(
+    job_data: &[u8],
+    raw_coinbase_len: usize,
+    nonce2_offset: usize,
+    nonce2_len: usize,
+    merkle_count: usize,
+) -> Result<StockDmaJobPlan, StockDmaJobPlanError> {
+    if raw_coinbase_len > job_data.len() {
+        return Err(StockDmaJobPlanError::CoinbaseLengthOutOfBounds);
+    }
+    let merkle_len = merkle_count
+        .checked_mul(STOCK_DMA_MERKLE_BRANCH_LEN)
+        .ok_or(StockDmaJobPlanError::MerkleLengthOverflow)?;
+    let expected_len = raw_coinbase_len
+        .checked_add(merkle_len)
+        .ok_or(StockDmaJobPlanError::MerkleLengthOverflow)?;
+    if expected_len != job_data.len() {
+        return Err(StockDmaJobPlanError::PayloadLengthMismatch {
+            expected: expected_len,
+            observed: job_data.len(),
+        });
+    }
+    if nonce2_len > 8 || nonce2_len > usize::from(u8::MAX) {
+        return Err(StockDmaJobPlanError::Nonce2LengthUnsupported {
+            observed: nonce2_len,
+        });
+    }
+    let nonce2_end = nonce2_offset
+        .checked_add(nonce2_len)
+        .ok_or(StockDmaJobPlanError::Nonce2RangeOutOfBounds)?;
+    if nonce2_offset > usize::from(u16::MAX) || nonce2_end > raw_coinbase_len {
+        return Err(StockDmaJobPlanError::Nonce2RangeOutOfBounds);
+    }
+    let merkle_count_u16 =
+        u16::try_from(merkle_count).map_err(|_| StockDmaJobPlanError::MerkleCountOverflow)?;
+    let mut padded_coinbase =
+        crate::sha256_padding::sha256_pad_message(&job_data[..raw_coinbase_len])
+            .ok_or(StockDmaJobPlanError::CoinbasePaddingOverflow)?;
+    let padded_coinbase_len = padded_coinbase.len();
+    let block_count = padded_coinbase_len / 64;
+    let block_count_u8 =
+        u8::try_from(block_count).map_err(|_| StockDmaJobPlanError::CoinbaseBlockCountOverflow)?;
+    let final_len = padded_coinbase_len
+        .checked_add(merkle_len)
+        .ok_or(StockDmaJobPlanError::JobLengthOverflow)?;
+    if final_len > STOCK_DMA_JOB_SLOT_SIZE {
+        return Err(StockDmaJobPlanError::JobSlotOverflow {
+            required: final_len,
+            slot_size: STOCK_DMA_JOB_SLOT_SIZE,
+        });
+    }
+    let job_length =
+        u16::try_from(final_len).map_err(|_| StockDmaJobPlanError::JobLengthOverflow)?;
+    padded_coinbase.extend_from_slice(&job_data[raw_coinbase_len..]);
+
+    let mut nonce2_bytes = [0u8; 8];
+    nonce2_bytes[..nonce2_len].copy_from_slice(&job_data[nonce2_offset..nonce2_end]);
+    let nonce2_initial = u64::from_le_bytes(nonce2_bytes);
+    let coinbase_layout =
+        ((nonce2_offset as u32) << 16) | ((nonce2_len as u32) << 8) | u32::from(block_count_u8);
+
+    Ok(StockDmaJobPlan {
+        buffer_payload: padded_coinbase,
+        padded_coinbase_len,
+        coinbase_layout,
+        nonce2_low: nonce2_initial as u32,
+        nonce2_high: (nonce2_initial >> 32) as u32,
+        merkle_count: merkle_count_u16,
+        job_length,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +788,14 @@ pub const fn stock_open_core_bc_nullwork_prelude(status: u32, chain: u8) -> u32 
 #[inline]
 pub const fn stock_open_core_bc_nullwork_enable(status: u32) -> u32 {
     status | STOCK_OPEN_CORE_BC_NULLWORK_ENABLE_BIT
+}
+
+/// Pure shutdown RMW from signed S9j `bitmain_c5_shutdown@0x2db64`.
+///
+/// Nullwork is disabled before DHASH RUN is cleared so the FPGA cannot keep
+/// emitting dummy work while software proceeds to rail teardown.
+pub const fn stock_shutdown_bc_disable_nullwork(status: u32) -> u32 {
+    status & !STOCK_OPEN_CORE_BC_NULLWORK_ENABLE_BIT
 }
 
 /// Pure: BUFFER_SPACE has room for chain (bit set).
@@ -1615,6 +1783,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_s9_dma_job_plan_pads_and_derives_coupled_registers() {
+        let coinbase = [0xaa, 0xbb, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
+        let mut raw = coinbase.to_vec();
+        raw.extend_from_slice(&[0xcc; STOCK_DMA_MERKLE_BRANCH_LEN]);
+        let plan = plan_stock_dma_job(&raw, coinbase.len(), 2, 8, 1).expect("exact plan");
+        assert_eq!(plan.padded_coinbase_len(), 64);
+        assert_eq!(plan.buffer_payload().len(), 96);
+        assert_eq!(&plan.buffer_payload()[..coinbase.len()], &coinbase);
+        assert_eq!(plan.buffer_payload()[coinbase.len()], 0x80);
+        assert_eq!(
+            &plan.buffer_payload()[56..64],
+            &(u64::try_from(coinbase.len()).unwrap() * 8).to_be_bytes()
+        );
+        assert_eq!(&plan.buffer_payload()[64..], &[0xcc; 32]);
+        assert_eq!(plan.coinbase_layout(), (2 << 16) | (8 << 8) | 1);
+        assert_eq!(plan.nonce2_low(), 0x0506_0708);
+        assert_eq!(plan.nonce2_high(), 0x0102_0304);
+        assert_eq!(plan.merkle_count(), 1);
+        assert_eq!(plan.job_length(), 96);
+    }
+
+    #[test]
+    fn exact_s9_header_scalars_match_signed_binary_and_live_probe() {
+        assert_eq!(stock_fpga_header_scalar_word(0x2000_0000), 0x0000_0020);
+        assert_eq!(stock_fpga_header_scalar_word(0x69b3_3555), 0x5535_b369);
+        assert_eq!(stock_fpga_header_scalar_word(0x1701_f0cc), 0xccf0_0117);
+    }
+
+    #[test]
+    fn exact_s9_shutdown_disables_nullwork_before_dhash_stop() {
+        assert_eq!(stock_shutdown_bc_disable_nullwork(0xffff_ffff), 0xffbf_ffff);
+        assert_eq!(stock_shutdown_bc_disable_nullwork(0x1234_5678), 0x1234_5678);
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
+            .expect("stock FPGA HAL");
+        let start = src.find("pub fn stop(&self)").expect("stop method");
+        let body: String = src[start..].chars().take(1_500).collect();
+        let nullwork = body
+            .find("stock_shutdown_bc_disable_nullwork")
+            .expect("nullwork disable");
+        let dhash = body.find("dhash_stop_value").expect("DHASH stop");
+        assert!(
+            nullwork < dhash,
+            "signed S9j shutdown disables BC nullwork before clearing DHASH RUN"
+        );
+    }
+
+    #[test]
+    fn s9_dma_job_plan_refuses_inconsistent_or_cross_slot_payloads() {
+        assert_eq!(
+            plan_stock_dma_job(&[0u8; 10], 4, 0, 4, 1),
+            Err(StockDmaJobPlanError::PayloadLengthMismatch {
+                expected: 36,
+                observed: 10,
+            })
+        );
+        assert_eq!(
+            plan_stock_dma_job(&[0u8; 16], 16, 10, 8, 0),
+            Err(StockDmaJobPlanError::Nonce2RangeOutOfBounds)
+        );
+        let largest = vec![0u8; 1 + 2_045 * STOCK_DMA_MERKLE_BRANCH_LEN];
+        assert_eq!(
+            plan_stock_dma_job(&largest, 1, 0, 0, 2_045)
+                .expect("largest u16-aligned exact job")
+                .job_length(),
+            0xffe0
+        );
+        let wraps_u16 = vec![0u8; 1 + 2_046 * STOCK_DMA_MERKLE_BRANCH_LEN];
+        assert_eq!(
+            plan_stock_dma_job(&wraps_u16, 1, 0, 0, 2_046),
+            Err(StockDmaJobPlanError::JobLengthOverflow)
+        );
+    }
+
+    #[test]
     fn bip320_mask_packs_first_four_slots_like_increment_bitmask() {
         // For contiguous mask starting at bit 13, stock (i<<13)&mask matches
         // the first four increment_bitmask steps from a cleared base.
@@ -1641,17 +1885,17 @@ mod tests {
     }
 
     #[test]
-    fn non_zero_mask_admitted() {
-        assert!(stock_asicboost_admitted(STOCK_ASICBOOST_BIP320_MASK));
-        assert!(stock_asicboost_admitted(0x00FF_E000));
+    fn every_runtime_mask_is_refused_until_s9j_extra_lanes_are_mapped() {
+        assert!(!stock_asicboost_admitted(STOCK_ASICBOOST_BIP320_MASK));
+        assert!(!stock_asicboost_admitted(0x00FF_E000));
     }
 
     #[test]
-    fn version_regs_are_0x130_stride_4() {
+    fn exact_s9j_version_regs_do_not_alias_timestamp_or_target() {
         assert_eq!(stock_asicboost_version_reg(0), 0x130);
-        assert_eq!(stock_asicboost_version_reg(1), 0x134);
-        assert_eq!(stock_asicboost_version_reg(2), 0x138);
-        assert_eq!(stock_asicboost_version_reg(3), 0x13C);
+        assert_eq!(stock_asicboost_version_reg(1), 0x164);
+        assert_eq!(stock_asicboost_version_reg(2), 0x168);
+        assert_eq!(stock_asicboost_version_reg(3), 0x16C);
         assert_eq!(stock_asicboost_version_reg(4), 0x130); // wrap
     }
 
@@ -1669,72 +1913,54 @@ mod tests {
     }
 
     #[test]
-    fn hal_set_asicboost_consumes_pure_packing() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
-            .expect("stock_fpga_work");
-        let set_fn = {
-            let start = src
-                .find("fn set_asicboost_versions")
-                .expect("set_asicboost_versions");
-            &src[start..start + 1_200]
-        };
-        assert!(
-            set_fn.contains("stock_asicboost_version_words")
-                || set_fn.contains("dcentrald_common::stock_asicboost_version_words"),
-            "HAL set_asicboost_versions must consume pure stock_asicboost_version_words"
-        );
-        // Must not keep an independent open-coded (i << 13) fork once pure is wired.
-        assert!(
-            !set_fn.contains("(i << 13) & version_mask")
-                || set_fn.contains("stock_asicboost_version_words"),
-            "open-coded (i<<13) without pure SSOT is banned after G17"
-        );
-    }
-
-    /// G17 critic: AB dispatch must program 4 version words **after** ntime/nbits
-    /// writes so 0x134/0x138 are not left as ntime/nbits at JOB_DATA_READY.
-    #[test]
-    fn hal_asicboost_dispatch_writes_versions_last_before_ready() {
+    fn hal_asicboost_entry_is_non_mutating_and_fail_closed() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
             .expect("stock_fpga_work");
         let start = src
             .find("pub fn dispatch_work_asicboost")
             .expect("dispatch_work_asicboost");
-        let body = &src[start..start + 3_500];
-        let ntime_pos = body.find("write_reg(REG_TIME_STAMP").expect("ntime write");
-        let nbits_pos = body.find("write_reg(REG_TARGET_BITS").expect("nbits write");
-        let versions_pos = body
-            .find("self.set_asicboost_versions(")
-            .expect("set_asicboost_versions call in dispatch");
-        let ready_pos = body
-            .find("write_reg(REG_JOB_DATA_READY")
-            .expect("JOB_DATA_READY");
+        let body: String = src[start..].chars().take(3_500).collect();
         assert!(
-            ntime_pos < versions_pos && nbits_pos < versions_pos,
-            "ntime/nbits must be written before set_asicboost_versions (alias 0x134/0x138)"
+            body.contains("four-way AsicBoost is refused")
+                && !body.contains("self.fpga.write_reg")
+                && !body.contains("write_bytes_verified"),
+            "four-way entry must return an evidence-backed refusal before hardware mutation"
         );
+    }
+
+    /// Exact S9j falsifies the old consecutive 0x130..0x13c alias map.
+    #[test]
+    fn hal_asicboost_dispatch_never_overwrites_timestamp_or_target() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
+            .expect("stock_fpga_work");
+        let start = src
+            .find("pub fn dispatch_work_asicboost")
+            .expect("dispatch_work_asicboost");
+        let body: String = src[start..].chars().take(3_500).collect();
         assert!(
-            versions_pos < ready_pos,
-            "set_asicboost_versions must run before JOB_DATA_READY so latch image is v0..v3"
+            !body.contains("REG_TIME_STAMP")
+                && !body.contains("REG_TARGET_BITS")
+                && !body.contains("REG_JOB_DATA_READY"),
+            "refused four-way entry must not emit the disproved alias or 0x120 writes"
         );
     }
 
     #[test]
-    fn multi_midstate_bit_apply_and_clear_are_pure() {
-        // Live mining VIL base 0x8160; AB enables bit 12 → 0x9160 class.
+    fn midstate_count_field_switches_one_and_four_without_touching_other_bits() {
         let base = 0x8160_u32;
-        assert!(!stock_dhash_multi_midstate_enabled(base));
-        let ab = stock_dhash_with_multi_midstate(base, true);
-        assert_eq!(ab, 0x9160);
-        assert!(stock_dhash_multi_midstate_enabled(ab));
-        let cleared = stock_dhash_with_multi_midstate(ab, false);
+        assert_eq!(stock_dhash_midstate_count(base), 1);
+        let ab = stock_dhash_with_midstate_mode(base, StockDhashMidstateMode::FourWay);
+        assert_eq!(ab, 0x8460);
+        assert_eq!(stock_dhash_midstate_count(ab), 4);
+        let cleared = stock_dhash_with_midstate_mode(ab, StockDhashMidstateMode::Single);
         assert_eq!(cleared, base);
-        assert!(!stock_dhash_multi_midstate_enabled(cleared));
-        // Idempotent.
-        assert_eq!(stock_dhash_with_multi_midstate(ab, true), ab);
-        assert_eq!(stock_dhash_with_multi_midstate(base, false), base);
+        assert_eq!(stock_dhash_midstate_count(cleared), 1);
+        assert_eq!(
+            stock_dhash_with_midstate_mode(base | (1 << 12), StockDhashMidstateMode::FourWay),
+            0x9460
+        );
     }
 
     /// G27: CRC5 matches published BM1397 GetAddress vector (same poly/init).
@@ -2867,7 +3093,7 @@ mod tests {
     }
 
     #[test]
-    fn hal_single_version_dispatch_clears_sticky_multi_midstate() {
+    fn hal_dispatch_commits_single_count_and_refuses_four_way() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
             .expect("stock_fpga_work");
@@ -2879,23 +3105,62 @@ mod tests {
             .unwrap_or(start + 2_500);
         let body = &src[start..end];
         assert!(
-            body.contains("stock_dhash_with_multi_midstate")
-                || body.contains("DHASH_MULTI_MIDSTATE")
-                    && (body.contains("!DHASH_MULTI_MIDSTATE")
-                        || body.contains("& !")
-                        || body.contains("false)")),
-            "single-version dispatch_work must clear sticky multi-midstate (G18)"
+            body.contains("resume_after_job_commit")
+                && body.contains("StockDhashMidstateMode::Single"),
+            "single-version dispatch_work must program explicit count one"
         );
-        // Prefer pure SSOT helper.
         assert!(
-            body.contains("stock_dhash_with_multi_midstate")
-                || body.contains("dcentrald_common::stock_dhash_with_multi_midstate"),
-            "HAL should consume pure stock_dhash_with_multi_midstate for clear path"
+            body.contains("plan_stock_dma_job")
+                && body.contains("plan.buffer_payload()")
+                && body.contains("split_at(plan.padded_coinbase_len())")
+                && body.contains("set_coinbase_layout(plan.coinbase_layout())")
+                && body.contains("set_nonce2_parts(plan.nonce2_low(), plan.nonce2_high())")
+                && body.contains("REG_JOB_LENGTH")
+                && body.contains("plan.job_length()"),
+            "live single-version dispatch must consume the exact coupled DMA job plan"
+        );
+        let job_address = body.find("REG_JOB_START_ADDRESS").expect("job address");
+        let job_id = body.find("REG_JOB_ID").expect("job id");
+        let version = body
+            .find("REG_BLOCK_HEADER_VERSION")
+            .expect("block version");
+        assert!(
+            job_address < job_id && job_id < version,
+            "exact S9j scalar spine must publish JOB_START, JOB_ID, then VERSION"
+        );
+        assert!(
+            body.contains("self.poisoned = true")
+                && body.contains("self.active_buffer = published_buffer"),
+            "ambiguous post-quiesce failures must poison the engine after publishing ownership"
+        );
+        let ab_start = src
+            .find("pub fn dispatch_work_asicboost")
+            .expect("dispatch_work_asicboost");
+        let ab_body: String = src[ab_start..].chars().take(5_000).collect();
+        assert!(
+            ab_body.contains("four-way AsicBoost is refused")
+                && !ab_body.contains("StockDhashMidstateMode::FourWay"),
+            "AsicBoost dispatch must not program count four before aperture admission"
         );
     }
 
     #[test]
-    fn stock_mining_wires_asicboost_when_mask_nonzero() {
+    fn hal_dhash_setter_rewrites_and_checks_full_word_ignoring_bit_seven() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = std::fs::read_to_string(root.join("dcentrald-hal/src/stock_fpga_work.rs"))
+            .expect("stock_fpga_work");
+        let start = src
+            .find("fn write_dhash_control_verified")
+            .expect("verified DHASH setter");
+        let body: String = src[start..].chars().take(1_500).collect();
+        assert!(body.contains("for _ in 0..DHASH_STOP_MAX_POLLS"));
+        assert!(body.contains("write_reg(REG_DHASH_ACC_CONTROL, requested)"));
+        assert!(body.contains("DHASH_STOP_POLL_DELAY_MS"));
+        assert!(body.contains("(requested | DHASH_NEW_BLOCK) == (observed | DHASH_NEW_BLOCK)"));
+    }
+
+    #[test]
+    fn stock_mining_keeps_asicboost_behind_fail_closed_policy() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let src = std::fs::read_to_string(root.join("dcentrald/src/stock_mining.rs"))
             .expect("stock_mining");

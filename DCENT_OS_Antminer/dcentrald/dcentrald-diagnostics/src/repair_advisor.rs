@@ -114,6 +114,17 @@ pub enum SuspectedComponent {
 }
 
 impl SuspectedComponent {
+    /// Canonical output-component identities. Exhaustiveness is enforced by
+    /// [`repair_mode_capability`]'s compiler-checked match below.
+    pub const ALL: [Self; 6] = [
+        Self::ChainBreak,
+        Self::VoltageDomain,
+        Self::PowerRail,
+        Self::Cooling,
+        Self::SignalIntegrity,
+        Self::WeakSilicon,
+    ];
+
     /// Stable machine-readable slug.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -137,6 +148,105 @@ impl SuspectedComponent {
             Self::Cooling => 4,
             Self::WeakSilicon => 5,
         }
+    }
+}
+
+/// Evidence ceiling for an implemented repair-advisor output family.
+///
+/// The historical `Mode` name is retained for API compatibility.  A row is
+/// keyed by [`SuspectedComponent`], not by an individual heuristic emitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairModeCapabilityState {
+    /// A deterministic ChipMap pattern can emit an explicitly inferred bench
+    /// hint; no direct measurement or repair action is performed.
+    PureInferredTriageRule,
+}
+
+/// Non-authorizing capability record for one repair-advisor output family.
+/// Multiple deterministic heuristics may emit the same component family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairModeCapability {
+    pub component: SuspectedComponent,
+    pub state: RepairModeCapabilityState,
+    pub evidence: &'static str,
+    pub direct_measurement_verified: bool,
+    pub repair_action_authorized: bool,
+    pub hardware_mutation_authorized: bool,
+    pub manufacturing_pass_authorized: bool,
+}
+
+/// Exhaustive capability ceiling for every `SuspectedComponent` rule family.
+pub const REPAIR_MODE_CAPABILITIES: &[RepairModeCapability] = &[
+    RepairModeCapability {
+        component: SuspectedComponent::ChainBreak,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "tail-dark ChipMap continuity inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+    RepairModeCapability {
+        component: SuspectedComponent::VoltageDomain,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "domain-aligned tail-dark ChipMap inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+    RepairModeCapability {
+        component: SuspectedComponent::PowerRail,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "whole-chain-dark or uniform whole-board health-distribution inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+    RepairModeCapability {
+        component: SuspectedComponent::Cooling,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "temperature-present spatial-cluster inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+    RepairModeCapability {
+        component: SuspectedComponent::SignalIntegrity,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "CRC-to-nonce pattern inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+    RepairModeCapability {
+        component: SuspectedComponent::WeakSilicon,
+        state: RepairModeCapabilityState::PureInferredTriageRule,
+        evidence: "isolated weak/dead ChipMap cell inference",
+        direct_measurement_verified: false,
+        repair_action_authorized: false,
+        hardware_mutation_authorized: false,
+        manufacturing_pass_authorized: false,
+    },
+];
+
+/// Return the canonical capability row for a repair output family.
+///
+/// The explicit match makes a future [`SuspectedComponent`] a compile error
+/// until its evidence ceiling is classified.
+pub const fn repair_mode_capability(
+    component: SuspectedComponent,
+) -> &'static RepairModeCapability {
+    match component {
+        SuspectedComponent::ChainBreak => &REPAIR_MODE_CAPABILITIES[0],
+        SuspectedComponent::VoltageDomain => &REPAIR_MODE_CAPABILITIES[1],
+        SuspectedComponent::PowerRail => &REPAIR_MODE_CAPABILITIES[2],
+        SuspectedComponent::Cooling => &REPAIR_MODE_CAPABILITIES[3],
+        SuspectedComponent::SignalIntegrity => &REPAIR_MODE_CAPABILITIES[4],
+        SuspectedComponent::WeakSilicon => &REPAIR_MODE_CAPABILITIES[5],
     }
 }
 
@@ -605,6 +715,35 @@ fn collect_chips_from_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_mode_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        assert_eq!(
+            REPAIR_MODE_CAPABILITIES.len(),
+            SuspectedComponent::ALL.len()
+        );
+        for component in SuspectedComponent::ALL {
+            let matches: Vec<_> = REPAIR_MODE_CAPABILITIES
+                .iter()
+                .filter(|capability| capability.component == component)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let capability = matches[0];
+            assert_eq!(
+                *capability,
+                *repair_mode_capability(component),
+                "compiler-exhaustive resolver and canonical table drifted"
+            );
+            assert_eq!(
+                capability.state,
+                RepairModeCapabilityState::PureInferredTriageRule
+            );
+            assert!(!capability.direct_measurement_verified);
+            assert!(!capability.repair_action_authorized);
+            assert!(!capability.hardware_mutation_authorized);
+            assert!(!capability.manufacturing_pass_authorized);
+        }
+    }
     use crate::chip_health::{ChipColor, ChipMap, ChipMapCell};
 
     /// Build a cell whose color is derived from the score (as the real builders do).

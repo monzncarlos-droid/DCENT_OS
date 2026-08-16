@@ -26,12 +26,34 @@ modules:
    test or production. Zero-anywhere = an orphan capability on a live type
    (the `flash_firmware` class).
 
+3. SCOPE CHECK -- every entry in SCOPE_GLOBS must match at least one file.
+   A scope entry that silently matches nothing is the same failure class this
+   gate exists to catch, occurring inside the gate itself. Round-16 B6 found
+   exactly that: `dcentrald-hal/src/voltage_rail_adapters.rs` had been listed
+   as scope since 2026-08-03 while the real file lives in `dcentrald-asic/`,
+   so two complete `pub` VoltageRail energization adapters (`DsPicVoltageRail`,
+   `Pic1704VoltageRail`) were never scanned. A dead glob is now a FAIL.
+4. REASON CHECK -- every TOLERATED_ORPHANS value must be a dated, substantive
+   reason. An allowlist without reasons is what a future "generalisation" wave
+   strips without noticing; blanking a reason must fail loudly, not pass.
+
 Known limitations (deliberate; documented so nobody "fixes" them into noise):
 - One-hop only. A production construction inside a function that is itself
   unreachable still passes (e.g. `psus.rs`'s catalog gained a production
   consumer in rank-35 `power_topology.rs` whose own consumers are test-only).
   Transitive reachability is the compiler's job, not a regex gate's; the
   allowlist ledger is where such chains are recorded.
+- Method-name collisions across types. The METHOD CHECK matches `.name(` /
+  `::name(` textually, so a method is treated as live when a DIFFERENT type's
+  identically-named method is called. Live example: the daemon calls
+  `CurtailmentController::enter_sleep`, which masks the fact that
+  `ThermalController::enter_sleep` has no production caller either. Resolving
+  this needs type resolution, not regex; where it matters, the allowlist row
+  for the visible half records the masked half explicitly.
+- Construction-shaped only. A type whose values are minted exclusively by
+  derive-generated conversions (`thiserror` `#[from]`, `Into`, `?`) shows zero
+  constructions. Such rows are adjudicated by reading the crate, not by
+  loosening the regex.
 - Scoped to `DCENT_OS_Antminer/dcentrald/`. The three 2026-07-30 ESP
   rail-enablement cases lived in `DCENT_OS_ESP/` and would need a
   sibling instance of this gate there.
@@ -45,6 +67,8 @@ change that wires the backend). NEVER silently exempt.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import re
 import sys
 import tempfile
@@ -57,10 +81,17 @@ from pathlib import Path
 
 SCOPE_GLOBS = (
     "dcentrald/dcentrald-hal/src/psu*.rs",
-    "dcentrald/dcentrald-hal/src/voltage_rail_adapters.rs",
+    # 2026-08-07 (Round-16 B6): corrected from `dcentrald-hal/src/`, which had
+    # matched ZERO files since the gate shipped. See SCOPE CHECK above.
+    "dcentrald/dcentrald-asic/src/voltage_rail_adapters.rs",
     "dcentrald/dcentrald-asic/src/pic/*.rs",
     "dcentrald/dcentrald-asic/src/pic1704/*.rs",
     "dcentrald/dcentrald-asic/src/dspic/*.rs",
+    # 2026-08-07 (Round-16 B6): thermal actuation is a safety-critical control
+    # surface in the same "complete pub backend, zero production constructions"
+    # class as the PSU drivers. 36 of its 38 pub types are live; the residue is
+    # adjudicated individually in TOLERATED_ORPHANS below.
+    "dcentrald/dcentrald-thermal/src/*.rs",
 )
 
 # Method names never reported by the method check: constructor-shaped names are
@@ -223,7 +254,176 @@ TOLERATED_ORPHANS = {
         "2026-08-03: dspic/mod.rs:5195; conversion into the orphaned raw "
         "Pic0x89 wrapper (see its row); zero callers."
     ),
+    # ======================================================================
+    # Round-16 B6 census, adjudicated 2026-08-07. Two sources:
+    #   (a) the SCOPE_GLOBS dead-glob fix, which finally scanned
+    #       dcentrald-asic/src/voltage_rail_adapters.rs for the first time;
+    #   (b) the dcentrald-thermal/src widening (Round-15 A7's open item).
+    # Each row below was adjudicated individually against a COMPLETE,
+    # untruncated scan of all 2,618 `.rs` files under `projects/` (no
+    # `head`/`tail`/limit anywhere), cross-checked against the gate's own
+    # census. Round 15 retracted an orphan claim produced by a truncated
+    # `git grep | head -8`; an orphan gate is the one place where a truncated
+    # search MANUFACTURES the finding it reports.
+    # ======================================================================
+    #
+    # -- energization-shaped VoltageRail adapters (dead-glob discovery) -----
+    # These are the Apw12SmbusBackend class exactly: complete `pub` drivers
+    # with live set_mv/enable/disable, zero production constructions. They
+    # went unseen for four days because the scope entry naming their file
+    # pointed at the wrong crate. Wiring EITHER is a rail-risk change that
+    # needs its own review -- this ledger only makes them countable.
+    "DsPicVoltageRail": (
+        "2026-08-07: generic dsPIC33EP VoltageRail adapter "
+        "(dcentrald-asic/src/voltage_rail_adapters.rs:61); zero constructions "
+        "anywhere, production or test. The live AM2 path deliberately uses the "
+        "observed-firmware Pic0x89VoltageRail instead "
+        "(s19j_hybrid_mining.rs:1183). Kept because the structural contract "
+        "`asic_voltage_rail_adapters_module_exists_and_uses_policy` "
+        "(dcentrald-common/src/voltage_rail.rs:1402-1421) pins "
+        "`impl VoltageRail for DsPicVoltageRail` as required source: deleting "
+        "the type breaks that pin. Energization-shaped -- never wire casually."
+    ),
+    "Pic1704VoltageRail": (
+        "2026-08-07: PIC1704 VoltageRail adapter "
+        "(dcentrald-asic/src/voltage_rail_adapters.rs:299); zero constructions "
+        "anywhere. NECESSARILY orphaned: its only constructor takes "
+        "`&mut Pic1704Service`, and Pic1704Service is itself a pinned orphan "
+        "in this same ledger with zero constructions even in tests. It cannot "
+        "become live before Pic1704Service does. Same structural-contract pin "
+        "as the DsPicVoltageRail row (voltage_rail.rs:1412)."
+    ),
+    # -- deliberate, truth-contract-load-bearing non-instantiation ----------
+    "HeaterController": (
+        "2026-08-07: space-heater room-temp PID "
+        "(dcentrald-thermal/src/heater.rs:80); 2 constructions, both in its "
+        "own #[cfg(test)] module. DELIBERATE and LOAD-BEARING: "
+        "dcentrald-api/src/rest.rs:2798-2814 advertises "
+        "`target_temp_control: false` BECAUSE this controller is not "
+        "instantiated and no room-temp setpoint endpoint exists, and it "
+        "explicitly forbids flipping that capability true without first "
+        "wiring a live closed-loop controller AND a setpoint endpoint AND "
+        "preserving the PWM<=30 home cap. Wiring this type is a product + "
+        "safety-envelope change, not a lint fix. Do NOT delete: the REST "
+        "truth-contract comment cites it by name."
+    ),
+    # -- genuine orphans: visible debt, adjudicated, NOT silently deleted ---
+    "ThermalError": (
+        "2026-08-07: crate error enum (dcentrald-thermal/src/lib.rs:53). "
+        "Genuine orphan, wider than the gate can see: a complete scan of all "
+        "2,618 `.rs` files under projects/ finds NO function in "
+        "dcentrald-thermal returning `Result<..>` at all, and NO variant of "
+        "ThermalError constructed anywhere. Its only reference outside the "
+        "definition is the `#[from]` bridge at dcentrald/src/error.rs:30, "
+        "which therefore can never fire. Not a safety gap -- the thermal "
+        "safety path signals through ThermalAction / SupervisorAction, not "
+        "Result. Deletion is the right end state but must also remove "
+        "DaemonError::Thermal, which is outside dcentrald-thermal."
+    ),
+    "ThermalController::exit_sleep": (
+        "2026-08-07: controller.rs:960; zero references anywhere, even tests. "
+        "NOT the dangerous asymmetry it looks like: its sibling "
+        "ThermalController::enter_sleep (:954) is ALSO production-unreachable "
+        "-- every production sleep/wake call site (daemon.rs x7, "
+        "dcentrald-api/src/rest/late.rs:10748) targets the identically-named "
+        "CurtailmentController::enter_sleep (curtailment.rs:55). The gate "
+        "cannot see that because its method check is textual, so the sibling "
+        "is masked as live (see the method-name-collision limitation above). "
+        "ThermalState::Sleep is never entered in production, so there is no "
+        "stuck-asleep hazard. Dormant pair; adjudicate delete-or-wire "
+        "together, never one half alone."
+    ),
+    "ThermalController::is_temp_stale": (
+        "2026-08-07: controller.rs:974; zero callers. NOT a safety wiring gap "
+        "-- the live update() path already performs this check inline at "
+        "controller.rs:564 and :672 against TEMP_STALE_TIMEOUT_S, driving "
+        "fans to profile max and requesting EmergencyShutdown. The "
+        "2026-03-25 swarm review's recommendation to 'wire is_temp_stale() "
+        "into the daemon watchdog loop' is superseded by that inline net. "
+        "DRIFT HAZARD, recorded not fixed: this accessor hardcodes the "
+        "literal `30` while the live path uses TEMP_STALE_TIMEOUT_S (=30 "
+        "today). If the constant ever moves, the public predicate silently "
+        "disagrees with the enforced behaviour. Fix = use the constant, or "
+        "delete the accessor."
+    ),
+    "OffGridController::smoothed_voltage": (
+        "2026-08-07: offgrid.rs:528; zero callers. Redundant public accessor "
+        "-- the underlying field is used 12x inside offgrid.rs and is already "
+        "surfaced to consumers through OffGridTelemetry.bus_voltage_v "
+        "(offgrid.rs:457, :498), which IS live (daemon.rs:6357). Lowest-risk "
+        "row in this batch; safe to delete whenever someone touches the file."
+    ),
+    "ThermalProfile::s19j_pro_industrial": (
+        "2026-08-07: profiles.rs:103; zero references anywhere. NOT an "
+        "energization gap: production never calls ANY named ThermalProfile "
+        "constructor -- daemon.rs:10498 and serial_mining.rs:8563 both build "
+        "the struct literally from TOML config, so the shipped S19j Pro "
+        "envelope comes from config, not from here. home_quiet()/hacker() "
+        "escape this gate only because tests reference them. REFERENCE-DRIFT "
+        "HAZARD, recorded not fixed: this constructor encodes a researched, "
+        "sourced envelope (target 60C / hot 80C / dangerous 90C / fan_max 80, "
+        "attributed to the Phase-1 Agent-7 probe + bosminer TEMPCTRL) and "
+        "NOTHING asserts the shipped am2-s19jpro config defaults match it. "
+        "The right fix is a config-vs-constructor pin, not deletion."
+    ),
+    "SupervisorAction::is_hash_cut": (
+        "2026-08-07: supervisor.rs:235; zero callers. Added by Round-15 A3 as "
+        "the documentation sibling of is_fan_request(), which IS called by "
+        "filter_actions_for_declared_medium (supervisor.rs:267). The comment "
+        "at supervisor.rs:2750 only DESCRIBES that is_hash_cut() actions "
+        "survive medium filtering; no assertion calls it. Deliberately kept "
+        "as a visible orphan rather than silenced: the whole cooling-medium "
+        "axis still has zero production consumers (Round-15 A9 F-9), and this "
+        "row is the only automated signal of that. Turning the :2750 comment "
+        "into an is_hash_cut() assertion is the right fix, and belongs with "
+        "the work that gives the axis a real consumer -- not a drive-by that "
+        "removes the signal while the axis stays unconsumed."
+    ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Allowlist reason quality. A dated, substantive reason is the whole value of
+# the ledger: it is what stops a future "cleanup" wave from deleting a
+# deliberate fail-closed scaffold, and what stops a real orphan from hiding
+# behind a bare name. Blanking a reason must FAIL, not silently pass.
+# ---------------------------------------------------------------------------
+
+# Floor set to catch BLANK and bare-stub reasons, not to grade prose. The
+# terse-but-adequate rows ("2026-08-03: dspic/mod.rs:4970; predicate with zero
+# callers.", 59 chars) still pass; "", "TODO", "wired later" and a bare name
+# do not. The dated `YYYY-MM-DD: ` prefix is the stronger of the two signals.
+ALLOWLIST_REASON_MIN_CHARS = 40
+DATED_REASON_RE = re.compile(r"^\s*20\d{2}-\d{2}-\d{2}:\s*\S")
+
+
+def verify_allowlist_reasons() -> bool:
+    ok = True
+    for name, reason in TOLERATED_ORPHANS.items():
+        if not isinstance(reason, str) or not DATED_REASON_RE.match(reason):
+            ok = False
+            print(
+                f"NO_ORPHAN_POWER_BACKEND_FAIL allowlist row {name!r} has no "
+                "dated reason. Every TOLERATED_ORPHANS value must begin "
+                "'YYYY-MM-DD: ' and explain WHY the backend must ship "
+                "unreachable. A row without a reason cannot be adjudicated by "
+                "the next reader and will be deleted by the next cleanup wave "
+                "-- which is how a deliberate fail-closed scaffold gets "
+                "silently wired or removed.",
+                file=sys.stderr,
+            )
+            continue
+        if len(reason.strip()) < ALLOWLIST_REASON_MIN_CHARS:
+            ok = False
+            print(
+                f"NO_ORPHAN_POWER_BACKEND_FAIL allowlist row {name!r} has a "
+                f"stub reason ({len(reason.strip())} chars, minimum "
+                f"{ALLOWLIST_REASON_MIN_CHARS}). State the evidence: where the "
+                "constructions are, why production has none, and what wiring "
+                "it would cost.",
+                file=sys.stderr,
+            )
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +619,8 @@ class Census:
     methods_checked: int = 0
     orphans: list[Finding] = field(default_factory=list)
     live: dict[str, str] = field(default_factory=dict)  # type -> first prod evidence
+    scoped_files: int = 0
+    empty_globs: list[str] = field(default_factory=list)
 
 
 def construction_re(type_name: str) -> re.Pattern:
@@ -447,14 +649,19 @@ def run_census(project_root: Path) -> Census:
     ]
     by_path = {f.path.resolve(): f for f in files}
 
+    census = Census()
+
     scoped: list[SourceFile] = []
     for glob in SCOPE_GLOBS:
+        matched = 0
         for p in sorted(project_root.glob(glob)):
             sf = by_path.get(p.resolve())
             if sf is not None:
                 scoped.append(sf)
-
-    census = Census()
+                matched += 1
+        if matched == 0:
+            census.empty_globs.append(glob)
+    census.scoped_files = len(scoped)
 
     # ---- pass 1: type-level construction reachability --------------------
     type_defs: list[tuple[str, SourceFile, int]] = []
@@ -545,7 +752,20 @@ def run_census(project_root: Path) -> Census:
 
 def verify(census: Census) -> bool:
     found = {f.name: f for f in census.orphans}
-    ok = True
+    ok = verify_allowlist_reasons()
+
+    for glob in census.empty_globs:
+        ok = False
+        print(
+            f"NO_ORPHAN_POWER_BACKEND_FAIL dead scope glob {glob!r} matches "
+            "ZERO files. A scope entry that silently matches nothing is this "
+            "gate's own failure mode: everything it was supposed to cover is "
+            "unscanned while the gate still reports OK. Either correct the "
+            "path (a crate move is the usual cause -- "
+            "voltage_rail_adapters.rs moved hal -> asic) or delete the entry "
+            "deliberately.",
+            file=sys.stderr,
+        )
 
     for f in census.orphans:
         if f.name in TOLERATED_ORPHANS:
@@ -577,6 +797,8 @@ def verify(census: Census) -> bool:
         tolerated = sum(1 for f in census.orphans if f.name in TOLERATED_ORPHANS)
         print(
             "NO_ORPHAN_POWER_BACKEND_OK "
+            f"scope_globs={len(SCOPE_GLOBS)} "
+            f"scoped_files={census.scoped_files} "
             f"types={len(census.types_checked)} "
             f"methods={census.methods_checked} "
             f"orphans_tolerated={tolerated} new_orphans=0"
@@ -598,6 +820,19 @@ def print_current(census: Census) -> None:
 # ---------------------------------------------------------------------------
 # Self-test: synthetic fixture proves both detection directions.
 # ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _silenced():
+    """Swallow stdout/stderr while running an EXPECTED-FAIL negative control.
+
+    Without this the self-test prints real-looking FAIL lines -- and even a
+    stray `NO_ORPHAN_POWER_BACKEND_OK` from the clean-census control -- into
+    CI logs that are grepped for exactly those sentinels.
+    """
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        yield
+
 
 def self_test() -> bool:
     with tempfile.TemporaryDirectory(prefix="dcentos-orphan-gate-") as tmp:
@@ -681,6 +916,118 @@ def self_test() -> bool:
                 file=sys.stderr,
             )
             return False
+
+        # -- SCOPE CHECK negative control: a glob matching nothing must be
+        #    reported, not silently ignored (the Round-16 B6 defect).
+        with _mock.patch.object(
+            sys.modules[__name__],
+            "SCOPE_GLOBS",
+            (
+                "dcentrald/dcentrald-hal/src/psu*.rs",
+                "dcentrald/dcentrald-hal/src/this_file_does_not_exist.rs",
+            ),
+        ):
+            dead = run_census(root)
+        if "dcentrald/dcentrald-hal/src/this_file_does_not_exist.rs" not in (
+            dead.empty_globs
+        ):
+            print(
+                "NO_ORPHAN_SELFTEST_FAILED: a SCOPE_GLOBS entry matching zero "
+                f"files was not reported (empty_globs={dead.empty_globs}). A "
+                "dead scope glob silently unscans everything it named.",
+                file=sys.stderr,
+            )
+            return False
+        if not dead.orphans and dead.scoped_files == 0:
+            print(
+                "NO_ORPHAN_SELFTEST_FAILED: dead-glob fixture scanned nothing "
+                "at all, so the control proves nothing",
+                file=sys.stderr,
+            )
+            return False
+
+    # verify() must REFUSE on a dead glob even when nothing else is wrong.
+    # Synthetic census + empty allowlist isolates the scope check from the
+    # real ledger (a fixture census would otherwise report every real row
+    # stale and mask which check actually fired).
+    clean = Census()
+    clean.empty_globs = ["dcentrald/definitely/not/here/*.rs"]
+    with _mock.patch.dict(
+        sys.modules[__name__].TOLERATED_ORPHANS, {}, clear=True
+    ):
+        with _silenced():
+            dead_glob_refused = not verify(clean)
+            clean_census_accepted = verify(Census())
+    if not dead_glob_refused:
+        print(
+            "NO_ORPHAN_SELFTEST_FAILED: verify() returned OK despite a dead "
+            "scope glob and no other finding",
+            file=sys.stderr,
+        )
+        return False
+    if not clean_census_accepted:
+        print(
+            "NO_ORPHAN_SELFTEST_FAILED: verify() rejected a clean census with "
+            "no dead globs -- the scope check is over-firing",
+            file=sys.stderr,
+        )
+        return False
+
+    # -- REASON CHECK negative control: a blank / undated reason must FAIL.
+    real = dict(TOLERATED_ORPHANS)
+    if not real:
+        print(
+            "NO_ORPHAN_SELFTEST_FAILED: TOLERATED_ORPHANS is empty",
+            file=sys.stderr,
+        )
+        return False
+    if not verify_allowlist_reasons():
+        print(
+            "NO_ORPHAN_SELFTEST_FAILED: the real allowlist does not satisfy "
+            "its own reason-quality rule",
+            file=sys.stderr,
+        )
+        return False
+    victim = next(iter(real))
+    # Three controls, one per failure mode the reason check must cover:
+    #   ""              -> reason deleted outright
+    #   "wired later"   -> short prose, no date
+    #   "2026-08-07: x" -> correctly DATED but contentless. Isolates the
+    #                      MIN_CHARS rule: without it, setting MIN_CHARS to 0
+    #                      leaves the self-test green (B6 mutation M6).
+    #   long-but-undated-> isolates the DATED_REASON_RE rule: without it,
+    #                      neutering the regex leaves the self-test green,
+    #                      because MIN_CHARS alone still catches the three
+    #                      short controls (B6 mutation M7).
+    # Each control must be caught by exactly the sub-rule it targets; two
+    # overlapping rules with only overlapping controls verify neither.
+    for bad_reason, label in (
+        ("", "blank"),
+        ("wired later", "undated stub"),
+        ("2026-08-07: x", "dated but contentless"),
+        (
+            "space-heater room-temp PID; deliberate non-instantiation per the "
+            "REST truth contract, do not wire without a setpoint endpoint",
+            "substantive but undated",
+        ),
+    ):
+        with _mock.patch.dict(
+            sys.modules[__name__].TOLERATED_ORPHANS,
+            {victim: bad_reason},
+            clear=False,
+        ):
+            with _silenced():
+                stub_accepted = verify_allowlist_reasons()
+            if stub_accepted:
+                print(
+                    f"NO_ORPHAN_SELFTEST_FAILED: a {label} reason on "
+                    f"{victim!r} passed the reason check. Stripping the WHY "
+                    "must fail loudly -- that is what stops a cleanup wave "
+                    "from deleting a deliberate fail-closed scaffold.",
+                    file=sys.stderr,
+                )
+                return False
+
     print("NO_ORPHAN_SELFTEST_OK")
     return True
 

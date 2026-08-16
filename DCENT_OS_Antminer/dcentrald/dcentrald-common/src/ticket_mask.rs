@@ -79,7 +79,7 @@ pub fn ticket_mask_esp_miner_pow2_floor(difficulty: u32) -> u32 {
 pub fn ticket_mask_encoding_for_chip_id(chip_id: u16) -> TicketMaskEncoding {
     match chip_id {
         // Bit-reversed family (jig / Braiins / BM1397 pure / BM1391 set_TM).
-        0x1387 | 0x1391 | 0x1397 | 0x1398 => TicketMaskEncoding::BitReversed,
+        0x1387 | 0x1391 | 0x1393 | 0x1397 | 0x1398 => TicketMaskEncoding::BitReversed,
         // BM136x industrial plain (fixture 0x7F @ diff 128).
         0x1362 | 0x1366 | 0x1368 | 0x1370 | 0x1373 => TicketMaskEncoding::PlainDiffMinusOne,
         // BM1489: plain (wave-8 unconfirmed vs BM1485 bit-reversed predecessor).
@@ -179,7 +179,12 @@ mod tests {
             ticket_mask_encoding_for_chip_id(0x1391),
             TicketMaskEncoding::BitReversed
         );
+        assert_eq!(
+            ticket_mask_encoding_for_chip_id(0x1393),
+            TicketMaskEncoding::BitReversed
+        );
         assert_eq!(resolve_ticket_mask(0x1391, 64), 0xFC);
+        assert_eq!(resolve_ticket_mask(0x1393, 64), 0xFC);
         assert_eq!(bit_reverse_u32_bytewise(0x0000_003F), 0x0000_00FC);
         assert_eq!(bit_reverse_u32_bytewise(0xFFFF_FFFF), 0xFFFF_FFFF);
 

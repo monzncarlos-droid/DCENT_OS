@@ -494,9 +494,9 @@ struct MinerTypeResponse {
     voltage_fixed: bool,
     /// `true` ⇒ per-chain `mix_levels` supported (BHB42611 only).
     mix_levels_supported: bool,
-    /// `true` ⇒ requires APW12+ register-based PSU protocol (high-bin
-    /// + repair-class 4000W+ envelopes).
-    requires_apw12_plus: bool,
+    /// Three-state PSU binding: true/false only when exact evidence settles
+    /// it; null means unresolved and remains an install/cold-boot blocker.
+    requires_apw12_plus: Option<bool>,
     /// `true` ⇒ inverted curve (freq↓ ⇒ volt↑). BHB42841 only.
     inverted_curve: bool,
     /// Number of mining chains for the detected SKU (3 for BHB42803,
@@ -576,7 +576,7 @@ struct PvtEnvelope {
     freq_max_mhz: u16,
     voltage_fixed: bool,
     mix_levels: bool,
-    requires_apw12_plus: bool,
+    requires_apw12_plus: Option<bool>,
     inverted_curve: bool,
     chain_count: u8,
     asics_per_chain: u8,
@@ -592,7 +592,7 @@ impl Default for PvtEnvelope {
             freq_max_mhz: 0,
             voltage_fixed: false,
             mix_levels: false,
-            requires_apw12_plus: false,
+            requires_apw12_plus: None,
             inverted_curve: false,
             chain_count: 0,
             asics_per_chain: 0,
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(env.freq_min_mhz, 0);
         assert_eq!(env.freq_max_mhz, 0);
         assert!(!env.voltage_fixed);
-        assert!(!env.requires_apw12_plus);
+        assert_eq!(env.requires_apw12_plus, None);
         assert_eq!(env.chain_count, 0);
         assert_eq!(env.asics_per_chain, 0);
     }
@@ -1025,17 +1025,17 @@ mod tests {
         assert_eq!(env.chain_count, 4);
         assert_eq!(env.asics_per_chain, 126);
         assert!(!env.voltage_fixed);
-        assert!(!env.requires_apw12_plus);
+        assert_eq!(env.requires_apw12_plus, Some(false));
         assert!(!env.inverted_curve);
         assert!(!env.mix_levels);
     }
 
     #[test]
-    fn derive_pvt_envelope_bhb42803_voltage_fixed_apw12_plus() {
+    fn derive_pvt_envelope_bhb42803_voltage_fixed_psu_unresolved() {
         let env = derive_pvt_envelope("BHB42803");
         assert_eq!(env.grade, "single-voltage");
         assert!(env.voltage_fixed);
-        assert!(env.requires_apw12_plus);
+        assert_eq!(env.requires_apw12_plus, None);
         assert_eq!(env.chain_count, 3);
         assert_eq!(env.asics_per_chain, 84);
         assert_eq!(env.voltage_min_mv, 1530);
@@ -1079,7 +1079,7 @@ mod tests {
             pvt_freq_max_mhz: 545,
             voltage_fixed: false,
             mix_levels_supported: false,
-            requires_apw12_plus: false,
+            requires_apw12_plus: Some(false),
             inverted_curve: false,
             sku_chain_count: 4,
             sku_asics_per_chain: 126,

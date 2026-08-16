@@ -2,7 +2,7 @@
   "schema_version": 1,
   "miner_model": "antminer_s19",
   "hashboard": "BHB42821",
-  "chip": "bm1366",
+  "chip": "bm1362",
   "source": {
     "vendor": "bitmain",
     "firmware_version": "S19jPro_stock_2022-12-26",

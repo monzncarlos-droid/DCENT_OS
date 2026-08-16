@@ -153,6 +153,39 @@ def admit_manifest(path: Path) -> dict[str, Any]:
     return value
 
 
+def require_payload_binding(
+    manifest: dict[str, Any],
+    payload_name: str,
+    expected_path: str,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    """Require one payload object's path, size, and digest as a typed tuple.
+
+    Mutation authority must never be inferred from matching strings elsewhere
+    in the document: that would admit swapped kernel/rootfs hashes or decoy
+    values in unrelated fields.
+    """
+
+    payloads = manifest.get("payloads")
+    if not isinstance(payloads, dict):
+        raise AdmissionError("payloads must be a JSON object")
+    payload = payloads.get(payload_name)
+    if not isinstance(payload, dict):
+        raise AdmissionError(f"payloads.{payload_name} must be a JSON object")
+    expected = {
+        "path": expected_path,
+        "size": expected_size,
+        "sha256": expected_sha256,
+    }
+    for field, expected_value in expected.items():
+        actual = payload.get(field)
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            raise AdmissionError(
+                f"payloads.{payload_name}.{field} does not match the exact payload"
+            )
+
+
 def _bounded_parts(value: str, separator: str) -> list[str]:
     parts = re.split(separator, value)
     if len(parts) > MAX_VERSION_PARTS:
@@ -277,14 +310,28 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser.add_argument("current")
     read_parser = subparsers.add_parser("read-version-file")
     read_parser.add_argument("path", type=Path)
+    payload_parser = subparsers.add_parser("verify-payload")
+    payload_parser.add_argument("manifest", type=Path)
+    payload_parser.add_argument("payload_name")
+    payload_parser.add_argument("expected_path")
+    payload_parser.add_argument("expected_size", type=int)
+    payload_parser.add_argument("expected_sha256")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             admit_manifest(args.manifest)
         elif args.command == "compare-version":
             print(compare_versions(args.candidate, args.current))
-        else:
+        elif args.command == "read-version-file":
             print(read_version_file(args.path))
+        else:
+            require_payload_binding(
+                admit_manifest(args.manifest),
+                args.payload_name,
+                args.expected_path,
+                args.expected_size,
+                args.expected_sha256,
+            )
     except AdmissionError as exc:
         print(f"sysupgrade manifest admission: {exc}", file=sys.stderr)
         return 2

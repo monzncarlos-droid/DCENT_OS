@@ -14,7 +14,7 @@ export type InstallCapability = typeof INSTALL_CAPABILITY_VALUES[number];
 export const PLANNER_OUTCOME_VALUES = ['supported', 'ota-supported', 'runtime-only', 'evidence-gap'] as const;
 export type PlannerOutcome = typeof PLANNER_OUTCOME_VALUES[number];
 
-export const PROOF_SCOPE_VALUES = ['exact_target', 'exact_target_lab_only', 'passthrough_only', 'physical_media_required', 'upload_only_boot_pending'] as const;
+export const PROOF_SCOPE_VALUES = ['exact_target', 'exact_target_lab_only', 'local_artifact_only', 'passthrough_only', 'physical_media_required', 'upload_only_boot_pending'] as const;
 export type ProofScope = typeof PROOF_SCOPE_VALUES[number];
 
 export const DEVICE_FAMILY_VALUES = ['antminer', 'esp', 'whatsminer', 'avalon', 'innosilicon', 'unknown'] as const;

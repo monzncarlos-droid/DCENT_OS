@@ -15,8 +15,9 @@
 //!
 //! Every platform has its own PSU enable pin, hashboard reset pins,
 //! plug-detect pins, fan tachometer pins, and LED pins. RE2 §8.6 cross-
-//! references the PSU enable pin specifically; this module is the
-//! authoritative table for the rest.
+//! references the PSU enable pin specifically. This module preserves the
+//! source-catalog table; it does not independently prove a live carrier,
+//! polarity, safe electrical composition, or mutation authority.
 //!
 //! Routing rules:
 //! - The **stock** CV1835 `S19j Pro` PSU enable is GPIO 412 (PWR_EN).
@@ -255,21 +256,95 @@ pub enum ControlBoardGpioMap {
     BraiinsBbb(BraiinsBbbGpioMap),
 }
 
+/// Source-level capability ceiling for one control-board GPIO map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpioMapCapabilityState {
+    /// Exact source-catalog pins are retained, but model/live composition is
+    /// not established by this registry.
+    CatalogPinsOnly,
+    /// PSU control is mediated by FPGA fabric and has no sysfs GPIO number.
+    FpgaMediatedNoSysfsPsuPin,
+}
+
+/// Exact, non-authorizing capability record for a GPIO-map identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GpioMapCapability {
+    pub platform: &'static str,
+    pub state: GpioMapCapabilityState,
+    pub psu_enable_pin: GpioPin,
+    pub exact_live_carrier_verified: bool,
+    pub polarity_verified: bool,
+    pub runtime_admission_authorized: bool,
+    pub mutation_authorized: bool,
+}
+
 impl ControlBoardGpioMap {
-    /// PSU enable GPIO pin for this platform.
-    pub const fn psu_enable_pin(&self) -> u32 {
+    /// Source-catalog PSU-enable GPIO pin for this platform.
+    ///
+    /// `None` means the function is not a sysfs GPIO. It must never be
+    /// replaced with a numeric sentinel because GPIO 0 is a valid pin number.
+    pub const fn psu_enable_pin(&self) -> GpioPin {
         match self {
-            ControlBoardGpioMap::Cv1835(m) => m.pwr_en,
-            ControlBoardGpioMap::Am335x(m) => m.psu_en,
-            ControlBoardGpioMap::Amlogic(m) => m.pwr_en,
-            ControlBoardGpioMap::Zynq(m) => m.psu_en,
+            ControlBoardGpioMap::Cv1835(m) => Some(m.pwr_en),
+            ControlBoardGpioMap::Am335x(m) => Some(m.psu_en),
+            ControlBoardGpioMap::Amlogic(m) => Some(m.pwr_en),
+            ControlBoardGpioMap::Zynq(m) => Some(m.psu_en),
             // Braiins BBB PSU enable is FPGA-mediated (board control
-            // block 0x42810000 per RE2 §8.6 row 5). Return 0 as a
-            // sentinel — callers must handle this specially.
-            ControlBoardGpioMap::BraiinsBbb(_) => 0,
+            // block 0x42810000 per RE2 §8.6 row 5).
+            ControlBoardGpioMap::BraiinsBbb(_) => None,
         }
     }
 }
+
+/// Exhaustive source capability ceiling for the five canonical GPIO maps.
+pub const GPIO_MAP_CAPABILITIES: &[GpioMapCapability] = &[
+    GpioMapCapability {
+        platform: "Cv1835GpioMap",
+        state: GpioMapCapabilityState::CatalogPinsOnly,
+        psu_enable_pin: Some(Cv1835GpioMap::STANDARD.pwr_en),
+        exact_live_carrier_verified: false,
+        polarity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    GpioMapCapability {
+        platform: "Am335xGpioMap",
+        state: GpioMapCapabilityState::CatalogPinsOnly,
+        psu_enable_pin: Some(Am335xGpioMap::STANDARD.psu_en),
+        exact_live_carrier_verified: false,
+        polarity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    GpioMapCapability {
+        platform: "AmlogicGpioMap",
+        state: GpioMapCapabilityState::CatalogPinsOnly,
+        psu_enable_pin: Some(AmlogicGpioMap::STANDARD.pwr_en),
+        exact_live_carrier_verified: false,
+        polarity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    GpioMapCapability {
+        platform: "ZynqGpioMap",
+        state: GpioMapCapabilityState::CatalogPinsOnly,
+        psu_enable_pin: Some(ZynqGpioMap::STANDARD.psu_en),
+        exact_live_carrier_verified: false,
+        polarity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+    GpioMapCapability {
+        platform: "BraiinsBbbGpioMap",
+        state: GpioMapCapabilityState::FpgaMediatedNoSysfsPsuPin,
+        psu_enable_pin: None,
+        exact_live_carrier_verified: false,
+        polarity_verified: false,
+        runtime_admission_authorized: false,
+        mutation_authorized: false,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -374,12 +449,11 @@ mod tests {
     }
 
     #[test]
-    fn braiins_bbb_psu_enable_returns_zero_sentinel() {
+    fn braiins_bbb_psu_enable_has_no_numeric_sentinel() {
         // Braiins BBB routes PSU enable through the FPGA board control
-        // block; there's no sysfs GPIO. The wrapper returns 0 as a
-        // sentinel so callers know to switch paths.
+        // block; there is no sysfs GPIO and no numeric sentinel.
         let bbb = ControlBoardGpioMap::BraiinsBbb(BraiinsBbbGpioMap::STANDARD);
-        assert_eq!(bbb.psu_enable_pin(), 0);
+        assert_eq!(bbb.psu_enable_pin(), None);
     }
 
     #[test]
@@ -388,20 +462,44 @@ mod tests {
         // platform map.
         assert_eq!(
             ControlBoardGpioMap::Cv1835(Cv1835GpioMap::STANDARD).psu_enable_pin(),
-            412
+            Some(412)
         );
         assert_eq!(
             ControlBoardGpioMap::Am335x(Am335xGpioMap::STANDARD).psu_enable_pin(),
-            65
+            Some(65)
         );
         assert_eq!(
             ControlBoardGpioMap::Amlogic(AmlogicGpioMap::STANDARD).psu_enable_pin(),
-            437
+            Some(437)
         );
         assert_eq!(
             ControlBoardGpioMap::Zynq(ZynqGpioMap::STANDARD).psu_enable_pin(),
-            907
+            Some(907)
         );
+    }
+
+    #[test]
+    fn gpio_map_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        assert_eq!(GPIO_MAP_CAPABILITIES.len(), 5);
+        let platforms: std::collections::BTreeSet<&str> = GPIO_MAP_CAPABILITIES
+            .iter()
+            .map(|capability| capability.platform)
+            .collect();
+        assert_eq!(platforms.len(), GPIO_MAP_CAPABILITIES.len());
+
+        for capability in GPIO_MAP_CAPABILITIES {
+            assert!(!capability.exact_live_carrier_verified);
+            assert!(!capability.polarity_verified);
+            assert!(!capability.runtime_admission_authorized);
+            assert!(!capability.mutation_authorized);
+        }
+
+        let bbb = GPIO_MAP_CAPABILITIES
+            .iter()
+            .find(|capability| capability.platform == "BraiinsBbbGpioMap")
+            .unwrap();
+        assert_eq!(bbb.psu_enable_pin, None);
+        assert_eq!(bbb.state, GpioMapCapabilityState::FpgaMediatedNoSysfsPsuPin);
     }
 
     #[test]

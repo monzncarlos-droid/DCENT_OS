@@ -52,9 +52,11 @@
 //! This resolver answers "WHERE is the line" and nothing else. It carries no
 //! active-low/active-high notion, and the migration below must not either:
 //!
-//! - `gpio437` (Amlogic PSU enable): polarity is **UNRESOLVED** (ePIC writes
-//!   1 to disable; we record 1 = ON; neither side has measured a rail — needs
-//!   a DMM). Changing addressing must not encode a polarity opinion.
+//! - `gpio437` (Amlogic PSU enable): polarity is **board_target-scoped**,
+//!   not one Amlogic fact. am3-s19k / Braiins S19k Pro is active-LOW
+//!   (`0=ON`, `1=OFF`; software+log CLOSED, DMM rail still EXPERIMENTAL).
+//!   S21-class NoPic SafeOff remains `0`. This resolver must not encode
+//!   either opinion — see `s19k_am3_gpio437`.
 //! - `gpio907` (AM2 Zynq PWR_CONTROL): live-proven ACTIVE-LOW on both S17
 //!   Pro and S19 Pro jigs, yet the shipped `ACTIVE_HIGH` constant is
 //!   **deliberately kept** (removing it once made safe-off inoperative; flip
@@ -67,13 +69,18 @@
 //! concurrent session). The rewiring pass, to be done as ONE reviewable
 //! change per platform, is:
 //!
-//! 1. `platform/amlogic/mod.rs` — `GPIO_PSU_ENABLE = 437`,
-//!    `GPIO_PLUG_BASE = 439` (..441), `GPIO_RESET_BASE = 454` (..456),
-//!    `GPIO_FAN_TACH_BASE = 447` (..450), `GPIO_PINMUX_FIX = [476, 477]`,
-//!    LEDs 438/453. Replace each raw `N` with
+//! 1. `platform/amlogic/mod.rs` — `GPIO_PSU_ENABLE = 437` (:
+//!    `PWR_CONTROL`), `GPIO_PLUG_BASE = 439` (..441) (: `CH0_PLUG`/
+//!    `CH1_PLUG`/`CH2_PLUG`), `GPIO_RESET_BASE = 454` (..456) (:
+//!    `HB0_RESET`/`HB1_RESET`/`HB2_RESET`), `GPIO_FAN_TACH_BASE = 447` (..450)
+//!    (: `FAN_FRONT_SPEED0/1`, `FAN_REAR_SPEED0/1`),
+//!    `GPIO_PINMUX_FIX = [476, 477]` (: `I2C_SCL`/`I2C_SDA`),
+//!    LEDs 438/453 (: `LED_RED`/`LED_GREEN`). Remaining integer
+//!    call sites: none on the Amlogic gpiolib map. Replace each
+//!    remaining raw `N` with
 //!    `resolve_name_or_legacy("<dt-name>", N)` where `<dt-name>` is read from
 //!    OUR unit's live DT (`/proc/device-tree/.../gpio-line-names`), NOT from
-//!    ePIC's.
+//!    ePIC's. Do not use Zynq `HB0_PLUG` as the Amlogic plug name.
 //! 2. `board_control.rs` — `AM2_PSU_ENABLE_GPIO = 907` (PS bank e000a000)
 //!    and the PL bank window 897..=901. Same recipe; polarity untouched.
 //! 3. `psu_apw12_plus.rs` — `GPIO_PSU_ENABLE = 907`.

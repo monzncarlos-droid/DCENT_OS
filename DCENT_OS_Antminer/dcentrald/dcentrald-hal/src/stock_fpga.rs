@@ -150,7 +150,8 @@ pub const REG_CRC_ERROR_CNT: u32 = 0x0F8;
 
 /// DHASH accelerator control register.
 /// Idle: 0x00000020 (init flag), Mining: 0x00008160 (VIL + run).
-/// Bit 15 = VIL mode, Bit 12 = multi-midstate (AsicBoost), Bit 8 = run.
+/// Bit 15 = VIL, bits 11:8 = midstate count, bit 7 = new block,
+/// bit 6 = run, bit 5 = operation mode.
 pub const REG_DHASH_ACC_CONTROL: u32 = 0x100;
 
 /// Coinbase length + nonce2 length packed register.
@@ -158,6 +159,9 @@ pub const REG_COINBASE_AND_NONCE2_LENGTH: u32 = 0x104;
 
 /// Current nonce2 counter value.
 pub const REG_WORK_NONCE2: u32 = 0x108;
+
+/// High 32 bits of the exact S9/S9j nonce2 start value.
+pub const REG_WORK_NONCE2_HIGH: u32 = 0x10C;
 
 /// DMA base address for nonce2/jobid storage.
 /// Default: 0x1F000000.
@@ -173,14 +177,14 @@ pub const REG_JOB_START_ADDRESS: u32 = 0x118;
 /// Job data length in bytes (e.g., 0x340 = 832 bytes).
 pub const REG_JOB_LENGTH: u32 = 0x11C;
 
-/// Write 1 to signal FPGA that new job data is ready at JOB_START_ADDRESS.
-pub const REG_JOB_DATA_READY: u32 = 0x120;
-
 /// Current job ID (incremented by software for each new job).
 pub const REG_JOB_ID: u32 = 0x124;
 
-/// Block header version (with AsicBoost version bits).
-/// 4 consecutive registers for 4-way AsicBoost: 0x130, 0x134, 0x138, 0x13C.
+/// Block-header version / S9j AsicBoost lane zero.
+///
+/// Exact S9j lanes 1..3 are `0x164,0x168,0x16c`; `0x134` and `0x138` remain
+/// timestamp and target. Runtime four-way use is fail-closed until that page
+/// tail is admitted by a typed board/revision profile.
 pub const REG_BLOCK_HEADER_VERSION: u32 = 0x130;
 
 /// ntime value.
@@ -203,21 +207,45 @@ pub const PRE_HEADER_HASH_WORDS: usize = 8;
 /// VIL (Variable Input Length) mode bit.
 pub const DHASH_VIL_MODE: u32 = 1 << 15;
 
-/// New block flag bit.
-pub const DHASH_NEW_BLOCK: u32 = 1 << 13;
+/// Self-clearing new-block flag bit.
+pub const DHASH_NEW_BLOCK: u32 = 1 << 7;
 
-/// Multi-midstate enable (AsicBoost).
-pub const DHASH_MULTI_MIDSTATE: u32 = 1 << 12;
+/// S9j version-count transition flag. The exact job path asserts this while
+/// RUN is clear when the midstate count changes, then clears it in the final
+/// commit RMW.
+pub const DHASH_MIDSTATE_COUNT_CHANGE: u32 = 1 << 16;
 
 /// Run bit (DHASH accelerator running).
-pub const DHASH_RUN: u32 = 1 << 8;
+///
+/// Exact signed S17e/T17e miners clear and poll bit 6 at register `0x100`;
+/// the S9 live mining value `0x8160` carries the same bit. Bit 8 belongs to
+/// the midstate-count nibble and must not be used to stop the accelerator.
+pub const DHASH_RUN: u32 = 1 << 6;
 
-/// Init/ready flag.
-pub const DHASH_INIT: u32 = 1 << 5;
+/// Exact maximum acknowledgement polls after clearing [`DHASH_RUN`].
+pub const DHASH_STOP_MAX_POLLS: usize = 10;
 
-/// Typical mining control value: VIL + run + init.
-/// From live probe: 0x8160 = VIL(15) | run(8) | bits 6:5.
+/// Exact S9j delay between write/readback attempts in the recovered DHASH
+/// setter. S17e/T17e use 1 ms; the S9/BM1387 lane must use its local 2 ms
+/// evidence so it does not reject a valid slow acknowledgement.
+pub const DHASH_STOP_POLL_DELAY_MS: u64 = 2;
+
+/// Operation-mode flag.
+pub const DHASH_OPERATION_MODE: u32 = 1 << 5;
+
+/// Typical mining control value: VIL + count one + run + operation.
+/// From live probe: 0x8160 = VIL(15) | count-one bit(8) | run(6) | operation(5).
 pub const DHASH_MINING_VIL: u32 = 0x8160;
+
+#[inline]
+pub const fn dhash_stop_value(current: u32) -> u32 {
+    current & !DHASH_RUN
+}
+
+#[inline]
+pub const fn dhash_run_is_clear(current: u32) -> bool {
+    current & DHASH_RUN == 0
+}
 
 // ---------------------------------------------------------------------------
 // NONCE_FIFO_INTERRUPT bit definitions
@@ -468,5 +496,15 @@ mod tests {
             u32::MAX - 1,
             FPGA_REGS_SIZE
         ));
+    }
+
+    #[test]
+    fn dhash_stop_clears_run_bit_six_without_corrupting_midstate_count() {
+        assert_eq!(DHASH_NEW_BLOCK, 0x80);
+        assert_eq!(DHASH_MIDSTATE_COUNT_CHANGE, 0x1_0000);
+        assert_eq!(DHASH_RUN, 0x40);
+        assert_eq!(dhash_stop_value(DHASH_MINING_VIL), 0x8120);
+        assert!(dhash_run_is_clear(0x8120));
+        assert!(!dhash_run_is_clear(DHASH_MINING_VIL));
     }
 }

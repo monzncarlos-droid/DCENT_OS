@@ -3535,7 +3535,7 @@ export interface MinerTypeResponse {
   pvt_freq_max_mhz?: number;
   voltage_fixed?: boolean;
   mix_levels_supported?: boolean;
-  requires_apw12_plus?: boolean;
+  requires_apw12_plus?: boolean | null;
   inverted_curve?: boolean;
   sku_chain_count?: number;
   sku_asics_per_chain?: number;
@@ -3552,7 +3552,7 @@ export interface PvtTableResponse {
   grade: string;
   voltage_fixed: boolean;
   mix_levels: boolean;
-  requires_apw12_plus: boolean;
+  requires_apw12_plus: boolean | null;
   inverted_curve: boolean;
   chain_count: number;
   asics_per_chain: number;

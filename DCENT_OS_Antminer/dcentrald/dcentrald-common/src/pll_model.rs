@@ -212,23 +212,27 @@ pub fn pll_family_for_protocol(protocol: AsicProtocolIdentity) -> Option<PllFami
         // G19: BM1398 production pure encode (vendor dual-binary search SSOT).
         AsicProtocolIdentity::Bm1398 => Some(PllFamily::Bm1398),
         AsicProtocolIdentity::Bm1387 => Some(PllFamily::Bm1387),
-        // BM1396: production pure encode is NOT IMPLEMENTED offline (no die-bound
-        // goldens). Do **not** map to PllFamily::Bm1397 here — that would be a
-        // silent production alias (G12 anti-goal). Experimental family-hypothesis
-        // encode is a separate named API (see resolve_bm1396_pll_experimental_*).
+        // BM1396 has a separate fail-closed exact signed-firmware solver below.
+        // It is deliberately not a PllFamily::Bm1397 alias; generic transport
+        // planning dispatches to its exact named solver/plan instead.
         AsicProtocolIdentity::Bm1391
+        | AsicProtocolIdentity::Bm1393
         | AsicProtocolIdentity::Bm1396
         | AsicProtocolIdentity::RuntimeDiscovered => None,
     }
 }
 
 // ---------------------------------------------------------------------------
-// G42: BM1391 pure PLL (jig set_BM1391_freq@128F4 — named API, not protocol map)
+// G42: BM1391 S17-jig PLL (set_BM1391_freq@128F4 — not S15/T15 stock)
 // ---------------------------------------------------------------------------
 //
-// Bar: S17 jig `set_BM1391_freq` pack `0xC000_0000 | fb<<16 | ref<<8 | post_field`,
+// Bar: S17 jig `set_BM1391_freq` packs `0xC000_0000 | fb<<16 | ref<<8 | post_field`,
 // external divider @ 0x70 as (div-1), program order PLL0 → 10ms → 0x70 → 10ms →
 // PLL0 → 10ms. Search fails → held 200 MHz fallback `0xC078_0111` + div 15.
+// Exact S15/T15 stock uses the same fallback fields (`0x0078_0111`, /15) and
+// therefore the same 200 MHz frequency, but transforms the register payload to
+// `0x4078_0111` and programs divider → PLL0 → divider → PLL0 without these
+// jig delays. The two program plans and their top-bit encodings are not aliases.
 // `pll_family_for_protocol(Bm1391)` stays None (init fail-closed); ChipDriver thin-wraps.
 
 /// BM1391 PLL0 register (jig writes reg 0x08).
@@ -237,14 +241,17 @@ pub const BM1391_PLL0_REG: u8 = 0x08;
 /// BM1391 external PLL divider register (jig writes reg 0x70).
 pub const BM1391_PLL0_DIVIDER_REG: u8 = 0x70;
 
-/// Jig inter-write spacing (`usleep(10000)`).
-pub const BM1391_PLL_PROGRAM_SPACING_MS: u32 = 10;
+/// Held S17-jig inter-write spacing (`usleep(10000)`).
+pub const BM1391_S17_JIG_PLL_PROGRAM_SPACING_MS: u32 = 10;
 
-/// Jig "using 200M pll" fallback register (`0xC078_0111`).
-pub const BM1391_PLL_FALLBACK_200M: u32 = 0xC078_0111;
+/// Held S17-jig "using 200M pll" fallback register (`0xC078_0111`).
+pub const BM1391_S17_JIG_PLL_FALLBACK_200M: u32 = 0xC078_0111;
 
-/// External divider for 200 MHz fallback (jig `v30=15`, 0x70 gets 14).
-pub const BM1391_PLL_FALLBACK_EXTERNAL_DIV: u8 = 15;
+/// External divider for the held S17-jig 200 MHz fallback (`v30=15`).
+pub const BM1391_S17_JIG_PLL_FALLBACK_EXTERNAL_DIV: u8 = 15;
+
+/// Sibling-jig evidence does not authorize the exact S15/T15 stock plan.
+pub const BM1391_S17_JIG_PLL_AUTHORIZES_S15_T15_PROGRAMMING: bool = false;
 
 /// Pure BM1391 PLL solution (PLL0 + external divider).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,11 +277,11 @@ pub const fn bm1391_pll_pack(fb_div: u16, ref_div: u8, post_div1: u8, post_div2:
         | ((post_div2 as u32) & 0xF)
 }
 
-/// Pure: jig 200 MHz fallback solution.
+/// Pure: held S17-jig 200 MHz fallback solution.
 pub const fn bm1391_pll_fallback_200m() -> Bm1391PllSolution {
     Bm1391PllSolution {
-        pll0_register: BM1391_PLL_FALLBACK_200M,
-        external_div: BM1391_PLL_FALLBACK_EXTERNAL_DIV,
+        pll0_register: BM1391_S17_JIG_PLL_FALLBACK_200M,
+        external_div: BM1391_S17_JIG_PLL_FALLBACK_EXTERNAL_DIV,
         actual_freq_mhz: 200,
         fb_div: 120, // 0x78
         ref_div: 1,
@@ -340,7 +347,10 @@ pub fn bm1391_pll_search(target_mhz: u16) -> Option<Bm1391PllSolution> {
     best.map(|(_, s)| s)
 }
 
-/// Pure: resolve BM1391 PLL (search then jig 200 MHz fallback).
+/// Pure: resolve the held S17-jig BM1391 PLL (search then 200 MHz fallback).
+///
+/// This is not the exact S15/T15 stock solver or four-write startup plan. See
+/// [`crate::bm1391_stock_startup`] for that independently scoped contract.
 pub fn resolve_bm1391_pll(target_mhz: u16) -> Bm1391PllSolution {
     if target_mhz == 200 {
         // Jig-held exact: 25*120/(1*1*1)/15 = 200.
@@ -382,52 +392,194 @@ fn plan_bm1391_frequency_program_ops_target(
     };
     push(&mut ops, BM1391_PLL0_REG, pll0_register);
     ops.push(TransportOp::DelayMs {
-        ms: BM1391_PLL_PROGRAM_SPACING_MS,
+        ms: BM1391_S17_JIG_PLL_PROGRAM_SPACING_MS,
     });
     push(&mut ops, BM1391_PLL0_DIVIDER_REG, div_word);
     ops.push(TransportOp::DelayMs {
-        ms: BM1391_PLL_PROGRAM_SPACING_MS,
+        ms: BM1391_S17_JIG_PLL_PROGRAM_SPACING_MS,
     });
     push(&mut ops, BM1391_PLL0_REG, pll0_register);
     ops.push(TransportOp::DelayMs {
-        ms: BM1391_PLL_PROGRAM_SPACING_MS,
+        ms: BM1391_S17_JIG_PLL_PROGRAM_SPACING_MS,
     });
     ops
 }
 
 // ---------------------------------------------------------------------------
-// BM1396 pure PLL maturity (G12 — honesty-first, no silent production alias)
+// BM1396 exact signed-firmware runtime PLL solver
 // ---------------------------------------------------------------------------
 //
-// Corpus (PR-056 / 2026-05-16 disambiguation): BM1396 is a distinct chip ID
-// (0x1396, S17+/T17+) in the BM1397-era header/PLL *generation*, with **no
-// offline die-bound PLL table or ESP-Miner goldens** for 0x1396. Production
-// pure must stay fail-closed. ChipRegistry must not register BM1396.
-//
-// EXPERIMENTAL family-hypothesis: same BM1397 pure encoder may be used for
-// offline RE/beta comparison only via explicitly named APIs below — never
-// via pll_family_for_protocol(Bm1396).
+// Ghidra analysis of exact signed S17e and T17e `bmminer` binaries recovered
+// equivalent runtime solvers. This is a die-bound BM1396 pure register codec;
+// it does not authorize carrier I/O, a frequency safety envelope, or live
+// ChipDriver registration.
 
-/// Why production pure PLL encode is refused for BM1396 offline.
+pub const BM1396_PLL_CLKI_MHZ: f32 = 25.0;
+pub const BM1396_PLL_FB_DIV_MIN: u16 = 16;
+pub const BM1396_PLL_FB_DIV_MAX: u16 = 250;
+pub const BM1396_PLL_VCO_MIN_MHZ: f32 = 2_000.0;
+pub const BM1396_PLL_VCO_MAX_MHZ: f32 = 3_200.0;
+pub const BM1396_PLL_REFDIV_ONE_VCO_MAX_MHZ: f32 = 3_125.0;
+pub const BM1396_PLL_MAX_ERROR_MHZ_EXCLUSIVE: f32 = 10.0;
+pub const BM1396_PLL_SUCCESS_SELECTOR: u8 = 0x01;
+pub const BM1396_PLL_FAILURE_SELECTOR: u8 = 0x0f;
+pub const BM1396_PLL_FAILURE_REGISTER: u32 = 0x0078_0111;
+pub const BM1396_PLL_PRESERVE_MASK: u32 = 0xf000_c088;
+pub const BM1396_PLL_REGISTER_ADDRS: [u8; 4] = [0x08, 0x60, 0x64, 0x68];
+pub const BM1396_PLL_PROGRAM_WRITE_COUNT: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Bm1396PurePllStatus {
-    /// No die-bound goldens / held PLL table for chip ID `0x1396` offline.
-    NotImplementedNoDieBoundGoldens,
+pub struct Bm1396PllDividers {
+    pub fb_div: u16,
+    pub ref_div: u8,
+    pub post_div1: u8,
+    pub post_div2: u8,
 }
 
-/// Production pure PLL status for BM1396 (always NI offline as of G12).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm1396PllSolution {
+    register_value: u32,
+    selector: u8,
+    actual_freq_mhz: f32,
+    dividers: Bm1396PllDividers,
+}
+
+impl Bm1396PllSolution {
+    pub const fn register_value(self) -> u32 {
+        self.register_value
+    }
+
+    pub const fn selector(self) -> u8 {
+        self.selector
+    }
+
+    pub const fn actual_freq_mhz(self) -> f32 {
+        self.actual_freq_mhz
+    }
+
+    pub const fn dividers(self) -> Bm1396PllDividers {
+        self.dividers
+    }
+}
+
+/// Maturity of the clean-room BM1396 pure PLL codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bm1396PurePllStatus {
+    /// Equivalent exact signed S17e/T17e solvers plus fixed register goldens.
+    OfflineVerifiedExactSignedMultiFirmware,
+}
+
+/// Production-pure PLL codec status. Carrier and electrical admission remain
+/// independent and closed.
 #[inline]
 pub const fn bm1396_production_pure_pll_status() -> Bm1396PurePllStatus {
-    Bm1396PurePllStatus::NotImplementedNoDieBoundGoldens
+    Bm1396PurePllStatus::OfflineVerifiedExactSignedMultiFirmware
 }
 
 /// Whether production pure may expand frequency program ops for BM1396.
 ///
-/// Always `false` until die-bound offline goldens exist. Distinct from the
-/// EXPERIMENTAL family-hypothesis helpers below.
+/// This admits pure solving and exact double-write planning. BoardDesc carrier
+/// admission and the live ChipDriver remain independently closed.
 #[inline]
 pub const fn bm1396_production_pure_pll_admitted() -> bool {
-    false
+    true
+}
+
+/// Exact signed-firmware BM1396 PLL solver.
+///
+/// Search order, f32 rounding, strict tie behavior, VCO limits, and register
+/// preservation match both held production miners. `None` represents the
+/// vendor `-1` outcome; callers must fail closed instead of programming the
+/// vendor failure sentinel [`BM1396_PLL_FAILURE_REGISTER`].
+pub fn resolve_bm1396_pll(target_mhz: f32, old_register_value: u32) -> Option<Bm1396PllSolution> {
+    if !target_mhz.is_finite() || target_mhz <= 0.0 {
+        return None;
+    }
+
+    let mut best_error = BM1396_PLL_MAX_ERROR_MHZ_EXCLUSIVE;
+    let mut best: Option<(Bm1396PllDividers, f32)> = None;
+    for ref_div in [2u8, 1] {
+        for post_div2 in 1u8..=7 {
+            for post_div1 in post_div2..=7 {
+                let feedback =
+                    target_mhz * f32::from(ref_div) * f32::from(post_div2) * f32::from(post_div1)
+                        / BM1396_PLL_CLKI_MHZ
+                        + 0.5;
+                let fb_div = feedback.trunc() as u16;
+                if !(BM1396_PLL_FB_DIV_MIN..=BM1396_PLL_FB_DIV_MAX).contains(&fb_div) {
+                    continue;
+                }
+                let vco = (BM1396_PLL_CLKI_MHZ / f32::from(ref_div)) * f32::from(fb_div);
+                if !(BM1396_PLL_VCO_MIN_MHZ..=BM1396_PLL_VCO_MAX_MHZ).contains(&vco)
+                    || (ref_div == 1 && vco > BM1396_PLL_REFDIV_ONE_VCO_MAX_MHZ)
+                {
+                    continue;
+                }
+                let actual = vco / (f32::from(post_div1) * f32::from(post_div2));
+                let error = (target_mhz - actual).abs();
+                if error < best_error {
+                    best_error = error;
+                    best = Some((
+                        Bm1396PllDividers {
+                            fb_div,
+                            ref_div,
+                            post_div1,
+                            post_div2,
+                        },
+                        actual,
+                    ));
+                }
+            }
+        }
+    }
+
+    best.map(|(div, actual_freq_mhz)| Bm1396PllSolution {
+        register_value: (old_register_value & BM1396_PLL_PRESERVE_MASK)
+            | ((u32::from(div.post_div1) & 0x7) << 4)
+            | (u32::from(div.post_div2) & 0x7)
+            | ((u32::from(div.ref_div) & 0x3f) << 8)
+            | ((u32::from(div.fb_div) & 0x0fff) << 16),
+        selector: BM1396_PLL_SUCCESS_SELECTOR,
+        actual_freq_mhz,
+        dividers: div,
+    })
+}
+
+/// Transform a solved BM1396 word into the exact on-wire value: force bit 30
+/// and clear bits 31 and 29.
+pub const fn bm1396_pll_program_register_value(solved_register_value: u32) -> u32 {
+    (solved_register_value & 0x5fff_ffff) | 0x4000_0000
+}
+
+/// Exact signed-firmware BM1396 PLL programming plan for index 0 through 3.
+///
+/// The selected register is written twice back-to-back with no intervening
+/// delay or readback. Outer ramp pacing is caller-specific and is not invented
+/// here.
+pub fn plan_bm1396_pll_program_ops(
+    solution: Bm1396PllSolution,
+    pll_index: u8,
+) -> Option<Vec<TransportOp>> {
+    let register = *BM1396_PLL_REGISTER_ADDRS.get(usize::from(pll_index))?;
+    let value = bm1396_pll_program_register_value(solution.register_value);
+    Some(vec![
+        TransportOp::SendWriteRegBroadcastBm1397Plus {
+            reg: register,
+            value,
+        },
+        TransportOp::SendWriteRegBroadcastBm1397Plus {
+            reg: register,
+            value,
+        },
+    ])
+}
+
+/// Resolve and plan the primary BM1396 mining PLL. An unattainable target
+/// returns `None` and cannot be confused with a successful no-op or program
+/// the vendor failure sentinel.
+pub fn plan_bm1396_frequency_program_ops(target_mhz: u16) -> Option<Vec<TransportOp>> {
+    resolve_bm1396_pll(f32::from(target_mhz), 0)
+        .and_then(|solution| plan_bm1396_pll_program_ops(solution, 0))
 }
 
 /// EXPERIMENTAL: BM1396 PLL encode family-compatibility hypothesis.
@@ -437,8 +589,8 @@ pub const fn bm1396_production_pure_pll_admitted() -> bool {
 /// [`PllFamily::Bm1397`] — the proven pure family — so callers cannot mistake
 /// this for a die-bound BM1396 PRODUCTION encoder.
 ///
-/// **Not** wired through [`pll_family_for_protocol`]. Live lock unproven.
-/// ChipDriver for `0x1396` stays unregistered.
+/// Retained only for historical comparison with the older BM1397 hypothesis.
+/// New BM1396 work must use [`resolve_bm1396_pll`].
 pub fn resolve_bm1396_pll_experimental_family_hypothesis(
     target_mhz: u16,
 ) -> (PllSolution, Bm1397PllDividers) {
@@ -448,7 +600,7 @@ pub fn resolve_bm1396_pll_experimental_family_hypothesis(
 /// EXPERIMENTAL: frequency program ops under the BM1396 family hypothesis.
 ///
 /// Same cadence as [`plan_bm1397_frequency_program_ops`] (0x70×2 + PLL0×2).
-/// Production protocol path for Bm1396 stays empty.
+/// This historical hypothesis is not used by the exact BM1396 production plan.
 pub fn plan_bm1396_frequency_program_ops_experimental(
     pll0_register_value: u32,
 ) -> Vec<TransportOp> {
@@ -781,13 +933,21 @@ pub fn plan_bm1397_pll0_verify_retry_rewrite(pll0_register_value: u32) -> Vec<Tr
 ///   Parameter ×2 (+ delays) — bible / ESP-Miner / driver sequence (G5 R3).
 /// - **BM1387**: empty — pure table encode only; stock FPGA SetConfig residual
 ///   (do not invent BM1397+ TransportOp or BM1397 `0x70` prelude for S9).
+/// - **BM1396**: exact signed-firmware PLL0 double-write, no inter-write delay.
 ///
-/// Empty when protocol has no pure PLL family or `frequency_mhz == 0`.
+/// Empty when protocol has no pure PLL family/named solver, the target is
+/// unattainable, or `frequency_mhz == 0`.
 /// Does **not** fan out to PLL1/2 (see [`plan_all_pll_broadcast_writes`]).
 pub fn plan_frequency_program_ops(
     protocol: AsicProtocolIdentity,
     frequency_mhz: u16,
 ) -> Vec<TransportOp> {
+    if protocol == AsicProtocolIdentity::Bm1396 {
+        // The exact pure resolver is available through the named BM1396 API,
+        // but no carrier/output-frequency admission exists yet. Do not let a
+        // generic protocol-only planner manufacture mutation-shaped ops.
+        return Vec::new();
+    }
     match resolve_pll_for_protocol(protocol, frequency_mhz) {
         // G5/G11: BM1397 and BM1398 share 0x70×2 + PLL0×2 program cadence.
         Some(sol) if sol.family == PllFamily::Bm1397 || sol.family == PllFamily::Bm1398 => {
@@ -2004,6 +2164,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn industrial_serial_routes_select_jig_vco_without_changing_global_defaults() {
+        let (_safe_1368, safe_1368_dividers) =
+            resolve_bm1368_pll_mhz(491.0, Bm1368VcoPolicy::BitmainJigClamp);
+        let safe_1368_vco = BM1368_CLKI_MHZ * f64::from(safe_1368_dividers.fb_div)
+            / f64::from(safe_1368_dividers.ref_div);
+        assert!(bm1368_vco_in_jig_range(
+            safe_1368_vco,
+            safe_1368_dividers.ref_div
+        ));
+        let default_1368 =
+            crystal25_pll_decode_dividers(resolve_pll(PllFamily::Bm1368, 491).register_value);
+        let default_1368_vco =
+            BM1368_CLKI_MHZ * f64::from(default_1368.fb_div) / f64::from(default_1368.ref_div);
+        assert_eq!(default_1368_vco, 1962.5);
+        assert!(!bm1368_vco_in_jig_range(
+            default_1368_vco,
+            default_1368.ref_div
+        ));
+
+        let (_safe_1370, safe_1370_dividers) =
+            resolve_bm1370_pll_mhz(447.0, Bm1370VcoPolicy::BitmainJigClamp);
+        let safe_1370_vco = BM1370_CLKI_MHZ * f64::from(safe_1370_dividers.fb_div)
+            / f64::from(safe_1370_dividers.ref_div);
+        assert!(bm1370_vco_in_jig_range(
+            safe_1370_vco,
+            safe_1370_dividers.ref_div
+        ));
+        let default_1370 =
+            crystal25_pll_decode_dividers(resolve_pll(PllFamily::Bm1370, 447).register_value);
+        let default_1370_vco =
+            BM1370_CLKI_MHZ * f64::from(default_1370.fb_div) / f64::from(default_1370.ref_div);
+        assert!(!bm1370_vco_in_jig_range(
+            default_1370_vco,
+            default_1370.ref_div
+        ));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let serial = std::fs::read_to_string(root.join("dcentrald/src/serial_mining.rs"))
+            .expect("serial_mining");
+        let production_end = serial
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("serial production/test boundary");
+        let production = &serial[..production_end];
+        for marker in [
+            "S21Bm1368ShippedConfig",
+            "T21Bm1368ShippedConfig",
+            "S21ProBm1370ShippedConfig",
+            "S21XpBm1370ShippedConfig",
+            "Bm1368VcoPolicy::BitmainJigClamp",
+            "Bm1370VcoPolicy::BitmainJigClamp",
+            "preflight_industrial_pll_policy",
+        ] {
+            assert!(
+                production.contains(marker),
+                "missing industrial pin {marker}"
+            );
+        }
+        assert!(!production.contains("resolve_pll(dcentrald_common::PllFamily::Bm1368"));
+        assert!(!production.contains("resolve_pll(dcentrald_common::PllFamily::Bm1370"));
+    }
+
     /// G28: BM1366 pure search matches ChipDriver thin-wrap (no forked float search).
     #[test]
     fn bm1366_chipdriver_thin_wraps_pure_pll_and_esp_goldens() {
@@ -2287,20 +2509,101 @@ mod tests {
     }
 
     #[test]
-    fn bm1396_production_pure_pll_refuses_and_experimental_is_named_only() {
-        // G12 bar: production pure BM1396 stays fail-closed (no die-bound goldens).
-        // EXPERIMENTAL family hypothesis is a separate named API — never a silent
-        // pll_family_for_protocol(Bm1396) → Bm1397 production alias.
+    fn bm1396_exact_signed_pll_solver_and_plan_are_admitted_but_carrier_stays_closed() {
+        // Exact pure solving is admitted while generic transport and the live
+        // ChipDriver stay closed. The old family hypothesis remains only as an
+        // explicit comparison API, never a silent BM1397 production alias.
         assert_eq!(
             bm1396_production_pure_pll_status(),
-            Bm1396PurePllStatus::NotImplementedNoDieBoundGoldens
+            Bm1396PurePllStatus::OfflineVerifiedExactSignedMultiFirmware
         );
-        assert!(!bm1396_production_pure_pll_admitted());
+        assert!(bm1396_production_pure_pll_admitted());
+
+        let goldens = [
+            (500.0, 0x00a0_0241, (160, 2, 4, 1)),
+            (600.0, 0x00c0_0241, (192, 2, 4, 1)),
+            (650.0, 0x00d0_0241, (208, 2, 4, 1)),
+            (700.0, 0x00a8_0231, (168, 2, 3, 1)),
+        ];
+        for (target, register, dividers) in goldens {
+            let solved = resolve_bm1396_pll(target, 0).expect("exact signed solver");
+            assert_eq!(solved.register_value, register, "target {target} MHz");
+            assert_eq!(solved.selector, BM1396_PLL_SUCCESS_SELECTOR);
+            assert_eq!(solved.actual_freq_mhz, target);
+            assert_eq!(
+                (
+                    solved.dividers.fb_div,
+                    solved.dividers.ref_div,
+                    solved.dividers.post_div1,
+                    solved.dividers.post_div2,
+                ),
+                dividers
+            );
+        }
+        let preserved = resolve_bm1396_pll(600.0, u32::MAX).expect("old register preservation");
+        assert_eq!(
+            preserved.register_value & BM1396_PLL_PRESERVE_MASK,
+            BM1396_PLL_PRESERVE_MASK
+        );
+        assert_eq!(
+            preserved.register_value & !BM1396_PLL_PRESERVE_MASK,
+            0x00c0_0241 & !BM1396_PLL_PRESERVE_MASK,
+            "unpreserved old bits must not leak into the solved register"
+        );
+        let threshold_accepted =
+            resolve_bm1396_pll(3_134.0, 0).expect("strictly less than 10 MHz error");
+        assert_eq!(threshold_accepted.actual_freq_mhz, 3_125.0);
+        assert!(resolve_bm1396_pll(3_135.0, 0).is_none());
+        assert!(resolve_bm1396_pll(0.0, 0).is_none());
+        assert!(resolve_bm1396_pll(1.0, 0).is_none());
+        assert!(resolve_bm1396_pll(f32::NAN, 0).is_none());
+        assert!(resolve_bm1396_pll(f32::INFINITY, 0).is_none());
+        assert_eq!(BM1396_PLL_FAILURE_REGISTER, 0x0078_0111);
+        assert_eq!(BM1396_PLL_FAILURE_SELECTOR, 0x0f);
+
+        let solved_600 = resolve_bm1396_pll(600.0, 0).expect("600 MHz program plan");
+        assert_eq!(
+            bm1396_pll_program_register_value(solved_600.register_value),
+            0x40c0_0241
+        );
+        let pll0_ops = plan_bm1396_pll_program_ops(solved_600, 0).expect("PLL0 index");
+        assert_eq!(pll0_ops.len(), BM1396_PLL_PROGRAM_WRITE_COUNT);
+        assert_eq!(
+            pll0_ops,
+            vec![
+                TransportOp::SendWriteRegBroadcastBm1397Plus {
+                    reg: 0x08,
+                    value: 0x40c0_0241,
+                },
+                TransportOp::SendWriteRegBroadcastBm1397Plus {
+                    reg: 0x08,
+                    value: 0x40c0_0241,
+                },
+            ]
+        );
+        let pll3_ops = plan_bm1396_pll_program_ops(solved_600, 3).expect("PLL3 index");
+        assert!(matches!(
+            pll3_ops.as_slice(),
+            [
+                TransportOp::SendWriteRegBroadcastBm1397Plus { reg: 0x68, .. },
+                TransportOp::SendWriteRegBroadcastBm1397Plus { reg: 0x68, .. }
+            ]
+        ));
+        assert!(plan_bm1396_pll_program_ops(solved_600, 4).is_none());
+
+        // BM1396 remains a distinct named solver rather than a silent BM1397
+        // PllFamily alias. Carrier admission remains a separate closed gate.
         assert!(pll_family_for_protocol(AsicProtocolIdentity::Bm1396).is_none());
         assert!(resolve_pll_for_protocol(AsicProtocolIdentity::Bm1396, 400).is_none());
         assert!(resolve_pll_for_protocol(AsicProtocolIdentity::Bm1396, 500).is_none());
         assert!(resolve_pll_for_protocol(AsicProtocolIdentity::Bm1396, 650).is_none());
-        assert!(plan_frequency_program_ops(AsicProtocolIdentity::Bm1396, 500).is_empty());
+        assert_eq!(
+            plan_bm1396_frequency_program_ops(600),
+            Some(pll0_ops.clone())
+        );
+        assert!(plan_bm1396_frequency_program_ops(1).is_none());
+        assert!(plan_frequency_program_ops(AsicProtocolIdentity::Bm1396, 600).is_empty());
+        assert!(plan_frequency_program_ops(AsicProtocolIdentity::Bm1396, 0).is_empty());
 
         // Experimental hypothesis reuses BM1397 pure encoder; family label stays Bm1397.
         let (sol, div) = resolve_bm1396_pll_experimental_family_hypothesis(450);
@@ -2322,10 +2625,23 @@ mod tests {
         // Structural: production match arm must list Bm1396 with the refuse group
         // (not map to Some(PllFamily::Bm1397)).
         let src = include_str!("pll_model.rs");
+        let solution_struct = src
+            .split("pub struct Bm1396PllSolution")
+            .nth(1)
+            .and_then(|s| s.split("impl Bm1396PllSolution").next())
+            .expect("BM1396 solution struct body");
+        assert!(
+            !solution_struct.contains("pub register_value")
+                && !solution_struct.contains("pub selector")
+                && !solution_struct.contains("pub actual_freq_mhz")
+                && !solution_struct.contains("pub dividers"),
+            "BM1396 solution fields must remain solver-owned so a failure sentinel cannot be forged"
+        );
         assert!(
             src.contains("AsicProtocolIdentity::Bm1396")
-                && src.contains("NotImplementedNoDieBoundGoldens"),
-            "pll_model must document BM1396 production pure NI"
+                && src.contains("OfflineVerifiedExactSignedMultiFirmware")
+                && src.contains("resolve_bm1396_pll"),
+            "pll_model must retain the exact signed BM1396 solver"
         );
         // Anti-silent-alias: the production mapping function body must not assign
         // Bm1396 => Some(...).
@@ -2801,11 +3117,31 @@ mod tests {
         }
     }
 
-    /// G42: BM1391 pure PLL pack/search/fallback + jig program order (≠ BM1397).
+    /// G42: S17-jig PLL stays distinct from the exact S15/T15 stock contract.
     #[test]
-    fn g42_bm1391_pll_matches_jig_set_freq() {
-        assert_eq!(bm1391_pll_pack(120, 1, 1, 1), BM1391_PLL_FALLBACK_200M);
-        assert_eq!(BM1391_PLL_FALLBACK_200M, 0xC078_0111);
+    fn g42_bm1391_s17_jig_pll_matches_jig_without_aliasing_stock() {
+        assert_eq!(
+            bm1391_pll_pack(120, 1, 1, 1),
+            BM1391_S17_JIG_PLL_FALLBACK_200M
+        );
+        assert_eq!(BM1391_S17_JIG_PLL_FALLBACK_200M, 0xC078_0111);
+        assert_eq!(
+            crate::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_WORD,
+            0x0078_0111
+        );
+        assert_eq!(
+            crate::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_REGISTER_PAYLOAD,
+            0x4078_0111
+        );
+        assert_eq!(
+            BM1391_S17_JIG_PLL_FALLBACK_200M & 0x3fff_ffff,
+            crate::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_WORD
+        );
+        assert_ne!(
+            BM1391_S17_JIG_PLL_FALLBACK_200M,
+            crate::bm1391_stock_startup::BM1391_STOCK_PLL_SOLVER_FALLBACK_REGISTER_PAYLOAD
+        );
+        assert!(!BM1391_S17_JIG_PLL_AUTHORIZES_S15_T15_PROGRAMMING);
 
         let f200 = resolve_bm1391_pll(200);
         assert_eq!(f200.pll0_register, 0xC078_0111);

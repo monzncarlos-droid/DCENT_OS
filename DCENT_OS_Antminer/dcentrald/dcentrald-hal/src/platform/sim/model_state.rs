@@ -29,10 +29,8 @@ impl SimSiliconState {
             S11 | S15 | T15 => &BM1391_TABLE,
             // 2026-08-03 mapping correction (W8-G): S17+/T17+ are BM1397 and
             // S17e is BM1396 (PR-056's reversed attribution is retracted).
-            // NOTE the BM1396 table's five rows were harvested as *plus-family*
-            // vendor anchors under the old attribution, so they now describe the
-            // wrong models; re-homing that vendor curve to BM1397 is tracked as
-            // follow-up. Table selection here follows the CHIP, as it must.
+            // BM1396 intentionally has no operating points: only exact T17e
+            // topology is held, so S17e simulation returns typed absence.
             S17 | S17Pro | T17 | S17Plus | T17Plus => &BM1397_TABLE,
             S17e => &BM1396_TABLE,
             S19 | S19Pro => &BM1398_TABLE,
@@ -99,6 +97,14 @@ mod tests {
         assert_eq!(state.table().chip_family, BM1373_TABLE.chip_family);
         assert_eq!(state.table().profiles, BM1373_TABLE.profiles);
         assert_eq!(state.board().chips_per_chain, None);
+    }
+
+    #[test]
+    fn s17e_bm1396_has_no_cross_sku_operating_point() {
+        let state = SimSiliconState::for_profile(SimBoardProfile::for_model(SimModel::S17e));
+        assert_eq!(state.table().chip_family, "BM1396");
+        assert!(state.default_operating_point().is_none());
+        assert!(state.voltage_envelope_v().is_none());
     }
 
     #[test]

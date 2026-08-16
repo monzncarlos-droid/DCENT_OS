@@ -1101,12 +1101,12 @@ mod tests {
         );
     }
 
-    /// Regression pin: the pre-existing `Hashboard` enum surface is unchanged
-    /// by the registry's introduction (20 catalog entries, canonical routing
-    /// intact). The registry is additive.
+    /// Regression pin: the legacy `Hashboard` enum has 21 catalog entries after
+    /// adding the official-guide-backed S15 host-data row; canonical EEPROM
+    /// routing remains intact. The topology registry is additive.
     #[test]
     fn legacy_enum_catalog_is_unchanged_by_the_registry() {
-        assert_eq!(ALL_HASHBOARDS.len(), 20);
+        assert_eq!(ALL_HASHBOARDS.len(), 21);
         assert_eq!(
             crate::hashboards::classify_by_eeprom_preamble([0x04, 0x11]),
             Some(Hashboard::Bhb42601)

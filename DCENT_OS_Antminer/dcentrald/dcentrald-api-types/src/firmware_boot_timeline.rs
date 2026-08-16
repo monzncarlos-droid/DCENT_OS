@@ -4,15 +4,11 @@
 //!
 //! §1 (Family A-F boot timelines, lines 33-160).
 //!
-//! Each firmware flavor has a canonical cold-boot timeline from
-//! BootROM through first-share-accepted. This module pins the
-//! milestones so:
-//! - The dashboard "boot progress" widget can show a competitive
-//!   comparison ("DCENT_OS reaches first hash 3s faster than Family A").
-//! - The dcent-toolbox install adapter can sanity-check that a given
-//!   miner is following the expected timeline (a unit stuck at
-//!   `KernelBoot` after 30s is broken).
-//! - The recovery flow can identify which boot phase a hung unit is in.
+//! Each firmware flavor has a research-reference cold-boot timeline from
+//! BootROM through first-share-accepted. The static seconds are RE-derived
+//! estimates/range midpoints, not live service-level objectives. Runtime
+//! decisions must use [`ObservedBootPhase`] evidence instead of treating a
+//! reference time as a failure, recovery, or competitive-performance proof.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +28,107 @@ pub enum FirmwareBootFamily {
     BraiinsOsPlus,
     /// Family F — DCENT_OS (target architecture).
     DcentOs,
+}
+
+/// Evidence ceiling for a static boot-family timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootTimelineEvidenceState {
+    /// A source/RE reference estimate. No exact live timing distribution or
+    /// runtime deadline is established by the static table.
+    ResearchReferenceNotLiveSlo,
+}
+
+/// Exact, non-authorizing capability record for one boot-family timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BootTimelineCapability {
+    pub family: FirmwareBootFamily,
+    pub evidence_state: BootTimelineEvidenceState,
+    pub evidence_source: &'static str,
+    pub live_timing_verified: bool,
+    pub runtime_deadline_authorized: bool,
+    pub recovery_decision_authorized: bool,
+    pub competitive_claim_authorized: bool,
+}
+
+/// Every boot family represented by [`timeline_of`].
+pub const ALL_FIRMWARE_BOOT_FAMILIES: &[FirmwareBootFamily] = &[
+    FirmwareBootFamily::BitmainStockS9,
+    FirmwareBootFamily::VnishS17_204,
+    FirmwareBootFamily::Vnish127Overlay,
+    FirmwareBootFamily::Vnish127Amlogic,
+    FirmwareBootFamily::BraiinsOsPlus,
+    FirmwareBootFamily::DcentOs,
+];
+
+/// Exhaustive capability ceiling for the six static timeline tables.
+pub const BOOT_TIMELINE_CAPABILITIES: &[BootTimelineCapability] = &[
+    BootTimelineCapability {
+        family: FirmwareBootFamily::BitmainStockS9,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "system-orchestration-bible Family A research reference",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+    BootTimelineCapability {
+        family: FirmwareBootFamily::VnishS17_204,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "system-orchestration-bible Family B research reference",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+    BootTimelineCapability {
+        family: FirmwareBootFamily::Vnish127Overlay,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "system-orchestration-bible Family C research reference",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+    BootTimelineCapability {
+        family: FirmwareBootFamily::Vnish127Amlogic,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "Family D aliases the Family C research reference",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+    BootTimelineCapability {
+        family: FirmwareBootFamily::BraiinsOsPlus,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "system-orchestration-bible Family E research reference",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+    BootTimelineCapability {
+        family: FirmwareBootFamily::DcentOs,
+        evidence_state: BootTimelineEvidenceState::ResearchReferenceNotLiveSlo,
+        evidence_source: "system-orchestration-bible Family F target estimate",
+        live_timing_verified: false,
+        runtime_deadline_authorized: false,
+        recovery_decision_authorized: false,
+        competitive_claim_authorized: false,
+    },
+];
+
+/// Return the exact capability ceiling for one firmware family.
+pub const fn capability_of(family: FirmwareBootFamily) -> &'static BootTimelineCapability {
+    match family {
+        FirmwareBootFamily::BitmainStockS9 => &BOOT_TIMELINE_CAPABILITIES[0],
+        FirmwareBootFamily::VnishS17_204 => &BOOT_TIMELINE_CAPABILITIES[1],
+        FirmwareBootFamily::Vnish127Overlay => &BOOT_TIMELINE_CAPABILITIES[2],
+        FirmwareBootFamily::Vnish127Amlogic => &BOOT_TIMELINE_CAPABILITIES[3],
+        FirmwareBootFamily::BraiinsOsPlus => &BOOT_TIMELINE_CAPABILITIES[4],
+        FirmwareBootFamily::DcentOs => &BOOT_TIMELINE_CAPABILITIES[5],
+    }
 }
 
 /// Common boot phase label across all families. Each phase represents
@@ -282,7 +379,7 @@ pub const DCENT_OS_TIMELINE: &[BootMilestone] = &[
     },
 ];
 
-/// Look up the canonical timeline for a firmware family.
+/// Look up the static research-reference timeline for a firmware family.
 pub fn timeline_of(family: FirmwareBootFamily) -> &'static [BootMilestone] {
     match family {
         FirmwareBootFamily::BitmainStockS9 => BITMAIN_STOCK_S9_TIMELINE,
@@ -295,8 +392,11 @@ pub fn timeline_of(family: FirmwareBootFamily) -> &'static [BootMilestone] {
     }
 }
 
-/// Returns the canonical first-hash time (seconds since BootRom) for a
-/// family, or `None` if the timeline doesn't reach FirstShareAccepted.
+/// Returns the static reference first-share time (seconds since BootROM) for a
+/// family, or `None` if the timeline does not reach FirstShareAccepted.
+///
+/// This value is not a live deadline or recovery trigger; use runtime-observed
+/// phases for those decisions.
 pub fn first_share_time(family: FirmwareBootFamily) -> Option<f32> {
     timeline_of(family)
         .iter()
@@ -369,6 +469,30 @@ impl BootProgressTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_timeline_capability_ceiling_is_exhaustive_and_non_authorizing() {
+        assert_eq!(ALL_FIRMWARE_BOOT_FAMILIES.len(), 6);
+        assert_eq!(BOOT_TIMELINE_CAPABILITIES.len(), 6);
+        let families: std::collections::HashSet<FirmwareBootFamily> = BOOT_TIMELINE_CAPABILITIES
+            .iter()
+            .map(|capability| capability.family)
+            .collect();
+        assert_eq!(families.len(), BOOT_TIMELINE_CAPABILITIES.len());
+
+        for family in ALL_FIRMWARE_BOOT_FAMILIES {
+            let capability = capability_of(*family);
+            assert_eq!(capability.family, *family);
+            assert_eq!(
+                capability.evidence_state,
+                BootTimelineEvidenceState::ResearchReferenceNotLiveSlo
+            );
+            assert!(!capability.live_timing_verified);
+            assert!(!capability.runtime_deadline_authorized);
+            assert!(!capability.recovery_decision_authorized);
+            assert!(!capability.competitive_claim_authorized);
+        }
+    }
 
     #[test]
     fn every_family_has_bootrom_anchor() {

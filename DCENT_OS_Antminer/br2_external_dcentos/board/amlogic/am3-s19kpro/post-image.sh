@@ -128,16 +128,8 @@ ROOTFS_SHA256=$(sha256sum "$ROOTFS_UIMAGE" | awk '{print $1}')
 echo "uImage:  uImage_rootfs.bin ($((ROOTFS_SIZE / 1024)) KB)"
 echo "  SHA256: ${ROOTFS_SHA256}"
 
-# -----------------------------------------------------------------------------
-# Locate a kernel uImage for the am3-aml sysupgrade package.
-# Probe order (most-specific to least):
-#   1. $DCENT_AM3_AML_KERNEL (env override — Phase J operator override)
-#   2. <repo>/
-#   3. <repo>/ (verified
-#      AXG kernel — same A113D family, same 4.9.113 base; safe fallback
-#      until an S19K-specific kernel is extracted).
-#   No further fallback — refuse to ship without a verified am3-aml kernel.
-# -----------------------------------------------------------------------------
+# The kernel is admitted below with the exact target's manifest-pinned DTB and
+# fw-info identity. Sibling-model and live repository fallbacks are forbidden.
 # BR2_EXTERNAL_DCENTOS_PATH = DCENT_OS_Antminer/br2_external_dcentos
 # PROJECT_ROOT              = DCENT_OS_Antminer
 # REPO_ROOT                 = DCENT Projects
@@ -199,44 +191,12 @@ case "$PACKAGE_VERSION" in
 esac
 echo "Version: ${PACKAGE_VERSION}"
 
-# Probe order:
-#   1. $DCENT_AM3_AML_KERNEL                         (env override — Phase J operator)
-#   2. ${PROJECT_ROOT}/extractions/s19k/...          (Docker-staged, see build_in_docker.sh Phase 4)
-#   3. ${PROJECT_ROOT}/extractions/s21/...           (Docker-staged AXG fallback)
-#   4. ${REPO_ROOT}/ (host-direct path; works
-#      when invoked outside Docker or when REPO_ROOT correctly points at the
-#      DCENT-Projects checkout root).
-#   5. ${REPO_ROOT}/ (host-direct fallback).
-KERNEL=""
-KERNEL_SRC=""
-if [ -n "${DCENT_AM3_AML_KERNEL:-}" ] && [ -f "${DCENT_AM3_AML_KERNEL}" ]; then
-    KERNEL="${DCENT_AM3_AML_KERNEL}"
-    KERNEL_SRC="env override (DCENT_AM3_AML_KERNEL)"
-elif [ -f "${PROJECT_ROOT}/extractions/s19k/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s19k/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s19k"
-elif [ -f "${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="docker-staged extractions/s21 (verified AXG fallback)"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s19k/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s19k/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s19k"
-elif [ -f "${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" ]; then
-    KERNEL="${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin"
-    KERNEL_SRC="knowledge-base/extractions/s21 (verified AXG fallback)"
-fi
-
-if [ -z "$KERNEL" ]; then
-    echo "ERROR: no kernel_uimage.bin found for am3-aml sysupgrade packaging." >&2
-    echo "  Expected one of (in probe order):" >&2
-    echo "    \$DCENT_AM3_AML_KERNEL" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s19k/kernel_uimage.bin" >&2
-    echo "    ${PROJECT_ROOT}/extractions/s21/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s19k/kernel_uimage.bin" >&2
-    echo "    ${REPO_ROOT}/knowledge-base/extractions/s21/kernel_uimage.bin" >&2
-    echo "  Refusing to package am3-aml without a verified am3-family kernel." >&2
-    exit 1
-fi
+# Only the target-selected, manifest-pinned snapshot is admissible. The exact
+# fw-info is part of the gate so shared kernel/DTB bytes cannot imply identity.
+. "${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/require-exact-build-inputs.sh"
+dcent_require_exact_amlogic_build_inputs "${TARGET:-}"
+KERNEL="$DCENT_AM3_AML_KERNEL"
+KERNEL_SRC="exact model-bound build-input snapshot (s19kpro/aml)"
 
 cp "$KERNEL" "${BINARIES_DIR}/kernel"
 KERNEL_SIZE=$(stat -c%s "${BINARIES_DIR}/kernel")
@@ -317,7 +277,10 @@ EOF
 # Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
 # are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
 DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>"
-DCENT_TOOLBOX_UPDATE_COMMAND=""
+# OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
+# rail accepts the amlogic_rootfs_window method; identical root SSH +
+# restore-verified + signed-package gates; write+readback, NO auto-reboot).
+DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>"
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
 DCENT_TARGET_SIDE_SYSUPGRADE=false

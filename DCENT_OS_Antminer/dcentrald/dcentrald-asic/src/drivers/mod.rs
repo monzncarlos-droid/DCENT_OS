@@ -100,6 +100,11 @@ pub mod bm139x;
 /// encoding of the unresolved operational baud.
 pub mod bm1485;
 pub mod bm1489;
+/// BM1491 (L9 — CVCtrl/CV183x variant, Scrypt) — Scaffold, refuses to energize.
+/// DISTINCT chip-id `0x1491` from bm1489's `0x1489` (two L9 control-board variants).
+/// Carries the byte-exact RE-recovered chain stride (2) and operational baud
+/// (1,562,500) from the un-obfuscated CVCtrl `godminer`; baud stays bench-gated.
+pub mod bm1491;
 /// ScryptL7 (L7 / BM1489 Litecoin Scrypt) — DCENT_OS's first non-SHA256 chip
 /// driver. Default-OFF: only compiled under the `scrypt-l7` Cargo feature so
 /// production SHA256 builds are byte-unchanged. Pins the W3-A RE facts and
@@ -191,6 +196,11 @@ pub const fn is_scaffold_driver_chip(chip_id: u16) -> bool {
     chip_id == bm1373::CHIP_ID
         || chip_id == bm1373::ENUM_CHIP_ID
         || chip_id == bm1489::CHIP_ID
+        // BM1491 = the L9-CVCtrl (CV183x) variant; distinct id 0x1491 from the
+        // 0x1489 AML L9. Real enumerable id (godminer `machine_runtime_ctrl_ltc_1491`),
+        // registered scaffold + fail-closed until a live L9-CVCtrl reconciles the
+        // 0x1489-vs-0x1491 identity split.
+        || chip_id == bm1491::CHIP_ID
         || chip_id == bm1391::CHIP_ID
         // BM1485 (L3/L3+/L3++). Note this key is SYNTHETIC — real BM1485
         // silicon never reports it — so no live enumeration can reach this
@@ -1362,9 +1372,20 @@ impl ChipRegistry {
             Box::new(bm1489::Bm1489Driver::new()),
             ChipDriverMaturity::Scaffold,
         );
-        // BM1391 (S11) — jig-verified protocol but fail-closed (no live S11 on
-        // the fleet to validate a bring-up against). Gated like the other
-        // pre-live drivers; its init_chain refuses live bring-up regardless.
+        // BM1491 (L9 — CVCtrl/CV183x variant, Scrypt). Distinct id 0x1491 from the
+        // 0x1489 AML L9 above. Scaffold: chain stride (2) and operational baud
+        // (1,562,500) are byte-exact RE-recovered from the un-obfuscated CVCtrl
+        // `godminer`, but every hardware method fails closed (register map + init
+        // sequence unresolved), and max_baud stays at the enumeration rate until a
+        // bench UART capture confirms the recovered baud on the wire.
+        self.register_with_maturity(
+            Box::new(bm1491::Bm1491Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
+        // BM1391 (S15/T15) — jig-observed protocol scaffold but fail-closed.
+        // Held S15 evidence settles chip/core/board geometry, not the carrier,
+        // PIC, thermal, PLL, or energization contract. Every runtime operation
+        // refuses even when the explicit scaffold registry exposes the type.
         self.register_with_maturity(
             Box::new(bm1391::Bm1391Driver::new()),
             ChipDriverMaturity::Scaffold,
@@ -1729,7 +1750,7 @@ mod tests {
                 catalog_chip: Some(AsicChip::Bm1391),
                 catalog_absence_reason: None,
                 driver_above_catalog_reason: Some(
-                    "BM1391 is a jig-verified scaffold driver; asics.rs keeps legacy catalog baud until live S11 proof",
+                    "BM1391 is a jig-observed scaffold; catalog baud is not runtime authority without exact S15/T15 carrier and live proof",
                 ),
             },
             Case {
@@ -1764,12 +1785,36 @@ mod tests {
                 catalog_absence_reason: Some("BM1489 is a Scrypt scaffold outside asics.rs"),
                 driver_above_catalog_reason: None,
             },
+            Case {
+                source_file: "bm1491.rs",
+                driver_name: bm1491::Bm1491Driver::new().chip_name(),
+                driver_max_baud: bm1491::Bm1491Driver::new().max_baud(),
+                catalog_chip: None,
+                catalog_absence_reason: Some("BM1491 is a Scrypt scaffold (L9-CVCtrl) outside asics.rs"),
+                driver_above_catalog_reason: None,
+            },
         ];
 
         assert_eq!(
             cases.len(),
-            12,
+            13,
             "this pin must cover every concrete driver file with max_baud()"
+        );
+
+        // BM1491 (L9-CVCtrl): the operational baud IS RE-recovered byte-exact
+        // (1_562_500, godminer chip_setting_buadrate_ltc), but max_baud() stays at
+        // the enumeration rate until a bench UART capture — same "never raise a
+        // driver baud without bench proof" discipline as BM1485. The recovered value
+        // is preserved in bm1491::OPERATIONAL_BAUD, deliberately NOT wired to max_baud.
+        assert_eq!(bm1491::Bm1491Driver::new().max_baud(), 115_200);
+        assert_eq!(
+            bm1491::Bm1491Driver::new().max_baud(),
+            bm1491::Bm1491Driver::new().default_baud(),
+        );
+        assert_eq!(bm1491::OPERATIONAL_BAUD, Some(1_562_500));
+        assert_ne!(
+            bm1491::Bm1491Driver::new().max_baud() as u64,
+            bm1491::OPERATIONAL_BAUD.unwrap() as u64,
         );
 
         // Rank 44: BM1485's operational baud is UNRESOLVED (bm1485.md gives
@@ -1869,7 +1914,7 @@ mod tests {
                 source_file: "bm1391.rs",
                 driver: Box::new(bm1391::Bm1391Driver::new()),
                 profile_absence_reason: Some(
-                    "BM1391/S15/S11 remains scaffold-gated without a MinerProfile until live validation resolves the core geometry",
+                    "BM1391/S15/T15 remains scaffold-gated without a MinerProfile; core count and S15 topology are known, but the carrier and safe runtime envelope are not",
                 ),
             },
             Case {
@@ -1982,10 +2027,30 @@ mod tests {
         );
 
         assert!(MinerProfile::for_chip(bm1391::CHIP_ID).is_none());
-        assert_eq!(AsicChip::Bm1391.catalog().cores, 0);
+        // BM1391's core count is no longer unresolved: 256, byte-stated by the
+        // S17 jig `calculate_core_number(256u)` and cross-anchored by BM1385=50
+        // and BM1397=672 in the SAME binary. This assertion previously pinned
+        // the placeholder `0` and was left stale when the catalog was
+        // populated, so `dcentrald-asic` contradicted `dcentrald-silicon-
+        // profiles` at HEAD (Round 16 coordinator; the static offline gate runs
+        // no cargo, so a red test at HEAD is invisible to it —
+        // ).
+        //
+        // Pinned against the canonical constant rather than a repeated literal
+        // so the two layers cannot drift apart again, matching the BM1398
+        // treatment above.
+        assert_eq!(
+            u32::from(AsicChip::Bm1391.catalog().cores),
+            dcentrald_silicon_profiles::bm1391::BM1391_CORE_NUM,
+            "driver and silicon layers must agree on physical BM1391 geometry"
+        );
+        // The safety property is unchanged and is NOT the core count: BM1391
+        // still has no `MinerProfile` and must stay out of production
+        // detection until a live S11/S15/T15 validates it.
         assert!(
             ChipRegistry::production().detect(bm1391::CHIP_ID).is_none(),
-            "BM1391's unresolved core geometry must stay scaffold-gated"
+            "BM1391 must stay scaffold-gated: a known core count is not a \
+             validated mining envelope"
         );
 
         // Rank 44: BM1485's 12 cores/chip is the one well-attested BM1485
@@ -2009,8 +2074,8 @@ mod tests {
         assert!(registry.detect(bm1362::CHIP_ID).is_some());
         assert!(registry.detect(bm1373::CHIP_ID).is_none());
         assert!(registry.detect(bm1489::CHIP_ID).is_none());
-        // BM1391 (S11) is a jig-verified-but-fail-closed scaffold — excluded
-        // from production until a live S11 validates it.
+        // BM1391 (S15/T15) is a jig-observed, fail-closed scaffold — excluded
+        // until exact carrier contracts and live S15/T15 validation exist.
         assert!(registry.detect(bm1391::CHIP_ID).is_none());
         // BM1485 (L3/L3+) — rank 44 scaffold, unresolved baud/stride/PLL.
         assert!(registry.detect(bm1485::CHIP_ID).is_none());
@@ -2285,13 +2350,12 @@ mod tests {
     /// registry membership — no value/behavior/API change. Mirrors the
     /// PR-055 `pr055_t21_asic_identity` pin idiom.
     ///
-    /// Verdict: BM1397 (`0x1397`, S17/T17/S17e/T17e) is recognized and has an
-    /// exact-policy Experimental runtime driver. BM1396 (`0x1396`,
-    /// S17+/T17+ per the W11.10 family-ID convention `bm1393.rs:172` +
-    /// `asics.rs:155`) has NO chip-ID constant and is an unregistered
-    /// scaffold — a `0x1396` enumeration resolves to `detect()` → `None`
-    /// and is NEVER silently mapped onto the BM1397 driver. There is no
-    /// silent-interchange path.
+    /// Verdict: BM1397 (`0x1397`, S17/T17/S17+/T17+) is recognized and has an
+    /// exact-policy Experimental runtime driver. Exact signed S17e/T17e
+    /// production binaries independently prove wire BM1396 (`0x1396`), but its
+    /// live driver remains unregistered until PLL, carrier, and electrical
+    /// safety contracts are complete. A literal `0x1396` still resolves to
+    /// `detect()` → `None` and is NEVER silently mapped onto BM1397.
     #[test]
     fn pr056_bm1396_vs_bm1397_disambiguation() {
         // BM1397 is the recognized S17-class runtime die (0x1397).
@@ -2310,7 +2374,7 @@ mod tests {
         assert_eq!(
             recognition.chip_name(),
             "BM1397",
-            "0x1397 must retain BM1397 identity (S17/T17/S17e/T17e)"
+            "0x1397 must retain BM1397 identity (S17/T17/S17+/T17+)"
         );
         assert_eq!(recognition.maturity(), ChipDriverMaturity::Experimental);
         assert!(production.detect(bm1397::CHIP_ID).is_none());
@@ -2318,15 +2382,15 @@ mod tests {
             .detect(bm1397::CHIP_ID)
             .is_some());
 
-        // BM1396 (0x1396, S17+/T17+) is corpus-named but code-
-        // UNREGISTERED. A 0x1396 enumeration must fall through to None
+        // BM1396 is a proven wire identity but code-UNREGISTERED. A literal 0x1396
+        // enumeration must fall through to None
         // — it is NEVER silently mapped onto the BM1397 driver. This
         // regression-pins the absence of the interchange path so a
         // future edit can't introduce a 0x1396 -> 0x1397 fall-through.
-        const BM1396_FAMILY_ID: u16 = 0x1396; // bm1393.rs:172 family-ID convention; NOT a registry key.
+        const BM1396_WIRE_ID: u16 = dcentrald_common::BM1396_WIRE_CHIP_ID;
         assert!(
-            production.detect(BM1396_FAMILY_ID).is_none(),
-            "BM1396 (0x1396) must NOT resolve to any registered driver — \
+            production.detect(BM1396_WIRE_ID).is_none(),
+            "BM1396 wire ID 0x1396 must NOT resolve to any registered driver — \
              the bm1396 scaffold is intentionally unregistered (see \
              2026-05-16-bm1396-vs-bm1397-disambiguation.md §1/§5)"
         );
@@ -2334,7 +2398,7 @@ mod tests {
         // driver (only BM1373/BM1489 are) and never gets registered.
         assert!(
             ChipRegistry::with_scaffold_drivers()
-                .detect(BM1396_FAMILY_ID)
+                .detect(BM1396_WIRE_ID)
                 .is_none(),
             "BM1396 is not a scaffold driver; it must stay unregistered \
              even when scaffold drivers are enabled"
@@ -2344,13 +2408,12 @@ mod tests {
         // scaffold / RE-pending sentinels — it is neither interchangeable
         // with BM1397 nor a simulator/pre-hardware chip.
         assert_ne!(
-            BM1396_FAMILY_ID,
+            BM1396_WIRE_ID,
             bm1397::CHIP_ID,
-            "BM1396 (S17+/T17+) and BM1397 (S17/T17/S17e/T17e) are \
-             distinct chip IDs — never collapse them"
+            "BM1396 and BM1397 wire identities are distinct — never collapse them"
         );
-        assert!(!is_scaffold_driver_chip(BM1396_FAMILY_ID));
-        assert!(!is_re_pending_chip(BM1396_FAMILY_ID));
+        assert!(!is_scaffold_driver_chip(BM1396_WIRE_ID));
+        assert!(!is_re_pending_chip(BM1396_WIRE_ID));
     }
 
     /// S15 (BM1391, `0x1391`) production-readiness DET contract (2026-07-02).
@@ -2358,15 +2421,16 @@ mod tests {
     /// The Antminer S15 uses the 7 nm BM1391 die and rides the am1 Xilinx-Zynq
     /// image with the "Broad Zynq-era Hash Board Auto-Detection" core feature:
     /// on a live S15, ChipID `0x1391` dispatches to the BM1391 driver. That
-    /// driver is a JIG-VERIFIED but FAIL-CLOSED scaffold (no live S15/S11 on the
-    /// fleet), so it is:
+    /// driver is a JIG-OBSERVED but FAIL-CLOSED scaffold. Held evidence settles
+    /// the S15's 3 × 60 × 256 geometry, but not the carrier, PIC, thermal, PLL,
+    /// or energization contract, so it is:
     ///   - NOT in the default `production()` registry (a stray 0x1391 must NOT
     ///     silently load a scaffold onto a live miner → `detect` = None), and
     ///   - present in the double-env-gated scaffold registry, where a live
     ///     S15 bring-up (BP-S15-BRINGUP) enables it, enumerates, and the
     ///     scaffold's `init_chain` fail-closes until an operator validates it.
-    /// This pins S15's DET/ASIC cells at YELLOW (auto-detect wired behind the
-    /// scaffold-ack gate; live validation is the physical residual), not RED.
+    /// This pins only the scaffold registry behavior. It does not promote the
+    /// S15 acceptance row beyond `NOT-IMPLEMENTED` or authorize live bring-up.
     #[test]
     fn s15_bm1391_detect_is_scaffold_gated_not_production() {
         assert_eq!(bm1391::CHIP_ID, 0x1391, "S15 die = BM1391 = 0x1391");

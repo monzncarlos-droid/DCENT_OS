@@ -73,6 +73,15 @@ class ReleaseSetPublicationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_windows_native_identity_normalizes_cpython_device_bits(self) -> None:
+        module = self.load_module()
+        self.assertEqual(
+            module.windows_native_identity(
+                (0xB2CC1379CC133757, 0x000F000000001234)
+            ),
+            (0xCC133757, 0x000F000000001234),
+        )
+
     def quarantines(self, output_name: str = "dcentos-v1-release") -> list[Path]:
         parent = self.stage_parent if os.name == "nt" else self.output_parent
         return list(parent.glob(f".{output_name}.publication-failed.*"))

@@ -1,0 +1,49 @@
+#!/bin/sh
+
+# External-media AM2 boots are deliberately management-only.  The producer
+# inserts this exact empty regular marker into its copied CPIO; normal NAND
+# root filesystems do not carry it and retain the ordinary Buildroot rcS loop.
+DCENTOS_EXTERNAL_MEDIA_MARKER=${DCENTOS_EXTERNAL_MEDIA_MARKER:-/etc/dcentos/external-media-ephemeral-root}
+DCENTOS_INIT_DIR=${DCENTOS_INIT_DIR:-/etc/init.d}
+DCENTOS_EXTERNAL_MEDIA_START_ALLOWLIST='S01syslogd S02klogd S40network S41ntp S43logrotate S45persistent S50dropbear'
+
+run_start_script() {
+    script=$1
+    [ -f "$script" ] || return 0
+    case "$script" in
+        *.sh)
+            (
+                trap - INT QUIT TSTP
+                set start
+                . "$script"
+            )
+            ;;
+        *)
+            "$script" start
+            ;;
+    esac
+}
+
+if [ -f "$DCENTOS_EXTERNAL_MEDIA_MARKER" ] && \
+   [ ! -L "$DCENTOS_EXTERNAL_MEDIA_MARKER" ] && \
+   [ ! -s "$DCENTOS_EXTERNAL_MEDIA_MARKER" ]; then
+    echo "[external-media] restricted init allowlist active"
+    for script in "$DCENTOS_INIT_DIR"/S??*; do
+        [ -f "$script" ] || continue
+        name=${script##*/}
+        case " $DCENTOS_EXTERNAL_MEDIA_START_ALLOWLIST " in
+            *" $name "*) ;;
+            *) echo "[external-media] skipped init service: $name" ;;
+        esac
+    done
+    for name in $DCENTOS_EXTERNAL_MEDIA_START_ALLOWLIST; do
+        run_start_script "$DCENTOS_INIT_DIR/$name"
+    done
+    exit 0
+fi
+
+# Normal on-board boot: preserve the upstream Buildroot ordering and behavior.
+for script in "$DCENTOS_INIT_DIR"/S??*; do
+    [ -f "$script" ] || continue
+    run_start_script "$script"
+done

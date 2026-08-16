@@ -19,7 +19,7 @@
 //! - `serial_chain`     - Serial-based chain transport (NS16550A UART backend for ASIC comms)
 //! - `psu`              - APW PSU controller via I2C bus 1 (PMBus-like protocol, watchdog)
 //! - `psu_apw12_smbus`  - APW12 SMBus opcode driver for CV1835/AM335x BB/Amlogic S19j Pro (NOT for Zynq am2 — that uses `psu::Apw121215a`)
-//! - `psu_apw12_plus`   - APW12+ register-based PSU driver for S21 family (Amlogic, NoPic). DIFFERENT protocol from APW12 SMBus.
+//! - `psu_apw12_plus`   - quarantined APW12+ register-model evidence and exact framed-protocol builders; no production constructor.
 //! - `psu_apw_uart_tunnel` - APW121215f framed UART-tunnel driver for the AM335x BB S19j Pro on S19J_IO_BOARD_V2_0 (the `a lab unit` unit). DIFFERENT framing from `psu_apw12_smbus`. Frame format LIVE-CONFIRMED (2026-05-12 ftrace on `a lab unit`); calibration read + watchdog-disable opcodes Ghidra-confirmed (2026-05-31); set-voltage payload still TODO.
 //! - `stock_fpga`       - Stock Bitmain FPGA register access (/dev/axi_fpga_dev, 352-byte flat space)
 //! - `stock_fpga_iic`   - Stock FPGA PIC I2C via IIC_COMMAND register (no /dev/i2c-*)
@@ -74,6 +74,7 @@ pub mod stock_fpga;
 pub mod stock_fpga_axi_ioctl;
 pub mod stock_fpga_axi_mmap;
 pub mod stock_fpga_iic;
+pub mod stock_fpga_preflight;
 pub mod stock_fpga_work;
 /// Pure TransportOp → Bm1397PlusChainBackend execute adapter (P1-3).
 pub mod transport_op_execute;

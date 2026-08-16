@@ -324,6 +324,55 @@ mod tests {
             let end = (call.0 + 240).min(LATE_SOURCE.len());
             assert!(LATE_SOURCE[call.0..end].contains(".await"));
         }
+        let chip_start = LATE_SOURCE
+            .find("pub(super) async fn post_diag_chiphealth_start(")
+            .expect("ChipHealth start route");
+        let chip_end = LATE_SOURCE[chip_start..]
+            .find("pub(super) async fn get_diag_chiphealth_status(")
+            .map(|offset| chip_start + offset)
+            .expect("ChipHealth start route boundary");
+        let chip_route = &LATE_SOURCE[chip_start..chip_end];
+        let persist = chip_route
+            .find("persist_snapshot_artifact(")
+            .expect("ChipHealth route must persist its typed snapshot");
+        let publish = chip_route
+            .find("record_persisted_chip_health_snapshot(")
+            .expect("ChipHealth route must record persisted lifecycle completion");
+        assert!(
+            persist < publish,
+            "ChipHealth must not emit lifecycle completion before durable persistence"
+        );
+        let board_start = LATE_SOURCE
+            .find("pub(super) async fn post_diag_boardhealth_start(")
+            .expect("BoardHealth start route");
+        let board_end = LATE_SOURCE[board_start..]
+            .find("pub(super) async fn get_diag_boardhealth_status(")
+            .map(|offset| board_start + offset)
+            .expect("BoardHealth start route boundary");
+        let board_route = &LATE_SOURCE[board_start..board_end];
+        let board_persist = board_route
+            .find("persist_snapshot_artifact(")
+            .expect("BoardHealth route must persist its typed results");
+        let board_publish = board_route
+            .find("record_persisted_board_health_snapshot(")
+            .expect("BoardHealth route must record persisted lifecycle completion");
+        assert!(
+            board_persist < board_publish,
+            "BoardHealth must not emit lifecycle completion before durable persistence"
+        );
+        let asic_start = LATE_SOURCE
+            .find("pub(super) async fn get_diag_asic_comm(")
+            .expect("passive ASIC communication route");
+        let asic_end = LATE_SOURCE[asic_start..]
+            .find("pub(super) async fn get_diag_i2c_scan(")
+            .map(|offset| asic_start + offset)
+            .expect("passive ASIC communication route boundary");
+        let asic_route = &LATE_SOURCE[asic_start..asic_end];
+        assert!(asic_route.contains("let miner = state.state_rx.borrow().clone();"));
+        assert!(asic_route.contains("AsicCommSnapshot::from_chains(chains)"));
+        assert!(asic_route.contains(".publish_asic_comm_snapshot(snapshot.clone())"));
+        assert!(!asic_route.contains("send_command("));
+        assert!(!asic_route.contains("AsicCommTest {"));
 
         assert!(STORE_SOURCE.contains("static DIAGNOSTIC_READ_OWNER:"));
         assert!(STORE_SOURCE.contains("async fn load_snapshot_artifact("));
