@@ -11,6 +11,7 @@
 //! continuously. Locate sequences and flash events temporarily override the
 //! background, then resume it.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,151 @@ use tokio_util::sync::CancellationToken;
 
 use crate::gpio::{GpioController, Led};
 use crate::led_patterns;
+
+/// Platform LED writer used by [`LedEngine`].
+///
+/// S9/Zynq uses the AXI [`GpioController`] (Linux LED-class sysfs).
+/// Amlogic / BeagleBone / CViTek have no AXI GPIO map; VNish `blink` and
+/// `S11board` drive the front-panel pair through sysfs GPIO (AML 438/453,
+/// live-confirmed on S21 `a lab unit`). The engine must own those writes — overlay
+/// scripts must not open a parallel locate loop.
+pub trait LedIo: Send + Sync {
+    fn set_led(&self, led: Led, on: bool);
+    fn read_led(&self, led: Led) -> bool;
+    fn toggle_led(&self, led: Led) {
+        let on = self.read_led(led);
+        self.set_led(led, !on);
+    }
+    fn init_leds(&self) {}
+}
+
+impl LedIo for GpioController {
+    fn set_led(&self, led: Led, on: bool) {
+        GpioController::set_led(self, led, on);
+    }
+    fn read_led(&self, led: Led) -> bool {
+        GpioController::read_led(self, led)
+    }
+    fn toggle_led(&self, led: Led) {
+        GpioController::toggle_led(self, led);
+    }
+    fn init_leds(&self) {
+        GpioController::init_leds(self);
+    }
+}
+
+/// Which sysfs pair [`sysfs_status_led_backend`] selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysfsLedPlatform {
+    Amlogic,
+    BeagleBone,
+    Cvitek,
+}
+
+/// Map a logical LED onto the Amlogic red/green sysfs pair.
+///
+/// `Some(true)` = red (gpio438), `Some(false)` = green (gpio453).
+/// Internal D7/D8 have no Amlogic pins — `None` is a no-op.
+pub fn amlogic_led_is_red(led: Led) -> Option<bool> {
+    match led {
+        Led::Red => Some(true),
+        Led::Green => Some(false),
+        Led::RedInternal | Led::D8 => None,
+    }
+}
+
+/// Amlogic A113D front-panel LEDs (VNish `blink` + `S11board`, DCENT HAL
+/// `write_amlogic_status_led`). Active HIGH. Does not touch PSU/reset.
+pub struct AmlogicSysfsLed;
+
+impl LedIo for AmlogicSysfsLed {
+    fn set_led(&self, led: Led, on: bool) {
+        if let Some(red) = amlogic_led_is_red(led) {
+            let _ = crate::platform::amlogic::write_amlogic_status_led(red, on);
+        }
+    }
+    fn read_led(&self, _led: Led) -> bool {
+        // Locate/flash do not require readback; sysfs value is best-effort.
+        false
+    }
+    fn init_leds(&self) {
+        self.set_led(Led::Green, false);
+        self.set_led(Led::Red, false);
+    }
+}
+
+/// BeagleBone front-panel LEDs (gpio 23/45).
+pub struct BeagleBoneSysfsLed;
+
+impl LedIo for BeagleBoneSysfsLed {
+    fn set_led(&self, led: Led, on: bool) {
+        match led {
+            Led::Green => crate::platform::beaglebone::set_led_green(on),
+            Led::Red => crate::platform::beaglebone::set_led_red(on),
+            Led::RedInternal | Led::D8 => {}
+        }
+    }
+    fn read_led(&self, _led: Led) -> bool {
+        false
+    }
+    fn init_leds(&self) {
+        crate::platform::beaglebone::set_led_green(false);
+        crate::platform::beaglebone::set_led_red(false);
+    }
+}
+
+/// CViTek CV1835 front-panel LEDs.
+pub struct CvitekSysfsLed;
+
+impl LedIo for CvitekSysfsLed {
+    fn set_led(&self, led: Led, on: bool) {
+        match led {
+            Led::Green => crate::platform::cvitek::set_led_green(on),
+            Led::Red => crate::platform::cvitek::set_led_red(on),
+            Led::RedInternal | Led::D8 => {}
+        }
+    }
+    fn read_led(&self, _led: Led) -> bool {
+        false
+    }
+    fn init_leds(&self) {
+        crate::platform::cvitek::set_led_green(false);
+        crate::platform::cvitek::set_led_red(false);
+    }
+}
+
+/// Pick a sysfs LED backend when AXI GPIO is absent (Amlogic/BB/CV).
+///
+/// Probe order is fail-closed: never assume Amlogic pins on a Zynq board
+/// that already has `/sys/class/leds/Green LED` (S9 LED-class path).
+pub fn sysfs_status_led_kind() -> Option<SysfsLedPlatform> {
+    if Path::new("/sys/class/leds/Green LED").exists() {
+        return None;
+    }
+    if Path::new("/sys/module/uart_trans").exists() {
+        return Some(SysfsLedPlatform::Cvitek);
+    }
+    if Path::new("/dev/ttyO1").exists() && !Path::new("/dev/uio0").exists() {
+        return Some(SysfsLedPlatform::BeagleBone);
+    }
+    if Path::new("/sys/class/gpio/gpio438").exists()
+        || Path::new("/sys/class/gpio/gpio453").exists()
+        || (Path::new("/dev/ttyS1").exists() && !Path::new("/dev/uio0").exists())
+    {
+        return Some(SysfsLedPlatform::Amlogic);
+    }
+    None
+}
+
+/// Construct the sysfs LED backend for the probed platform, if any.
+pub fn sysfs_status_led_backend() -> Option<Arc<dyn LedIo>> {
+    match sysfs_status_led_kind() {
+        Some(SysfsLedPlatform::Amlogic) => Some(Arc::new(AmlogicSysfsLed)),
+        Some(SysfsLedPlatform::BeagleBone) => Some(Arc::new(BeagleBoneSysfsLed)),
+        Some(SysfsLedPlatform::Cvitek) => Some(Arc::new(CvitekSysfsLed)),
+        None => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -152,7 +298,7 @@ impl Default for LedEngineConfig {
 
 /// Async LED engine that runs as a tokio task.
 pub struct LedEngine {
-    gpio: Arc<GpioController>,
+    leds: Arc<dyn LedIo>,
     cmd_rx: mpsc::Receiver<LedCommand>,
     cancel: CancellationToken,
     config: LedEngineConfig,
@@ -180,7 +326,7 @@ impl LedEngine {
     /// receiver that always holds the latest `LedStatus` snapshot. Pass it
     /// to the API layer for `GET /api/led/status`.
     pub fn new(
-        gpio: Arc<GpioController>,
+        leds: Arc<dyn LedIo>,
         cmd_rx: mpsc::Receiver<LedCommand>,
         cancel: CancellationToken,
         config: LedEngineConfig,
@@ -196,7 +342,7 @@ impl LedEngine {
         let (status_tx, status_rx) = watch::channel(initial_status);
 
         let engine = Self {
-            gpio,
+            leds,
             cmd_rx,
             cancel,
             config,
@@ -274,7 +420,7 @@ impl LedEngine {
                         2 => (true,  150), // DUB ON
                         _ => (false, 650), // pause
                     };
-                    self.gpio.set_led(Led::RedInternal, on);
+                    self.leds.set_led(Led::RedInternal, on);
                     self.d7_phase = (self.d7_phase + 1) % 4;
                     d7_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(next_ms));
                 }
@@ -386,8 +532,8 @@ impl LedEngine {
                 self.night_mode = enabled && self.config.night_mode_disable;
                 if self.night_mode && !self.locate_active {
                     // Turn off user-facing LEDs
-                    self.gpio.set_led(Led::Green, false);
-                    self.gpio.set_led(Led::Red, false);
+                    self.leds.set_led(Led::Green, false);
+                    self.leds.set_led(Led::Red, false);
                 }
                 self.publish_status();
             }
@@ -402,7 +548,7 @@ impl LedEngine {
             }
 
             LedCommand::TogglePipelineHeartbeat => {
-                self.gpio.toggle_led(Led::D8);
+                self.leds.toggle_led(Led::D8);
             }
         }
     }
@@ -470,55 +616,55 @@ impl LedEngine {
     /// Advance the background pattern by one tick.
     fn tick_background_pattern(&mut self) {
         if self.night_mode && !self.locate_active {
-            self.gpio.set_led(Led::Green, false);
-            self.gpio.set_led(Led::Red, false);
+            self.leds.set_led(Led::Green, false);
+            self.leds.set_led(Led::Red, false);
             return;
         }
 
         match self.current_pattern {
             LedPattern::Mining => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, self.heartbeat_on);
-                self.gpio.set_led(Led::Red, false);
+                self.leds.set_led(Led::Green, self.heartbeat_on);
+                self.leds.set_led(Led::Red, false);
             }
             LedPattern::Initializing => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, self.heartbeat_on);
-                self.gpio.set_led(Led::Red, false);
+                self.leds.set_led(Led::Green, self.heartbeat_on);
+                self.leds.set_led(Led::Red, false);
             }
             LedPattern::Error => {
-                self.gpio.set_led(Led::Green, false);
-                self.gpio.set_led(Led::Red, true);
+                self.leds.set_led(Led::Green, false);
+                self.leds.set_led(Led::Red, true);
             }
             LedPattern::FanFailure => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, false);
-                self.gpio.set_led(Led::Red, self.heartbeat_on);
+                self.leds.set_led(Led::Green, false);
+                self.leds.set_led(Led::Red, self.heartbeat_on);
             }
             LedPattern::ThermalWarning => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, false);
-                self.gpio.set_led(Led::Red, self.heartbeat_on);
+                self.leds.set_led(Led::Green, false);
+                self.leds.set_led(Led::Red, self.heartbeat_on);
             }
             LedPattern::PoolDisconnected => {
                 // Alternate green/red
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, self.heartbeat_on);
-                self.gpio.set_led(Led::Red, !self.heartbeat_on);
+                self.leds.set_led(Led::Green, self.heartbeat_on);
+                self.leds.set_led(Led::Red, !self.heartbeat_on);
             }
             LedPattern::Shutdown => {
-                self.gpio.set_led(Led::Green, false);
-                self.gpio.set_led(Led::Red, false);
+                self.leds.set_led(Led::Green, false);
+                self.leds.set_led(Led::Red, false);
             }
             LedPattern::Sleep => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, self.heartbeat_on);
-                self.gpio.set_led(Led::Red, false);
+                self.leds.set_led(Led::Green, self.heartbeat_on);
+                self.leds.set_led(Led::Red, false);
             }
             LedPattern::FirmwareUpdate => {
                 self.heartbeat_on = !self.heartbeat_on;
-                self.gpio.set_led(Led::Green, self.heartbeat_on);
-                self.gpio.set_led(Led::Red, !self.heartbeat_on);
+                self.leds.set_led(Led::Green, self.heartbeat_on);
+                self.leds.set_led(Led::Red, !self.heartbeat_on);
             }
             LedPattern::Booting => {
                 // Static during boot — animation is played once in play_boot_animation()
@@ -535,8 +681,8 @@ impl LedEngine {
             (false, false, 200), // Off
         ];
         for &(green, red, ms) in frames {
-            self.gpio.set_led(Led::Green, green);
-            self.gpio.set_led(Led::Red, red);
+            self.leds.set_led(Led::Green, green);
+            self.leds.set_led(Led::Red, red);
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
     }
@@ -569,8 +715,8 @@ impl LedEngine {
                     break 'outer;
                 }
 
-                self.gpio.set_led(Led::Green, frame.green);
-                self.gpio.set_led(Led::Red, frame.red);
+                self.leds.set_led(Led::Green, frame.green);
+                self.leds.set_led(Led::Red, frame.red);
 
                 // Sleep for frame duration, but check for commands
                 let frame_dur = Duration::from_millis(frame.duration_ms as u64);
@@ -600,7 +746,7 @@ impl LedEngine {
                                     self.temperature_c = t;
                                 }
                                 Some(LedCommand::TogglePipelineHeartbeat) => {
-                                    self.gpio.toggle_led(Led::D8);
+                                    self.leds.toggle_led(Led::D8);
                                 }
                                 Some(_) => {} // Ignore other commands during locate
                                 None => {
@@ -629,14 +775,14 @@ impl LedEngine {
             return;
         }
         // Save current state
-        let was_on = self.gpio.read_led(led);
+        let was_on = self.leds.read_led(led);
 
         // Flash
-        self.gpio.set_led(led, true);
+        self.leds.set_led(led, true);
         tokio::time::sleep(Duration::from_millis(duration_ms as u64)).await;
 
         // Restore
-        self.gpio.set_led(led, was_on);
+        self.leds.set_led(led, was_on);
     }
 
     /// Brief both-LED flash (new block from pool, both green + red).
@@ -644,15 +790,15 @@ impl LedEngine {
         if self.night_mode {
             return;
         }
-        let was_green = self.gpio.read_led(Led::Green);
-        let was_red = self.gpio.read_led(Led::Red);
+        let was_green = self.leds.read_led(Led::Green);
+        let was_red = self.leds.read_led(Led::Red);
 
-        self.gpio.set_led(Led::Green, true);
-        self.gpio.set_led(Led::Red, true);
+        self.leds.set_led(Led::Green, true);
+        self.leds.set_led(Led::Red, true);
         tokio::time::sleep(Duration::from_millis(duration_ms as u64)).await;
 
-        self.gpio.set_led(Led::Green, was_green);
-        self.gpio.set_led(Led::Red, was_red);
+        self.leds.set_led(Led::Green, was_green);
+        self.leds.set_led(Led::Red, was_red);
     }
 
     /// Play a celebration pattern (lucky share / block found).
@@ -662,16 +808,16 @@ impl LedEngine {
         }
         // 3 rapid both-LED flashes
         for _ in 0..3 {
-            self.gpio.set_led(Led::Green, true);
-            self.gpio.set_led(Led::Red, true);
+            self.leds.set_led(Led::Green, true);
+            self.leds.set_led(Led::Red, true);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            self.gpio.set_led(Led::Green, false);
-            self.gpio.set_led(Led::Red, false);
+            self.leds.set_led(Led::Green, false);
+            self.leds.set_led(Led::Red, false);
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
         // Long hold
-        self.gpio.set_led(Led::Green, true);
-        self.gpio.set_led(Led::Red, true);
+        self.leds.set_led(Led::Green, true);
+        self.leds.set_led(Led::Red, true);
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Resume
@@ -689,9 +835,9 @@ impl LedEngine {
         };
 
         for _ in 0..flashes {
-            self.gpio.set_led(Led::Green, true);
+            self.leds.set_led(Led::Green, true);
             tokio::time::sleep(Duration::from_millis(150)).await;
-            self.gpio.set_led(Led::Green, false);
+            self.leds.set_led(Led::Green, false);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -699,9 +845,31 @@ impl LedEngine {
 
     /// Turn all LEDs off.
     fn all_off(&self) {
-        self.gpio.set_led(Led::Green, false);
-        self.gpio.set_led(Led::Red, false);
-        self.gpio.set_led(Led::RedInternal, false);
-        self.gpio.set_led(Led::D8, false);
+        self.leds.set_led(Led::Green, false);
+        self.leds.set_led(Led::Red, false);
+        self.leds.set_led(Led::RedInternal, false);
+        self.leds.set_led(Led::D8, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpio::Led;
+
+    #[test]
+    fn amlogic_led_map_matches_vnish_blink_pair() {
+        assert_eq!(amlogic_led_is_red(Led::Red), Some(true));
+        assert_eq!(amlogic_led_is_red(Led::Green), Some(false));
+        assert_eq!(amlogic_led_is_red(Led::RedInternal), None);
+        assert_eq!(amlogic_led_is_red(Led::D8), None);
+    }
+
+    #[test]
+    fn sysfs_kind_is_none_on_host_without_miner_sysfs() {
+        // Windows/Linux CI hosts have neither Green LED class nor gpio438.
+        // A live miner may return Some(_); this pin is "do not panic".
+        let _ = sysfs_status_led_kind();
+        let _ = sysfs_status_led_backend();
     }
 }

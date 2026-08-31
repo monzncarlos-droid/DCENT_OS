@@ -92,10 +92,19 @@ AMLOGIC_EXACT_INPUTS_BY_TARGET = {
 }
 PREBUILT_RUST_INPUTS_BY_TARGET = {
     "s9": ("dcentos-init", "dcentrald"),
+    # 2026-08-29 packaging-lane wave: the S9 SE / S9k research shells
+    # ride the same zynq prebuilt Rust lane as s9.
+    "am1-s9se": ("dcentos-init", "dcentrald"),
+    "am1-s9k": ("dcentos-init", "dcentrald"),
     "am2-s19jpro": ("dcentos-init", "dcentrald"),
     "am2-s19jpro-sd": ("dcentos-init", "dcentrald"),
     "am2-s19pro": ("dcentos-init", "dcentrald"),
     "am2-s17pro": ("dcentos-init", "dcentrald"),
+    # 2026-08-27 armada (B2): the remaining BM1397 17-series siblings ride
+    # the same zynq prebuilt Rust lane.
+    "am2-s17plus": ("dcentos-init", "dcentrald"),
+    "am2-t17": ("dcentos-init", "dcentrald"),
+    "am2-t17plus": ("dcentos-init", "dcentrald"),
     **{
         target: ("dcentos-init", "dcentrald")
         for target in AMLOGIC_EXACT_MODEL_BY_TARGET
@@ -114,6 +123,17 @@ TARGET_BUILD_INPUTS = {
         "",
         "",
     ),
+    # 2026-08-29 packaging-lane wave: the S9 SE / S9k post-image scripts
+    # consume the same am1-s9 vendor SoC boot inputs (fail-closed when
+    # absent) — see board/zynq/am1-s9{se,k}/post-image.sh.
+    "am1-s9se": (
+        "",
+        "",
+    ),
+    "am1-s9k": (
+        "",
+        "",
+    ),
     "am2-s19jpro": (
         "",
         "",
@@ -128,7 +148,12 @@ TARGET_BUILD_INPUTS = {
         "",
         "",
     ),
+    # A2 section 3: the ONE held Braiins am2-s17 donor serves the whole
+    # 17 family (S17/S17 Pro/S17+/T17/T17+ share its boot chain).
     "am2-s17pro": (AM2_S17_DONOR_RELATIVE_PATH,),
+    "am2-s17plus": (AM2_S17_DONOR_RELATIVE_PATH,),
+    "am2-t17": (AM2_S17_DONOR_RELATIVE_PATH,),
+    "am2-t17plus": (AM2_S17_DONOR_RELATIVE_PATH,),
     **AMLOGIC_EXACT_INPUTS_BY_TARGET,
 }
 # Canonical-manifest entries that are deliberately not direct inputs to the
@@ -162,6 +187,20 @@ BUILD_TARGET_POLICIES = {
             "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_s9_defconfig",
         ),
     },
+    "am1-s9se": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am1-s9se_defconfig",
+        ),
+    },
+    "am1-s9k": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am1-s9k_defconfig",
+        ),
+    },
     "am2-s19jpro": {
         "arch": "armv7-unknown-linux-musleabihf",
         "configs": (
@@ -188,6 +227,26 @@ BUILD_TARGET_POLICIES = {
         "configs": (
             "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
             "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_s17pro_zynq_defconfig",
+        ),
+    },    "am2-s17plus": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_s17plus_defconfig",
+        ),
+    },
+    "am2-t17": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_t17_defconfig",
+        ),
+    },
+    "am2-t17plus": {
+        "arch": "armv7-unknown-linux-musleabihf",
+        "configs": (
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos-common.fragment",
+            "DCENT_OS_Antminer/br2_external_dcentos/configs/dcentos_am2_t17plus_defconfig",
         ),
     },
     **{
@@ -392,10 +451,10 @@ def build_input_evidence(
     blocked = BLOCKED_BUILD_INPUT_TARGETS.get(target)
     if blocked is not None:
         fail(blocked)
-    if target == "am2-s17pro":
+    if target in ("am2-s17pro", "am2-s17plus", "am2-t17", "am2-t17plus"):
         donor = discover_am2_s17_donor(root)
         if donor["path"] != AM2_S17_DONOR_RELATIVE_PATH:
-            fail("am2-s17pro donor discovery did not resolve its canonical path")
+            fail(f"{target} donor discovery did not resolve its canonical path")
 
     manifest, declared = parse_build_input_manifest(root, manifest_text)
     selected = TARGET_BUILD_INPUTS.get(target)

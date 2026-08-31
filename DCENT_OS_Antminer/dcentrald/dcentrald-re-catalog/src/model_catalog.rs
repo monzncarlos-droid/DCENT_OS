@@ -52,6 +52,14 @@ macro_rules! model {
 /// Unknown geometry remains `None`; it is never filled from projections.
 pub static ANTMINER_MODELS: &[ModelEvidence] = &[
     model!("s9", 0x1387, 3, Some(63), 115_200, 7, Some(650), Some(8_000), Some(9_000), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    // Evidence-only marketing variant. This records held identity/geometry; it
+    // does not alias S9i into the callable am1-s9 runtime or install route.
+    model!("s9i", 0x1387, 3, Some(63), 115_200, 7, Some(500), None, None, Exact, &[MASTER_MODELS, ""]),
+    model!("s9j", 0x1387, 3, Some(63), 115_200, 7, None, None, None, Exact, &[MASTER_MODELS, ""]),
+    // The S9k's unstripped miner proves this ASIC/population tuple. This is
+    // evidence coverage only: `BoardDesc::am1_s9k` deliberately keeps carrier,
+    // voltage and install authority closed.
+    model!("s9k", 0x1393, 3, Some(60), 115_200, 9, None, None, None, Exact, &[MASTER_MODELS, ""]),
     model!("s11", 0x1391, 3, None, 115_200, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
     model!("s15", 0x1391, 3, None, 115_200, 7, None, None, None, Scaffold, &[MASTER_MODELS]),
     model!("t15", 0x1391, 3, None, 115_200, 7, None, None, None, Scaffold, &[MASTER_MODELS]),
@@ -66,15 +74,21 @@ pub static ANTMINER_MODELS: &[ModelEvidence] = &[
     model!("s17plus", 0x1397, 3, Some(65), 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
     model!("t17plus", 0x1397, 3, Some(44), 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
     model!("s17e", 0x1396, 3, None, 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, "", ""]),
+    model!("t17e", 0x1396, 3, Some(78), 115_740, 7, None, None, None, Structural, &[MASTER_MODELS, ""]),
     model!("s19", 0x1398, 3, None, 115_740, 7, Some(650), None, None, Structural, &[MASTER_MODELS, MASTER_PLL, S19_JIG]),
     model!("s19pro", 0x1398, 3, Some(114), 115_740, 7, Some(675), Some(13_000), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S19_JIG, ""]),
+    model!("s19a", 0x1398, 3, Some(114), 115_740, 7, None, None, None, Exact, &[MASTER_MODELS]),
+    model!("s19apro", 0x1398, 3, Some(114), 115_740, 7, None, None, None, Exact, &[MASTER_MODELS]),
+    model!("s19i", 0x1398, 3, Some(114), 115_740, 7, None, None, None, Exact, &[MASTER_MODELS]),
+    model!("s19j", 0x1398, 3, None, 115_740, 7, None, None, None, Structural, &[MASTER_MODELS]),
     model!("s19jpro", 0x1362, 3, Some(126), 115_200, 9, Some(545), None, None, Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
+    model!("s19jplus", 0x1362, 3, Some(110), 115_200, 9, None, None, None, Exact, &[MASTER_MODELS]),
     model!("s19xp", 0x1366, 3, Some(110), 115_200, 9, Some(675), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s19jxp", 0x1366, 3, Some(110), 115_200, 9, Some(675), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, "DCENT_OS_Antminer/dcentrald/dcentrald-silicon-profiles/src/hashboard_catalog.rs:462", ""]),
     model!("s19kpro", 0x1366, 3, Some(77), 115_200, 9, Some(670), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s21", 0x1368, 3, Some(108), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, ""]),
     model!("s21pro", 0x1370, 3, Some(65), 115_200, 9, Some(525), Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]),
-    model!("s21xp", 0x1370, 3, None, 115_200, 9, None, Some(13_400), Some(14_200), Structural, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG]),
+    model!("s21xp", 0x1370, 3, Some(91), 115_200, 9, None, Some(13_400), Some(14_200), Exact, &[MASTER_MODELS, MASTER_PLL, S21_PRO_JIG, "DCENT_OS_Antminer/dcentrald/dcentrald-silicon-profiles/src/hashboard_catalog.rs"]),
     model!("s23", 0x1372, 4, None, 115_200, 9, None, None, None, Scaffold, &[""]),
 ];
 
@@ -106,6 +120,44 @@ mod tests {
         assert_eq!(s23.strength, EvidenceStrength::Scaffold);
         assert_eq!(s23.chips_per_chain, None);
         assert_eq!(s23.default_frequency_mhz, None);
+    }
+
+    #[test]
+    fn catalog_shape_strength_counts_and_provenance_are_pinned() {
+        assert_eq!(ANTMINER_MODELS.len(), 29);
+        assert_eq!(
+            ANTMINER_MODELS
+                .iter()
+                .filter(|row| row.strength == EvidenceStrength::Exact)
+                .count(),
+            19
+        );
+        assert_eq!(
+            ANTMINER_MODELS
+                .iter()
+                .filter(|row| row.strength == EvidenceStrength::Structural)
+                .count(),
+            7
+        );
+        assert_eq!(
+            ANTMINER_MODELS
+                .iter()
+                .filter(|row| row.strength == EvidenceStrength::Scaffold)
+                .count(),
+            3
+        );
+        for row in ANTMINER_MODELS {
+            assert!(row.chains > 0);
+            assert!(row.default_baud > 0);
+            assert!(row.response_body_len > 0);
+            assert!(!row.provenance.is_empty());
+            for source in row.provenance {
+                assert!(!source.trim().is_empty());
+                assert!(!source.starts_with('/'));
+                assert!(!source.contains(".."));
+                assert!(!source.contains('\\'));
+            }
+        }
     }
 
     /// The S17-class model -> chip-family mapping, pinned in both directions so

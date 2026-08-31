@@ -204,6 +204,7 @@ impl EfficiencyOptimizer {
                     power_model.chip_id(),
                     p.operating_mhz,
                 )
+                .unwrap_or(0.0)
             })
             .sum();
 

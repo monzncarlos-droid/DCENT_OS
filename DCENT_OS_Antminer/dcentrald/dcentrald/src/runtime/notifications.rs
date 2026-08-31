@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::DcentraldConfig;
@@ -384,16 +384,23 @@ pub fn spawn_notification_stack(
 ///
 /// Serialized as tagged JSON and POSTed to the configured webhook URL
 /// (and surfaced as a browser notification by the dashboard).
-/// The thermal loop fires `EmergencyShutdown`, `FanFailure`, and
+/// The thermal loop fires `ThermalSafety`, `FanFailure`, and
 /// `ThermalRestart`. The three mining-health events a home operator most
 /// needs — `PoolDisconnected`, `MiningStopped`, and `HashBoardOffline` —
 /// are constructed and fired by [`MiningAlertMonitor`] from the daemon's
 /// 1 Hz state-publisher loop, debounced so a flapping condition can't spam
 /// the alert surface.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// Thermal JSON name is unified with [`dcentrald_api::webhook::WebhookEvent`]:
+/// the canonical tag is `thermal_safety`. The historical `emergency_shutdown`
+/// tag still deserializes (serde alias) and still matches `[webhook].events`
+/// allow-lists via [`AlertEvent::matches_event_filter`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum AlertEvent {
-    EmergencyShutdown {
+    /// Dangerous-temp / emergency-cut event. Wire name `thermal_safety`.
+    #[serde(alias = "emergency_shutdown")]
+    ThermalSafety {
         temp_c: f32,
         chain_id: u8,
     },
@@ -430,10 +437,11 @@ pub enum AlertEvent {
 }
 
 impl AlertEvent {
-    /// Return the event name string for filtering against `WebhookConfig.events`.
+    /// Canonical event name string (`thermal_safety` for the unified thermal
+    /// event). Matches [`dcentrald_api::webhook::WebhookEvent::event_name`].
     pub fn event_name(&self) -> &'static str {
         match self {
-            AlertEvent::EmergencyShutdown { .. } => "emergency_shutdown",
+            AlertEvent::ThermalSafety { .. } => "thermal_safety",
             AlertEvent::FanFailure { .. } => "fan_failure",
             AlertEvent::PoolDisconnected { .. } => "pool_disconnected",
             AlertEvent::MiningStopped { .. } => "mining_stopped",
@@ -442,6 +450,31 @@ impl AlertEvent {
             AlertEvent::HashrateDegraded { .. } => "hashrate_degraded",
             AlertEvent::HashrateRecoveryExhausted { .. } => "hashrate_recovery_exhausted",
         }
+    }
+
+    /// Names that match this event in `[webhook].events` allow-lists.
+    ///
+    /// `ThermalSafety` keeps the historical `emergency_shutdown` alias so the
+    /// dashboard default list and older Generic webhook subscribers still fire.
+    pub fn event_filter_names(&self) -> &'static [&'static str] {
+        match self {
+            AlertEvent::ThermalSafety { .. } => &["thermal_safety", "emergency_shutdown"],
+            AlertEvent::FanFailure { .. } => &["fan_failure"],
+            AlertEvent::PoolDisconnected { .. } => &["pool_disconnected"],
+            AlertEvent::MiningStopped { .. } => &["mining_stopped"],
+            AlertEvent::HashBoardOffline { .. } => &["hashboard_offline"],
+            AlertEvent::ThermalRestart => &["thermal_restart"],
+            AlertEvent::HashrateDegraded { .. } => &["hashrate_degraded"],
+            AlertEvent::HashrateRecoveryExhausted { .. } => &["hashrate_recovery_exhausted"],
+        }
+    }
+
+    /// True when `configured` is this event's canonical name or a kept alias.
+    pub fn matches_event_filter(&self, configured: &str) -> bool {
+        self.event_filter_names()
+            .iter()
+            .copied()
+            .any(|name| name == configured)
     }
 }
 
@@ -465,7 +498,7 @@ pub fn redact_alert_event(event: &mut AlertEvent) {
         AlertEvent::MiningStopped { reason } => {
             *reason = dcentrald_common::wallet_mask::mask_in_string(reason).into_owned();
         }
-        AlertEvent::EmergencyShutdown { .. }
+        AlertEvent::ThermalSafety { .. }
         | AlertEvent::FanFailure { .. }
         | AlertEvent::HashBoardOffline { .. }
         | AlertEvent::ThermalRestart
@@ -487,7 +520,7 @@ pub fn redact_alert_event(event: &mut AlertEvent) {
 pub fn alert_event_to_webhook_event(event: &AlertEvent) -> dcentrald_api::webhook::WebhookEvent {
     use dcentrald_api::webhook::WebhookEvent;
     match event {
-        AlertEvent::EmergencyShutdown { temp_c, chain_id } => WebhookEvent::ThermalSafety {
+        AlertEvent::ThermalSafety { temp_c, chain_id } => WebhookEvent::ThermalSafety {
             temp_c: *temp_c,
             chain_id: *chain_id,
         },
@@ -519,6 +552,105 @@ pub fn alert_event_to_webhook_event(event: &AlertEvent) -> dcentrald_api::webhoo
             attempts: *attempts,
         },
     }
+}
+
+/// Inputs that are not on the live [`dcentrald_api::MinerState`] snapshot.
+///
+/// Used by am3-bb / serial (and any non-`Daemon` path) to feed
+/// [`MiningAlertMonitor`] from the same MinerState watch the dashboard serves.
+#[derive(Debug, Clone)]
+pub struct MiningAlertMonitorBind {
+    pub mining_enabled: bool,
+    pub pool_url: String,
+    pub degraded_floor_ghs: f64,
+    pub degraded_pct: f64,
+    /// Rated nominal GH/s for the HLA-10 %-form floor. `0.0` leaves the
+    /// absolute floor in force (am3-bb/serial do not always have a profile).
+    pub nominal_ghs: f64,
+}
+
+impl MiningAlertMonitorBind {
+    pub fn from_config(config: &DcentraldConfig) -> Self {
+        Self {
+            mining_enabled: config.mining_start_enabled(),
+            pool_url: config.pool.url.clone(),
+            degraded_floor_ghs: config.mining.degraded_hashrate_alert_floor_ghs,
+            degraded_pct: config.mining.degraded_hashrate_alert_pct,
+            nominal_ghs: 0.0,
+        }
+    }
+}
+
+/// Project a live [`dcentrald_api::MinerState`] into a [`MiningHealthSnapshot`].
+pub fn mining_health_snapshot_from_state(
+    state: &dcentrald_api::MinerState,
+    bind: &MiningAlertMonitorBind,
+) -> MiningHealthSnapshot {
+    MiningHealthSnapshot {
+        mining_enabled: bind.mining_enabled,
+        pool_status: state.pool.status.clone(),
+        pool_url: if state.pool.url.is_empty() {
+            bind.pool_url.clone()
+        } else {
+            state.pool.url.clone()
+        },
+        total_hashrate_ghs: state.hashrate_ghs,
+        degraded_floor_ghs: effective_degraded_floor_ghs(
+            bind.degraded_pct,
+            bind.degraded_floor_ghs,
+            bind.nominal_ghs,
+        ),
+        chains: state
+            .chains
+            .iter()
+            .map(|chain| ChainHealth {
+                chain_id: chain.id,
+                chips: chain.chips,
+                hashrate_ghs: chain.hashrate_ghs,
+            })
+            .collect(),
+    }
+}
+
+/// Spawn the AlertEvent → webhook POST path used by non-`Daemon` mining modes.
+///
+/// Returns a non-blocking `try_send` producer. Default-OFF: the dispatcher
+/// drops every event until `[webhook].enabled` and a URL (or Telegram
+/// token/chat) are set — the same gate `spawn_notification_stack` uses.
+/// Must be called from a Tokio context (including `spawn_blocking` on a
+/// runtime — `Handle::current()` is available there).
+pub fn spawn_alert_event_dispatcher(
+    webhook: RuntimeWebhookConfig,
+    miner_name: String,
+    shutdown: CancellationToken,
+) -> mpsc::Sender<AlertEvent> {
+    let (alert_tx, mut alert_rx) = mpsc::channel::<AlertEvent>(64);
+    let (cfg_tx, cfg_rx) =
+        tokio::sync::watch::channel(webhook_dispatch_config(&webhook, &miner_name));
+    let dispatcher = dcentrald_api::webhook::WebhookDispatcher::spawn(
+        cfg_rx,
+        dcentrald_api::webhook::WebhookDispatchTuning::default(),
+        shutdown.child_token(),
+    );
+    let handle = dispatcher.handle();
+    let task_shutdown = shutdown.child_token();
+    tokio::spawn(async move {
+        let _dispatcher = dispatcher;
+        let _cfg_tx = cfg_tx;
+        loop {
+            tokio::select! {
+                _ = task_shutdown.cancelled() => break,
+                Some(mut event) = alert_rx.recv() => {
+                    redact_alert_event(&mut event);
+                    let mut webhook_event = alert_event_to_webhook_event(&event);
+                    webhook_event.redact();
+                    let _ = handle.dispatch(webhook_event);
+                }
+                else => break,
+            }
+        }
+    });
+    alert_tx
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,7 +1242,7 @@ mod alert_mapping_tests {
 
     #[test]
     fn redact_alert_event_is_noop_for_non_secret_variants() {
-        let mut ev = AlertEvent::EmergencyShutdown {
+        let mut ev = AlertEvent::ThermalSafety {
             temp_c: 75.0,
             chain_id: 1,
         };
@@ -1121,14 +1253,13 @@ mod alert_mapping_tests {
 
     #[test]
     fn mapping_is_total_and_preserves_event_name_for_filtering() {
-        // Every AlertEvent maps to a WebhookEvent. The inline loop filters on the
-        // AlertEvent name (operator allow-list contract), and the mapped
-        // WebhookEvent name must match for these so a future dispatcher-side
-        // allow-list stays consistent. (EmergencyShutdown is the one intentional
-        // rename → thermal_safety; its Generic envelope still uses the AlertEvent.)
+        // Every AlertEvent maps to a WebhookEvent. Canonical names now match
+        // (ThermalSafety serializes and filters as thermal_safety on both
+        // sides). The historical emergency_shutdown JSON tag is a deserialize
+        // + allow-list alias, not a second variant.
         let samples = [
             (
-                AlertEvent::EmergencyShutdown {
+                AlertEvent::ThermalSafety {
                     temp_c: 72.0,
                     chain_id: 2,
                 },
@@ -1170,6 +1301,7 @@ mod alert_mapping_tests {
         ];
         for (alert, expect_webhook_name) in samples {
             let mapped = alert_event_to_webhook_event(&alert);
+            assert_eq!(alert.event_name(), expect_webhook_name);
             assert_eq!(mapped.event_name(), expect_webhook_name);
         }
     }
@@ -1207,6 +1339,100 @@ mod alert_mapping_tests {
                 floor_ghs: 10_000.0,
                 attempts: 4,
             }
+        );
+    }
+
+    #[test]
+    fn thermal_safety_is_canonical_json_and_keeps_emergency_shutdown_alias() {
+        let ev = AlertEvent::ThermalSafety {
+            temp_c: 72.5,
+            chain_id: 2,
+        };
+        assert_eq!(ev.event_name(), "thermal_safety");
+        assert!(ev.matches_event_filter("thermal_safety"));
+        assert!(ev.matches_event_filter("emergency_shutdown"));
+        assert!(!ev.matches_event_filter("fan_failure"));
+        assert_eq!(
+            ev.event_filter_names(),
+            &["thermal_safety", "emergency_shutdown"]
+        );
+
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["event"], "thermal_safety");
+        assert_eq!(json["data"]["temp_c"], 72.5);
+        assert_eq!(json["data"]["chain_id"], 2);
+
+        let from_canonical: AlertEvent = serde_json::from_value(json.clone()).unwrap();
+        match from_canonical {
+            AlertEvent::ThermalSafety { temp_c, chain_id } => {
+                assert_eq!(temp_c, 72.5);
+                assert_eq!(chain_id, 2);
+            }
+            other => panic!("expected ThermalSafety, got {other:?}"),
+        }
+
+        let from_legacy: AlertEvent = serde_json::from_value(serde_json::json!({
+            "event": "emergency_shutdown",
+            "data": { "temp_c": 81.0, "chain_id": 0 }
+        }))
+        .unwrap();
+        match from_legacy {
+            AlertEvent::ThermalSafety { temp_c, chain_id } => {
+                assert_eq!(temp_c, 81.0);
+                assert_eq!(chain_id, 0);
+            }
+            other => panic!("legacy emergency_shutdown must parse as ThermalSafety, got {other:?}"),
+        }
+
+        let mapped = alert_event_to_webhook_event(&ev);
+        assert_eq!(mapped.event_name(), ev.event_name());
+    }
+
+    #[test]
+    fn mining_health_snapshot_from_state_copies_chain_and_pool() {
+        let mut state = dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard);
+        state.hashrate_ghs = 12_000.0;
+        state.pool.status = "Authorized".to_string();
+        state.pool.url = String::new();
+        state.chains = vec![dcentrald_api::ChainState {
+            id: 6,
+            chips: 63,
+            frequency_mhz: 400,
+            voltage_mv: 13_800,
+            temp_c: 42.0,
+            temp_source: None,
+            hashrate_ghs: 12_000.0,
+            errors: 0,
+            status: "mining".to_string(),
+        }];
+        let bind = MiningAlertMonitorBind {
+            mining_enabled: true,
+            pool_url: "stratum+tcp://public-pool.io:21496".to_string(),
+            degraded_floor_ghs: 5_000.0,
+            degraded_pct: 0.0,
+            nominal_ghs: 0.0,
+        };
+        let snap = mining_health_snapshot_from_state(&state, &bind);
+        assert!(snap.mining_enabled);
+        assert_eq!(snap.pool_status, "Authorized");
+        assert_eq!(snap.pool_url, "stratum+tcp://public-pool.io:21496");
+        assert_eq!(snap.total_hashrate_ghs, 12_000.0);
+        assert_eq!(snap.degraded_floor_ghs, 5_000.0);
+        assert_eq!(snap.chains.len(), 1);
+        assert_eq!(snap.chains[0].chain_id, 6);
+        assert_eq!(snap.chains[0].chips, 63);
+    }
+
+    #[test]
+    fn am3_bb_mining_source_wires_mining_alert_monitor() {
+        let src = include_str!("../am3_bb_mining.rs");
+        assert!(
+            src.contains("MiningAlertMonitor"),
+            "am3-bb mining path must construct MiningAlertMonitor"
+        );
+        assert!(
+            src.contains("spawn_alert_event_dispatcher"),
+            "am3-bb mining path must dispatch AlertEvents through the shared webhook path"
         );
     }
 }
@@ -1284,6 +1510,24 @@ mod notification_stack_tests {
         let _ = mining_sync_tx.send("ping".to_string());
 
         // The stack winds down promptly on shutdown (no hang, no panic).
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn alert_event_dispatcher_default_off_drops_without_io() {
+        let shutdown = CancellationToken::new();
+        let tx = spawn_alert_event_dispatcher(
+            default_off_config().webhook,
+            "test-miner".to_string(),
+            shutdown.clone(),
+        );
+        assert!(tx
+            .try_send(AlertEvent::ThermalSafety {
+                temp_c: 80.0,
+                chain_id: 0,
+            })
+            .is_ok());
         shutdown.cancel();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

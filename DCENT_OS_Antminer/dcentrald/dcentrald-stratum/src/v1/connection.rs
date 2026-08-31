@@ -405,6 +405,15 @@ impl StratumConnection {
         Ok(())
     }
 
+    /// Half-close the miner→pool write side (TCP FIN / TLS close_notify).
+    ///
+    /// Pair this with a pending-submit flush on daemon clean-stop so "upgrade
+    /// OK" does not RST a pool that still has unread bytes. Dropping the
+    /// socket without shutdown can send TCP RST.
+    pub async fn shutdown_write(&mut self) -> Result<(), ConnectionError> {
+        self.writer.shutdown().await.map_err(ConnectionError::Io)
+    }
+
     /// Get the connected host.
     pub fn host(&self) -> &str {
         &self.host

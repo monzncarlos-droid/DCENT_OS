@@ -1264,6 +1264,12 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             .to_string();
         let build_board_version_str = crate::config::default_profile_for_build().board_version;
         let ota_key_id = crate::ota_signature::compiled_key_id().unwrap_or("").to_string();
+        // Build script validates this registry-owned JSON before compiling the
+        // image. Parse into an owned vector so the typed response can expose a
+        // real array without duplicating target policy in firmware source.
+        let production_blockers: Vec<String> =
+            serde_json::from_str(env!("DCENTAXE_PRODUCTION_BLOCKERS_JSON"))
+                .unwrap_or_default();
 
         // B-ESP-10 read-surface masking: the worker is the operator's FULL BTC
         // payout address and a pool URL can embed `user:pass@` creds. Mirror the
@@ -1460,7 +1466,19 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
             // MQTT + HA config (read surface) — password masked to password_set.
             mqtt: crate::api_system_info::MqttView {
                 enabled: config.mqtt.enabled,
-                commands_enabled: config.mqtt.commands_enabled,
+                // Report the effective control surface, not merely the stored
+                // request: identity-only/blocked/unsafe targets must never tell
+                // operators that MQTT writes are active.
+                commands_enabled: crate::mqtt_ha::command_surface_enabled(
+                    config.mqtt.commands_enabled,
+                    crate::capabilities::deployment_allows_operational_mutations(
+                        env!("DCENTAXE_RUNTIME_MODE"),
+                        env!("DCENTAXE_INSTALL_POLICY"),
+                        config
+                            .board_profile_resolution()
+                            .mining_allowed_without_lab_bypass,
+                    ),
+                ),
                 broker_host: config.mqtt.broker_host.as_str(),
                 broker_port: config.mqtt.broker_port,
                 username: config.mqtt.username.as_str(),
@@ -1474,6 +1492,18 @@ fn register_system_info(server: &mut EspHttpServer, state: SharedState) {
                 runtime_device_model: runtime_device_model_key.as_str(),
                 build_device_model: build_device_model_key.as_str(),
                 build_board_version: build_board_version_str,
+                deployment: crate::api_system_info::DeploymentView {
+                    hardware_family: env!("DCENTAXE_HARDWARE_FAMILY"),
+                    release_scope: env!("DCENTAXE_RELEASE_SCOPE"),
+                    support_tier: env!("DCENTAXE_SUPPORT_TIER"),
+                    evidence_level: env!("DCENTAXE_EVIDENCE_LEVEL"),
+                    runtime_mode: env!("DCENTAXE_RUNTIME_MODE"),
+                    install_policy: env!("DCENTAXE_INSTALL_POLICY"),
+                    package_policy: env!("DCENTAXE_PACKAGE_POLICY"),
+                    flash_layout: env!("DCENTAXE_FLASH_LAYOUT"),
+                    promotion_receipt_id: option_env!("DCENTAXE_PROMOTION_RECEIPT_ID"),
+                    production_blockers: production_blockers.as_slice(),
+                },
                 autotuner: crate::api_system_info::AutotunerView {
                     enabled: autotune.enabled,
                     mode: mode_str.as_str(),
@@ -1657,6 +1687,12 @@ fn register_capabilities(server: &mut EspHttpServer, state: SharedState) {
                     state.board_limits.max_frequency,
                     state.board_limits.min_voltage_mv,
                     state.board_limits.max_voltage_mv,
+                    crate::capabilities::DeploymentPolicy {
+                        hardware_family: env!("DCENTAXE_HARDWARE_FAMILY"),
+                        support_tier: env!("DCENTAXE_SUPPORT_TIER"),
+                        runtime_mode: env!("DCENTAXE_RUNTIME_MODE"),
+                        install_policy: env!("DCENTAXE_INSTALL_POLICY"),
+                    },
                 );
 
                 let mut resp = req.into_response(200, None, &JSON_HEADERS)?;

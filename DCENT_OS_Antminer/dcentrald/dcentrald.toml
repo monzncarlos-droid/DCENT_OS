@@ -6,7 +6,12 @@ hostname = "dcentral-s9"
 log_level = "info"
 
 [pool]
-url = "stratum+tcp://solo.ckpool.org:3333"
+# Lottery solo (e.g. solo.ckpool.org) is NOT a first-boot default. First shares
+# must not leave to a lottery pool before the operator chooses a pool and
+# completes first-boot credentials. Leave url empty until you set one.
+# Example (operator-chosen, never a shipped default):
+#   url = "stratum+tcp://solo.ckpool.org:3333"
+url = ""
 sv2_url = "stratum2+tcp://v2.stratum.braiins.com:3333"
 # SV2 Standard Channels cause nonce exhaustion on S9 (~2.5s to exhaust 4×2^32 search space).
 # Until Extended Channels or per-job merkle diversification is implemented, use V1.
@@ -114,10 +119,12 @@ active = "standard"
 # Per-chip frequency auto-tuning (TABS algorithm)
 # DCENTos tunes all 63 chips in parallel in ~15 seconds
 # VNish takes 3-6 hours doing it one chip at a time
+# Ships DISABLED. measurement_window_s=6 matches the crate default; 3s windows
+# caused false "0 nonces" readings. target_mode=efficiency is the home default.
 enabled = false
 preset = "balanced_home"
-target_mode = "hashrate"         # hashrate | power | efficiency
-measurement_window_s = 3         # seconds per binary search step
+target_mode = "efficiency"       # hashrate | power | efficiency
+measurement_window_s = 6         # seconds per binary search step
 verification_window_s = 15       # seconds to verify stability
 error_threshold_pct = 0.5        # max HW error rate per chip
 safety_margin_pct = 5.0          # headroom below max stable freq

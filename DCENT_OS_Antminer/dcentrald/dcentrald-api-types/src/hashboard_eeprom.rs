@@ -316,8 +316,10 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
     // S21 BM1368 — EXACT SKUs only. `starts_with("BHB68")` would be a
     // wrong-voltage-table hazard: every other SKU in that prefix space falls
     // through to the catalog's broad `BHB68xxx` → BM1370 row. `BHB68606` is
-    // validated vs the held S21 `eeprom_dump_0x51.hex`; `BHB68603` and
-    // `BHB68603-` are exact high-confidence catalog rows (no held dump).
+    // validated vs the held S21 `eeprom_dump_0x51.hex`. `BHB68603` also has
+    // an exact ePIC fixture page (not an authenticated live dump), while
+    // `BHB68603-` is a medium-confidence identity row with no held page and an
+    // unknown EEPROM format.
     (
         DeployedSkuMatch::Exact("BHB68603"),
         AsicProtocolIdentity::Bm1368,
@@ -361,7 +363,8 @@ const DEPLOYED_SKU_IDENTITY_POLICY: &[(DeployedSkuMatch, AsicProtocolIdentity)] 
 ///   S19k BHB56903 dump — the unique `0x05` NoPic family).
 /// - `BHB68603` / `BHB68603-` / `BHB68606` → [`AsicProtocolIdentity::Bm1368`]
 ///   (S21; EXACT SKUs only — `BHB68606` is validated vs the held S21
-///   `eeprom_dump_0x51.hex`, the other two are exact catalog rows).
+///   `eeprom_dump_0x51.hex`; `BHB68603` has an ePIC fixture page but not an
+///   authenticated live dump; `BHB68603-` has no held EEPROM page).
 ///
 /// Can never return [`AsicProtocolIdentity::Bm1398`]: no policy row declares it,
 /// and a row only ever admits its OWN declared identity, so the catalog cannot
@@ -686,8 +689,9 @@ mod tests {
     }
 
     /// The three EXACT S21 SKUs the catalog documents as BM1368. `BHB68606` is the
-    /// one validated against a held dump (
-    /// eeprom_dump_0x51.hex`); all three are exact catalog rows placed BEFORE the
+    /// one validated against a held live dump (
+    /// eeprom_dump_0x51.hex`); BHB68603 has a held ePIC fixture page, BHB68603-
+    /// has no held page, and all three are exact identity rows placed BEFORE the
     /// broad `BHB68xxx` → BM1370 row.
     #[test]
     fn deployed_bhb686_exact_skus_map_to_bm1368() {

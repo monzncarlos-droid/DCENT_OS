@@ -114,13 +114,11 @@ jobs:
         run: |
           python - <<'PY'
           import hashlib, json, os, pathlib, subprocess, sys
+          registry = json.loads(pathlib.Path('esp-targets.json').read_text(encoding='utf-8'))
           expected_models = {
-              'bitaxe-max': 'max',
-              'bitaxe-ultra': 'ultra',
-              'bitaxe-supra': 'supra',
-              'bitaxe-gamma': 'gamma',
-              'bitaxe-hex-ultra': 'hexultra',
-              'bitaxe-hex-supra': 'suprahex',
+              target['board_target']: target['device_model']
+              for target in registry['targets']
+              if target['package_policy'] == 'public'
           }
           manifests = list(pathlib.Path('dist').glob('*/*-manifest.json'))
           assert manifests, 'no packaged manifests found'

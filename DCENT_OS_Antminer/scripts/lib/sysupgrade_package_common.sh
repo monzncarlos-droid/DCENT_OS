@@ -38,9 +38,15 @@ dcent_is_release_status() {
 
 # CE-183: a release-status package must not decouple from release-image
 # hardening (root SSH lockdown + /etc/dcentos/release-image marker).
+# Public/customer flags (DCENT_PUBLIC_ARTIFACT / DCENT_CUSTOMER_IMAGE) also
+# require RELEASE even if status is lab_unsigned — lab builds leave them unset.
 dcent_require_release_image_hardening() {
     package_status="${DCENT_PACKAGE_STATUS:-release}"
-    dcent_is_release_status "$package_status" || return 0
+    if ! dcent_is_release_status "$package_status" \
+        && ! dcent_is_truthy "${DCENT_PUBLIC_ARTIFACT:-0}" \
+        && ! dcent_is_truthy "${DCENT_CUSTOMER_IMAGE:-0}"; then
+        return 0
+    fi
     if ! dcent_is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
         echo "ERROR: DCENT_PACKAGE_STATUS='${package_status}' (release-status) requires DCENT_RELEASE_IMAGE=1" >&2
         echo "       (defconfig root-lock + /etc/dcentos/release-image marker)." >&2
@@ -94,7 +100,55 @@ dcent_require_canonical_authority_status() {
     fi
 }
 
+# The S19k hermetic A/B builders are permitted to emit one narrowly scoped
+# release-profile intermediate with the pinned public key but no signature.
+# This is not the generic lab-unsigned downgrade: the pair must be validated
+# byte-for-byte and signed by the isolated post-A/B signer before publication.
+dcent_require_s19k_unsigned_release_intermediate() {
+    [ "${DCENT_S19K_UNSIGNED_INTERMEDIATE:-0}" = "1" ] || {
+        echo "ERROR: S19k unsigned release intermediate requires exact DCENT_S19K_UNSIGNED_INTERMEDIATE=1" >&2
+        exit 1
+    }
+    [ "${BOARD_NAME:-}" = "am3-s19k" ] || {
+        echo "ERROR: unsigned release intermediate is restricted to BOARD_NAME=am3-s19k" >&2
+        exit 1
+    }
+    [ "${DCENT_PACKAGE_STATUS:-release}" = "release" ] || {
+        echo "ERROR: S19k unsigned release intermediate requires release status" >&2
+        exit 1
+    }
+    [ "${DCENT_RELEASE_IMAGE:-0}" = "1" ] || {
+        echo "ERROR: S19k unsigned release intermediate requires DCENT_RELEASE_IMAGE=1" >&2
+        exit 1
+    }
+    [ "${DCENT_REQUIRE_RELEASE_KEY:-0}" = "1" ] || {
+        echo "ERROR: S19k unsigned release intermediate requires DCENT_REQUIRE_RELEASE_KEY=1" >&2
+        exit 1
+    }
+    [ -z "${DCENT_RELEASE_SIGNING_KEY:-}" ] || {
+        echo "ERROR: S19k A/B build must not receive DCENT_RELEASE_SIGNING_KEY" >&2
+        exit 1
+    }
+    [ -n "${DCENT_RELEASE_PUBKEY_FILE:-}" ] || {
+        echo "ERROR: S19k unsigned release intermediate requires the pinned public key" >&2
+        exit 1
+    }
+    if dcent_is_truthy "${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}"; then
+        echo "ERROR: S19k unsigned release intermediate must not use the lab unsigned override" >&2
+        exit 1
+    fi
+}
+
 dcent_sysupgrade_manifest_profile() {
+    if [ "${DCENT_S19K_UNSIGNED_INTERMEDIATE:-0}" = "1" ]; then
+        dcent_require_s19k_unsigned_release_intermediate
+        [ "${DCENT_RELEASE_KEY_STAGED:-0}" = "1" ] || {
+            echo "ERROR: S19k unsigned release intermediate lacks its staged public key" >&2
+            exit 1
+        }
+        printf '%s\n' "$DCENT_SYSUPGRADE_AUTHORITY_PROFILE"
+        return 0
+    fi
     if [ "${DCENT_RELEASE_KEY_STAGED:-0}" = "1" ]; then
         dcent_require_canonical_authority_status
         printf '%s\n' "$DCENT_SYSUPGRADE_AUTHORITY_PROFILE"
@@ -109,6 +163,20 @@ dcent_stage_release_key() {
     DCENT_RELEASE_KEY_STAGED=0
     DCENT_RELEASE_KEY_SIZE=""
     DCENT_RELEASE_KEY_SHA256=""
+
+    if [ "${DCENT_S19K_UNSIGNED_INTERMEDIATE:-0}" = "1" ]; then
+        dcent_require_s19k_unsigned_release_intermediate
+        [ -f "$DCENT_RELEASE_PUBKEY_FILE" ] && [ ! -L "$DCENT_RELEASE_PUBKEY_FILE" ] || {
+            echo "ERROR: S19k release public key is missing or indirect: $DCENT_RELEASE_PUBKEY_FILE" >&2
+            exit 1
+        }
+        cp "$DCENT_RELEASE_PUBKEY_FILE" "$SUP_DIR/release_ed25519.pub"
+        DCENT_RELEASE_KEY_SIZE=$(stat -c%s "$SUP_DIR/release_ed25519.pub" 2>/dev/null || stat -f%z "$SUP_DIR/release_ed25519.pub")
+        DCENT_RELEASE_KEY_SHA256=$(sha256sum "$SUP_DIR/release_ed25519.pub" | awk '{print $1}')
+        echo "${DCENT_RELEASE_KEY_SHA256}  release_ed25519.pub" >> "$SUP_DIR/SHA256SUMS"
+        DCENT_RELEASE_KEY_STAGED=1
+        return 0
+    fi
 
     if [ -z "${DCENT_RELEASE_SIGNING_KEY:-}" ]; then
         if [ "${DCENT_REQUIRE_RELEASE_KEY:-0}" = "1" ]; then
@@ -422,6 +490,23 @@ EOF
 }
 
 dcent_sign_sysupgrade_manifest() {
+    if [ "${DCENT_S19K_UNSIGNED_INTERMEDIATE:-0}" = "1" ]; then
+        dcent_require_s19k_unsigned_release_intermediate
+        [ "${DCENT_RELEASE_KEY_STAGED:-0}" = "1" ] || {
+            echo "ERROR: S19k unsigned release intermediate lacks staged public key" >&2
+            exit 1
+        }
+        [ -f "$SUP_DIR/MANIFEST.json" ] && [ ! -L "$SUP_DIR/MANIFEST.json" ] || {
+            echo "ERROR: S19k unsigned release intermediate lacks exact MANIFEST.json" >&2
+            exit 1
+        }
+        [ ! -e "$SUP_DIR/MANIFEST.sig" ] || {
+            echo "ERROR: S19k A/B intermediate unexpectedly contains MANIFEST.sig" >&2
+            exit 1
+        }
+        echo "Emitted unsigned S19k release intermediate for post-A/B signing"
+        return 0
+    fi
     if [ "${DCENT_RELEASE_KEY_STAGED:-0}" != "1" ]; then
         return 0
     fi

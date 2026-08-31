@@ -93,7 +93,7 @@ else
     fi
 fi
 
-run_main_start=$(grep -nF 'async fn run_main() -> Result<()> {' \
+run_main_start=$(grep -nF 'async fn run_main(' \
     "$DAEMON_MAIN_SOURCE" | head -n 1 | cut -d: -f1)
 sigint_registration=$(awk -v start="$run_main_start" \
     'NR > start && /signal::unix::signal\(signal::unix::SignalKind::interrupt\(\)\)/ { print NR; exit }' \
@@ -215,177 +215,43 @@ for sysupgrade in $(find "$BOARD_DIR/zynq" -type f -path '*/usr/sbin/sysupgrade'
     relative=${sysupgrade#"$PROJECT_DIR"/}
     sh -n "$sysupgrade" \
         || fail "$relative is not POSIX-shell parseable"
-    grep -Fq 'SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"' "$sysupgrade" \
-        || fail "$relative does not bind hardware-session update admission"
-    grep -Fq 'SYSUPGRADE_UPDATE_LOCK="/run/dcentos-sysupgrade.lock"' "$sysupgrade" \
-        || fail "$relative does not publish the canonical update transaction"
-    grep -Fq 'release_pre_mutation_update_lock()' "$sysupgrade" \
-        || fail "$relative cannot retire a pre-mutation update transaction"
-    grep -Fq 'release_pre_mutation_update_lock' "$sysupgrade" \
-        || fail "$relative package cleanup omits pre-mutation update-lock retirement"
-    grep -Fq 'trap cleanup_package EXIT' "$sysupgrade" \
-        && grep -Fq "trap 'terminate_sysupgrade 130' INT" "$sysupgrade" \
-        && grep -Fq "trap 'terminate_sysupgrade 143' TERM" "$sysupgrade" \
-        || fail "$relative does not terminate explicitly on INT/TERM"
-    function_fixture="$SYSUPGRADE_SIGNAL_ROOT/functions.$SYSUPGRADES_CHECKED"
-    awk '
-        /^release_pre_mutation_update_lock\(\)/ { copying = 1 }
-        /^manifest_field\(\)/ { copying = 0 }
-        copying { print }
-    ' "$sysupgrade" >"$function_fixture"
-    for signal_fixture_shell in $SYSUPGRADE_SIGNAL_SHELLS; do
-    signal_shell_label=$(basename "$signal_fixture_shell")
-    pre_root="$SYSUPGRADE_SIGNAL_ROOT/pre.$SYSUPGRADES_CHECKED.$signal_shell_label"
-    post_root="$SYSUPGRADE_SIGNAL_ROOT/post.$SYSUPGRADES_CHECKED.$signal_shell_label"
-    int_root="$SYSUPGRADE_SIGNAL_ROOT/int.$SYSUPGRADES_CHECKED.$signal_shell_label"
-    kill_root="$SYSUPGRADE_SIGNAL_ROOT/kill.$SYSUPGRADES_CHECKED.$signal_shell_label"
-    mkdir "$pre_root" "$post_root" "$int_root" "$kill_root" \
-        "$pre_root/package" "$pre_root/update-lock" \
-        "$post_root/package" "$post_root/update-lock" \
-        "$int_root/package" "$int_root/update-lock" \
-        "$kill_root/package" "$kill_root/update-lock"
-    "$signal_fixture_shell" -c '
-        . "$1"
-        PACKAGE_DIR=$2
-        SYSUPGRADE_UPDATE_LOCK=$3
-        SYSUPGRADE_UPDATE_LOCK_OWNED=1
-        SYSUPGRADE_MUTATION_STARTED=0
-        trap cleanup_package EXIT
-        trap "terminate_sysupgrade 130" INT
-        trap "terminate_sysupgrade 143" TERM
-        kill -TERM $$
-        : >"$4"
-    ' sh "$function_fixture" "$pre_root/package" "$pre_root/update-lock" \
-        "$pre_root/resumed"
-    pre_status=$?
-    if [ "$pre_status" -eq 143 ] \
-       && [ ! -e "$pre_root/update-lock" ] \
-       && [ ! -e "$pre_root/package" ] \
-       && [ ! -e "$pre_root/resumed" ]; then
-        pass "$relative TERM exits and retires only its pre-mutation update lock under $signal_shell_label"
-    else
-        fail "$relative TERM can resume or retain invalid pre-mutation state"
-    fi
-    "$signal_fixture_shell" -c '
-        . "$1"
-        PACKAGE_DIR=$2
-        SYSUPGRADE_UPDATE_LOCK=$3
-        SYSUPGRADE_UPDATE_LOCK_OWNED=1
-        SYSUPGRADE_MUTATION_STARTED=1
-        trap cleanup_package EXIT
-        trap "terminate_sysupgrade 130" INT
-        trap "terminate_sysupgrade 143" TERM
-        kill -TERM $$
-        : >"$4"
-    ' sh "$function_fixture" "$post_root/package" "$post_root/update-lock" \
-        "$post_root/resumed"
-    post_status=$?
-    if [ "$post_status" -eq 143 ] \
-       && [ -d "$post_root/update-lock" ] \
-       && [ ! -e "$post_root/package" ] \
-       && [ ! -e "$post_root/resumed" ]; then
-        pass "$relative TERM exits and retains its post-mutation update lock under $signal_shell_label"
-    else
-        fail "$relative TERM can resume or release post-mutation admission evidence"
-    fi
-    "$signal_fixture_shell" -c '
-        . "$1"
-        PACKAGE_DIR=$2
-        SYSUPGRADE_UPDATE_LOCK=$3
-        SYSUPGRADE_UPDATE_LOCK_OWNED=1
-        SYSUPGRADE_MUTATION_STARTED=0
-        trap cleanup_package EXIT
-        trap "terminate_sysupgrade 130" INT
-        trap "terminate_sysupgrade 143" TERM
-        kill -INT $$
-        : >"$4"
-    ' sh "$function_fixture" "$int_root/package" "$int_root/update-lock" \
-        "$int_root/resumed"
-    int_status=$?
-    if [ "$int_status" -eq 130 ] \
-       && [ ! -e "$int_root/update-lock" ] \
-       && [ ! -e "$int_root/package" ] \
-       && [ ! -e "$int_root/resumed" ]; then
-        pass "$relative INT exits 130 without resuming into mutation under $signal_shell_label"
-    else
-        fail "$relative INT can resume or retain invalid pre-mutation state"
-    fi
-    "$signal_fixture_shell" -c '
-        . "$1"
-        PACKAGE_DIR=$2
-        SYSUPGRADE_UPDATE_LOCK=$3
-        SYSUPGRADE_UPDATE_LOCK_OWNED=1
-        SYSUPGRADE_MUTATION_STARTED=0
-        trap cleanup_package EXIT
-        trap "terminate_sysupgrade 130" INT
-        trap "terminate_sysupgrade 143" TERM
-        : >"$4"
-        while :; do sleep 1; done
-        : >"$5"
-    ' sh "$function_fixture" "$kill_root/package" "$kill_root/update-lock" \
-        "$kill_root/ready" "$kill_root/resumed" &
-    kill_fixture_pid=$!
-    kill_ready=0
-    kill_wait_attempt=0
-    while [ "$kill_wait_attempt" -lt 500 ]; do
-        if [ -e "$kill_root/ready" ]; then
-            kill_ready=1
-            break
-        fi
-        kill -0 "$kill_fixture_pid" 2>/dev/null || break
-        kill_wait_attempt=$((kill_wait_attempt + 1))
-        sleep 0.01
-    done
-    if [ "$kill_ready" -eq 1 ]; then
-        kill -KILL "$kill_fixture_pid"
-        wait "$kill_fixture_pid" 2>/dev/null
-        kill_status=$?
-    else
-        kill -KILL "$kill_fixture_pid" 2>/dev/null || true
-        wait "$kill_fixture_pid" 2>/dev/null || true
-        kill_status=0
-        fail "$relative SIGKILL fixture failed to reach bounded readiness under $signal_shell_label"
-    fi
-    if [ "$kill_status" -eq 137 ] \
-       && [ -d "$kill_root/update-lock" ] \
-       && [ -d "$kill_root/package" ] \
-       && [ ! -e "$kill_root/resumed" ]; then
-        pass "$relative SIGKILL retains fail-closed update evidence under $signal_shell_label"
-    else
-        fail "$relative SIGKILL did not preserve fail-closed update evidence"
-    fi
-    rm -f "$kill_root/ready"
-    rmdir "$post_root/update-lock" "$kill_root/update-lock" \
-        "$kill_root/package" "$pre_root" "$post_root" "$int_root" \
-        "$kill_root" 2>/dev/null || true
-    done
+    grep -Fq 'SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"' "$sysupgrade"         || fail "$relative does not bind hardware-session update admission"
+    # 2026-08 sysupgrade helper split: the canonical update transaction moved
+    # from an inline /run lock file + release_pre_mutation_update_lock() into
+    # the typed transaction-lock and transaction-workspace helpers. Their
+    # adversarial signal/cleanup behavior is proven by
+    # scripts/test_sysupgrade_transaction_lock.sh,
+    # scripts/test_sysupgrade_transaction_workspace.sh, and
+    # scripts/test_sysupgrade_signal_exit.sh, which the offline gate runs
+    # directly. This loop keeps the binding + ordering contracts at
+    # operative-line strength.
+    grep -Fq 'TRANSACTION_LOCK_HELPER="/usr/libexec/dcentos/sysupgrade-transaction-lock.sh"' "$sysupgrade"         || fail "$relative does not bind the typed transaction-lock helper"
+    grep -Fq 'TRANSACTION_WORKSPACE_HELPER="/usr/libexec/dcentos/sysupgrade-transaction-workspace.sh"' "$sysupgrade"         || fail "$relative does not bind the typed transaction-workspace helper"
+    grep -Fq 'trap cleanup_package EXIT' "$sysupgrade"         || fail "$relative does not route every termination through one cleanup path"
+    grep -Fq "trap 'exit 129' HUP" "$sysupgrade"         && grep -Fq "trap 'exit 130' INT" "$sysupgrade"         && grep -Fq "trap 'exit 143' TERM" "$sysupgrade"         || fail "$relative does not translate HUP/INT/TERM into explicit exit statuses"
+    grep -Fq 'dcent_sysupgrade_workspace_cleanup "$PROC_MOUNTS_PATH"' "$sysupgrade"         || fail "$relative cleanup omits typed workspace retirement"
+    grep -Fq 'dcent_sysupgrade_lock_require_cleanup' "$sysupgrade"         || fail "$relative cleanup omits cleanup-required transaction publication"
+    grep -Fq 'dcent_sysupgrade_lock_release' "$sysupgrade"         || fail "$relative cleanup omits explicit update-lock retirement"
     ADMIT_LINE=$(grep -n '"$SESSION_LATCH_HELPER" admit-update' "$sysupgrade" | head -n 1 | cut -d: -f1)
     STEP_LINE=$(grep -n '^# --- Step 1:' "$sysupgrade" | head -n 1 | cut -d: -f1)
-    MUTATION_MARK_LINE=$(grep -n '^[[:space:]]*SYSUPGRADE_MUTATION_STARTED=1' "$sysupgrade" | head -n 1 | cut -d: -f1)
-    FIRST_NAND_WRITE_LINE=$(grep -En '^[[:space:]]*if ! (ubimkvol|ubiupdatevol)' "$sysupgrade" | head -n 1 | cut -d: -f1)
-    INT_TRAP_LINE=$(grep -nF "trap 'terminate_sysupgrade 130' INT" "$sysupgrade" | head -n 1 | cut -d: -f1)
-    TERM_TRAP_LINE=$(grep -nF "trap 'terminate_sysupgrade 143' TERM" "$sysupgrade" | head -n 1 | cut -d: -f1)
-    if [ -n "$ADMIT_LINE" ] && [ -n "$STEP_LINE" ] \
-       && [ "$ADMIT_LINE" -lt "$STEP_LINE" ]; then
+    LOCK_ACQUIRE_LINE=$(grep -nF 'dcent_sysupgrade_lock_acquire "$SYSUPGRADE_LOCK_DIR" "$PROC_ROOT" "$BOOT_ID_PATH"' "$sysupgrade" | head -n 1 | cut -d: -f1)
+    INT_TRAP_LINE=$(grep -nF "trap 'exit 130' INT" "$sysupgrade" | head -n 1 | cut -d: -f1)
+    TERM_TRAP_LINE=$(grep -nF "trap 'exit 143' TERM" "$sysupgrade" | head -n 1 | cut -d: -f1)
+    FIRST_NAND_WRITE_LINE=$(grep -nE '^[[:space:]]*if ! dcent_ubi_(update|make)_volume ' "$sysupgrade" | head -n 1 | cut -d: -f1)
+    if [ -n "$ADMIT_LINE" ] && [ -n "$STEP_LINE" ]        && [ "$ADMIT_LINE" -lt "$STEP_LINE" ]; then
         pass "$relative admits hardware-session disposition before inactive-slot access"
     else
         fail "$relative reaches inactive-slot access before hardware-session admission"
     fi
-    if [ -n "$MUTATION_MARK_LINE" ] && [ -n "$FIRST_NAND_WRITE_LINE" ] \
-       && [ "$MUTATION_MARK_LINE" -lt "$FIRST_NAND_WRITE_LINE" ]; then
-        pass "$relative retains its update lock from the first NAND mutation"
+    if [ -n "$LOCK_ACQUIRE_LINE" ] && [ -n "$FIRST_NAND_WRITE_LINE" ]        && [ "$LOCK_ACQUIRE_LINE" -lt "$FIRST_NAND_WRITE_LINE" ]; then
+        pass "$relative owns its transaction lock before the first NAND mutation"
     else
-        fail "$relative can mutate NAND while its update lock is cleanup-eligible"
+        fail "$relative can mutate NAND without owning its transaction lock"
     fi
-    if [ -n "$INT_TRAP_LINE" ] && [ -n "$TERM_TRAP_LINE" ] \
-       && [ -n "$MUTATION_MARK_LINE" ] && [ -n "$FIRST_NAND_WRITE_LINE" ] \
-       && [ "$INT_TRAP_LINE" -lt "$MUTATION_MARK_LINE" ] \
-       && [ "$TERM_TRAP_LINE" -lt "$MUTATION_MARK_LINE" ] \
-       && [ "$INT_TRAP_LINE" -lt "$FIRST_NAND_WRITE_LINE" ] \
-       && [ "$TERM_TRAP_LINE" -lt "$FIRST_NAND_WRITE_LINE" ]; then
-        pass "$relative owns INT/TERM before mutation admission and NAND writes"
+    if [ -n "$INT_TRAP_LINE" ] && [ -n "$TERM_TRAP_LINE" ]        && [ -n "$LOCK_ACQUIRE_LINE" ] && [ -n "$FIRST_NAND_WRITE_LINE" ]        && [ "$INT_TRAP_LINE" -lt "$LOCK_ACQUIRE_LINE" ]        && [ "$TERM_TRAP_LINE" -lt "$LOCK_ACQUIRE_LINE" ]        && [ "$INT_TRAP_LINE" -lt "$FIRST_NAND_WRITE_LINE" ]        && [ "$TERM_TRAP_LINE" -lt "$FIRST_NAND_WRITE_LINE" ]; then
+        pass "$relative owns INT/TERM translation before lock acquisition and NAND writes"
     else
-        fail "$relative can reach mutation before production INT/TERM traps are installed"
+        fail "$relative can reach the transaction lock or mutation before signal traps are installed"
     fi
 done
 IFS=$OLD_IFS_SYSUPGRADE
@@ -518,8 +384,12 @@ IFS=$OLD_IFS
 
 [ "$CONFIGS_CHECKED" -gt 0 ] || fail 'no Buildroot overlay defconfigs were discovered'
 [ "$CHECKED" -gt 0 ] || fail 'no shipped S82dcentrald supervisors were discovered'
-[ "$SYSUPGRADES_CHECKED" -eq 4 ] \
-    || fail "expected 4 Zynq sysupgrade hardware-session callers, found $SYSUPGRADES_CHECKED"
+# 2026-08-27 armada (C1): 4 -> 7 — B2 shipped the three 17-series sibling
+# sysupgrade wrappers (am2-s17plus / am2-t17 / am2-t17plus); every one binds
+# the hardware-session latch and the canonical update transaction, verified
+# by the per-script contract checks in this loop.
+[ "$SYSUPGRADES_CHECKED" -eq 7 ] \
+    || fail "expected 7 Zynq sysupgrade hardware-session callers, found $SYSUPGRADES_CHECKED"
 
 for platform in zynq amlogic; do
     web_root="$BOARD_DIR/$platform/rootfs-overlay/root/web"

@@ -26,6 +26,7 @@
 // message naming the offending string is the correct and only useful behaviour.
 // `unwrap_used` stays enforced: these are `.expect(..)` with real messages.
 #![allow(clippy::expect_used)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::CString;
 use std::fs;
@@ -449,13 +450,13 @@ fn external_media_marker_state(path: &Path) -> ExternalMediaMarkerState {
 
 fn service_posture(marker: ExternalMediaMarkerState, early_init_succeeded: bool) -> ServicePosture {
     match marker {
-        ExternalMediaMarkerState::Absent => ServicePosture::Normal,
+        ExternalMediaMarkerState::Absent if early_init_succeeded => ServicePosture::Normal,
         ExternalMediaMarkerState::Exact if early_init_succeeded => {
             ServicePosture::ExternalRestricted
         }
-        ExternalMediaMarkerState::Exact | ExternalMediaMarkerState::Unsafe => {
-            ServicePosture::ConsoleOnly
-        }
+        ExternalMediaMarkerState::Absent
+        | ExternalMediaMarkerState::Exact
+        | ExternalMediaMarkerState::Unsafe => ServicePosture::ConsoleOnly,
     }
 }
 
@@ -464,15 +465,29 @@ fn service_posture(marker: ExternalMediaMarkerState, early_init_succeeded: bool)
 /// the generic fallback: an absent, failed, or unexecutable early-init leaves
 /// PID 1 in its already-mounted recovery console posture with no service pass.
 fn run_early_init(external_media_posture: bool) -> bool {
-    if !Path::new(EARLY_INIT).exists() {
-        eprintln!("  [WARN] {} not found — skipping early init", EARLY_INIT);
-        if external_media_posture {
-            eprintln!("  [FAIL] External-media early init is mandatory; fallback refused");
+    match fs::symlink_metadata(EARLY_INIT) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            eprintln!("  [WARN] {} not found — skipping early init", EARLY_INIT);
+            if external_media_posture {
+                eprintln!("  [FAIL] External-media early init is mandatory; fallback refused");
+                return false;
+            }
+            // Fallback: do minimal /dev/tmpfs + /tmp + /run setup ourselves.
+            fallback_early_init();
+            return true;
+        }
+        Err(error) => {
+            eprintln!("  [FAIL] Cannot inspect {}: {}", EARLY_INIT, error);
             return false;
         }
-        // Fallback: do minimal /dev/tmpfs + /tmp + /run setup ourselves
-        fallback_early_init();
-        return true;
+        Ok(_) if !is_exact_executable_regular_file(Path::new(EARLY_INIT)) => {
+            eprintln!(
+                "  [FAIL] {} must be an executable regular file; indirection and special objects are refused",
+                EARLY_INIT
+            );
+            return false;
+        }
+        Ok(_) => {}
     }
 
     // Find a working shell to execute the script
@@ -620,7 +635,7 @@ fn run_init_scripts_from(
         let all_executable = complete_set
             && scripts
                 .iter()
-                .all(|script| is_executable(init_d.join(script).to_string_lossy().as_ref()));
+                .all(|script| is_exact_executable_regular_file(&init_d.join(script)));
         if !all_executable {
             eprintln!(
                 "  [FAIL] External-media startup preflight refused service pass; exact executable policy set is required"
@@ -807,6 +822,10 @@ fn spawn_getty() -> i32 {
 /// it). When in doubt we treat it as agetty, because a util-linux getty is the
 /// one that ships under the literal name `getty` in Buildroot images.
 fn getty_is_busybox(path: &str) -> bool {
+    getty_is_busybox_with_candidates(path, &["/bin/busybox", "/usr/bin/busybox"])
+}
+
+fn getty_is_busybox_with_candidates(path: &str, busybox_paths: &[&str]) -> bool {
     // Resolve symlinks; if the resolved path mentions busybox it's BusyBox getty.
     if let Ok(real) = fs::read_link(path) {
         if real.to_string_lossy().contains("busybox") {
@@ -817,6 +836,20 @@ fn getty_is_busybox(path: &str) -> bool {
         if real.to_string_lossy().contains("busybox") {
             return true;
         }
+    }
+    // BusyBox applets may instead be hard links. A hard link retains the same
+    // device/inode identity but canonicalization preserves the applet path, so
+    // path spelling alone cannot classify it.
+    use std::os::unix::fs::MetadataExt;
+    let Ok(candidate) = fs::metadata(path) else {
+        return false;
+    };
+    if busybox_paths.iter().any(|busybox| {
+        fs::metadata(busybox)
+            .map(|metadata| metadata.dev() == candidate.dev() && metadata.ino() == candidate.ino())
+            .unwrap_or(false)
+    }) {
+        return true;
     }
     false
 }
@@ -1094,6 +1127,21 @@ fn is_executable(path: &str) -> bool {
         Err(_) => return false,
     };
     unsafe { libc::access(cpath.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// External-media startup is a narrower trust boundary than the normal SysV
+/// pass. Refuse symlinks, directories, and other special objects even when
+/// `access(X_OK)` would follow or admit them; the host producer pins regular
+/// script bytes, not a mutable indirection target.
+fn is_exact_executable_regular_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+        }
+        Err(_) => false,
+    }
 }
 
 /// Mount a filesystem. Wraps the mount(2) syscall.
@@ -1522,6 +1570,40 @@ mod tests {
         assert!(!witness.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_readiness_gate_refuses_the_whole_pass() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new("external-gate-symlink");
+        let witness = directory.path().join("service-ran");
+        let witness_text = witness.to_string_lossy();
+        assert!(!witness_text.contains('\''));
+
+        write_executable_script(directory.path(), "gate-target", "exit 0");
+        symlink(
+            directory.path().join("gate-target"),
+            directory.path().join("S45persistent"),
+        )
+        .expect("create readiness-gate symlink");
+        for name in EXTERNAL_MEDIA_SERVICES.iter().skip(1) {
+            write_executable_script(
+                directory.path(),
+                name,
+                &format!("printf '%s\\n' '{name}' >> '{witness_text}'"),
+            );
+        }
+
+        let result = run_init_scripts_from(
+            directory.path(),
+            "start",
+            ServicePosture::ExternalRestricted,
+        );
+        assert!(!result.external_gate_admitted);
+        assert!(result.succeeded.is_empty());
+        assert!(!witness.exists());
+    }
+
     #[test]
     fn console_only_posture_admits_no_start_or_stop_scripts() {
         let names = vec![
@@ -1586,8 +1668,8 @@ mod tests {
     fn external_early_init_failure_and_unsafe_marker_are_console_only() {
         assert_eq!(
             service_posture(ExternalMediaMarkerState::Absent, false),
-            ServicePosture::Normal,
-            "normal NAND boot retains its existing service pass after early-init failure"
+            ServicePosture::ConsoleOnly,
+            "normal NAND boot must not start services after a present early-init exits nonzero"
         );
         assert_eq!(
             service_posture(ExternalMediaMarkerState::Exact, true),
@@ -1631,8 +1713,8 @@ mod tests {
             "BusyBox getty must receive BAUD before TTY"
         );
         // The positional after -L must be the numeric baud, never the device.
-        assert_eq!(args[1], "115200");
-        assert_eq!(args[2], "ttyPS0");
+        assert_eq!(args.get(1).map(String::as_str), Some("115200"));
+        assert_eq!(args.get(2).map(String::as_str), Some("ttyPS0"));
     }
 
     #[test]
@@ -1649,8 +1731,8 @@ mod tests {
             ],
             "util-linux agetty must receive TTY before BAUD"
         );
-        assert_eq!(args[1], "ttyPS0");
-        assert_eq!(args[2], "115200");
+        assert_eq!(args.get(1).map(String::as_str), Some("ttyPS0"));
+        assert_eq!(args.get(2).map(String::as_str), Some("115200"));
     }
 
     #[test]
@@ -1671,6 +1753,21 @@ mod tests {
         // agetty (the conservative default). A bare nonexistent path has no
         // symlink target, so it is NOT classified as busybox.
         assert!(!getty_is_busybox("/no/such/getty/binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn getty_busybox_classifier_recognizes_hard_link_identity() {
+        let directory = TestDir::new("busybox-hardlink");
+        let busybox = directory.path().join("busybox");
+        let getty = directory.path().join("getty");
+        fs::write(&busybox, b"fixture").expect("write BusyBox identity fixture");
+        fs::hard_link(&busybox, &getty).expect("hard-link getty to BusyBox fixture");
+
+        assert!(getty_is_busybox_with_candidates(
+            getty.to_string_lossy().as_ref(),
+            &[busybox.to_string_lossy().as_ref()],
+        ));
     }
 
     // --- BusyBox halt-applet signal -> reboot(2) action mapping --------------
@@ -1749,7 +1846,7 @@ mod tests {
     #[test]
     fn shutdown_watchdog_exceeds_daemon_typed_teardown_budget() {
         assert!(
-            SHUTDOWN_WATCHDOG_MS > 36_000,
+            include_str!("main.rs").contains("const SHUTDOWN_WATCHDOG_MS: u64 = 60_000;"),
             "PID 1 must exceed S82's 30s TERM, 5s death check, and 1s receipt retry budget"
         );
     }

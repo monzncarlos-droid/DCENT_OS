@@ -1,15 +1,20 @@
-//! BM1398 / NBP1901 identity + geometry stub — NOT IMPLEMENTED / admit=false.
+//! Legacy BM1398 / NBP1901 identity + geometry compatibility layer.
 //!
 //! Source:
 //!
 //!
 //!
-//! Public NBP1901 `topol.conf` + stock log geometry only. **No UART wire bytes.**
-//! GetAddress / SetAddress / chain_inactive / open-core / midstate-4 work are
-//! `DESK_PENDING_BINARY`. Do **not** invent GetAddress; do **not** copy BM1397
-//! `0x40` / `0x52` / `0x53` command bytes into this driver.
+//! This was the first desk-only scaffold. It is intentionally retained for old
+//! callers that import its identity/geometry names, but it is no longer the
+//! protocol source of truth. Exact stock-NBP1901 plus repair-jig evidence now
+//! lives in `dcentrald-api-types::bm1398_protocol`, and executable codec support
+//! lives in `dcentrald-asic::drivers::bm1398`.
 //!
-//! Runtime wire try always refuses. Mining stays off. No energize / flash.
+//! The remaining refusal is narrower and load-bearing: the held corpus contains
+//! no deployed S19 Pro EEPROM page whose decoded board name independently binds
+//! the physical hashboard to BM1398. Therefore protocol reconstruction is true,
+//! native runtime admission is false, mining stays default-off, and this module
+//! exposes no alternate encoder. No energize / flash.
 
 use core::fmt;
 
@@ -47,13 +52,32 @@ pub const NBP1901_PIC_FW_OBSERVED: u8 = 0x89;
 pub const MOST_HW_HINT_FAMILY_S21: u16 = 128;
 pub const MOST_HW_HINT_DEFAULT_OFF: bool = true;
 
-/// Production admit is false until RE `.dec` lands.
+/// The exact BM1398/NBP1901 software protocol surface has been reconstructed.
+///
+/// This is not runtime authority. See [`BM1398_NBP1901_DEPLOYED_IDENTITY_HELD`]
+/// and [`BM1398_NBP1901_ADMIT`].
+pub const BM1398_NBP1901_PROTOCOL_RECONSTRUCTED: bool = true;
+/// No held deployed S19 Pro page currently provides an exact independent
+/// board-name -> BM1398 binding.
+pub const BM1398_NBP1901_DEPLOYED_IDENTITY_HELD: bool = false;
+/// Production/native admission remains false until that physical identity gap
+/// closes and the current binary earns its capstone.
 pub const BM1398_NBP1901_ADMIT: bool = false;
+/// Compatibility name: this means the *native runtime composition* is not
+/// implemented/admitted. It does not mean the chip protocol is unrecovered.
 pub const BM1398_NBP1901_IMPLEMENTED: bool = false;
 pub const BM1398_MINING_DEFAULT_ENABLED: bool = false;
 
-/// Honest label for missing S19/BM1398 UART opcodes.
+/// Legacy string retained for source compatibility only. Current code must use
+/// `dcentrald-api-types::bm1398_protocol`, not interpret this as current evidence.
+#[deprecated(
+    note = "BM1398 wire evidence is reconstructed in dcentrald-api-types::bm1398_protocol"
+)]
 pub const DESK_PENDING_BINARY: &str = "DESK_PENDING_BINARY";
+
+/// Exact remaining native-runtime blocker after protocol convergence.
+pub const BM1398_NBP1901_RUNTIME_BLOCKER: &str =
+    "missing held deployed S19 Pro EEPROM page with an exact board-name-to-BM1398 binding";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bm1398Nbp1901Identity {
@@ -66,6 +90,8 @@ pub struct Bm1398Nbp1901Identity {
     pub asic_addr_interval: u8,
     pub chain_domain_num: u8,
     pub domain_asic_num: u8,
+    pub protocol_reconstructed: bool,
+    pub deployed_identity_held: bool,
     pub admit: bool,
     pub implemented: bool,
     pub mining_default_enabled: bool,
@@ -81,6 +107,8 @@ pub const BM1398_NBP1901_IDENTITY: Bm1398Nbp1901Identity = Bm1398Nbp1901Identity
     asic_addr_interval: NBP1901_ASIC_ADDR_INTERVAL,
     chain_domain_num: NBP1901_CHAIN_DOMAIN_NUM,
     domain_asic_num: NBP1901_DOMAIN_ASIC_NUM,
+    protocol_reconstructed: BM1398_NBP1901_PROTOCOL_RECONSTRUCTED,
+    deployed_identity_held: BM1398_NBP1901_DEPLOYED_IDENTITY_HELD,
     admit: BM1398_NBP1901_ADMIT,
     implemented: BM1398_NBP1901_IMPLEMENTED,
     mining_default_enabled: BM1398_MINING_DEFAULT_ENABLED,
@@ -88,18 +116,10 @@ pub const BM1398_NBP1901_IDENTITY: Bm1398Nbp1901Identity = Bm1398Nbp1901Identity
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bm1398Nbp1901StubError {
-    NotImplemented,
+    MissingDeployedIdentityEvidence,
     AdmitFalse,
-    DeskPendingBinary {
-        op: &'static str,
-    },
-    /// Refuse copying BM1397 analogue opcodes into BM1398 wire.
-    Bm1397AnalogueOpcodeForbidden {
-        byte: u8,
-    },
-    ChipIdMismatch {
-        observed: u16,
-    },
+    ProtocolSurfaceMoved { op: &'static str },
+    ChipIdMismatch { observed: u16 },
     GeometryMismatch,
     MiningDefaultMustStayOff,
 }
@@ -107,29 +127,27 @@ pub enum Bm1398Nbp1901StubError {
 impl fmt::Display for Bm1398Nbp1901StubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(
+            Self::MissingDeployedIdentityEvidence => write!(
                 f,
-                "BM1398 NBP1901 stub: NOT IMPLEMENTED until S19/BM1398 .dec"
+                "BM1398 NBP1901 native runtime refused: {BM1398_NBP1901_RUNTIME_BLOCKER}"
             ),
-            Self::AdmitFalse => write!(f, "BM1398 NBP1901 stub: admit=false"),
-            Self::DeskPendingBinary { op } => write!(
+            Self::AdmitFalse => write!(f, "BM1398 NBP1901 native runtime: admit=false"),
+            Self::ProtocolSurfaceMoved { op } => write!(
                 f,
-                "BM1398 NBP1901 stub: {op} is {DESK_PENDING_BINARY} — no invented wire bytes"
+                "BM1398 NBP1901 {op} belongs to dcentrald-api-types::bm1398_protocol / dcentrald-asic::drivers::bm1398; the legacy compatibility layer exposes no second encoder"
             ),
-            Self::Bm1397AnalogueOpcodeForbidden { byte } => write!(
-                f,
-                "BM1398 NBP1901 stub: refuse BM1397 analogue opcode {byte:#04x} as BM1398 wire"
-            ),
-            Self::ChipIdMismatch { observed } => write!(
-                f,
-                "BM1398 NBP1901 stub: chip_id {observed:#06x} != 0x1398"
-            ),
+            Self::ChipIdMismatch { observed } => {
+                write!(f, "BM1398 NBP1901 stub: chip_id {observed:#06x} != 0x1398")
+            }
             Self::GeometryMismatch => write!(
                 f,
                 "BM1398 NBP1901 stub: geometry must be 114 ASICs @ interval 2 / 38×3"
             ),
             Self::MiningDefaultMustStayOff => {
-                write!(f, "BM1398 NBP1901 stub: mining_default_enabled must stay false")
+                write!(
+                    f,
+                    "BM1398 NBP1901 stub: mining_default_enabled must stay false"
+                )
             }
         }
     }
@@ -161,26 +179,33 @@ pub fn validate_identity_geometry() -> Result<(), Bm1398Nbp1901StubError> {
     if plan.len() != 114 || plan[0] != 0 || plan[113] != NBP1901_LAST_ASIC_ADDR {
         return Err(Bm1398Nbp1901StubError::GeometryMismatch);
     }
-    if id.admit || id.implemented || id.mining_default_enabled {
+    if !id.protocol_reconstructed
+        || id.deployed_identity_held
+        || id.admit
+        || id.implemented
+        || id.mining_default_enabled
+    {
         return Err(Bm1398Nbp1901StubError::AdmitFalse);
     }
     Ok(())
 }
 
-/// Production admit gate — always false for this stub.
+/// Production/native admit gate — false for the exact physical-identity gap,
+/// not for lack of reconstructed protocol bytes.
 pub fn admit_bm1398_nbp1901() -> Result<(), Bm1398Nbp1901StubError> {
     if BM1398_NBP1901_ADMIT || BM1398_NBP1901_IMPLEMENTED {
         return Err(Bm1398Nbp1901StubError::AdmitFalse);
     }
-    Err(Bm1398Nbp1901StubError::NotImplemented)
+    Err(Bm1398Nbp1901StubError::MissingDeployedIdentityEvidence)
 }
 
-/// Runtime wire try — every UART opcode path refuses as DESK_PENDING_BINARY.
+/// Legacy wire entry point. The exact protocol has one newer source of truth;
+/// this compatibility layer refuses to create a divergent second encoder.
 pub fn refuse_runtime_wire_try(op: &'static str) -> Result<(), Bm1398Nbp1901StubError> {
-    Err(Bm1398Nbp1901StubError::DeskPendingBinary { op })
+    Err(Bm1398Nbp1901StubError::ProtocolSurfaceMoved { op })
 }
 
-/// Empty GetAddress TX template — do not invent bytes.
+/// Legacy empty GetAddress entry point; use the exact current protocol module.
 pub fn get_address_tx_template() -> Result<&'static [u8], Bm1398Nbp1901StubError> {
     refuse_runtime_wire_try("GetAddress")?;
     unreachable!()
@@ -210,18 +235,20 @@ pub fn midstate4_work_tx_template() -> Result<&'static [u8], Bm1398Nbp1901StubEr
     unreachable!()
 }
 
-/// Refuse shipping BM1397 analogue command heads as BM1398 truth.
+/// Legacy analogue-opcode adjudicator.
 ///
-/// ANALOGUE_ONLY desk hypothesis bytes: inactive `0x53`, get_status `0x52`/`0x42`,
-/// set_address `0x40`. Never admit as BM1398 wire.
-pub fn refuse_bm1397_analogue_opcode(byte: u8) -> Result<(), Bm1398Nbp1901StubError> {
-    match byte {
-        0x40 | 0x52 | 0x53 | 0x42 => Err(Bm1398Nbp1901StubError::Bm1397AnalogueOpcodeForbidden { byte }),
-        _ => Ok(()),
-    }
+/// The old scaffold incorrectly treated the shared BM1397-family command heads
+/// as forbidden BM1398 guesses. Exact NBP1901 evidence superseded that claim.
+/// Refuse this obsolete adjudicator itself so it can neither reject proven
+/// commands nor authorize a byte outside the current protocol module.
+#[deprecated(note = "use dcentrald-api-types::bm1398_protocol and the BM1398 driver")]
+pub fn refuse_bm1397_analogue_opcode(_byte: u8) -> Result<(), Bm1398Nbp1901StubError> {
+    refuse_runtime_wire_try("legacy BM1397-analogue opcode adjudication")
 }
 
-pub fn admit_mining_default_off(mining_default_enabled: bool) -> Result<(), Bm1398Nbp1901StubError> {
+pub fn admit_mining_default_off(
+    mining_default_enabled: bool,
+) -> Result<(), Bm1398Nbp1901StubError> {
     if mining_default_enabled || BM1398_MINING_DEFAULT_ENABLED {
         return Err(Bm1398Nbp1901StubError::MiningDefaultMustStayOff);
     }
@@ -261,23 +288,25 @@ mod tests {
     }
 
     #[test]
-    fn admit_false_not_implemented() {
+    fn protocol_is_reconstructed_but_native_runtime_stays_refused() {
+        assert!(BM1398_NBP1901_PROTOCOL_RECONSTRUCTED);
+        assert!(!BM1398_NBP1901_DEPLOYED_IDENTITY_HELD);
         assert!(!BM1398_NBP1901_ADMIT);
         assert!(!BM1398_NBP1901_IMPLEMENTED);
         assert!(!BM1398_MINING_DEFAULT_ENABLED);
         assert!(matches!(
             admit_bm1398_nbp1901(),
-            Err(Bm1398Nbp1901StubError::NotImplemented)
+            Err(Bm1398Nbp1901StubError::MissingDeployedIdentityEvidence)
         ));
         assert!(admit_mining_default_off(false).is_ok());
         assert!(admit_mining_default_off(true).is_err());
     }
 
     #[test]
-    fn runtime_wire_try_refuses_desk_pending_binary() {
+    fn legacy_runtime_wire_surface_refuses_a_second_encoder() {
         assert!(matches!(
             refuse_runtime_wire_try("GetAddress"),
-            Err(Bm1398Nbp1901StubError::DeskPendingBinary { op: "GetAddress" })
+            Err(Bm1398Nbp1901StubError::ProtocolSurfaceMoved { op: "GetAddress" })
         ));
         assert!(get_address_tx_template().is_err());
         assert!(set_address_tx_template(0).is_err());
@@ -287,15 +316,15 @@ mod tests {
     }
 
     #[test]
-    fn refuse_bm1397_analogue_opcodes_not_copied() {
+    #[allow(deprecated)]
+    fn obsolete_analogue_adjudicator_cannot_authorize_or_reject_bytes() {
         for b in [0x40u8, 0x52, 0x53, 0x42] {
             assert!(matches!(
                 refuse_bm1397_analogue_opcode(b),
-                Err(Bm1398Nbp1901StubError::Bm1397AnalogueOpcodeForbidden { byte }) if byte == b
+                Err(Bm1398Nbp1901StubError::ProtocolSurfaceMoved { .. })
             ));
         }
-        // Unrelated byte is not this gate's concern.
-        assert!(refuse_bm1397_analogue_opcode(0x00).is_ok());
+        assert!(refuse_bm1397_analogue_opcode(0x00).is_err());
     }
 
     #[test]

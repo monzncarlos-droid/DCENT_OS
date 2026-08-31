@@ -37,6 +37,9 @@ describe('advanced live power display honesty', () => {
     expect(kitDashboardPage).toContain('currentWatts={liveCircuitWatts > 0 ? liveCircuitWatts : null}');
     expect(kitDashboardPage).not.toContain('currentWatts={status?.power?.wall_watts ?? null}');
     expect(circuitWarning).toContain('Live wall power telemetry (watts).');
+    expect(circuitWarning).toContain('overUndeclaredCeiling');
+    expect(circuitWarning).toContain('1440 W residential ceiling');
+    expect(circuitWarning).toContain('live wall watts only');
   });
 
   it('keeps Temp/Fans PSU wall power and heat live-only', () => {

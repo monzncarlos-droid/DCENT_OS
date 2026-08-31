@@ -324,6 +324,15 @@ pub enum LifecycleLane {
     /// AM2 S19j hybrid lifecycle (`--s19j-hybrid`).
     #[serde(rename = "s19j_hybrid")]
     S19jHybrid,
+    /// AM2 S17-family (BM1397) hybrid lifecycle (`--s17-hybrid`).
+    ///
+    /// Added 2026-08-28 (unlock-armada convergence): the four promoted
+    /// 17-series targets previously reused `S19jHybrid` because the enum
+    /// lived outside that campaign's crate lane; the dedicated variant
+    /// restores one-lane-per-engine routing honesty. No consumer matches
+    /// exhaustively on this enum outside its own `as_str`/serde impls.
+    #[serde(rename = "s17_hybrid")]
+    S17Hybrid,
 }
 
 impl LifecycleLane {
@@ -333,6 +342,7 @@ impl LifecycleLane {
             Self::Am2Bm1362Serial => "am2_bm1362_serial",
             Self::Am3BbSerial => "am3_bb_serial",
             Self::S19jHybrid => "s19j_hybrid",
+            Self::S17Hybrid => "s17_hybrid",
         }
     }
 }

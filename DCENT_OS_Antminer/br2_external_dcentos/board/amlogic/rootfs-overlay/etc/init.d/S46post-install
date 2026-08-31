@@ -9,11 +9,50 @@
 
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
-. /lib/functions/dcentos-defaults.sh
-. /lib/functions/system.sh
-
 log() {
     echo "S46post-install: $*"
+}
+
+read_trimmed() {
+    [ -r "$1" ] || return 1
+    value=$(cat "$1" 2>/dev/null) || return 1
+    printf '%s' "$value"
+}
+
+require_post_install_authority() {
+    policy_file=/etc/dcentos/mutation_policy
+    target=$(read_trimmed /etc/dcentos/board_target 2>/dev/null || true)
+    platform=$(read_trimmed /etc/dcentos/platform 2>/dev/null || true)
+    [ -n "$platform" ] || platform=$(read_trimmed /etc/dcentos-platform 2>/dev/null || true)
+
+    # The legacy length-prefixed NAND tar has no signature or member manifest.
+    # S19k must not read, erase, extract, or execute it until an authenticated
+    # post-install envelope and safe extractor exist.
+    case "$platform:$target" in
+        am3-aml-s19k:*|*:am3-s19k|*:am3-s19kpro|*:am3-aml-s19kpro)
+            log "unsigned S19k NAND post-install payloads are disabled"
+            return 1
+            ;;
+    esac
+
+    if [ -e "$policy_file" ]; then
+        policy=$(read_trimmed "$policy_file") || {
+            log "unreadable mutation_policy; refusing post-install mutation"
+            return 1
+        }
+        [ "$policy" = hardware-enabled ] || {
+            log "mutation_policy=$policy; refusing post-install mutation"
+            return 1
+        }
+    fi
+
+    case "$platform:$target" in
+        am3-aml-t21:*|*:am3-t21|am3-aml-s21xp:*|*:am3-s21xp|\
+        am3-aml-s19xp:*|*:am3-s19xp|am3-aml-s19jxp:*|*:am3-s19jxp)
+            log "target storage/recovery contract is unresolved; refusing post-install mutation"
+            return 1
+            ;;
+    esac
 }
 
 have_tools() {
@@ -34,6 +73,12 @@ read_tar_size() {
 }
 
 run_post_install() {
+    # This gate precedes loading generic NAND offsets, reading an MTD, erasing
+    # a slot, extracting a payload, or executing its run.sh.
+    require_post_install_authority || return 1
+    . /lib/functions/dcentos-defaults.sh
+    . /lib/functions/system.sh
+
     if [ "$DCENTOS_MODE" != "nand" ]; then
         log "mode=$DCENTOS_MODE; skipping NAND post-install hook"
         return 0

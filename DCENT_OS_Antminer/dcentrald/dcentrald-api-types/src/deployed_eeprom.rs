@@ -172,7 +172,8 @@ mod r2 {
 // (BHB56903), s21 `0x51` (BHB68606) and xil `0x50`/`0x52` (BHB42601), i.e.
 // 3 SKUs across both `0x04` and `0x05` board classes: 10 of 10 stored bytes
 // equal the recompute. The region-relative alternative for block 1 (760 bits)
-// missed 5 of 5. Note a 5-bit CRC collides 1 time in 32 by construction, and
+// missed 5 of 5. Corpus-wide the same spans verify on armada deliverable 13 §F7
+// (17/17 ePIC matched samples + 5/5 real held DCENT pages). Note a 5-bit CRC collides 1 time in 32 by construction, and
 // that was observed live during verification — an over-long block-1 span
 // matched on one page by chance. One page can never establish this framing.
 /// Page-absolute offset of the block-1 CRC5 byte.
@@ -1256,6 +1257,26 @@ f825543962db6d5a5bcf22b0438c6e3bad67545b71fc57a10dc0d22dae63d298";
                     );
                 }
             }
+        }
+    }
+
+    /// The format-1 arm must not widen the door: every first byte that is not a
+    /// handled format (`0x01` format-1, `0x04`/`0x05` XXTEA-class) still refuses.
+    /// Byte 1 is a valid `0x11` XXTEA header on every page, so a refusal here can
+    /// only come from the unhandled byte 0 — pin that no future format slips
+    /// through to a decrypt-and-hope path.
+    #[test]
+    fn every_unhandled_first_byte_refuses_fail_closed() {
+        for b0 in 0u8..=0xFF {
+            if matches!(b0, FORMAT_1_CLASS | 0x04 | 0x05) {
+                continue;
+            }
+            let mut page = vec![0x11u8; RAW_PAGE_LEN];
+            page[0] = b0;
+            assert!(
+                decode_deployed_eeprom(&page).is_err(),
+                "first byte 0x{b0:02x} is not a handled format and must refuse"
+            );
         }
     }
 

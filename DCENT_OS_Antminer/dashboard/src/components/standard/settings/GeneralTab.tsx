@@ -1,12 +1,18 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useMinerStore } from '../../../store/miner';
 import type { OperatingMode } from '../../../api/types';
 import { ModeSwitch } from '../../common/ModeSwitch';
 import { LanguageSelector } from '../../../i18n/i18n';
 import { PowerCalibrationCard } from '../../common/PowerCalibrationCard';
 import { DonationFeeCard } from '../../common/DonationFeeCard';
+import { api } from '../../../api/client';
 import { getLiveWallWatts } from '../../../utils/power';
-import { estimateDailyProfit } from '../../../utils/thermal';
+import {
+  estimateDailyProfit,
+  donationTakePercent,
+  DEFAULT_DONATION_PERCENT,
+  loadPoolFeePercent,
+} from '../../../utils/thermal';
 import { formatSats } from '../../../utils/format';
 
 export function GeneralTab({ onModeSelect }: { onModeSelect: (mode: OperatingMode) => void }) {
@@ -24,7 +30,30 @@ export function GeneralTab({ onModeSelect }: { onModeSelect: (mode: OperatingMod
     : status
       ? `Power unavailable; cost uses ${watts}W standby assumption.`
       : null;
-  const profit = estimateDailyProfit(hashrate, watts, settings.btcPrice, settings.electricityRate, networkDifficulty);
+  // Unknown donation config → firmware default 2%, never a silent 0% take-rate.
+  const [donationPercent, setDonationPercent] = useState(DEFAULT_DONATION_PERCENT);
+  const [poolFeePercent] = useState(() => loadPoolFeePercent());
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getDonationConfig()
+      .then(cfg => {
+        if (!cancelled) setDonationPercent(donationTakePercent(cfg));
+      })
+      .catch(() => {
+        if (!cancelled) setDonationPercent(DEFAULT_DONATION_PERCENT);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const profit = estimateDailyProfit(
+    hashrate,
+    watts,
+    settings.btcPrice,
+    settings.electricityRate,
+    networkDifficulty,
+    { donationPercent, poolFeePercent },
+  );
 
   return (
     <>

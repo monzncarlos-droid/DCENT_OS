@@ -1,8 +1,17 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useMinerStore } from '../../store/miner';
 import { useHeaterPresets } from '../../hooks/useHeaterPresets';
 import { api } from '../../api/client';
 import { glossaryText } from '../../utils/glossary';
+import {
+  NIGHT_FAN_PWM_SAFETY_CAP,
+  NIGHT_FREQUENCY_DEFAULT_MHZ,
+  NIGHT_FREQUENCY_MAX_MHZ,
+  NIGHT_FREQUENCY_MIN_MHZ,
+  buildNightModeCommitRequest,
+  clampNightFanPwm,
+  clampNightFrequencyMhz,
+} from './NightMode';
 
 /**
  * Heater-mode side-column "Boost / Away / Quiet" tiles — emits the kit
@@ -21,8 +30,10 @@ import { glossaryText } from '../../utils/glossary';
  *   - Away   → `api.setHeaterTarget({ preset: <eco-tier preset> })`
  *              (the lowest-power preset — still mines/earns, just quietly).
  *              Active when the reported preset IS that preset.
- *   - Quiet  → toggles REAL Night Mode via `api.setNightMode(...)` (the exact
- *              call NightMode.tsx makes). Active when `nightMode.enabled`.
+ *   - Quiet  → toggles REAL Night Mode via `buildNightModeCommitRequest` →
+ *              `api.setNightMode` (same helper NightMode.tsx uses). PWM and
+ *              frequency sliders under the row set those ceilings. Active
+ *              when `nightMode.enabled`.
  *
  * Honest active states: a tile only shows `active` when the live store
  * reflects that the action actually took effect — never optimistically.
@@ -58,6 +69,20 @@ export function HeaterModeTiles() {
   const setNightMode = useMinerStore(s => s.setNightMode);
   const addToast = useMinerStore(s => s.addToast);
   const [busy, setBusy] = useState<string | null>(null);
+  const [maxFanPwm, setMaxFanPwm] = useState(
+    clampNightFanPwm(nightMode?.max_fan_pwm ?? NIGHT_FAN_PWM_SAFETY_CAP),
+  );
+  const [maxFrequencyMhz, setMaxFrequencyMhz] = useState(
+    clampNightFrequencyMhz(nightMode?.max_frequency_mhz ?? NIGHT_FREQUENCY_DEFAULT_MHZ),
+  );
+
+  useEffect(() => {
+    if (!nightMode) return;
+    setMaxFanPwm(clampNightFanPwm(nightMode.max_fan_pwm));
+    setMaxFrequencyMhz(
+      clampNightFrequencyMhz(nightMode.max_frequency_mhz ?? NIGHT_FREQUENCY_DEFAULT_MHZ),
+    );
+  }, [nightMode]);
 
   // Resolve the real max-power and eco presets from the live preset list
   // (sorted by wattage). Falls back to the built-in defaults via
@@ -89,28 +114,52 @@ export function HeaterModeTiles() {
     }
   };
 
+  const commitQuiet = async (
+    nextEnabled: boolean,
+    nextFanPwm: number,
+    nextFrequencyMhz: number,
+  ) => {
+    const body = buildNightModeCommitRequest({
+      enabled: nextEnabled,
+      startHour: nightMode?.start_hour ?? 22,
+      endHour: nightMode?.end_hour ?? 7,
+      reductionPct: nightMode?.power_reduction_pct ?? 50,
+      maxFanPwm: nextFanPwm,
+      maxFrequencyMhz: nextFrequencyMhz,
+    });
+    await api.setNightMode(body);
+    setNightMode({
+      enabled: nextEnabled,
+      start_hour: nightMode?.start_hour ?? 22,
+      end_hour: nightMode?.end_hour ?? 7,
+      max_fan_pwm: body.max_fan_pwm ?? NIGHT_FAN_PWM_SAFETY_CAP,
+      max_frequency_mhz: body.max_frequency_mhz,
+      power_reduction_pct: nightMode?.power_reduction_pct ?? 50,
+      active: nightMode?.active ?? false,
+    });
+  };
+
   const toggleQuiet = async () => {
     const next = !(nightMode?.enabled ?? false);
     try {
       setBusy('Quiet');
-      await api.setNightMode({
-        enabled: next,
-        start_hour: nightMode?.start_hour ?? 22,
-        end_hour: nightMode?.end_hour ?? 7,
-        power_reduction_pct: nightMode?.power_reduction_pct ?? 50,
-      });
-      // Mirror NightMode.tsx: reflect the committed state into the store so
-      // the active pill is honest (only after the API call resolved).
-      setNightMode({
-        enabled: next,
-        start_hour: nightMode?.start_hour ?? 22,
-        end_hour: nightMode?.end_hour ?? 7,
-        max_fan_pwm: nightMode?.max_fan_pwm ?? 30,
-        power_reduction_pct: nightMode?.power_reduction_pct ?? 50,
-        active: nightMode?.active ?? false,
-      });
+      await commitQuiet(next, maxFanPwm, maxFrequencyMhz);
     } catch {
       addToast('Failed to toggle Quiet (Night Mode)', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const commitQuietCeiling = async (nextFanPwm: number, nextFrequencyMhz: number) => {
+    setMaxFanPwm(nextFanPwm);
+    setMaxFrequencyMhz(nextFrequencyMhz);
+    if (!nightMode?.enabled) return;
+    try {
+      setBusy('Quiet');
+      await commitQuiet(true, nextFanPwm, nextFrequencyMhz);
+    } catch {
+      addToast('Failed to save Quiet night ceilings', 'error');
     } finally {
       setBusy(null);
     }
@@ -120,6 +169,7 @@ export function HeaterModeTiles() {
   const maxWatts = maxPreset ? `Max ${maxPreset.watts}W` : 'Max heat';
 
   return (
+    <div className="heater-mode-tiles-block">
     <div
       className="nest-mode-tiles"
       role="group"
@@ -163,6 +213,57 @@ export function HeaterModeTiles() {
         <span className="nest-mode-label">Quiet</span>
         <span className="nest-mode-sub">{quietActive ? 'On' : 'Night mode'}</span>
       </button>
+    </div>
+    <div className="quiet-night-ceilings" aria-label="Quiet night ceilings">
+      <div>
+        <div className="night-mode-slider-head">
+          <label htmlFor="quiet-night-fan">Quiet fan PWM</label>
+          <span aria-hidden="true" className="night-mode-slider-value">{maxFanPwm}</span>
+        </div>
+        <input
+          id="quiet-night-fan"
+          className="night-mode-range"
+          type="range"
+          min={0}
+          max={NIGHT_FAN_PWM_SAFETY_CAP}
+          step={1}
+          value={maxFanPwm}
+          disabled={busy !== null}
+          onChange={e => {
+            const next = clampNightFanPwm(Number(e.target.value));
+            void commitQuietCeiling(next, maxFrequencyMhz);
+          }}
+          aria-label={`Quiet fan PWM: ${maxFanPwm}`}
+          aria-valuemin={0}
+          aria-valuemax={NIGHT_FAN_PWM_SAFETY_CAP}
+          aria-valuenow={maxFanPwm}
+        />
+      </div>
+      <div>
+        <div className="night-mode-slider-head">
+          <label htmlFor="quiet-night-frequency">Quiet frequency</label>
+          <span aria-hidden="true" className="night-mode-slider-value">{maxFrequencyMhz} MHz</span>
+        </div>
+        <input
+          id="quiet-night-frequency"
+          className="night-mode-range"
+          type="range"
+          min={NIGHT_FREQUENCY_MIN_MHZ}
+          max={NIGHT_FREQUENCY_MAX_MHZ}
+          step={10}
+          value={maxFrequencyMhz}
+          disabled={busy !== null}
+          onChange={e => {
+            const next = clampNightFrequencyMhz(Number(e.target.value));
+            void commitQuietCeiling(maxFanPwm, next);
+          }}
+          aria-label={`Quiet frequency: ${maxFrequencyMhz} megahertz`}
+          aria-valuemin={NIGHT_FREQUENCY_MIN_MHZ}
+          aria-valuemax={NIGHT_FREQUENCY_MAX_MHZ}
+          aria-valuenow={maxFrequencyMhz}
+        />
+      </div>
+    </div>
     </div>
   );
 }

@@ -323,6 +323,18 @@ impl RepairContext {
             voltage_domain_size: default_voltage_domain_size(chip_id),
         }
     }
+
+    /// Build a repair context only when chip family and expected population
+    /// jointly identify one held voltage-domain geometry. BM1366 requires this
+    /// form because S19 XP is 110=11x10 while S19k Pro BHB56902 is 77=11x7.
+    pub fn for_chain_geometry(chip_id: u16, expected_chip_count: u16) -> Self {
+        Self {
+            voltage_domain_size: default_voltage_domain_size_for_geometry(
+                chip_id,
+                expected_chip_count,
+            ),
+        }
+    }
 }
 
 /// Default chips-per-voltage-domain for a registered ASIC family.
@@ -335,9 +347,29 @@ pub fn default_voltage_domain_size(chip_id: u16) -> Option<u16> {
         0x1387 => Some(63), // S9: 1 domain × 63 chips
         0x1398 => Some(2),  // S19: 38 domains × 2
         0x1362 => Some(3),  // S19j Pro: 42 domains × 3
-        0x1366 => Some(10), // S19 XP: 11 domains × 10
-        0x1368 => Some(9),  // S21: 12 domains × 9
-        0x1370 => Some(7),  // S21 XP: 13 domains × 7
+        // Ambiguous by chip ID: S19 XP is 11x10; S19k Pro BHB56902 is 11x7.
+        0x1366 => None,
+        0x1368 => Some(9), // S21: 12 domains × 9
+        0x1370 => Some(7), // S21 XP: 13 domains × 7
+        _ => None,
+    }
+}
+
+/// Exact chips-per-voltage-domain for a chip family *and* chain population.
+/// Unknown, degraded, or sibling geometry yields `None` rather than assigning a
+/// fault to a physically incorrect regulator boundary.
+pub const fn default_voltage_domain_size_for_geometry(
+    chip_id: u16,
+    expected_chip_count: u16,
+) -> Option<u16> {
+    match (chip_id, expected_chip_count) {
+        (0x1387, 63) => Some(63),
+        (0x1398, 76) => Some(2),
+        (0x1362, 126) => Some(3),
+        (0x1366, 77) => Some(7),
+        (0x1366, 110) => Some(10),
+        (0x1368, 108) => Some(9),
+        (0x1370, 91) => Some(7),
         _ => None,
     }
 }
@@ -798,10 +830,23 @@ mod tests {
         assert_eq!(default_voltage_domain_size(0x1362), Some(3));
         assert_eq!(default_voltage_domain_size(0x1368), Some(9));
         assert_eq!(default_voltage_domain_size(0x1398), Some(2));
+        assert_eq!(default_voltage_domain_size(0x1366), None);
         assert_eq!(default_voltage_domain_size(0xFFFF), None);
         assert_eq!(
             RepairContext::for_chip_id(0x1362).voltage_domain_size,
             Some(3)
+        );
+        assert_eq!(
+            RepairContext::for_chain_geometry(0x1366, 77).voltage_domain_size,
+            Some(7)
+        );
+        assert_eq!(
+            RepairContext::for_chain_geometry(0x1366, 110).voltage_domain_size,
+            Some(10)
+        );
+        assert_eq!(
+            RepairContext::for_chain_geometry(0x1366, 76).voltage_domain_size,
+            None
         );
     }
 

@@ -1,4 +1,4 @@
-﻿//! S19k Pro / BM1366 Amlogic NoPic profile admission (BETA-shaped, offline).
+//! S19k Pro / BM1366 Amlogic NoPic profile admission (BETA-shaped, offline).
 //!
 //! Desk/host-testable gates for community tryable-beta readiness. This module
 //! admits **management-fabric identity only** — it never authorizes mining,
@@ -8,7 +8,8 @@
 //! - `Has_Pic: false` (BHB5690x Config.ini family)
 //! - ChipID / catalog binding BM1366 (`0x1366`)
 //! - CtrlBoard LM75A before ASIC probe (twin of BM1368 NoPic fabric)
-//! - GPIO437 PWR_EN active-HIGH / SafeOff LOW (RE-4C) is orthogonal OTA gate
+//! - am3-s19k GPIO437 `PWR_CONTROL` is active-LOW (`0=ON`); checked
+//!   HIGH (`1=OFF`) SafeOff is an orthogonal OTA gate
 //!
 //! Native BM1366 mining remains `NOT IMPLEMENTED` / experimental opt-in
 //! fail-closed in `serial_mining` until a deliberate BETA mining admission
@@ -20,9 +21,8 @@ use crate::sensor_topology::sensor_topology_for_sku;
 /// Exact board_name strings admitted for S19k-class BM1366 NoPic identity.
 ///
 /// Catalogued BHB5690x family only. Marketing names alone never admit.
-pub const S19K_NOPIC_BOARD_NAMES: &[&str] = &[
-    "BHB56901", "BHB56902", "BHB56903", "BHB56906", "BHB56907",
-];
+pub const S19K_NOPIC_BOARD_NAMES: &[&str] =
+    &["BHB56901", "BHB56902", "BHB56903", "BHB56906", "BHB56907"];
 
 /// Canonical live-probed SKU (`a lab unit` / catalog LiveDeployedPage).
 pub const S19K_CANONICAL_BOARD_NAME: &str = "BHB56902";
@@ -193,7 +193,6 @@ pub fn is_forbidden_pic_voltage_class(class: &str) -> bool {
     )
 }
 
-
 /// Ordered fabric phases for S19k NoPic tryable-BETA (host-testable).
 ///
 /// CtrlBoard LM75-before-probe MUST complete before ASIC probe. This is the
@@ -227,9 +226,7 @@ impl S19kNopicFabricPhaseLatch {
             S19kNopicFabricPhase::CtrlBoardLm75BeforeProbe => {
                 Some(S19kNopicFabricPhase::IdentityAdmitted)
             }
-            S19kNopicFabricPhase::AsicProbe => {
-                Some(S19kNopicFabricPhase::CtrlBoardLm75BeforeProbe)
-            }
+            S19kNopicFabricPhase::AsicProbe => Some(S19kNopicFabricPhase::CtrlBoardLm75BeforeProbe),
         };
         if let Some(prev) = required_prev {
             match self.highest {
@@ -405,9 +402,12 @@ mod tests {
         // BHB56902 corpus row historically carries vendor_declared_pic=PIC1704.
         // Corpus helper must still force Has_Pic=false and never offer PIC owners.
         let desc = descriptor_by_sku("BHB56902").expect("BHB56902 topology");
+        let pic = desc
+            .vendor_declared_pic
+            .as_ref()
+            .expect("BHB56902 still carries the vendor claim");
         assert_eq!(
-            desc.vendor_declared_pic.device,
-            "PIC1704",
+            pic.device, "PIC1704",
             "fixture still carries vendor_declared_pic — regression pin"
         );
         let claim = s19k_claim_from_pinned_corpus("BHB56902").expect("claim");
@@ -423,7 +423,10 @@ mod tests {
         // Even with BM1366 chip claim, S21 fixture board_name must not admit as S19k.
         match admit_s19k_nopic_profile(claim) {
             S19kNoPicAdmission::Refused(r) => {
-                assert!(r.contains("BHB68603") || r.contains("not a catalogued"), "{r}");
+                assert!(
+                    r.contains("BHB68603") || r.contains("not a catalogued"),
+                    "{r}"
+                );
             }
             other => panic!("expected refuse BHB68603, got {other:?}"),
         }
@@ -435,7 +438,9 @@ mod tests {
         let mut claim = good_claim();
         claim.board_name = "BHB56903";
         match admit_s19k_nopic_profile(claim) {
-            S19kNoPicAdmission::AdmittedFabric { board_name, mining, .. } => {
+            S19kNoPicAdmission::AdmittedFabric {
+                board_name, mining, ..
+            } => {
                 assert_eq!(board_name, "BHB56903");
                 assert_eq!(mining, S19kMiningDisposition::NotImplemented);
             }
@@ -456,27 +461,20 @@ mod tests {
         ));
     }
 
-
-
-
     #[test]
     fn lm75_before_probe_phase_order_is_enforced() {
         let mut latch = S19kNopicFabricPhaseLatch::new();
-        assert!(
-            latch
-                .advance(S19kNopicFabricPhase::AsicProbe)
-                .unwrap_err()
-                .contains("LM75-before-probe")
-        );
+        assert!(latch
+            .advance(S19kNopicFabricPhase::AsicProbe)
+            .unwrap_err()
+            .contains("LM75-before-probe"));
         latch
             .advance(S19kNopicFabricPhase::IdentityAdmitted)
             .expect("identity");
-        assert!(
-            latch
-                .advance(S19kNopicFabricPhase::AsicProbe)
-                .unwrap_err()
-                .contains("CtrlBoardLm75BeforeProbe")
-        );
+        assert!(latch
+            .advance(S19kNopicFabricPhase::AsicProbe)
+            .unwrap_err()
+            .contains("CtrlBoardLm75BeforeProbe"));
         latch
             .advance(S19kNopicFabricPhase::CtrlBoardLm75BeforeProbe)
             .expect("lm75");
@@ -492,10 +490,10 @@ mod tests {
         let mut claim = good_claim();
         claim.offers_pic_voltage_owner = true;
         match admit_s19k_nopic_profile(claim) {
-            S19kNoPicAdmission::Refused(r) => assert!(r.contains("PIC") || r.contains("BM1362"), "{r}"),
+            S19kNoPicAdmission::Refused(r) => {
+                assert!(r.contains("PIC") || r.contains("BM1362"), "{r}")
+            }
             other => panic!("expected refuse, got {other:?}"),
         }
     }
-
-
 }

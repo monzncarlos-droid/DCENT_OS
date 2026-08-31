@@ -227,7 +227,9 @@ class Bcb100OfflineBootInputTests(unittest.TestCase):
                 source.symlink_to(backing)
             except (OSError, NotImplementedError):
                 self.skipTest("symlink creation is unavailable")
-            with self.assertRaisesRegex(MODULE.EvidenceError, "symlink"):
+            with self.assertRaisesRegex(
+                MODULE.EvidenceError, "must not traverse a link"
+            ):
                 MODULE.analyze(root)
 
     def test_source_multilink_is_refused(self) -> None:

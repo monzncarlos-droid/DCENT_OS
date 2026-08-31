@@ -89,6 +89,7 @@ pub mod bm1373;
 pub mod bm1385;
 pub mod bm1387;
 pub mod bm1391;
+pub mod bm1393;
 pub mod bm1396;
 pub mod bm1397;
 pub mod bm1398;
@@ -202,6 +203,7 @@ pub const fn is_scaffold_driver_chip(chip_id: u16) -> bool {
         // 0x1489-vs-0x1491 identity split.
         || chip_id == bm1491::CHIP_ID
         || chip_id == bm1391::CHIP_ID
+        || chip_id == bm1393::CHIP_ID
         // BM1485 (L3/L3+/L3++). Note this key is SYNTHETIC — real BM1485
         // silicon never reports it — so no live enumeration can reach this
         // branch today. It is registered so the scaffold is reachable for
@@ -526,6 +528,25 @@ impl MinerProfile {
         };
         (freq_mhz as f64 * self.nonce_attribution_cores_with_correction(corrected) as f64 * 1e6)
             / (diff as f64 * 4.294e9)
+    }
+
+    /// Fail-closed nonce-attribution slots for a chip ID.
+    ///
+    /// Unknown IDs return `None`. Never a silent BM1387 114-core default.
+    pub fn try_nonce_attribution_cores_for_chip(chip_id: u16) -> Option<u32> {
+        Self::for_chip(chip_id).map(|profile| profile.nonce_attribution_cores_effective())
+    }
+
+    /// Fail-closed GH/s per MHz for a chip ID. Unknown IDs return `None`.
+    pub fn try_ghs_per_mhz_for_chip(chip_id: u16) -> Option<f64> {
+        Self::for_chip(chip_id).map(|profile| profile.ghs_per_mhz)
+    }
+
+    /// Fail-closed expected nonces/sec for a chip ID.
+    ///
+    /// Unknown IDs return `None` instead of inventing BM1387 114-core NPS.
+    pub fn try_expected_nps_for_chip(chip_id: u16, freq_mhz: u16, difficulty: u32) -> Option<f64> {
+        Self::for_chip(chip_id).map(|profile| profile.expected_nps(freq_mhz, difficulty))
     }
 }
 
@@ -1390,6 +1411,10 @@ impl ChipRegistry {
             Box::new(bm1391::Bm1391Driver::new()),
             ChipDriverMaturity::Scaffold,
         );
+        self.register_with_maturity(
+            Box::new(bm1393::Bm1393Driver::new()),
+            ChipDriverMaturity::Scaffold,
+        );
         // BM1485 (L3 / L3+ / L3++ Scrypt) — rank 44. Scaffold: EVERY hardware
         // method returns Err (operational baud, chain address stride, PLL
         // register encoding and nonce field layout are all unresolved), and
@@ -1754,6 +1779,16 @@ mod tests {
                 ),
             },
             Case {
+                source_file: "bm1393.rs",
+                driver_name: bm1393::Bm1393Driver::new().chip_name(),
+                driver_max_baud: bm1393::Bm1393Driver::new().max_baud(),
+                catalog_chip: None,
+                catalog_absence_reason: Some(
+                    "BM1393 is retained as an exact fail-closed S9 SE/S9k protocol scaffold; the silicon profile catalog has no executable row",
+                ),
+                driver_above_catalog_reason: None,
+            },
+            Case {
                 source_file: "bm1397.rs",
                 driver_name: bm1397::Bm1397Driver::new().chip_name(),
                 driver_max_baud: bm1397::Bm1397Driver::new().max_baud(),
@@ -1915,6 +1950,13 @@ mod tests {
                 driver: Box::new(bm1391::Bm1391Driver::new()),
                 profile_absence_reason: Some(
                     "BM1391/S15/T15 remains scaffold-gated without a MinerProfile; core count and S15 topology are known, but the carrier and safe runtime envelope are not",
+                ),
+            },
+            Case {
+                source_file: "bm1393.rs",
+                driver: Box::new(bm1393::Bm1393Driver::new()),
+                profile_absence_reason: Some(
+                    "BM1393/S9 SE/S9k remains scaffold-gated; exact protocol bytes do not settle the production carrier, voltage, cooling, or safe runtime envelope",
                 ),
             },
             Case {
@@ -2256,6 +2298,41 @@ mod tests {
         assert!(s9.nominal_hashrate_ghs(0).is_none());
     }
 
+    /// Rank 20: unknown chip IDs must not inherit BM1387 114-core NPS.
+    #[test]
+    fn unknown_chip_geometry_refuses_silent_114_nps() {
+        let bm1387 = MinerProfile::for_chip(0x1387).expect("BM1387 profile");
+        assert_eq!(bm1387.nonce_attribution_cores, 114);
+        assert_eq!(
+            MinerProfile::try_nonce_attribution_cores_for_chip(0x1387),
+            Some(114)
+        );
+        assert!(MinerProfile::try_expected_nps_for_chip(0x1387, 650, 256).is_some());
+        assert!(MinerProfile::try_ghs_per_mhz_for_chip(0x1387).is_some());
+
+        for unknown in [0x0000u16, 0xFFFF, BM1390_RE_PENDING_CHIP_ID, 0x1234, 0xABCD] {
+            assert!(
+                MinerProfile::for_chip(unknown).is_none(),
+                "chip 0x{unknown:04X} must have no MinerProfile"
+            );
+            assert_eq!(
+                MinerProfile::try_nonce_attribution_cores_for_chip(unknown),
+                None,
+                "chip 0x{unknown:04X} must not silently report 114 cores"
+            );
+            assert_eq!(
+                MinerProfile::try_ghs_per_mhz_for_chip(unknown),
+                None,
+                "chip 0x{unknown:04X} must not silently report 0.114 GH/s/MHz"
+            );
+            assert_eq!(
+                MinerProfile::try_expected_nps_for_chip(unknown, 650, 256),
+                None,
+                "chip 0x{unknown:04X} must not invent BM1387 expected-nps"
+            );
+        }
+    }
+
     // W22 (parity #9): scaffold drivers register only when BOTH the lab
     // override AND the explicit stub-behavior acknowledgment are present — a
     // single stray env var must never load a stub driver onto live hardware.
@@ -2453,6 +2530,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bm1393_detect_is_scaffold_gated_not_production() {
+        assert!(ChipRegistry::production().detect(bm1393::CHIP_ID).is_none());
+        let scaffold = ChipRegistry::with_scaffold_drivers();
+        let driver = scaffold
+            .detect(bm1393::CHIP_ID)
+            .expect("explicit scaffold registry must expose exact BM1393 codec");
+        assert_eq!(driver.chip_name(), "BM1393");
+        assert_eq!(driver.cores_per_chip(), 208);
+        assert!(is_scaffold_driver_chip(bm1393::CHIP_ID));
+    }
+
     /// Safety pin: the scaffold/pre-hardware chip PROFILES (BM1373/BM1489) carry
     /// PLACEHOLDER voltages. `MinerProfile::for_chip` is an ungated metadata lookup
     /// that returns them, but the LIVE driver path is gated — `ChipRegistry::
@@ -2467,7 +2556,12 @@ mod tests {
     fn scaffold_chip_profiles_are_live_gated_and_voltage_safe() {
         const SAFE_VOLTAGE_CAP_MV: u16 = 14_500; // dsPIC clamp_dspic_voltage_to_hard_cap
         let production = ChipRegistry::production();
-        for chip_id in [bm1373::CHIP_ID, bm1489::CHIP_ID, bm1391::CHIP_ID] {
+        for chip_id in [
+            bm1373::CHIP_ID,
+            bm1489::CHIP_ID,
+            bm1391::CHIP_ID,
+            bm1393::CHIP_ID,
+        ] {
             assert!(
                 production.detect(chip_id).is_none(),
                 "scaffold chip 0x{chip_id:04X} must be absent from the production registry (live-gated)"

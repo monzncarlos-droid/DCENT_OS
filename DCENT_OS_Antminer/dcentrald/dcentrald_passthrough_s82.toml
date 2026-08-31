@@ -26,7 +26,7 @@ target_temp_c = 55
 hot_temp_c = 65
 dangerous_temp_c = 75
 fan_min_pwm = 10
-fan_max_pwm = 127
+fan_max_pwm = 30  # home-quiet ceiling; industrial 127 is not a shipped default
 
 [api]
 cgminer_port = 4029

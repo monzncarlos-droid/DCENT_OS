@@ -42,14 +42,21 @@ export function CircuitWarning({
   if (currentWatts === null || !Number.isFinite(currentWatts)) return null;
 
   const isResidential15A = voltageV === 120 && amperageA === 15;
+  const circuitUndeclared =
+    voltageV == null && amperageA == null && circuitCapacityW == null;
   const overCap = circuitCapacityW !== null && currentWatts > circuitCapacityW;
 
   // The hard-coded 1440 W threshold is the spec from W8.2: any 120 V/15 A
   // circuit drawing >1440 W is past the NEC continuous-load ceiling
   // (1800 × 0.8 = 1440), even before applying PSU efficiency.
   const overResidential = isResidential15A && currentWatts > RESIDENTIAL_120V_15A_THRESHOLD_W;
+  // Desk-now 2026-08-19: undeclared circuit still warns at the same 1440 W
+  // residential ceiling. Do not wait for wizard storage before surfacing
+  // overdraw on live wall watts.
+  const overUndeclaredCeiling =
+    circuitUndeclared && currentWatts > RESIDENTIAL_120V_15A_THRESHOLD_W;
 
-  if (!overCap && !overResidential) return null;
+  if (!overCap && !overResidential && !overUndeclaredCeiling) return null;
 
   const cap = circuitCapacityW ?? RESIDENTIAL_120V_15A_THRESHOLD_W;
   const overBy = Math.max(0, currentWatts - cap);
@@ -66,10 +73,22 @@ export function CircuitWarning({
 
       <div className="circuit-warning__content">
         <div className="circuit-warning__title">
-          Circuit budget exceeded
+          {overUndeclaredCeiling
+            ? 'Circuit undeclared — 1440 W residential ceiling'
+            : 'Circuit budget exceeded'}
         </div>
         <div className="circuit-warning__body">
-          {isResidential15A ? (
+          {overUndeclaredCeiling ? (
+            <>
+              Live wall power is <strong>{Math.round(currentWatts)} W</strong>
+              {' '}and no circuit has been declared. The NEC continuous-load
+              ceiling for an undeclared 120 V / 15 A home circuit is{' '}
+              <strong>{RESIDENTIAL_120V_15A_THRESHOLD_W} W</strong>
+              {overBy > 0 ? <> ({Math.round(overBy)} W over)</> : null}.
+              Declare the circuit or lower the power target. This banner uses
+              live wall watts only — not a V²f estimate.
+            </>
+          ) : isResidential15A ? (
             <>
               This miner is drawing <strong>{Math.round(currentWatts)} W</strong>
               {' '}on a declared <strong>120 V / 15 A</strong> circuit.

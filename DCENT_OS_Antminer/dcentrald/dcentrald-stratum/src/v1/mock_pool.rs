@@ -38,12 +38,18 @@ pub struct MockV1Pool;
 pub struct MockV1PoolHandle {
     accepted: Arc<AtomicU64>,
     requests: Arc<Mutex<Vec<String>>>,
+    clean_eof_disconnects: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
 
 impl MockV1PoolHandle {
     pub fn accepted_shares(&self) -> u64 {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Connections that ended with a clean read EOF (TCP FIN), not a reset.
+    pub fn clean_eof_disconnects(&self) -> u64 {
+        self.clean_eof_disconnects.load(Ordering::SeqCst)
     }
 
     pub fn requests(&self) -> Vec<String> {
@@ -82,16 +88,21 @@ impl MockV1Pool {
         let addr = listener.local_addr()?;
         let accepted = Arc::new(AtomicU64::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let clean_eof_disconnects = Arc::new(AtomicU64::new(0));
         let accepted_for_task = Arc::clone(&accepted);
         let requests_for_task = Arc::clone(&requests);
+        let clean_eof_for_task = Arc::clone(&clean_eof_disconnects);
 
         let task = tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
                 let config = config.clone();
                 let accepted = Arc::clone(&accepted_for_task);
                 let requests = Arc::clone(&requests_for_task);
+                let clean_eof_disconnects = Arc::clone(&clean_eof_for_task);
                 tokio::spawn(async move {
-                    let _ = serve_connection(stream, config, accepted, requests).await;
+                    let _ =
+                        serve_connection(stream, config, accepted, requests, clean_eof_disconnects)
+                            .await;
                 });
             }
         });
@@ -101,6 +112,7 @@ impl MockV1Pool {
             MockV1PoolHandle {
                 accepted,
                 requests,
+                clean_eof_disconnects,
                 task,
             },
         ))
@@ -147,58 +159,68 @@ async fn serve_connection(
     config: MockV1PoolConfig,
     accepted: Arc<AtomicU64>,
     requests: Arc<Mutex<Vec<String>>>,
+    clean_eof_disconnects: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        if let Ok(mut captured) = requests.lock() {
-            captured.push(line.clone());
-        }
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let id = message.get("id").cloned().unwrap_or(Value::Null);
-        let method = message
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        match method {
-            "mining.configure" => {
-                write_json_line(
-                    &mut writer,
-                    response(
-                        id,
-                        json!({
-                            "version-rolling": true,
-                            "version-rolling.mask": config.version_mask,
-                        }),
-                    ),
-                )
-                .await?;
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if let Ok(mut captured) = requests.lock() {
+                    captured.push(line.clone());
+                }
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let method = message
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match method {
+                    "mining.configure" => {
+                        write_json_line(
+                            &mut writer,
+                            response(
+                                id,
+                                json!({
+                                    "version-rolling": true,
+                                    "version-rolling.mask": config.version_mask,
+                                }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    "mining.subscribe" => {
+                        write_json_line(&mut writer, response(id, json!([[], "deadbeef", 4])))
+                            .await?;
+                    }
+                    "mining.authorize" => {
+                        write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
+                        write_json_line(&mut writer, set_difficulty(config.difficulty)).await?;
+                        write_json_line(&mut writer, notify(&config)).await?;
+                    }
+                    "mining.suggest_difficulty" => {
+                        write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
+                        write_json_line(&mut writer, set_difficulty(config.difficulty)).await?;
+                    }
+                    "mining.submit" => {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
+                    }
+                    _ if !id.is_null() => {
+                        write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
+                    }
+                    _ => {}
+                }
             }
-            "mining.subscribe" => {
-                write_json_line(&mut writer, response(id, json!([[], "deadbeef", 4]))).await?;
+            Ok(None) => {
+                clean_eof_disconnects.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
             }
-            "mining.authorize" => {
-                write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
-                write_json_line(&mut writer, set_difficulty(config.difficulty)).await?;
-                write_json_line(&mut writer, notify(&config)).await?;
-            }
-            "mining.suggest_difficulty" => {
-                write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
-                write_json_line(&mut writer, set_difficulty(config.difficulty)).await?;
-            }
-            "mining.submit" => {
-                accepted.fetch_add(1, Ordering::SeqCst);
-                write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
-            }
-            _ if !id.is_null() => {
-                write_json_line(&mut writer, response(id, Value::Bool(true))).await?;
-            }
-            _ => {}
+            Err(_) => return Ok(()),
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

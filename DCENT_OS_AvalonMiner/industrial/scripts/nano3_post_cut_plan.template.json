@@ -1,0 +1,81 @@
+{
+  "schema": "dcent.nano3.post-cut-plan.v2",
+  "status": "TEMPLATE_NOT_QUALIFIED",
+  "session": {
+    "session_id": "REPLACE_WITH_SESSION_ID",
+    "session_nonce_sha256": null,
+    "authorization_ref": "REPLACE_WITH_AUTHORIZATION_REFERENCE",
+    "authorized_from_utc": null,
+    "authorized_until_utc": null,
+    "exact_unit_fingerprint_sha256": null,
+    "operator_public_key_sha256": null,
+    "action": "manual_whole_unit_ac_disconnect"
+  },
+  "sources": {
+    "capture_adapter": {
+      "public_key_sha256": null,
+      "identity_record_sha256": null,
+      "channel_contract_record_sha256": null,
+      "powered_independently_of_nano": true,
+      "method": "signed_external_multichannel_export_v1"
+    },
+    "sensor": {
+      "asset_record_sha256": null,
+      "calibration_record_sha256": null,
+      "placement_record_sha256": null,
+      "identity_label": "REPLACE_WITH_EXTERNAL_SENSOR_ID",
+      "powered_independently_of_nano": true,
+      "role": "external_hotspot_temperature",
+      "channel": "temperature_c",
+      "units": "degree_celsius",
+      "coverage": "qualified_worst_case_hotspot_external"
+    },
+    "wall_meter": {
+      "asset_record_sha256": null,
+      "calibration_record_sha256": null,
+      "channel_contract_record_sha256": null,
+      "identity_label": "REPLACE_WITH_WALL_METER_ID",
+      "powered_independently_of_nano": true,
+      "role": "whole_unit_input_power",
+      "channel": "wall_w",
+      "units": "watt"
+    }
+  },
+  "envelope": {
+    "baseline_sample_count": null,
+    "minimum_observation_seconds": null,
+    "maximum_first_post_cut_delay_seconds": null,
+    "maximum_sample_gap_seconds": null,
+    "maximum_utc_monotonic_drift_seconds": null,
+    "maximum_temperature_c": null,
+    "maximum_post_cut_temperature_rise_c": null,
+    "maximum_positive_trend_c_per_minute": null,
+    "temperature_uncertainty_c": null,
+    "wall_zero_maximum_w": null,
+    "wall_uncertainty_w": null,
+    "wall_zero_grace_seconds": null,
+    "wall_zero_hold_seconds": null,
+    "voltage_uncertainty_v": null,
+    "input_absent_maximum_v": null,
+    "fan_supply_absent_maximum_v": null,
+    "api_supply_absent_maximum_v": null
+  },
+  "reviews": {
+    "thermal_reviewer_public_key_sha256": null,
+    "electrical_reviewer_public_key_sha256": null,
+    "distinct_reviewers": false,
+    "engineering_envelope_approved": false,
+    "source_calibration_approved": false,
+    "post_cut_method_approved": false
+  },
+  "claims": {
+    "authorization_a_granted": false,
+    "cut_action_performed_by_collector": false,
+    "energization_authorized": false,
+    "hardware_contact_performed_by_collector": false,
+    "independent_interlock_qualified": false,
+    "production_authority_granted": false,
+    "reenergization_authorized": false,
+    "unattended_operation_authorized": false
+  }
+}

@@ -8,10 +8,12 @@ param(
     [string]$OtaAppPartition = $env:DCENT_OTA_APP_PARTITION,
     [string]$DeviceModel = $env:DCENT_DEVICE_MODEL,
     [string]$Esptool = "python",
+    [string]$Python = "python",
     [string]$SigningKeyPem = $env:DCENT_OTA_PRIVATE_KEY_PEM,
     [string]$SigningKeyId = $env:DCENT_OTA_KEY_ID,
     [string]$PublicKeyHex = $env:DCENT_OTA_PUBLIC_KEY_HEX,
-    [string]$EnforceSignedOta = $env:DCENT_ENFORCE_SIGNED_OTA
+    [string]$EnforceSignedOta = $env:DCENT_ENFORCE_SIGNED_OTA,
+    [string]$PromotionCandidatePath = $env:DCENTAXE_PROMOTION_CANDIDATE_PATH
 )
 
 Set-StrictMode -Version Latest
@@ -144,41 +146,69 @@ function Sign-OtaMetadata {
 function Resolve-DeviceModel {
     param([string]$BoardTarget)
 
-    switch ($BoardTarget) {
-        "bitaxe-max" { return "max" }
-        "bitaxe-ultra" { return "ultra" }
-        "bitaxe-supra" { return "supra" }
-        "bitaxe-gamma" { return "gamma" }
-        "bitaxe-gamma-duo" { return "gammaduo" }
-        "bitaxe-gt" { return "gammaturbo" }
-        "bitaxe-touch" { return "touch" }
-        "bitaxe-gt-touch" { return "gt_touch" }
-        "bitaxe-hex-ultra" { return "hexultra" }
-        "bitaxe-hex-supra" { return "suprahex" }
-        "nerdnos" { return "nerdnos" }
-        "nerdaxe" { return "nerdaxe" }
-        "nerdqaxe-plus" { return "nerdqaxeplus" }
-        "nerdqaxe-pp" { return "nerdqaxepp" }
-        "nerdoctaxe-plus" { return "nerdoctaxeplus" }
-        "nerdoctaxe-gamma" { return "nerdoctaxegamma" }
-        "dcent-axe-bm1397" { return "dcentaxe_bm1397" }
-        "dcent-axe-quad-bm1397" { return "dcentaxe_quad_bm1397" }
-        "dcent-axe-hex-bm1397" { return "dcentaxe_hex_bm1397" }
-        "hammer-bc01" { return "hammer_bc01" }
-        "hammer-bc01-pro" { return "hammer_bc01_pro" }
-        "hammer-bc02" { return "hammer_bc02" }
-        "hammer-bc04" { return "hammer_bc04" }
-        "hammer-dc02" { return "hammer_dc02" }
-        "hammer-dc04" { return "hammer_dc04" }
-        "hammer-dc06" { return "hammer_dc06" }
-        # Lucky Miner LVxx (EXPERIMENTAL — no live hardware; host-tested only).
-        # Must byte-match BitAxeModel::canonical_key() and package-firmware.sh:
-        # device_model is bound into the OTA schema-2 signed message.
-        "lucky-lv06" { return "lv06" }
-        "lucky-lv07" { return "lv07" }
-        "lucky-lv08" { return "lv08" }
-        default { throw "Unknown -BoardTarget '$BoardTarget'" }
+    $matrixPath = Join-Path $PSScriptRoot "..\esp-targets.json"
+    $matches = @(
+        (Get-Content -LiteralPath $matrixPath -Raw | ConvertFrom-Json).targets |
+            Where-Object { $_.board_target -eq $BoardTarget }
+    )
+    if ($matches.Count -ne 1) {
+        throw "Unknown or duplicate -BoardTarget '$BoardTarget' in $matrixPath"
     }
+    return $matches[0]
+}
+
+if ([string]::IsNullOrWhiteSpace($BoardTarget)) {
+    throw "-BoardTarget is required"
+}
+
+$promotionState = "registry"
+$promotionCandidateId = $null
+$promotionCandidateDescriptorSha = $null
+$qualificationOnly = $false
+$candidateVersion = $null
+if (-not [string]::IsNullOrWhiteSpace($PromotionCandidatePath)) {
+    Require-Path -Path $PromotionCandidatePath -Label "Promotion candidate descriptor"
+    $candidateTool = Join-Path $PSScriptRoot "promotion_candidate.py"
+    & $Python $candidateTool validate $PromotionCandidatePath --for-build | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Promotion candidate validation failed"
+    }
+    $candidate = Get-Content -LiteralPath $PromotionCandidatePath -Raw | ConvertFrom-Json
+    if ($candidate.board_target -ne $BoardTarget) {
+        throw "Promotion candidate target $($candidate.board_target) does not match $BoardTarget"
+    }
+    $promotionCandidateId = $candidate.candidate_id
+    if ($env:DCENTAXE_PROMOTION_CANDIDATE_VALIDATED -ne $promotionCandidateId) {
+        throw "DCENTAXE_PROMOTION_CANDIDATE_VALIDATED must equal $promotionCandidateId"
+    }
+    if ($env:DCENTAXE_PROMOTION_CANDIDATE_PACKAGE_CONFIRM -ne "package-$BoardTarget") {
+        throw "Set DCENTAXE_PROMOTION_CANDIDATE_PACKAGE_CONFIRM=package-$BoardTarget"
+    }
+    $promotionCandidateDescriptorSha = (Get-FileHash -LiteralPath $PromotionCandidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $targetMetadata = $candidate.registry_row
+    $candidateVersion = $candidate.source.firmware_version
+    $promotionState = "qualification"
+    $qualificationOnly = $true
+    $EnforceSignedOta = "1"
+} else {
+    $targetMetadata = Resolve-DeviceModel -BoardTarget $BoardTarget
+}
+
+$defaultDeviceModel = $targetMetadata.device_model
+$promotionReceiptId = $null
+if ($targetMetadata.PSObject.Properties.Name -contains "promotion_receipt_id") {
+    $promotionReceiptId = $targetMetadata.promotion_receipt_id
+}
+$hardwareEvidenceIndexPath = Join-Path $PSScriptRoot "..\hardware-evidence\index.json"
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Get-WorkspaceVersion
+}
+if ($qualificationOnly -and $Version -ne $candidateVersion) {
+    throw "Candidate firmware version is $candidateVersion, not $Version"
+}
+if ($targetMetadata.install_policy -eq "production") {
+    $EnforceSignedOta = "1"
 }
 
 if (-not [string]::IsNullOrWhiteSpace($EnforceSignedOta)) {
@@ -193,22 +223,17 @@ if (-not [string]::IsNullOrWhiteSpace($EnforceSignedOta)) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($BoardTarget)) {
-    throw "-BoardTarget is required"
-}
-
-$defaultDeviceModel = Resolve-DeviceModel -BoardTarget $BoardTarget
-
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $Version = Get-WorkspaceVersion
-}
-
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
     $OutDir = Join-Path $PSScriptRoot "..\dist\$BoardTarget"
 }
 
 if ([string]::IsNullOrWhiteSpace($PartitionsCsv)) {
-    $PartitionsCsv = Join-Path $PSScriptRoot "..\partitions.csv"
+    $partitionFile = if ($targetMetadata.flash_layout -eq "n16r8") {
+        "..\partitions-16mb.csv"
+    } else {
+        "..\partitions.csv"
+    }
+    $PartitionsCsv = Join-Path $PSScriptRoot $partitionFile
 }
 
 if ([string]::IsNullOrWhiteSpace($OtaAppPartition)) {
@@ -231,8 +256,18 @@ Require-Path -Path $ElfPath -Label "ELF"
 Require-Path -Path $bootloader -Label "Bootloader"
 Require-Path -Path $partitionTable -Label "Partition table"
 Require-Path -Path $PartitionsCsv -Label "Partition CSV"
+Require-Path -Path $hardwareEvidenceIndexPath -Label "Hardware evidence index"
+if (-not [string]::IsNullOrWhiteSpace($promotionReceiptId)) {
+    $elfBytes = [System.IO.File]::ReadAllBytes($ElfPath)
+    $receiptBytes = [System.Text.Encoding]::ASCII.GetBytes([string]$promotionReceiptId)
+    $elfText = [System.Text.Encoding]::ASCII.GetString($elfBytes)
+    if (-not $elfText.Contains([System.Text.Encoding]::ASCII.GetString($receiptBytes))) {
+        throw "ELF does not contain the compiled promotion receipt ID; refusing stale/mislabeled package"
+    }
+}
 $otaAppOffset = Get-PartitionOffsetBytes -Path $PartitionsCsv -PartitionName $OtaAppPartition
 $otaDataOffset = Get-PartitionOffsetBytes -Path $PartitionsCsv -PartitionName "otadata"
+$hardwareEvidenceIndexSha = (Get-FileHash -LiteralPath $hardwareEvidenceIndexPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
 if (-not [string]::IsNullOrWhiteSpace($SigningKeyPem) -and -not [string]::IsNullOrWhiteSpace($PublicKeyHex)) {
     $derivedPublic = Get-PublicKeyHexFromPem -Path $SigningKeyPem
@@ -303,6 +338,20 @@ $manifest = [ordered]@{
     packageType = "esp32-factory-and-ota-bundle"
     boardTarget = $BoardTarget
     deviceModel = $DeviceModel
+    hardwareFamily = $targetMetadata.hardware_family
+    supportTier = $targetMetadata.support_tier
+    evidenceLevel = $targetMetadata.evidence_level
+    runtimeMode = $targetMetadata.runtime_mode
+    installPolicy = $targetMetadata.install_policy
+    packagePolicy = $targetMetadata.package_policy
+    flashLayout = $targetMetadata.flash_layout
+    productionBlockers = @($targetMetadata.blockers)
+    promotionReceiptId = $promotionReceiptId
+    promotionState = $promotionState
+    promotionCandidateId = $promotionCandidateId
+    promotionCandidateDescriptorSha256 = $promotionCandidateDescriptorSha
+    qualificationOnly = $qualificationOnly
+    hardwareEvidenceIndexSha256 = $hardwareEvidenceIndexSha
     version = $Version
     createdAtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     ota = [ordered]@{

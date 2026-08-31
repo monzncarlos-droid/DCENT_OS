@@ -96,6 +96,8 @@ pub struct HeaterController {
     pub electricity_rate: f32,
     /// Currency for cost display.
     pub currency: String,
+    /// Power-domain integral (watts). Separate from the thermal fan PID.
+    power_integral: f32,
 }
 
 impl HeaterController {
@@ -111,6 +113,7 @@ impl HeaterController {
             night_mode: NightMode::default(),
             electricity_rate: 0.12,
             currency: "USD".to_string(),
+            power_integral: 0.0,
         }
     }
 
@@ -120,6 +123,7 @@ impl HeaterController {
         self.active_preset = Some(preset.name.clone());
         self.pid.setpoint = preset.watts as f32;
         self.pid.reset();
+        self.power_integral = 0.0;
     }
 
     /// Set an exact wattage target.
@@ -128,6 +132,7 @@ impl HeaterController {
         self.active_preset = None;
         self.pid.setpoint = watts as f32;
         self.pid.reset();
+        self.power_integral = 0.0;
     }
 
     /// Update room temperature from sensor/user input.
@@ -140,39 +145,69 @@ impl HeaterController {
         self.current_power_w = finite_nonnegative_or_zero(watts);
     }
 
+    /// Night-mode-adjusted watt setpoint. This is the number a watt PID
+    /// must chase — not the raw preset.
+    pub fn control_setpoint_watts(&self) -> u32 {
+        self.effective_target_watts()
+    }
+
+    /// Next commanded watt target from the power-domain error.
+    ///
+    /// Uses a dedicated integral on `target − measured` watts. The thermal
+    /// fan PID (`self.pid`) is the wrong unit and is not consulted.
+    pub fn next_watt_command(&mut self) -> u32 {
+        let target = self.effective_target_watts();
+        let measured = finite_nonnegative_or_zero(self.current_power_w);
+        if target == 0 {
+            self.power_integral = 0.0;
+            return 0;
+        }
+        if measured <= 0.0 {
+            return target;
+        }
+        let error = target as f32 - measured;
+        let limit = target as f32;
+        self.power_integral = (self.power_integral + error).clamp(-limit, limit);
+        let command = target as f32 + 0.35 * error + 0.05 * self.power_integral;
+        if !command.is_finite() {
+            return target;
+        }
+        command.round().clamp(0.0, target as f32 * 1.5) as u32
+    }
+
     /// Compute the next power adjustment.
     ///
     /// Returns a frequency adjustment factor (0.0 to 2.0):
     ///   < 1.0 = reduce frequency (too much power)
     ///   > 1.0 = increase frequency (not enough power)
-    /// > = 1.0 = on target
+    ///   = 1.0 = on target
     pub fn compute_adjustment(&mut self) -> f32 {
-        let effective_target = self.effective_target_watts();
         let measured_power_w = finite_nonnegative_or_zero(self.current_power_w);
-        self.pid.setpoint = effective_target as f32;
-        let _output = self.pid.update(measured_power_w);
-
-        // Convert PID output to frequency adjustment factor
-        if effective_target == 0 || measured_power_w <= 0.0 {
+        let command = self.next_watt_command();
+        if command == 0 || measured_power_w <= 0.0 {
             return 1.0;
         }
 
-        let ratio = effective_target as f32 / measured_power_w;
+        let ratio = command as f32 / measured_power_w;
         if !ratio.is_finite() {
             return 1.0;
         }
         ratio.clamp(0.5, 1.5)
     }
 
+    /// Apply a night-mode percent cut. Delegates to the shared helper the
+    /// autotuner Power path also calls.
+    pub fn night_adjusted_watts(target_watts: u32, in_night: bool, reduction_pct: u8) -> u32 {
+        dcentrald_common::night_power::night_adjusted_watts(target_watts, in_night, reduction_pct)
+    }
+
     /// Get the effective target watts, accounting for night mode.
     pub fn effective_target_watts(&self) -> u32 {
-        if self.night_mode.enabled && self.is_night_hours() {
-            let reduction =
-                self.target_heat_watts * self.night_mode.power_reduction_pct as u32 / 100;
-            self.target_heat_watts.saturating_sub(reduction)
-        } else {
-            self.target_heat_watts
-        }
+        Self::night_adjusted_watts(
+            self.target_heat_watts,
+            self.night_mode.enabled && self.is_night_hours(),
+            self.night_mode.power_reduction_pct,
+        )
     }
 
     /// Check if current time falls within night mode hours.
@@ -260,5 +295,41 @@ mod tests {
         assert_eq!(heater.current_btu_h(), 0);
         heater.electricity_rate = f32::NAN;
         assert_eq!(heater.daily_cost(), 0.0);
+    }
+
+    #[test]
+    fn watt_command_uses_power_error_not_discarded_pid() {
+        let mut heater = HeaterController::new(1_000);
+        heater.update_power(1_500.0);
+        let high = heater.next_watt_command();
+        assert!(
+            high < 1_000,
+            "over-target power must command fewer watts, got {high}"
+        );
+
+        let mut heater = HeaterController::new(1_000);
+        heater.update_power(500.0);
+        let low = heater.next_watt_command();
+        assert!(
+            low > 1_000,
+            "under-target power must command more watts, got {low}"
+        );
+
+        let mut heater = HeaterController::new(1_000);
+        heater.update_power(1_400.0);
+        let adj = heater.compute_adjustment();
+        assert!(
+            adj < 1.0,
+            "over-target adjustment must reduce frequency, got {adj}"
+        );
+        assert!(adj >= 0.5);
+    }
+
+    #[test]
+    fn night_adjusted_watts_matches_shared_helper() {
+        assert_eq!(
+            HeaterController::night_adjusted_watts(1_000, true, 40),
+            dcentrald_common::night_power::night_adjusted_watts(1_000, true, 40)
+        );
     }
 }

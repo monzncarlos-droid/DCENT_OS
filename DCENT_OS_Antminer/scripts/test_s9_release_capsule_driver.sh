@@ -364,7 +364,10 @@ test ! -d "$OUTPUT_ROOT/.dcent-release-capsules" \
 READY="$TMPDIR_TEST/signal.ready"; rm -f "$READY"
 (run_capsule_raw HARNESS_ROTATE_KEYS=0 HARNESS_SIGNAL_READY="$READY" \
     > "$TMPDIR_TEST/signal.out" 2>&1) & signal_pid=$!
-for _ in $(seq 1 500); do [ -e "$READY" ] && break; sleep 0.02; done
+# The aggregate may be CPU-starved after Cargo-heavy phases. Bound only this
+# fixture-readiness wait at 30 seconds; production capsule timeouts are not
+# changed.
+for _ in $(seq 1 1500); do [ -e "$READY" ] && break; sleep 0.02; done
 test -e "$READY"
 capsule_children="$(pgrep -P "$signal_pid" || true)"
 test "$(printf '%s\n' "$capsule_children" | grep -c '[0-9]')" -eq 1

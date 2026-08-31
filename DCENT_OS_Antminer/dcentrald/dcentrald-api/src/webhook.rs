@@ -460,9 +460,28 @@ impl WebhookDispatchConfig {
     }
 
     /// Does the allow-list permit this event? Empty allow-list = all allowed.
+    ///
+    /// `thermal_safety` and `emergency_shutdown` are aliases: operators who
+    /// subscribed to either name still receive the thermal-loop event
+    /// (`WebhookEvent::ThermalSafety` serializes as `thermal_safety`; the
+    /// REST filter list also advertises `emergency_shutdown`).
     fn allows(&self, event_name: &str) -> bool {
-        self.events.is_empty() || self.events.iter().any(|e| e == event_name)
+        if self.events.is_empty() {
+            return true;
+        }
+        self.events.iter().any(|configured| {
+            configured == event_name || thermal_event_alias(configured, event_name)
+        })
     }
+}
+
+/// True when the configured filter and the fired event are the thermal-safety
+/// / emergency-shutdown pair (either direction).
+fn thermal_event_alias(configured: &str, event_name: &str) -> bool {
+    matches!(
+        (configured, event_name),
+        ("thermal_safety", "emergency_shutdown") | ("emergency_shutdown", "thermal_safety")
+    )
 }
 
 /// Tuning knobs for the dispatcher task. Defaulted to the constants above;
@@ -976,6 +995,19 @@ mod tests {
         assert!(c.allows("ota"));
         assert!(!c.allows("mining_started"));
         assert!(!c.allows("lucky_share"));
+    }
+
+    #[test]
+    fn thermal_safety_and_emergency_shutdown_are_aliases() {
+        let thermal = cfg(true, "https://x", &["thermal_safety"]);
+        assert!(thermal.allows("thermal_safety"));
+        assert!(thermal.allows("emergency_shutdown"));
+        assert!(!thermal.allows("mining_started"));
+
+        let emergency = cfg(true, "https://x", &["emergency_shutdown"]);
+        assert!(emergency.allows("emergency_shutdown"));
+        assert!(emergency.allows("thermal_safety"));
+        assert!(!emergency.allows("ota"));
     }
 
     // ---- redaction ---------------------------------------------------------

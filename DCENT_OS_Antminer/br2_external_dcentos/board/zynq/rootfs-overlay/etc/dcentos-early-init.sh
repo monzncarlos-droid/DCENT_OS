@@ -108,7 +108,11 @@ for mtd in /sys/class/mtd/mtd*; do
         minor=${dev##*:}
         case "$name" in
             *ro) mknod -m 444 "/dev/$name" c "$major" "$minor" 2>/dev/null ;;
-            *)   mknod -m 660 "/dev/$name" c "$major" "$minor" 2>/dev/null ;;
+            # Writable raw MTD nodes are root-only.  In particular, the
+            # evidence-backed redundant U-Boot environment admission requires
+            # /dev/mtd4 to remain root:root 0600 before libubootenv can read or
+            # mutate it.
+            *)   mknod -m 600 "/dev/$name" c "$major" "$minor" 2>/dev/null ;;
         esac
     fi
 done
@@ -120,7 +124,7 @@ for ubi in /sys/class/ubi/ubi*; do
     if [ -n "$dev" ]; then
         major=${dev%%:*}
         minor=${dev##*:}
-        mknod -m 660 "/dev/$name" c "$major" "$minor" 2>/dev/null
+        mknod -m 600 "/dev/$name" c "$major" "$minor" 2>/dev/null
     fi
 done
 
@@ -129,7 +133,7 @@ if [ -e /sys/class/misc/ubi_ctrl/dev ]; then
     dev=$(cat /sys/class/misc/ubi_ctrl/dev)
     major=${dev%%:*}
     minor=${dev##*:}
-    mknod -m 660 /dev/ubi_ctrl c "$major" "$minor" 2>/dev/null
+    mknod -m 600 /dev/ubi_ctrl c "$major" "$minor" 2>/dev/null
 fi
 
 # UBI block devices
@@ -206,7 +210,9 @@ if [ -d /root ]; then
 fi
 
 # --- Mount persistent storage, or enforce external-media volatility ---
-# rootfs_data is a 72MB dynamic UBI volume on mtd8 (NAND flash).
+# rootfs_data is a slot-local dynamic UBI volume on the selected firmware MTD.
+# Its size is layout/profile data (the captured AM2 layout has 210 x 126,976
+# usable bytes); it is not a universal 72 MB constant.
 # UBIFS auto-creates the filesystem on first mount. Data survives reboots
 # without modifying the read-only squashfs root image.
 mkdir -p /data

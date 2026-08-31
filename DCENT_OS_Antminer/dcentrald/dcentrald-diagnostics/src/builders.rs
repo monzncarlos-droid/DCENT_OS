@@ -121,6 +121,7 @@ pub fn build_chip_health_snapshot(
         let expected_chip_count = context
             .expected_chip_count(chain.chain_id)
             .max(chain.chips as u16);
+        let address_interval = diagnostic_address_interval(context.chip_id, expected_chip_count);
         total_chips += expected_chip_count;
 
         let mut chipmap = chipmap_layout(chain.chain_id, expected_chip_count);
@@ -131,7 +132,7 @@ pub fn build_chip_health_snapshot(
                 let grade = score_to_grade(score);
                 chipmap.add_cell(ChipMapCell {
                     index: chip.chip_index as u16,
-                    address: chip.chip_index.saturating_mul(4),
+                    address: chip.chip_index.saturating_mul(address_interval),
                     health_score: score,
                     grade,
                     color: ChipColor::from_score(score),
@@ -148,7 +149,7 @@ pub fn build_chip_health_snapshot(
                 });
             }
             if let Some(profile) = profile {
-                fill_missing_profile_cells(&mut chipmap, profile, cores, now_ts);
+                fill_missing_profile_cells(&mut chipmap, profile, cores, now_ts, address_interval);
             }
             "runtime_chip_health".to_string()
         } else if let Some(profile) = profile {
@@ -160,7 +161,7 @@ pub fn build_chip_health_snapshot(
                 let grade = score_to_grade(score);
                 chipmap.add_cell(ChipMapCell {
                     index: chip.chip_index as u16,
-                    address: chip.chip_index.saturating_mul(4),
+                    address: chip.chip_index.saturating_mul(address_interval),
                     health_score: score,
                     grade,
                     color: ChipColor::from_score(score),
@@ -186,7 +187,7 @@ pub fn build_chip_health_snapshot(
                 let score = if is_responding { inferred_score } else { 0.0 };
                 chipmap.add_cell(ChipMapCell {
                     index: chip_index,
-                    address: (chip_index as u8).saturating_mul(4),
+                    address: (chip_index as u8).saturating_mul(address_interval),
                     health_score: score,
                     grade: score_to_grade(score),
                     color: ChipColor::from_score(score),
@@ -216,7 +217,12 @@ pub fn build_chip_health_snapshot(
         // is known so the domain-boundary discriminator can fire.
         let repair_ctx = context
             .chip_id
-            .map(crate::repair_advisor::RepairContext::for_chip_id)
+            .map(|chip_id| {
+                crate::repair_advisor::RepairContext::for_chain_geometry(
+                    chip_id,
+                    expected_chip_count,
+                )
+            })
             .unwrap_or_default();
         let repair_recommendations = crate::repair_advisor::analyze_chipmap(&chipmap, &repair_ctx);
         for rec in &repair_recommendations {
@@ -714,6 +720,7 @@ fn fill_missing_profile_cells(
     profile: &SnapshotProfile,
     cores: Option<u32>,
     now_ts: Option<u64>,
+    address_interval: u8,
 ) {
     let mut present: HashMap<u16, bool> = chipmap
         .cells
@@ -728,7 +735,7 @@ fn fill_missing_profile_cells(
         let score = profile_score(chip.grade, chip.error_rate) as f32;
         chipmap.add_cell(ChipMapCell {
             index,
-            address: chip.chip_index.saturating_mul(4),
+            address: chip.chip_index.saturating_mul(address_interval),
             health_score: score,
             grade: score_to_grade(score),
             color: ChipColor::from_score(score),
@@ -778,6 +785,22 @@ fn chipmap_layout(chain_id: u8, chip_count: u16) -> ChipMap {
     }
 }
 
+/// Address stride for diagnostic display only. The BM1362/BM1366/BM1368/
+/// BM1370 factory jigs share the count-bucket address ladder, including S19k
+/// BHB56902 `77 -> interval 2`. Other families retain the historical display
+/// stride until their own transport contract is supplied; this function never
+/// authorizes a hardware write.
+fn diagnostic_address_interval(chip_id: Option<u16>, expected_chip_count: u16) -> u8 {
+    let Ok(chip_count) = u8::try_from(expected_chip_count) else {
+        return 4;
+    };
+    if matches!(chip_id, Some(0x1362 | 0x1366 | 0x1368 | 0x1370)) {
+        dcentrald_common::chain_transport::bitmain_jig_addr_interval(chip_count).unwrap_or(4)
+    } else {
+        4
+    }
+}
+
 fn profile_score(grade: char, error_rate: f64) -> f64 {
     let base = match grade {
         'A' => 0.98,
@@ -798,7 +821,8 @@ mod re010_helpers_tests {
     //! Every entry cites its `dcentrald-silicon-profiles` source in the
     //! `cores_per_chip_for_family` doc-comment.
     use super::{
-        cores_per_chip_for_family, expected_nonce_rate_hz, inferred_chain_score, snapshot_health_ts,
+        cores_per_chip_for_family, diagnostic_address_interval, expected_nonce_rate_hz,
+        inferred_chain_score, snapshot_health_ts,
     };
 
     #[test]
@@ -830,6 +854,18 @@ mod re010_helpers_tests {
         assert_eq!(cores_per_chip_for_family("BM1489"), None);
         assert_eq!(cores_per_chip_for_family(""), None);
         assert_eq!(cores_per_chip_for_family("unknown"), None);
+    }
+
+    #[test]
+    fn diagnostic_address_interval_keeps_s19k_bhb56902_at_stride_two() {
+        assert_eq!(diagnostic_address_interval(Some(0x1366), 77), 2);
+        assert_eq!(diagnostic_address_interval(Some(0x1366), 110), 2);
+        assert_eq!(diagnostic_address_interval(Some(0x1362), 126), 2);
+        assert_eq!(diagnostic_address_interval(Some(0x1368), 108), 2);
+        assert_eq!(diagnostic_address_interval(Some(0x1398), 76), 4);
+        assert_eq!(diagnostic_address_interval(None, 77), 4);
+        assert_eq!(76u8.saturating_mul(2), 152);
+        assert_ne!(76u8.saturating_mul(4), 152);
     }
 
     #[test]

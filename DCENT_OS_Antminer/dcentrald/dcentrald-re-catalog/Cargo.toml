@@ -7,37 +7,31 @@ description = "Pure no-HAL reverse-engineering catalog for DCENT_OS offline brin
 
 #  W7.1 + W7.2 + W7.3 (DCENT_RE + DCENT_Thermal + DCENT_Perf, 2026-05-07):
 #
-# STATUS (2026-05-29): STUB., a
-# research wave that produces a master catalog should land a Rust `pub static`
-# consumer mirror. This crate is the INTENDED mirror for the +6 catalogs,
-# but the content has NOT been ported — the three modules are empty stubs and
-# the crate exports nothing. PLANNED source -> target mapping (not yet done):
+# STATUS (2026-08-19): OFFLINE EVIDENCE CATALOG. Per
+# , research master catalogs have a
+# typed Rust mirror here. `model_catalog` carries 27 evidence-tiered board rows,
+# `pll_bible` carries nine chip/register expectation rows, and `fan_curves`
+# remains an explicitly empty deferred module. Current source -> target mapping:
 #
 #          -> src/fan_curves.rs
 #     -> src/pll_bible.rs
 #         -> src/model_catalog.rs
 #
-# PLANNED consumers (NONE wired yet — verified 2026-05-29, gap-swarm #4):
-#   - `dcentrald-thermal::profiles::ThermalProfile::for_chip_family()`  (planned)
-#   - `dcentrald-asic::drivers::*` chip-family `pll_frequencies()` lookup (planned)
-#   - the API re-catalog route — TODAY it reads from `dcentrald-api-types`, NOT
-#     this crate (no `serve_master_model_catalog()` symbol exists anywhere)
-#   - dashboard `wizard/ModelSelectStep.tsx`  (planned)
+# The sole Cargo consumer is the `dcentrald-asic` dev-dependency: its examples
+# and golden integration tests consume the typed tables and 13 sidecar vector
+# artifacts. No production-default crate consumes this catalog. The API route
+# still reads `dcentrald-api-types`; thermal/autotuner integration remains a
+# separate review-gated task.
 #
-# This crate is intentionally HAL-free so that — WHEN the catalog content is
-# ported — Windows/macOS/Linux host tests run without an ARM cross-compile and a
-# catalog typo can't reach `mmap(/dev/mem)`. The drift-guard regression suite
-# (`tests/` pinning row counts + representative rows) does NOT exist yet; it must
-# be added in lockstep with the content port (the serde_json dev-dep below is
-# reserved for it).
+# This crate is intentionally HAL-free so Windows/macOS/Linux host tests run
+# without an ARM cross-compile and a catalog typo cannot reach `mmap(/dev/mem)`.
+# Module tests and the external surface registry pin row counts, representative
+# facts, provenance shape, vector hashes, consumers, and ledger scope.
 
 [dependencies]
 # Plain serde for optional REST serialization. Never pulls in serde_json
 # directly — that's the API crate's responsibility.
 serde = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
 
 # W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
 # New crate, no grandfather list. Inherit workspace `warn` and keep this

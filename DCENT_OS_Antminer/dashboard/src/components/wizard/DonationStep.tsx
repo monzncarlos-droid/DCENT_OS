@@ -158,8 +158,8 @@ export function DonationStep({ value, mode, onChange }: DonationStepProps) {
       <div className="wiz-info">
         <strong>Always visible.</strong> Whenever donation is active, a
         &quot;DONATING&quot; pill shows on the dashboard top bar so you can see
-        exactly what&apos;s happening. The autotuner typically recovers the cost in
-        efficiency gains.
+        exactly what&apos;s happening. The autotuner does not pay this donation;
+        it is a separate, disableable take-rate.
         {mode === 'heater' && <> At 2%, that&apos;s 72 seconds inside a 60-minute cycle.</>}
       </div>
 

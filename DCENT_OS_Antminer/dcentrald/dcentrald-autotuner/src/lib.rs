@@ -34,6 +34,7 @@ pub mod chain_voltage;
 // opt-in at integration sites via TOML `[autotune.bad_chip].enabled`. See
 //
 // and the internal Wave E planning notes (§E2).
+pub mod bad_chip_actuation;
 pub mod bad_chip_supervisor;
 pub mod binary_search;
 pub mod chip_health;
@@ -54,6 +55,10 @@ pub mod event_log;
 pub mod fleet;
 pub mod mcr_fit;
 pub mod power_budget;
+/// Closed-loop watt-anchored power-target controller (PID). Opt-in, default-inert
+/// (not wired into the live tuner runtime); complements the feed-forward-only
+/// `TunerMode::PowerTarget` allocation in [`tuner`].
+pub mod power_pid;
 pub mod profile;
 pub mod profitability;
 /// W13.C3 (2026-05-10): per-SKU PVT envelope clamp helpers.
@@ -70,6 +75,7 @@ pub mod profitability;
 /// - `~/
 pub mod pvt_envelope;
 pub mod schedule;
+pub mod silicon_profile_select;
 pub mod silicon_report;
 pub mod state_persistence;
 pub mod telemetry;
@@ -129,6 +135,8 @@ use thiserror::Error;
 /// the corrected BM1362=514 / BM1370=2040. See
 /// `dcentrald_asic::drivers::sg1_corrected_nonce_attribution_cores` for the
 /// evidence chain.
+///
+/// Unknown chip IDs return `None` (rank 20). Do not invent BM1387 114-core NPS.
 pub mod chip_geometry {
     /// Get nonce-attribution slot count for any supported chip ID.
     ///
@@ -139,23 +147,16 @@ pub mod chip_geometry {
     /// field). Used for nonces-per-second math, NOT for engine-state
     /// bookkeeping.
     ///
-    /// Falls back to a conservative 114 (BM1387) for unknown chip IDs so
-    /// hashrate predictions stay non-zero on a brand-new chip family the
-    /// `MINER_PROFILES` table hasn't learned about yet.
+    /// Unknown chip IDs return `None` — never a silent BM1387 114-core default.
     #[inline]
-    pub fn cores_for_chip(chip_id: u16) -> u32 {
-        dcentrald_asic::drivers::MinerProfile::for_chip(chip_id)
-            .map(|profile| profile.nonce_attribution_cores_effective())
-            .unwrap_or(114)
+    pub fn cores_for_chip(chip_id: u16) -> Option<u32> {
+        dcentrald_asic::drivers::MinerProfile::try_nonce_attribution_cores_for_chip(chip_id)
     }
 
-    /// Get GH/s per MHz for any supported chip ID.
-    /// Falls back to BM1387 (0.114 GH/s/MHz) for unknown chip IDs.
+    /// GH/s per MHz for a registered chip ID. Unknown IDs return `None`.
     #[inline]
-    pub fn ghs_per_mhz_for_chip(chip_id: u16) -> f64 {
-        dcentrald_asic::drivers::MinerProfile::for_chip(chip_id)
-            .map(|profile| profile.ghs_per_mhz)
-            .unwrap_or(0.114)
+    pub fn ghs_per_mhz_for_chip(chip_id: u16) -> Option<f64> {
+        dcentrald_asic::drivers::MinerProfile::try_ghs_per_mhz_for_chip(chip_id)
     }
 
     /// BM1387 expected nonces per second at given frequency and difficulty.
@@ -163,33 +164,31 @@ pub mod chip_geometry {
     #[inline]
     pub fn bm1387_expected_nps(freq_mhz: u16, difficulty: u32) -> f64 {
         expected_nps_for_chip(0x1387, freq_mhz, difficulty)
+            .expect("BM1387 MinerProfile is in MINER_PROFILES")
     }
 
     /// BM1387 hashrate for a single chip in GH/s.
     #[inline]
     pub fn bm1387_chip_hashrate_ghs(freq_mhz: u16) -> f64 {
         chip_hashrate_ghs_for_chip(0x1387, freq_mhz)
+            .expect("BM1387 MinerProfile is in MINER_PROFILES")
     }
 
-    /// Expected nonces per second for any chip type at given frequency and difficulty.
-    /// Formula: freq_mhz × nonce_attribution_cores × 1e6 / (difficulty × 2^32)
+    /// Expected nonces per second for a registered chip at frequency and difficulty.
     ///
-    /// Routed through `MinerProfile::expected_nps` so the autotuner and
-    /// the asic crate share a single hashrate prediction implementation.
+    /// Formula: freq_mhz × nonce_attribution_cores × 1e6 / (difficulty × 2^32).
+    /// Unknown chip IDs return `None` instead of inventing BM1387 114-core NPS.
     #[inline]
-    pub fn expected_nps_for_chip(chip_id: u16, freq_mhz: u16, difficulty: u32) -> f64 {
-        if let Some(profile) = dcentrald_asic::drivers::MinerProfile::for_chip(chip_id) {
-            return profile.expected_nps(freq_mhz, difficulty);
-        }
-        // Unknown chip: fall back to BM1387 geometry (114 cores, 256 diff).
-        let diff = if difficulty == 0 { 256 } else { difficulty };
-        (freq_mhz as f64 * 114.0 * 1e6) / (diff as f64 * 4.294e9)
+    pub fn expected_nps_for_chip(chip_id: u16, freq_mhz: u16, difficulty: u32) -> Option<f64> {
+        dcentrald_asic::drivers::MinerProfile::try_expected_nps_for_chip(
+            chip_id, freq_mhz, difficulty,
+        )
     }
 
-    /// Hashrate for a single chip of any type in GH/s.
+    /// Hashrate for a single registered chip in GH/s. Unknown IDs return `None`.
     #[inline]
-    pub fn chip_hashrate_ghs_for_chip(chip_id: u16, freq_mhz: u16) -> f64 {
-        freq_mhz as f64 * ghs_per_mhz_for_chip(chip_id)
+    pub fn chip_hashrate_ghs_for_chip(chip_id: u16, freq_mhz: u16) -> Option<f64> {
+        Some(freq_mhz as f64 * ghs_per_mhz_for_chip(chip_id)?)
     }
 }
 
@@ -489,6 +488,17 @@ pub struct AutoTunerSiliconProfileResult {
     pub message: String,
 }
 
+/// Result for [`AutoTunerCommand::ApplyNightPowerPolicy`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoTunerNightPowerResult {
+    pub status: AutoTunerCommandStatus,
+    /// True when Power-mode frequencies were recomputed with the new policy.
+    pub applied_runtime: bool,
+    pub night_power: config::NightPowerPolicy,
+    pub power_target_watts: Option<u32>,
+    pub message: String,
+}
+
 #[derive(Debug)]
 pub enum AutoTunerCommand {
     /// Apply an operator-facing target mode to the live autotuner if it is in a
@@ -534,6 +544,14 @@ pub enum AutoTunerCommand {
         presets: Vec<SiliconPreset>,
         ack_tx: tokio::sync::oneshot::Sender<AutoTunerSiliconProfileResult>,
     },
+    /// Adopt a new `[mode.home.night_mode]` policy on the live tuner.
+    /// REST persists the same fields before sending. A Power-mode tuner
+    /// that is already in background monitoring recomputes its setpoint
+    /// immediately; otherwise the policy is recorded for the next cycle.
+    ApplyNightPowerPolicy {
+        policy: config::NightPowerPolicy,
+        ack_tx: tokio::sync::oneshot::Sender<AutoTunerNightPowerResult>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -564,6 +582,10 @@ pub enum FrequencyLimitSource {
     /// it. Active ONLY when the (default-off, operator-gated) thermal supervisor
     /// is enabled — so a unit with the supervisor off never carries this slot.
     AtmStep,
+    /// Decrease-only bad-chip / healthchipset ceiling. Dedicated slot so a
+    /// health actuation cannot clobber thermal / ATM / power-cap ceilings.
+    /// Applied only when `[autotune.bad_chip].actuate = true`.
+    BadChip,
 }
 
 /// Auto-tuner error type.
@@ -651,11 +673,17 @@ pub type Result<T> = std::result::Result<T, AutoTunerError>;
 // the daemon integration site (default-off, gated on
 // `[autotune.bad_chip].enabled`) can refer to them without the long module
 // path. The module stays the source of truth; this is convenience only.
+pub use bad_chip_actuation::{
+    actuation_bases, bad_chip_actuation_armed, decrease_only_step_base, plan_bad_chip_actuation,
+    plan_bad_chip_actuation_on_chain, resolve_health_operating_mhz, BadChipActuation,
+    BadChipRefuseReason, BAD_CHIP_ACTUATION_FLOOR_MHZ,
+};
 pub use bad_chip_supervisor::{
     BadChipAction, BadChipConfig, BadChipReason, BadChipSupervisor, BoardFingerprint,
     ChipHealthState, HaltReason,
 };
 pub use binary_search::VerificationState;
+pub use silicon_profile_select::select_silicon_preset_table;
 // AT-1: measured chip-rail voltage input accessors + types (read-back spine).
 pub use chain_voltage::{
     measured_rail_from_0x3a_reply, plausible_rail_mv, resolve_chain_rail_voltage, ChainRailVoltage,
@@ -668,8 +696,9 @@ pub use config::{
     autotuner_capabilities_for_chip_with_voltage_autotune,
     autotuner_capabilities_for_mixed_families, autotuner_preset_display_name,
     clamp_am2_dspic_autotune_voltage_mv, is_supported_autotuner_preset,
-    is_supported_autotuner_preset_for_capabilities, resolve_autotuner_policy, AutoTunerConfig,
-    AutotunerCapabilityStatus, AutotunerPresetDef, Bm1362SkuClass, ResolvedAutotunerPolicy,
+    is_supported_autotuner_preset_for_capabilities, night_mode_read_truth,
+    resolve_autotuner_policy, AutoTunerConfig, AutotunerCapabilityStatus, AutotunerPresetDef,
+    Bm1362SkuClass, NightModeReadTruth, NightPowerPolicy, ResolvedAutotunerPolicy,
     AM2_DSPIC_VOLTAGE_AUTOTUNE_MAX_MV, AM2_DSPIC_VOLTAGE_AUTOTUNE_MIN_MV, AM2_VOLTAGE_AUTOTUNE_ENV,
     AUTOTUNER_PRESETS,
 };
@@ -678,6 +707,12 @@ pub use fleet::ChipBinningDatabase;
 pub use fleet::FleetProfile;
 pub use power_budget::{
     btu_from_watts, LivePowerEstimate, PowerAuthorityKind, PowerAuthoritySample, PowerCalibration,
+    PowerEnvelope,
+};
+pub use power_pid::{
+    allocate_power_target_step, estimated_power_sample, pmbus_power_sample,
+    resolve_power_mode_target_watts, watt_pid_should_step, PidGains, WattCommand, WattControlStep,
+    WattTargetController, WattTargetPid,
 };
 pub use profile::{ChipProfile, TuningProfile};
 pub use profitability::{
@@ -738,7 +773,8 @@ mod tests {
         let expected = dcentrald_asic::drivers::MinerProfile::for_chip(0x1398)
             .expect("BM1398 profile should exist")
             .ghs_per_mhz;
-        let actual = crate::chip_geometry::ghs_per_mhz_for_chip(0x1398);
+        let actual = crate::chip_geometry::ghs_per_mhz_for_chip(0x1398)
+            .expect("BM1398 geometry must resolve");
 
         assert!((actual - expected).abs() < f64::EPSILON);
     }
@@ -749,8 +785,10 @@ mod tests {
             .expect("BM1368 profile should exist");
         assert_eq!(profile.hardware_difficulty, 128);
 
-        let implicit = crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 0);
-        let explicit = crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 128);
+        let implicit =
+            crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 0).expect("BM1368 NPS");
+        let explicit =
+            crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 128).expect("BM1368 NPS");
 
         assert!((implicit - explicit).abs() < f64::EPSILON);
     }
@@ -790,7 +828,7 @@ mod tests {
              (no split engine/slot geometry on BM1368)",
         );
         // The autotuner public helper must return the same 1280, not 894.
-        let cores = crate::chip_geometry::cores_for_chip(0x1368);
+        let cores = crate::chip_geometry::cores_for_chip(0x1368).expect("BM1368 cores");
         assert_eq!(
             cores, 1280,
             "autotuner chip_geometry::cores_for_chip(0x1368) must return 1280, not 894 (W6.8 drift fix)",
@@ -798,7 +836,8 @@ mod tests {
         // Hashrate-predicted NPS must match what `MinerProfile::expected_nps`
         // returns, proving the autotuner consumes the MinerProfile single
         // source of truth instead of a stale local constant.
-        let nps_via_helper = crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 128);
+        let nps_via_helper =
+            crate::chip_geometry::expected_nps_for_chip(0x1368, 500, 128).expect("BM1368 NPS");
         let nps_via_profile = profile.expected_nps(500, 128);
         assert!(
             (nps_via_helper - nps_via_profile).abs() < f64::EPSILON,
@@ -852,7 +891,7 @@ mod tests {
         // count. `cores_for_chip` consumes the effective (flag-aware)
         // accessor; under the default flag-off CI environment that is the
         // declared 894 — and never the 4-engine count.
-        let cores = crate::chip_geometry::cores_for_chip(0x1362);
+        let cores = crate::chip_geometry::cores_for_chip(0x1362).expect("BM1362 cores");
         assert_eq!(
             cores,
             profile.nonce_attribution_cores_effective(),
@@ -885,7 +924,8 @@ mod tests {
     /// `state_persistence` tests).
     #[test]
     fn bm1362_chain_nps_scales_with_enumerated_chip_count() {
-        let per_chip = crate::chip_geometry::expected_nps_for_chip(0x1362, 525, 256);
+        let per_chip =
+            crate::chip_geometry::expected_nps_for_chip(0x1362, 525, 256).expect("BM1362 NPS");
         assert!(per_chip > 0.0, "BM1362 per-chip NPS must be positive");
 
         for &chips in &[28u32, 64, 110, 126] {
@@ -914,5 +954,26 @@ mod tests {
             "BM1362 per-chip NPS must derive from 894 nonce-attribution slots \
              (got {per_chip}, expected ≈ {nps_894})",
         );
+    }
+
+    /// Rank 20: unknown chip IDs must not inherit BM1387 114-core NPS.
+    #[test]
+    fn unknown_chip_geometry_refuses_silent_114_nps() {
+        assert_eq!(crate::chip_geometry::cores_for_chip(0xFFFF), None);
+        assert_eq!(crate::chip_geometry::ghs_per_mhz_for_chip(0xFFFF), None);
+        assert_eq!(
+            crate::chip_geometry::expected_nps_for_chip(0xFFFF, 650, 256),
+            None
+        );
+        assert_eq!(
+            crate::chip_geometry::chip_hashrate_ghs_for_chip(0xFFFF, 650),
+            None
+        );
+        assert_eq!(crate::chip_geometry::cores_for_chip(0), None);
+        assert_eq!(crate::chip_geometry::cores_for_chip(0x1387), Some(114));
+        let silent_114 = (650.0_f64 * 114.0 * 1e6) / (256.0 * 4.294e9);
+        let unknown = crate::chip_geometry::expected_nps_for_chip(0xABCD, 650, 256);
+        assert_ne!(unknown, Some(silent_114));
+        assert!(unknown.is_none());
     }
 }

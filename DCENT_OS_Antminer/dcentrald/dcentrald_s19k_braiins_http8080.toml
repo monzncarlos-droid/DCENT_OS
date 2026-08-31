@@ -63,7 +63,7 @@ target_temp_c = 60
 hot_temp_c = 70
 dangerous_temp_c = 80
 fan_min_pwm = 10
-fan_max_pwm = 40
+fan_max_pwm = 30  # home-quiet ceiling (was 40; PWM-30 is the shipped cap)
 
 [api]
 cgminer_port = 14028

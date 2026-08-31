@@ -245,3 +245,15 @@ fi
 # marker + first-boot SSH posture when DCENT_RELEASE_IMAGE=1. NO-OP on DEV/LAB.
 . "${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/release_image_provision.sh"
 dcent_provision_release_image "$TARGET_DIR" "am3-bb-s19jpro"
+
+# RELEASE must not ship the AM3-BB lab rescue SSH marker. DEV/lab keeps it
+# (required above). provision.sh strips it when DCENT_RELEASE_IMAGE=1.
+case "${DCENT_RELEASE_IMAGE:-0}" in
+    1|true|TRUE|yes|YES|y|Y)
+        if [ -e "${TARGET_DIR}/etc/dcentos/rescue_ssh_enabled" ]; then
+            echo "DCENTos post-build (am3-bb-s19jpro): ERROR: RELEASE image still has /etc/dcentos/rescue_ssh_enabled" >&2
+            exit 1
+        fi
+        echo "DCENTos post-build (am3-bb-s19jpro): RELEASE image — AM3-BB rescue SSH marker absent"
+        ;;
+esac

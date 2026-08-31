@@ -381,6 +381,23 @@ const ZYNQ_RUNTIME_ONLY_ENABLEMENT: HardwareEnablementPolicy = HardwareEnablemen
     external_media_authorization: InstallAuthorization::Denied,
 };
 
+/// Exact S9i/S9j removable boot artifacts are host-buildable and can be
+/// written by Toolbox's guarded raw-media writer. Cold boot remains
+/// unwitnessed, so this is LabOnly/Experimental and grants no NAND mutation.
+const AM1_LEGACY_EXPERIMENTAL_MEDIA_ENABLEMENT: HardwareEnablementPolicy =
+    HardwareEnablementPolicy {
+        storage_topology: StorageTopology::RedundantSlots,
+        update_mechanism: UpdateMechanism::ZynqUbiFwSetenv,
+        update_maturity: ImplementationMaturity::NotImplemented,
+        install_authorization: InstallAuthorization::Denied,
+        recovery_maturity: RecoveryMaturity::EvidenceOnly,
+        artifact_kind: ArtifactKind::None,
+        artifact_maturity: ArtifactMaturity::NotImplemented,
+        external_media_mode: ExternalMediaMode::BootOnly,
+        external_media_maturity: ExternalMediaMaturity::ArtifactGenerated,
+        external_media_authorization: InstallAuthorization::LabOnly,
+    };
+
 const AMLOGIC_LAB_ENABLEMENT: HardwareEnablementPolicy = HardwareEnablementPolicy {
     storage_topology: StorageTopology::SingleSlot,
     update_mechanism: UpdateMechanism::HostRootfsWindow,
@@ -412,11 +429,27 @@ const AMLOGIC_RUNTIME_ONLY_ENABLEMENT: HardwareEnablementPolicy = HardwareEnable
 /// Held vendor firmware binds product identity and the shared runtime ABI, but
 /// does not constitute a live witness for a DCENT_OS rootfs-window install.
 const AMLOGIC_PACKAGE_ONLY_ENABLEMENT: HardwareEnablementPolicy = HardwareEnablementPolicy {
+    storage_topology: StorageTopology::Unknown,
+    update_mechanism: UpdateMechanism::None,
+    update_maturity: ImplementationMaturity::NotImplemented,
+    install_authorization: InstallAuthorization::Denied,
+    recovery_maturity: RecoveryMaturity::NotImplemented,
+    artifact_kind: ArtifactKind::SysupgradeBundle,
+    artifact_maturity: ArtifactMaturity::Experimental,
+    external_media_mode: ExternalMediaMode::None,
+    external_media_maturity: ExternalMediaMaturity::NotImplemented,
+    external_media_authorization: InstallAuthorization::Denied,
+};
+
+/// S19k has a signed, dependency-bound host rootfs-window package lane. The
+/// implementation remains experimental and LabOnly: actual backup/recovery
+/// evidence and explicit operator authority stay outside this source policy.
+const AMLOGIC_S19K_GUARDED_ENABLEMENT: HardwareEnablementPolicy = HardwareEnablementPolicy {
     storage_topology: StorageTopology::SingleSlot,
     update_mechanism: UpdateMechanism::HostRootfsWindow,
     update_maturity: ImplementationMaturity::Experimental,
-    install_authorization: InstallAuthorization::Denied,
-    recovery_maturity: RecoveryMaturity::NotImplemented,
+    install_authorization: InstallAuthorization::LabOnly,
+    recovery_maturity: RecoveryMaturity::EvidenceOnly,
     artifact_kind: ArtifactKind::SysupgradeBundle,
     artifact_maturity: ArtifactMaturity::Experimental,
     external_media_mode: ExternalMediaMode::None,
@@ -510,7 +543,7 @@ const CV1835_RETAINED_EVIDENCE: &[&str] = &[
 const AM1_S15_CLASS_UNCONFIRMED_DATUMS: &[&str] = &[
     "release-bound controller revision, resident DTB, and control-board GPIO map",
     "release-bound chain UART/header route and electrical levels",
-    "release-bound FPGA-I2C/PIC/PSU topology and GPIO907 physical load/polarity",
+    "release-bound APW8 revision plus physical FPGA-I2C/PIC/PSU topology and GPIO907-to-PWR_EN net/polarity",
     "certified cold-boot rail/PLL/thermal sequence with verified readback and independent cutoff",
 ];
 
@@ -593,14 +626,27 @@ const AM1_T9PLUS_UNCONFIRMED_DATUMS: &[&str] = &[
 /// S9 SE Ctrl_C43 live/firmware-settled vs still capture-first.
 ///
 /// Settled on the desk: BM1393 CRC5 VIL, FPGA AXI map, 208 cores, PWM-dead
-/// `0x84`/`0x04`, 3×60 last-addr `0x78` (issue #2), C43 / XC7Z007S, 256 MiB.
-/// Not settled: live GetAddress body, DMA base on this 256 MiB board, dsPIC
-/// IIC adapter vs AM2 framed warmup, NAND slot layout.
+/// `0x84`/`0x04`, 3×60 last-addr `0x78` (issue #2), C43 / XC7Z007S, 256 MiB,
+/// and the exact S9 SE ramdisk's 256-MiB `fpga_mem` base `0x0F000000`.
+/// Not settled: live GetAddress body, dsPIC IIC adapter vs AM2 framed warmup,
+/// and an install-safe NAND slot contract.
 const AM1_S9SE_UNCONFIRMED_DATUMS: &[&str] = &[
     "live GetAddress response body (firmware is 1393; #2 pasted BC word0 only)",
-    "256 MiB DMA physical base (stock uses 0x0F000000 on 256 MiB boards)",
     "dsPIC33EP16GS202 IIC adapter ABI vs AM2 framed warmup (do not copy)",
     "NAND slot layout / first-install capsule (management-only until captured)",
+];
+
+/// S9k carrier/safety facts that the recovered BM1393 miner does not settle.
+///
+/// The held S9k `cgminer` is valuable exact evidence for the BM1393 codec,
+/// 60-response population and address interval, but it is not authority to
+/// reuse the S9 SE's C43 carrier or any S9-family power/install contract.
+const AM1_S9K_UNCONFIRMED_DATUMS: &[&str] = &[
+    "exact production control-board revision and resident device tree",
+    "chain carrier/UART route and reset GPIO map",
+    "voltage-controller and PSU electrical contract",
+    "cooling custody and independent power cutoff",
+    "NAND slot layout / recoverable first-install transaction",
 ];
 
 const AM1_S9IJ_CLASS_UNCONFIRMED_DATUMS: &[&str] = &[
@@ -1016,10 +1062,13 @@ impl BoardDesc {
     /// control-board datums remain UNCONFIRMED (`scripts/hw-acceptance/skus.conf`).
     /// Declaring a concrete transport here would assert an am1 carrier nobody
     /// has captured; a target that cannot open a chain cannot open the wrong
-    /// one. Likewise `voltage_controller: RuntimeDiscovered`: the held guide's
-    /// PIC16(L)F1704 and PL/header topology describe a conflicting 60-chip S15
-    /// variant, not a release-bound controller for the exact 72-response S15
-    /// or T15. A real controller claim must not be copied across that boundary.
+    /// one. Likewise `voltage_controller: RuntimeDiscovered`: exact stock
+    /// software and the APW8 guide establish adjacent FPGA-I2C and documentary
+    /// SDA/SCL/active-low-EN observations, but do not join GPIO907 to PWR_EN or
+    /// bind an APW8/controller revision. The held S15 guide's PIC16(L)F1704 and
+    /// PL/header topology describe a conflicting 60-chip S15 variant, not a
+    /// release-bound controller for the exact 72-response S15 or T15. A real
+    /// controller claim must not be copied across that boundary.
     pub const fn am1_s15() -> Self {
         Self {
             board_target: "am1-s15",
@@ -1189,7 +1238,7 @@ impl BoardDesc {
             asic_protocol: AsicProtocolIdentity::Bm1387,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            enablement: AM1_LEGACY_EXPERIMENTAL_MEDIA_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
@@ -1222,7 +1271,7 @@ impl BoardDesc {
             asic_protocol: AsicProtocolIdentity::Bm1387,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            enablement: AM1_LEGACY_EXPERIMENTAL_MEDIA_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
@@ -1250,7 +1299,43 @@ impl BoardDesc {
             asic_protocol: AsicProtocolIdentity::Bm1393,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            // 2026-08-29 packaging-lane wave: the research-shell
+            // artifact exists (dcentos_am1_s9{se,k}_defconfig + per-board
+            // post-image) — the row CLAIMS the package while install
+            // stays Denied and the BM1393 scaffold refuses every
+            // mutating operation.
+            enablement: ZYNQ_PACKAGE_ONLY_ENABLEMENT,
+            public_beta_install: false,
+            mining_default_enabled: false,
+        }
+    }
+
+    /// S9k evidence identity; deliberately distinct from S9 and S9 SE.
+    ///
+    /// The unstripped held S9k miner proves BM1393 framing and a 60-chip
+    /// population. It does not prove that the production unit uses the S9 SE
+    /// C43 carrier, so this row remains capture-first and cannot open hardware.
+    pub const fn am1_s9k() -> Self {
+        Self {
+            board_target: "am1-s9k",
+            cooling_medium: None,
+            cut_ladder: CANONICAL_FORCED_AIR_LADDER,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::CaptureFirst {
+                unconfirmed: AM1_S9K_UNCONFIRMED_DATUMS,
+            },
+            family: BoardFamily::Zynq,
+            chain_transport: ChainTransportKind::None,
+            work_engine: WorkEngineKind::ManagementOnly,
+            asic_protocol: AsicProtocolIdentity::Bm1393,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
+            slot_policy: SlotPolicy::LabGated,
+            // 2026-08-29 packaging-lane wave: the research-shell
+            // artifact exists (dcentos_am1_s9{se,k}_defconfig + per-board
+            // post-image) — the row CLAIMS the package while install
+            // stays Denied and the BM1393 scaffold refuses every
+            // mutating operation.
+            enablement: ZYNQ_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
@@ -1258,10 +1343,11 @@ impl BoardDesc {
 
     /// T15 exact composition; management-only sibling of [`Self::am1_s15`].
     ///
-    /// Same silicon and the same UNCONFIRMED control-board datums, so it
-    /// carries the identical fail-closed facets. Kept as its own row rather
-    /// than aliased to `am1-s15` so that when first-light capture promotes one
-    /// of the two, the other does not silently inherit the promotion.
+    /// Same silicon and the same UNCONFIRMED control-board datums, including
+    /// the unjoined GPIO907/APW8 physical boundary, so it carries the identical
+    /// fail-closed facets. Kept as its own row rather than aliased to
+    /// `am1-s15` so that when first-light capture promotes one of the two, the
+    /// other does not silently inherit the promotion.
     pub const fn am1_t15() -> Self {
         Self {
             board_target: "am1-t15",
@@ -1398,53 +1484,60 @@ impl BoardDesc {
         }
     }
 
-    /// Amlogic S21 XP — runtime identity is subtype/topology discovered.
+    /// Amlogic S21 XP evidence/package target. Exact held VNish 1.2.7
+    /// production binaries and independent Bosminer code agree on the
+    /// three-chain ttyS3/ttyS2/ttyS1 route, contradicting the shared S21
+    /// ttyS4 assumption. PIC/PSU selection and safe power/cooling composition
+    /// remain unresolved, so the shared S21 NoPic runtime is refused.
     pub const fn am3_s21xp() -> Self {
         Self {
             board_target: "am3-s21xp",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Am3Aml,
-            runtime_status: RuntimeStatus::SpecialisedLifecycle {
-                lane: LifecycleLane::AmlogicNativeSerial,
-                generic_construction: GenericConstruction::Refused,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "S21 XP exact ttyS3/ttyS2/ttyS1 route conflicts with shared S21 profile; PIC/PSU and safe lifecycle unproven",
             },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
-            work_engine: WorkEngineKind::SerialWork,
+            work_engine: WorkEngineKind::ManagementOnly,
             asic_protocol: AsicProtocolIdentity::Bm1370,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: AMLOGIC_LAB_ENABLEMENT,
+            enablement: AMLOGIC_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// Amlogic T21 — complete target uses BM1368; controller remains runtime-discovered.
+    /// Amlogic T21 evidence/package target. An exact held production rootfs
+    /// binds T21/AML to three direct UART routes plus GPIO/PWM observations,
+    /// while PIC/PSU protocol, safe power/cooling lifecycle, live enumeration,
+    /// cold-init sequencing, and persistent-write geometry remain unresolved.
     pub const fn am3_t21() -> Self {
         Self {
             board_target: "am3-t21",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Am3Aml,
-            runtime_status: RuntimeStatus::SpecialisedLifecycle {
-                lane: LifecycleLane::AmlogicNativeSerial,
-                generic_construction: GenericConstruction::Refused,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "T21 route is evidence-only; PIC/PSU, safe power/cooling, live-init, and persistent-write contracts unproven",
             },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
-            work_engine: WorkEngineKind::SerialWork,
+            work_engine: WorkEngineKind::ManagementOnly,
             asic_protocol: AsicProtocolIdentity::Bm1368,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: AMLOGIC_LAB_ENABLEMENT,
+            enablement: AMLOGIC_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// Amlogic S19k Pro — runtime board target is the stock-compatible `am3-s19k`.
+    /// Amlogic S19k Pro. The default-off native BM1366 route joins the exact
+    /// NoPic lifecycle owner; live cold-init and NAND remain evidence- and
+    /// operator-authority-gated.
     pub const fn am3_s19kpro() -> Self {
         Self {
             board_target: "am3-s19k",
@@ -1461,75 +1554,79 @@ impl BoardDesc {
             asic_protocol: AsicProtocolIdentity::Bm1366,
             voltage_controller: VoltageControllerClass::NoPic,
             slot_policy: SlotPolicy::LabGated,
-            enablement: AMLOGIC_LAB_ENABLEMENT,
+            enablement: AMLOGIC_S19K_GUARDED_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// Amlogic S19 XP (BM1366 class): exact package plus guarded
-    /// rootfs-window lab install; mining remains default-off until witness.
+    /// Amlogic S19 XP (BM1366 class): exact package and held production
+    /// software-route evidence only. The route proves no deployed hashboard,
+    /// PIC/PSU selection, electrical safe lifecycle, cooling, or persistent
+    /// write/recovery contract; TD-003 keeps runtime and install denied.
     pub const fn am3_s19xp() -> Self {
         Self {
             board_target: "am3-s19xp",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Am3Aml,
-            runtime_status: RuntimeStatus::SpecialisedLifecycle {
-                lane: LifecycleLane::AmlogicNativeSerial,
-                generic_construction: GenericConstruction::Refused,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate: "TD-003 blocks S19 XP before runtime dispatch; physical identity and safe lifecycle pending",
             },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
-            work_engine: WorkEngineKind::SerialWork,
+            work_engine: WorkEngineKind::ManagementOnly,
             asic_protocol: AsicProtocolIdentity::Bm1366,
-            voltage_controller: VoltageControllerClass::NoPic,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: AMLOGIC_LAB_ENABLEMENT,
+            enablement: AMLOGIC_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// Amlogic S19j XP (BM1366 BHB56804 class): exact package plus guarded
-    /// rootfs-window lab install; mining remains default-off until witness.
+    /// Amlogic S19j XP (BM1366 BHB56804 software-profile class): exact package
+    /// and held production software-route evidence only. The route proves no
+    /// deployed board, PIC/PSU selection, electrical safe lifecycle, cooling,
+    /// or persistent write/recovery contract; runtime and install stay denied.
     pub const fn am3_s19jxp() -> Self {
         Self {
             board_target: "am3-s19jxp",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Am3Aml,
-            runtime_status: RuntimeStatus::SpecialisedLifecycle {
-                lane: LifecycleLane::AmlogicNativeSerial,
-                generic_construction: GenericConstruction::Refused,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate:
+                    "TD-003 blocks S19j XP before runtime dispatch; deployed identity and safe lifecycle pending",
             },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
-            work_engine: WorkEngineKind::SerialWork,
+            work_engine: WorkEngineKind::ManagementOnly,
             asic_protocol: AsicProtocolIdentity::Bm1366,
-            voltage_controller: VoltageControllerClass::NoPic,
+            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
-            enablement: AMLOGIC_LAB_ENABLEMENT,
+            enablement: AMLOGIC_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
     /// Amlogic S19j Pro+ (BM1362 BHB42612 class): exact package plus guarded
-    /// rootfs-window lab install; mining remains default-off until witness.
+    /// rootfs-window lab install; the daemon's TD-003 gate keeps this target
+    /// management-only before runtime dispatch.
     pub const fn am3_s19jproplus() -> Self {
         Self {
             board_target: "am3-s19jproplus",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Am3Aml,
-            runtime_status: RuntimeStatus::SpecialisedLifecycle {
-                lane: LifecycleLane::AmlogicNativeSerial,
-                generic_construction: GenericConstruction::Refused,
+            supervisor_class: SupervisorClass::Unclassified,
+            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
+                gate:
+                    "TD-003 blocks S19j Pro+ before runtime dispatch; exact NoPic lifecycle pending",
             },
             family: BoardFamily::Amlogic,
             chain_transport: ChainTransportKind::Serial,
-            work_engine: WorkEngineKind::SerialWork,
+            work_engine: WorkEngineKind::ManagementOnly,
             asic_protocol: AsicProtocolIdentity::Bm1362,
             voltage_controller: VoltageControllerClass::RuntimeDiscovered,
             slot_policy: SlotPolicy::LabGated,
@@ -1654,19 +1751,33 @@ impl BoardDesc {
         }
     }
 
-    /// TD-003 scaffolding: S17 family — management-only until promotion.
+    /// S17 / S17 Pro (am2-s17p) — BM1397 hybrid runtime lane (2026-08-27).
+    ///
+    /// Promoted from the TD-003 management-only scaffold by the
+    /// `2026-08-27-antminer17-unlock-armada` campaign (agent B1). Hashboard is
+    /// **BHB07601** (48 BM1397/chain × 3 chains, 672 cores/chip); S17 and
+    /// S17 Pro are binary-identical stock bmminers except build-id/timestamp,
+    /// the SKU split being runtime EEPROM dispatch (A1 §V1). Voltage controller
+    /// is the dsPIC33EP16GS202 **G2a framed** class at FPGA-bus `0x20|chain`
+    /// (A1 §V3, A3 §2).
+    ///
+    /// `LifecycleLane::S17Hybrid` (added 2026-08-28, unlock-armada
+    /// convergence): the interim reuse of `S19jHybrid` documented by B1 is
+    /// retired — the four 17-series rows now carry their dedicated lane, one
+    /// lane per engine (`--s17-hybrid` vs `--s19j-hybrid`).
     pub const fn am2_s17() -> Self {
         Self {
             board_target: "am2-s17p",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Unclassified,
-            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
-                gate: "TD-003 scaffold; S17/BM1397 promotion pending",
+            supervisor_class: SupervisorClass::Am2Zynq,
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::S17Hybrid,
+                generic_construction: GenericConstruction::ManagementOnly,
             },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
-            work_engine: WorkEngineKind::ManagementOnly,
+            work_engine: WorkEngineKind::SerialWork,
             asic_protocol: AsicProtocolIdentity::Bm1397,
             voltage_controller: VoltageControllerClass::DsPic33Ep,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
@@ -1676,88 +1787,103 @@ impl BoardDesc {
         }
     }
 
-    /// S17+ management-only composition pending separate BM1397 controller-ABI
-    /// adjudication.
+    /// S17+ (am2-s17plus) — BM1397 hybrid runtime lane (2026-08-27).
     ///
-    /// Hashboard is **BHB07602**. Its co-bundled `S17+PIC.hex` is a PIC16F1704
-    /// image, but this older descriptor's `DsPic33Ep` value is an application
-    /// adapter classification, not a physical-silicon assertion. This BM1396
-    /// correction does not reroute the separate BM1397 lane without its own
-    /// ABI adjudication.
+    /// Promoted from management-only by the `2026-08-27-antminer17-unlock-armada`
+    /// campaign (agent B1) after controller-ABI adjudication. Hashboard is
+    /// **BHB07602** (65 BM1397/chain × 3 chains = 195). Stock-RE verdict (A1 §V1,
+    /// HIGH): the S17+ class co-bundles `S17+PIC.hex`, a **PIC16F1704** image, and
+    /// `bmminer` drives it through the `pic1704_*` (`init_pic_one_chain`) flow —
+    /// the G2b raw S9-family frame dialect (`55 AA 10 VV` set-voltage, A3 §2).
+    /// The prior `DsPic33Ep` value was an adapter placeholder from the BM1396
+    /// correction era, superseded by the 17-family controller-ABI RE. Lane reuse
+    /// note: see `am2_s17`.
     pub const fn am2_s17plus() -> Self {
         Self {
             board_target: "am2-s17plus",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Unclassified,
-            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
-                gate: "dsPIC33/BM1397 bench admission pending",
+            supervisor_class: SupervisorClass::Am2Zynq,
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::S17Hybrid,
+                generic_construction: GenericConstruction::ManagementOnly,
             },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
-            work_engine: WorkEngineKind::ManagementOnly,
+            work_engine: WorkEngineKind::SerialWork,
             asic_protocol: AsicProtocolIdentity::Bm1397,
-            voltage_controller: VoltageControllerClass::DsPic33Ep,
+            voltage_controller: VoltageControllerClass::Pic16F1704,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            // 2026-08-27 armada (C1): B2 shipped the package-only board lane.
+            enablement: ZYNQ_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// T17 exact composition; management-only until controller/BM1397 bench admission.
+    /// T17 (am2-t17) — BM1397 hybrid runtime lane (2026-08-27).
     ///
-    /// T17's signed `bmminer` hardcodes a common
-    /// `/etc/config/dsPIC33EP16GS202_app.txt` updater path, but the T17e
-    /// adjudication proves that filename is not physical-part evidence. The
-    /// exact T17 image ships no model-bundled MCU payload or factory jig that
-    /// settles its physical part and application ABI together, so this stays
-    /// `RuntimeDiscovered` rather than inheriting a sibling's controller claim.
+    /// Promoted from `RuntimeDiscovered` by the `2026-08-27-antminer17-unlock-armada`
+    /// campaign (agent B1). Stock-RE verdict (A1 §V1, HIGH): T17 is S17-class —
+    /// BOOT.bin variant A is byte-identical to S17's, the dsPIC33EP16GS202 flow
+    /// (no `init_pic_one_chain`), per-chain pattern file `/dev/07701_pattern_30.txt`
+    /// (hashboard **BHB07701**, sibling of S17's BHB07601). The earlier
+    /// `RuntimeDiscovered` posture was correct only while the signed bmminer's
+    /// common updater filename was the sole evidence; the pattern-file + BOOT.bin
+    /// + shared-gram triangulation settles the dsPIC G2a plan. Geometry 30
+    /// BM1397/chain × 3 chains = 90. Lane reuse note: see `am2_s17`.
     pub const fn am2_t17() -> Self {
         Self {
             board_target: "am2-t17",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Unclassified,
-            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
-                gate: "controller family unconfirmed; BM1397 bench admission pending",
+            supervisor_class: SupervisorClass::Am2Zynq,
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::S17Hybrid,
+                generic_construction: GenericConstruction::ManagementOnly,
             },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
-            work_engine: WorkEngineKind::ManagementOnly,
+            work_engine: WorkEngineKind::SerialWork,
             asic_protocol: AsicProtocolIdentity::Bm1397,
-            voltage_controller: VoltageControllerClass::RuntimeDiscovered,
+            voltage_controller: VoltageControllerClass::DsPic33Ep,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            // 2026-08-27 armada (C1): B2 shipped the package-only board lane.
+            enablement: ZYNQ_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
     }
 
-    /// T17+ management-only composition pending separate BM1397 controller-ABI
-    /// adjudication.
+    /// T17+ (am2-t17plus) — BM1397 hybrid runtime lane (2026-08-27).
     ///
-    /// Hashboard is **BHB07702**. Its co-bundled `T17+PIC.hex` is a PIC16F1704
-    /// image, but this older descriptor's `DsPic33Ep` value is an application
-    /// adapter classification, not a physical-silicon assertion. This BM1396
-    /// correction does not reroute the separate BM1397 lane without its own
-    /// ABI adjudication.
+    /// Promoted from management-only by the `2026-08-27-antminer17-unlock-armada`
+    /// campaign (agent B1) after controller-ABI adjudication. Hashboard is
+    /// **BHB07702** (44 BM1397/chain × 3 chains = 132 — stock
+    /// `/dev/07702_pattern_44.txt`, A1 §V2). Stock-RE verdict (A1 §V1, HIGH):
+    /// the T17+ class is S17+-class — `init_pic_one_chain` + `pic1704_*` flow,
+    /// **PIC16F1704** (`T17+PIC.hex`), G2b raw S9-family frame dialect (A3 §2).
+    /// The prior `DsPic33Ep` value was an adapter placeholder from the BM1396
+    /// correction era, superseded by the 17-family controller-ABI RE. Lane reuse
+    /// note: see `am2_s17`.
     pub const fn am2_t17plus() -> Self {
         Self {
             board_target: "am2-t17plus",
             cooling_medium: None,
             cut_ladder: CANONICAL_FORCED_AIR_LADDER,
-            supervisor_class: SupervisorClass::Unclassified,
-            runtime_status: RuntimeStatus::ManagementOnlyByPolicy {
-                gate: "dsPIC33/BM1397 bench admission pending",
+            supervisor_class: SupervisorClass::Am2Zynq,
+            runtime_status: RuntimeStatus::SpecialisedLifecycle {
+                lane: LifecycleLane::S17Hybrid,
+                generic_construction: GenericConstruction::ManagementOnly,
             },
             family: BoardFamily::Zynq,
             chain_transport: ChainTransportKind::ZynqHybrid,
-            work_engine: WorkEngineKind::ManagementOnly,
+            work_engine: WorkEngineKind::SerialWork,
             asic_protocol: AsicProtocolIdentity::Bm1397,
-            voltage_controller: VoltageControllerClass::DsPic33Ep,
+            voltage_controller: VoltageControllerClass::Pic16F1704,
             slot_policy: SlotPolicy::ZynqAbFwSetenv,
-            enablement: ZYNQ_RUNTIME_ONLY_ENABLEMENT,
+            // 2026-08-27 armada (C1): B2 shipped the package-only board lane.
+            enablement: ZYNQ_PACKAGE_ONLY_ENABLEMENT,
             public_beta_install: false,
             mining_default_enabled: false,
         }
@@ -1771,7 +1897,9 @@ impl BoardDesc {
     /// response high word to `0x1396` and enforces 135 responses on every
     /// caller-selected present chain. See
     /// [`S17E_T17E_JIG_ASIC_TYPE_EVIDENCE`] and
-    /// [`S17E_T17E_SIGNED_USERSPACE_EVIDENCE`].
+    /// [`S17E_T17E_SIGNED_USERSPACE_EVIDENCE`]. The exact held S17e recovery
+    /// parent contains an anti-downgrade shell writer, but its unchecked,
+    /// non-atomic behavior grants no install or recovery authority.
     /// Exact co-bundled `S17ePIC.hex` bytes establish dsPIC33EP16GS202 physical
     /// silicon. Exact Ghidra analysis independently establishes the framed
     /// application ABI. The descriptor records that ABI rather than routing by
@@ -1826,7 +1954,10 @@ impl BoardDesc {
     /// `T17ePIC.hex` plus the maintenance schematic establish PIC16F1704 as the
     /// populated controller; that physical identity does not select the legacy
     /// S9 PIC adapter because the recovered T17e application ABI is BM1396
-    /// framed.
+    /// framed. The exact held T17e SD parent contains eleven boot-media entries
+    /// and no `runme.sh`; it therefore cannot inherit the S17e or S17+/T17+
+    /// shell-writer path, and its boot/recovery execution semantics remain
+    /// unknown.
     pub const fn am2_t17e() -> Self {
         Self {
             board_target: "am2-t17e",
@@ -1967,6 +2098,7 @@ impl BoardDesc {
             BoardDesc::am1_s9i(),
             BoardDesc::am1_s9j(),
             BoardDesc::am1_s9se(),
+            BoardDesc::am1_s9k(),
             BoardDesc::am1_s11(),
             BoardDesc::am1_s15(),
             BoardDesc::am1_t15(),
@@ -2244,8 +2376,8 @@ mod tests {
             }
         }
         assert_eq!(
-            lane_rows, 8,
-            "eight Amlogic rows route via the native serial lane"
+            lane_rows, 3,
+            "three admitted Amlogic rows route via the native serial lane"
         );
     }
 
@@ -2292,19 +2424,20 @@ mod tests {
     }
 
     #[test]
-    fn amlogic_bm1366_board_descs_pin_nopic_voltage_controller() {
-        // RE-4A / S19k BETA: Has_Pic:false boards must not inherit RuntimeDiscovered
-        // -> ChipDriverPic fallback from ASIC identity alone.
-        for desc in [
-            BoardDesc::am3_s19kpro(),
-            BoardDesc::am3_s19xp(),
-            BoardDesc::am3_s19jxp(),
-        ] {
+    fn amlogic_bm1366_board_descs_preserve_voltage_evidence_boundaries() {
+        // RE-4A / S19k BETA has exact Has_Pic:false evidence. X19 XP evidence
+        // does not settle PIC-versus-NoPic, so ASIC identity alone must not
+        // let those package-only rows inherit the S19k controller choice.
+        let s19k = BoardDesc::am3_s19kpro();
+        assert_eq!(s19k.asic_protocol, AsicProtocolIdentity::Bm1366);
+        assert_eq!(s19k.voltage_controller, VoltageControllerClass::NoPic);
+
+        for desc in [BoardDesc::am3_s19xp(), BoardDesc::am3_s19jxp()] {
             assert_eq!(desc.asic_protocol, AsicProtocolIdentity::Bm1366);
             assert_eq!(
                 desc.voltage_controller,
-                VoltageControllerClass::NoPic,
-                "{} must pin NoPic voltage controller",
+                VoltageControllerClass::RuntimeDiscovered,
+                "{} must keep the unresolved controller explicit",
                 desc.board_target
             );
             assert!(!desc.mining_default_enabled);
@@ -2337,6 +2470,23 @@ mod tests {
             "S19k post-build target drifted from BoardDesc: {}",
             stamps[0]
         );
+        assert_eq!(descriptor.work_engine, WorkEngineKind::SerialWork);
+        assert!(descriptor.runtime_status.permits_mining_lane());
+        assert_eq!(
+            descriptor.enablement.update_maturity,
+            ImplementationMaturity::Experimental
+        );
+        assert_eq!(
+            descriptor.enablement.install_authorization,
+            InstallAuthorization::LabOnly
+        );
+        assert!(descriptor.enablement.allows_persistent_update());
+        assert_eq!(
+            descriptor.enablement.recovery_maturity,
+            RecoveryMaturity::EvidenceOnly
+        );
+        assert!(!descriptor.enablement.allows_restore());
+        assert_eq!(descriptor.supervisor_class, SupervisorClass::Am3Aml);
     }
 
     #[test]
@@ -2550,9 +2700,87 @@ mod tests {
             validated_rows += 1;
         }
         assert_eq!(
-            validated_rows, 22,
+            validated_rows, 25,
             "registered acceptance coverage changed; classify new aliases explicitly"
         );
+    }
+
+    /// `skus.conf` release labels are executable-support claims, not evidence
+    /// or artifact-maturity labels. Keep them derived from the registry's
+    /// runtime status so a package-only or management-only row cannot enter
+    /// live acceptance merely because a tarball exists. Conversely, a real
+    /// callable lane must not remain labelled NOT-IMPLEMENTED.
+    #[test]
+    fn acceptance_release_state_matches_executable_runtime_status() {
+        let acceptance_skus = include_str!("../../../scripts/hw-acceptance/skus.conf");
+        // 2026-08-27 S17 promotion TRANSITION arm REMOVED (C1 convergence,
+        // `2026-08-27-antminer17-unlock-armada`): agent B2 landed the
+        // EXPERIMENTAL skus.conf release_state for all four BM1397 17-series
+        // targets (rows 32-36), completing the B1 handoff contract. Every row
+        // is back under the exact bidirectional equality below.
+        //
+        // 2026-08-26 s19j-pro-complete-enablement cross-campaign state (pinned
+        // by C1 convergence 2026-08-27): that campaign's variant-matrix-closure
+        // phase deliberately made S19jProAML/S19jProPlus FIRST-CLASS SKU rows
+        // (skus.conf EXPERIMENTAL + SUPPORT_MATRIX experimental = a package/
+        // identity claim) while the runtime stays TD-003 management-only until
+        // the unit-gated promotion evidence closes
+        // (
+        // S19JPROPLUS_TD003_PROMOTION_DRAFT.md` items 1-3; its lane verifier
+        // `s19jpro_lane_verify.py::condition_td003_s19jproplus_release` still
+        // expects the intercept). This arm pins BOTH halves of that split so
+        // it fails closed on either side: remove it only in the promotion
+        // change-set that removes the s19jproplus TD-003 intercept (draft
+        // item 4), restoring plain equality.
+        const S19JPRO_FIRST_CLASS_PENDING_TD003: &[&str] = &["am3-s19jpro-aml", "am3-s19jproplus"];
+        let mut checked = 0;
+        for line in acceptance_skus.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<_> = line.split('|').collect();
+            assert_eq!(fields.len(), 11, "malformed acceptance row: {line}");
+            let descriptor = BoardDesc::lookup(canonical_board_target(fields[1]))
+                .unwrap_or_else(|| panic!("{} has no registered BoardDesc", fields[0]));
+            let release_claims_callable = matches!(fields[8], "PRODUCTION" | "EXPERIMENTAL");
+            if S19JPRO_FIRST_CLASS_PENDING_TD003.contains(&fields[1]) {
+                assert_eq!(
+                    fields[8], "EXPERIMENTAL",
+                    "{}: first-class pending-TD-003 row must stay EXPERIMENTAL (package claim); \
+                     NOT-IMPLEMENTED would contradict SUPPORT_MATRIX.md",
+                    fields[1]
+                );
+                assert!(
+                    matches!(
+                        descriptor.runtime_status,
+                        RuntimeStatus::ManagementOnlyByPolicy { .. }
+                    ),
+                    "{}: descriptor must stay ManagementOnlyByPolicy until the TD-003 \
+                     promotion change-set lands runtime evidence",
+                    fields[1]
+                );
+                assert!(
+                    !descriptor.runtime_status.permits_mining_lane(),
+                    "{}: pending-TD-003 row must not claim a mining lane",
+                    fields[1]
+                );
+                checked += 1;
+                continue;
+            }
+            assert_eq!(
+                release_claims_callable,
+                descriptor.runtime_status.permits_mining_lane(),
+                "{} ({}) release_state={} contradicts BoardDesc runtime_status={:?}; \
+                 artifact/install maturity is orthogonal to callable mining support",
+                fields[0],
+                fields[1],
+                fields[8],
+                descriptor.runtime_status
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 25, "acceptance executable-support roster changed");
     }
 
     // ---- rank 18: cross-registry identity graph ----------------------------
@@ -2632,7 +2860,7 @@ mod tests {
             }
         }
         assert_eq!(
-            resolved, 22,
+            resolved, 25,
             "registered acceptance-SKU coverage changed; reconcile skus.conf against the registry"
         );
     }
@@ -2786,26 +3014,22 @@ mod tests {
     }
 
     #[test]
-    fn amlogic_targets_are_runtime_discovered_serial_lab_gated() {
-        for id in [
-            "am3-s21",
-            "am3-s21pro",
-            "am3-s21xp",
-            "am3-t21",
-            "am3-s19k",
-            "am3-s19xp",
-            "am3-s19jxp",
-            "am3-s19jproplus",
-            "am3-s19jpro-aml",
+    fn amlogic_targets_pin_controller_class_and_stay_serial_lab_gated() {
+        for (id, voltage_controller) in [
+            ("am3-s21", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s21pro", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s21xp", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-t21", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s19k", VoltageControllerClass::NoPic),
+            ("am3-s19xp", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s19jxp", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s19jproplus", VoltageControllerClass::RuntimeDiscovered),
+            ("am3-s19jpro-aml", VoltageControllerClass::RuntimeDiscovered),
         ] {
             let d = BoardDesc::lookup(id).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(d.family, BoardFamily::Amlogic, "{id}");
             assert_eq!(d.chain_transport, ChainTransportKind::Serial, "{id}");
-            assert_eq!(
-                d.voltage_controller,
-                VoltageControllerClass::RuntimeDiscovered,
-                "{id}"
-            );
+            assert_eq!(d.voltage_controller, voltage_controller, "{id}");
             assert_eq!(d.slot_policy, SlotPolicy::LabGated, "{id}");
             assert!(!d.product_install_allowed(), "{id}");
         }
@@ -2834,12 +3058,18 @@ mod tests {
 
     #[test]
     fn unimplemented_runtime_targets_are_management_only() {
+        // The four BM1397 17-series targets (am2-s17p/am2-s17plus/am2-t17/
+        // am2-t17plus) were PROMOTED to the S17 hybrid SerialWork lane on
+        // 2026-08-27 (`2026-08-27-antminer17-unlock-armada`, agent B1) and are
+        // therefore deliberately absent here; their lane is pinned by
+        // `s17_family_never_inherits_legacy_s9_pic16_adapter_from_part_name`.
         for id in [
-            "am2-s17plus",
-            "am2-t17",
-            "am2-t17plus",
             "am3-bb",
+            "am3-s19xp",
+            "am3-s19jxp",
+            "am3-s19jproplus",
             "am3-s19jpro-aml",
+            "am3-s21xp",
             "cv1835-s19jpro",
             "bcb100-s19jpro",
         ] {
@@ -3000,8 +3230,7 @@ mod tests {
     #[test]
     fn asic_protocol_chip_id_roundtrip_for_known_families() {
         for id in [
-            0x1387u16, 0x1391, 0x1393, 0x1396, 0x1397, 0x1398, 0x1362, 0x1366, 0x1368,
-            0x1370,
+            0x1387u16, 0x1391, 0x1393, 0x1396, 0x1397, 0x1398, 0x1362, 0x1366, 0x1368, 0x1370,
         ] {
             let identity = AsicProtocolIdentity::from_chip_id(id).expect("known id");
             assert_eq!(identity.to_chip_id(), Some(id));
@@ -3286,7 +3515,33 @@ mod tests {
         };
         let joined = unconfirmed.join(" | ").to_ascii_lowercase();
         assert!(joined.contains("getaddress"), "{joined}");
-        assert!(joined.contains("pwm") || joined.contains("dspic"), "{joined}");
+        assert!(joined.contains("dspic"), "{joined}");
+        assert!(joined.contains("nand slot"), "{joined}");
+        assert!(!joined.contains("dma physical base"), "{joined}");
+    }
+
+    /// S9k has exact BM1393 population evidence but no inherited carrier authority.
+    #[test]
+    fn am1_s9k_is_distinct_registered_and_fail_closed() {
+        let d = BoardDesc::lookup("am1-s9k").expect("am1-s9k descriptor");
+        assert_eq!(d.asic_protocol, AsicProtocolIdentity::Bm1393);
+        assert_eq!(d.chain_transport, ChainTransportKind::None);
+        assert_eq!(d.work_engine, WorkEngineKind::ManagementOnly);
+        assert_eq!(
+            d.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert!(!d.public_beta_install);
+        assert!(!d.mining_default_enabled);
+        assert_ne!(d.board_target, BoardDesc::am1_s9().board_target);
+        assert_ne!(d.board_target, BoardDesc::am1_s9se().board_target);
+        let RuntimeStatus::CaptureFirst { unconfirmed } = d.runtime_status else {
+            panic!("am1-s9k must be CaptureFirst");
+        };
+        let joined = unconfirmed.join(" | ").to_ascii_lowercase();
+        assert!(joined.contains("control-board revision"), "{joined}");
+        assert!(joined.contains("voltage-controller"), "{joined}");
+        assert!(joined.contains("nand slot"), "{joined}");
     }
 
     /// S9i and S9j are registered, resolvable, and authorize nothing.
@@ -3311,6 +3566,14 @@ mod tests {
                 InstallAuthorization::Denied,
                 "{target} install must be denied"
             );
+            assert!(
+                d.enablement.allows_external_media_write(),
+                "{target} exact Experimental boot image must remain writable to removable media"
+            );
+            assert_eq!(
+                d.enablement.external_media_authorization,
+                InstallAuthorization::LabOnly
+            );
 
             // A chain that cannot be opened cannot be opened wrongly.
             assert_eq!(d.chain_transport, ChainTransportKind::None);
@@ -3329,17 +3592,23 @@ mod tests {
         }
     }
 
-    /// A physical PIC16F1704 identity must not select the legacy S9 adapter ABI.
+    /// A physical PIC16F1704 identity must not select the legacy S9 adapter ABI
+    /// *without an application-ABI adjudication*.
     ///
-    /// The physical family and application ABI are separate contracts. In
-    /// particular, exact T17e evidence proves PIC16F1704 silicon while Ghidra
-    /// proves the BM1396 framed application ABI. `VoltageControllerClass` is an
-    /// adapter/ABI selector, so none of these non-S9 rows may inherit the S9
-    /// `Pic16F1704` adapter solely from the part number.
+    /// The physical family and application ABI are separate contracts.
+    /// `VoltageControllerClass` is an adapter/ABI selector, so no non-S9 row may
+    /// inherit the S9 `Pic16F1704` adapter solely from a part number.
     ///
-    /// Mutation-checked 2026-08-07: flipping `am2_s17plus` or `am2_t17plus`
-    /// back to `Pic16F1704`, or `am2_t17` to either `Pic16F1704` or
-    /// `DsPic33Ep`, each fails this test.
+    /// Mutation-checked 2026-08-07; **REBASED 2026-08-27** by the
+    /// `2026-08-27-antminer17-unlock-armada` campaign (agent B1): the 17-family
+    /// stock-RE (A1 §V1 HIGH + A3 §2) adjudicated the S17+/T17+ application ABI
+    /// as the G2b raw S9-family frame dialect (`55 AA 10 VV` set-voltage etc.),
+    /// so `am2-s17plus`/`am2-t17plus` now deliberately carry `Pic16F1704` on RE
+    /// evidence, and all four BM1397 rows are promoted to the S17 hybrid
+    /// SerialWork lane. The part-name-without-evidence guard below still applies
+    /// in full to the BM1396 rows (`am2-s17e`/`am2-t17e`), which stay
+    /// `Bm1396FramedI2c11` + management-only, and to T17, which is pinned to
+    /// the RE-adjudicated dsPIC G2a plan.
     #[test]
     fn s17_family_never_inherits_legacy_s9_pic16_adapter_from_part_name() {
         // REGISTRY-DERIVED, not hand-enumerated (Round-15 A8 coverage gap):
@@ -3359,8 +3628,8 @@ mod tests {
         //      FACET (S17-family silicon on Zynq), with the target prefixes kept
         //      only as an additional, not exclusive, admission path.
         //
-        //  (b) A `>= 4` floor against a 6-row family is theatre in precisely the
-        //      direction A8 complained about: two rows could be dropped or
+        //  (b) A `>= 4` floor against a 6-row family is theatre in precisely
+        //      the direction A8 complained about: two rows could be dropped or
         //      renamed out of coverage and the assertion would still pass. The
         //      floor is replaced by an EXACT-SET assertion, so adding, removing
         //      or renaming an S17-family row forces a deliberate edit here.
@@ -3396,18 +3665,49 @@ mod tests {
             found, EXPECTED_S17_FAMILY,
             "the S17/T17-family roster changed. This is an EXACT set on purpose: a new \
              or renamed row must be added here deliberately so it cannot slip out of the \
-             legacy-adapter guard below. Update EXPECTED_S17_FAMILY in the same change."
+             adapter guards below. Update EXPECTED_S17_FAMILY in the same change."
         );
+
+        // BM1396 rows keep the original guard in full: their application ABI is
+        // the framed BM1396 contract (Bm1396FramedI2c11), proven for their
+        // physical silicon, and they remain management-only.
         for d in &family {
             let target = d.board_target;
+            if matches!(d.asic_protocol, AsicProtocolIdentity::Bm1397) {
+                continue;
+            }
             assert_ne!(
                 d.voltage_controller,
                 VoltageControllerClass::Pic16F1704,
                 "{target}: {S17_FAMILY_STOCK_CONTROLLER_EVIDENCE}"
             );
-            // None of these rows may authorize an install or start mining, so a
-            // controller correction can never become a runtime affordance.
-            assert_eq!(d.work_engine, WorkEngineKind::ManagementOnly);
+            assert_eq!(
+                d.work_engine,
+                WorkEngineKind::ManagementOnly,
+                "{target}: BM1396 rows stay out of the promoted BM1397 runtime lane"
+            );
+        }
+
+        // The four BM1397 rows are pinned to the 2026-08-27 RE-adjudicated
+        // controller plan (A1 §V1: s17p/t17 = dsPIC G2a framed; s17plus/t17plus
+        // = PIC16 G2b raw) and to the promoted S17 hybrid work lane. None of
+        // them may authorize an install or start mining.
+        for (target, controller) in [
+            ("am2-s17p", VoltageControllerClass::DsPic33Ep),
+            ("am2-t17", VoltageControllerClass::DsPic33Ep),
+            ("am2-s17plus", VoltageControllerClass::Pic16F1704),
+            ("am2-t17plus", VoltageControllerClass::Pic16F1704),
+        ] {
+            let d = BoardDesc::lookup(target).unwrap();
+            assert_eq!(
+                d.voltage_controller, controller,
+                "{target}: controller plan drifted from the 2026-08-27 stock-RE adjudication"
+            );
+            assert_eq!(
+                d.work_engine,
+                WorkEngineKind::SerialWork,
+                "{target}: promoted S17 hybrid lane regressed to management-only"
+            );
             assert!(
                 !d.public_beta_install,
                 "{target} must not be install-eligible"
@@ -3415,24 +3715,15 @@ mod tests {
             assert!(!d.mining_default_enabled, "{target} must not auto-mine");
         }
 
-        // These existing BM1397 descriptors retain their application-adapter
-        // classification. This test does not use it as physical-part evidence.
-        for target in ["am2-s17p", "am2-s17plus", "am2-t17plus"] {
-            assert_eq!(
-                BoardDesc::lookup(target).unwrap().voltage_controller,
-                VoltageControllerClass::DsPic33Ep,
-                "{target}: BM1397 adapter classification changed outside its ABI adjudication"
+        // Negative control for the promotion: the BM1396 siblings did NOT get
+        // swept into the runtime lane.
+        for target in ["am2-s17e", "am2-t17e"] {
+            assert_ne!(
+                BoardDesc::lookup(target).unwrap().work_engine,
+                WorkEngineKind::SerialWork,
+                "{target}: BM1396 capture-first row must not inherit the BM1397 lane"
             );
         }
-
-        // Negative: T17's signed image ships NO `single-board-test`, so held
-        // bytes exclude PIC16 without confirming dsPIC. Do not promote it on
-        // sibling resemblance — that is the `am1-t9plus` trap.
-        assert_eq!(
-            BoardDesc::am2_t17().voltage_controller,
-            VoltageControllerClass::RuntimeDiscovered,
-            "T17 stock ships no per-model factory jig; controller family is not settled"
-        );
     }
 
     /// The BM1396/BM1397 reversal must not creep back into the original
@@ -3867,16 +4158,19 @@ mod tests {
     fn executable_rows_declare_an_exact_supervisor_lane_roster() {
         const EXPECTED: &[(&str, SupervisorClass)] = &[
             ("am1-s9", SupervisorClass::Am1S9),
+            // 2026-08-27 S17 hybrid promotion (`2026-08-27-antminer17-unlock-armada`,
+            // agent B1): the four BM1397 17-series rows join the executable
+            // roster on the same am2 Zynq thermal-supervisor lane as the S19j
+            // hybrid (ZynqVariant::S17 fan/PSU/GPIO907 plan).
+            ("am2-s17p", SupervisorClass::Am2Zynq),
+            ("am2-s17plus", SupervisorClass::Am2Zynq),
             ("am2-s19j", SupervisorClass::Am2Zynq),
+            ("am2-t17", SupervisorClass::Am2Zynq),
+            ("am2-t17plus", SupervisorClass::Am2Zynq),
             ("am3-bb-s19jpro", SupervisorClass::Am3Bb),
-            ("am3-s19jproplus", SupervisorClass::Am3Aml),
-            ("am3-s19jxp", SupervisorClass::Am3Aml),
             ("am3-s19k", SupervisorClass::Am3Aml),
-            ("am3-s19xp", SupervisorClass::Am3Aml),
             ("am3-s21", SupervisorClass::Am3Aml),
             ("am3-s21pro", SupervisorClass::Am3Aml),
-            ("am3-s21xp", SupervisorClass::Am3Aml),
-            ("am3-t21", SupervisorClass::Am3Aml),
         ];
         let mut found: Vec<(&str, SupervisorClass)> = BoardDesc::all_registered()
             .iter()

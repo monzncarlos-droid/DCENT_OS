@@ -1,0 +1,5 @@
+# DCENT K230 first-light image: root ships with an EMPTY password (console
+# login works out of the box). Without -B, Dropbear refuses blank-password
+# auth, which would block the SSH-first-light bench gate. Lab/bench posture
+# only — replace with a real credential scheme before any public image.
+DROPBEAR_ARGS="-B"

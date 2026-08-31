@@ -1,0 +1,29 @@
+# DCENT_OS Avalon industrial daemon — example config.
+#
+# Copy to one of the loader paths and edit:
+#   - $DCENTRALD_AVALON_CONFIG (env var)
+#   - /data/dcentrald-avalon.toml (canonical on K230 rootfs)
+#   - ./dcentrald-avalon.toml (next to the binary, dev)
+#
+# If no config file is present, compiled-in defaults are used (solo.ckpool.org
+# with a throwaway worker name) so the daemon still starts for smoke testing.
+
+[pool]
+url = "solo.ckpool.org"
+port = 3333
+worker_name = "bc1qexampleworkerreplacewithyours"
+password = "x"
+version_rolling = true
+suggest_difficulty = 0
+
+[miner]
+# Required target identity. `nano3` means the original Nano 3, never Nano 3S.
+# This resolves identity facts only; the daemon still refuses mining until the
+# independent cut, native TX, cooling, sensor, and watchdog custody gates pass.
+# model = "nano3"
+# Legacy industrial-shim frequency field. This 500 MHz example is not a Nano 3
+# operating point and grants no native Nano 3 frequency/voltage authority.
+frequency_mhz = 500.0
+# Optional: pin the chip count. 0 = let driver.init() detect.
+# Avalon Q ≈ 100 chips/board; A14xx ≈ 105 chips/board.
+asic_count = 0

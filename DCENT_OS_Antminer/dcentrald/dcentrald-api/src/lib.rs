@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(
     dead_code,
     clippy::doc_lazy_continuation,
@@ -49,10 +50,15 @@ pub mod cgminer_luxos;
 /// read-only status handlers stop re-parsing the file from disk on every
 /// request. Post-write-fresh via the `atomic_io` config-write generation.
 pub mod config_cache;
+/// First-boot CSRF Host allowlist (DNS-rebinding residual on Origin==Host).
+/// Wired from `auth::is_allowed_dashboard_origin`.
+pub mod csrf_allowlist;
 pub mod dashboard;
 pub mod mining_pipeline_snapshot;
 pub mod mode_middleware;
 pub mod mqtt;
+/// Pure MQTT TLS-scheme + RELEASE command-admission (host-testable).
+pub mod mqtt_security;
 pub mod ota_signature;
 pub mod rest;
 ///  W8-D: route modules split out of `rest.rs`. Currently
@@ -68,7 +74,7 @@ pub mod webhook;
 pub mod websocket;
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
@@ -236,7 +242,12 @@ fn audit_log_path_for_policy(
         // process-wide ephemeral policy. Alternate launchers need only set the
         // exact policy token; the audit sink then stays on tmpfs.
         return configured
-            .filter(|path| path.starts_with("/tmp/dcent"))
+            .filter(|path| {
+                path.starts_with("/tmp/dcent")
+                    && path.components().all(|component| {
+                        !matches!(component, Component::ParentDir | Component::CurDir)
+                    })
+            })
             .unwrap_or_else(|| PathBuf::from(DEFAULT_EPHEMERAL_AUDIT_LOG_PATH));
     }
     configured.unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_LOG_PATH))
@@ -393,6 +404,16 @@ pub struct AppState {
     /// Live power estimate from the work dispatcher (updated every 5s).
     /// Uses watch channel so REST API and WebSocket can read simultaneously.
     pub power_rx: watch::Receiver<LivePowerEstimate>,
+    /// Optional retained FPGA snapshot published by the runtime transport
+    /// owner. API handlers may clone it but never open MMIO/UIO/devmem.
+    pub fpga_status_rx: Option<
+        watch::Receiver<Option<dcentrald_diagnostics::troubleshoot::RuntimeOwnedFpgaTelemetry>>,
+    >,
+    /// Sender-free readers for positive observations retained by serialized
+    /// I2C service owners. REST may clone their in-memory snapshots but cannot
+    /// submit a request, scan/probe a bus, or infer absence.
+    pub i2c_observation_readers:
+        Arc<std::sync::Mutex<Vec<dcentrald_hal::i2c::I2cObservationReader>>>,
     /// Persistent wall-meter correction shared with the estimator.
     pub power_calibration: Arc<std::sync::RwLock<PowerCalibration>>,
     /// Serialize runtime access to the smart PSU control bus.
@@ -414,6 +435,15 @@ pub struct AppState {
     pub autotuner_telemetry_rx: watch::Receiver<TelemetryExportState>,
     /// Live autotuner runtime command channel.
     pub autotuner_command_tx: Option<mpsc::Sender<dcentrald_autotuner::AutoTunerCommand>>,
+    /// Live home-night fan/frequency window. POST `/api/home/night-mode`
+    /// publishes here; the thermal `SetFanPwm` / QuietMode path and serial
+    /// Amlogic/AM2 fan ticks read the latest value.
+    pub home_night_fan_tx: Option<watch::Sender<dcentrald_common::night_power::NightFanWindow>>,
+    /// Live serial adopted PLL (MHz). Serial mining publishes
+    /// `operating_freq` here; GET/POST night-mode read it. `None` on
+    /// the tuner/daemon path that has no serial PLL owner.
+    pub serial_live_mhz_tx:
+        Option<watch::Sender<dcentrald_common::night_power::SerialLiveFrequency>>,
     /// Historical data samples for /api/history (populated by daemon's history task).
     /// Vec<serde_json::Value> to avoid cross-crate dependency on HistoryBuffer.
     /// The daemon pushes serialized HistorySample values into this shared vec.
@@ -639,6 +669,16 @@ pub struct RecentShareEvent {
     pub version_bits: Option<String>,
     pub version: Option<u32>,
     pub protocol_meta_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_logical_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_attribution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_chip_addr: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_asic_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_core_id: Option<u8>,
 }
 
 pub fn push_recent_share_event(
@@ -1139,6 +1179,21 @@ pub struct MinerState {
     pub rejected: u64,
     /// Per-chain status.
     pub chains: Vec<ChainState>,
+    /// Per-logical-UART protocol/runtime observations.
+    ///
+    /// This is deliberately separate from `chains`: on S19k the available
+    /// offline evidence does not prove a tty-to-physical-hashboard-slot
+    /// mapping. These records therefore describe only the named serial
+    /// endpoint and MUST NOT be interpreted as per-board telemetry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serial_endpoints: Vec<SerialEndpointState>,
+    /// Semantic scope of the legacy `chains` array when it is not ordinary
+    /// per-physical-board telemetry. Absent preserves the legacy meaning.
+    ///
+    /// S19k serial mining publishes `aggregate_serial_runtime`; this is a
+    /// provenance tag, not a physical topology claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chains_scope: Option<String>,
     /// Fan status.
     pub fans: FanState,
     /// Pool connection status.
@@ -1166,6 +1221,8 @@ impl MinerState {
             accepted: 0,
             rejected: 0,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: FanState {
                 pwm: 0,
                 rpm: 0,
@@ -1209,6 +1266,120 @@ impl MinerState {
             uptime_s: 0,
             firmware_version: env!("CARGO_PKG_VERSION").to_string(),
             mode,
+        }
+    }
+}
+
+/// Canonical `MinerState::chains_scope` value used by S19k serial runtime.
+pub const CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME: &str = "aggregate_serial_runtime";
+
+/// Evidence from one logical serial endpoint.
+///
+/// The schema intentionally contains no physical-slot id, hashrate, share
+/// acceptance, voltage, or thermal field. Those values are not independently
+/// attributable to an S19k tty from the currently proven runtime evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerialEndpointState {
+    /// Logical device path observed by the runtime (for example `/dev/ttyS1`).
+    #[serde(default)]
+    pub logical_path: String,
+    /// Typed/open lifecycle state rendered as a stable diagnostic string.
+    #[serde(default)]
+    pub open_state: String,
+    /// Evidence-backed TX role rendered as a stable diagnostic string.
+    #[serde(default)]
+    pub tx_role: String,
+    /// Whether this endpoint is admitted for work TX in the current run.
+    #[serde(default)]
+    pub tx_active: bool,
+    /// Number of valid GetAddress responses observed during admission.
+    #[serde(default)]
+    pub getaddress_responses: u16,
+    /// Whether a complete 77-chip response was observed at work baud.
+    #[serde(default)]
+    pub complete_77_at_work_baud: bool,
+    /// Complete work frames committed to this endpoint.
+    #[serde(default)]
+    pub work_frames_committed: u64,
+    /// Bytes received from the endpoint.
+    #[serde(default)]
+    pub rx_wire_bytes: u64,
+    /// CRC-valid protocol frames decoded from the endpoint.
+    #[serde(default)]
+    pub rx_frames: u64,
+    /// Frames rejected for CRC failure on this endpoint.
+    #[serde(default)]
+    pub crc_rejected_frames: u64,
+    /// Bytes currently buffered by this endpoint's parser.
+    #[serde(default)]
+    pub buffered_rx_bytes: u64,
+    /// History-admitted job/nonce observations from this endpoint.
+    ///
+    /// This is a protocol-observation counter, not an accepted-share counter.
+    #[serde(default)]
+    pub valid_job_nonce_observations: u64,
+    /// Age of the last decoded frame, when one has been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_frame_rx_age_s: Option<u64>,
+    /// Age of the last history-admitted job/nonce observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_valid_job_nonce_age_s: Option<u64>,
+    /// Parser state rendered as a stable diagnostic string.
+    #[serde(default)]
+    pub parser_state: String,
+}
+
+#[cfg(test)]
+mod serial_endpoint_state_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_miner_state_wire_defaults_and_omits_serial_observability() {
+        let state = MinerState::empty(OperatingMode::Standard);
+        let wire = serde_json::to_value(&state).expect("serialize empty MinerState");
+        assert!(wire.get("serial_endpoints").is_none());
+        assert!(wire.get("chains_scope").is_none());
+
+        let decoded: MinerState =
+            serde_json::from_value(wire).expect("deserialize legacy-shaped MinerState");
+        assert!(decoded.serial_endpoints.is_empty());
+        assert_eq!(decoded.chains_scope, None);
+    }
+
+    #[test]
+    fn serial_endpoint_wire_is_logical_only_and_carries_no_board_attribution() {
+        let endpoint = SerialEndpointState {
+            logical_path: "/dev/ttyS2".to_string(),
+            open_state: "open".to_string(),
+            tx_role: "rx_only".to_string(),
+            tx_active: false,
+            getaddress_responses: 77,
+            complete_77_at_work_baud: true,
+            work_frames_committed: 9,
+            rx_wire_bytes: 1024,
+            rx_frames: 8,
+            crc_rejected_frames: 1,
+            buffered_rx_bytes: 3,
+            valid_job_nonce_observations: 4,
+            last_frame_rx_age_s: Some(2),
+            last_valid_job_nonce_age_s: Some(7),
+            parser_state: "synchronized".to_string(),
+        };
+        let wire = serde_json::to_value(endpoint).expect("serialize serial endpoint");
+
+        assert_eq!(wire["logical_path"], "/dev/ttyS2");
+        for forbidden in [
+            "physical_slot",
+            "chain_id",
+            "hashrate_ghs",
+            "accepted",
+            "temperature_c",
+            "voltage_mv",
+        ] {
+            assert!(
+                wire.get(forbidden).is_none(),
+                "logical endpoint must not claim {forbidden}"
+            );
         }
     }
 }
@@ -2292,6 +2463,8 @@ pub fn build_minimal_app_state_with_hardware_mutation_gate(
         accepted: 0,
         rejected: 0,
         chains: Vec::new(),
+        serial_endpoints: Vec::new(),
+        chains_scope: None,
         fans: FanState {
             pwm: inputs.fan_pwm,
             rpm: 0,
@@ -2400,6 +2573,8 @@ pub fn build_minimal_app_state_with_hardware_mutation_gate(
         led_status_rx: None,
         curtailment,
         power_rx,
+        fpga_status_rx: None,
+        i2c_observation_readers: Arc::new(std::sync::Mutex::new(Vec::new())),
         power_calibration,
         psu_lock,
         hardware_mutation_gate,
@@ -2408,6 +2583,8 @@ pub fn build_minimal_app_state_with_hardware_mutation_gate(
         autotuner_chip_health_rx,
         autotuner_telemetry_rx,
         autotuner_command_tx: None,
+        home_night_fan_tx: None,
+        serial_live_mhz_tx: None,
         history_data,
         recent_share_history,
         local_reject_ring: Arc::new(Mutex::new(
@@ -2681,6 +2858,13 @@ mod minimal_app_state_tests {
             audit_log_path_for_policy(Some("1"), Some(persistent_override)),
             PathBuf::from(DEFAULT_EPHEMERAL_AUDIT_LOG_PATH)
         );
+        assert_eq!(
+            audit_log_path_for_policy(
+                Some("1"),
+                Some(PathBuf::from("/tmp/dcent/../../data/inherited-audit.log")),
+            ),
+            PathBuf::from(DEFAULT_EPHEMERAL_AUDIT_LOG_PATH)
+        );
 
         let path = PathBuf::from(format!(
             "/tmp/dcent/audit-policy-test-{}-{}.log",
@@ -2825,13 +3009,101 @@ mod minimal_app_state_tests {
 /// - axum HTTP server on port 8080 (REST + WebSocket + dashboard)
 ///
 /// Returns JoinHandles for both servers.
+fn parsed_http_origin_authority(origin: &str) -> Option<axum::http::uri::Authority> {
+    let (scheme, authority) = origin.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'?' | b'#' | b'@'))
+    {
+        return None;
+    }
+    let parsed = authority.parse::<axum::http::uri::Authority>().ok()?;
+    let rendered = parsed.as_str();
+    let port = if let Some(bracketed) = rendered.strip_prefix('[') {
+        let close = bracketed.find(']')?;
+        let suffix = &bracketed[close + 1..];
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?)
+        }
+    } else {
+        rendered.rsplit_once(':').map(|(_, port)| port)
+    };
+    if port
+        .is_some_and(|value| value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// Decide whether a browser Origin may read API responses.
+///
+/// Parse the complete authority before classifying it. Prefix checks such as
+/// `starts_with("http://localhost")` also admit attacker-controlled names like
+/// `localhost.attacker.example`; splitting on `:` also misclassifies bracketed
+/// IPv6. This helper keeps the decision pure and host-testable.
+fn cors_origin_is_allowed(origin: &str, request_host: Option<&str>) -> bool {
+    let Some(authority) = parsed_http_origin_authority(origin) else {
+        return false;
+    };
+    let authority_host = authority.host();
+    let origin_host = authority_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(authority_host);
+
+    if origin_host.eq_ignore_ascii_case("localhost")
+        || origin_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if origin_host
+        .rsplit('.')
+        .next()
+        .map(|label| label.eq_ignore_ascii_case("local"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    request_host
+        .map(|host| crate::csrf_allowlist::origin_matches_allowed_host(authority.as_str(), host))
+        .unwrap_or(false)
+}
+
+fn admit_auth_storage_before_bind(
+    release_image: bool,
+    preflight: std::io::Result<()>,
+) -> Result<()> {
+    match preflight {
+        Ok(()) => Ok(()),
+        Err(error) if release_image => Err(ApiError::Io(std::io::Error::new(
+            error.kind(),
+            format!("release auth storage preflight failed: {error}"),
+        ))),
+        Err(error) => {
+            tracing::warn!(error = %error, "verify_auth_file_perms failed on development image");
+            Ok(())
+        }
+    }
+}
+
 pub async fn start_api_servers(
     state: Arc<AppState>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
     let cgminer_port = state.config.cgminer_port;
     let http_port = state.config.http_port;
     let http_bind = state.config.http_bind.clone();
-    mark_daemon_started();
 
     // Initialize auth module with config-driven flags
     auth::init_auth_config(
@@ -2840,17 +3112,12 @@ pub async fn start_api_servers(
         state.config.observer_only,
     );
 
-    // SECURITY (W1.5, 2026-05-07): verify and auto-correct on-disk auth file
-    // perms BEFORE binding any sockets. /data/dcent/auth.json must be 0o600
-    // and /data/dcent/ must be 0o700. Wider perms are auto-tightened in
-    // place; ownership drift (uid != 0) logs ERROR but does not fail closed
-    // — fail-soft because losing access to /data/dcent on first boot would
-    // brick the password-setup wizard, which is a worse user-facing failure
-    // than a transient wide-perms window during the few hundred ms between
-    // boot and the first verify_auth_file_perms() call. See auth.rs.
-    if let Err(err) = auth::verify_auth_file_perms() {
-        tracing::warn!(error = %err, "verify_auth_file_perms failed (non-fatal)");
-    }
+    // Verify and auto-correct auth storage before either listener can bind. A
+    // genuinely absent file remains valid first-boot state. Invalid path types
+    // and I/O/chmod failures are fatal on release images; development images
+    // retain their warning-only recovery posture.
+    admit_auth_storage_before_bind(auth::is_release_image(), auth::verify_auth_file_perms())?;
+    mark_daemon_started();
 
     // --- CGMiner TCP server on port 4028 ---
     let cgminer_state = state.clone();
@@ -2879,53 +3146,14 @@ pub async fn start_api_servers(
                 |origin: &axum::http::HeaderValue, request_parts: &axum::http::request::Parts| {
                     let origin_str = origin.to_str().unwrap_or("");
 
-                    // Allow localhost (any port) for development
-                    if origin_str.starts_with("http://localhost")
-                        || origin_str.starts_with("https://localhost")
-                        || origin_str.starts_with("http://127.0.0.1")
-                        || origin_str.starts_with("https://127.0.0.1")
-                    {
-                        return true;
-                    }
-
-                    // Allow .local mDNS hostnames (e.g., http://dcentos.local).
-                    //  W10-D (A1-LOW-1): the previous predicate
-                    // used `.contains(".local")`, which matched any
-                    // origin that contained the substring `.local` —
-                    // including hostile origins like
-                    // `local.example.com` or `evil.local.attacker.io`.
-                    // Now we strip the scheme (and an optional port),
-                    // split the host on `.`, and require the LAST
-                    // label to be exactly `local`. This is a strict
-                    // TLD-style suffix match.
-                    let host_only = origin_str
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://");
-                    let host_no_port = host_only.split(':').next().unwrap_or("");
-                    if host_no_port
-                        .rsplit('.')
-                        .next()
-                        .map(|tld| tld == "local")
-                        .unwrap_or(false)
-                    {
-                        return true;
-                    }
-
-                    // Allow if Origin matches the request's Host header
-                    // (same-origin: dashboard served from the miner itself)
-                    if let Some(host) = request_parts.headers.get("host") {
-                        if let Ok(host_str) = host.to_str() {
-                            // Origin is scheme://host[:port], Host is host[:port]
-                            let origin_host = origin_str
-                                .trim_start_matches("http://")
-                                .trim_start_matches("https://");
-                            if origin_host == host_str {
-                                return true;
-                            }
-                        }
-                    }
-
-                    false
+                    // Parse and validate the whole Origin authority before the
+                    // exact loopback, strict `.local`, or allowlisted
+                    // same-origin decision.
+                    let request_host = request_parts
+                        .headers
+                        .get("host")
+                        .and_then(|host| host.to_str().ok());
+                    cors_origin_is_allowed(origin_str, request_host)
                 },
             ))
             .allow_methods([
@@ -3011,6 +3239,10 @@ pub fn update_led_config(
     path: &str,
     update: &crate::rest::LedConfigUpdateRequest,
 ) -> anyhow::Result<()> {
+    // This helper is another whole-config read→modify→write path. Serialize it
+    // with every other API config writer so concurrent mutations cannot erase
+    // one another, and publish through the crash-durable atomic writer.
+    let _guard = crate::atomic_io::config_write_lock();
     let contents = std::fs::read_to_string(path)?;
     let mut table: toml::Table = toml::from_str(&contents)?;
 
@@ -3052,6 +3284,160 @@ pub fn update_led_config(
     }
 
     let output = toml::to_string_pretty(&table)?;
-    std::fs::write(path, output)?;
+    crate::atomic_io::atomic_write(path, output)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod api_boundary_hardening_tests {
+    use super::*;
+
+    fn led_update() -> crate::rest::LedConfigUpdateRequest {
+        crate::rest::LedConfigUpdateRequest {
+            locate_pattern: Some("heartbeat".to_string()),
+            heartbeat_on_ms: Some(125),
+            heartbeat_off_ms: None,
+            locate_duration_s: None,
+            flash_on_accepted_share: None,
+            flash_on_rejected_share: None,
+            night_mode_disable: None,
+            celebration_on_lucky_share: None,
+            chain_status_blink_codes: None,
+            enabled: Some(false),
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dcentrald_api_{label}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn cors_origin_parser_admits_only_exact_loopback_authorities() {
+        for origin in [
+            "http://localhost",
+            "https://localhost:8443",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(cors_origin_is_allowed(origin, None), "{origin}");
+        }
+
+        for origin in [
+            "http://localhost.attacker.example",
+            "http://127.0.0.1.attacker.example",
+            "http://localhost@attacker.example",
+            "http://localhost:not-a-port",
+            "http://localhost/path",
+            "ftp://localhost",
+        ] {
+            assert!(!cors_origin_is_allowed(origin, None), "{origin}");
+        }
+    }
+
+    #[test]
+    fn cors_origin_parser_keeps_strict_mdns_and_same_origin_policy() {
+        assert!(cors_origin_is_allowed("https://dcentos.local:8443", None));
+        assert!(!cors_origin_is_allowed(
+            "https://dcentos.local.attacker.example",
+            None
+        ));
+        assert!(cors_origin_is_allowed(
+            "http://203.0.113.50:8080",
+            Some("203.0.113.50:8080")
+        ));
+        assert!(!cors_origin_is_allowed(
+            "http://evil.example",
+            Some("evil.example")
+        ));
+    }
+
+    #[test]
+    fn release_auth_storage_preflight_is_fail_closed_before_bind() {
+        let release_error = admit_auth_storage_before_bind(
+            true,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "synthetic invalid auth path",
+            )),
+        )
+        .expect_err("release image must refuse an invalid auth path");
+        assert!(release_error
+            .to_string()
+            .contains("release auth storage preflight failed"));
+
+        admit_auth_storage_before_bind(
+            false,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "synthetic development drift",
+            )),
+        )
+        .expect("development image keeps warning-only recovery posture");
+    }
+
+    #[test]
+    fn led_config_update_is_atomic_and_preserves_unrelated_sections() {
+        let dir = unique_temp_dir("led_atomic");
+        std::fs::create_dir_all(&dir).expect("create LED test dir");
+        let path = dir.join(crate::atomic_io::CONFIG_FILE_NAME);
+        std::fs::write(
+            &path,
+            "[pool]\nurl = \"stratum+tcp://example.invalid:3333\"\n\n[led]\nenabled = true\nheartbeat_on_ms = 100\n",
+        )
+        .expect("write LED fixture");
+        let generation_before = crate::atomic_io::config_write_generation();
+
+        update_led_config(path.to_str().expect("UTF-8 temp path"), &led_update())
+            .expect("atomic LED config update");
+
+        let persisted = std::fs::read_to_string(&path).expect("read LED config");
+        let parsed: toml::Table = toml::from_str(&persisted).expect("parse LED config");
+        assert_eq!(
+            parsed["pool"]["url"].as_str(),
+            Some("stratum+tcp://example.invalid:3333")
+        );
+        assert_eq!(parsed["led"]["enabled"].as_bool(), Some(false));
+        assert_eq!(parsed["led"]["heartbeat_on_ms"].as_integer(), Some(125));
+        assert_eq!(parsed["led"]["locate_pattern"].as_str(), Some("heartbeat"));
+        assert!(crate::atomic_io::config_write_generation() > generation_before);
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .expect("read LED test dir")
+                .filter_map(|entry| entry.ok())
+                .count(),
+            1,
+            "atomic publish must not leave a staging sibling"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn led_config_update_refuses_a_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_temp_dir("led_symlink");
+        std::fs::create_dir_all(&dir).expect("create LED symlink test dir");
+        let referent = dir.join("referent.toml");
+        let target = dir.join(crate::atomic_io::CONFIG_FILE_NAME);
+        let original = "[led]\nenabled = true\n";
+        std::fs::write(&referent, original).expect("write LED referent");
+        symlink(&referent, &target).expect("create LED symlink");
+
+        update_led_config(target.to_str().expect("UTF-8 temp path"), &led_update())
+            .expect_err("LED config symlink must fail closed");
+        assert_eq!(
+            std::fs::read_to_string(&referent).expect("read LED referent"),
+            original
+        );
+        assert!(std::fs::symlink_metadata(&target)
+            .expect("stat LED symlink")
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

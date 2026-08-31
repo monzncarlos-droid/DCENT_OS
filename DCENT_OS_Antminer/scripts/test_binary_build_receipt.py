@@ -119,6 +119,12 @@ class ReceiptFixture(unittest.TestCase):
         (self.root / "DCENT_OS_Antminer/scripts/binary_build_receipt.py").write_text(
             "# fixture receipt generator\n", encoding="utf-8"
         )
+        (self.root / "DCENT_OS_Antminer/scripts/s19k_aarch64_compile_check.sh").write_text(
+            "#!/bin/sh\n# fixture smoke compile check\n", encoding="utf-8"
+        )
+        (self.root / "DCENT_OS_Antminer/scripts/s19k_native_build_verify.py").write_text(
+            "# fixture native build verifier\n", encoding="utf-8"
+        )
         self.external_root = self.root.parent / f"{self.root.name}-external-inputs"
         self.external_s9_kernel = (
             self.external_root / ""
@@ -727,6 +733,8 @@ class ReceiptFixture(unittest.TestCase):
         for relative in RECEIPT_MODULE.BAKED_INPUTS:
             self.assertIn(relative, paths)
         self.assertIn("DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml", paths)
+        self.assertIn("DCENT_OS_Antminer/scripts/s19k_aarch64_compile_check.sh", paths)
+        self.assertIn("DCENT_OS_Antminer/scripts/s19k_native_build_verify.py", paths)
 
     def test_live_deletion_of_required_inputs_does_not_change_snapshot(self) -> None:
         for relative in RECEIPT_MODULE.REQUIRED_SOURCE_INPUTS:

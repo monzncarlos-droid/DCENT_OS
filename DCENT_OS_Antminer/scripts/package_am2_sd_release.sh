@@ -16,11 +16,12 @@ LABEL=""
 OUT_ROOT=""
 REQUIRE_COMPLETE=1
 ALLOW_INCOMPLETE_LAB=0
+ALLOW_DEV_IMAGE=0
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --image <path.img> --label <slug> [--output-root <dir>]
-                        [--require-complete|--allow-incomplete-lab]
+                        [--require-complete|--allow-incomplete-lab|--allow-dev-image]
 
 Packages:
   <label>.img (+ .sig/.manifest.json if present)
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
         --output-root=*) OUT_ROOT="${1#*=}"; shift ;;
         --require-complete) REQUIRE_COMPLETE=1; ALLOW_INCOMPLETE_LAB=0; shift ;;
         --allow-incomplete-lab) REQUIRE_COMPLETE=0; ALLOW_INCOMPLETE_LAB=1; shift ;;
+        --allow-dev-image) ALLOW_DEV_IMAGE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -62,6 +64,15 @@ if [ ! -f "$MANIFEST" ]; then
     # try sibling without double extension
     MANIFEST_ALT="${IMAGE%.img}.img.manifest.json"
     [ -f "$MANIFEST_ALT" ] && MANIFEST="$MANIFEST_ALT"
+fi
+
+if [ "$ALLOW_INCOMPLETE_LAB" -eq 0 ] && [ "$ALLOW_DEV_IMAGE" -eq 0 ]; then
+    # Complete customer/public SD bundles require RELEASE. Lab: --allow-incomplete-lab
+    # or --allow-dev-image. Do not ship a DEV-posture complete image as release media.
+    # shellcheck source=lib/public_artifact_release_gate.sh
+    . "$SCRIPT_DIR/lib/public_artifact_release_gate.sh"
+    DCENT_PUBLIC_ARTIFACT="${DCENT_PUBLIC_ARTIFACT:-1}"
+    dcent_require_release_image_for_public_artifact || exit 1
 fi
 
 if [ "$REQUIRE_COMPLETE" -eq 1 ]; then

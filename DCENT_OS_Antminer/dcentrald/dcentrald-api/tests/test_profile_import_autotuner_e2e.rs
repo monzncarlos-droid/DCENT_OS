@@ -25,6 +25,7 @@
 //! Linux/CI only — `dcentrald-api` pulls Unix-only HAL crates.
 
 #![cfg(unix)]
+#![allow(clippy::await_holding_lock)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -313,8 +314,10 @@ fn build_w30_tuner_for_case(
     miner_profile: &MinerProfile,
     chain_id: u8,
 ) -> (AutoTuner, mpsc::Sender<AutoTunerCommand>, AutoTunerConfig) {
-    let mut config = AutoTunerConfig::default();
-    config.max_freq_mhz = miner_profile.max_freq_mhz;
+    let mut config = AutoTunerConfig {
+        max_freq_mhz: miner_profile.max_freq_mhz,
+        ..AutoTunerConfig::default()
+    };
     if miner_profile.pic_type == PicType::DsPic33EP {
         config.min_voltage_mv = config.min_voltage_mv.max(DSPIC_MIN_VOLTAGE_MV);
     }

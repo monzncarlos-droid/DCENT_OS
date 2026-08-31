@@ -3,7 +3,11 @@
 # had zero dependency vulnerability / license / source scanning, while the ESP
 # sibling already runs cargo-audit in CI. This gives the daemon a CVE gate, a
 # copyleft/unknown-license tripwire, and a no-unknown-source guarantee.
-# Run: `cargo deny check` (wire into CI as a job — see the ESP gate for the shape).
+# Run: `cargo deny check` from this directory, or:
+#   sh DCENT_OS_Antminer/scripts/run_cargo_deny.sh
+# CI note: invoke `run_cargo_deny.sh` as a separate host job. Do NOT fold this
+# into scripts/ci_offline_gates.sh (QA sibling owns that file). Set
+# DCENT_REQUIRE_CARGO_DENY=1 so a missing cargo-deny binary fails closed.
 #
 # NOTE: to add a permissive SPDX id, run `cargo deny check licenses` and append
 # it here with justification rather than loosening the whole check.

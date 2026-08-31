@@ -111,6 +111,29 @@ pub struct FanMetric {
     pub pwm_percent: u8,
 }
 
+/// Evidence from one logical serial endpoint.
+///
+/// This is deliberately not a `ChainMetric`: no physical-slot mapping or
+/// per-UART hashrate/share/thermal attribution is implied by these counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerialEndpointMetric {
+    pub logical_path: String,
+    pub open_state: String,
+    pub tx_role: String,
+    pub tx_active: bool,
+    pub getaddress_responses: u16,
+    pub complete_77_at_work_baud: bool,
+    pub work_frames_committed: u64,
+    pub rx_wire_bytes: u64,
+    pub rx_frames: u64,
+    pub crc_rejected_frames: u64,
+    pub buffered_rx_bytes: u64,
+    pub valid_job_nonce_observations: u64,
+    pub last_frame_rx_age_s: Option<u64>,
+    pub last_valid_job_nonce_age_s: Option<u64>,
+    pub parser_state: String,
+}
+
 /// A complete, HAL-free snapshot of everything the Prometheus exporter
 /// publishes. Built by the HTTP handler from existing watch channels;
 /// consumed only by [`Self::to_exposition`].
@@ -186,6 +209,13 @@ pub struct PrometheusSnapshot {
     // ---- per-board / per-fan -------------------------------------------
     /// Per-board (per-chain) samples.
     pub chains: Vec<ChainMetric>,
+    /// Per-logical-UART protocol/runtime observations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serial_endpoints: Vec<SerialEndpointMetric>,
+    /// Provenance for `chains` when its contents are aggregate-only rather
+    /// than independently attributable physical boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chains_scope: Option<String>,
     /// Per-fan samples.
     pub fans: Vec<FanMetric>,
 
@@ -414,6 +444,171 @@ impl PrometheusSnapshot {
                 "gauge",
             );
             b.push_str(&format!("dcentrald_btu_h {:.0}\n", self.btu_h));
+        }
+
+        // ---- logical serial endpoints ---------------------------------
+        // These series describe protocol/runtime evidence for a device path.
+        // They intentionally use `logical_path` rather than a chain/slot label
+        // because no physical S19k tty-to-hashboard mapping is proven.
+        if let Some(scope) = self.chains_scope.as_deref() {
+            family(
+                &mut b,
+                "dcentrald_chains_scope_info",
+                "Semantic scope of the legacy chains telemetry (always 1)",
+                "gauge",
+            );
+            b.push_str(&format!(
+                "dcentrald_chains_scope_info{{scope=\"{}\"}} 1\n",
+                escape_label_value(scope)
+            ));
+        }
+
+        if !self.serial_endpoints.is_empty() {
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_info",
+                "Logical serial endpoint lifecycle and parser state (always 1)",
+                "gauge",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_tx_active",
+                "Whether the logical serial endpoint is admitted for work TX",
+                "gauge",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_getaddress_responses",
+                "Valid GetAddress responses observed during endpoint admission",
+                "gauge",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_complete_77_at_work_baud",
+                "Whether a complete 77-chip response was observed at work baud",
+                "gauge",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_work_frames_committed_total",
+                "Complete work frames committed to the logical serial endpoint",
+                "counter",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_rx_wire_bytes_total",
+                "Bytes received from the logical serial endpoint",
+                "counter",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_rx_frames_total",
+                "CRC-valid protocol frames decoded from the logical serial endpoint",
+                "counter",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_crc_rejected_frames_total",
+                "Frames rejected for CRC failure on the logical serial endpoint",
+                "counter",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_buffered_rx_bytes",
+                "Bytes currently buffered by the logical serial endpoint parser",
+                "gauge",
+            );
+            family(
+                &mut b,
+                "dcentrald_serial_endpoint_valid_job_nonce_observations_total",
+                "History-admitted job/nonce observations from the logical serial endpoint; not accepted shares",
+                "counter",
+            );
+            if self
+                .serial_endpoints
+                .iter()
+                .any(|endpoint| endpoint.last_frame_rx_age_s.is_some())
+            {
+                family(
+                    &mut b,
+                    "dcentrald_serial_endpoint_last_frame_rx_age_seconds",
+                    "Age of the last decoded frame from the logical serial endpoint",
+                    "gauge",
+                );
+            }
+            if self
+                .serial_endpoints
+                .iter()
+                .any(|endpoint| endpoint.last_valid_job_nonce_age_s.is_some())
+            {
+                family(
+                    &mut b,
+                    "dcentrald_serial_endpoint_last_valid_job_nonce_age_seconds",
+                    "Age of the last history-admitted job/nonce observation from the logical serial endpoint",
+                    "gauge",
+                );
+            }
+
+            for endpoint in &self.serial_endpoints {
+                let path = escape_label_value(&endpoint.logical_path);
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_info{{logical_path=\"{}\",open_state=\"{}\",tx_role=\"{}\",parser_state=\"{}\"}} 1\n",
+                    path,
+                    escape_label_value(&endpoint.open_state),
+                    escape_label_value(&endpoint.tx_role),
+                    escape_label_value(&endpoint.parser_state),
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_tx_active{{logical_path=\"{}\"}} {}\n",
+                    path,
+                    if endpoint.tx_active { 1 } else { 0 }
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_getaddress_responses{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.getaddress_responses
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_complete_77_at_work_baud{{logical_path=\"{}\"}} {}\n",
+                    path,
+                    if endpoint.complete_77_at_work_baud { 1 } else { 0 }
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_work_frames_committed_total{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.work_frames_committed
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_rx_wire_bytes_total{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.rx_wire_bytes
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_rx_frames_total{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.rx_frames
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_crc_rejected_frames_total{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.crc_rejected_frames
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_buffered_rx_bytes{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.buffered_rx_bytes
+                ));
+                b.push_str(&format!(
+                    "dcentrald_serial_endpoint_valid_job_nonce_observations_total{{logical_path=\"{}\"}} {}\n",
+                    path, endpoint.valid_job_nonce_observations
+                ));
+                if let Some(age) = endpoint.last_frame_rx_age_s {
+                    b.push_str(&format!(
+                        "dcentrald_serial_endpoint_last_frame_rx_age_seconds{{logical_path=\"{}\"}} {}\n",
+                        path, age
+                    ));
+                }
+                if let Some(age) = endpoint.last_valid_job_nonce_age_s {
+                    b.push_str(&format!(
+                        "dcentrald_serial_endpoint_last_valid_job_nonce_age_seconds{{logical_path=\"{}\"}} {}\n",
+                        path, age
+                    ));
+                }
+            }
         }
 
         // ---- per-board temp / hashrate / chips / freq / volt / errors --
@@ -880,6 +1075,8 @@ mod tests {
                     errors: 7,
                 },
             ],
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: vec![
                 FanMetric {
                     id: 0,
@@ -1337,6 +1534,75 @@ mod tests {
         assert!(fams.contains("dcentrald_info"));
         // Default chip model renders as "unknown".
         assert!(txt.contains("model=\"unknown\""));
+    }
+
+    #[test]
+    fn legacy_snapshot_wire_defaults_and_omits_serial_observability() {
+        let snapshot = full_snapshot();
+        let mut wire = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(wire.get("serial_endpoints").is_none());
+        assert!(wire.get("chains_scope").is_none());
+
+        let decoded: PrometheusSnapshot =
+            serde_json::from_value(wire.take()).expect("deserialize legacy snapshot");
+        assert!(decoded.serial_endpoints.is_empty());
+        assert_eq!(decoded.chains_scope, None);
+        assert!(!decoded
+            .to_exposition()
+            .contains("dcentrald_serial_endpoint_"));
+    }
+
+    #[test]
+    fn logical_serial_endpoints_are_independent_and_non_physical_metrics() {
+        let mut snapshot = full_snapshot();
+        snapshot.chains_scope = Some("aggregate_serial_runtime".to_string());
+        snapshot.serial_endpoints = vec![
+            SerialEndpointMetric {
+                logical_path: "/dev/ttyS1".to_string(),
+                open_state: "open".to_string(),
+                tx_role: "work_tx".to_string(),
+                tx_active: true,
+                getaddress_responses: 77,
+                complete_77_at_work_baud: true,
+                work_frames_committed: 11,
+                rx_wire_bytes: 1200,
+                rx_frames: 9,
+                crc_rejected_frames: 2,
+                buffered_rx_bytes: 3,
+                valid_job_nonce_observations: 4,
+                last_frame_rx_age_s: Some(1),
+                last_valid_job_nonce_age_s: Some(6),
+                parser_state: "synchronized".to_string(),
+            },
+            SerialEndpointMetric {
+                logical_path: "/dev/ttyS2".to_string(),
+                open_state: "open".to_string(),
+                tx_role: "rx_only".to_string(),
+                parser_state: "seeking_header".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let text = snapshot.to_exposition();
+        assert_parseable(&text);
+        assert!(text.contains("dcentrald_chains_scope_info{scope=\"aggregate_serial_runtime\"} 1"));
+        assert!(text.contains("dcentrald_serial_endpoint_tx_active{logical_path=\"/dev/ttyS1\"} 1"));
+        assert!(text.contains("dcentrald_serial_endpoint_tx_active{logical_path=\"/dev/ttyS2\"} 0"));
+        assert!(text.contains(
+            "dcentrald_serial_endpoint_valid_job_nonce_observations_total{logical_path=\"/dev/ttyS1\"} 4"
+        ));
+        for line in text
+            .lines()
+            .filter(|line| line.starts_with("dcentrald_serial_endpoint_"))
+        {
+            assert!(!line.contains("physical"));
+            assert!(!line.contains("slot="));
+            assert!(!line.contains("chain="));
+            assert!(!line.contains("hashrate"));
+            assert!(!line.contains("accepted"));
+            assert!(!line.contains("temp"));
+            assert!(!line.contains("voltage"));
+        }
     }
 
     #[test]

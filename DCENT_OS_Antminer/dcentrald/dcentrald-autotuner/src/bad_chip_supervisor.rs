@@ -170,6 +170,12 @@ pub struct BadChipConfig {
     /// `tick()` returns `NoOp` immediately.
     #[serde(default)]
     pub enabled: bool,
+    /// **Default false.** Separate from `enabled`: telemetry can run without
+    /// moving frequency. When true (and `enabled` is true) the daemon applies
+    /// decrease-only `bad_chip_actuation` ceilings. Never raises fans,
+    /// voltage, or EEPROM.
+    #[serde(default)]
+    pub actuate: bool,
 
     /// Below this % of expected nonces → `Degraded`. Default 85.0 (mid of
     /// the RE-004 "roughly 80–90 percent expected" band).
@@ -245,6 +251,7 @@ impl Default for BadChipConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            actuate: false,
             degraded_threshold_pct: default_degraded_pct(),
             bad_threshold_pct: default_bad_pct(),
             min_samples: default_min_samples(),
@@ -451,6 +458,14 @@ impl ChipWindow {
         }
         self.actual_nonces() as f64 / expected
     }
+
+    /// Drop pre-downclock samples. Expected-nonce math after a frequency
+    /// change must not be judged against the old MHz window.
+    fn invalidate_after_freq_change(&mut self) {
+        self.samples.clear();
+        self.consecutive_bad = 0;
+        self.consecutive_good = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +509,28 @@ impl BadChipSupervisor {
     /// early when this returns false).
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Clear the rolling nonce window after a decrease-only downclock.
+    ///
+    /// `chip_index = None` invalidates every chip on `chain_id` (board-profile
+    /// step / halt). Classification state is kept; only the pre-change samples
+    /// are dropped so the next `observe()` uses the new expected rate.
+    pub fn invalidate_after_downclock(&mut self, chain_id: u8, chip_index: Option<u16>) {
+        match chip_index {
+            Some(idx) => {
+                if let Some(window) = self.chip_windows.get_mut(&(chain_id, idx)) {
+                    window.invalidate_after_freq_change();
+                }
+            }
+            None => {
+                for ((cid, _), window) in self.chip_windows.iter_mut() {
+                    if *cid == chain_id {
+                        window.invalidate_after_freq_change();
+                    }
+                }
+            }
+        }
     }
 
     /// Read current state for a specific chip. `Healthy` by default if not
@@ -1194,6 +1231,33 @@ mod tests {
         assert!(z < 0.0 && z > -12.0, "bounded steady-state z, got {z}");
         // pct reflects the recent ratio, not a lifetime sum.
         assert!((w.actual_pct() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn downclock_invalidates_old_expected_rate() {
+        let mut sup = BadChipSupervisor::new(config_enabled(), vec![fp(0)]);
+        // 50% at the old (high) expected rate — enough to Degrade chip 1.
+        let old = snapshot(0, vec![200, 100, 200, 200], None);
+        let first = sup.observe(&old, 200.0);
+        assert_eq!(sup.state(0, 1), ChipHealthState::Degraded);
+        assert!(first
+            .iter()
+            .any(|a| matches!(a, BadChipAction::PerChipDownclock { chip_index: 1, .. })));
+
+        sup.invalidate_after_downclock(0, Some(1));
+
+        // Same actual nonces at the new (halved) expected rate is 100%.
+        // A leftover high-expected window would still look like 50%.
+        let new = snapshot(0, vec![200, 100, 200, 200], None);
+        let after = sup.observe(&new, 100.0);
+        assert!(
+            !after.iter().any(|a| matches!(
+                a,
+                BadChipAction::PerChipDownclock { chip_index: 1, .. }
+                    | BadChipAction::BlacklistChip { chip_index: 1, .. }
+            )),
+            "post-downclock window must not keep judging against the old expected rate: {after:?}"
+        );
     }
 
     // -- 17. W24-BC-2 REGRESSION: a chip at a stable 90% ratio stays Healthy

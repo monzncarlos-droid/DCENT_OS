@@ -34,9 +34,15 @@ if (( sep < 0 )) || (( sep + 1 >= ${#args[@]} )); then
 fi
 
 cargo_args=("${args[@]:0:sep}")
-filter_args=("${args[@]:sep+1}")
+filter="${args[$((sep + 1))]}"
+harness_args=("${args[@]:sep+2}")
 
-list_output=$(cargo test "${cargo_args[@]}" "${filter_args[@]}" -- --list)
+if [[ -z "$filter" ]]; then
+  printf 'ERROR: FILTER must be non-empty\n' >&2
+  exit 2
+fi
+
+list_output=$(cargo test "${cargo_args[@]}" "$filter" -- --list "${harness_args[@]}")
 match_count=$(
   printf '%s\n' "$list_output" |
     awk '/: test$/ { count += 1 } END { print count + 0 }'
@@ -45,10 +51,12 @@ match_count=$(
 if (( match_count < 1 )); then
   printf 'ERROR: filter matched zero tests (plain cargo test would false-green)\n' >&2
   printf 'cargo args: %s\n' "${cargo_args[*]}" >&2
-  printf 'filter: %s\n' "${filter_args[*]}" >&2
+  printf 'filter: %s\n' "$filter" >&2
+  printf 'harness args: %s\n' "${harness_args[*]}" >&2
   printf '%s\n' "$list_output" >&2
   exit 1
 fi
 
-printf 'filtered cargo test: matches=%s filter=%s\n' "$match_count" "${filter_args[*]}"
-cargo test "${cargo_args[@]}" "${filter_args[@]}"
+printf 'filtered cargo test: matches=%s filter=%s harness_args=%s\n' \
+  "$match_count" "$filter" "${harness_args[*]}"
+cargo test "${cargo_args[@]}" "$filter" -- "${harness_args[@]}"

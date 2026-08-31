@@ -5,7 +5,7 @@
 //! S9 SE `cgminer` strings. No BC TX.
 
 use crate::s9se_vil::{
-    pack_set_config_all, pack_set_config_single, pack_vil_short, CRC5_VIL_SHORT_BITS, crc5_bits,
+    crc5_bits, pack_set_config_all, pack_set_config_single, pack_vil_short, CRC5_VIL_SHORT_BITS,
     HDR_READ_ALL, HDR_READ_SINGLE, VIL_LEN_SHORT,
 };
 use crate::ticket_mask::{bit_reverse_u32_bytewise, TicketMaskEncoding};
@@ -92,7 +92,11 @@ pub fn pack_ticket_mask_broadcast(ticket_mask: u32) -> [u8; 9] {
 }
 
 pub fn pack_core_number(chip_addr: u8) -> [u8; 9] {
-    pack_set_config_single(0, REG_CHIP_ADDRESS, CORE_NUMBER_VALUE_HI | u32::from(chip_addr))
+    pack_set_config_single(
+        0,
+        REG_CHIP_ADDRESS,
+        CORE_NUMBER_VALUE_HI | u32::from(chip_addr),
+    )
 }
 
 /// `enable_core_clock_BM1393(..., mode=1, ...)` broadcast CORE_CMD.

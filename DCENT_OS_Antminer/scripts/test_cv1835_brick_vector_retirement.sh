@@ -12,6 +12,7 @@ API_SOURCE="$PROJECT_DIR/dcentrald/dcentrald-api/src/routes/restore_to_stock.rs"
 API_TEST="$PROJECT_DIR/dcentrald/dcentrald-api/tests/restore_to_stock_routes.rs"
 BUILD_DRIVER="$SCRIPT_DIR/build_in_docker.sh"
 STANDALONE_BUILD="$SCRIPT_DIR/build_cv1835_s19jpro.sh"
+OVERLAY_PLANNER="$SCRIPT_DIR/cv1835_overlay_plan.py"
 NAME_TEST="$SCRIPT_DIR/test_firmware_release_name.sh"
 UPDATER="$SCRIPT_DIR/safe_sysupgrade_cv_emmc.sh"
 REVERT="$SCRIPT_DIR/revert_to_stock_cv1835.sh"
@@ -111,6 +112,13 @@ assert_builtin_refusal 'CV updater' "$UPDATER" 3
 assert_builtin_refusal 'CV stock revert' "$REVERT" 3
 assert_builtin_refusal 'target uninstall alias' "$OVERLAY/uninstall.sh" 2
 assert_builtin_refusal 'standalone CV build entry point' "$STANDALONE_BUILD" 3
+assert_file 'CV overlay planner exists' "$OVERLAY_PLANNER"
+assert_matches 'CV overlay planner is not_implemented' \
+    'DENIED_EXECUTION = "not_implemented"' "$OVERLAY_PLANNER"
+assert_matches 'CV overlay planner exits EX_UNAVAILABLE' \
+    'EX_UNAVAILABLE = 78' "$OVERLAY_PLANNER"
+assert_not_matches 'CV overlay planner has no storage-mutation API' \
+    'nandwrite|flash_erase|nanddump|/dev/mtd|/dev/mmc' "$OVERLAY_PLANNER"
 assert_builtin_refusal 'CV Buildroot post-build hook' "$POST_BUILD" 2
 assert_builtin_refusal 'CV Buildroot post-image hook' "$POST_IMAGE" 2
 assert_matches 'CV post-build declares typed non-activating build policy' \
@@ -197,8 +205,8 @@ assert_not_matches 'kernel fragment names no deleted defconfig or admitted users
 assert_matches 'shared matrix encodes no CV artifact' \
     '"board_target":"cv1835-s19jpro".*"artifact_kind":"none".*"artifact_maturity":"not_implemented"' \
     "$MATRIX_JSON"
-assert_matches 'hardware enablement matrix uses schema 2 for the new wire values' \
-    '^[[:space:]]*"schema":[[:space:]]*2,' "$MATRIX_JSON"
+assert_matches 'hardware enablement matrix uses current schema 4' \
+    '^[[:space:]]*"schema":[[:space:]]*4,' "$MATRIX_JSON"
 assert_matches 'shared schema has a typed absent-artifact kind' \
     '^[[:space:]]*None,[[:space:]]*$' "$SCHEMA_HARDWARE"
 assert_matches 'shared schema has typed not-implemented artifact maturity' \
@@ -206,18 +214,22 @@ assert_matches 'shared schema has typed not-implemented artifact maturity' \
 assert_not_matches 'capability schema contains no CV deployment unlock' \
     'cv1835-emmc-proven|Cv1835EmmcProven' "$SCHEMA_CAPABILITY"
 
-assert_matches 'HAL refuses CV before constructor/MMIO mutation' \
-    'CV1835 runtime NOT IMPLEMENTED: automatic CVitek HAL construction and pinmux mutation are disabled' \
-    "$HAL_FACTORY"
-assert_not_matches 'automatic platform detection cannot construct the CV HAL' \
-    'return Ok\(Box::new\(cvitek::CViTekPlatform::new\(\)\?\)\)' "$HAL_FACTORY"
+assert_matches 'automatic CV detection routes through the default-off constructor gate' \
+    'Box::new\(cvitek::CViTekPlatform::new\(\)\?\)' "$HAL_FACTORY"
+assert_matches 'automatic CV detection documents the exact default-off operator gate' \
+    'operator-authorized opt-in \(`DCENT_CV1835_EXPERIMENTAL_RUNTIME=1`' "$HAL_FACTORY"
 assert_matches 'CV HAL modules are crate-private evidence, not public runtime API' \
     '^pub\(crate\) mod cvitek;' "$HAL_FACTORY"
-assert_matches 'direct CV constructor is an unconditional typed refusal' \
-    'CV1835 runtime NOT IMPLEMENTED: reverse-engineered register evidence is retained' \
+assert_matches 'direct CV constructor retains a typed default refusal' \
+    'CV1835 runtime NOT IMPLEMENTED by default: reverse-engineered bring-up is retained' \
     "$HAL_CVITEK"
-assert_not_matches 'direct CV constructor has no pinmux, UART-table, probe, or env authority' \
-    'replay_pinmux\(\)\?|select_uart_table_cv1835\(\)\?|std::env::var\(CV1835_ACCEPT_UNVERIFIED_ENV\)' \
+assert_matches 'CV experimental runtime gate admits only the exact value one' \
+    'raw == Some\("1"\)' "$HAL_CVITEK"
+assert_matches 'CV experimental runtime gate has one named operator control' \
+    'pub const CV1835_EXPERIMENTAL_RUNTIME_ENV: &str = "DCENT_CV1835_EXPERIMENTAL_RUNTIME";' \
+    "$HAL_CVITEK"
+assert_not_matches 'direct CV constructor has no pinmux, UART-table, or legacy unverified override' \
+    'replay_pinmux\(\)\?|select_uart_table_cv1835\(\)\?|CV1835_ACCEPT_UNVERIFIED_ENV' \
     "$HAL_CVITEK"
 assert_not_matches 'daemon safe-off exposes no CV power mutation' \
     'CvitekDisablePsu|platform::cvitek::disable_psu' "$DAEMON_MAIN"
@@ -240,7 +252,12 @@ else
     not_ok 'safe-off failure guard must precede every quiet-fan mutation'
 fi
 
-assert_absent 'speculative toolbox CV artifact classifier is absent' \
+assert_file 'toolbox retains the read-only CV artifact classifier' \
+    "$TOOLBOX/core/cv1835_artifact_state.py"
+assert_matches 'toolbox CV artifact classifier declares its read-only boundary' \
+    'classifier is \*\*read-only\*\*' "$TOOLBOX/core/cv1835_artifact_state.py"
+assert_not_matches 'toolbox CV artifact observations cannot claim install authorization' \
+    'Persistent install is unlocked|unlock persistent install' \
     "$TOOLBOX/core/cv1835_artifact_state.py"
 assert_not_matches 'toolbox planner registers no CV install fact or unlock' \
     'board_family="cv1835"|cv1835-emmc-proven|DCENT_CV1835_EMMC_PROVEN' \

@@ -1,0 +1,75 @@
+# DCENT_OS K230 buildroot defconfig — first DCENT image pipeline target (M2).
+#
+# Derived from kendryte k230_evb_defconfig (k230_linux_sdk dev@42f0988) with
+# DCENT changes:
+#   - U-Boot board k230_evb_nand (SPI-NAND boot: env in SPI NAND,
+#     k230_evb_nand DT) — the boot medium of the Avalon Nano 3S class
+#   - AI/multimedia stack stripped (nncase/opencv/webrtc/python3/...) —
+#     a miner bring-up image needs none of it; this also cuts hours of
+#     build time and tens of GB of build state
+#   - Dropbear instead of OpenSSH (fleet SSH with a small footprint)
+#   - rootfs.tar kept as the canonical DCENT rootfs artifact: the SPI-NAND
+#     UBI volume is ubinize'd at assembly time (chip parameters are
+#     bench-tunable, see scripts/assemble_k230_kdimg.sh)
+#   - ext2 kept only because the vendor post-image.sh genimage SD pass
+#     expects rootfs.ext4; the DCENT artifact is the .tar + UBI wrap
+#
+# Boot map note: the public SDK uboot expects uboot@0x80000 / rtt@0x200000 /
+# linux@0xA00000 on SPI NAND (board/canaan/common/k230_board_common.h), while
+# the stock Nano 3S AUP map is uboot@0x100000 / rtt@0x600000 / linux@0xA00000.
+# The Nano 3S offsets are patched in at assembly/uboot-config time before any
+# bench flash; linux already matches.
+
+BR2_riscv=y
+BR2_RISCV_ISA_RVC=y
+BR2_RISCV_ISA_RVV=y
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_PATH="/opt/toolchain/Xuantie-900-gcc-linux-6.6.0-glibc-x86_64-V3.0.2/"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="riscv64-unknown-linux-gnu"
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_6_6=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+# BR2_TOOLCHAIN_EXTERNAL_INET_RPC is not set
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+BR2_TARGET_OPTIMIZATION="-mcpu=c908v -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize"
+BR2_DL_DIR="$(TOPDIR)/../../dl"
+BR2_SYSTEM_DHCP="eth0"
+BR2_ROOTFS_OVERLAY="board/canaan/k230-soc/rootfs_overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="board/canaan/k230-soc/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="board/canaan/k230-soc/post-image.sh"
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_GIT=y
+BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/ruyisdk/linux-xuantie-kernel.git"
+BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="7d4e1f444f461dbe3833bd99a4640e7b6c2cd529"
+BR2_LINUX_KERNEL_DEFCONFIG="k230"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="board/canaan/k230-soc/fragment/linux.fragment board/canaan/k230-soc/fragment/linux.led_btn board/canaan/k230-soc/fragment/linux.dcent.fragment"
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+# Both Avalon home-line DTs build from the one tree; the per-model kdimg
+# picks its DTB at assembly time (k230-nano3s.dtb / k230-nano3.dtb).
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="canaan/k230-nano3s canaan/k230-nano3 canaan/k230-evb"
+BR2_PACKAGE_LINUX_TOOLS_GPIO=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/canaan/k230-soc/fragment/busybox.fragment"
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_E2FSPROGS=y
+BR2_PACKAGE_EVTEST=y
+BR2_PACKAGE_LIBGPIOD2=y
+BR2_PACKAGE_LIBGPIOD2_TOOLS=y
+BR2_PACKAGE_SPI_TOOLS=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+BR2_TARGET_ROOTFS_TAR=y
+BR2_TARGET_OPENSBI=y
+BR2_TARGET_OPENSBI_CUSTOM_VERSION=y
+BR2_TARGET_OPENSBI_CUSTOM_VERSION_VALUE="1.4"
+BR2_TARGET_OPENSBI_PLAT="generic"
+# BR2_TARGET_OPENSBI_INSTALL_DYNAMIC_IMG is not set
+BR2_TARGET_OPENSBI_LINUX_PAYLOAD=y
+BR2_TARGET_OPENSBI_ADDITIONAL_VARIABLES="FW_TEXT_START=0"
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BOARDNAME="k230_evb_nand"
+BR2_TARGET_UBOOT_CUSTOM_VERSION=y
+BR2_TARGET_UBOOT_CUSTOM_VERSION_VALUE="2022.10"
+BR2_PACKAGE_HOST_GENIMAGE=y

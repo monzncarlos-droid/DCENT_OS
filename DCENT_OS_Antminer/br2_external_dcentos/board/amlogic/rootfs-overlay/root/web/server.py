@@ -86,6 +86,98 @@ def release_image():
     return os.path.exists(RELEASE_IMAGE_MARKER)
 
 
+def _strip_host_port(host):
+    """Strip :port from Host / Origin host. Default :80 must match a bare host."""
+    host = (host or "").strip().rstrip(".")
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[1:end]
+    if ":" in host and host.count(":") == 1:
+        name, port = host.rsplit(":", 1)
+        if name and port.isdigit():
+            return name
+    return host
+
+
+def _is_loopback_or_literal_ip(host):
+    if host.lower() == "localhost":
+        return True
+    try:
+        import ipaddress
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_mdns_local(host):
+    labels = host.rsplit(".", 1)
+    return bool(labels) and labels[-1].lower() == "local"
+
+
+def _extra_csrf_hosts():
+    raw = os.environ.get("DCENT_CSRF_ALLOWED_HOSTS", "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def host_header_is_allowed(host):
+    """Parity with dcentrald-api csrf_allowlist.rs. Origin==Host is not enough."""
+    host = _strip_host_port(host)
+    if not host:
+        return False
+    if _is_loopback_or_literal_ip(host) or _is_mdns_local(host):
+        return True
+    bare = host.lower()
+    return any(_strip_host_port(extra).lower() == bare for extra in _extra_csrf_hosts())
+
+
+def cors_origin_allowed(origin, host):
+    """Mirror dcentrald-api csrf_allowlist: localhost, .local, literal IP.
+
+    Origin==Host without the allowlist is DNS-rebinding. :80 overlay Host
+    headers are compared after stripping the port so `ip` and `ip:80` match.
+    """
+    if not origin:
+        return False
+    origin = origin.strip()
+    host_only = origin
+    if host_only.startswith("https://"):
+        host_only = host_only[8:]
+    elif host_only.startswith("http://"):
+        host_only = host_only[7:]
+    origin_host = _strip_host_port(host_only.split("/")[0])
+    if origin_host.lower() in ("localhost", "127.0.0.1", "::1"):
+        return True
+    if _is_mdns_local(origin_host):
+        return True
+    if not host:
+        return False
+    host_bare = _strip_host_port(host)
+    if origin_host.lower() != host_bare.lower():
+        return False
+    return host_header_is_allowed(host)
+
+
+def cors_allow_origin_value(headers):
+    origin = headers.get("Origin") if headers else None
+    host = headers.get("Host") if headers else None
+    if cors_origin_allowed(origin, host):
+        return origin
+    return None
+
+
+_WALLET_RE = re.compile(r"\b(bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{20,}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b")
+
+
+def mask_wallet_lines(lines):
+    """Redact bech32/base58 payout-shaped strings in local dashboard logs."""
+    out = []
+    for line in lines:
+        out.append(_WALLET_RE.sub(lambda m: m.group(0)[:6] + "…" + m.group(0)[-4:], line))
+    return out
+
+
 def bearer_auth_header(headers):
     """Extract a Bearer Authorization header from an HTTP header mapping."""
     value = headers.get("Authorization")
@@ -545,6 +637,9 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                 return
             if self.path.startswith("/api/dashboard/log"):
                 # /api/dashboard/log?lines=N (default 100, max 1000)
+                if release_image() and not bearer_auth_header(self.headers):
+                    self.send_json({"error": "unauthorized"}, status=401)
+                    return
                 lines = 100
                 if "?" in self.path:
                     qs = self.path.split("?", 1)[1]
@@ -555,12 +650,15 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
                             except ValueError:
                                 pass
                 self.send_json({
-                    "lines": tail_log(DCENTRALD_LOG, lines=lines),
+                    "lines": mask_wallet_lines(tail_log(DCENTRALD_LOG, lines=lines)),
                     "path": DCENTRALD_LOG,
                     "ts": int(time.time()),
                 })
                 return
             if self.path == "/api/dashboard/probe":
+                if release_image() and not bearer_auth_header(self.headers):
+                    self.send_json({"error": "unauthorized"}, status=401)
+                    return
                 # Full diagnostic snapshot — same data as health but explicit
                 self.send_json({
                     "braiins_glitch_mirror": get_braiins_glitch_mirror(),
@@ -685,7 +783,10 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle CORS preflight for all paths."""
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allow = cors_allow_origin_value(self.headers)
+        if allow:
+            self.send_header("Access-Control-Allow-Origin", allow)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
@@ -695,7 +796,10 @@ class DCENTosHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allow = cors_allow_origin_value(self.headers)
+        if allow:
+            self.send_header("Access-Control-Allow-Origin", allow)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 

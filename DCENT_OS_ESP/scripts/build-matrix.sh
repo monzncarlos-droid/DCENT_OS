@@ -8,73 +8,56 @@ BUILD_ROOT=${BUILD_ROOT:-$ROOT_DIR/build-matrix}
 DIST_ROOT=${DIST_ROOT:-$ROOT_DIR/dist}
 INCLUDE_INTERNAL_TARGETS=${INCLUDE_INTERNAL_TARGETS:-0}
 PACKAGE_SCRIPT="$SCRIPT_DIR/package-firmware.sh"
+TARGET_MATRIX_TOOL="$SCRIPT_DIR/target_matrix.py"
+PYTHON=${PYTHON:-python}
 
 export CC_xtensa_esp32s3_espidf=${CC_xtensa_esp32s3_espidf:-xtensa-esp32s3-elf-gcc}
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$ROOT_DIR" log -1 --format=%ct -- .)}
+case "$SOURCE_DATE_EPOCH" in
+    ''|*[!0-9]*) printf '%s\n' "Unable to derive numeric SOURCE_DATE_EPOCH" >&2; exit 1 ;;
+esac
+export SOURCE_DATE_EPOCH
 
 cd "$ROOT_DIR"
+"$PYTHON" "$TARGET_MATRIX_TOOL" validate
 
 build_one() {
     feature=$1
     board_target=$2
+    flash_layout=$3
     cargo_target_dir="$BUILD_ROOT/$board_target"
     release_dir="$cargo_target_dir/xtensa-esp32s3-espidf/release"
 
-    printf '%s\n' "==> Building $board_target ($feature)"
-    CARGO_TARGET_DIR="$cargo_target_dir" cargo build --locked --release -p dcentaxe --no-default-features --features "$feature"
+    if [ "$flash_layout" = "n16r8" ]; then
+        sdkconfig_defaults="sdkconfig.defaults;sdkconfig.defaults.16mb"
+        partitions_csv="$ROOT_DIR/partitions-16mb.csv"
+    else
+        sdkconfig_defaults="sdkconfig.defaults"
+        partitions_csv="$ROOT_DIR/partitions.csv"
+    fi
+
+    printf '%s\n' "==> Building $board_target ($feature, $flash_layout)"
+    CARGO_TARGET_DIR="$cargo_target_dir" \
+        ESP_IDF_SDKCONFIG_DEFAULTS="$sdkconfig_defaults" \
+        cargo build --locked --release -p dcentaxe --no-default-features --features "$feature"
 
     printf '%s\n' "==> Packaging $board_target"
-    TARGET_DIR="$release_dir" BOARD_TARGET="$board_target" OUT_DIR="$DIST_ROOT/$board_target" "$PACKAGE_SCRIPT"
+    TARGET_DIR="$release_dir" \
+        BOARD_TARGET="$board_target" \
+        OUT_DIR="$DIST_ROOT/$board_target" \
+        PARTITIONS_CSV="$partitions_csv" \
+        "$PACKAGE_SCRIPT"
 }
 
-# Default public release matrix: exactly the six DCENT Toolbox install targets.
-build_one bitaxe-max bitaxe-max
-build_one bitaxe-ultra bitaxe-ultra
-build_one bitaxe-supra bitaxe-supra
-build_one bitaxe-gamma bitaxe-gamma
-build_one bitaxe-hex-ultra bitaxe-hex-ultra
-build_one bitaxe-hex-supra bitaxe-hex-supra
+build_scope() {
+    scope=$1
+    "$PYTHON" "$TARGET_MATRIX_TOOL" list --scope "$scope" --format tsv |
+        while IFS="$(printf '\t')" read -r feature board_target _device_model flash_layout _package_policy; do
+            build_one "$feature" "$board_target" "$flash_layout"
+        done
+}
 
+build_scope public
 if [ "$INCLUDE_INTERNAL_TARGETS" = "1" ]; then
-    build_one bitaxe-gamma-duo bitaxe-gamma-duo
-    build_one bitaxe-gt bitaxe-gt
-    build_one bitaxe-touch bitaxe-touch
-    build_one bitaxe-gt-touch bitaxe-gt-touch
-    build_one nerdnos nerdnos
-    build_one nerdaxe nerdaxe
-    build_one nerdaxe-gamma nerdaxe-gamma
-    build_one nerdqaxe-plus nerdqaxe-plus
-    build_one nerdqaxe-pp nerdqaxe-pp
-    build_one nerdoctaxe-plus nerdoctaxe-plus
-    build_one nerdoctaxe-gamma nerdoctaxe-gamma
-    build_one nerdqx nerdqx
-    build_one nerdhaxe-gamma nerdhaxe-gamma
-    build_one nerdeko nerdeko
-    build_one q1370 q1370
-    build_one q1373 q1373
-    build_one dcent-axe-bm1397 dcent-axe-bm1397
-    build_one dcent-axe-quad-bm1397 dcent-axe-quad-bm1397
-    build_one dcent-axe-hex-bm1397 dcent-axe-hex-bm1397
-    # 16 MB (N16R8) flash targets — Hammer BC0x/DC0x and Lucky LVxx all use the
-    # shared 16 MB layout (partitions-16mb.csv), so they build under one loop.
-    # Subshell keeps the sdkconfig override from leaking to other targets;
-    # cargo's .cargo/config.toml [env] entry does not override a variable
-    # already present in the environment, so the export below wins.
-    # PARTITIONS_CSV must be exported too: package-firmware.sh reads it to
-    # compute ota.slotSize / updateFitsSlot, and defaulting to the 8 MB
-    # partitions.csv would publish a manifest that lies about the slot.
-    #
-    # Lucky LVxx is EXPERIMENTAL — no Lucky hardware exists on any bench; these
-    # images are host-built and have never been flashed to a Lucky unit.
-    for flash16_target in \
-        hammer-bc01 hammer-bc01-pro hammer-bc02 hammer-bc04 \
-        hammer-dc02 hammer-dc04 hammer-dc06 \
-        lucky-lv06 lucky-lv07 lucky-lv08 \
-        bitforge-nano bitaxe-naja
-    do
-        (
-            export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.16mb"
-            export PARTITIONS_CSV="$ROOT_DIR/partitions-16mb.csv"
-            build_one "$flash16_target" "$flash16_target"
-        )
-    done
+    build_scope internal
 fi

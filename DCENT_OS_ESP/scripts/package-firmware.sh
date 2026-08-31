@@ -14,12 +14,16 @@ ESPTOOL=${ESPTOOL:-python}
 ESPTOOL_MODULE=${ESPTOOL_MODULE:-esptool}
 PYTHON=${PYTHON:-python}
 ELF_PATH=${ELF_PATH:-}
-PARTITIONS_CSV=${PARTITIONS_CSV:-$ROOT_DIR/partitions.csv}
+PARTITIONS_CSV=${PARTITIONS_CSV:-}
 OTA_APP_PARTITION=${DCENT_OTA_APP_PARTITION:-ota_0}
 SIGNING_KEY_PEM=${DCENT_OTA_PRIVATE_KEY_PEM:-}
 SIGNING_KEY_ID=${DCENT_OTA_KEY_ID:-}
 PUBLIC_KEY_HEX=${DCENT_OTA_PUBLIC_KEY_HEX:-}
 ENFORCE_SIGNED_OTA=${DCENT_ENFORCE_SIGNED_OTA:-}
+TARGET_MATRIX_TOOL="$SCRIPT_DIR/target_matrix.py"
+PROMOTION_CANDIDATE_TOOL="$SCRIPT_DIR/promotion_candidate.py"
+PROMOTION_CANDIDATE_PATH=${DCENTAXE_PROMOTION_CANDIDATE_PATH:-}
+HARDWARE_EVIDENCE_INDEX="$ROOT_DIR/hardware-evidence/index.json"
 
 if [ -z "$BOARD_TARGET" ]; then
     printf '%s\n' "BOARD_TARGET is required" >&2
@@ -27,52 +31,86 @@ if [ -z "$BOARD_TARGET" ]; then
 fi
 
 device_model_for_board_target() {
-    case "$1" in
-        bitaxe-max) printf '%s\n' "max" ;;
-        bitaxe-ultra) printf '%s\n' "ultra" ;;
-        bitaxe-supra) printf '%s\n' "supra" ;;
-        bitaxe-gamma) printf '%s\n' "gamma" ;;
-        bitaxe-gamma-duo) printf '%s\n' "gammaduo" ;;
-        bitaxe-gt) printf '%s\n' "gammaturbo" ;;
-        bitaxe-touch) printf '%s\n' "touch" ;;
-        bitaxe-gt-touch) printf '%s\n' "gt_touch" ;;
-        bitaxe-hex-ultra) printf '%s\n' "hexultra" ;;
-        bitaxe-hex-supra) printf '%s\n' "suprahex" ;;
-        nerdnos) printf '%s\n' "nerdnos" ;;
-        nerdaxe) printf '%s\n' "nerdaxe" ;;
-        nerdqaxe-plus) printf '%s\n' "nerdqaxeplus" ;;
-        nerdqaxe-pp) printf '%s\n' "nerdqaxepp" ;;
-        nerdoctaxe-plus) printf '%s\n' "nerdoctaxeplus" ;;
-        nerdoctaxe-gamma) printf '%s\n' "nerdoctaxegamma" ;;
-        dcent-axe-bm1397) printf '%s\n' "dcentaxe_bm1397" ;;
-        dcent-axe-quad-bm1397) printf '%s\n' "dcentaxe_quad_bm1397" ;;
-        dcent-axe-hex-bm1397) printf '%s\n' "dcentaxe_hex_bm1397" ;;
-        hammer-bc01) printf '%s\n' "hammer_bc01" ;;
-        hammer-bc01-pro) printf '%s\n' "hammer_bc01_pro" ;;
-        hammer-bc02) printf '%s\n' "hammer_bc02" ;;
-        hammer-bc04) printf '%s\n' "hammer_bc04" ;;
-        hammer-dc02) printf '%s\n' "hammer_dc02" ;;
-        hammer-dc04) printf '%s\n' "hammer_dc04" ;;
-        hammer-dc06) printf '%s\n' "hammer_dc06" ;;
-        # Lucky Miner LVxx (EXPERIMENTAL — no live hardware; host-tested only).
-        # These strings MUST byte-match BitAxeModel::canonical_key() in
-        # dcentaxe-hal/src/board.rs: the device_model is bound into the OTA
-        # schema-2 signed message, so a mismatch produces an artifact the
-        # device correctly refuses.
-        lucky-lv06) printf '%s\n' "lv06" ;;
-        lucky-lv07) printf '%s\n' "lv07" ;;
-        lucky-lv08) printf '%s\n' "lv08" ;;
-        *)
-            printf '%s\n' "Unknown BOARD_TARGET '$1'" >&2
-            exit 1
-            ;;
-    esac
+    "$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$1" device_model
 }
 
-DEFAULT_DEVICE_MODEL=$(device_model_for_board_target "$BOARD_TARGET")
+candidate_value() {
+    "$PYTHON" "$PROMOTION_CANDIDATE_TOOL" lookup "$PROMOTION_CANDIDATE_PATH" "$1"
+}
+
+"$PYTHON" "$TARGET_MATRIX_TOOL" validate >/dev/null
+PROMOTION_STATE=registry
+PROMOTION_CANDIDATE_ID=""
+PROMOTION_CANDIDATE_DESCRIPTOR_SHA256=""
+QUALIFICATION_ONLY=false
+if [ -n "$PROMOTION_CANDIDATE_PATH" ]; then
+    if [ ! -f "$PROMOTION_CANDIDATE_PATH" ]; then
+        printf '%s\n' "Promotion candidate descriptor not found: $PROMOTION_CANDIDATE_PATH" >&2
+        exit 1
+    fi
+    "$PYTHON" "$PROMOTION_CANDIDATE_TOOL" validate "$PROMOTION_CANDIDATE_PATH" --for-build >/dev/null
+    CANDIDATE_BOARD_TARGET=$(candidate_value board_target)
+    if [ "$CANDIDATE_BOARD_TARGET" != "$BOARD_TARGET" ]; then
+        printf '%s\n' "Promotion candidate target $CANDIDATE_BOARD_TARGET does not match $BOARD_TARGET" >&2
+        exit 1
+    fi
+    PROMOTION_CANDIDATE_ID=$(candidate_value candidate_id)
+    if [ "${DCENTAXE_PROMOTION_CANDIDATE_VALIDATED:-}" != "$PROMOTION_CANDIDATE_ID" ]; then
+        printf '%s\n' "DCENTAXE_PROMOTION_CANDIDATE_VALIDATED must equal $PROMOTION_CANDIDATE_ID" >&2
+        exit 1
+    fi
+    if [ "${DCENTAXE_PROMOTION_CANDIDATE_PACKAGE_CONFIRM:-}" != "package-$BOARD_TARGET" ]; then
+        printf '%s\n' "Set DCENTAXE_PROMOTION_CANDIDATE_PACKAGE_CONFIRM=package-$BOARD_TARGET" >&2
+        exit 1
+    fi
+    PROMOTION_CANDIDATE_DESCRIPTOR_SHA256=$("$PYTHON" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$PROMOTION_CANDIDATE_PATH")
+    DEFAULT_DEVICE_MODEL=$(candidate_value device_model)
+    HARDWARE_FAMILY=$(candidate_value hardware_family)
+    SUPPORT_TIER=$(candidate_value support_tier)
+    EVIDENCE_LEVEL=$(candidate_value evidence_level)
+    RUNTIME_MODE=$(candidate_value runtime_mode)
+    INSTALL_POLICY=$(candidate_value install_policy)
+    PACKAGE_POLICY=$(candidate_value package_policy)
+    FLASH_LAYOUT=$(candidate_value flash_layout)
+    PRODUCTION_BLOCKERS=$(candidate_value blockers)
+    PROMOTION_RECEIPT_ID=$(candidate_value promotion_receipt_id)
+    CANDIDATE_VERSION=$(candidate_value source.firmware_version)
+    PROMOTION_STATE=qualification
+    QUALIFICATION_ONLY=true
+    ENFORCE_SIGNED_OTA=1
+else
+    DEFAULT_DEVICE_MODEL=$(device_model_for_board_target "$BOARD_TARGET")
+    HARDWARE_FAMILY=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" hardware_family)
+    SUPPORT_TIER=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" support_tier)
+    EVIDENCE_LEVEL=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" evidence_level)
+    RUNTIME_MODE=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" runtime_mode)
+    INSTALL_POLICY=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" install_policy)
+    PACKAGE_POLICY=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" package_policy)
+    FLASH_LAYOUT=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" flash_layout)
+    PRODUCTION_BLOCKERS=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" blockers)
+    PROMOTION_RECEIPT_ID=$("$PYTHON" "$TARGET_MATRIX_TOOL" lookup "$BOARD_TARGET" promotion_receipt_id)
+fi
+PROMOTION_RECEIPT_JSON=$("$PYTHON" -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "$PROMOTION_RECEIPT_ID")
+PROMOTION_CANDIDATE_ID_JSON=$("$PYTHON" -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "$PROMOTION_CANDIDATE_ID")
+PROMOTION_CANDIDATE_DESCRIPTOR_SHA_JSON=$("$PYTHON" -c 'import json, sys; print(json.dumps(sys.argv[1] or None))' "$PROMOTION_CANDIDATE_DESCRIPTOR_SHA256")
+if [ "$INSTALL_POLICY" = "production" ]; then
+    ENFORCE_SIGNED_OTA=1
+fi
+
+if [ -z "$PARTITIONS_CSV" ]; then
+    if [ "$FLASH_LAYOUT" = "n16r8" ]; then
+        PARTITIONS_CSV="$ROOT_DIR/partitions-16mb.csv"
+    else
+        PARTITIONS_CSV="$ROOT_DIR/partitions.csv"
+    fi
+fi
 
 if [ -z "$VERSION" ]; then
     VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | sed -n '1p')
+fi
+if [ -n "$PROMOTION_CANDIDATE_PATH" ] && [ "$VERSION" != "$CANDIDATE_VERSION" ]; then
+    printf '%s\n' "Candidate firmware version is $CANDIDATE_VERSION, not $VERSION" >&2
+    exit 1
 fi
 
 if [ -z "$OUT_DIR" ]; then
@@ -209,6 +247,20 @@ require_path "$BOOTLOADER" "Bootloader"
 require_path "$PARTITION_TABLE" "Partition table"
 require_path "$OTA_DATA" "OTA data"
 require_path "$PARTITIONS_CSV" "Partition CSV"
+require_path "$HARDWARE_EVIDENCE_INDEX" "Hardware evidence index"
+if [ -n "$PROMOTION_RECEIPT_ID" ]; then
+    "$PYTHON" -c '
+import pathlib
+import sys
+
+elf, receipt_id = pathlib.Path(sys.argv[1]), sys.argv[2].encode("ascii")
+if receipt_id not in elf.read_bytes():
+    raise SystemExit(
+        "ELF does not contain the compiled promotion receipt ID; refusing stale/mislabeled package"
+    )
+' "$ELF_PATH" "$PROMOTION_RECEIPT_ID"
+fi
+HARDWARE_EVIDENCE_INDEX_SHA=$(sha256_file "$HARDWARE_EVIDENCE_INDEX")
 OTA_APP_OFFSET=$(partition_offset_bytes "$OTA_APP_PARTITION")
 OTA_DATA_OFFSET=$(partition_offset_bytes "otadata")
 
@@ -282,6 +334,20 @@ cat >"$MANIFEST_PATH" <<EOF
   "packageType": "esp32-factory-and-ota-bundle",
   "boardTarget": "$BOARD_TARGET",
   "deviceModel": "$DEVICE_MODEL",
+  "hardwareFamily": "$HARDWARE_FAMILY",
+  "supportTier": "$SUPPORT_TIER",
+  "evidenceLevel": "$EVIDENCE_LEVEL",
+  "runtimeMode": "$RUNTIME_MODE",
+  "installPolicy": "$INSTALL_POLICY",
+  "packagePolicy": "$PACKAGE_POLICY",
+  "flashLayout": "$FLASH_LAYOUT",
+  "productionBlockers": $PRODUCTION_BLOCKERS,
+  "promotionReceiptId": $PROMOTION_RECEIPT_JSON,
+  "promotionState": "$PROMOTION_STATE",
+  "promotionCandidateId": $PROMOTION_CANDIDATE_ID_JSON,
+  "promotionCandidateDescriptorSha256": $PROMOTION_CANDIDATE_DESCRIPTOR_SHA_JSON,
+  "qualificationOnly": $QUALIFICATION_ONLY,
+  "hardwareEvidenceIndexSha256": "$HARDWARE_EVIDENCE_INDEX_SHA",
   "version": "$VERSION",
   "createdAtUtc": "$CREATED_AT",
   "ota": {

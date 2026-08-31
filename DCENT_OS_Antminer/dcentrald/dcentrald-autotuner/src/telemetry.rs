@@ -398,7 +398,8 @@ pub fn build_efficiency_snapshot(
         for chip in &profile.chips {
             let power = power_model.chip_power_w(voltage_v, chip.operating_mhz);
             let hashrate =
-                crate::chip_geometry::chip_hashrate_ghs_for_chip(chip_id, chip.operating_mhz);
+                crate::chip_geometry::chip_hashrate_ghs_for_chip(chip_id, chip.operating_mhz)
+                    .unwrap_or(0.0);
             let hashrate_ths = hashrate / 1000.0;
             let efficiency = if hashrate_ths > 0.0 {
                 power / hashrate_ths
@@ -755,7 +756,8 @@ mod tests {
         );
 
         let snapshot = build_efficiency_snapshot(&profiles, 1.0);
-        let expected_hashrate = crate::chip_geometry::chip_hashrate_ghs_for_chip(0x1398, 500);
+        let expected_hashrate =
+            crate::chip_geometry::chip_hashrate_ghs_for_chip(0x1398, 500).expect("BM1398 geometry");
 
         assert!(
             (snapshot.total_hashrate_ghs - expected_hashrate).abs() < 0.01,

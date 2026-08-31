@@ -25,6 +25,18 @@
 #
 set -e
 TARGET_DIR=$1
+ELF_CONTRACT_CHECK="${BR2_EXTERNAL_DCENTOS_PATH}/board/amlogic/am3-s19kpro/verify_aarch64_static_elf.py"
+
+[ -f "$ELF_CONTRACT_CHECK" ] && [ ! -L "$ELF_CONTRACT_CHECK" ] || {
+    echo "DCENTos post-build (am3-s19kpro): ERROR: AArch64 ELF contract checker is missing or unsafe: $ELF_CONTRACT_CHECK" >&2
+    exit 1
+}
+
+verify_aarch64_static_elf() {
+    ELF_PATH=$1
+    ELF_LABEL=$2
+    python3 "$ELF_CONTRACT_CHECK" "$ELF_PATH" "$ELF_LABEL"
+}
 
 mkdir -p "${TARGET_DIR}/etc"
 mkdir -p "${TARGET_DIR}/proc"
@@ -50,6 +62,27 @@ chown 0:0 "${TARGET_DIR}/data/dcent" 2>/dev/null || true
 # Make init scripts executable (from either overlay layer)
 chmod +x "${TARGET_DIR}"/etc/init.d/* 2>/dev/null || true
 
+# S19k release reconnect is owned by the signed per-unit witness helper. The
+# unsigned length-prefixed S46 payload has no admissible role on this SKU and
+# is removed entirely. The board overlay supplies an S49 first-boot signer and
+# an S50 Dropbear override that rechecks the durable admission before SSH.
+rm -f "${TARGET_DIR}/etc/init.d/S46post-install"
+S19K_DATA_HELPER="${TARGET_DIR}/usr/sbin/dcent-s19k-data-mount"
+S19K_DATA_INIT="${TARGET_DIR}/etc/init.d/S38s19k-data"
+S19K_WITNESS_HELPER="${TARGET_DIR}/usr/sbin/dcent-s19k-postinstall-witness.py"
+S19K_WITNESS_INIT="${TARGET_DIR}/etc/init.d/S49s19k-postinstall-witness"
+S19K_DROPBEAR_INIT="${TARGET_DIR}/etc/init.d/S50dropbear"
+for witness_file in "$S19K_DATA_HELPER" "$S19K_DATA_INIT" \
+    "$S19K_WITNESS_HELPER" "$S19K_WITNESS_INIT" "$S19K_DROPBEAR_INIT"
+do
+    [ -f "$witness_file" ] && [ ! -L "$witness_file" ] || {
+        echo "DCENTos post-build (am3-s19kpro): ERROR: target witness component missing or indirect: $witness_file" >&2
+        exit 1
+    }
+    chmod 0755 "$witness_file"
+done
+echo "DCENTos post-build (am3-s19kpro): installed fail-closed S38/S49/S50 durable postinstall witness boundary; removed unsigned S46"
+
 # Remote access is Dropbear SSH only. Buildroot's default BusyBox config can
 # install S50telnet + telnet applets; remove them from am3 images so port 23
 # is never exposed and no telnet tooling ships in the rootfs.
@@ -74,23 +107,16 @@ chmod +x "${TARGET_DIR}"/root/web/mcp_server.py 2>/dev/null || true
 # served by server.py. See DCENT_OS_Antminer/br2_external_dcentos/board/zynq/
 # post-build.sh for the full rationale.
 DASHBOARD_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../dashboard/dist/index.html"
-DASHBOARD_GZ_SRC="${DASHBOARD_SRC}.gz"
-DASHBOARD_SHA_SRC="${DASHBOARD_SRC}.sha256"
 DASHBOARD_DEST_DIR="${TARGET_DIR}/usr/share/dcentos-dashboard"
 if [ -f "$DASHBOARD_SRC" ]; then
     mkdir -p "$DASHBOARD_DEST_DIR"
     cp "$DASHBOARD_SRC" "$DASHBOARD_DEST_DIR/index.html"
     chmod 644 "$DASHBOARD_DEST_DIR/index.html"
-    if [ ! -f "$DASHBOARD_GZ_SRC" ] || [ "$DASHBOARD_SRC" -nt "$DASHBOARD_GZ_SRC" ]; then
-        gzip -9 -c "$DASHBOARD_SRC" > "$DASHBOARD_DEST_DIR/index.html.gz"
-    else
-        cp "$DASHBOARD_GZ_SRC" "$DASHBOARD_DEST_DIR/index.html.gz"
-    fi
-    if [ ! -f "$DASHBOARD_SHA_SRC" ] || [ "$DASHBOARD_SRC" -nt "$DASHBOARD_SHA_SRC" ]; then
-        sha256sum "$DASHBOARD_SRC" | awk '{print $1}' > "$DASHBOARD_DEST_DIR/index.html.sha256"
-    else
-        cp "$DASHBOARD_SHA_SRC" "$DASHBOARD_DEST_DIR/index.html.sha256"
-    fi
+    # Always derive deterministic dashboard sidecars from the admitted HTML.
+    # `gzip -n` omits source name/time; checkout mtimes cannot perturb either
+    # of the two clean persistent-image builds.
+    gzip -9 -n -c "$DASHBOARD_SRC" > "$DASHBOARD_DEST_DIR/index.html.gz"
+    sha256sum "$DASHBOARD_SRC" | awk '{print $1}' > "$DASHBOARD_DEST_DIR/index.html.sha256"
     chmod 644 "$DASHBOARD_DEST_DIR/index.html.gz" "$DASHBOARD_DEST_DIR/index.html.sha256"
     DASHBOARD_SIZE=$(stat -c%s "$DASHBOARD_SRC" 2>/dev/null || stat -f%z "$DASHBOARD_SRC")
     echo "DCENTos post-build (am3-s19kpro): installed dashboard SPA ($DASHBOARD_SIZE bytes) at /usr/share/dcentos-dashboard/index.html"
@@ -108,9 +134,11 @@ fi
 # Install dcentos-init as /sbin/init if present (aarch64 build)
 DCENTOS_INIT="${BR2_EXTERNAL_DCENTOS_PATH}/../dcentrald/target/aarch64-unknown-linux-musl/release/dcentos-init"
 if [ -f "$DCENTOS_INIT" ]; then
+    verify_aarch64_static_elf "$DCENTOS_INIT" "source dcentos-init"
     rm -f "${TARGET_DIR}/sbin/init" 2>/dev/null || true
     cp "$DCENTOS_INIT" "${TARGET_DIR}/sbin/init"
     chmod 755 "${TARGET_DIR}/sbin/init"
+    verify_aarch64_static_elf "${TARGET_DIR}/sbin/init" "staged /sbin/init"
     echo "DCENTos post-build (am3-s19kpro): installed dcentos-init as /sbin/init"
 else
     echo "DCENTos post-build (am3-s19kpro): WARNING: dcentos-init not found at $DCENTOS_INIT"
@@ -123,9 +151,11 @@ fi
 # -----------------------------------------------------------------------------
 DCENTRALD_BIN="${BR2_EXTERNAL_DCENTOS_PATH}/../dcentrald/target/aarch64-unknown-linux-musl/release/dcentrald"
 if [ -f "$DCENTRALD_BIN" ]; then
+    verify_aarch64_static_elf "$DCENTRALD_BIN" "source dcentrald"
     STAGED_BIN="${TARGET_DIR}/usr/local/bin/dcentrald"
     cp "$DCENTRALD_BIN" "$STAGED_BIN"
     chmod 755 "$STAGED_BIN"
+    verify_aarch64_static_elf "$STAGED_BIN" "staged /usr/local/bin/dcentrald"
     DCENTRALD_SIZE=$(stat -c%s "$DCENTRALD_BIN" 2>/dev/null || stat -f%z "$DCENTRALD_BIN")
     echo "DCENTos post-build (am3-s19kpro): installed dcentrald ($DCENTRALD_SIZE bytes)"
 else
@@ -192,6 +222,28 @@ if [ ! -f "${TARGET_DIR}/etc/dcentrald.toml" ]; then
     echo "  Expected to come from board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentrald.toml" >&2
     exit 1
 fi
+
+# Install an inert, non-active reference copy of the exact pool-free
+# first-install custody policy.  The pre-flash ARMv7 owner still comes only
+# from the signed transition capsule and stages this policy under its exact
+# /tmp Track-1 basename.  Keeping the image copy outside every S82dcentrald
+# config search path prevents it from becoming boot/runtime authority.
+INSTALL_CUSTODY_CFG_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../dcentrald/dcentrald_s19k_install_custody.toml"
+INSTALL_CUSTODY_CFG_DIR="${TARGET_DIR}/usr/share/dcentos/install-custody"
+INSTALL_CUSTODY_CFG_DST="${INSTALL_CUSTODY_CFG_DIR}/dcentrald_s19k.toml"
+[ -f "$INSTALL_CUSTODY_CFG_SRC" ] && [ ! -L "$INSTALL_CUSTODY_CFG_SRC" ] || {
+    echo "DCENTos post-build (am3-s19kpro): ERROR: exact install-custody config is missing or indirect: $INSTALL_CUSTODY_CFG_SRC" >&2
+    exit 1
+}
+mkdir -p "$INSTALL_CUSTODY_CFG_DIR"
+cp "$INSTALL_CUSTODY_CFG_SRC" "$INSTALL_CUSTODY_CFG_DST"
+chmod 0444 "$INSTALL_CUSTODY_CFG_DST"
+[ -f "$INSTALL_CUSTODY_CFG_DST" ] && [ ! -L "$INSTALL_CUSTODY_CFG_DST" ] \
+    && cmp -s "$INSTALL_CUSTODY_CFG_SRC" "$INSTALL_CUSTODY_CFG_DST" || {
+    echo "DCENTos post-build (am3-s19kpro): ERROR: staged install-custody config differs from source" >&2
+    exit 1
+}
+echo "DCENTos post-build (am3-s19kpro): installed non-active install-custody policy reference"
 
 # -----------------------------------------------------------------------------
 # Board identity (the per-board overlay already ships /etc/dcentos-platform =

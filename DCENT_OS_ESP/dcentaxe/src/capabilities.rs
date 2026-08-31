@@ -11,6 +11,34 @@ use dcentaxe_hal::board::{FanControllerKind, PowerControllerKind, TempSensorKind
 
 use crate::config::DcentAxeConfig;
 
+/// Build-bound deployment policy from the canonical `esp-targets.json` row.
+///
+/// The firmware build script emits these values as compile-time environment
+/// constants. Keeping them explicit here prevents the shared DCENT_OS
+/// capability surface from treating an identity-only diagnostic image like a
+/// public mining image merely because both run on an ESP32-S3.
+#[derive(Debug, Clone, Copy)]
+pub struct DeploymentPolicy<'a> {
+    pub hardware_family: &'a str,
+    pub support_tier: &'a str,
+    pub runtime_mode: &'a str,
+    pub install_policy: &'a str,
+}
+
+/// One policy predicate for every operator-facing mutation surface.
+///
+/// Unknown values deny by default. The profile input is the runtime board
+/// resolver's fail-closed result, not merely the presence of ASIC topology.
+pub fn deployment_allows_operational_mutations(
+    runtime_mode: &str,
+    install_policy: &str,
+    profile_allows_mining: bool,
+) -> bool {
+    runtime_mode == "mining"
+        && matches!(install_policy, "production" | "public-beta" | "lab-only")
+        && profile_allows_mining
+}
+
 pub fn build_esp_capability_descriptor(
     config: &DcentAxeConfig,
     mining_enabled: bool,
@@ -18,10 +46,11 @@ pub fn build_esp_capability_descriptor(
     max_frequency_mhz: f32,
     min_voltage_mv: u16,
     max_voltage_mv: u16,
+    deployment: DeploymentPolicy<'_>,
 ) -> DeviceCapabilityDescriptor {
     let board = config.board_config();
-    let recognized =
-        config.board_identity_recognized() && config.board_identity_family_consistent();
+    let profile_resolution = config.board_profile_resolution();
+    let recognized = profile_resolution.identity_recognized && profile_resolution.family_consistent;
 
     if !recognized {
         return DeviceCapabilityDescriptor::unknown(
@@ -30,31 +59,55 @@ pub fn build_esp_capability_descriptor(
         );
     }
 
+    // `BoardConfig::mining_capable()` describes physical mining topology only
+    // (ASICs plus an operating envelope). The profile resolution is the real
+    // fail-closed runtime gate: it also covers trusted thermal sensing, board
+    // identity consistency, accessory pin conflicts, and custom-board rules.
+    let profile_allows_mining = profile_resolution.mining_allowed_without_lab_bypass;
+    let read_only = !deployment_allows_operational_mutations(
+        deployment.runtime_mode,
+        deployment.install_policy,
+        profile_allows_mining,
+    );
+
     let mut runtime_caps = READ_ONLY_RUNTIME_CAPABILITIES.to_vec();
-    runtime_caps.extend_from_slice(&[
-        RuntimeCapability::PoolsRw,
-        RuntimeCapability::ConfigRw,
-        RuntimeCapability::Reboot,
-        RuntimeCapability::Backup,
-        RuntimeCapability::FlashOta,
-        RuntimeCapability::FlashOtaWww,
-        RuntimeCapability::SettingsPatch,
-        RuntimeCapability::AsicOptions,
-        RuntimeCapability::Identify,
-        RuntimeCapability::WifiScan,
-    ]);
-    if board.model.has_voltage_control() {
-        runtime_caps.push(RuntimeCapability::PowerControl);
+    if !read_only {
+        runtime_caps.extend_from_slice(&[
+            RuntimeCapability::PoolsRw,
+            RuntimeCapability::ConfigRw,
+            RuntimeCapability::Reboot,
+            RuntimeCapability::Backup,
+            RuntimeCapability::FlashOta,
+            RuntimeCapability::FlashOtaWww,
+            RuntimeCapability::SettingsPatch,
+            RuntimeCapability::AsicOptions,
+            RuntimeCapability::Identify,
+            RuntimeCapability::WifiScan,
+        ]);
+        if board.model.has_voltage_control() {
+            runtime_caps.push(RuntimeCapability::PowerControl);
+        }
     }
 
-    let support = match config.support_status() {
-        // ESP board-registry "supported" means the board profile is known and
-        // host/live development has progressed. At the DCENT_OS multi-family
-        // tier level it is still experimental until install/soak evidence is
-        // promoted through the shared support matrix.
-        "supported" | "experimental" => SupportTier::Experimental,
-        "unknown" => SupportTier::Unknown,
-        _ => SupportTier::Unsupported,
+    let support = match deployment.support_tier {
+        "stable" | "production" => SupportTier::Stable,
+        "beta" => SupportTier::Beta,
+        "experimental" => SupportTier::Experimental,
+        "unsupported" => SupportTier::Unsupported,
+        _ => SupportTier::Unknown,
+    };
+    let asic_family = asic_family(&board.asic_model);
+    let install = install_capability_plan(deployment.install_policy);
+    let fail_safe_reason = if read_only {
+        format!(
+            "build policy is runtime_mode={} install_policy={}; expose identity and monitoring only",
+            deployment.runtime_mode, deployment.install_policy
+        )
+    } else {
+        format!(
+            "recognized {} ESP board; mutating routes remain owner-authenticated and safety-clamped",
+            deployment.install_policy
+        )
     };
 
     DeviceCapabilityDescriptor {
@@ -68,8 +121,10 @@ pub fn build_esp_capability_descriptor(
             },
             sources: identity_sources(config),
             note: Some(format!(
-                "ESP board registry reports '{}'; shared DCENT_OS tier remains {:?}",
+                "ESP board registry reports '{}' with runtime_mode={} install_policy={} tier={:?}",
                 config.support_status(),
+                deployment.runtime_mode,
+                deployment.install_policy,
                 support
             )),
             device_model: Some(board.device_model.clone()),
@@ -80,7 +135,7 @@ pub fn build_esp_capability_descriptor(
         support,
         board: BoardCapability {
             board_target: Some(board.model.board_target().to_string()),
-            family: Some("esp-bitaxe".to_string()),
+            family: Some(deployment.hardware_family.to_string()),
             control_board: Some(board.model.name().to_string()),
             fixture_refs: vec![
                 "DCENT_OS_ESP/dcentaxe-hal/src/board.rs".to_string(),
@@ -94,7 +149,7 @@ pub fn build_esp_capability_descriptor(
         },
         asic: AsicCapability {
             chip_model: Some(board.asic_model.clone()),
-            asic_family: AsicFamily::BitmainBm13xx,
+            asic_family,
             chip_id: Some(board.model.expected_chip_id()),
             baud: Some(esp_runtime_baud(&board.asic_model)),
             cores_per_chip: Some(cores_per_chip(&board.asic_model)),
@@ -109,7 +164,7 @@ pub fn build_esp_capability_descriptor(
                 index: Some(0),
                 chain_index: Some(0),
                 chip_model: Some(board.asic_model.clone()),
-                asic_family: AsicFamily::BitmainBm13xx,
+                asic_family,
                 chip_id: Some(board.model.expected_chip_id()),
                 chips_per_chain: Some(board.asic_count as u16),
                 present: Some(board.mining_capable()),
@@ -123,7 +178,7 @@ pub fn build_esp_capability_descriptor(
             fail_closed_on_sensor_loss: board.temp_sensor != TempSensorKind::None,
         },
         power: PowerCapability {
-            runtime_caps: if board.model.has_voltage_control() {
+            runtime_caps: if board.model.has_voltage_control() && !read_only {
                 vec![RuntimeCapability::PowerControl]
             } else {
                 Vec::new()
@@ -132,13 +187,21 @@ pub fn build_esp_capability_descriptor(
             psu_protocol: Some("board-regulator".to_string()),
             psu_mode: PsuMode::AutoDetect,
             psu_model: Some(power_controller_label(board.power_controller).to_string()),
-            writes_enabled: board.model.has_voltage_control(),
+            writes_enabled: board.model.has_voltage_control() && !read_only,
         },
         controllers: Vec::new(),
         operating_envelopes: OperatingEnvelopes {
             frequency: Some(FrequencyEnvelope {
-                min_mhz: Some(clamp_f32_to_u16(min_frequency_mhz, min_frequency_mhz, max_frequency_mhz)),
-                max_mhz: Some(clamp_f32_to_u16(max_frequency_mhz, min_frequency_mhz, max_frequency_mhz)),
+                min_mhz: Some(clamp_f32_to_u16(
+                    min_frequency_mhz,
+                    min_frequency_mhz,
+                    max_frequency_mhz,
+                )),
+                max_mhz: Some(clamp_f32_to_u16(
+                    max_frequency_mhz,
+                    min_frequency_mhz,
+                    max_frequency_mhz,
+                )),
                 step_mhz: None,
             }),
             voltage: Some(VoltageEnvelope {
@@ -154,13 +217,40 @@ pub fn build_esp_capability_descriptor(
         references: CapabilityReferences {
             fixture_refs: vec![
                 "DCENT_OS_ESP/dcentaxe-hal/src/board.rs".to_string(),
-                "DCENT_OS_ESP/".to_string(),
+                "DCENT_OS_ESP/"
+                    .to_string(),
             ],
             sim_profile_ref: None,
             bench_checklist_ref: Some("BP-ESP-BOARD-SOAK".to_string()),
         },
         runtime_caps,
-        install: InstallCapabilityPlan {
+        install,
+        safe_defaults: SafeDefaults {
+            mining_enabled: mining_enabled && !read_only && profile_allows_mining,
+            fan_pwm_cap: if read_only { 30 } else { 100 },
+            frequency_mhz: Some(clamp_f32_to_u16(
+                board.default_frequency,
+                min_frequency_mhz,
+                max_frequency_mhz,
+            )),
+            voltage_mv: Some(
+                board
+                    .default_voltage_mv
+                    .clamp(min_voltage_mv, max_voltage_mv),
+            ),
+        },
+        fail_safe: FailSafePolicy {
+            read_only,
+            mining_start_allowed: !read_only && profile_allows_mining,
+            mutating_routes_allowed: !read_only,
+            reason: fail_safe_reason,
+        },
+    }
+}
+
+fn install_capability_plan(install_policy: &str) -> InstallCapabilityPlan {
+    match install_policy {
+        "public-beta" => InstallCapabilityPlan {
             planner_outcome: PlannerOutcome::OtaSupported,
             proof_scope: Some(ProofScope::UploadOnlyBootPending),
             required_capabilities: vec![
@@ -170,25 +260,48 @@ pub fn build_esp_capability_descriptor(
             missing_capabilities: vec![InstallCapability::RestoreVerified],
             recovery_route_id: Some("esp-ota-or-usb-serial".to_string()),
             note: Some(
-                "ESP supports signed OTA/upload surfaces; boot/rollback proof remains operator-gated"
+                "Public-beta signed OTA/upload is supported; boot, rollback, and mining proof remain pending"
                     .to_string(),
             ),
         },
-        safe_defaults: SafeDefaults {
-            mining_enabled,
-            fan_pwm_cap: 100,
-            frequency_mhz: Some(
-                clamp_f32_to_u16(board.default_frequency, min_frequency_mhz, max_frequency_mhz),
+        "lab-only" => InstallCapabilityPlan {
+            planner_outcome: PlannerOutcome::EvidenceGap,
+            proof_scope: Some(ProofScope::ExactTargetLabOnly),
+            required_capabilities: vec![
+                InstallCapability::HttpOtaOrUsbSerial,
+                InstallCapability::ManifestBoardMatch,
+            ],
+            missing_capabilities: vec![InstallCapability::RestoreVerified],
+            recovery_route_id: Some("esp-exact-target-lab".to_string()),
+            note: Some(
+                "Exact-target lab installation only; field promotion requires retained boot, safety, share, rollback, and soak evidence"
+                    .to_string(),
             ),
-            voltage_mv: Some(board.default_voltage_mv.clamp(min_voltage_mv, max_voltage_mv)),
         },
-        fail_safe: FailSafePolicy {
-            read_only: false,
-            mining_start_allowed: board.mining_capable(),
-            mutating_routes_allowed: true,
-            reason: "recognized ESP board profile; mutating routes still enforce their own auth and safety clamps"
-                .to_string(),
+        _ => InstallCapabilityPlan {
+            planner_outcome: PlannerOutcome::EvidenceGap,
+            proof_scope: Some(ProofScope::LocalArtifactOnly),
+            required_capabilities: Vec::new(),
+            missing_capabilities: vec![
+                InstallCapability::HttpOtaOrUsbSerial,
+                InstallCapability::RestoreVerified,
+            ],
+            recovery_route_id: None,
+            note: Some(
+                "Installation is blocked; this artifact is limited to offline package proof and identity diagnostics"
+                    .to_string(),
+            ),
         },
+    }
+}
+
+fn asic_family(chip_model: &str) -> AsicFamily {
+    match chip_model.trim() {
+        "BM1397" | "BM1366" | "BM1368" | "BM1370" | "BM1373" => AsicFamily::BitmainBm13xx,
+        // MSBT0501/LT0051 is a Hammer Scrypt ASIC, not a Bitmain BM13xx.
+        // The shared schema does not yet have a dedicated family, so Unknown
+        // is the honest value rather than fabricating a Bitmain lineage.
+        _ => AsicFamily::Unknown,
     }
 }
 
@@ -332,15 +445,33 @@ fn clamp_f32_to_u16(value: f32, min: f32, max: f32) -> u16 {
 mod tests {
     use super::*;
 
+    fn public_beta_policy() -> DeploymentPolicy<'static> {
+        DeploymentPolicy {
+            hardware_family: "bitaxe",
+            support_tier: "beta",
+            runtime_mode: "mining",
+            install_policy: "public-beta",
+        }
+    }
+
     #[test]
-    fn known_gamma_descriptor_is_experimental_not_beta_or_stable() {
+    fn known_gamma_descriptor_uses_the_registry_public_beta_policy() {
         let cfg = DcentAxeConfig::default();
-        let desc = build_esp_capability_descriptor(&cfg, true, 50.0, 650.0, 850, 1350);
+        let desc = build_esp_capability_descriptor(
+            &cfg,
+            true,
+            50.0,
+            650.0,
+            850,
+            1350,
+            public_beta_policy(),
+        );
 
         assert_eq!(desc.family, DeviceFamily::Esp);
-        assert_eq!(desc.support, SupportTier::Experimental);
+        assert_eq!(desc.support, SupportTier::Beta);
         assert_eq!(desc.identity.confidence, IdentityConfidence::Exact);
         assert_eq!(desc.board.board_target.as_deref(), Some("bitaxe-gamma"));
+        assert_eq!(desc.board.family.as_deref(), Some("bitaxe"));
         assert_eq!(desc.asic.chip_model.as_deref(), Some("BM1370"));
         assert_eq!(desc.asic.baud, Some(1_000_000));
         assert!(desc.runtime_caps.contains(&RuntimeCapability::FlashOta));
@@ -354,7 +485,15 @@ mod tests {
         let mut cfg = DcentAxeConfig::default();
         cfg.board_version = "unknown-board-version".to_string();
 
-        let desc = build_esp_capability_descriptor(&cfg, true, 50.0, 650.0, 850, 1350);
+        let desc = build_esp_capability_descriptor(
+            &cfg,
+            true,
+            50.0,
+            650.0,
+            850,
+            1350,
+            public_beta_policy(),
+        );
 
         assert_eq!(desc.support, SupportTier::Unknown);
         assert_eq!(desc.identity.confidence, IdentityConfidence::Unknown);
@@ -363,6 +502,86 @@ mod tests {
         assert!(!desc.fail_safe.mining_start_allowed);
         assert!(!desc.fail_safe.mutating_routes_allowed);
         assert!(!desc.safe_defaults.mining_enabled);
+    }
+
+    #[test]
+    fn hammer_identity_only_policy_is_read_only_and_not_installable() {
+        let mut cfg = DcentAxeConfig::default();
+        cfg.board_version = "3004".to_string();
+        cfg.board_model = "hammer_bc04".to_string();
+        cfg.asic_model = "BM1370".to_string();
+        cfg.asic_count = 4;
+
+        let desc = build_esp_capability_descriptor(
+            &cfg,
+            true,
+            50.0,
+            650.0,
+            1000,
+            1250,
+            DeploymentPolicy {
+                hardware_family: "hammer-bc",
+                support_tier: "experimental",
+                runtime_mode: "identity-only",
+                install_policy: "blocked",
+            },
+        );
+
+        assert_eq!(desc.board.family.as_deref(), Some("hammer-bc"));
+        assert_eq!(desc.support, SupportTier::Experimental);
+        assert_eq!(desc.runtime_caps, READ_ONLY_RUNTIME_CAPABILITIES);
+        assert_eq!(desc.install.planner_outcome, PlannerOutcome::EvidenceGap);
+        assert_eq!(
+            desc.install.proof_scope,
+            Some(ProofScope::LocalArtifactOnly)
+        );
+        assert!(desc.fail_safe.read_only);
+        assert!(!desc.fail_safe.mining_start_allowed);
+        assert!(!desc.fail_safe.mutating_routes_allowed);
+        assert!(!desc.safe_defaults.mining_enabled);
+        assert!(!desc.power.writes_enabled);
+    }
+
+    #[test]
+    fn hammer_scrypt_asic_is_not_misreported_as_bitmain_bm13xx() {
+        assert_eq!(asic_family("MSBT0501"), AsicFamily::Unknown);
+        assert_eq!(asic_family("LT0051"), AsicFamily::Unknown);
+        assert_eq!(asic_family("BM1370"), AsicFamily::BitmainBm13xx);
+    }
+
+    #[test]
+    fn deployment_mutation_policy_is_closed_by_default() {
+        assert!(deployment_allows_operational_mutations(
+            "mining",
+            "public-beta",
+            true
+        ));
+        assert!(deployment_allows_operational_mutations(
+            "mining",
+            "production",
+            true
+        ));
+        assert!(deployment_allows_operational_mutations(
+            "mining", "lab-only", true
+        ));
+        assert!(!deployment_allows_operational_mutations(
+            "identity-only",
+            "blocked",
+            true
+        ));
+        assert!(!deployment_allows_operational_mutations(
+            "mining", "blocked", true
+        ));
+        assert!(!deployment_allows_operational_mutations(
+            "mining",
+            "public-beta",
+            false
+        ));
+        assert!(!deployment_allows_operational_mutations(
+            "future-mode",
+            "future-policy",
+            true
+        ));
     }
 
     #[test]

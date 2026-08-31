@@ -63,6 +63,7 @@
 //! See [`Apw12SmbusBackend::cold_boot_sequence_5_step`] for the five-step
 //! init flow lifted from RE2 §3 (`apw12.c::apw12_init_sequence`):
 //! POWER_ON → fw probe → SET_VOLTAGE → telemetry confirm → ENABLE_WDOG.
+//! SET_VOLTAGE is refused until the millivolt LSB is evidence-bound.
 
 use std::time::{Duration, Instant};
 
@@ -111,7 +112,9 @@ pub const POWER_ON_SETTLE_MS: u64 = 250;
 pub const DEFAULT_COLD_BOOT_WDOG_MS: u16 = 5000;
 
 /// Default cold-boot voltage (RE2 `apw12_init_sequence` step 3 uses 1420 mV
-/// "typical for S19j Pro").
+/// "typical for S19j Pro"). 1200–1600 looks like BM1362 core mV, not a
+/// 12–15 V APW12 rail. [`Apw12SmbusBackend::set_voltage_mv`] refuses until
+/// the millivolt LSB is evidence-bound.
 pub const DEFAULT_COLD_BOOT_VOLTAGE_MV: u16 = 1420;
 
 /// Calibration-ready poll budget. RE2 `apw12_is_calibrated` polls 50 × 2 ms
@@ -632,22 +635,16 @@ impl Apw12SmbusBackend {
     //  Voltage
     // -----------------------------------------------------------------------
 
-    /// SET_VOLTAGE in millivolts (RE2 `apw12_set_voltage_mv`). Bounds checked
-    /// against [`VOLTAGE_MIN_MV`] / [`VOLTAGE_MAX_MV`].
+    /// SET_VOLTAGE is refused until the millivolt LSB is evidence-bound.
+    /// 1200–1600 looks like BM1362 core mV, not a 12–15 V APW12 rail.
+    /// Encoding helpers ([`set_voltage_steps`]) stay host-testable; this
+    /// method never issues opcode `0x02`.
     pub fn set_voltage_mv(&mut self, mv: u16) -> Result<()> {
-        if !(VOLTAGE_MIN_MV..=VOLTAGE_MAX_MV).contains(&mv) {
-            return Err(HalError::PsuProtocolOwned(format!(
-                "set_voltage_mv: {} outside [{}, {}]",
-                mv, VOLTAGE_MIN_MV, VOLTAGE_MAX_MV
-            )));
-        }
-        self.run_with_intent(I2cOperationIntent::Energize, set_voltage_steps(mv))?;
-        tracing::info!(
-            addr = format_args!("0x{:02X}", self.address),
-            mv,
-            "APW12 SET_VOLTAGE"
-        );
-        Ok(())
+        let _ = mv;
+        Err(HalError::PsuProtocolOwned(
+            "APW12 SMBus SET_VOLTAGE refused: millivolt scale unresolved (desk-now 2026-08-19); 1200-1600 looks like BM1362 core mV, not a 12-15 V APW12 rail"
+                .into(),
+        ))
     }
 
     /// READ_VOLTAGE (RE2 `apw12_read_voltage_mv` per spec). Returns mV LE.
@@ -834,11 +831,14 @@ impl Apw12SmbusBackend {
     /// 1. POWER_ON + 250 ms settle
     /// 2. GET_FW_VERSION + check vs [`EXPECTED_FW_VER`]
     /// 3. wait for calibration ready (poll CALIB_STATUS, up to 2 min)
-    /// 4. SET_VOLTAGE to `target_mv`
+    /// 4. SET_VOLTAGE to `target_mv` — **refused** until the millivolt LSB
+    ///    is evidence-bound ([`Self::set_voltage_mv`]); POWER_ON is rolled
+    ///    back and this method does not issue opcode `0x02`.
     /// 5. READ_TELEMETRY confirm (DC volt non-zero), then ENABLE_WDOG
     ///
-    /// This method honors RE2's ordering exactly. Deterministic parameter
-    /// errors are rejected before POWER_ON. Any later failure triggers one
+    /// This method honors RE2's ordering except the SET step, which is
+    /// hard-refused. Deterministic parameter errors are rejected before
+    /// POWER_ON. Any later failure triggers one
     /// worker-owned watchdog-disarm + POWER_OFF plan and returns
     /// [`HalError::PartialBootRollback`] containing both typed outcomes;
     /// callers must not proceed to mining.
@@ -1198,15 +1198,43 @@ mod tests {
     }
 
     /// Voltage bounds gate: 1199 and 1601 must error before any I/O.
+    /// In-range SET is also refused until the millivolt LSB is bound.
     #[test]
     fn voltage_bounds_rejected() {
-        let (handle, _rx) = I2cServiceHandle::for_unit_tests();
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
         let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
 
         let r = psu.set_voltage_mv(1199);
         assert!(r.is_err(), "1199 mV must be rejected");
         let r = psu.set_voltage_mv(1601);
         assert!(r.is_err(), "1601 mV must be rejected");
+        drop(psu);
+        assert!(rx.try_recv().is_err(), "set_voltage_mv must not issue I/O");
+    }
+
+    #[test]
+    fn set_voltage_mv_refused_until_lsb_bound() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
+        for mv in [VOLTAGE_MIN_MV, DEFAULT_COLD_BOOT_VOLTAGE_MV, VOLTAGE_MAX_MV] {
+            let err = psu
+                .set_voltage_mv(mv)
+                .expect_err("in-range SET must refuse");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("SET_VOLTAGE refused"),
+                "unexpected refuse text for {mv} mV: {rendered}"
+            );
+            assert!(
+                rendered.contains("millivolt scale unresolved"),
+                "unexpected refuse text for {mv} mV: {rendered}"
+            );
+        }
+        drop(psu);
+        assert!(
+            rx.try_recv().is_err(),
+            "refused SET must not issue opcode 0x02"
+        );
     }
 
     /// Watchdog bounds gate: 99 ms and 60001 ms must error before any I/O.
@@ -1667,71 +1695,59 @@ mod tests {
         assert!(r.is_none(), "<9 byte response must yield Ok(None)");
     }
 
-    /// cold_boot_sequence_5_step orders POWER_ON → GET_FW → CALIB poll →
-    /// SET_VOLTAGE → READ_TELEMETRY → ENABLE_WDOG with the right opcodes.
-    /// Wdog timeout=100ms is the boundary — minimum legal value.
+    /// cold_boot_sequence_5_step reaches SET_VOLTAGE and refuses it. Opcode
+    /// `0x02` must not appear; POWER_ON is rolled back.
     #[test]
-    fn cold_boot_sequence_5_step_orders_correctly() {
+    fn cold_boot_sequence_5_step_refuses_set_voltage() {
         let (handle, rx) = I2cServiceHandle::for_unit_tests();
-        let worker = spawn_mock_worker(
+        let worker = spawn_boot_rollback_worker(
             rx,
             vec![
-                Ok(Vec::new()),                        // 1) POWER_ON
-                Ok(vec![vec![0x03, 0x01]]),            // 2) GET_FW_VERSION → 0x0103
-                Ok(vec![vec![0x01]]),                  // 3) CALIB_STATUS → ready
-                Ok(Vec::new()),                        // 4) SET_VOLTAGE
-                Ok(vec![telemetry_block(1412, 1420)]), // 5) READ_TELEMETRY → DC=1412
-                Ok(Vec::new()),                        // 6) ENABLE_WDOG
+                Ok(Vec::new()),             // 1) POWER_ON
+                Ok(vec![vec![0x03, 0x01]]), // 2) GET_FW_VERSION → 0x0103
+                Ok(vec![vec![0x01]]),       // 3) CALIB_STATUS → ready
             ],
+            Ok(successful_rollback_outcome()),
         );
 
         let mut psu = Apw12SmbusBackend::new(handle, Cv1835S19jPro);
-        psu.cold_boot_sequence_5_step(1420, 100)
-            .expect("cold boot should succeed");
+        let error = psu
+            .cold_boot_sequence_5_step(1420, 100)
+            .expect_err("cold boot SET_VOLTAGE must refuse until LSB bound");
+        let source = std::error::Error::source(&error)
+            .expect("PartialBootRollback must expose the SET refuse");
+        assert!(
+            source.to_string().contains("SET_VOLTAGE refused"),
+            "primary error was {source}"
+        );
+        match error {
+            HalError::PartialBootRollback {
+                context,
+                rollback: crate::PowerRollbackOutcome::Completed,
+                ..
+            } => {
+                assert_eq!(context, "APW12 five-step cold boot");
+            }
+            other => panic!("unexpected structured boot error: {other:?}"),
+        }
 
         drop(psu);
         let log = worker.join().expect("worker thread");
-
-        assert_eq!(log.len(), 6, "exactly six transactions");
+        assert_eq!(log.rollback_plans, 1);
+        assert_eq!(log.transactions.len(), 3, "SET opcode must not be issued");
         let opcodes: Vec<u8> = log
+            .transactions
             .iter()
-            .map(|(_, steps)| match &steps[0] {
+            .map(|steps| match &steps[0] {
                 I2cTransactionStep::Write(b) => b[0],
                 I2cTransactionStep::WriteRead { write_data, .. } => write_data[0],
                 _ => 0xFF,
             })
             .collect();
-        assert_eq!(
-            opcodes,
-            vec![0x01, 0x04, 0x09, 0x02, 0x05, 0x06],
-            "ordering: POWER_ON, GET_FW, CALIB_STATUS, SET_VOLTAGE, READ_TELEMETRY, ENABLE_WDOG",
+        assert_eq!(opcodes, vec![0x01, 0x04, 0x09]);
+        assert!(
+            !opcodes.contains(&0x02),
+            "refused SET must not place opcode 0x02 on the wire"
         );
-
-        // Confirm the SET_VOLTAGE payload is 1420 mV LE.
-        match &log[3].1[0] {
-            I2cTransactionStep::Write(b) => assert_eq!(b, &[0x02, 0x8C, 0x05]),
-            _ => unreachable!(),
-        }
-        // Confirm ENABLE_WDOG payload is 100 ms LE = [0x64, 0x00].
-        match &log[5].1[0] {
-            I2cTransactionStep::Write(b) => assert_eq!(b, &[0x06, 0x64, 0x00]),
-            _ => unreachable!(),
-        }
-    }
-
-    fn telemetry_block(dc_mv: u16, set_mv: u16) -> Vec<u8> {
-        let mut v = vec![
-            (dc_mv & 0xFF) as u8,
-            (dc_mv >> 8) as u8,
-            (set_mv & 0xFF) as u8,
-            (set_mv >> 8) as u8,
-            0x00,
-            0x00, // current
-            0x00,
-            0x00, // power
-            0x00, // status
-        ];
-        v.resize(TELEMETRY_BLOCK_LEN, 0);
-        v
     }
 }

@@ -172,7 +172,7 @@ pub enum PowerAuthorityKind {
 impl PowerAuthorityKind {
     pub fn from_source(source: &str, calibrated: bool) -> Self {
         match source.trim().to_ascii_lowercase().as_str() {
-            "pmbus" | "psu" | "apw" | "apw12" | "apw121215" => Self::Pmbus,
+            "pmbus" => Self::Pmbus,
             "adc" | "ina226" | "ina" => Self::Adc,
             "estimated" if calibrated => Self::WallCalibratedEstimate,
             "wall_calibrated_estimate" | "calibrated_estimate" => Self::WallCalibratedEstimate,
@@ -193,6 +193,23 @@ impl PowerAuthorityKind {
 
     pub fn is_measured(self) -> bool {
         matches!(self, Self::Pmbus | Self::Adc)
+    }
+
+    /// Whether this source may **close a control loop** (drive actuation), as
+    /// opposed to only being reported on a dashboard.
+    ///
+    /// A measured source (`Pmbus`/`Adc`) is tied to physical reality, and a
+    /// `WallCalibratedEstimate` is a model reading anchored to a real external
+    /// wall-meter reference — both are legitimate feedback for a closed loop.
+    /// A bare `Estimated` (the `C_eff·V²·f` model with no measurement anchor)
+    /// or `Unknown` source is **the controller's own feed-forward**: closing a
+    /// loop on it is a tautology that chases the model instead of the hardware,
+    /// and it also silently drops the family safety derate that
+    /// [`PowerModel::allocate_budget_safe`] would apply. The watt-target loop
+    /// ([`crate::power_pid`]) refuses to actuate on such a sample — it HOLDs
+    /// (freezes its integral, re-issues its last command) instead.
+    pub fn is_control_authoritative(self) -> bool {
+        self.is_measured() || matches!(self, Self::WallCalibratedEstimate)
     }
 
     /// Stable wire label for this authority class (matches the serde
@@ -1264,7 +1281,9 @@ impl PowerModel {
             return 0.0;
         }
 
-        let ghs_per_mhz = crate::chip_geometry::ghs_per_mhz_for_chip(self.chip_id());
+        let Some(ghs_per_mhz) = crate::chip_geometry::ghs_per_mhz_for_chip(self.chip_id()) else {
+            return 0.0;
+        };
 
         // target_ths * 1000 = total GH/s
         // total GH/s / ghs_per_mhz / chip_count = avg_freq_mhz needed
@@ -1277,6 +1296,116 @@ impl PowerModel {
             self.static_per_chain_w() * num_chains as f64 + self.control_board_w();
 
         total_dynamic + static_overhead
+    }
+
+    /// Achievable total-board-power envelope for a fixed chip set + voltage.
+    ///
+    /// Returns the `(floor_watts, ceiling_watts)` total-board-power range the
+    /// [`allocate_budget`](Self::allocate_budget) planner can actually realise
+    /// for these chips: the floor pins every chip at `min_freq_mhz`, the ceiling
+    /// pins every chip at its stable ceiling (`max_stable_mhz`, further capped by
+    /// an optional PVT-envelope ceiling frequency). Both ends use the SAME
+    /// accounting as `allocate_budget` — dynamic `C_eff·V²·f` per chip +
+    /// `static_per_chain_w × num_chains` + `control_board_w` — so a watt budget
+    /// clamped to this range maps 1:1 onto a realisable allocation.
+    ///
+    /// This is the operating-point clamp for the closed watt-target loop
+    /// ([`crate::power_pid`]): the loop clamps its commanded budget to
+    /// `[floor_watts, ceiling_watts]` so an impossible watt target saturates at
+    /// the envelope ceiling instead of overclocking chips past their stable /
+    /// PVT-published limit.
+    ///
+    /// `pvt_ceiling_mhz` — optional per-chip frequency cap from the SKU's PVT
+    /// envelope (`pvt_envelope::pvt_envelope(sku)` max frequency). When present,
+    /// every chip's ceiling is `min(max_stable_mhz, pvt_ceiling_mhz)`; when
+    /// `None`, only the chip's own `max_stable_mhz` bounds the ceiling.
+    ///
+    /// A zero / non-finite voltage or empty chip set collapses the envelope to
+    /// pure static overhead (there is no realisable dynamic power), mirroring
+    /// `allocate_budget`'s fail-closed voltage guard.
+    pub fn achievable_power_envelope(
+        &self,
+        voltage_v: f64,
+        chip_profiles: &[ChipProfile],
+        min_freq_mhz: u16,
+        num_chains: u8,
+        pvt_ceiling_mhz: Option<u16>,
+    ) -> PowerEnvelope {
+        let static_overhead =
+            self.static_per_chain_w() * num_chains as f64 + self.control_board_w();
+
+        if chip_profiles.is_empty() || !voltage_v.is_finite() || voltage_v <= 0.0 {
+            return PowerEnvelope {
+                floor_watts: static_overhead,
+                ceiling_watts: static_overhead,
+            };
+        }
+
+        let mut dyn_floor = 0.0_f64;
+        let mut dyn_ceiling = 0.0_f64;
+        for profile in chip_profiles {
+            // Per-chip stable ceiling, optionally capped by the PVT envelope.
+            let mut ceiling = if profile.max_stable_mhz > 0 {
+                profile.max_stable_mhz
+            } else {
+                min_freq_mhz
+            };
+            if let Some(cap) = pvt_ceiling_mhz {
+                ceiling = ceiling.min(cap);
+            }
+            // The floor can never exceed the ceiling — a weak/degraded chip
+            // (ceiling below the config floor) must not be overclocked to honour
+            // the floor. Mirrors allocate_budget's inverted-range handling.
+            let floor = min_freq_mhz.min(ceiling);
+            dyn_floor += self.chip_power_w(voltage_v, floor);
+            dyn_ceiling += self.chip_power_w(voltage_v, ceiling);
+        }
+
+        PowerEnvelope {
+            floor_watts: dyn_floor + static_overhead,
+            ceiling_watts: dyn_ceiling + static_overhead,
+        }
+    }
+}
+
+/// Achievable total-board-power range for a fixed chip set + voltage.
+///
+/// Produced by [`PowerModel::achievable_power_envelope`]; consumed by the closed
+/// watt-target loop in [`crate::power_pid`] as the hard clamp on the commanded
+/// power budget. `floor_watts` is every chip at the frequency floor;
+/// `ceiling_watts` is every chip at its stable / PVT-capped ceiling. Both
+/// include static overhead so they are directly comparable to a watt setpoint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PowerEnvelope {
+    /// Minimum realisable board power (all chips at the frequency floor).
+    pub floor_watts: f64,
+    /// Maximum realisable board power (all chips at the envelope ceiling).
+    pub ceiling_watts: f64,
+}
+
+impl PowerEnvelope {
+    /// Clamp a commanded budget to `[floor_watts, ceiling_watts]`.
+    ///
+    /// Guards against a degenerate/inverted envelope (`ceiling < floor`, only
+    /// reachable from non-finite upstream inputs) so the clamp can never widen
+    /// the request.
+    pub fn clamp(&self, watts: f64) -> f64 {
+        let lo = self.floor_watts.min(self.ceiling_watts);
+        let hi = self.floor_watts.max(self.ceiling_watts);
+        if !watts.is_finite() {
+            return lo;
+        }
+        watts.clamp(lo, hi)
+    }
+
+    /// Envelope span in watts (always `>= 0`).
+    pub fn span_watts(&self) -> f64 {
+        (self.ceiling_watts - self.floor_watts).max(0.0)
+    }
+
+    /// Whether a watt target is inside the achievable envelope (inclusive).
+    pub fn contains(&self, watts: f64) -> bool {
+        watts.is_finite() && watts >= self.floor_watts && watts <= self.ceiling_watts
     }
 }
 
@@ -1296,6 +1425,69 @@ pub(crate) fn grade_weight(grade: ChipGrade) -> f64 {
 mod tests {
     use super::*;
     use dcentrald_silicon_profiles::operating_points::Cooling;
+
+    #[test]
+    fn from_source_does_not_launder_apw12_or_v2f_as_pmbus() {
+        // Desk-now 2026-08-19: APW12 framed identity / V²f labels must not
+        // become PowerAuthorityKind::Pmbus. Only the literal "pmbus" token
+        // is measured PSU telemetry.
+        assert_eq!(
+            PowerAuthorityKind::from_source("pmbus", false),
+            PowerAuthorityKind::Pmbus
+        );
+        assert!(PowerAuthorityKind::from_source("pmbus", false).is_measured());
+        for src in [
+            "psu",
+            "apw",
+            "apw12",
+            "apw121215",
+            "v2f",
+            "v2f_estimate",
+            "estimated",
+        ] {
+            let kind = PowerAuthorityKind::from_source(src, false);
+            assert_ne!(
+                kind,
+                PowerAuthorityKind::Pmbus,
+                "{src} must not launder as Pmbus"
+            );
+            assert!(!kind.is_measured(), "{src} must not be is_measured");
+        }
+        assert_eq!(
+            PowerAuthorityKind::from_source("estimated", false),
+            PowerAuthorityKind::Estimated
+        );
+    }
+
+    #[test]
+    fn power_authority_control_gate_admits_measured_and_wall_calibrated_only() {
+        // Measured PSU/board telemetry closes a loop.
+        assert!(PowerAuthorityKind::Pmbus.is_control_authoritative());
+        assert!(PowerAuthorityKind::Adc.is_control_authoritative());
+        // A wall-meter-anchored estimate is a real external reference → allowed.
+        assert!(PowerAuthorityKind::WallCalibratedEstimate.is_control_authoritative());
+        // A bare model estimate is the controller's own feed-forward → refused
+        // (closing a loop on it is a tautology; it also drops the safety derate).
+        assert!(!PowerAuthorityKind::Estimated.is_control_authoritative());
+        assert!(!PowerAuthorityKind::Unknown.is_control_authoritative());
+        // The control gate is strictly narrower than the "is it a number we can
+        // report" question: every measured source is also reportable, but not
+        // every reportable source is control-authoritative.
+        for k in [
+            PowerAuthorityKind::Pmbus,
+            PowerAuthorityKind::Adc,
+            PowerAuthorityKind::WallCalibratedEstimate,
+            PowerAuthorityKind::Estimated,
+            PowerAuthorityKind::Unknown,
+        ] {
+            if k.is_measured() {
+                assert!(
+                    k.is_control_authoritative(),
+                    "measured must be authoritative"
+                );
+            }
+        }
+    }
 
     #[test]
     fn harvested_efficiency_anchor_returns_measured_for_s9() {

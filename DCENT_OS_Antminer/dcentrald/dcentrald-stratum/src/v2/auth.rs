@@ -24,9 +24,9 @@
 //! - [`parse_authority_key_from_sv2_url`] extracts the optional pinned
 //!   authority key from the SV2 URL exactly as the spec encodes it:
 //!   `stratum2+tcp://host:port/<base58check(version_le_u16 || pubkey32)>`.
-//! - [`sv2_insecure_no_noise`] is the single, loudly-logged escape hatch.
-//!   Secure Noise is the default; this only returns `true` when the
-//!   operator explicitly sets `DCENT_SV2_INSECURE_NO_NOISE=1`.
+//! - [`sv2_insecure_no_noise_for_peer`] is the single, loudly-logged escape
+//!   hatch. Secure Noise is the default; explicit cleartext is admitted only
+//!   when the connected peer is actually loopback.
 //!
 //! # Spec citations
 //!
@@ -83,36 +83,33 @@ pub fn sv2_tp_require_noise() -> bool {
     env_truthy(ENV_TP_REQUIRE_NOISE)
 }
 
-/// Returns `true` only when the operator has explicitly opted out of the
-/// secure Noise transport via `DCENT_SV2_INSECURE_NO_NOISE`.
+/// Classify the explicit insecure-transport request for the connected peer.
 ///
-/// Secure Noise is the **default**. This is the single, audited escape
-/// hatch. It emits a loud `tracing::error!` every time it returns `true`
-/// so an accidentally-set env var is impossible to miss in logs.
+/// Secure Noise is the **default**. Even an explicit opt-out is refused unless
+/// `peer_is_loopback` was derived from the connected socket's peer address;
+/// trusting only the configured host string would permit a misleading
+/// `localhost` resolver entry to authorize remote cleartext.
 ///
 /// Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
-/// Anything else (including unset) → secure (returns `false`).
-pub fn sv2_insecure_no_noise() -> bool {
-    match std::env::var(ENV_INSECURE_NO_NOISE) {
-        Ok(v) => {
-            let on = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-            if on {
-                tracing::error!(
-                    env = ENV_INSECURE_NO_NOISE,
-                    "*** SV2 NOISE DISABLED — CLEARTEXT TRANSPORT *** \
-                     This is INSECURE: an active network attacker can read \
-                     and rewrite mining traffic and steal hashrate. Only valid \
-                     against a mock pool you fully control. Unset \
-                     DCENT_SV2_INSECURE_NO_NOISE for production."
-                );
-            }
-            on
-        }
-        Err(_) => false,
+/// Anything else (including unset) selects secure transport.
+pub fn sv2_insecure_no_noise_for_peer(peer_is_loopback: bool) -> Result<bool, &'static str> {
+    if !env_truthy(ENV_INSECURE_NO_NOISE) {
+        return Ok(false);
     }
+
+    if !peer_is_loopback {
+        tracing::error!(
+            env = ENV_INSECURE_NO_NOISE,
+            "SV2 cleartext override refused: connected peer is not loopback"
+        );
+        return Err("SV2 cleartext override requires an actual loopback peer");
+    }
+
+    tracing::error!(
+        env = ENV_INSECURE_NO_NOISE,
+        "*** SV2 NOISE DISABLED FOR LOOPBACK PEER — CLEARTEXT TEST TRANSPORT ***"
+    );
+    Ok(true)
 }
 
 /// A pinned SV2 pool authority public key (x-only, 32 bytes, secp256k1).
@@ -137,6 +134,9 @@ pub enum AuthorityKeyError {
     /// operator did not pin a key — but it is surfaced so the caller can
     /// log the (insecure) TOFU posture.
     NotPresent,
+    /// A non-loopback peer omitted the authority key required to authenticate
+    /// the Noise certificate and prevent active hashrate redirection.
+    RequiredForNonLoopback,
     /// The path component was present but not valid base58check.
     InvalidBase58Check(String),
     /// Decoded payload had the wrong length or version prefix.
@@ -147,6 +147,9 @@ impl std::fmt::Display for AuthorityKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthorityKeyError::NotPresent => write!(f, "no authority key in SV2 URL"),
+            AuthorityKeyError::RequiredForNonLoopback => {
+                write!(f, "SV2 authority key required for a non-loopback peer")
+            }
             AuthorityKeyError::InvalidBase58Check(e) => {
                 write!(f, "invalid base58check authority key: {}", e)
             }
@@ -260,6 +263,23 @@ pub fn parse_authority_key_from_sv2_url(url: &str) -> Result<PoolAuthorityKey, A
     Ok(PoolAuthorityKey(key))
 }
 
+/// Admit a pinned authority key, or a local-only TOFU exception.
+///
+/// A missing key is accepted only when `peer_is_loopback` comes from the
+/// connected socket. Present-but-invalid keys always fail, including on
+/// loopback, so malformed configuration cannot silently downgrade to TOFU.
+pub fn admit_authority_key_for_peer(
+    url: &str,
+    peer_is_loopback: bool,
+) -> Result<Option<PoolAuthorityKey>, AuthorityKeyError> {
+    match parse_authority_key_from_sv2_url(url) {
+        Ok(key) => Ok(Some(key)),
+        Err(AuthorityKeyError::NotPresent) if peer_is_loopback => Ok(None),
+        Err(AuthorityKeyError::NotPresent) => Err(AuthorityKeyError::RequiredForNonLoopback),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +356,23 @@ mod tests {
     }
 
     #[test]
+    fn authority_admission_allows_only_pinned_or_loopback_tofu() {
+        let unpinned = "stratum2+tcp://pool.example.com:3336";
+        assert_eq!(admit_authority_key_for_peer(unpinned, true), Ok(None));
+        assert_eq!(
+            admit_authority_key_for_peer(unpinned, false),
+            Err(AuthorityKeyError::RequiredForNonLoopback)
+        );
+
+        let key = [0x42u8; 32];
+        let pinned = make_url_with_key(key);
+        assert_eq!(
+            admit_authority_key_for_peer(&pinned, false),
+            Ok(Some(PoolAuthorityKey(key)))
+        );
+    }
+
+    #[test]
     fn corrupt_base58_is_rejected() {
         let e =
             parse_authority_key_from_sv2_url("stratum2+tcp://pool.example.com:3336/not-valid-0OIl")
@@ -382,21 +419,37 @@ mod tests {
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Default (unset) → secure.
         std::env::remove_var(ENV_INSECURE_NO_NOISE);
-        assert!(!sv2_insecure_no_noise(), "unset must be secure");
+        assert_eq!(
+            sv2_insecure_no_noise_for_peer(false),
+            Ok(false),
+            "unset must be secure"
+        );
 
         // Explicit truthy values → insecure.
         for v in ["1", "true", "TRUE", "yes", "On"] {
             std::env::set_var(ENV_INSECURE_NO_NOISE, v);
-            assert!(sv2_insecure_no_noise(), "{v} must opt out");
+            assert_eq!(
+                sv2_insecure_no_noise_for_peer(true),
+                Ok(true),
+                "{v} must opt out only for loopback"
+            );
+            assert!(
+                sv2_insecure_no_noise_for_peer(false).is_err(),
+                "{v} must be refused for a non-loopback peer"
+            );
         }
 
         // Non-truthy / garbage → still secure (fail-closed).
         for v in ["0", "false", "no", "garbage", ""] {
             std::env::set_var(ENV_INSECURE_NO_NOISE, v);
-            assert!(!sv2_insecure_no_noise(), "{v:?} must stay secure");
+            assert_eq!(
+                sv2_insecure_no_noise_for_peer(false),
+                Ok(false),
+                "{v:?} must stay secure"
+            );
         }
 
         std::env::remove_var(ENV_INSECURE_NO_NOISE);
-        assert!(!sv2_insecure_no_noise());
+        assert_eq!(sv2_insecure_no_noise_for_peer(false), Ok(false));
     }
 }

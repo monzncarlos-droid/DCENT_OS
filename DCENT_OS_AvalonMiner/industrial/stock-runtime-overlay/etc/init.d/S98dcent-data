@@ -1,0 +1,194 @@
+#!/bin/sh
+# Repair only the factory-empty Nano 3 data UBI layout.
+#
+# The stock rcS attaches mtd12 after running the S?? scripts and then assumes
+# /dev/ubi2_0 already exists.  Canaan's recovery master contains a valid UBI
+# device but zero user volumes, so a recovery round-trip otherwise leaves
+# /data unmounted.  Stage only known configuration files synchronously before
+# rcS can cover the rootfs underlay, then run a bounded background waiter.
+# Create only the exact factory volume when the device is proven empty. Never
+# format, delete, resize, or overwrite anything on an existing volume.
+
+case "${1:-}" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+seed_dir=
+readiness_dir=/run/dcentos-data-ready
+init_lock=/run/dcentos-data-init-lock
+init_lock_owned=0
+
+cleanup_seed() {
+    [ -n "$seed_dir" ] && [ -d "$seed_dir" ] || return 0
+    if command -v dcent_remove_seed >/dev/null 2>&1; then
+        dcent_remove_seed "$seed_dir"
+    else
+        rm -f "$seed_dir/usrcon/systemcfg.ini" "$seed_dir/usrcon/cgminer.ini"
+        rmdir "$seed_dir/usrcon" 2>/dev/null || true
+        rmdir "$seed_dir" 2>/dev/null || true
+    fi
+}
+
+cleanup_init_lock() {
+    [ "$init_lock_owned" = 1 ] || return 0
+    rmdir "$init_lock" 2>/dev/null || return 1
+    init_lock_owned=0
+}
+
+log_refusal() {
+    cleanup_seed
+    cleanup_init_lock || true
+    logger -t dcentos "Nano 3 data initialization refused: $*"
+    exit 0
+}
+
+MIGRATION_LIB=/etc/dcentos/dcent-data-migrate.sh
+[ -r "$MIGRATION_LIB" ] || log_refusal 'configuration migration library is missing'
+. "$MIGRATION_LIB" || log_refusal 'configuration migration library could not load'
+
+# These identity gates and underlay reads must finish before this init script
+# returns. Stock rcS performs ubiattach + mount immediately after the S?? loop.
+tr '\000' '\n' </proc/device-tree/compatible 2>/dev/null |
+    grep -qx 'kendryte,k230' ||
+    log_refusal 'device-tree compatibility is not kendryte,k230'
+rootfs_ubi_mtd="$(tr ' ' '\n' </proc/cmdline 2>/dev/null |
+    sed -n 's/^ubi\.mtd=//p')"
+case "$rootfs_ubi_mtd" in
+    8|9) ;;
+    *) log_refusal 'active rootfs is not a Nano 3 A/B UBI slot' ;;
+esac
+grep -qx 'mtd12: 01c00000 00020000 "data"' /proc/mtd ||
+    log_refusal 'mtd12 data geometry does not match Nano 3'
+
+# /run is boot-local. A repeated/manual start must preserve a marker that is
+# already bound to the exact live mount instead of relocking a running miner.
+if [ -e "$readiness_dir" ] || [ -L "$readiness_dir" ]; then
+    [ -d "$readiness_dir" ] && [ ! -L "$readiness_dir" ] &&
+        grep -q '^/dev/ubi2_0 /data ubifs ' /proc/mounts 2>/dev/null &&
+        [ -r /sys/class/ubi/ubi2/mtd_num ] &&
+        [ "$(cat /sys/class/ubi/ubi2/mtd_num 2>/dev/null)" = 12 ] &&
+        [ -r /sys/class/ubi/ubi2_0/name ] &&
+        [ "$(cat /sys/class/ubi/ubi2_0/name 2>/dev/null)" = ubi_data_part ] &&
+        exit 0
+    log_refusal 'existing readiness marker failed live identity checks'
+fi
+
+# Serialize the pre-mount seed and the asynchronous publication path. /run is
+# boot-local, so an interrupted owner cannot carry this lock into the next boot.
+if mkdir -m 0700 "$init_lock" 2>/dev/null; then
+    init_lock_owned=1
+else
+    log_refusal 'another data initialization owns the boot-local lock'
+fi
+dcent_cleanup_stale_seed_dirs /tmp ||
+    log_refusal 'stale pre-mount seed state is not safely recoverable'
+
+# The normal boot path reaches S98 before /data is mounted and can stage its
+# narrow underlay allowlist. A repeated/manual start on the exact live mount
+# skips staging but still validates, prepares, syncs, and republishes readiness.
+if mountpoint -q /data 2>/dev/null; then
+    grep -q '^/dev/ubi2_0 /data ubifs ' /proc/mounts 2>/dev/null ||
+        log_refusal '/data is mounted from an unexpected source or type'
+else
+    seed_dir="/tmp/dcentos-data-seed.$$"
+    dcent_stage_known_configs /data "$seed_dir" ||
+        log_refusal 'could not stage known pre-mount configuration'
+    [ -d "$seed_dir" ] || seed_dir=
+fi
+
+(
+
+    attempts=0
+    while [ "$attempts" -lt 30 ]; do
+        [ -r /sys/class/ubi/ubi2/mtd_num ] &&
+            [ "$(cat /sys/class/ubi/ubi2/mtd_num 2>/dev/null)" = 12 ] &&
+            break
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    [ -c /dev/ubi2 ] || log_refusal 'mtd12 did not attach as ubi2'
+    [ -r /sys/class/ubi/ubi2/mtd_num ] &&
+        [ "$(cat /sys/class/ubi/ubi2/mtd_num 2>/dev/null)" = 12 ] ||
+        log_refusal 'ubi2 is not attached to mtd12'
+
+    volume_count="$(ubinfo /dev/ubi2 2>/dev/null |
+        awk -F: '/Volumes count:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')"
+    case "$volume_count" in
+        0)
+            ubimkvol /dev/ubi2 -N ubi_data_part -m >/dev/null 2>&1 ||
+                log_refusal 'could not create empty ubi_data_part volume'
+            ;;
+        1)
+            [ -r /sys/class/ubi/ubi2_0/name ] ||
+                log_refusal 'single data volume has no readable name'
+            [ "$(cat /sys/class/ubi/ubi2_0/name 2>/dev/null)" = ubi_data_part ] ||
+                log_refusal 'existing data volume has an unknown name'
+            ;;
+        *)
+            log_refusal "unexpected data volume count: ${volume_count:-unknown}"
+            ;;
+    esac
+
+    attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        [ -c /dev/ubi2_0 ] &&
+            [ -r /sys/class/ubi/ubi2_0/name ] &&
+            [ "$(cat /sys/class/ubi/ubi2_0/name 2>/dev/null)" = ubi_data_part ] &&
+            break
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    [ -c /dev/ubi2_0 ] || log_refusal 'ubi_data_part device did not appear'
+    [ "$(cat /sys/class/ubi/ubi2_0/name 2>/dev/null)" = ubi_data_part ] ||
+        log_refusal 'ubi2_0 is not the expected ubi_data_part volume'
+    if ! grep -q '^/dev/ubi2_0 /data ubifs ' /proc/mounts 2>/dev/null; then
+        if ! mount -t ubifs /dev/ubi2_0 /data >/dev/null 2>&1; then
+            # Stock rcS performs the same mount concurrently. EBUSY is a
+            # success only when the exact expected tuple is now present.
+            grep -q '^/dev/ubi2_0 /data ubifs ' /proc/mounts 2>/dev/null ||
+                log_refusal 'ubi_data_part mount failed'
+        fi
+    fi
+    grep -q '^/dev/ubi2_0 /data ubifs ' /proc/mounts 2>/dev/null ||
+        log_refusal '/data mount source or type is invalid'
+
+    # Exclude the stock admin account from renaming either the parent or the
+    # configuration directory while migration/bootstrap decisions are made.
+    # The synchronous launch hook retains this lock until Canaan's original
+    # recursive chown and final chmod restore normal policy.
+    chown root:root /data || log_refusal 'could not lock /data ownership'
+    chmod 0700 /data || log_refusal 'could not lock /data mode'
+
+    # btcminer creates and rewrites its INI files in place.  The directory is
+    # required even when the rootfs underlay had no configuration to stage.
+    dcent_prepare_stock_config_dir /data ||
+        log_refusal 'could not prepare stock configuration directory'
+    chown root:root /data/usrcon ||
+        log_refusal 'could not lock stock configuration ownership'
+    chmod 0700 /data/usrcon ||
+        log_refusal 'could not lock stock configuration mode'
+
+    if [ -n "$seed_dir" ]; then
+        dcent_restore_missing_configs "$seed_dir" /data ||
+            log_refusal 'could not restore missing known configuration'
+        cleanup_seed
+        seed_dir=
+    fi
+
+    for data_dir in /data/core /data/dcentos; do
+        if [ ! -e "$data_dir" ]; then
+            mkdir -m 0755 "$data_dir" ||
+                log_refusal "could not create $data_dir"
+        elif [ ! -d "$data_dir" ]; then
+            log_refusal "$data_dir exists but is not a directory"
+        fi
+    done
+    sync || log_refusal 'persistent data sync failed'
+    cleanup_init_lock || log_refusal 'could not release data initialization lock'
+    mkdir -m 0700 "$readiness_dir" ||
+        log_refusal 'could not publish data readiness marker'
+    logger -t dcentos 'Nano 3 persistent data volume is mounted'
+) &
+
+exit 0

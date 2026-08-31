@@ -14,26 +14,34 @@ case "$BOARD_NAME" in
     am3-s21)
         PRODUCT_LABEL="S21"
         PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_STORAGE_AUTHORIZED=1
         PACKAGE_POSTURE="lab-gated host rootfs-window target"
         INSTALL_DETAIL="Lab-gated host installation requires restore-verified evidence."
+        METADATA_INSTALL_CONTRACT="host-driven rootfs-window only; target-side AM3 sysupgrade unsupported"
         ;;
     am3-s19xp)
         PRODUCT_LABEL="S19 XP"
-        PACKAGE_INSTALL_AUTHORIZED=1
-        PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
-        INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        PACKAGE_INSTALL_AUTHORIZED=0
+        PACKAGE_STORAGE_AUTHORIZED=0
+        PACKAGE_POSTURE="management-only package-format evidence target"
+        INSTALL_DETAIL="Persistent install is denied: storage, boot-selection, rollback, and recovery authority are unresolved."
+        METADATA_INSTALL_CONTRACT="package-only denied; no hardware write or recovery authority"
         ;;
     am3-s19jxp)
         PRODUCT_LABEL="S19j XP"
-        PACKAGE_INSTALL_AUTHORIZED=1
-        PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
-        INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        PACKAGE_INSTALL_AUTHORIZED=0
+        PACKAGE_STORAGE_AUTHORIZED=0
+        PACKAGE_POSTURE="management-only package-format evidence target"
+        INSTALL_DETAIL="Persistent install is denied: storage, boot-selection, rollback, and recovery authority are unresolved."
+        METADATA_INSTALL_CONTRACT="package-only denied; no hardware write or recovery authority"
         ;;
     am3-s19jproplus)
         PRODUCT_LABEL="S19j Pro+"
         PACKAGE_INSTALL_AUTHORIZED=1
+        PACKAGE_STORAGE_AUTHORIZED=1
         PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"
         INSTALL_DETAIL="Toolbox admission still requires exact observed PCB, lock epoch, geometry, MAC, backup, and restore proof."
+        METADATA_INSTALL_CONTRACT="host-driven rootfs-window only; target-side AM3 sysupgrade unsupported"
         ;;
     *)
         echo "ERROR: unadmitted or missing A113D board_target: ${BOARD_NAME:-<missing>}" >&2
@@ -125,7 +133,17 @@ echo "  SHA256: ${ROOTFS_SHA256}"
 PROJECT_ROOT="$(cd "${BR2_EXTERNAL_DCENTOS_PATH}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
 . "${PROJECT_ROOT}/scripts/lib/sysupgrade_package_common.sh"
-. "${PROJECT_ROOT}/scripts/lib/am3_geometry.sh"
+
+if [ "$PACKAGE_STORAGE_AUTHORIZED" = "1" ]; then
+    . "${PROJECT_ROOT}/scripts/lib/am3_geometry.sh"
+    PACKAGE_ROOTFS_MAX_BYTES=$DCENT_AM3_ROOTFS_WINDOW_DEC
+    PACKAGE_SIZE_LABEL="Amlogic rootfs window"
+else
+    # Build-resource ceiling only. This is not an admitted MTD window, offset,
+    # write geometry, boot selector, rollback path, or recovery contract.
+    PACKAGE_ROOTFS_MAX_BYTES=41943040
+    PACKAGE_SIZE_LABEL="package-format rootfs ceiling"
+fi
 
 case "$ROOTFS_SIZE" in
     ''|*[!0-9]*)
@@ -133,11 +151,11 @@ case "$ROOTFS_SIZE" in
         exit 1
         ;;
 esac
-if [ "$ROOTFS_SIZE" -gt "$DCENT_AM3_ROOTFS_WINDOW_DEC" ]; then
-    echo "ERROR: rootfs uImage exceeds Amlogic rootfs window: ${ROOTFS_SIZE} > ${DCENT_AM3_ROOTFS_WINDOW_DEC}" >&2
+if [ "$ROOTFS_SIZE" -gt "$PACKAGE_ROOTFS_MAX_BYTES" ]; then
+    echo "ERROR: rootfs uImage exceeds ${PACKAGE_SIZE_LABEL}: ${ROOTFS_SIZE} > ${PACKAGE_ROOTFS_MAX_BYTES}" >&2
     exit 1
 fi
-echo "Rootfs window: ${ROOTFS_SIZE} <= ${DCENT_AM3_ROOTFS_WINDOW_DEC} bytes"
+echo "${PACKAGE_SIZE_LABEL}: ${ROOTFS_SIZE} <= ${PACKAGE_ROOTFS_MAX_BYTES} bytes"
 
 read_first_nonempty_line() {
     sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$1"
@@ -208,7 +226,7 @@ Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board: ${BOARD_NAME}
 Kernel: Amlogic 4.9.113 (shared A113D runtime / ${PRODUCT_LABEL})
 Rootfs: DCENTos (Buildroot, uImage-wrapped gzip CPIO)
-Install contract: host-driven rootfs-window only; target-side AM3 sysupgrade unsupported
+Install contract: ${METADATA_INSTALL_CONTRACT}
 EOF
 METADATA_SHA256=$(sha256sum "$SUP_DIR/METADATA" | awk '{print $1}')
 METADATA_SIZE=$(stat -c%s "$SUP_DIR/METADATA")
@@ -256,8 +274,9 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
 }
 EOF
 
-# Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
-# are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
+# Final manifest/signature rewrite through the shared AM2/AM3 helper. Admitted
+# targets expose guarded host-driven rootfs-window tooling; package-only targets
+# remain non-installable format/evidence artifacts with no writer metadata.
 if [ "$PACKAGE_INSTALL_AUTHORIZED" = "1" ]; then
     DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"
     DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
@@ -266,12 +285,17 @@ if [ "$PACKAGE_INSTALL_AUTHORIZED" = "1" ]; then
 else
     DCENT_TOOLBOX_INSTALL_COMMAND=""
     DCENT_TOOLBOX_INSTALL_MODE=package_only_denied
+    DCENT_PACKAGE_STATUS=unvalidated_package_only
     DCENT_PACKAGE_INSTALLABLE=false
 fi
 # OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
 # rail accepts the amlogic_rootfs_window method; identical root SSH +
 # restore-verified + signed-package gates; write+readback, NO auto-reboot).
-DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"
+if [ "$PACKAGE_INSTALL_AUTHORIZED" = "1" ]; then
+    DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"
+else
+    DCENT_TOOLBOX_UPDATE_COMMAND=""
+fi
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
 DCENT_TARGET_SIDE_SYSUPGRADE=false
 dcent_stage_release_key
@@ -310,12 +334,22 @@ Rootfs (uImage-wrapped gzip CPIO): uImage_rootfs.bin
   SHA256: ${ROOTFS_SHA256}
 
 Install contract:
-  Host-driven rootfs-window package only. Target-side AM3 sysupgrade is not
-  validated or claimed by this package.
+  ${METADATA_INSTALL_CONTRACT}
   ${INSTALL_DETAIL}
+EOF
+if [ "$PACKAGE_STORAGE_AUTHORIZED" = "1" ]; then
+    cat >> "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
   mtd=${DCENT_AM3_ROOTFS_MTD}
   rootfs_offset=${DCENT_AM3_ROOTFS_OFFSET_HEX}
   rootfs_window=${DCENT_AM3_ROOTFS_WINDOW_HEX}
+EOF
+else
+    cat >> "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
+  No MTD number, offset, writable window, boot selector, rollback, or recovery
+  geometry is claimed by this package.
+EOF
+fi
+cat >> "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
 
 Target fleet:
   Exact held A113D vendor runtime identity for ${PRODUCT_LABEL}; ${PACKAGE_POSTURE}

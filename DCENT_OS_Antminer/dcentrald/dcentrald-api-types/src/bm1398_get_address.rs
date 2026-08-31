@@ -246,9 +246,8 @@ mod tests {
     fn exact_114_window_mints_sealed_nbp1901_admission() {
         let body = locked_bm1398_unassigned_get_address_body();
         let responses = vec![body; 114];
-        let admission =
-            admit_nbp1901_bm1398_get_address_window(responses.iter().map(|b| &b[..]))
-                .expect("exact 114 BM1398 frames must admit NBP1901");
+        let admission = admit_nbp1901_bm1398_get_address_window(responses.iter().map(|b| &b[..]))
+            .expect("exact 114 BM1398 frames must admit NBP1901");
         assert_eq!(admission.observed_frames().get(), 114);
         assert_eq!(admission.expected_chip_count(), 114);
         assert_eq!(admission.chip_id(), 0x1398);
@@ -363,7 +362,9 @@ mod tests {
         // Address + UART-relay plan remain load-bearing on the chain spec pin.
         assert_eq!(S19_PRO_NBP1901_CHAIN_SPEC.voltage_domain_count, 38);
         assert_eq!(
-            S19_PRO_NBP1901_CHAIN_SPEC.production_uart_relay_writes.len(),
+            S19_PRO_NBP1901_CHAIN_SPEC
+                .production_uart_relay_writes
+                .len(),
             12
         );
         // BM1362 serial ChipAddress bodies are 9 bytes; this dialect must not

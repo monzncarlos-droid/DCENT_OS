@@ -218,6 +218,14 @@ pub const HIGH_PLL_TABLE_COUNT: usize = 33;
 pub const HIGH_PLL_MAX_INDEX: u8 = 32;
 pub const HIGH_PLL_DEFAULT_INDEX: u8 = 4; // 200 MHz
 pub const S9SE_CGMINER_HIGH_PLL_FILE_OFF: usize = 0x94E28;
+/// The official Bitmain OM 2019-09-18 `cgminer` build (opkg `cgminer-t11
+/// 1.0-r1.29`, 614796 B) carries the same 33 × 12 table, shifted deeper into
+/// `.data` by the larger September build. Cross-adjudication 2026-08-17.
+pub const OFFICIAL_S9SE_CGMINER_HIGH_PLL_FILE_OFF: usize = 0x95A38;
+/// Length of the `freq_pll_1393` region sitting immediately before
+/// `freq_high_pll_1393` in both S9 SE builds (179 × 16 B) — byte-identical
+/// across the July HiveOS and September OM builds.
+pub const S9SE_PLL_REGION_LEN: usize = 179 * 16;
 pub const S9SE_CGMINER_HIGH_PLL_STRIDE: usize = 12;
 /// S9k `change_high_pll_by_aisc` still does `asic << 2`. Not S9 SE geometry.
 pub const S9K_PLL_ADDR_INTERVAL: u8 = 4;
@@ -420,7 +428,10 @@ pub fn freq_pll_1393_row(index: u8) -> Result<(u16, u32), S9SePllError> {
 }
 
 /// Packed frames for the operational spine. Not a TX permit.
-pub fn pack_operational_pll_frames(raw_word: u32, divider: u8) -> Result<[[u8; 9]; 4], S9SePllError> {
+pub fn pack_operational_pll_frames(
+    raw_word: u32,
+    divider: u8,
+) -> Result<[[u8; 9]; 4], S9SePllError> {
     let _ = operational_pll_plan(raw_word, divider)?;
     Ok([
         pack_pll0_divider(divider),
@@ -433,9 +444,24 @@ pub fn pack_operational_pll_frames(raw_word: u32, divider: u8) -> Result<[[u8; 9
 /// `set_unused_pll`: park PLL1/2/3 (each pair written twice). Not a TX permit.
 pub fn pack_unused_pll_park_frames() -> [[u8; 9]; 12] {
     let pairs = [
-        (REG_PLL1_DIVIDER, UNUSED_PLL_DIVIDER_FILL, REG_PLL1, UNUSED_PLL_PARK_WORD),
-        (REG_PLL2_DIVIDER, UNUSED_PLL_DIVIDER_FILL, REG_PLL2, UNUSED_PLL_PARK_WORD),
-        (REG_PLL3_DIVIDER, UNUSED_PLL_DIVIDER_FILL, REG_PLL3, UNUSED_PLL_PARK_WORD),
+        (
+            REG_PLL1_DIVIDER,
+            UNUSED_PLL_DIVIDER_FILL,
+            REG_PLL1,
+            UNUSED_PLL_PARK_WORD,
+        ),
+        (
+            REG_PLL2_DIVIDER,
+            UNUSED_PLL_DIVIDER_FILL,
+            REG_PLL2,
+            UNUSED_PLL_PARK_WORD,
+        ),
+        (
+            REG_PLL3_DIVIDER,
+            UNUSED_PLL_DIVIDER_FILL,
+            REG_PLL3,
+            UNUSED_PLL_PARK_WORD,
+        ),
     ];
     let mut out = [[0u8; 9]; 12];
     let mut i = 0;
@@ -522,11 +548,7 @@ mod tests {
             let off = i * S9SE_CGMINER_HIGH_PLL_STRIDE;
             let mut row = [0u8; 12];
             row.copy_from_slice(&raw[off..off + 12]);
-            assert_eq!(
-                decode_high_pll_row(&row),
-                FREQ_HIGH_PLL_1393[i],
-                "row {i}"
-            );
+            assert_eq!(decode_high_pll_row(&row), FREQ_HIGH_PLL_1393[i], "row {i}");
         }
         assert_eq!(freq_high_pll_1393_row(4).unwrap(), (200, 15, 3000));
         assert_eq!(freq_high_pll_1393_row(19).unwrap(), (575, 5, 2870));
@@ -536,6 +558,55 @@ mod tests {
         assert_eq!(get_index_from_high_pll(50), HIGH_PLL_DEFAULT_INDEX);
         // 3000 MHz pll_out at 200 MHz / div 15 is the solver fallback row.
         assert_eq!(freq_pll_1393_row(175).unwrap(), (3000, PLL_FALLBACK_WORD));
+    }
+
+    #[test]
+    fn official_om_cgminer_tables_match_held_build() {
+        let kb = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../");
+        let held = std::fs::read(kb.join("rootfs/usr/bin/cgminer")).expect("held S9 SE cgminer");
+        let official = std::fs::read(kb.join("om-20190918/rootfs/usr/bin/cgminer"))
+            .expect("official OM S9 SE cgminer");
+
+        // The official September build decodes to the exact pinned 33 rows.
+        let start = OFFICIAL_S9SE_CGMINER_HIGH_PLL_FILE_OFF;
+        let end = start + HIGH_PLL_TABLE_COUNT * S9SE_CGMINER_HIGH_PLL_STRIDE;
+        let raw = &official[start..end];
+        for i in 0..HIGH_PLL_TABLE_COUNT {
+            let off = i * S9SE_CGMINER_HIGH_PLL_STRIDE;
+            let mut row = [0u8; 12];
+            row.copy_from_slice(&raw[off..off + 12]);
+            assert_eq!(decode_high_pll_row(&row), FREQ_HIGH_PLL_1393[i], "row {i}");
+        }
+
+        // Cross-build byte equality: the 33 × 12 high table …
+        let held_start = S9SE_CGMINER_HIGH_PLL_FILE_OFF;
+        let held_high = &held[held_start..held_start + 396];
+        assert_eq!(raw, held_high, "freq_high_pll_1393 differs across builds");
+        // … and the 179 × 16 freq_pll_1393 region immediately before it.
+        let official_pll = &official[start - S9SE_PLL_REGION_LEN..start];
+        let held_pll = &held[held_start - S9SE_PLL_REGION_LEN..held_start];
+        assert_eq!(
+            official_pll, held_pll,
+            "freq_pll_1393 region differs across builds"
+        );
+
+        // The stock assertion-string set survives in the official build —
+        // the RE'd bring-up contract (check_asic_num == 60 et al.) is not a
+        // HiveOS-only artifact.
+        for needle in [
+            b"check_asic_num".as_slice(),
+            b"bitmain_soc_init".as_slice(),
+            b"send_job".as_slice(),
+            b"calculate_asic_number".as_slice(),
+            b"T11".as_slice(),
+        ] {
+            assert!(
+                official.windows(needle.len()).any(|w| w == needle),
+                "official cgminer missing {:?}",
+                String::from_utf8_lossy(needle)
+            );
+        }
     }
 
     #[test]

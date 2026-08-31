@@ -381,6 +381,61 @@ def _write_tool_authorized(auth_token):
     return False, "release-image-token-mismatch"
 
 
+# One-shot RELEASE write-token mint. MCP/gRPC/MQTT command writes fail closed
+# on a release image when no token file exists. This CLI writes a root-only
+# token so the operator can `S81mcp start-force` without shipping DEV posture.
+# Does NOT start the MCP server.
+_MCP_TOKEN_BASENAME = "mcp_token"
+_GRPC_TOKEN_BASENAME = "grpc_token"
+_MQTT_TOKEN_BASENAME = "mqtt_token"
+_DEFAULT_TOKEN_DIR = "/data/dcent"
+_TOKEN_BYTES = 32
+
+
+def generate_release_token():
+    """Return a 64-char hex token (32 random bytes). Meets gRPC min length."""
+    return os.urandom(_TOKEN_BYTES).hex()
+
+
+def mint_release_token_file(path, token, overwrite=False):
+    """Write `token\\n` to path with mode 0600. Does not follow symlinks."""
+    directory = os.path.dirname(path) or "."
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, 0o700)
+    flags = os.O_WRONLY | os.O_CREAT
+    if overwrite:
+        flags |= os.O_TRUNC
+    else:
+        flags |= os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, (token + "\n").encode("ascii"))
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return path
+
+
+def mint_release_tokens(token_dir, overwrite=False, token=None):
+    """Mint MCP + gRPC + MQTT command tokens into token_dir (same secret)."""
+    secret = token or generate_release_token()
+    if len(secret) < 32 or not all(32 < ord(c) < 127 for c in secret):
+        raise ValueError("token must be >=32 visible ASCII characters")
+    written = []
+    for name in (_MCP_TOKEN_BASENAME, _GRPC_TOKEN_BASENAME, _MQTT_TOKEN_BASENAME):
+        path = os.path.join(token_dir, name)
+        if os.path.lexists(path) and not overwrite:
+            raise FileExistsError("token already exists: %s (pass --force)" % path)
+        mint_release_token_file(path, secret, overwrite=overwrite)
+        written.append(path)
+    return secret, written
+
+
 _PLATFORM_CACHE = None
 
 
@@ -1685,7 +1740,36 @@ def main():
     # still pass --bind 0.0.0.0 explicitly, but the release-image token gate on
     # write tools (see handle_jsonrpc) then protects the mutating surface.
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument(
+        "--mint-token",
+        action="store_true",
+        help="One-shot: mint MCP/gRPC/MQTT write tokens and exit (does not start the server)",
+    )
+    parser.add_argument(
+        "--token-dir",
+        default=_DEFAULT_TOKEN_DIR,
+        help="Directory for minted token files (default: /data/dcent)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing minted token",
+    )
     args = parser.parse_args()
+
+    if args.mint_token:
+        try:
+            secret, written = mint_release_tokens(args.token_dir, overwrite=args.force)
+        except Exception as exc:
+            print("ERROR: mint-token failed: %s" % exc, file=sys.stderr)
+            sys.exit(1)
+        print("Minted RELEASE write tokens (0600):")
+        for path in written:
+            print("  %s" % path)
+        print("MCP writes: Authorization: Bearer <token>")
+        print("MCP server is NOT started. On RELEASE, start with: /etc/init.d/S81mcp start-force")
+        print("Token (shown once): %s" % secret)
+        sys.exit(0)
 
     server = http.server.HTTPServer((args.bind, args.port), MCPHandler)
     print(f"DCENTos MCP Server v{VERSION}")

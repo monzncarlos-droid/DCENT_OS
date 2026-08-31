@@ -35,6 +35,30 @@ pub fn pll_expectation(chip_id: u16) -> Option<&'static PllExpectation> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rows_are_unique_and_scaffold_provenance_is_explicit() {
+        assert_eq!(PLL_EXPECTATIONS.len(), 9);
+        for (index, row) in PLL_EXPECTATIONS.iter().enumerate() {
+            assert!(PLL_EXPECTATIONS[..index]
+                .iter()
+                .all(|other| other.chip_id != row.chip_id));
+            assert!(!row.provenance.trim().is_empty());
+        }
+        assert_eq!(
+            pll_expectation(0x1372).map(|row| (
+                row.reset_value,
+                row.representative_frequency_mhz,
+                row.representative_value,
+                row.provenance,
+            )),
+            Some((None, None, None, "SCAFFOLD_NO_GROUND_TRUTH"))
+        );
+        assert!(PLL_EXPECTATIONS
+            .iter()
+            .filter(|row| row.chip_id != 0x1372)
+            .all(|row| row.provenance != "SCAFFOLD_NO_GROUND_TRUTH"));
+    }
+
     /// W8 CLK-4: the per-chip declared reference is uniformly 25 MHz today.
     /// This field is enforced against the production PLL solvers by
     /// `dcentrald_common::pll_model::PLL_REFERENCE_HZ` (compile-time pinned in

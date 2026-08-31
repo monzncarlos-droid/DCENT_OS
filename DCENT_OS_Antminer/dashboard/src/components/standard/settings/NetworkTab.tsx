@@ -152,7 +152,7 @@ export function NetworkTab() {
               </button>
             </div>
             <div style={{ marginTop: 6, fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-              Saves the hostname to daemon config. The active OS hostname updates after the next daemon or host restart.
+              Saves the hostname to daemon config and /etc/hostname so 4028, mDNS, and network/info stay a single source.
             </div>
           </form>
 

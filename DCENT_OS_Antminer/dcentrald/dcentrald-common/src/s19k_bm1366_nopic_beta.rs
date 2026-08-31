@@ -12,7 +12,11 @@
 //! (11×7). `dcentrald-silicon-profiles` still documents a stock hashcounting
 //! 76-chip constant — that tension is intentional and not resolved here.
 
-use crate::{AsicProtocolIdentity, BoardDesc, VoltageControllerClass};
+use crate::s19k_bm1366_init_seq::{
+    BOSMINER_BM1366_AML_HOST_BAUD, BOSMINER_BM1366_FASTUART_3M125,
+    BOSMINER_BM1366_REQUESTED_FAST_BAUD,
+};
+use crate::{AsicProtocolIdentity, BoardDesc, VoltageControllerClass, WorkEngineKind};
 use std::fmt;
 
 /// Exact HashSource PT board_name set for S19k BM1366 NoPic admission (G1).
@@ -28,7 +32,15 @@ pub const S19K_BM1366_VOLTAGE_DOMAINS: u8 = 11;
 pub const S19K_BM1366_CHIPS_PER_DOMAIN: u8 = 7;
 pub const S19K_BM1366_MIDSTATE_NUMBER: u8 = 8;
 pub const S21_BM1368_FIXTURE_MIDSTATE_NUMBER: u8 = 16;
-pub const S19K_BM1366_BAUD_HZ: u32 = 12_000_000;
+/// Exact stock semantic chip baud requested by the S19k BM1366 driver.
+pub const S19K_BM1366_BAUD_HZ: u32 = BOSMINER_BM1366_REQUESTED_FAST_BAUD;
+/// Exact Amlogic Linux termios rate paired with the semantic 3.125 Mbaud
+/// request. Do not configure host 3.125 Mbaud or treat this as a readback.
+pub const S19K_BM1366_HOST_BAUD_HZ: u32 = BOSMINER_BM1366_AML_HOST_BAUD;
+pub const S19K_BM1366_FASTUART_VALUE: u32 = BOSMINER_BM1366_FASTUART_3M125;
+/// HashSource/AMTC factory-jig class retained as evidence only. It is not the
+/// stock production driver pair and must not pass the NoPic runtime admission.
+pub const S19K_BM1366_JIG_BAUD_HZ: u32 = 12_000_000;
 pub const S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV: u16 = 1500;
 pub const S19K_BM1366_INC_FREQ_DELAY_MS: u16 = 100;
 pub const S19K_BM1366_VOLTAGE_ADJUST_STEP: u16 = 10;
@@ -51,7 +63,10 @@ pub struct S19kBm1366NopicSkeleton {
     pub voltage_domains: u8,
     pub chips_per_domain: u8,
     pub midstate_number: u8,
+    /// Semantic baud requested from the ASIC driver.
     pub baud_hz: u32,
+    pub host_baud_hz: u32,
+    pub fast_uart_value: u32,
     pub pre_open_core_voltage_cv: u16,
     pub inc_freq_delay_ms: u16,
     pub voltage_adjust_step: u16,
@@ -69,6 +84,8 @@ pub const S19K_BM1366_NOPIC_SKELETON: S19kBm1366NopicSkeleton = S19kBm1366NopicS
     chips_per_domain: S19K_BM1366_CHIPS_PER_DOMAIN,
     midstate_number: S19K_BM1366_MIDSTATE_NUMBER,
     baud_hz: S19K_BM1366_BAUD_HZ,
+    host_baud_hz: S19K_BM1366_HOST_BAUD_HZ,
+    fast_uart_value: S19K_BM1366_FASTUART_VALUE,
     pre_open_core_voltage_cv: S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV,
     inc_freq_delay_ms: S19K_BM1366_INC_FREQ_DELAY_MS,
     voltage_adjust_step: S19K_BM1366_VOLTAGE_ADJUST_STEP,
@@ -80,20 +97,38 @@ pub const S19K_BM1366_NOPIC_SKELETON: S19kBm1366NopicSkeleton = S19kBm1366NopicS
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum S19kBm1366NopicAdmitError {
-    UnknownBoardName { observed: String },
+    UnknownBoardName {
+        observed: String,
+    },
     S21FixtureBoardNameForbidden,
-    ChipIdMismatch { observed: u16 },
+    ChipIdMismatch {
+        observed: u16,
+    },
     GeometryMismatch,
-    MidstateMustBeEight { observed: u8 },
+    MidstateMustBeEight {
+        observed: u8,
+    },
     PicOwnerForbidden,
-    BaudClassMismatch { observed: u32 },
+    BaudClassMismatch {
+        observed: u32,
+    },
+    StockBaudPairMismatch {
+        requested_chip_baud_hz: u32,
+        host_baud_hz: u32,
+        fast_uart_value: u32,
+    },
     PreOpenDefaultsMismatch,
     Lm75MapMismatch,
     GpioSafeOffContractBroken,
-    VoltageControllerNotNoPic { observed: String },
-    BoardTargetMismatch { observed: String },
+    VoltageControllerNotNoPic {
+        observed: String,
+    },
+    BoardTargetMismatch {
+        observed: String,
+    },
     AsicProtocolMismatch,
     MiningDefaultMustStayOff,
+    WorkEngineMustBeSerial,
 }
 
 impl fmt::Display for S19kBm1366NopicAdmitError {
@@ -117,8 +152,19 @@ impl fmt::Display for S19kBm1366NopicAdmitError {
                 "S19k NoPic admission hard-fail: PIC/dsPIC ownership selected; NoPic fabric required"
             ),
             Self::BaudClassMismatch { observed } => {
-                write!(f, "S19k NoPic admit: baud {observed} is not 12 Mbaud class")
+                write!(
+                    f,
+                    "S19k NoPic admit: requested chip baud {observed} is not stock 3.125 Mbaud"
+                )
             }
+            Self::StockBaudPairMismatch {
+                requested_chip_baud_hz,
+                host_baud_hz,
+                fast_uart_value,
+            } => write!(
+                f,
+                "S19k NoPic admit: stock baud pair mismatch requested={requested_chip_baud_hz} host={host_baud_hz} FastUART={fast_uart_value:#010x}"
+            ),
             Self::PreOpenDefaultsMismatch => {
                 write!(f, "S19k NoPic admit: pre-open defaults mismatch")
             }
@@ -140,6 +186,12 @@ impl fmt::Display for S19kBm1366NopicAdmitError {
             }
             Self::MiningDefaultMustStayOff => {
                 write!(f, "S19k NoPic admit: mining_default_enabled must stay false")
+            }
+            Self::WorkEngineMustBeSerial => {
+                write!(
+                    f,
+                    "S19k NoPic admit: work_engine must be SerialWork (production construction)"
+                )
             }
         }
     }
@@ -183,6 +235,9 @@ pub fn admit_s19k_am3_board_desc(desc: &BoardDesc) -> Result<(), S19kBm1366Nopic
     }
     if desc.mining_default_enabled {
         return Err(S19kBm1366NopicAdmitError::MiningDefaultMustStayOff);
+    }
+    if desc.work_engine != WorkEngineKind::SerialWork {
+        return Err(S19kBm1366NopicAdmitError::WorkEngineMustBeSerial);
     }
     admit_s19k_nopic_voltage_controller(desc.voltage_controller)?;
     Ok(())
@@ -286,6 +341,26 @@ impl S19kNopicBringupSession {
 }
 
 /// G1–G5 fail-closed admit for the tryable-BETA skeleton (no energize).
+/// Admit only the held-stock S19k BM1366 ASIC/host/FastUART triple. The 12M
+/// AMTC/HashSource jig setting is retained separately and deliberately fails.
+pub fn admit_s19k_bm1366_stock_baud_pair(
+    requested_chip_baud_hz: u32,
+    host_baud_hz: u32,
+    fast_uart_value: u32,
+) -> Result<(), S19kBm1366NopicAdmitError> {
+    if requested_chip_baud_hz != S19K_BM1366_BAUD_HZ
+        || host_baud_hz != S19K_BM1366_HOST_BAUD_HZ
+        || fast_uart_value != S19K_BM1366_FASTUART_VALUE
+    {
+        return Err(S19kBm1366NopicAdmitError::StockBaudPairMismatch {
+            requested_chip_baud_hz,
+            host_baud_hz,
+            fast_uart_value,
+        });
+    }
+    Ok(())
+}
+
 pub fn admit_s19k_bm1366_nopic_skeleton(
     board_name: &str,
     chip_id: u16,
@@ -328,6 +403,11 @@ pub fn admit_s19k_bm1366_nopic_skeleton(
     if baud_hz != S19K_BM1366_BAUD_HZ {
         return Err(S19kBm1366NopicAdmitError::BaudClassMismatch { observed: baud_hz });
     }
+    admit_s19k_bm1366_stock_baud_pair(
+        baud_hz,
+        S19K_BM1366_HOST_BAUD_HZ,
+        S19K_BM1366_FASTUART_VALUE,
+    )?;
     if pre_open_core_voltage_cv != S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV
         || inc_freq_delay_ms != S19K_BM1366_INC_FREQ_DELAY_MS
         || voltage_adjust_step != S19K_BM1366_VOLTAGE_ADJUST_STEP
@@ -449,8 +529,6 @@ mod tests {
         ));
     }
 
-
-
     #[test]
     fn g1_geometry_is_77_equals_11_by_7() {
         assert_eq!(
@@ -500,6 +578,7 @@ mod tests {
         let desc = BoardDesc::am3_s19kpro();
         assert_eq!(desc.asic_protocol, AsicProtocolIdentity::Bm1366);
         assert_eq!(desc.voltage_controller, VoltageControllerClass::NoPic);
+        assert_eq!(desc.work_engine, WorkEngineKind::SerialWork);
         assert!(!desc.mining_default_enabled);
         assert!(!matches!(
             desc.voltage_controller,
@@ -571,7 +650,34 @@ mod tests {
 
     #[test]
     fn g4_g5_baud_and_preopen_defaults() {
-        assert_eq!(S19K_BM1366_BAUD_HZ, 12_000_000);
+        assert_eq!(S19K_BM1366_BAUD_HZ, 3_125_000);
+        assert_eq!(S19K_BM1366_HOST_BAUD_HZ, 3_000_000);
+        assert_eq!(S19K_BM1366_FASTUART_VALUE, 0x0000_3011);
+        assert_eq!(S19K_BM1366_JIG_BAUD_HZ, 12_000_000);
+        assert!(admit_s19k_bm1366_stock_baud_pair(
+            S19K_BM1366_BAUD_HZ,
+            S19K_BM1366_HOST_BAUD_HZ,
+            S19K_BM1366_FASTUART_VALUE,
+        )
+        .is_ok());
+        assert!(admit_s19k_bm1366_stock_baud_pair(
+            S19K_BM1366_JIG_BAUD_HZ,
+            S19K_BM1366_HOST_BAUD_HZ,
+            S19K_BM1366_FASTUART_VALUE,
+        )
+        .is_err());
+        assert!(admit_s19k_bm1366_stock_baud_pair(
+            S19K_BM1366_BAUD_HZ,
+            3_125_000,
+            S19K_BM1366_FASTUART_VALUE,
+        )
+        .is_err());
+        assert!(admit_s19k_bm1366_stock_baud_pair(
+            S19K_BM1366_BAUD_HZ,
+            S19K_BM1366_HOST_BAUD_HZ,
+            0x0000_3001,
+        )
+        .is_err());
         assert_eq!(S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV, 1500);
         assert_eq!(S19K_BM1366_INC_FREQ_DELAY_MS, 100);
         assert_eq!(S19K_BM1366_VOLTAGE_ADJUST_STEP, 10);
@@ -598,9 +704,25 @@ mod tests {
 
     #[test]
     fn native_bm1366_mining_stays_not_implemented_refusal() {
-        assert!(SERIAL_MINING.contains(
-            "NOT IMPLEMENTED: native BM1366 catalog identities are live-evidence-backed NoPic hashboards"
+        // Since 13915439a the authoritative refusal literal lives in the
+        // silicon-profiles admission module (S19K_NATIVE_MINING_REFUSAL),
+        // wired to S19kMiningDisposition::NotImplemented, which every
+        // successful admit_s19k_nopic_profile fabric admission returns.
+        const NOPIC_ADMISSION: &str =
+            include_str!("../../dcentrald-silicon-profiles/src/s19k_nopic_admission.rs");
+        assert!(NOPIC_ADMISSION.contains(
+            "pub const S19K_NATIVE_MINING_REFUSAL: &str = \"NOT IMPLEMENTED: native BM1366 catalog identities are live-evidence-backed NoPic hashboards"
         ));
+        assert!(NOPIC_ADMISSION.contains("Self::NotImplemented => S19K_NATIVE_MINING_REFUSAL"));
+        // Single source of truth: the serial engine must not re-inline a
+        // drifting copy of the refusal.
+        assert!(!SERIAL_MINING.contains("NOT IMPLEMENTED: native BM1366 catalog identities"));
+        // The serial path keeps native S19k BM1366 cold start behind an
+        // explicit fail-closed opt-in (default: refused).
+        assert!(SERIAL_MINING.contains("DCENT_S19K_NATIVE_COLD_START"));
+        assert!(SERIAL_MINING
+            .contains("fn s19k_native_cold_start_opt_in_from(raw: Option<&str>) -> bool"));
+        assert!(SERIAL_MINING.contains("matches!(raw, Some(\"1\"))"));
     }
 
     #[test]
@@ -610,16 +732,25 @@ mod tests {
         let safe = INSTALL_SCRIPT
             .find("Step 7b/10: GPIO437 PWR_EN SafeOff")
             .expect("safeoff");
+        let refusal = INSTALL_SCRIPT
+            .find("CLEAR_FOR_FLASH=false")
+            .expect("immutable flash refusal");
         let flash = INSTALL_SCRIPT
-            .find("ssh_run \"flash_erase $ROOTFS_MTD")
+            .find("    flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT")
             .expect("flash");
+        assert!(
+            refusal < safe,
+            "fail-closed gate must make the destructive sequence unreachable"
+        );
         assert!(safe < flash, "SafeOff must precede destructive flash_erase");
         assert_eq!(S19K_GPIO_PWR_EN, 437);
         assert_eq!(S19K_GPIO_PWR_EN_SAFE_OFF_VALUE, 1);
-        assert!(crate::s19k_am3_gpio437::refuse_re4c_safe_off_as_am3_s19k_cut(
-            S19K_GPIO_PWR_EN_SAFE_OFF_VALUE
-        )
-        .is_ok());
+        assert!(
+            crate::s19k_am3_gpio437::refuse_re4c_safe_off_as_am3_s19k_cut(
+                S19K_GPIO_PWR_EN_SAFE_OFF_VALUE
+            )
+            .is_ok()
+        );
         assert!(crate::s19k_am3_gpio437::refuse_re4c_safe_off_as_am3_s19k_cut(0).is_err());
         assert!(matches!(
             admit_s19k_bm1366_nopic_skeleton(
@@ -643,6 +774,7 @@ mod tests {
     #[test]
     fn skeleton_constant_matches_admit_surface() {
         let s = S19K_BM1366_NOPIC_SKELETON;
+        admit_s19k_bm1366_stock_baud_pair(s.baud_hz, s.host_baud_hz, s.fast_uart_value).unwrap();
         admit_s19k_bm1366_nopic_skeleton(
             s.board_name,
             s.chip_id,
@@ -671,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_trial_toml_aligned_with_am3_s19kpro_identity() {
+    fn configs_align_and_tmp_trial_only_aliases_hardened_deployer() {
         assert!(S19K_TOML.contains("model = \"s19k\""));
         assert!(S19K_TOML.contains("serial_chip_count = 77"));
         assert!(S19K_TOML.contains("serial_chip_type = \"BM1366\""));
@@ -684,17 +816,10 @@ mod tests {
         assert!(S19K_TOML.contains("am3-s19k"));
         assert!(S19K_TOML.contains("NoPic") || S19K_TOML.contains("am3-s19k"));
         assert!(OVERLAY.contains("model = \"s19k\""));
-        assert!(
-            OVERLAY.contains("serial_chip_type = \"BM1366\"")
-                || OVERLAY.contains("BM1366")
-        );
-        assert!(
-            OVERLAY.contains("serial_chip_count = 77") || OVERLAY.contains("77")
-        );
+        assert!(OVERLAY.contains("serial_chip_type = \"BM1366\"") || OVERLAY.contains("BM1366"));
+        assert!(OVERLAY.contains("serial_chip_count = 77") || OVERLAY.contains("77"));
         assert!(OVERLAY.lines().any(|l| l.trim() == "[platform]"));
-        assert!(
-            OVERLAY.contains("/etc/dcentos/board_target") || OVERLAY.contains("am3-s19k")
-        );
+        assert!(OVERLAY.contains("/etc/dcentos/board_target") || OVERLAY.contains("am3-s19k"));
         assert!(OVERLAY.contains("serial_device = \"/dev/ttyS2\""));
         assert!(OVERLAY.to_ascii_lowercase().contains("nopic"));
         let host_mining = S19K_TOML.split("[autotuner]").next().expect("host mining");
@@ -702,24 +827,27 @@ mod tests {
         let overlay_mining = OVERLAY.split("[autotuner]").next().expect("overlay mining");
         assert!(overlay_mining.contains("enabled = false"));
         assert!(OVERLAY.contains("[autotuner]"));
-        let overlay_at = OVERLAY.split("[autotuner]").nth(1).expect("overlay autotuner");
+        let overlay_at = OVERLAY
+            .split("[autotuner]")
+            .nth(1)
+            .expect("overlay autotuner");
         assert!(overlay_at.contains("enabled = false"));
-        assert!(TMP_TRIAL.contains("dcentrald_s19k.toml"));
-        assert!(TMP_TRIAL.contains("/tmp/dcentrald_bench_t1_"));
-        assert!(TMP_TRIAL.contains("scp -O"));
-        assert!(TMP_TRIAL.contains("/etc/dcentos/board_target"));
-        assert!(TMP_TRIAL.contains("am3-s19k"));
-        assert!(TMP_TRIAL.contains("serial_chip_count = 77"));
-        assert!(TMP_TRIAL.contains("BM1366"));
-        assert!(TMP_TRIAL.contains("does NOT use fw_setenv") || TMP_TRIAL.contains("NOT use fw_setenv"));
-        assert!(TMP_TRIAL.contains("Bench HOLD") || TMP_TRIAL.contains("does not energize"));
+        assert!(TMP_TRIAL.contains("dcentrald_s19k_tmp_deploy.sh"));
+        assert!(TMP_TRIAL.contains("exec \"$SCRIPT_DIR/dcentrald_s19k_tmp_deploy.sh\" \"$@\""));
+        for retired_surface in [
+            "scp -O",
+            "/etc/dcentos",
+            "/dev/tty",
+            "/sys/class/gpio",
+            "serial_chip_count",
+            "fw_setenv",
+        ] {
+            assert!(
+                !TMP_TRIAL.contains(retired_surface),
+                "compatibility entry point must not reintroduce {retired_surface}"
+            );
+        }
     }
-
-
-
-
-
-
 
     #[test]
     fn lm75_before_asic_probe_order_is_enforced() {
@@ -744,10 +872,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.phase(), S19kNopicBringupPhase::CtrlBoardLm75Fabric);
         session.admit_asic_probe_get_address().unwrap();
-        assert_eq!(
-            session.phase(),
-            S19kNopicBringupPhase::AsicProbeGetAddress
-        );
+        assert_eq!(session.phase(), S19kNopicBringupPhase::AsicProbeGetAddress);
 
         // Source-order pin: CtrlBoard LM75 phase must appear before AsicProbe in this module.
         let lm75_phase = BETA_SRC

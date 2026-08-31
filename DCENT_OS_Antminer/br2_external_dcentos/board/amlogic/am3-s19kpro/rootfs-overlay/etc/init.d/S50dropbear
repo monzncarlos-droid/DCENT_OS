@@ -1,0 +1,118 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 D-Central Technologies <dev@d-central.tech>
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# S19k-specific Dropbear gate. Release images accept exactly the independently
+# revalidated post-install witness admission, one preprovisioned client key,
+# and one eagerly generated persistent Ed25519 host key. They never use -R.
+# Dev/lab images retain the shared Amlogic development posture.
+
+NAME=dropbear
+DAEMON=/usr/sbin/dropbear
+PIDFILE=/var/run/dropbear.pid
+DROPBEAR_DEFAULTS=/etc/default/dropbear
+RELEASE_MARKER=/etc/dcentos/release-image
+SSH_DISABLED=/data/dcent/.ssh-disabled
+AUTH_FILE=/data/dcent/auth.json
+AUTHORIZED_KEYS=/data/dcent/authorized_keys
+WITNESS_HELPER=/usr/sbin/dcent-s19k-postinstall-witness.py
+DATA_HELPER=/usr/sbin/dcent-s19k-data-mount
+WITNESS_HOST_KEY=/data/dcent/s19k-postinstall-witness/dropbear_ed25519_host_key
+
+DROPBEAR_ARGS=""
+[ -r "$DROPBEAR_DEFAULTS" ] && . "$DROPBEAR_DEFAULTS"
+
+is_release_image() {
+    [ -f "$RELEASE_MARKER" ]
+}
+
+witness_gate_open() {
+    [ -x "$DATA_HELPER" ] || return 1
+    "$DATA_HELPER" verify >/dev/null 2>&1 || return 1
+    [ -x "$WITNESS_HELPER" ] || return 1
+    [ -f "$WITNESS_HOST_KEY" ] && [ ! -L "$WITNESS_HOST_KEY" ] || return 1
+    "$WITNESS_HELPER" verify-ssh-gate >/dev/null 2>&1
+}
+
+ssh_gate_state() {
+    if [ -e "$SSH_DISABLED" ] || [ -L "$SSH_DISABLED" ]; then
+        echo disabled-by-opt-out
+        return
+    fi
+    if is_release_image; then
+        if witness_gate_open; then
+            echo enabled-by-postinstall-witness
+        else
+            echo locked-postinstall-witness
+        fi
+        return
+    fi
+    if [ -s "$AUTHORIZED_KEYS" ]; then
+        echo enabled-by-keys
+    elif [ -f "$AUTH_FILE" ]; then
+        echo enabled-by-wizard
+    else
+        echo enabled-by-default
+    fi
+}
+
+start() {
+    STATE=$(ssh_gate_state)
+    case "$STATE" in
+        disabled-by-opt-out)
+            echo "Starting $NAME: BLOCKED (gate=$STATE)"
+            return 0
+            ;;
+        locked-postinstall-witness)
+            echo "Starting $NAME: BLOCKED (gate=$STATE; no TOFU fallback)"
+            return 0
+            ;;
+    esac
+
+    printf 'Starting %s: ' "$NAME"
+    if [ "$STATE" = enabled-by-postinstall-witness ]; then
+        # Exact release posture: password authentication disabled, only the
+        # admitted persistent Ed25519 host key loaded, and no lazy generation.
+        start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- \
+            -s -r "$WITNESS_HOST_KEY" \
+            && echo "OK (gate=$STATE; host-key=ed25519-eager)" \
+            || { echo "FAIL"; return 1; }
+        return 0
+    fi
+
+    # Development images preserve the shared Amlogic default/lazy-key flow.
+    case " $DROPBEAR_ARGS " in
+        *" -R "*) ;;
+        *) DROPBEAR_ARGS="$DROPBEAR_ARGS -R" ;;
+    esac
+    # shellcheck disable=SC2086
+    start-stop-daemon -S -q -p "$PIDFILE" --exec "$DAEMON" -- $DROPBEAR_ARGS \
+        && echo "OK (gate=$STATE)" || { echo "FAIL"; return 1; }
+}
+
+stop() {
+    printf 'Stopping %s: ' "$NAME"
+    start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null \
+        && echo OK || echo "not running"
+}
+
+status() {
+    STATE=$(ssh_gate_state)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "$NAME: running (gate=$STATE)"
+        return 0
+    fi
+    echo "$NAME: stopped (gate=$STATE)"
+    return 3
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) stop; sleep 1; start ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}" >&2
+        exit 2
+        ;;
+esac

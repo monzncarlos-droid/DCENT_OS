@@ -440,18 +440,6 @@ pub async fn run_publisher(
     // URL is logged/reported as `mqtts://host:port` only.
     let broker_display = sanitize_pool_url(&config.broker);
 
-    // MQTT-TLS-DOWNGRADE-1: an mqtts:// broker asks for TLS, but this build links
-    // rumqttc WITHOUT a TLS transport. Silently using plaintext TCP would send the
-    // credentials below in the clear — fail closed with a clear message instead.
-    if broker_url_requires_tls(&config.broker) {
-        anyhow::bail!(
-            "MQTT broker '{}' requests TLS (mqtts://) but this build has no MQTT TLS \
-             transport — refusing to send credentials over plaintext. Use mqtt:// on a \
-             trusted LAN, or build with MQTT TLS support.",
-            broker_display
-        );
-    }
-
     // Build MQTT client options (incl. the retained `offline` LastWill on the
     // availability topic — see `build_publisher_mqtt_options`).
     let mac_short = mac.replace(':', "");
@@ -460,6 +448,10 @@ pub async fn run_publisher(
 
     let mut mqttoptions =
         build_publisher_mqtt_options(&client_id, &host, port, &config.topic_prefix);
+
+    // MQTT-TLS-DOWNGRADE-1: mqtts:// demands TLS. Default builds (mqtt-tls
+    // feature OFF) refuse rather than silently sending credentials in the clear.
+    apply_mqtt_tls_transport(&mut mqttoptions, &config.broker)?;
 
     // Auth
     if let (Some(user), Some(pass)) = (&config.username, &config.password) {
@@ -484,7 +476,15 @@ pub async fn run_publisher(
 
     // Whether a validated-setter command sink is wired (default-OFF: `None`
     // for transient/proxy bring-ups, so no command surface is opened).
-    let commands_enabled = command_sink.is_some();
+    // RELEASE images also refuse the command subscriber unless a mint token
+    // is present (MCP/MQTT/gRPC write-lock; same files `mcp_server.py --mint-token`
+    // writes).
+    let commands_enabled = mqtt_commands_admitted(
+        command_sink.is_some(),
+        crate::auth::is_release_image(),
+        mqtt_command_token_is_present(),
+    );
+    let command_sink = if commands_enabled { command_sink } else { None };
 
     // Spawn the event loop processor (handles MQTT protocol, reconnects). It
     // owns the per-connection bring-up: EVERY ConnAck (initial connect AND
@@ -663,23 +663,14 @@ pub async fn run_publisher(
 /// Returns the generated client ID after a successful CONNACK.
 pub async fn test_connection(config: &MqttPublisherConfig) -> anyhow::Result<String> {
     let (host, port) = parse_broker_url(&config.broker)?;
-    // MQTT-4: mask any inline `user:pass@` credentials before they reach an error
-    // message (same masking as run_publisher).
-    let broker_display = sanitize_pool_url(&config.broker);
-    // MQTT-TLS-DOWNGRADE-1: same fail-closed posture as run_publisher — never
-    // probe an mqtts:// broker over plaintext with credentials attached.
-    if broker_url_requires_tls(&config.broker) {
-        anyhow::bail!(
-            "MQTT broker '{}' requests TLS (mqtts://) but this build has no MQTT TLS \
-             transport — refusing a plaintext connection test with credentials.",
-            broker_display
-        );
-    }
     let client_id = format!("dcentrald_test_{}", unique_suffix());
 
     let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
     mqttoptions.set_clean_session(true);
+    // MQTT-TLS-DOWNGRADE-1: same fail-closed posture as run_publisher — never
+    // probe an mqtts:// broker over plaintext with credentials attached.
+    apply_mqtt_tls_transport(&mut mqttoptions, &config.broker)?;
 
     if let (Some(user), Some(pass)) = (&config.username, &config.password) {
         mqttoptions.set_credentials(user, pass);
@@ -1062,7 +1053,9 @@ pub fn parse_broker_url(url: &str) -> anyhow::Result<(String, u16)> {
     let url = url
         .trim_start_matches("mqtt://")
         .trim_start_matches("mqtts://")
-        .trim_start_matches("tcp://");
+        .trim_start_matches("tcp://")
+        .trim_start_matches("ssl://")
+        .trim_start_matches("tls://");
 
     if let Some((host, port_str)) = url.rsplit_once(':') {
         if host.trim().is_empty() {
@@ -1078,14 +1071,46 @@ pub fn parse_broker_url(url: &str) -> anyhow::Result<(String, u16)> {
     }
 }
 
-/// MQTT-TLS-DOWNGRADE-1: true when the broker URL scheme requests an encrypted
-/// transport. `parse_broker_url` strips the scheme, so the connect sites check
-/// this separately and FAIL CLOSED rather than silently downgrade an `mqtts://`
-/// (or `ssl://`/`tls://`) broker to plaintext TCP — which would put the MQTT
-/// username/password on the wire in the clear.
-pub fn broker_url_requires_tls(url: &str) -> bool {
-    let t = url.trim();
-    t.starts_with("mqtts://") || t.starts_with("ssl://") || t.starts_with("tls://")
+pub use crate::mqtt_security::{
+    broker_url_requires_tls, mqtt_commands_admitted, MQTT_COMMAND_TOKEN_PATHS,
+};
+
+/// Apply TLS transport when the broker URL requests it.
+///
+/// Default builds (`mqtt-tls` cargo feature OFF) refuse `mqtts://` rather than
+/// silently downgrade to plaintext TCP. Opt-in builds set rumqttc's rustls
+/// transport. MQTT itself stays default-OFF (`[mqtt] enabled = false`).
+pub fn apply_mqtt_tls_transport(
+    mqttoptions: &mut MqttOptions,
+    broker_url: &str,
+) -> anyhow::Result<()> {
+    if !broker_url_requires_tls(broker_url) {
+        return Ok(());
+    }
+    #[cfg(feature = "mqtt-tls")]
+    {
+        mqttoptions.set_transport(rumqttc::Transport::tls_with_default_config());
+        Ok(())
+    }
+    #[cfg(not(feature = "mqtt-tls"))]
+    {
+        let _ = mqttoptions;
+        let broker_display = sanitize_pool_url(broker_url);
+        anyhow::bail!(
+            "MQTT broker '{}' requests TLS (mqtts://) but this build has no MQTT TLS \
+             transport — refusing to send credentials over plaintext. Use mqtt:// on a \
+             trusted LAN, or build with --features mqtt-tls.",
+            broker_display
+        )
+    }
+}
+
+pub fn mqtt_command_token_is_present() -> bool {
+    MQTT_COMMAND_TOKEN_PATHS.iter().any(|path| {
+        std::fs::read_to_string(path)
+            .map(|contents| !contents.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn unique_suffix() -> u64 {
@@ -1710,6 +1735,31 @@ mod broker_tls_guard_tests {
     /// detected so the connect sites refuse rather than silently downgrade an
     /// encrypted broker to plaintext TCP (which would put the username/password
     /// on the wire in the clear).
+    #[cfg(not(feature = "mqtt-tls"))]
+    #[test]
+    fn mqtt_tls_cargo_feature_is_default_off() {
+        assert!(
+            !cfg!(feature = "mqtt-tls"),
+            "mqtt-tls must stay default-OFF; default cargo test must refuse mqtts://"
+        );
+    }
+
+    #[cfg(not(feature = "mqtt-tls"))]
+    #[test]
+    fn apply_mqtt_tls_refuses_mqtts_without_feature() {
+        let mut options = MqttOptions::new("t", "broker.example", 8883);
+        let err =
+            apply_mqtt_tls_transport(&mut options, "mqtts://relay:secretpass@broker.example:8883")
+                .expect_err("mqtts must fail closed when mqtt-tls is off");
+        let shown = err.to_string();
+        assert!(!shown.contains("secretpass"), "{shown}");
+        assert!(shown.contains("broker.example"), "{shown}");
+        assert!(
+            shown.contains("mqtt-tls") || shown.contains("no MQTT TLS"),
+            "{shown}"
+        );
+    }
+
     #[test]
     fn tls_requesting_schemes_are_detected() {
         for url in [
@@ -2070,6 +2120,8 @@ mod ws_stats_schema_contract_tests {
                 errors: 0,
                 status: "Mining".to_string(),
             }],
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: WsFanStatus {
                 pwm: 30,
                 rpm: 2_880,

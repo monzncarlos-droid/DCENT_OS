@@ -29,6 +29,34 @@ dcent_am3_geometry_init() {
     DCENT_AM3_ROOTFS_END_DEC=$((DCENT_AM3_ROOTFS_OFFSET_DEC + DCENT_AM3_ROOTFS_WINDOW_DEC))
 }
 
+# Admit only the exact six-row S19k .78 MTD tuple used by the rootfs/recovery
+# offsets below.  A size sum is not identity: foreign names, erasesizes, row
+# counts, or an mtd5 of another size must fail even if mtd0..4 add to the same
+# base.  The caller supplies a regular proc_mtd-shaped file.
+dcent_am3_require_exact_s19k_mtd_map_file() {
+    _map_file=$1
+    [ -n "$_map_file" ] && [ -r "$_map_file" ] || return 1
+    _actual_map=$(awk '
+        /^mtd[0-9]+:/ {
+            name=$4
+            gsub(/"/, "", name)
+            print $1, $2, $3, name
+        }
+    ' "$_map_file")
+    _expected_map='mtd0: 00200000 00020000 bootloader
+mtd1: 00800000 00020000 tpl
+mtd2: 03200000 00020000 stock_system
+mtd3: 00500000 00020000 stock_config
+mtd4: 02000000 00020000 overlay
+mtd5: 09900000 00020000 system'
+    [ "$_actual_map" = "$_expected_map" ] || {
+        printf '%s\n' 'ERROR: S19k /proc/mtd does not match the exact six-part .78 map' >&2
+        printf '%s\n' "$_actual_map" >&2
+        return 1
+    }
+    return 0
+}
+
 # Physical mtd5 = sum(mtd0..mtd4 sizes) + 6MiB hole. Accepts newlines or '|'.
 # Prints 0xHHHHHHHH on success. Matches rust mtd5_base_from_proc_mtd.
 dcent_am3_mtd5_base_from_proc_mtd() {
@@ -121,6 +149,26 @@ dcent_am3_extract_recovery_flag_eraseblock() {
     dd if="$_in" of="$_out" bs=4096 skip=$((_eb_start / 4096)) count=$((_es / 4096)) status=none || return 1
     _out_len=$(wc -c < "$_out" | tr -d ' \t')
     [ "$_out_len" -eq "$_es" ] || return 1
+    return 0
+}
+
+# Prove that the stock U-Boot one-byte recovery_set_flag implementation cannot
+# destroy meaningful adjacent bytes. Held .78 recovery_set_flag erases one
+# complete 0x20000 block and writes only byte 0, so installation is admissible
+# only when the other 131071 bytes are already erased (0xFF).
+# Args: recovery_flag_eraseblock_file
+dcent_am3_admit_recovery_flag_eraseblock_exclusive() {
+    _flag_eb=$1
+    [ -n "$_flag_eb" ] && [ -f "$_flag_eb" ] && [ ! -L "$_flag_eb" ] || return 1
+    _flag_eb_len=$(wc -c < "$_flag_eb" | tr -d ' \t')
+    [ "$_flag_eb_len" -eq "$DCENT_AM3_ROOTFS_ERASESIZE_EXPECTED" ] || return 1
+    _flag_eb_value=$(od -An -tx1 -N1 "$_flag_eb" | tr -d ' \t\r\n')
+    case "$_flag_eb_value" in
+        01|02|03) ;;
+        *) return 1 ;;
+    esac
+    _flag_eb_tail_sha=$(dd if="$_flag_eb" bs=1 skip=1 2>/dev/null | sha256sum | awk '{print $1}')
+    [ "$_flag_eb_tail_sha" = "7d6d0bf52ce759862d4f62e20d038e0fca09df26dfb34ce2067efa0dc53558f0" ] || return 1
     return 0
 }
 

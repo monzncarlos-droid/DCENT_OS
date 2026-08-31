@@ -19,8 +19,8 @@ fn main() {
     // ── Git hash + build epoch stamps ──
     // Surfaced via /api/system/info so operators know exactly what commit is
     // on a miner — essential for OTA audit trails and field debugging.
-    let git_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short=10", "HEAD"])
+    let git_commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .and_then(|o| {
@@ -31,6 +31,7 @@ fn main() {
             }
         })
         .unwrap_or_else(|| "unknown".to_string());
+    let git_hash: String = git_commit.chars().take(10).collect();
     println!("cargo:rustc-env=DCENTAXE_GIT_HASH={git_hash}");
 
     let git_dirty = std::process::Command::new("git")
@@ -43,10 +44,23 @@ fn main() {
         if git_dirty { "1" } else { "0" }
     );
 
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Release/gauntlet builds set SOURCE_DATE_EPOCH to the source commit time.
+    // This keeps the embedded build stamp (and therefore the signed update
+    // payload) byte-stable across an exact-candidate rebuild. Interactive
+    // developer builds retain the useful wall-clock fallback.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value.parse::<u64>().unwrap_or_else(|_| {
+            panic!("SOURCE_DATE_EPOCH must be an unsigned integer, got {value:?}")
+        }),
+        Err(std::env::VarError::NotPresent) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SOURCE_DATE_EPOCH must be valid Unicode")
+        }
+    };
     println!("cargo:rustc-env=DCENTAXE_BUILD_EPOCH={epoch}");
 
     // Re-run if git state changes.
@@ -185,4 +199,226 @@ fn main() {
     let board_target = selected_targets[0];
 
     println!("cargo:rustc-env=DCENTAXE_BOARD_TARGET={board_target}");
+    emit_registry_metadata(board_target, &git_commit, git_dirty, epoch);
+}
+
+/// Bind the compiled image to the same ownership/evidence row used by the
+/// build matrix, packagers, verifier, and production gauntlet.
+///
+/// This intentionally fails the build if the registry is absent or incomplete:
+/// a firmware image whose runtime API cannot state its install/runtime policy is
+/// not a releasable artifact. `scripts/target_matrix.py validate` performs the
+/// wider cross-file validation; this is the last-mile, compile-time binding.
+fn emit_registry_metadata(
+    board_target: &str,
+    git_commit: &str,
+    git_dirty: bool,
+    source_date_epoch: u64,
+) {
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    let registry_path = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    )
+    .join("../esp-targets.json");
+    println!("cargo:rerun-if-changed={}", registry_path.display());
+
+    let raw = std::fs::read_to_string(&registry_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read ESP target registry {}: {err}",
+            registry_path.display()
+        )
+    });
+    let registry: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse ESP target registry {}: {err}",
+            registry_path.display()
+        )
+    });
+    let targets = registry
+        .get("targets")
+        .and_then(Value::as_array)
+        .expect("esp-targets.json targets must be an array");
+    let registered_row = targets
+        .iter()
+        .find(|row| row.get("board_target").and_then(Value::as_str) == Some(board_target))
+        .unwrap_or_else(|| panic!("board target {board_target} is missing from esp-targets.json"));
+
+    // A qualification build may compile the exact final production row before
+    // its live receipt exists. It is deliberately opt-in, source/epoch pinned,
+    // and non-publishable. The descriptor is NOT compiled into the payload, so
+    // the retained candidate bytes remain identical when that exact row is
+    // admitted to esp-targets.json after hardware proof.
+    println!("cargo:rerun-if-env-changed=DCENTAXE_PROMOTION_CANDIDATE_PATH");
+    println!("cargo:rerun-if-env-changed=DCENTAXE_PROMOTION_CANDIDATE_VALIDATED");
+    println!("cargo:rerun-if-env-changed=DCENTAXE_PROMOTION_CANDIDATE_CONFIRM");
+    let candidate = std::env::var_os("DCENTAXE_PROMOTION_CANDIDATE_PATH").map(|path| {
+        let path = PathBuf::from(path);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read promotion candidate {}: {err}",
+                path.display()
+            )
+        });
+        serde_json::from_str::<Value>(&raw).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse promotion candidate {}: {err}",
+                path.display()
+            )
+        })
+    });
+    let row = if let Some(candidate) = candidate.as_ref() {
+        let required_string = |key: &str| {
+            candidate
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("promotion candidate is missing string field {key}"))
+        };
+        if candidate.get("schema").and_then(Value::as_u64) != Some(1)
+            || required_string("authority") != "unreleased-exact-binary-promotion-candidate"
+            || required_string("disposition") != "qualification-only-not-publishable"
+            || candidate.get("publishable").and_then(Value::as_bool) != Some(false)
+        {
+            panic!("promotion candidate does not carry the qualification-only authority contract");
+        }
+        let candidate_id = required_string("candidate_id");
+        if std::env::var("DCENTAXE_PROMOTION_CANDIDATE_VALIDATED").as_deref() != Ok(candidate_id) {
+            panic!(
+                "promotion candidate must first pass promotion_candidate.py validate --for-build"
+            );
+        }
+        let expected_confirmation = format!("build-{board_target}");
+        if std::env::var("DCENTAXE_PROMOTION_CANDIDATE_CONFIRM").as_deref()
+            != Ok(expected_confirmation.as_str())
+        {
+            panic!(
+                "set DCENTAXE_PROMOTION_CANDIDATE_CONFIRM=build-{board_target} for this qualification build"
+            );
+        }
+        if required_string("board_target") != board_target {
+            panic!("promotion candidate board target does not match the selected Cargo feature");
+        }
+        let source = candidate
+            .get("source")
+            .and_then(Value::as_object)
+            .expect("promotion candidate source must be an object");
+        if source.get("git_dirty").and_then(Value::as_bool) != Some(false)
+            || git_commit == "unknown"
+            || git_dirty
+        {
+            panic!("promotion candidate requires a clean, known source checkout");
+        }
+        if source.get("git_commit").and_then(Value::as_str) != Some(git_commit) {
+            panic!("promotion candidate git commit does not match this checkout");
+        }
+        let expected_epoch = source
+            .get("source_date_epoch")
+            .and_then(Value::as_str)
+            .expect("promotion candidate source_date_epoch must be a string")
+            .parse::<u64>()
+            .expect("promotion candidate source_date_epoch must be numeric");
+        if expected_epoch != source_date_epoch {
+            panic!("promotion candidate SOURCE_DATE_EPOCH does not match this build");
+        }
+        if source.get("firmware_version").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION"))
+        {
+            panic!("promotion candidate firmware version does not match this build");
+        }
+        let proposed = candidate
+            .get("registry_row")
+            .and_then(Value::as_object)
+            .expect("promotion candidate registry_row must be an object");
+        for key in [
+            "feature",
+            "board_target",
+            "device_model",
+            "model_variant",
+            "hardware_family",
+            "asic",
+            "chip_count",
+            "flash_layout",
+        ] {
+            if proposed.get(key) != registered_row.get(key) {
+                panic!("promotion candidate changes immutable hardware field {key}");
+            }
+        }
+        for (key, expected) in [
+            ("support_tier", "production"),
+            ("evidence_level", "sustained-soak"),
+            ("runtime_mode", "mining"),
+            ("install_policy", "production"),
+            ("release_scope", "public"),
+            ("package_policy", "public"),
+        ] {
+            if proposed.get(key).and_then(Value::as_str) != Some(expected) {
+                panic!("promotion candidate requires {key}={expected}");
+            }
+        }
+        if !matches!(
+            proposed.get("blockers").and_then(Value::as_array),
+            Some(items) if items.is_empty()
+        ) {
+            panic!("promotion candidate requires an empty blockers array");
+        }
+        candidate
+            .get("registry_row")
+            .expect("promotion candidate registry_row exists")
+    } else {
+        registered_row
+    };
+
+    let required = |key: &str| -> &str {
+        let value = row
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("registry row {board_target} is missing string field {key}"));
+        if value.is_empty() || value.contains(['\r', '\n']) {
+            panic!("registry row {board_target} has an invalid {key}");
+        }
+        value
+    };
+
+    let feature = required("feature");
+    let feature_env = format!(
+        "CARGO_FEATURE_{}",
+        feature.replace('-', "_").to_ascii_uppercase()
+    );
+    if std::env::var_os(&feature_env).is_none() {
+        panic!(
+            "registry row {board_target} names feature {feature}, but {feature_env} is not enabled"
+        );
+    }
+
+    for (env_name, key) in [
+        ("DCENTAXE_DEVICE_MODEL", "device_model"),
+        ("DCENTAXE_HARDWARE_FAMILY", "hardware_family"),
+        ("DCENTAXE_RELEASE_SCOPE", "release_scope"),
+        ("DCENTAXE_SUPPORT_TIER", "support_tier"),
+        ("DCENTAXE_EVIDENCE_LEVEL", "evidence_level"),
+        ("DCENTAXE_RUNTIME_MODE", "runtime_mode"),
+        ("DCENTAXE_INSTALL_POLICY", "install_policy"),
+        ("DCENTAXE_PACKAGE_POLICY", "package_policy"),
+        ("DCENTAXE_FLASH_LAYOUT", "flash_layout"),
+    ] {
+        println!("cargo:rustc-env={env_name}={}", required(key));
+    }
+    if let Some(receipt_id) = row.get("promotion_receipt_id").and_then(Value::as_str) {
+        if receipt_id.is_empty() || receipt_id.contains(['\r', '\n']) {
+            panic!("registry row {board_target} has an invalid promotion_receipt_id");
+        }
+        println!("cargo:rustc-env=DCENTAXE_PROMOTION_RECEIPT_ID={receipt_id}");
+    }
+
+    let blockers = row
+        .get("blockers")
+        .and_then(Value::as_array)
+        .expect("registry blockers must be an array");
+    if blockers.iter().any(|item| item.as_str().is_none()) {
+        panic!("registry row {board_target} blockers must all be strings");
+    }
+    let blockers_json = serde_json::to_string(blockers)
+        .expect("registry blockers must serialize as a compact JSON array");
+    println!("cargo:rustc-env=DCENTAXE_PRODUCTION_BLOCKERS_JSON={blockers_json}");
 }

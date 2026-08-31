@@ -1,4 +1,4 @@
-//! BM1397 / S17 (BHB07601) bring-up skeleton — host-testable IMPLEMENT items 1–13.
+//! BM1397 / S17 (BHB07601) bring-up skeleton — host-testable IMPLEMENT items 1–14.
 //!
 //! Source:
 //!
@@ -14,13 +14,14 @@
 //! Config.ini `baudrate=` is the FPGA/ASIC **enum/divider** (0/1/3/4/5/26), **not**
 //! a bps integer — see item 13 map helpers.
 //!
-//! BENCH_HOLD (48-ASIC HW nonce parity, PLL accuracy / voltage envelope) and
-//! DESK_PENDING item 14 (Freq/OpenCoreGap/timeout_percent defaults — refuse
-//! inventing; no BHB07601 Config.ini in PUBLIC) are documented as refuse/hold —
-//! not faked. Item 13 baud↔enum map is **IMPLEMENT**. Item 17 domain nonce
+//! BENCH_HOLD (48-ASIC HW nonce parity, PLL accuracy / voltage envelope) is
+//! documented as refuse/hold — not faked. Exact held AMTC factory evidence makes
+//! item 14 an **IMPLEMENT** observation, but factory values remain explicitly
+//! refused as production defaults. Item 13 baud↔enum map is **IMPLEMENT**. Item 17 domain nonce
 //! math (`DAEMON_CHECKLIST_DELTA_DOMAIN.md`) is **IMPLEMENT**. Item 18 sensor
 //! model matrix (`DAEMON_CHECKLIST_DELTA_SENSOR.md`) is **IMPLEMENT**; item 19
-//! production `sensor_model` / TempSensor1..4 stays **DESK_PENDING**.
+//! production `sensor_model` / TempSensor1..4 stays **DESK_PENDING** even though
+//! the held factory profile includes exact factory-only values.
 
 use crate::stock_fpga_policy::stock_bitmain_crc5;
 
@@ -167,7 +168,7 @@ pub const fn domain_big_index(d: u32) -> Option<u32> {
 
 // --- Item 18: sensor_model matrix (jig status-thread dispatch + I2C hi) ---
 // From PUBLIC BHB07601_show_status_func / read_config / BM1397_read_asic_temperature_*.
-// Item 19 production sensor_model / TempSensor1..4 stays DESK_PENDING (no BHB07601 ini).
+// Item 19 production sensor_model / TempSensor1..4 stays DESK_PENDING: held values are factory-only.
 pub const BM1397_SENSOR_MODEL_LOCAL_REMOTE_MIN: u8 = 1;
 pub const BM1397_SENSOR_MODEL_LOCAL_REMOTE_MAX: u8 = 2;
 pub const BM1397_SENSOR_MODEL_LOCAL_MIN: u8 = 3;
@@ -247,15 +248,16 @@ pub const fn temp_sensor_chip_addr(temp_sensor_n_1based: u8, interval: u8) -> Op
 pub fn refuse_invent_production_sensor_config() -> Result<(), Bm1397S17HoldError> {
     Err(Bm1397S17HoldError::DeskPending {
         item: 19,
-        reason: "no PUBLIC BHB07601 Config.ini — refuse inventing sensor_model / TempSensor1..4",
+        reason: "exact AMTC factory sensor values are held, but no production authorization exists",
     })
 }
 
-/// Refuse inventing BHB07601 Config.ini Freq / OpenCoreGap / timeout_percent.
+/// Refuse treating observed AMTC factory values as BHB07601 production defaults.
 pub fn refuse_invent_bhb07601_config_defaults() -> Result<(), Bm1397S17HoldError> {
-    Err(Bm1397S17HoldError::DeskPending {
+    Err(Bm1397S17HoldError::FactoryEvidenceNotProduction {
         item: 14,
-        reason: "no PUBLIC BHB07601 Config.ini — refuse inventing Freq/OpenCoreGap/timeout_percent",
+        reason:
+            "exact AMTC factory profile is held, but factory values are not production defaults",
     })
 }
 
@@ -274,7 +276,7 @@ pub struct Bm1397S17ChecklistItem {
     pub tag: Bm1397S17ChecklistTag,
 }
 
-/// Items 1–13 + 17–18 IMPLEMENT; 14 + 19 DESK_PENDING; 15–16 BENCH_HOLD.
+/// Items 1–14 + 17–18 IMPLEMENT; 19 DESK_PENDING; 15–16 BENCH_HOLD.
 pub const BM1397_S17_CHECKLIST: &[Bm1397S17ChecklistItem] = &[
     Bm1397S17ChecklistItem {
         id: 1,
@@ -343,8 +345,8 @@ pub const BM1397_S17_CHECKLIST: &[Bm1397S17ChecklistItem] = &[
     },
     Bm1397S17ChecklistItem {
         id: 14,
-        name: "freq_timeout_opencoregap_defaults",
-        tag: Bm1397S17ChecklistTag::DeskPending,
+        name: "factory_config_observed_production_defaults_refused",
+        tag: Bm1397S17ChecklistTag::Implement,
     },
     Bm1397S17ChecklistItem {
         id: 15,
@@ -377,6 +379,7 @@ pub const BM1397_S17_CHECKLIST: &[Bm1397S17ChecklistItem] = &[
 pub enum Bm1397S17HoldError {
     BenchHold { item: u8, reason: &'static str },
     DeskPending { item: u8, reason: &'static str },
+    FactoryEvidenceNotProduction { item: u8, reason: &'static str },
     MiningDefaultMustStayOff,
     FanPreserveInventedForbidden,
 }
@@ -389,6 +392,12 @@ impl core::fmt::Display for Bm1397S17HoldError {
             }
             Self::DeskPending { item, reason } => {
                 write!(f, "BM1397 S17 DESK_PENDING item {item}: {reason}")
+            }
+            Self::FactoryEvidenceNotProduction { item, reason } => {
+                write!(
+                    f,
+                    "BM1397 S17 factory evidence is not production authority item {item}: {reason}"
+                )
             }
             Self::MiningDefaultMustStayOff => {
                 write!(f, "BM1397 S17: mining_default_enabled must stay false")
@@ -415,18 +424,14 @@ pub fn refuse_bench_hold(item: u8) -> Result<(), Bm1397S17HoldError> {
     }
 }
 
-/// Refuse DESK_PENDING Config.ini-driven inventing (items 14 + 19; 13/18 IMPLEMENT).
+/// Refuse DESK_PENDING Config.ini-driven inventing (item 19; 13/14/18 IMPLEMENT).
 pub fn refuse_desk_pending(item: u8) -> Result<(), Bm1397S17HoldError> {
     match item {
-        14 => Err(Bm1397S17HoldError::DeskPending {
-            item: 14,
-            reason: "Freq/timeout/OpenCoreGap defaults are config-driven — refuse inventing",
-        }),
         19 => Err(Bm1397S17HoldError::DeskPending {
             item: 19,
             reason: "production sensor_model / TempSensor1..4 are config-driven — refuse inventing",
         }),
-        _ => Ok(()), // items 13 baud map + 18 sensor matrix are IMPLEMENT
+        _ => Ok(()), // items 13 baud map + 14 factory observation + 18 sensor matrix are IMPLEMENT
     }
 }
 
@@ -724,7 +729,10 @@ mod tests {
     fn item10_pll_slow_ramp() {
         assert_eq!(pll_slow_ramp_mhz(50), vec![50]);
         assert_eq!(pll_slow_ramp_mhz(100), vec![50, 75, 100]);
-        assert_eq!(pll_slow_ramp_mhz(200), vec![50, 75, 100, 125, 150, 175, 200]);
+        assert_eq!(
+            pll_slow_ramp_mhz(200),
+            vec![50, 75, 100, 125, 150, 175, 200]
+        );
         assert_eq!(BM1397_PLL_PARAM_REG, 0x08);
         assert_eq!(BM1397_PLL_POSTDIV_REG, 0x70);
         assert_eq!(BM1397_PLL_FALLBACK, 0xC078_0111);
@@ -750,18 +758,15 @@ mod tests {
             Err(Bm1397S17HoldError::BenchHold { item: 16, .. })
         ));
         assert!(refuse_bench_hold(1).is_ok());
-        // Item 13 baud map is IMPLEMENT — no longer DeskPending refuse.
+        // Items 13 and 14 are IMPLEMENT observations — no DeskPending refuse.
         assert!(refuse_desk_pending(13).is_ok());
-        assert!(matches!(
-            refuse_desk_pending(14),
-            Err(Bm1397S17HoldError::DeskPending { item: 14, .. })
-        ));
+        assert!(refuse_desk_pending(14).is_ok());
         let implement: Vec<_> = BM1397_S17_CHECKLIST
             .iter()
             .filter(|i| i.tag == Bm1397S17ChecklistTag::Implement)
             .map(|i| i.id)
             .collect();
-        let mut expect: Vec<u8> = (1..=13).collect();
+        let mut expect: Vec<u8> = (1..=14).collect();
         expect.push(17);
         expect.push(18);
         assert_eq!(implement, expect);
@@ -795,7 +800,7 @@ mod tests {
         assert_eq!(bm1397_chip_div_from_bps_over_3m(3_000_000), None);
         assert!(matches!(
             refuse_invent_bhb07601_config_defaults(),
-            Err(Bm1397S17HoldError::DeskPending { item: 14, .. })
+            Err(Bm1397S17HoldError::FactoryEvidenceNotProduction { item: 14, .. })
         ));
         let item13 = BM1397_S17_CHECKLIST
             .iter()
@@ -807,7 +812,17 @@ mod tests {
             .iter()
             .find(|i| i.id == 14)
             .expect("item 14");
-        assert_eq!(item14.tag, Bm1397S17ChecklistTag::DeskPending);
+        assert_eq!(item14.tag, Bm1397S17ChecklistTag::Implement);
+        assert_eq!(
+            item14.name,
+            "factory_config_observed_production_defaults_refused"
+        );
+        let factory_profile = crate::x17_amtc_factory_evidence::x17_amtc_factory_profile("S17")
+            .expect("held S17 AMTC factory profile");
+        assert_eq!(factory_profile.hashboard, "BHB07601");
+        assert_eq!(factory_profile.frequency_steps_mhz[0], 450);
+        assert_eq!(factory_profile.open_core_gap, Some(20_000));
+        assert_eq!(factory_profile.timeout_percent, 10);
     }
 
     #[test]
@@ -855,10 +870,10 @@ mod tests {
             .expect("item 17");
         assert_eq!(item17.tag, Bm1397S17ChecklistTag::Implement);
         assert_eq!(item17.name, "domain_nonce_math");
-        // Item 14 still DESK_PENDING — refuse inventing Freq/OpenCoreGap/timeout.
+        // Factory values are observed, but still refused as production defaults.
         assert!(matches!(
             refuse_invent_bhb07601_config_defaults(),
-            Err(Bm1397S17HoldError::DeskPending { item: 14, .. })
+            Err(Bm1397S17HoldError::FactoryEvidenceNotProduction { item: 14, .. })
         ));
     }
 
@@ -932,12 +947,12 @@ mod tests {
             .find(|i| i.id == 19)
             .expect("item 19");
         assert_eq!(item19.tag, Bm1397S17ChecklistTag::DeskPending);
-        // Item 14 still DESK_PENDING
+        // Item 14 is an implemented factory observation, not production authority.
         let item14 = BM1397_S17_CHECKLIST
             .iter()
             .find(|i| i.id == 14)
             .expect("item 14");
-        assert_eq!(item14.tag, Bm1397S17ChecklistTag::DeskPending);
+        assert_eq!(item14.tag, Bm1397S17ChecklistTag::Implement);
         // Baud + domain must remain present (no regression)
         assert_eq!(BM1397_BAUD_ENUM_115200, 26);
         assert_eq!(BM1397_DOMAIN_COUNT, 48);

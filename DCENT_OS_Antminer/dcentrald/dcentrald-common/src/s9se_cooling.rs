@@ -209,7 +209,9 @@ mod tests {
 
     #[test]
     fn connecting_pwm_pin_is_never_a_software_fix() {
-        assert!(!pwm_pin_connect_is_safe(S9SePwmPinWiring::Pin4LiftedFullSpeed));
+        assert!(!pwm_pin_connect_is_safe(
+            S9SePwmPinWiring::Pin4LiftedFullSpeed
+        ));
         assert!(!pwm_pin_connect_is_safe(
             S9SePwmPinWiring::PwmPinConnectedStopped
         ));
@@ -217,7 +219,10 @@ mod tests {
 
     #[test]
     fn am1_s9se_supervisor_has_no_tach() {
-        assert_eq!(supervisor_tach_available_for_target("am1-s9se"), Some(false));
+        assert_eq!(
+            supervisor_tach_available_for_target("am1-s9se"),
+            Some(false)
+        );
         assert_eq!(supervisor_tach_available_for_target("am1-s9"), None);
     }
 

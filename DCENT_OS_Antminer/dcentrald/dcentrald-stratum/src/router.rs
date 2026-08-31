@@ -21,31 +21,43 @@
 //!
 //! - Cross-protocol failover between pool endpoints within one long-lived client
 //! - Connection quality metrics for protocol switching decisions
+//!
+//! # V2Only fail-closed (DESK_NOW rank 12)
+//!
+//! `protocol = "sv2"` / `"v2"` is single-pool and **will not** silently speak
+//! Stratum V1. A configured backup that is missing an SV2 endpoint or is
+//! V1-incompatible is **refused** ([`validate_v2_only_contract`]). Live SV2
+//! accepted shares remain BENCH_HOLD; this is not Braiins-parity.
 
-use crate::types::{JobTemplate, StratumConfig, StratumStatus, ValidShare};
+#[cfg(feature = "sv2")]
+use crate::types::PoolConfig;
+use crate::types::{
+    refuse_datum_protocol, JobTemplate, StratumConfig, StratumState, StratumStatus, ValidShare,
+};
 use crate::StratumV1Client;
 #[cfg(feature = "sv2")]
 use crate::StratumV2Client;
 use tokio::sync::mpsc;
 #[cfg(all(feature = "sv2", feature = "jd"))]
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // Hard Standard ceiling + soft Extended preference: shared with types so P2-9
 // resolve helpers and the router cannot drift (see
 //  — S9 13 TH/s exhausts Standard in ~2.5s).
 // Daemon `build_stratum_config` now fills `nominal_hashrate_ghs` from
 // MinerProfile when `mining.model` is set; 0.0 remains UnsetZero without a model.
-use crate::types::{
-    SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS, SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS,
-};
+use crate::types::SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS;
+#[cfg(any(feature = "sv2", test))]
+use crate::types::SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS;
 
 /// Protocol selection mode, derived from config at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolMode {
     /// Stratum V1 only (default, backward compatible).
     V1Only,
-    /// Stratum V2 only (encrypted, Noise_NX transport).
+    /// Stratum V2 only (encrypted, Noise_NX transport). Single-pool;
+    /// missing/V1 backups and silent V1 fallback are refused.
     V2Only,
     /// Auto-detect: try V2 if sv2_url is configured, else V1.
     Auto,
@@ -83,6 +95,7 @@ impl StratumRouter {
         }
     }
 
+    #[cfg(any(feature = "sv2", test))]
     fn protocol_mode_for_pool(&self, pool: &crate::types::PoolConfig) -> ProtocolMode {
         match Self::parse_protocol_mode(pool.protocol.as_deref()) {
             Some(ProtocolMode::Auto) => {
@@ -152,6 +165,7 @@ impl StratumRouter {
         &self.protocol_mode
     }
 
+    #[cfg(any(feature = "sv2", test))]
     fn sv2_standard_channel_block_reason(config: &StratumConfig) -> Option<&'static str> {
         if config.nominal_hashrate_ghs > SV2_STANDARD_CHANNEL_MAX_HASHRATE_GHS
             && !config.sv2_extended_channel
@@ -178,6 +192,110 @@ impl StratumRouter {
         config.nominal_hashrate_ghs >= SV2_EXTENDED_CHANNEL_PREFER_HASHRATE_GHS
     }
 
+    /// True when `protocol` selects V2Only (`sv2` / `v2`).
+    pub fn is_v2_only_protocol(protocol: Option<&str>) -> bool {
+        matches!(
+            Self::parse_protocol_mode(protocol),
+            Some(ProtocolMode::V2Only)
+        )
+    }
+}
+
+/// An endpoint can speak SV2 if it has `protocol=sv2/v2` or a non-empty `sv2_url`.
+pub fn endpoint_is_sv2_capable(protocol: Option<&str>, sv2_url: Option<&str>) -> bool {
+    let proto = protocol.map(str::trim).unwrap_or("");
+    let sv2 = sv2_url.map(str::trim).unwrap_or("");
+    matches!(proto, "sv2" | "v2") || !sv2.is_empty()
+}
+
+/// Fail-closed V2Only backup-pool contract (DESK_NOW rank 12).
+///
+/// If the primary is V2-only, a configured backup that is missing an SV2
+/// endpoint or is V1-incompatible is refused — we will not silently ignore
+/// it or speak Stratum V1 on it. SV2-capable backups are also refused
+/// because V2Only is single-pool (no SV2 multi-pool failover; live shares
+/// BENCH_HOLD). Use `protocol=auto` for V1 failover.
+///
+/// `backups` entries are `(label, protocol, sv2_url)` for each configured
+/// failover endpoint (omit unconfigured slots).
+pub fn v2_only_backup_refusal(
+    global_protocol: Option<&str>,
+    backups: &[(&str, Option<&str>, Option<&str>)],
+) -> Result<(), String> {
+    if !StratumRouter::is_v2_only_protocol(global_protocol) {
+        return Ok(());
+    }
+    if let Some((label, protocol, sv2_url)) = backups.first() {
+        if !endpoint_is_sv2_capable(*protocol, *sv2_url) {
+            return Err(format!(
+                "protocol=sv2/v2 (V2Only) refused: backup {label} is missing an SV2 endpoint \
+                 or is V1-incompatible. V2Only will not silently use Stratum V1 on a backup. \
+                 Remove the backup, give it sv2_url/protocol=sv2, or use protocol=auto for V1 failover"
+            ));
+        }
+        return Err(format!(
+            "protocol=sv2/v2 (V2Only) is single-pool: backup {label} is configured but SV2 \
+             multi-pool failover is not implemented (live accepted shares BENCH_HOLD, not \
+             Braiins-parity). Remove backups or use protocol=auto"
+        ));
+    }
+    Ok(())
+}
+
+/// Full V2Only contract for a [`StratumConfig`]: DATUM refuse, backup-pool
+/// fail-closed, and no silent V1 fallback (Standard-channel block or
+/// missing `sv2` feature).
+pub fn validate_v2_only_contract(config: &StratumConfig) -> Result<(), String> {
+    refuse_datum_protocol(config.protocol.as_deref())?;
+    refuse_datum_protocol(config.pool1.protocol.as_deref())?;
+    if let Some(pool) = config.pool2.as_ref() {
+        refuse_datum_protocol(pool.protocol.as_deref())?;
+    }
+    if let Some(pool) = config.pool3.as_ref() {
+        refuse_datum_protocol(pool.protocol.as_deref())?;
+    }
+
+    if !StratumRouter::is_v2_only_protocol(config.protocol.as_deref()) {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "sv2"))]
+    {
+        Err(
+            "protocol=sv2/v2 (V2Only) refused: SV2 is not compiled in (feature 'sv2' disabled); \
+             will not silently speak Stratum V1"
+                .to_string(),
+        )
+    }
+
+    #[cfg(feature = "sv2")]
+    {
+        if let Some(reason) = StratumRouter::sv2_standard_channel_block_reason(config) {
+            return Err(format!(
+                "protocol=sv2/v2 (V2Only) refused: {reason}. V2Only will not silently fall back to \
+                 Stratum V1; set sv2_extended_channel=true, lower nominal_hashrate_ghs, or use protocol=auto"
+            ));
+        }
+
+        let mut backups: Vec<(&str, Option<&str>, Option<&str>)> = Vec::new();
+        push_backup(&mut backups, "pool2", config.pool2.as_ref());
+        push_backup(&mut backups, "pool3", config.pool3.as_ref());
+        v2_only_backup_refusal(config.protocol.as_deref(), &backups)
+    }
+}
+
+#[cfg(feature = "sv2")]
+fn push_backup<'a>(
+    backups: &mut Vec<(&'a str, Option<&'a str>, Option<&'a str>)>,
+    label: &'a str,
+    pool: Option<&'a PoolConfig>,
+) {
+    if let Some(pool) = pool {
+        backups.push((label, pool.protocol.as_deref(), pool.sv2_url.as_deref()));
+    }
+}
+
+impl StratumRouter {
     /// Run the stratum client with protocol selection.
     ///
     /// This is the main entry point — spawn as a tokio task. The router
@@ -207,27 +325,18 @@ impl StratumRouter {
 
             #[cfg(feature = "sv2")]
             ProtocolMode::V2Only => {
-                if let Some(reason) = Self::sv2_standard_channel_block_reason(&self.config) {
-                    warn!(
-                        nominal_hashrate_ghs = self.config.nominal_hashrate_ghs,
-                        reason, "SV2 Standard channel refused; falling back to Stratum V1"
+                // Fail-closed: do not silently speak V1, and do not ignore a
+                // missing/V1-incompatible backup. Auto mode (below) may still
+                // fall back to V1.
+                if let Err(reason) = validate_v2_only_contract(&self.config) {
+                    error!(
+                        reason = %reason,
+                        "V2Only configuration refused (fail-closed); not falling back to Stratum V1"
                     );
-                    let client = StratumV1Client::new(self.config, job_tx, share_rx, status_tx);
-                    client.run().await;
+                    let _ = status_tx
+                        .send(StratumStatus::StateChanged(StratumState::Disconnected))
+                        .await;
                     return;
-                }
-                // V2Only is single-pool: it reconnects to pool1 forever (capped
-                // backoff) and has NO multi-pool failover and NO V1 fallback
-                // (unlike Auto). Warn the operator so a configured-but-unused
-                // pool2/pool3 isn't mistaken for resilience. (Structural SV2
-                // multi-pool failover is a tracked follow-up — see router rustdoc.)
-                if self.config.pool2.is_some() || self.config.pool3.is_some() {
-                    warn!(
-                        "protocol=\"sv2\" (V2Only) is single-pool: backup pool2/pool3 are NOT used \
-                         for failover and there is no V1 fallback on this mode. A dead SV2 pool1 is \
-                         retried forever with capped backoff. For multi-pool resilience use \
-                         protocol=\"auto\" (falls back to V1) or list backups as V1 endpoints."
-                    );
                 }
                 let sv2_url = self
                     .config
@@ -324,9 +433,21 @@ impl StratumRouter {
                 }
             }
 
-            // When sv2 feature is not compiled in but V2/Auto was requested
+            // V2Only must not silently speak V1 when SV2 is not compiled in.
             #[cfg(not(feature = "sv2"))]
-            ProtocolMode::V2Only | ProtocolMode::Auto => {
+            ProtocolMode::V2Only => {
+                error!(
+                    "protocol=sv2/v2 (V2Only) refused: SV2 is not compiled in (feature 'sv2' disabled); \
+                     will not silently speak Stratum V1"
+                );
+                let _ = status_tx
+                    .send(StratumStatus::StateChanged(StratumState::Disconnected))
+                    .await;
+            }
+
+            // Auto may still fall back to V1 when the sv2 feature is absent.
+            #[cfg(not(feature = "sv2"))]
+            ProtocolMode::Auto => {
                 warn!(
                     "SV2 requested but not compiled in (feature 'sv2' disabled), falling back to V1"
                 );
@@ -731,5 +852,149 @@ mod tests {
                 "Display(\"{s}\") must round-trip through parse_protocol_mode"
             );
         }
+    }
+
+    fn v2_capable_backup(url: &str) -> PoolConfig {
+        PoolConfig {
+            url: url.into(),
+            worker: "backup.worker".into(),
+            password: "x".into(),
+            sv2_url: Some("stratum2+tcp://v2.backup.example.com:3336".into()),
+            protocol: Some("sv2".into()),
+            split_bps: None,
+        }
+    }
+
+    fn v1_backup(url: &str) -> PoolConfig {
+        PoolConfig {
+            url: url.into(),
+            worker: "backup.worker".into(),
+            password: "x".into(),
+            sv2_url: None,
+            protocol: Some("sv1".into()),
+            split_bps: None,
+        }
+    }
+
+    #[test]
+    fn v2_only_without_backup_is_ok_when_standard_channel_is_safe() {
+        let mut config = make_test_config();
+        config.protocol = Some("sv2".into());
+        config.nominal_hashrate_ghs = 500.0;
+        config.sv2_extended_channel = false;
+        let result = validate_v2_only_contract(&config);
+        #[cfg(feature = "sv2")]
+        result.expect("single-pool V2Only below 1 TH/s must be accepted");
+        #[cfg(not(feature = "sv2"))]
+        {
+            let err = result.expect_err("V2Only must fail closed when SV2 is not compiled");
+            assert!(err.contains("feature 'sv2' disabled"));
+            assert!(err.contains("will not silently speak Stratum V1"));
+        }
+    }
+
+    #[test]
+    fn v2_only_refuses_silent_v1_fallback_on_standard_channel_block() {
+        let mut config = make_test_config();
+        config.protocol = Some("sv2".into());
+        config.nominal_hashrate_ghs = 13_500.0;
+        config.sv2_extended_channel = false;
+        let err = validate_v2_only_contract(&config)
+            .expect_err("V2Only must not silently fall back to V1 when Standard is unsafe");
+        #[cfg(feature = "sv2")]
+        {
+            assert!(err.contains("will not silently fall back"));
+            assert!(err.contains("V2Only"));
+        }
+        #[cfg(not(feature = "sv2"))]
+        {
+            assert!(err.contains("feature 'sv2' disabled"));
+            assert!(err.contains("will not silently speak Stratum V1"));
+        }
+    }
+
+    #[test]
+    fn v2_only_refuses_missing_or_v1_incompatible_backup() {
+        let mut config = make_test_config();
+        config.protocol = Some("v2".into());
+        config.nominal_hashrate_ghs = 500.0;
+        config.pool2 = Some(v1_backup("stratum+tcp://backup.example.com:3333"));
+        let err = validate_v2_only_contract(&config)
+            .expect_err("V1 backup under V2Only must fail closed");
+        #[cfg(feature = "sv2")]
+        {
+            assert!(err.contains("V1-incompatible") || err.contains("missing an SV2 endpoint"));
+            assert!(err.contains("will not silently use Stratum V1"));
+        }
+        #[cfg(not(feature = "sv2"))]
+        {
+            assert!(err.contains("feature 'sv2' disabled"));
+            assert!(err.contains("will not silently speak Stratum V1"));
+        }
+    }
+
+    #[test]
+    fn v2_only_refuses_sv2_backup_because_single_pool() {
+        let mut config = make_test_config();
+        config.protocol = Some("sv2".into());
+        config.nominal_hashrate_ghs = 500.0;
+        config.sv2_extended_channel = true;
+        config.pool2 = Some(v2_capable_backup(
+            "stratum2+tcp://v2.backup.example.com:3336",
+        ));
+        let err = validate_v2_only_contract(&config)
+            .expect_err("even SV2-capable backups are unused on V2Only");
+        #[cfg(feature = "sv2")]
+        {
+            assert!(err.contains("single-pool"));
+            assert!(err.contains("BENCH_HOLD"));
+        }
+        #[cfg(not(feature = "sv2"))]
+        {
+            assert!(err.contains("feature 'sv2' disabled"));
+            assert!(err.contains("will not silently speak Stratum V1"));
+        }
+    }
+
+    #[test]
+    fn v1_and_auto_may_keep_v1_backups() {
+        let mut config = make_test_config();
+        config.protocol = Some("sv1".into());
+        config.pool2 = Some(v1_backup("stratum+tcp://backup.example.com:3333"));
+        validate_v2_only_contract(&config).expect("V1Only backups are V1 failover, not V2Only");
+
+        config.protocol = Some("auto".into());
+        validate_v2_only_contract(&config).expect("Auto may use V1 backups");
+        v2_only_backup_refusal(Some("auto"), &[("pool.failover1", Some("sv1"), None)])
+            .expect("Auto backup check is a no-op");
+    }
+
+    #[test]
+    fn v2_only_backup_refusal_names_missing_sv2_url() {
+        let err = v2_only_backup_refusal(Some("sv2"), &[("pool.failover1", None, None)])
+            .expect_err("configured backup with no sv2_url is missing/V1");
+        assert!(err.contains("pool.failover1"));
+        assert!(err.contains("missing an SV2 endpoint") || err.contains("V1-incompatible"));
+    }
+
+    #[test]
+    fn endpoint_sv2_capable_requires_sv2_url_or_protocol() {
+        assert!(!endpoint_is_sv2_capable(None, None));
+        assert!(!endpoint_is_sv2_capable(Some("sv1"), None));
+        assert!(!endpoint_is_sv2_capable(Some("v1"), Some("")));
+        assert!(endpoint_is_sv2_capable(Some("sv2"), None));
+        assert!(endpoint_is_sv2_capable(
+            None,
+            Some("stratum2+tcp://v2.example:3336")
+        ));
+    }
+
+    #[test]
+    fn v2_only_refuses_datum_protocol() {
+        let mut config = make_test_config();
+        config.protocol = Some("datum".into());
+        let err = validate_v2_only_contract(&config).expect_err("DATUM is not implemented");
+        assert!(err.contains("DATUM"));
+        assert!(err.contains("not implemented"));
     }
 }

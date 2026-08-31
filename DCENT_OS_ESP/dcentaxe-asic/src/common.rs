@@ -32,6 +32,102 @@ pub const UART_FREQ: u32 = 115200;
 /// Default Stratum version mask
 pub const STRATUM_DEFAULT_VERSION_MASK: u32 = 0x1FFFE000;
 
+// ── Version-roll slot table (chains whose nonce reports carry a slot index) ─
+//
+// Some chains (Avalon A3197S class) do not echo the rolled version itself in
+// the nonce record — they echo a small SLOT INDEX into a candidate table the
+// host configured. Reconstructing the hashed version therefore needs one
+// shared, explicit table model, not per-driver guesses.
+//
+// STOCK CONSTRUCTION (2026-08-29 held-evidence exhaustion — no longer a
+// guess): Canaan's own cgminer `set_vmask` builds the candidate list as
+// [0, full_mask, single bits 15..=28 ascending] — bits 13/14 NEVER receive
+// their own slot — and the job carries exactly the first 8 entries of that
+// list (mm_work.vmask[8]; there is no separate vmask config opcode: the
+// table rides inside every SET_JOB). Two Canaan-origin sources agree (the
+// held cgminer source and the held stock 3S binary's 8-entry job field;
+// see dcent-avalon-proto/src/mm_work.rs for the full evidence stack). The
+// WIRE encoding stays a bench falsification target (H-table), but this
+// ordering is now stock-derived rather than hypothesized.
+//
+// Operational symptom of a reconstruction mismatch (undetectable in
+// software): every rolled share fails local PoW — presents as ~100%
+// rolled-share rejects with slot-0-only acceptance, indistinguishable from
+// a broken chip. The P1-4 capture still verifies before trusting rolled
+// shares on hardware.
+
+/// Maximum version-roll table entries the ASIC side is configured with
+/// (the stock job field carries 8 entries).
+pub const VERSION_ROLL_TABLE_MAX_SLOTS: usize = 8;
+
+/// Build the ordered version-roll candidate table for a BIP320 mask,
+/// stock construction: `[0, full_mask, single mask bits 15..=28 ascending]`,
+/// truncated to `VERSION_ROLL_TABLE_MAX_SLOTS` entries. Bits 13/14 never
+/// receive their own slot (they appear only inside the full-mask entry).
+pub fn version_roll_table(mask: u32) -> Vec<u32> {
+    std::iter::once(0)
+        .chain(std::iter::once(mask))
+        .chain(
+            (15..=28u32)
+                .map(|bit| 1 << bit)
+                .filter(|bits| bits & mask != 0),
+        )
+        .take(VERSION_ROLL_TABLE_MAX_SLOTS)
+        .collect()
+}
+
+/// Reconstruct the version the chip actually hashed from the base version,
+/// the BIP320 mask, and the reported slot index. `None` = slot outside the
+/// configured table (drop the record; never guess).
+pub fn reconstruct_rolled_version(base_version: u32, mask: u32, slot: u8) -> Option<u32> {
+    let bits = *version_roll_table(mask).get(slot as usize)?;
+    Some((base_version & !mask) | (bits & mask))
+}
+
+// ── Per-job roll bases ──────────────────────────────────────────────────────
+//
+// A driver keeps ONE "current" base version/ntime per dispatch, but the
+// dispatcher runs many concurrent jobs: a nonce reported after the next
+// `send_work` would otherwise be reconstructed against the WRONG base and
+// fail PoW on every slot (dropped share + false HW-reject stats). The driver
+// records each dispatched job's base fields keyed by the dispatcher-assigned
+// job id; nonce reports are reconstructed against the base of the job they
+// echo, falling back to the most recent dispatch when the echoed id has
+// already left the window.
+
+/// How many recent dispatches stay resolvable for late nonce reports.
+pub const ROLL_BASES_WINDOW: usize = 16;
+
+/// Recent dispatched per-job base fields for roll reconstruction.
+#[derive(Debug, Clone, Default)]
+pub struct RollBases {
+    recent: std::collections::VecDeque<(u8, u32, u32)>,
+    latest: Option<(u32, u32)>,
+}
+
+impl RollBases {
+    /// Record the base fields of a dispatched job.
+    pub fn record(&mut self, job_id: u8, base_version: u32, base_ntime: u32) {
+        if self.recent.len() >= ROLL_BASES_WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((job_id, base_version, base_ntime));
+        self.latest = Some((base_version, base_ntime));
+    }
+
+    /// Resolve the base fields for an echoed job id: exact recent hit, else
+    /// the most recent dispatch, else `None` (nothing was ever dispatched —
+    /// the report cannot be reconstructed).
+    pub fn get(&self, job_id: u8) -> Option<(u32, u32)> {
+        self.recent
+            .iter()
+            .rev()
+            .find(|(id, _, _)| *id == job_id)
+            .map(|&(_, v, n)| (v, n))
+            .or(self.latest)
+    }
+}
+
 // ── Register types ──────────────────────────────────────────────────────────
 
 /// Register type identifiers matching the C enum
@@ -316,6 +412,108 @@ impl fmt::Display for PowAlgorithm {
 }
 
 #[cfg(test)]
+mod version_roll_tests {
+    use super::*;
+
+    const MASK: u32 = 0x1FFF_E000; // canonical BIP320 mask, bits 13..28
+
+    #[test]
+    fn table_shape_is_no_roll_full_mask_then_single_bits_ascending() {
+        let table = version_roll_table(MASK);
+        assert_eq!(table.len(), VERSION_ROLL_TABLE_MAX_SLOTS);
+        assert_eq!(table[0], 0);
+        assert_eq!(table[1], MASK);
+        // STOCK construction: single-bit slots start at bit 15 — bits 13/14
+        // never receive their own slot (Canaan's loop runs 15..=28).
+        assert_eq!(table[2], 1 << 15);
+        assert_eq!(table[3], 1 << 16);
+        assert_eq!(table[4], 1 << 17);
+        assert_eq!(table[7], 1 << 20);
+        // Every entry is a sub-mask of the mask.
+        for &bits in &table {
+            assert_eq!(bits & !MASK, 0);
+        }
+    }
+
+    #[test]
+    fn table_truncates_to_the_stock_eight_slot_job_field() {
+        // The canonical mask has 16 candidate bits, but the stock job field
+        // carries exactly the first 8 entries.
+        assert_eq!(version_roll_table(MASK).len(), 8);
+        // A mask confined to bits 13/14 yields NO single-bit slots.
+        let narrow = version_roll_table(0x0000_3000);
+        assert_eq!(narrow, vec![0, 0x3000]);
+        // A mask starting at bit 15 yields single-bit slots from bit 15.
+        let b15 = version_roll_table(0x0000_8000);
+        assert_eq!(b15, vec![0, 0x8000, 1 << 15]);
+    }
+
+    #[test]
+    fn reconstruction_selects_the_slot_bits_under_the_mask() {
+        let base = 0x2000_0000;
+        assert_eq!(reconstruct_rolled_version(base, MASK, 0), Some(base));
+        assert_eq!(
+            reconstruct_rolled_version(base, MASK, 1),
+            Some((base & !MASK) | MASK)
+        );
+        assert_eq!(
+            reconstruct_rolled_version(base, MASK, 2),
+            Some((base & !MASK) | (1 << 15))
+        );
+        // Base bits under the mask are cleared, not merged.
+        assert_eq!(
+            reconstruct_rolled_version(0x2000_2000, MASK, 0),
+            Some(0x2000_0000)
+        );
+    }
+
+    #[test]
+    fn out_of_table_slot_is_none_never_a_guess() {
+        // The table has 8 entries; mid_id is 4 bits, so 8..=15 are
+        // unreachable-in-hypothesis and must fail closed.
+        for slot in 8..=15u8 {
+            assert_eq!(reconstruct_rolled_version(0x2000_0000, MASK, slot), None);
+        }
+    }
+
+    #[test]
+    fn roll_bases_resolve_per_job_with_latest_fallback() {
+        let mut bases = RollBases::default();
+        bases.record(0x10, 0x2000_0000, 100);
+        bases.record(0x20, 0x2000_0004, 200);
+        // Exact recent hits win over recency.
+        assert_eq!(bases.get(0x10), Some((0x2000_0000, 100)));
+        assert_eq!(bases.get(0x20), Some((0x2000_0004, 200)));
+        // Unknown id falls back to the latest dispatch, not the first.
+        assert_eq!(bases.get(0xEE), Some((0x2000_0004, 200)));
+        // Nothing recorded yet -> unreconstructable.
+        assert_eq!(RollBases::default().get(0x10), None);
+    }
+
+    #[test]
+    fn roll_bases_window_is_bounded_and_repeats_overwrite_by_recency() {
+        let mut bases = RollBases::default();
+        for i in 0..(ROLL_BASES_WINDOW as u8 + 4) {
+            bases.record(i, 0x2000_0000, i as u32);
+        }
+        // The window slid: the oldest ids are gone; get() still resolves them
+        // via the latest fallback (which is NOT their own base — the report is
+        // then simply unrecoverable-in-practice and fails PoW, never guesses).
+        assert_eq!(
+            bases.get(0),
+            Some((0x2000_0000, (ROLL_BASES_WINDOW + 3) as u32))
+        );
+        // Recent ids still hit exactly.
+        assert_eq!(
+            bases.get(ROLL_BASES_WINDOW as u8 + 3),
+            Some((0x2000_0000, (ROLL_BASES_WINDOW + 3) as u32))
+        );
+        // Bounded memory.
+        assert!(bases.recent.len() <= ROLL_BASES_WINDOW);
+    }
+}
+
+#[cfg(test)]
 mod pow_algorithm_tests {
     use super::*;
 
@@ -485,6 +683,28 @@ pub struct MiningJob {
     pub midstates: Vec<[u8; 32]>,
     /// For BM1397 only: last 4 bytes of merkle root
     pub merkle4: [u8; 4],
+    /// Full serialized coinbase transaction (with this job's extranonce2
+    /// already spliced in). Empty = the caller does not track coinbase
+    /// (midstate/BM-style drivers never need it); chain-side splicing
+    /// drivers (the Avalon mm_work path) require it for a complete job.
+    pub coinbase: Vec<u8>,
+    /// Merkle branches from the pool notify, internal byte order. Paired
+    /// with `coinbase` for controllers that fold the merkle root themselves.
+    pub merkle_branches: Vec<[u8; 32]>,
+    /// The extranonce2 value assigned to this job (low 32 bits; the stock
+    /// mm_work field is a u32 and stock software supports 4-byte en2).
+    pub nonce2: u32,
+    /// Byte offset of extranonce2 inside `coinbase`; -1 = unknown.
+    pub nonce2_offset: i32,
+    /// extranonce2 width in bytes; 0 = unknown.
+    pub nonce2_size: i32,
+    /// Stock mm_work merkle-offset field. Semantics NOT independently
+    /// verified against held binaries (the little core folds the root from
+    /// `merkle_branches` itself); carried as 0 until a capture pins it.
+    pub merkle_offset: i32,
+    /// Pool share target (32 bytes, big-endian). `None` = the caller has
+    /// no target authority (share validation then stays host-side only).
+    pub target: Option<[u8; 32]>,
 }
 
 impl MiningJob {
@@ -508,7 +728,41 @@ impl MiningJob {
             starting_nonce,
             midstates: Vec::new(),
             merkle4: [0u8; 4],
+            coinbase: Vec::new(),
+            merkle_branches: Vec::new(),
+            nonce2: 0,
+            nonce2_offset: -1,
+            nonce2_size: 0,
+            merkle_offset: 0,
+            target: None,
         }
+    }
+
+    /// Attach the coinbase-carrying fields (chain-side splicing drivers).
+    /// `nonce2_value` is the assigned extranonce2 (low 32 bits).
+    #[must_use = "the coinbase-carrying job must be consumed"]
+    pub fn with_coinbase_parts(
+        mut self,
+        coinbase: Vec<u8>,
+        merkle_branches: Vec<[u8; 32]>,
+        nonce2_value: u32,
+        nonce2_offset: i32,
+        nonce2_size: i32,
+        target: Option<[u8; 32]>,
+    ) -> Self {
+        self.coinbase = coinbase;
+        self.merkle_branches = merkle_branches;
+        self.nonce2 = nonce2_value;
+        self.nonce2_offset = nonce2_offset;
+        self.nonce2_size = nonce2_size;
+        self.target = target;
+        self
+    }
+
+    /// True when this job carries the parts a chain-side splicing driver
+    /// needs for a complete wire job (coinbase + branch list + en2 geometry).
+    pub fn has_coinbase_parts(&self) -> bool {
+        !self.coinbase.is_empty() && self.nonce2_offset >= 0 && self.nonce2_size > 0
     }
 
     /// Create a new job for BM1397 style ASICs (midstate-based)
@@ -531,6 +785,13 @@ impl MiningJob {
             starting_nonce,
             midstates,
             merkle4,
+            coinbase: Vec::new(),
+            merkle_branches: Vec::new(),
+            nonce2: 0,
+            nonce2_offset: -1,
+            nonce2_size: 0,
+            merkle_offset: 0,
+            target: None,
         }
     }
 }
@@ -551,6 +812,13 @@ pub enum AsicResult {
         nonce: u32,
         /// Rolled version (with version bits applied)
         rolled_version: u32,
+        /// The ABSOLUTE ntime the chip hashed for this nonce (base job ntime
+        /// plus on-chip rolls), for chains whose ASICs roll ntime themselves
+        /// (Avalon A3197S class). `0` = the driver has no roll information —
+        /// consumers must fall back to the dispatched job ntime (real work
+        /// ntimes are Unix timestamps and never 0). BM-family drivers that do
+        /// not roll ntime on-chip pass 0.
+        rolled_ntime: u32,
         /// Which ASIC chip in the chain produced this
         asic_nr: u8,
         /// Receive timestamp (microseconds since boot, 0 if unavailable)

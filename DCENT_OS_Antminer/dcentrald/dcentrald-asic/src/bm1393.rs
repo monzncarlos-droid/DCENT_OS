@@ -1,9 +1,10 @@
 //! BM1393 protocol reference (S9k / S9 SE).
 //!
-//! **This module is reference-only.** It is not wired into
-//! [`crate::drivers::ChipRegistry`]. `0x1393` stays undriveable on the
-//! production `am1-s9` (BM1387) path until a dedicated `am1-s9se` /
-//! C43 profile exists.
+//! **This module grants no live authority.** Its companion driver is exposed
+//! only by [`crate::drivers::ChipRegistry::with_scaffold_drivers`]; the
+//! production registry deliberately omits `0x1393`. `0x1393` therefore stays
+//! undriveable until a dedicated S9 SE/S9k carrier and electrical admission
+//! exists.
 //!
 //! ## What this file is *not*
 //!
@@ -186,6 +187,27 @@ pub const POWER_IIC_B2: f64 = 1899.7248;
 pub const POWER_IIC_C2: f64 = 5.26;
 pub const POWER_IIC_D2: f64 = 161.5872;
 
+/// Exact T11 dsPIC voltage-conversion branch selected by the stock miner.
+///
+/// This is a pure evidence enum, not voltage-control authority. The physical
+/// S9 SE controller route and safe electrical envelope remain capture-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bm1393PowerIicMap {
+    /// `g_minor_type == PKG_CE || g_minor_type == PKG_B_BGM`.
+    CeOrBBgm,
+    /// Every other T11 package branch in the held S9k miner.
+    OtherT11,
+}
+
+impl Bm1393PowerIicMap {
+    const fn coefficients(self) -> (f64, f64, f64, f64) {
+        match self {
+            Self::CeOrBBgm => (POWER_IIC_A, POWER_IIC_B, POWER_IIC_C, POWER_IIC_D),
+            Self::OtherT11 => (POWER_IIC_A2, POWER_IIC_B2, POWER_IIC_C2, POWER_IIC_D2),
+        }
+    }
+}
+
 /// PLL xtal used by `get_pllparam_divider@129D8`:
 /// `f = 25 MHz × fbdiv / (refdiv × postdiv1 × postdiv2)`.
 pub const PLL_XTAL_MHZ: f64 = 25.0;
@@ -225,9 +247,15 @@ pub fn crc5_bits(data: &[u8], nbits: u32) -> u8 {
     crc
 }
 
-/// dsPIC IIC byte from commanded voltage (primary CE/B_BGM map).
-pub fn power_iic_from_voltage(voltage: f64) -> u8 {
-    let raw = (POWER_IIC_B - voltage * POWER_IIC_D) / (voltage * POWER_IIC_C - POWER_IIC_A);
+/// dsPIC IIC byte from commanded voltage for an exact stock T11 branch.
+///
+/// Stock converts the positive finite result to an unsigned integer, which
+/// truncates rather than rounds. Floating-point inversion can therefore map a
+/// code back to either itself or the immediately preceding code. The explicit
+/// bounds retain the existing fail-safe behavior outside the useful range.
+pub fn power_iic_from_voltage_for_map(voltage: f64, map: Bm1393PowerIicMap) -> u8 {
+    let (a, b, c, d) = map.coefficients();
+    let raw = (b - voltage * d) / (voltage * c - a);
     if raw >= 127.0 {
         127
     } else if raw <= 0.0 {
@@ -237,10 +265,21 @@ pub fn power_iic_from_voltage(voltage: f64) -> u8 {
     }
 }
 
-/// Inverse of [`power_iic_from_voltage`].
-pub fn voltage_from_power_iic(iic: u8) -> f64 {
+/// Inverse voltage observation for an exact stock T11 branch.
+pub fn voltage_from_power_iic_for_map(iic: u8, map: Bm1393PowerIicMap) -> f64 {
+    let (a, b, c, d) = map.coefficients();
     let data = f64::from(iic);
-    (data * POWER_IIC_A + POWER_IIC_B) / (data * POWER_IIC_C + POWER_IIC_D)
+    (data * a + b) / (data * c + d)
+}
+
+/// dsPIC IIC byte from commanded voltage (primary CE/B_BGM map).
+pub fn power_iic_from_voltage(voltage: f64) -> u8 {
+    power_iic_from_voltage_for_map(voltage, Bm1393PowerIicMap::CeOrBBgm)
+}
+
+/// Inverse of [`power_iic_from_voltage`] for the primary CE/B_BGM map.
+pub fn voltage_from_power_iic(iic: u8) -> f64 {
+    voltage_from_power_iic_for_map(iic, Bm1393PowerIicMap::CeOrBBgm)
 }
 
 #[cfg(test)]
@@ -333,16 +372,42 @@ mod tests {
     }
 
     #[test]
-    fn dspic_iic_voltage_round_trips_primary_map() {
+    fn dspic_iic_voltage_primary_map_matches_stock_truncation() {
         // Working voltage from #2 EEPROM (9.60 V) is inside the map.
         let iic = power_iic_from_voltage(9.60);
-        assert!(iic < 127);
+        assert_eq!(iic, 24);
         let back = voltage_from_power_iic(iic);
         assert!((back - 9.60).abs() < 0.05, "back={back} iic={iic}");
-        // Inverse formula is the S9k `get_power_voltage_from_iic_value`.
+
+        // The S9k routine casts the floating result to unsigned int. The exact
+        // inverse of code 50 is represented just below 50.0 in binary64, so
+        // stock truncation returns 49 rather than rounding back to 50.
         let v = voltage_from_power_iic(50);
         let iic2 = power_iic_from_voltage(v);
-        assert_eq!(iic2, 50);
+        assert_eq!(iic2, 49);
+    }
+
+    #[test]
+    fn dspic_iic_voltage_alternate_map_is_not_silently_primary() {
+        let map = Bm1393PowerIicMap::OtherT11;
+        assert_eq!(power_iic_from_voltage_for_map(9.60, map), 53);
+        let code_50_voltage = voltage_from_power_iic_for_map(50, map);
+        assert!((code_50_voltage - 9.650_608_402_702_673).abs() < 1e-12);
+        assert_eq!(power_iic_from_voltage_for_map(code_50_voltage, map), 49);
+    }
+
+    #[test]
+    fn dspic_iic_inverse_quantization_is_bounded_for_both_stock_maps() {
+        for map in [Bm1393PowerIicMap::CeOrBBgm, Bm1393PowerIicMap::OtherT11] {
+            for code in 0..=127u8 {
+                let voltage = voltage_from_power_iic_for_map(code, map);
+                let quantized = power_iic_from_voltage_for_map(voltage, map);
+                assert!(
+                    quantized == code || quantized.checked_add(1) == Some(code),
+                    "map={map:?} code={code} voltage={voltage} quantized={quantized}"
+                );
+            }
+        }
     }
 
     #[test]

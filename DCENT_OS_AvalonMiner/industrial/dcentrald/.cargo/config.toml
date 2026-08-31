@@ -1,0 +1,82 @@
+# Cross-compilation settings for Canaan Avalon industrial control boards
+#
+# DCENT_OS Avalon supports two RISC-V SoCs:
+#
+#   K230 (RISC-V Xuantie C908, dual-core Linux + RT-Smart):
+#     - Avalon Q (1700W home box, but rack-friendly — industrial scope per plan)
+#     - A14xx / A15xx / A16xx industrial line (when shipped)
+#     - Target: riscv64gc-unknown-linux-gnu (Linux little core)
+#
+#   K210 (RISC-V dual-core, FreeRTOS bare-metal, 8 MB SRAM only):
+#     - A1346 / A1146 / A1066 industrial (legacy)
+#     - Target: riscv64gc-unknown-none-elf (research stub for now)
+#     - Different firmware kernel entirely — defer real impl until K230 ships
+#
+# Build (K230):
+#   cargo build --release --target riscv64gc-unknown-linux-gnu
+# Verification check:
+#   cargo check --target riscv64gc-unknown-linux-gnu
+#
+# Cross-toolchain prerequisite (Windows): zig-cc-riscv64.bat / zig-ar-riscv64.bat
+# (analogous to existing zig-cc-arm.bat / zig-cc-aarch64.bat in dcentos/).
+# Linux/CI uses the distro `riscv64-linux-gnu-gcc` package.
+#
+# for tier + gotchas.
+
+# --- K230 Linux (industrial home/Avalon Q + A14xx/A15xx/A16xx) ---
+#
+# rust-lld produces fully-compiled object files but FAILS at the final link
+# on Windows without a riscv64-linux-gnu sysroot. To complete the link on
+# Windows, set:
+#
+#   set CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=C:\spaceless\zig-cc-riscv64.bat
+#   set CC_riscv64gc_unknown_linux_gnu=C:\spaceless\zig-cc-riscv64.bat
+#   set AR_riscv64gc_unknown_linux_gnu=C:\spaceless\zig-ar-riscv64.bat
+#
+# (`cmd /c` mis-splits the wrapper path when the workspace contains spaces;
+# point the wrappers at a spaceless directory, OR use Linux/CI where
+# `riscv64-linux-gnu-gcc` from the distro is the simpler answer.)
+#
+# `+crt-static` removed — glibc is dynamic on K230 SDK-built rootfs. For a
+# static binary, switch target to `riscv64gc-unknown-linux-musl`.
+[target.riscv64gc-unknown-linux-gnu]
+linker = "rust-lld"
+
+# --- K210 bare-metal (research stub) ---
+# Not active in Phase 1. Industrial K210 firmware is FreeRTOS, not Linux —
+# would need an entirely different binary topology (no_std, panic-abort,
+# bootable image with K210 boot ROM header). Defer until K230 industrial
+# ships and we have demand signal for K210 customers.
+#
+# [target.riscv64gc-unknown-none-elf]
+# linker = "rust-lld"
+# rustflags = [
+#     "-C", "target-feature=+m,+a,+f,+d,+c",
+#     "-C", "link-arg=-Tk210-link.x",
+# ]
+
+# C cross-compiler env-var hint for crates with build.rs:
+#
+#   set CC_riscv64gc_unknown_linux_gnu=%CD%\zig-cc-riscv64.bat
+#   set AR_riscv64gc_unknown_linux_gnu=%CD%\zig-ar-riscv64.bat
+#   cargo build --release --target riscv64gc-unknown-linux-gnu
+#
+# On Linux/CI:
+#   export CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc
+#   export AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar
+
+# --- K230 Linux, STATIC build (proven on Windows 2026-08-14) ---
+#
+# rust-lld + crt-static with no external toolchain; fully static RISC-V
+# EXEC that runs on the K230 (glibc) rootfs. Proven 2026-08-14:
+# dcentrald-avalon -> 1,590,776-byte ELF64 RISC-V EXEC (static).
+#
+#   cargo build --release --target riscv64gc-unknown-linux-musl -p dcentrald-avalon
+#
+# (The gnu/glibc zig lane is blocked on Windows: zig 0.13.0 cannot assemble
+# the glibc riscv startup files. gnu stays the Linux/CI lane.)
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]

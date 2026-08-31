@@ -65,6 +65,8 @@ REQUIRED_SOURCE_INPUTS = (
     "DCENT_OS_Antminer/docs/architecture/install_matrix.tsv",
     "DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json",
     "DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml",
+    "DCENT_OS_Antminer/scripts/s19k_aarch64_compile_check.sh",
+    "DCENT_OS_Antminer/scripts/s19k_native_build_verify.py",
 )
 BUILD_ENV_KEYS = (
     "DCENT_MANIFEST_PUBLIC_KEY_HEX",

@@ -4,6 +4,8 @@
 //! filesystem paths, and miner hardware. It is the host-safe boundary for API
 //! DTOs and status classifiers that should compile on Windows and Linux.
 
+#![forbid(unsafe_code)]
+
 ///  psu-C: APW12 dual-output architecture DTOs (HAL-free).
 pub mod apw_dual_output;
 ///  cmd-A: generic BM13xx ASIC command catalog (HAL-free).
@@ -28,10 +30,9 @@ pub mod baud_switch;
 pub mod bm1366_eeprom;
 /// S21/BM1368 per-chip temperature readback DTO shape (HAL-free, not live-proven by default).
 pub mod bm1368_temperature;
+pub mod bm1398_get_address;
 /// Evidence-scoped BM1398 chip, NBP1901 chain, and FPGA FIFO contracts.
 pub mod bm1398_protocol;
-pub mod bm1398_get_address;
-pub mod xil_dual_chain_desk_map;
 /// BM1397/BM1398-class GetAddress (0x52 dialect) sealed NBP1901 admission (RE-4A, host-testable).
 pub mod bm139x_get_address;
 /// Deterministic evidence-parameterized BM13xx four-divider PLL search.
@@ -199,6 +200,7 @@ pub mod watchdog_policy;
 pub mod whatsminer_btminer;
 ///  wrk-A: chip-family work frame builder (HAL-free).
 pub mod work_dispatch;
+pub mod xil_dual_chain_desk_map;
 /// Bitmain "zhiju" hashboard-EEPROM plaintext block, byte-exact from the AMTC
 /// S19 Pro factory jig. Supplies the chip-identity fields that the `(0x04,0x11)`
 /// preamble alone cannot provide (that family spans BM1398 *and* BM1362).
@@ -349,6 +351,21 @@ pub struct RecentShareRow {
     pub version_bits: Option<String>,
     pub version: Option<u32>,
     pub protocol_meta_present: bool,
+    /// Logical serial endpoint that produced this submitted share, when the
+    /// mining pipeline durably correlated a pool result to an S19k origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_logical_path: Option<String>,
+    /// Exact job-id attribution variant used by the serial RX validator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_attribution: Option<String>,
+    /// Physical chip address, ASIC index, and core ID are emitted only as one
+    /// complete tuple. Absence means the origin was not physically derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_chip_addr: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_asic_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_core_id: Option<u8>,
 }
 
 /// Pure freshness classifier for future mining-pipeline publisher tests.
@@ -727,10 +744,14 @@ pub const EEPROM_DENYLIST_PLATFORMS: &[&str] = &["am2-zynq", "am3-aml", "am3-bb"
 /// Returns true if writes to `addr` on the given platform must be rejected.
 ///
 /// Platform names follow the `port-bos-lux` PLATFORM_MATRIX tier IDs.
-/// Unknown platforms return `false` (fail-open at the API layer; HAL is
-/// still authoritative).
+/// Unknown platforms fail closed for the protected range. The only API-layer
+/// exception is the evidenced S9 PIC range at 0x55..=0x57; HAL remains
+/// authoritative for every actual bus transaction.
 pub fn eeprom_write_denied(platform: &str, addr: u16) -> bool {
-    EEPROM_DENYLIST_PLATFORMS.contains(&platform) && EEPROM_WRITE_DENYLIST.contains(&addr)
+    if !EEPROM_WRITE_DENYLIST.contains(&addr) {
+        return false;
+    }
+    !(platform == "am1-zynq" && (0x55..=0x57).contains(&addr))
 }
 
 #[cfg(test)]
@@ -806,6 +827,11 @@ mod tests {
             version_bits: Some("20000000".to_string()),
             version: Some(0x2000_0000),
             protocol_meta_present: true,
+            serial_logical_path: None,
+            serial_attribution: None,
+            serial_chip_addr: None,
+            serial_asic_index: None,
+            serial_core_id: None,
         };
 
         let body = serde_json::to_value(&row).unwrap();
@@ -819,6 +845,28 @@ mod tests {
         assert!(body.get("timestampMs").is_none());
         assert!(body.get("jobId").is_none());
         assert!(body.get("targetDifficulty").is_none());
+        assert!(body.get("serial_logical_path").is_none());
+    }
+
+    #[test]
+    fn recent_share_row_preserves_exact_serial_origin_when_present() {
+        let body = serde_json::to_value(RecentShareRow {
+            result: "accepted".to_string(),
+            serial_logical_path: Some("ttyS1".to_string()),
+            serial_attribution: Some("EspF8".to_string()),
+            serial_chip_addr: Some(0x18),
+            serial_asic_index: Some(3),
+            serial_core_id: Some(7),
+            ..RecentShareRow::default()
+        })
+        .unwrap();
+
+        assert_eq!(body["serial_logical_path"], "ttyS1");
+        assert_eq!(body["serial_attribution"], "EspF8");
+        assert_eq!(body["serial_chip_addr"], 0x18);
+        assert_eq!(body["serial_asic_index"], 3);
+        assert_eq!(body["serial_core_id"], 7);
+        assert!(body.get("serialLogicalPath").is_none());
     }
 
     #[test]
@@ -1512,6 +1560,11 @@ mod tests {
         assert!(default.extranonce2.is_none());
         assert!(default.version_bits.is_none());
         assert!(default.version.is_none());
+        assert!(default.serial_logical_path.is_none());
+        assert!(default.serial_attribution.is_none());
+        assert!(default.serial_chip_addr.is_none());
+        assert!(default.serial_asic_index.is_none());
+        assert!(default.serial_core_id.is_none());
         assert!(!default.protocol_meta_present);
     }
 
@@ -1598,11 +1651,13 @@ mod tests {
     }
 
     #[test]
-    fn eeprom_write_denied_unknown_platform_fails_open() {
-        // Unknown/empty platform IDs should return false; the HAL is still
-        // authoritative and will deny via per-bus denylist if applicable.
-        assert!(!eeprom_write_denied("", 0x50));
-        assert!(!eeprom_write_denied("unknown-platform", 0x50));
+    fn eeprom_write_denied_unknown_platform_fails_closed() {
+        // Unknown identity cannot inherit S9's narrow PIC exception.
+        assert!(eeprom_write_denied("", 0x50));
+        assert!(eeprom_write_denied("unknown-platform", 0x50));
+        assert!(eeprom_write_denied("unknown-platform", 0x55));
+        assert!(eeprom_write_denied("am1-zynq", 0x50));
+        assert!(!eeprom_write_denied("unknown-platform", 0x49));
     }
 
     #[test]

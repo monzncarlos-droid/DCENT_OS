@@ -9,11 +9,19 @@ import {
   estimateDailyCost,
   wattsToBtu,
   btuComparison,
-  estimateHeatingOffset,
+  seasonalHeatCredit,
+  monthsToFraction,
+  findHeatingZone,
+  HEATING_ZONES,
   daysToHalving,
   nextHalving,
   blockRewardAt,
   fourYearRevenueWithHalving,
+  donationTakePercent,
+  DEFAULT_DONATION_PERCENT,
+  clampPoolFeePercent,
+  loadPoolFeePercent,
+  persistPoolFeePercent,
 } from '../../utils/thermal';
 import { getLivePowerEfficiencyJth, getLiveWallWatts } from '../../utils/power';
 import { useNetworkContext } from '../../hooks/useNetworkContext';
@@ -36,12 +44,14 @@ function MetricCard({
   note,
   valueClassName = '',
   cardClassName = '',
+  testId,
 }: {
   label: string;
   value: React.ReactNode;
   note?: React.ReactNode;
   valueClassName?: string;
   cardClassName?: string;
+  testId?: string;
 }) {
   // Kit `.earn-kpi-tile` grammar (EarningsShares.jsx KpiTile,
   // styles.css:2476-2495): label / value / unit. Dual-classed with the
@@ -56,7 +66,10 @@ function MetricCard({
         ? 'accent'
         : '';
   return (
-    <div className={`earn-kpi-tile ${tileTone} metric-card centered ${cardClassName}`.trim()}>
+    <div
+      className={`earn-kpi-tile ${tileTone} metric-card centered ${cardClassName}`.trim()}
+      data-testid={testId}
+    >
       <div className="earn-kpi-label metric-card-title">{label}</div>
       <div className={`earn-kpi-value metric-card-value ${valueClassName}`.trim()}>{value}</div>
       {note != null && <div className="earn-kpi-unit metric-card-note">{note}</div>}
@@ -81,6 +94,12 @@ export function EarningsPage() {
   const [chartPeriod, setChartPeriod] = useState<EarningsPeriod>('24h');
   const [customHashrate, setCustomHashrate] = useState<string>('');
   const [customWatts, setCustomWatts] = useState<string>('');
+  const [donationPercent, setDonationPercent] = useState(DEFAULT_DONATION_PERCENT);
+  const [poolFeePercent, setPoolFeePercent] = useState(() => loadPoolFeePercent());
+  const [showHeatCredit, setShowHeatCredit] = useState(false);
+  const [heatZoneId, setHeatZoneId] = useState('quebec-hydro');
+  const [heatSeasonMonths, setHeatSeasonMonths] = useState(7);
+  const [heatDisplaced, setHeatDisplaced] = useState(0.85);
   // W9.4: source-tagged J/TH headline. Polls /api/perf/efficiency every 15s.
   const [perfEfficiency, setPerfEfficiency] = useState<PerfEfficiencyResponse | null>(null);
 
@@ -101,6 +120,19 @@ export function EarningsPage() {
       cancelled = true;
       window.clearInterval(id);
     };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getDonationConfig()
+      .then(cfg => {
+        if (!cancelled) setDonationPercent(donationTakePercent(cfg));
+      })
+      .catch(() => {
+        // Unknown config → firmware default 2%, never a silent 0%.
+        if (!cancelled) setDonationPercent(DEFAULT_DONATION_PERCENT);
+      });
+    return () => { cancelled = true; };
   }, []);
 
   const hashrate = status?.hashrate_ghs ?? 0;
@@ -139,15 +171,42 @@ export function EarningsPage() {
   const hashrateFlashCls = useValueFlash(usingManualInputs ? null : Math.round(hashrate));
 
   const profit = useMemo(
-    () => estimateDailyProfit(effectiveHashrate, effectiveWatts, settings.btcPrice, settings.electricityRate, networkDifficulty),
-    [effectiveHashrate, effectiveWatts, settings.btcPrice, settings.electricityRate, networkDifficulty]
+    () => estimateDailyProfit(
+      effectiveHashrate,
+      effectiveWatts,
+      settings.btcPrice,
+      settings.electricityRate,
+      networkDifficulty,
+      { donationPercent, poolFeePercent },
+    ),
+    [effectiveHashrate, effectiveWatts, settings.btcPrice, settings.electricityRate, networkDifficulty, donationPercent, poolFeePercent]
   );
 
   const multiplier = PERIOD_MULTIPLIERS[period];
   const periodSats = profit.sats * multiplier;
+  const periodGrossSats = profit.grossSats * multiplier;
   const periodRevenue = profit.revenue * multiplier;
+  const periodGrossRevenue = profit.grossRevenue * multiplier;
   const periodCost = profit.cost * multiplier;
   const periodProfit = profit.profit * multiplier;
+  const periodDonationSats = profit.donationSats * multiplier;
+  const periodPoolFeeSats = profit.poolFeeSats * multiplier;
+
+  // Heat-credit watts: never the standby 25 W assumption. Manual override is
+  // operator-entered; otherwise only live wall-power telemetry.
+  const heatCreditWatts = customWatts
+    ? Number.parseFloat(customWatts)
+    : (wattsFromTelemetry ? wallWatts : 0);
+  const heatZone = findHeatingZone(heatZoneId) ?? HEATING_ZONES[0];
+  const dailyHeatCreditUsd = showHeatCredit && heatCreditWatts > 0
+    ? seasonalHeatCredit({
+        wall_watts: heatCreditWatts,
+        displaced_fraction: heatDisplaced,
+        heating_season_active: monthsToFraction(heatSeasonMonths),
+        kwh_rate: settings.electricityRate,
+      })
+    : 0;
+  const periodHeatCreditUsd = dailyHeatCreditUsd * multiplier;
 
   // Break-even calculation
   const breakEvenDays = useMemo(() => {
@@ -257,16 +316,21 @@ export function EarningsPage() {
   const exportCsv = useCallback(() => {
     const rows = [
       ['Metric', 'Daily', 'Weekly', 'Monthly'],
-      ['Sats Earned', profit.sats.toString(), (profit.sats * 7).toString(), (profit.sats * 30).toString()],
-      ['Revenue (USD)', `$${profit.revenue.toFixed(2)}`, `$${(profit.revenue * 7).toFixed(2)}`, `$${(profit.revenue * 30).toFixed(2)}`],
+      ['Gross Sats', profit.grossSats.toString(), (profit.grossSats * 7).toString(), (profit.grossSats * 30).toString()],
+      ['Net Sats (after donation + pool fee)', profit.sats.toString(), (profit.sats * 7).toString(), (profit.sats * 30).toString()],
+      ['Gross Revenue (USD)', `$${profit.grossRevenue.toFixed(2)}`, `$${(profit.grossRevenue * 7).toFixed(2)}`, `$${(profit.grossRevenue * 30).toFixed(2)}`],
+      ['Net Revenue (USD)', `$${profit.revenue.toFixed(2)}`, `$${(profit.revenue * 7).toFixed(2)}`, `$${(profit.revenue * 30).toFixed(2)}`],
       ['Electricity Cost (USD)', `$${profit.cost.toFixed(2)}`, `$${(profit.cost * 7).toFixed(2)}`, `$${(profit.cost * 30).toFixed(2)}`],
-      ['Net Profit (USD)', `$${profit.profit.toFixed(2)}`, `$${(profit.profit * 7).toFixed(2)}`, `$${(profit.profit * 30).toFixed(2)}`],
+      ['Net BTC Profit (USD, no heat-credit)', `$${profit.profit.toFixed(2)}`, `$${(profit.profit * 7).toFixed(2)}`, `$${(profit.profit * 30).toFixed(2)}`],
+      ['Seasonal heat-credit (optional USD, not Bitcoin)', showHeatCredit ? `$${dailyHeatCreditUsd.toFixed(2)}` : 'not included', showHeatCredit ? `$${(dailyHeatCreditUsd * 7).toFixed(2)}` : 'not included', showHeatCredit ? `$${(dailyHeatCreditUsd * 30).toFixed(2)}` : 'not included'],
       [''],
       ['Settings'],
       ['Hashrate (GH/s)', effectiveHashrate.toString()],
       ['Power (W)', effectiveWatts.toString()],
       ['Electricity Rate ($/kWh)', settings.electricityRate.toString()],
       ['BTC Price (USD)', settings.btcPrice.toString()],
+      ['Donation percent', donationPercent.toString()],
+      ['Pool fee percent', poolFeePercent.toString()],
       ['Efficiency (J/TH)', efficiency > 0 ? efficiency.toFixed(1) : 'N/A'],
     ];
     const csv = rows.map(r => r.join(',')).join('\n');
@@ -277,7 +341,7 @@ export function EarningsPage() {
     a.download = `dcentos-earnings-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [profit, effectiveHashrate, effectiveWatts, settings, efficiency]);
+  }, [profit, effectiveHashrate, effectiveWatts, settings, efficiency, donationPercent, poolFeePercent, showHeatCredit, dailyHeatCreditUsd]);
 
   const profitableTone = periodProfit >= 0 ? 'good' : 'warn';
   const profitableLabel = periodProfit >= 0 ? 'profitable' : 'unprofitable';
@@ -305,17 +369,17 @@ export function EarningsPage() {
         </div>
         <div className="hero-kpi-strip">
           <div className="hero-kpi">
-            <div className="kpi-label">USD ({period})</div>
+            <div className="kpi-label">USD net ({period})</div>
             <div className="kpi-value">
               <span className="kpi-num-anim">${periodRevenue.toFixed(2)}</span>
             </div>
-            <div className="kpi-sub">@ ${settings.btcPrice.toLocaleString()}/BTC</div>
+            <div className="kpi-sub">after donation + pool fee</div>
           </div>
           <div
             className="hero-kpi"
-            data-tooltip="Estimated daily Bitcoin revenue minus electricity cost, at the BTC price and $/kWh you entered below. An estimate from current conditions — not a guarantee. As a space heater the heat has value you'd pay for anyway."
+            data-tooltip="Estimated daily Bitcoin revenue after donation and pool fee, minus electricity cost. An estimate from current conditions — not a guarantee. Optional seasonal heat-credit is a separate USD figure and is never added here as sats."
           >
-            <div className="kpi-label">$/day net</div>
+            <div className="kpi-label">$/day net BTC</div>
             <div className="kpi-value">
               <span className="kpi-num-anim">
                 {`${profit.profit >= 0 ? '+' : ''}$${profit.profit.toFixed(2)}`}
@@ -401,32 +465,40 @@ export function EarningsPage() {
         />
       )}
 
-      {/* Main earnings cards */}
+      {/* Main earnings cards — net after donation + pool fee; heat-credit excluded */}
       <div className="earn-kpi-strip metric-grid-auto">
         <MetricCard
-          label={`${period} Sats`}
+          testId="earnings-net-sats"
+          label={`${period} Net Sats`}
           value={formatSats(periodSats)}
           valueClassName="accent hero"
-          note={`~${(periodSats / 86400 * (period === 'daily' ? 1 : period === 'weekly' ? 1 / 7 : 1 / 30)).toFixed(2)} sats/sec`}
+          note={(
+            <>
+              <span data-testid="earnings-gross-sats">Gross {formatSats(periodGrossSats)}</span>
+              {' · after donation + pool fee'}
+            </>
+          )}
         />
         <MetricCard
-          label="Estimated Revenue"
+          testId="earnings-net-revenue"
+          label="Net BTC Revenue"
           value={`$${periodRevenue.toFixed(2)}`}
           valueClassName="green hero"
-          note={`@ $${settings.btcPrice.toLocaleString()}/BTC`}
+          note={`Gross $${periodGrossRevenue.toFixed(2)} @ $${settings.btcPrice.toLocaleString()}/BTC`}
         />
         <MetricCard
           label="Electricity"
           value={`-$${periodCost.toFixed(2)}`}
           valueClassName="red hero"
-          note={`$${settings.electricityRate}/kWh`}
+          note={`$${settings.electricityRate}/kWh · full watts (donation window still draws power)`}
         />
         <MetricCard
-          label="Estimated Net"
+          testId="earnings-net-btc-profit"
+          label="Net BTC Profit"
           value={`${periodProfit >= 0 ? '+' : ''}$${periodProfit.toFixed(2)}`}
           valueClassName={`${periodProfit >= 0 ? 'green' : 'red'} hero`}
           cardClassName={periodProfit >= 0 ? 'outline-positive' : 'outline-negative'}
-          note={periodProfit >= 0 ? 'Profitable' : 'Unprofitable'}
+          note="BTC only — heat-credit is not included"
         />
       </div>
 
@@ -508,7 +580,8 @@ export function EarningsPage() {
         />
       </div>
 
-      {/* Heat Value & Break-Even */}
+      {/* Heat output (physical) + break-even. Seasonal heat-credit is a
+          separate optional USD estimate below — never mixed into sats. */}
       <div className="earn-kpi-strip metric-grid-auto">
         <MetricCard
           label="Heat Output"
@@ -517,17 +590,18 @@ export function EarningsPage() {
           note={isMining ? btuComparison(btuH) : undefined}
         />
         <MetricCard
-          label={`Heating Value (${period})`}
-          value={isMining ? `$${(estimateHeatingOffset(effectiveWatts, 24, settings.electricityRate) * multiplier).toFixed(2)}` : 'N/A'}
-          valueClassName="green"
-          note="Equiv. electric heater cost"
+          testId="seasonal-heat-credit"
+          label={`Seasonal heat-credit (${period})`}
+          value={showHeatCredit ? `$${periodHeatCreditUsd.toFixed(2)}` : 'Off'}
+          valueClassName={showHeatCredit ? 'green' : 'mono'}
+          note="OPTIONAL estimate — not Bitcoin"
         />
         <MetricCard
           label="Break-Even BTC"
           value={breakEvenBtcPrice ? `$${breakEvenBtcPrice.toLocaleString()}` : 'N/A'}
           valueClassName={`mono ${breakEvenBtcPrice && breakEvenBtcPrice < settings.btcPrice ? 'green' : breakEvenBtcPrice ? 'red' : ''}`}
           note={breakEvenBtcPrice && breakEvenBtcPrice < settings.btcPrice
-            ? 'Currently profitable'
+            ? 'Currently profitable (BTC, no heat-credit)'
             : breakEvenBtcPrice
               ? 'BTC price needed to break even'
               : undefined}
@@ -587,10 +661,44 @@ export function EarningsPage() {
               </div>
             </div>
 
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: 4 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Gross mining revenue ({period})</span>
+                <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                  ${periodGrossRevenue.toFixed(2)}
+                </span>
+              </div>
+            </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: 4 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>
+                  Donation ({profit.donationPercent.toFixed(1)}%)
+                </span>
+                <span
+                  data-testid="earnings-donation-rate"
+                  style={{ fontFamily: "'JetBrains Mono', monospace", color: 'var(--red)' }}
+                >
+                  −{formatSats(periodDonationSats)}
+                </span>
+              </div>
+            </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: 4 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>
+                  Pool fee ({profit.poolFeePercent.toFixed(1)}%)
+                </span>
+                <span
+                  data-testid="earnings-pool-fee"
+                  style={{ fontFamily: "'JetBrains Mono', monospace", color: 'var(--red)' }}
+                >
+                  −{formatSats(periodPoolFeeSats)}
+                </span>
+              </div>
+            </div>
             {/* Revenue bar */}
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: 4 }}>
-                <span style={{ color: 'var(--text-secondary)' }}>Mining Revenue ({period})</span>
+                <span style={{ color: 'var(--text-secondary)' }}>Net mining revenue ({period})</span>
                 <span style={{ fontFamily: "'JetBrains Mono', monospace", color: 'var(--green)' }}>
                   ${periodRevenue.toFixed(2)}
                 </span>
@@ -611,7 +719,7 @@ export function EarningsPage() {
               borderTop: '1px solid var(--border)', paddingTop: 10,
               display: 'flex', justifyContent: 'space-between', alignItems: 'center',
             }}>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Profit Margin</span>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>BTC profit margin (no heat-credit)</span>
               <span style={{
                 fontFamily: "var(--font-heading)",
                 fontWeight: 700, fontSize: '1.1rem',
@@ -637,7 +745,7 @@ export function EarningsPage() {
           <div className="section-title">Session Totals</div>
           <div className="earn-kpi-strip metric-grid-auto">
             <MetricCard
-              label="Session Sats (est.)"
+              label="Session Net Sats (est.)"
               value={formatSats(cumulativeSats)}
               valueClassName="accent"
             />
@@ -705,6 +813,36 @@ export function EarningsPage() {
             </div>
             <div>
               <label className="field-label">
+                Donation ({donationPercent.toFixed(1)}%)
+              </label>
+              <input
+                type="number"
+                readOnly
+                value={donationPercent}
+                aria-label="Donation percent used in net earnings (firmware setting)"
+                title="Firmware donation percent. Default is 2% and disableable in Settings — not a 0% default."
+              />
+            </div>
+            <div>
+              <label className="field-label">
+                Pool fee (%)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                min="0"
+                max="10"
+                value={poolFeePercent}
+                onChange={e => {
+                  const next = clampPoolFeePercent(Number(e.target.value));
+                  setPoolFeePercent(next);
+                  persistPoolFeePercent(next);
+                }}
+                aria-label="Pool fee percent"
+              />
+            </div>
+            <div>
+              <label className="field-label">
                 BTC Price (USD)
               </label>
               {/* P1-8 (§4.E): manual BTC price is always editable — the
@@ -728,6 +866,103 @@ export function EarningsPage() {
             >
               Reset to Live Values
             </button>
+          )}
+          <div className="page-footnote" style={{ marginTop: 12 }}>
+            Donation defaults to 2% (firmware) and is disableable in Settings.
+            Pool fee is whatever your pool charges — enter it; 0% means unknown, not a claimed 0% pool.
+            Electricity is the full wall-power cost; donation time still draws watts.
+          </div>
+        </div>
+      </div>
+
+      <div className="section" data-testid="seasonal-heat-credit-section">
+        <div className="section-title">Optional seasonal heat-credit</div>
+        <div className="page-surface">
+          <p
+            data-testid="seasonal-heat-credit-optional-label"
+            style={{ margin: '0 0 12px', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}
+          >
+            OPTIONAL estimate: kWh × seasonal factor × $/kWh. This is displaced-heating
+            value in dollars — not sats, and it is never added to BTC earnings.
+            Uses the same watts figure as the electricity cost above (not a wattmeter claim).
+          </p>
+          <label
+            style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}
+          >
+            <input
+              type="checkbox"
+              checked={showHeatCredit}
+              onChange={e => setShowHeatCredit(e.target.checked)}
+              aria-label="Include optional seasonal heat-credit estimate"
+            />
+            <span>Include optional seasonal heat-credit estimate</span>
+          </label>
+          {showHeatCredit && (
+            <div className="standard-grid-2" style={{ gap: 12 }}>
+              <div>
+                <label className="field-label" htmlFor="heat-credit-zone">Climate zone</label>
+                <select
+                  id="heat-credit-zone"
+                  value={heatZoneId}
+                  onChange={e => {
+                    const id = e.target.value;
+                    setHeatZoneId(id);
+                    const zone = findHeatingZone(id);
+                    if (zone) {
+                      setHeatSeasonMonths(zone.season_months_default);
+                      setHeatDisplaced(zone.default_displaced_fraction);
+                    }
+                  }}
+                  aria-label="Heat-credit climate zone"
+                >
+                  {HEATING_ZONES.map(z => (
+                    <option key={z.id} value={z.id}>{z.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="field-label" htmlFor="heat-credit-months">
+                  Heating season ({heatSeasonMonths} months/year)
+                </label>
+                <input
+                  id="heat-credit-months"
+                  type="range"
+                  min="0"
+                  max="12"
+                  step="1"
+                  value={heatSeasonMonths}
+                  onChange={e => setHeatSeasonMonths(Number(e.target.value))}
+                  aria-label="Heating season length in months"
+                />
+              </div>
+              <div>
+                <label className="field-label" htmlFor="heat-credit-displaced">
+                  Displaced heat ({Math.round(heatDisplaced * 100)}%)
+                </label>
+                <input
+                  id="heat-credit-displaced"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={heatDisplaced}
+                  onChange={e => setHeatDisplaced(Number(e.target.value))}
+                  aria-label="Fraction of miner heat that displaces other heating"
+                />
+              </div>
+              <div>
+                <div className="field-label">Seasonal factor</div>
+                <div className="mono" style={{ fontSize: '0.95rem' }}>
+                  {(heatDisplaced * monthsToFraction(heatSeasonMonths)).toFixed(3)}
+                  {' '}({heatZone.name})
+                </div>
+                <div className="page-footnote" style={{ marginTop: 6 }}>
+                  {heatCreditWatts > 0
+                    ? `$${dailyHeatCreditUsd.toFixed(2)}/day annualized estimate`
+                    : 'No wall-power figure available — heat-credit stays $0 rather than using standby watts.'}
+                </div>
+              </div>
+            </div>
           )}
         </div>
       </div>
@@ -812,9 +1047,12 @@ export function EarningsPage() {
       )}
 
       {/* Disclaimer */}
-      <div className="page-footnote">
-        Earnings estimates are approximate. Actual revenue depends on network difficulty, pool luck, and block rewards.
-        Halving dates and post-halving rewards are estimates based on the current block production rate.
+      <div className="page-footnote" data-testid="bitcoin-net-excludes-heat-credit">
+        Earnings estimates are approximate. Net BTC figures subtract donation and pool fee from gross
+        hashrate revenue; electricity is the full watt cost. Seasonal heat-credit is an optional
+        USD estimate and is never mixed into sats. Actual revenue depends on network difficulty,
+        pool luck, and block rewards. Halving dates and post-halving rewards are estimates based
+        on the current block production rate. J/TH here is a snapshot, not a superiority claim.
       </div>
       </section>
     </div>

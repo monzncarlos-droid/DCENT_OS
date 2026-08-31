@@ -26,6 +26,10 @@ const TELEMETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Telemetry sample is unusable once it is older than this (spec §3.2).
 const MAX_SAMPLE_AGE_MS: u64 = 5000;
+/// Firmware `DCENT_OTA_MAX_BYTES` (`ota_handler.c`).
+const MAX_OTA_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+/// Firmware `ota_pull_job_t.url[512]`, including the terminating NUL.
+const MAX_OTA_PULL_URL_BYTES: usize = 511;
 const DEFAULT_TELEMETRY_PATH: &str = "/api/v1/telemetry";
 const DEFAULT_PROXY_PATH: &str = "/";
 
@@ -104,16 +108,17 @@ impl BridgeClient {
             return Ok(None); // signal: try the telemetry fallback
         }
         if !resp.status().is_success() {
-            return Ok(None);
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BridgeError::Http { status, body });
         }
-        let health: HealthResponse = match resp.json().await {
-            Ok(h) => h,
-            Err(_) => return Ok(None), // not JSON / wrong shape ⇒ not a bridge
-        };
+        let health: HealthResponse = resp.json().await?;
         if health.is_dcent_pack() {
             Ok(Some(health))
         } else {
-            Ok(None)
+            Err(BridgeError::Other(anyhow::anyhow!(
+                "health response did not identify product dcent-pack"
+            )))
         }
     }
 
@@ -298,9 +303,6 @@ impl BridgeClient {
     /// - `X-DCent-Heartbeat-Ts`  = current unix seconds (canonical decimal).
     /// - `X-DCent-Heartbeat-Sig` = [`heartbeat_sig`] over the serialized body.
     ///
-    /// `secret == None` preserves today's unsigned behavior (the bridge accepts
-    /// unsigned heartbeats while `DCENT_HEARTBEAT_REQUIRE_SIG=0` — staged rollout).
-    ///
     /// - 200 + `paired:true` ⇒ [`HeartbeatOutcome::Ok`].
     /// - 200 + `paired:false` ⇒ [`HeartbeatOutcome::NeedsRepair`] (re-pair signal).
     /// - 403 ⇒ [`BridgeError::WrongMiner`] (surface + stop).
@@ -308,28 +310,25 @@ impl BridgeClient {
     pub async fn heartbeat(
         &self,
         req: &HeartbeatRequest,
-        secret: Option<&UnitSecret>,
+        secret: &UnitSecret,
     ) -> Result<HeartbeatOutcome, BridgeError> {
         // Serialize once; sign and send the SAME bytes.
         let body = serde_json::to_vec(req)
             .map_err(|e| BridgeError::Other(anyhow::anyhow!("serialize heartbeat body: {e}")))?;
 
-        let mut request = self
+        let request = self
             .http
             .post(self.url("/api/v1/miner/heartbeat"))
             .timeout(HEARTBEAT_TIMEOUT)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
 
-        if let Some(secret) = secret {
-            let ts = unix_now_s().map_err(|_| {
-                BridgeError::Other(anyhow::anyhow!("system clock before unix epoch"))
-            })?;
-            let sig = heartbeat_sig(secret.as_bytes(), ts, &body);
-            request = request
-                // Canonical decimal seconds — matches the firmware "%PRId64".
-                .header("X-DCent-Heartbeat-Ts", ts.to_string())
-                .header("X-DCent-Heartbeat-Sig", sig);
-        }
+        let ts = unix_now_s()
+            .map_err(|_| BridgeError::Other(anyhow::anyhow!("system clock before unix epoch")))?;
+        let sig = heartbeat_sig(secret.as_bytes(), ts, &body);
+        let request = request
+            // Canonical decimal seconds — matches the firmware "%PRId64".
+            .header("X-DCent-Heartbeat-Ts", ts.to_string())
+            .header("X-DCent-Heartbeat-Sig", sig);
 
         let resp = request.body(body).send().await?;
 
@@ -399,7 +398,12 @@ impl BridgeClient {
 
     /// On-demand Mode-A OTA upload (spec §7.3): stream `image` to the bridge
     /// with an `X-DCent-Ota-Sig` HMAC header. 120 s timeout for slow Wi-Fi.
+    ///
+    /// This is a remote firmware mutation that can reboot the bridge. The
+    /// caller must obtain operator authorization; the lifecycle task never
+    /// invokes it. Empty and over-4-MiB images are rejected before networking.
     pub async fn ota_upload(&self, secret: &UnitSecret, image: Vec<u8>) -> Result<(), BridgeError> {
+        validate_ota_upload_image(&image)?;
         let sig = ota_sig(secret.as_bytes(), &image);
         let resp = self
             .http
@@ -420,6 +424,11 @@ impl BridgeClient {
 
     /// On-demand Mode-B OTA URL-pull (spec §7.3.1): hand the bridge a URL +
     /// expected SHA256 + HMAC and let it fetch the image itself.
+    ///
+    /// This is a remote firmware mutation that can make the bridge fetch from
+    /// the network, flip its boot partition, and reboot. The caller must obtain
+    /// operator authorization; the lifecycle task never invokes it. Inputs are
+    /// validated against the firmware contract before networking.
     pub async fn ota_pull(
         &self,
         secret: &UnitSecret,
@@ -427,6 +436,7 @@ impl BridgeClient {
         expected_sha256_hex: &str,
         release_notes_url: Option<&str>,
     ) -> Result<(), BridgeError> {
+        validate_ota_pull_inputs(url, expected_sha256_hex)?;
         let sig = ota_pull_sig(secret.as_bytes(), url, expected_sha256_hex);
         let body = serde_json::json!({
             "url": url,
@@ -453,11 +463,73 @@ impl BridgeClient {
 /// The `temperature.status == "ok" && last_sample_age_ms <= 5000` predicate
 /// (spec §3.2). Pure — does NOT consult the 3-identical-age staleness tracker.
 pub fn usable_temperature(t: &BridgeTelemetry) -> Option<f32> {
-    if t.temperature.status == "ok" && t.temperature.last_sample_age_ms <= MAX_SAMPLE_AGE_MS {
+    if t.temperature.present
+        && t.temperature.status == "ok"
+        && t.temperature.last_sample_age_ms <= MAX_SAMPLE_AGE_MS
+        && t.temperature.external_temperature_c.is_finite()
+    {
         Some(t.temperature.external_temperature_c)
     } else {
         None
     }
+}
+
+fn validate_ota_upload_image(image: &[u8]) -> Result<(), BridgeError> {
+    if image.is_empty() {
+        return Err(BridgeError::InvalidOtaRequest(
+            "upload image must not be empty".to_string(),
+        ));
+    }
+    if image.len() > MAX_OTA_UPLOAD_BYTES {
+        return Err(BridgeError::InvalidOtaRequest(format!(
+            "upload image is {} bytes, exceeding the 4 MiB firmware cap",
+            image.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ota_pull_inputs(url: &str, expected_sha256_hex: &str) -> Result<(), BridgeError> {
+    if url.len() > MAX_OTA_PULL_URL_BYTES {
+        return Err(BridgeError::InvalidOtaRequest(format!(
+            "pull URL is {} bytes, exceeding the 511-byte firmware cap",
+            url.len()
+        )));
+    }
+    let authority_and_tail = url.strip_prefix("https://").ok_or_else(|| {
+        BridgeError::InvalidOtaRequest("pull URL must use lowercase https://".to_string())
+    })?;
+    if authority_and_tail.is_empty()
+        || authority_and_tail.starts_with('/')
+        || authority_and_tail.starts_with('?')
+        || authority_and_tail.starts_with('#')
+    {
+        return Err(BridgeError::InvalidOtaRequest(
+            "pull URL must include a non-empty authority".to_string(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| BridgeError::InvalidOtaRequest(format!("invalid pull URL: {e}")))?;
+    if parsed.host_str().is_none() {
+        return Err(BridgeError::InvalidOtaRequest(
+            "pull URL must include a host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(BridgeError::InvalidOtaRequest(
+            "pull URL must not include credentials".to_string(),
+        ));
+    }
+    if expected_sha256_hex.len() != 64
+        || !expected_sha256_hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(BridgeError::InvalidOtaRequest(
+            "expected SHA256 must be exactly 64 lowercase hex characters".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_same_origin_pair_url(
@@ -608,6 +680,57 @@ mod tests {
         assert_eq!(usable_temperature(&telem("missing", 10, 23.4)), None);
         assert_eq!(usable_temperature(&telem("stale", 10, 23.4)), None);
         assert_eq!(usable_temperature(&telem("fault", 10, 23.4)), None);
+    }
+
+    #[test]
+    fn usable_temperature_rejects_absent_and_non_finite_samples() {
+        let mut absent = telem("ok", 100, 23.4);
+        absent.temperature.present = false;
+        assert_eq!(usable_temperature(&absent), None);
+        assert_eq!(usable_temperature(&telem("ok", 100, f32::NAN)), None);
+        assert_eq!(usable_temperature(&telem("ok", 100, f32::INFINITY)), None);
+        assert_eq!(
+            usable_temperature(&telem("ok", 100, f32::NEG_INFINITY)),
+            None
+        );
+    }
+
+    #[test]
+    fn ota_inputs_fail_closed_before_networking() {
+        assert!(validate_ota_upload_image(&[0xE9]).is_ok());
+        assert!(matches!(
+            validate_ota_upload_image(&[]),
+            Err(BridgeError::InvalidOtaRequest(_))
+        ));
+        assert!(matches!(
+            validate_ota_upload_image(&vec![0; MAX_OTA_UPLOAD_BYTES + 1]),
+            Err(BridgeError::InvalidOtaRequest(_))
+        ));
+
+        assert!(validate_ota_pull_inputs("https://example.com/fw.bin", &"a".repeat(64)).is_ok());
+        for (url, sha) in [
+            ("http://example.com/fw.bin", "a".repeat(64)),
+            ("https:///fw.bin", "a".repeat(64)),
+            ("https://user:pass@example.com/fw.bin", "a".repeat(64)),
+            ("https://example.com/fw.bin", "A".repeat(64)),
+            ("https://example.com/fw.bin", "a".repeat(63)),
+            ("https://example.com/fw.bin", format!("{}g", "a".repeat(63))),
+        ] {
+            assert!(
+                matches!(
+                    validate_ota_pull_inputs(url, &sha),
+                    Err(BridgeError::InvalidOtaRequest(_))
+                ),
+                "invalid OTA pull inputs unexpectedly passed: {url} {sha}"
+            );
+        }
+        assert!(matches!(
+            validate_ota_pull_inputs(
+                &format!("https://example.com/{}", "a".repeat(493)),
+                &"a".repeat(64)
+            ),
+            Err(BridgeError::InvalidOtaRequest(_))
+        ));
     }
 
     #[test]

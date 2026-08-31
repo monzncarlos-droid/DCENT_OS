@@ -1,0 +1,23 @@
+{
+  "completed": [
+    "d0-bspplan",
+    "d0-census",
+    "d0-crossera",
+    "d0-ingest",
+    "d0-rail",
+    "d0-registry",
+    "d0-runbooks",
+    "d0-soc",
+    "w1-bspa",
+    "w1-capture",
+    "w1-capturevalidator",
+    "w1-discoverytool",
+    "w1-fixtureplan",
+    "w1-fixturevalidator",
+    "w1-identityschema",
+    "w1-installplan",
+    "w1-renode",
+    "w1-routeengine"
+  ],
+  "operator_evidence": {}
+}

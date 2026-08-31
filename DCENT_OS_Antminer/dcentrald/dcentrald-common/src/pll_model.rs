@@ -2210,7 +2210,6 @@ mod tests {
         let production = &serial[..production_end];
         for marker in [
             "S21Bm1368ShippedConfig",
-            "T21Bm1368ShippedConfig",
             "S21ProBm1370ShippedConfig",
             "S21XpBm1370ShippedConfig",
             "Bm1368VcoPolicy::BitmainJigClamp",
@@ -2222,6 +2221,10 @@ mod tests {
                 "missing industrial pin {marker}"
             );
         }
+        assert!(
+            !production.contains("T21Bm1368ShippedConfig"),
+            "T21's non-authoritative frequency scaffold must not become a shipped PLL policy"
+        );
         assert!(!production.contains("resolve_pll(dcentrald_common::PllFamily::Bm1368"));
         assert!(!production.contains("resolve_pll(dcentrald_common::PllFamily::Bm1370"));
     }

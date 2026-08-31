@@ -58,6 +58,10 @@ pub struct ChipStatsSnapshot {
     /// When available, used to calibrate the power model (C_eff) for ±1% accuracy
     /// instead of the ±10% theoretical model. Set by the work dispatcher when
     /// PMBus communication is established.
+    ///
+    /// **Provenance pin (desk-now 2026-08-19):** this field is measured-only.
+    /// Never assign a V²f / C_eff / APW12-framed estimate here. The watt PID
+    /// treats `Some` as `PowerAuthorityKind::Pmbus` via `pmbus_power_sample`.
     pub psu_power_w: Option<f64>,
 }
 
@@ -452,6 +456,28 @@ impl ChipStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psu_power_w_consumer_is_pmbus_sample_not_v2f() {
+        // Tuner treats ChipStatsSnapshot.psu_power_w as measured PMBus. A V²f
+        // assignment into this field would un-HOLD the watt PID. Pin the
+        // consumer and refuse estimate tokens in this file's snapshot builders.
+        let tuner = include_str!("tuner.rs");
+        assert!(
+            tuner.contains("pmbus_power_sample(measured_w)"),
+            "tuner must map psu_power_w through pmbus_power_sample"
+        );
+        assert!(
+            !tuner.contains("psu_power_w: Some(estimate")
+                && !tuner.contains("psu_power_w: Some(v2f"),
+            "tuner must not assign V²f estimates to psu_power_w"
+        );
+        let me = include_str!("chip_stats.rs");
+        assert!(
+            me.contains("Never assign a V²f") || me.contains("measured-only"),
+            "chip_stats must keep the measured-only provenance pin"
+        );
+    }
 
     #[test]
     fn test_tracker_new() {

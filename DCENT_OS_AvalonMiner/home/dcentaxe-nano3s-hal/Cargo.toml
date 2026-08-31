@@ -1,0 +1,21 @@
+[package]
+name = "dcentaxe-nano3s-hal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "K230 Linux HAL for DCENT_axe Avalon Nano 3 / Nano 3S / Mini 3 — sysfs GPIO, hwmon temp, sysfs PWM"
+
+[lib]
+name = "dcentaxe_nano3s_hal"
+path = "src/lib.rs"
+
+[dependencies]
+dcent-avalon-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix.workspace = true

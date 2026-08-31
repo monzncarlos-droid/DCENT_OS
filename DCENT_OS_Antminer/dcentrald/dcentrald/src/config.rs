@@ -10,13 +10,20 @@
 
 use anyhow::{Context, Result};
 use dcentrald_api::{solar_provider_support, supported_solar_providers, NetworkBlockConfig};
+use dcentrald_stratum::router::v2_only_backup_refusal;
 use dcentrald_stratum::types::{
-    resolve_nominal_hashrate_ghs_with_geometry, DonationConfig as StratumDonationConfig,
-    NominalHashrateSource, PoolConfig as StratumPoolConfig, StratumConfig,
+    refuse_datum_protocol, resolve_nominal_hashrate_ghs_with_geometry,
+    DonationConfig as StratumDonationConfig, HashOnDisconnectPolicy, NominalHashrateSource,
+    PoolConfig as StratumPoolConfig, StratumConfig,
 };
 use dcentrald_stratum::url_validator::{validate_sv2_pool_url, validate_v1_pool_url};
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const AM1_S9_MAX_CHIP_RAIL_MV: u16 = 9_400;
 const MAX_PERSISTED_CONFIG_BYTES: usize = 1024 * 1024;
@@ -37,6 +44,73 @@ pub(crate) fn atomic_write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     )
     .map(|_| ())
     .map_err(dcentrald_common::atomic_file::AtomicWriteError::into_io_error)
+}
+
+/// Read one exact configuration document without following a symlink or
+/// accepting an unbounded/special input object.
+///
+/// This deliberately mirrors the one-mebibyte atomic-persistence envelope.
+/// On Unix, `O_NOFOLLOW` closes the final-component replacement race and
+/// `O_NONBLOCK` prevents a raced-in FIFO/device from hanging startup before
+/// the opened-handle type check. The bounded read catches growth after either
+/// metadata observation.
+fn read_bounded_config(path: &Path) -> Result<String> {
+    let path_label = path.display();
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect config file: {path_label}"))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "config file must not be a symlink: {path_label}"
+    );
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "config path is not a regular file: {path_label}"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_PERSISTED_CONFIG_BYTES as u64,
+        "config file exceeds {MAX_PERSISTED_CONFIG_BYTES} bytes: {path_label}"
+    );
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open config file: {path_label}"))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened config file: {path_label}"))?;
+    anyhow::ensure!(
+        opened_metadata.file_type().is_file(),
+        "opened config object is not a regular file: {path_label}"
+    );
+    anyhow::ensure!(
+        opened_metadata.len() <= MAX_PERSISTED_CONFIG_BYTES as u64,
+        "opened config file exceeds {MAX_PERSISTED_CONFIG_BYTES} bytes: {path_label}"
+    );
+
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    file.take((MAX_PERSISTED_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read config file: {path_label}"))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_PERSISTED_CONFIG_BYTES,
+        "config file grew beyond {MAX_PERSISTED_CONFIG_BYTES} bytes while reading: {path_label}"
+    );
+    String::from_utf8(bytes).with_context(|| format!("config file is not UTF-8: {path_label}"))
+}
+
+/// Return true only when the loader's causal chain proves that the selected
+/// path did not exist. No other I/O, type, size, encoding, parse, or validation
+/// error is allowed to activate a lower-authority fallback configuration.
+pub(crate) fn load_error_is_definitely_absent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// Convert daemon donation settings into the Stratum router contract.
@@ -334,8 +408,7 @@ impl DcentraldConfig {
     ///
     /// Returns an error if the file cannot be read or parsed.
     pub fn load(path: &str) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file: {}", path))?;
+        let contents = read_bounded_config(Path::new(path))?;
         let mut config: Self = toml::from_str(&contents)
             .with_context(|| format!("failed to parse config file: {}", path))?;
         config.normalize_legacy_fields()?;
@@ -389,6 +462,39 @@ impl DcentraldConfig {
 
     pub fn mining_start_enabled(&self) -> bool {
         self.mining.enabled && self.has_configured_pool()
+    }
+
+    /// Exact credential-free policy admitted by the S19k first-install
+    /// custody owner.  This is intentionally stricter than
+    /// `!mining_start_enabled()`: an incomplete/disabled pool declaration is
+    /// still a pool route and must not be carried into the custody process.
+    pub fn s19k_install_custody_pool_free(&self) -> bool {
+        !self.mining.enabled
+            && self.pool.url.trim().is_empty()
+            && self.pool.worker.trim().is_empty()
+            && self.pool.password.trim().is_empty()
+            && self
+                .pool
+                .sv2_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            && self.pool.failover1.is_none()
+            && self.pool.failover2.is_none()
+            && !self.pool.smart_failover_enabled
+            && !self.pool.smart_failover_drive
+            && !self.donation.enabled
+            && self.donation.percent == 0.0
+            && self.donation.pool_url.trim().is_empty()
+            && self.donation.worker.trim().is_empty()
+            && self.donation.password.trim().is_empty()
+            && !self.donation.fallback_enabled
+            && self.donation.fallback_pool_url.trim().is_empty()
+            && self.donation.fallback_worker.trim().is_empty()
+            && self.donation.fallback_password.trim().is_empty()
+            && !self.hash_on_disconnect.enabled
+            && !self.job_declaration.enabled
     }
 
     fn normalize_legacy_fields(&mut self) -> Result<()> {
@@ -778,6 +884,39 @@ impl DcentraldConfig {
                  pool.failover1). The failover2 pool would otherwise never be connected."
             );
         }
+
+        // DESK_NOW rank 12: DATUM is not implemented; V2Only must not silently
+        // speak V1 on a missing/V1-incompatible backup.
+        refuse_datum_protocol(self.pool.protocol.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(endpoint) = self.pool.failover1.as_ref() {
+            refuse_datum_protocol(endpoint.protocol.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        if let Some(endpoint) = self.pool.failover2.as_ref() {
+            refuse_datum_protocol(endpoint.protocol.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        {
+            let mut backups: Vec<(&str, Option<&str>, Option<&str>)> = Vec::new();
+            if let Some(endpoint) = self.pool.failover1.as_ref() {
+                backups.push((
+                    "pool.failover1",
+                    endpoint.protocol.as_deref(),
+                    endpoint.sv2_url.as_deref(),
+                ));
+            }
+            if let Some(endpoint) = self.pool.failover2.as_ref() {
+                backups.push((
+                    "pool.failover2",
+                    endpoint.protocol.as_deref(),
+                    endpoint.sv2_url.as_deref(),
+                ));
+            }
+            v2_only_backup_refusal(self.pool.protocol.as_deref(), &backups)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        self.hash_on_disconnect
+            .policy
+            .refuse_unimplemented()
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let pool_routing_mode = self.pool.routing_mode.trim();
         if pool_routing_mode != "failover" && pool_routing_mode != "weighted_split" {
@@ -1357,10 +1496,16 @@ pub struct PlatformIdentityConfig {
 
 impl PlatformIdentityConfig {
     pub fn board_target(&self) -> Option<&str> {
-        self.board_target.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        self.board_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     }
     pub fn target(&self) -> Option<&str> {
-        self.target.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        self.target
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     }
 }
 
@@ -1404,7 +1549,15 @@ impl Default for GeneralConfig {
 }
 
 fn default_hostname() -> String {
-    "dcentos-miner".to_string()
+    // Single source with `/etc/hostname`: an unset TOML hostname must not
+    // invent a second identity (`dcentos-miner` vs `dcentos`). Operator-set
+    // `[general].hostname` still wins because serde fills this default only
+    // when the key is absent.
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dcentos-miner".to_string())
 }
 
 fn default_log_level() -> String {
@@ -2269,10 +2422,11 @@ fn default_psu_voltage() -> f64 {
 mod tests {
     use super::{
         atomic_write, build_stratum_config, build_stratum_config_with_enumerated_chips,
-        enumerated_nominal_hashrate_ghs, profile_nominal_hashrate_ghs,
-        resolve_stratum_nominal_hashrate, stratum_donation_config, CurtailmentScheduleConfig,
-        DcentraldConfig, MiningConfig, NominalHashrateSource, PowerConfig, PsuOverride,
-        WatchdogConfig, MAX_PERSISTED_CONFIG_BYTES,
+        enumerated_nominal_hashrate_ghs, load_error_is_definitely_absent,
+        profile_nominal_hashrate_ghs, resolve_stratum_nominal_hashrate, stratum_donation_config,
+        CurtailmentScheduleConfig, DcentraldConfig, HashOnDisconnectPolicy, MiningConfig,
+        NominalHashrateSource, PowerConfig, PsuOverride, WatchdogConfig,
+        MAX_PERSISTED_CONFIG_BYTES,
     };
     use dcentrald_api::NetworkBlockConfig;
     use proptest::prelude::*;
@@ -2288,6 +2442,88 @@ mod tests {
                 let _ = cfg.normalize_legacy_fields();
                 let _ = cfg.validate();
             }
+        }
+    }
+
+    #[test]
+    fn s19k_install_custody_fixture_is_strictly_pool_free() {
+        let mut config: DcentraldConfig =
+            toml::from_str(include_str!("../../dcentrald_s19k_install_custody.toml"))
+                .expect("install-custody fixture must deserialize");
+        config
+            .normalize_legacy_fields()
+            .expect("install-custody fixture must normalize");
+        config
+            .validate()
+            .expect("install-custody fixture must satisfy the ordinary schema");
+        assert!(config.s19k_install_custody_pool_free());
+        assert!(!config.mining_start_enabled());
+        assert!(config.mining.passthrough);
+        assert_eq!(config.mining.model.as_deref(), Some("s19k"));
+        assert_eq!(config.mining.serial_chip_type.as_deref(), Some("BM1366"));
+        assert!(config.watchdog.enabled);
+    }
+
+    #[test]
+    fn s19k_install_custody_rejects_every_latent_work_route() {
+        let fixture = || {
+            toml::from_str::<DcentraldConfig>(include_str!(
+                "../../dcentrald_s19k_install_custody.toml"
+            ))
+            .expect("install-custody fixture")
+        };
+        let mut mutations: Vec<Box<dyn Fn(&mut DcentraldConfig)>> = vec![
+            Box::new(|cfg| cfg.mining.enabled = true),
+            Box::new(|cfg| cfg.pool.url = "stratum+tcp://pool.invalid:3333".into()),
+            Box::new(|cfg| cfg.pool.worker = "worker".into()),
+            Box::new(|cfg| cfg.pool.password = "secret".into()),
+            Box::new(|cfg| cfg.pool.sv2_url = Some("stratum2+tcp://pool.invalid:3336".into())),
+            Box::new(|cfg| {
+                cfg.pool.failover1 = Some(super::PoolEndpoint {
+                    url: "stratum+tcp://failover.invalid:3333".into(),
+                    worker: "worker".into(),
+                    password: "secret".into(),
+                    sv2_url: None,
+                    protocol: Some("sv1".into()),
+                    split_bps: None,
+                    priority: None,
+                })
+            }),
+            Box::new(|cfg| {
+                cfg.pool.failover2 = Some(super::PoolEndpoint {
+                    url: "stratum+tcp://failover.invalid:3333".into(),
+                    worker: "worker".into(),
+                    password: "secret".into(),
+                    sv2_url: None,
+                    protocol: Some("sv1".into()),
+                    split_bps: None,
+                    priority: None,
+                })
+            }),
+            Box::new(|cfg| cfg.pool.smart_failover_enabled = true),
+            Box::new(|cfg| cfg.pool.smart_failover_drive = true),
+            Box::new(|cfg| cfg.donation.enabled = true),
+            Box::new(|cfg| cfg.donation.percent = 1.0),
+            Box::new(|cfg| cfg.donation.pool_url = "stratum+tcp://donation.invalid:3333".into()),
+            Box::new(|cfg| cfg.donation.worker = "donation-worker".into()),
+            Box::new(|cfg| cfg.donation.password = "secret".into()),
+            Box::new(|cfg| cfg.donation.fallback_enabled = true),
+            Box::new(|cfg| {
+                cfg.donation.fallback_pool_url =
+                    "stratum+tcp://donation-fallback.invalid:3333".into()
+            }),
+            Box::new(|cfg| cfg.donation.fallback_worker = "fallback-worker".into()),
+            Box::new(|cfg| cfg.donation.fallback_password = "secret".into()),
+            Box::new(|cfg| cfg.hash_on_disconnect.enabled = true),
+            Box::new(|cfg| cfg.job_declaration.enabled = true),
+        ];
+        for mutate in mutations.drain(..) {
+            let mut config = fixture();
+            mutate(&mut config);
+            assert!(
+                !config.s19k_install_custody_pool_free(),
+                "one latent mining/pool route must invalidate install custody"
+            );
         }
     }
 
@@ -2381,6 +2617,73 @@ mod tests {
     }
 
     #[test]
+    fn config_load_is_bounded_regular_file_only_and_absence_is_exact() {
+        let dir = std::env::temp_dir().join(format!(
+            "dcentrald_config_load_boundary_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create config-load fixture directory");
+
+        let missing = dir.join("missing.toml");
+        let missing_error =
+            DcentraldConfig::load(missing.to_str().unwrap()).expect_err("missing config must fail");
+        assert!(load_error_is_definitely_absent(&missing_error));
+
+        let directory_error = DcentraldConfig::load(dir.to_str().unwrap())
+            .expect_err("directory config must fail before open");
+        assert!(!load_error_is_definitely_absent(&directory_error));
+
+        let oversized = dir.join("oversized.toml");
+        std::fs::write(&oversized, vec![b'x'; MAX_PERSISTED_CONFIG_BYTES + 1])
+            .expect("write oversized config fixture");
+        let oversized_error = DcentraldConfig::load(oversized.to_str().unwrap())
+            .expect_err("oversized config must fail before parsing");
+        assert!(!load_error_is_definitely_absent(&oversized_error));
+        assert!(oversized_error.to_string().contains("exceeds"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_refuses_valid_and_dangling_symlinks_without_fallback_authority() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dcentrald_config_load_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create symlink fixture directory");
+        let referent = dir.join("referent.toml");
+        let valid_link = dir.join("valid-link.toml");
+        let dangling_link = dir.join("dangling-link.toml");
+        std::fs::write(&referent, "[mining]\nenabled = false\n").expect("write config referent");
+        symlink(&referent, &valid_link).expect("create valid config symlink");
+        symlink(dir.join("absent-referent.toml"), &dangling_link)
+            .expect("create dangling config symlink");
+
+        for path in [&valid_link, &dangling_link] {
+            let error = DcentraldConfig::load(path.to_str().unwrap())
+                .expect_err("every config symlink must be refused");
+            assert!(error.to_string().contains("symlink"));
+            assert!(
+                !load_error_is_definitely_absent(&error),
+                "a present symlink must never activate fallback authority"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn enabled_psu_override_requires_finite_voltage_and_named_applicability() {
         let mut cfg = DcentraldConfig::management_only_default();
         cfg.power.psu_override = Some(PsuOverride {
@@ -2461,7 +2764,7 @@ model = "s19jpro"
     #[test]
     fn td003_models_validate_when_management_only() {
         for model in [
-            "s15", "t15", "s17", "s17pro", "s17+", "t17", "t17+", "t19", "s19xp",
+            "s15", "t15", "s17", "s17pro", "s17+", "t17", "t17+", "t19", "s19xp", "s19jxp",
         ] {
             let cfg = mining_config_for_model(model, false);
             cfg.validate().unwrap_or_else(|err| {
@@ -2477,7 +2780,7 @@ model = "s19jpro"
     #[test]
     fn td003_models_reject_mining_enabled_until_promoted() {
         for model in [
-            "s15", "t15", "s17", "s17pro", "s17+", "t17", "t17+", "t19", "s19xp",
+            "s15", "t15", "s17", "s17pro", "s17+", "t17", "t17+", "t19", "s19xp", "s19jxp",
         ] {
             let cfg = mining_config_for_model(model, true);
             let err = cfg
@@ -3679,6 +3982,81 @@ protocol = "sv2"
     }
 
     #[test]
+    fn v2_only_refuses_v1_incompatible_backup_pool() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[pool]
+url = "stratum2+tcp://v2.pool.example.com:3336"
+worker = "worker"
+protocol = "sv2"
+
+[pool.failover1]
+url = "stratum+tcp://v1.backup.example.com:3333"
+worker = "backup"
+"#,
+        )
+        .expect("V2Only + V1 backup should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("V2Only must refuse a missing/V1-incompatible backup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("V1-incompatible") || msg.contains("missing an SV2 endpoint"),
+            "unexpected refuse text: {msg}"
+        );
+    }
+
+    #[test]
+    fn datum_protocol_is_refused_fail_closed() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[pool]
+url = "stratum+tcp://pool.example.com:3333"
+worker = "worker"
+protocol = "datum"
+"#,
+        )
+        .expect("DATUM protocol should deserialize before validation");
+
+        let err = config
+            .validate()
+            .expect_err("DATUM must not look like a supported protocol");
+        assert!(err.to_string().contains("DATUM"));
+        assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn hash_on_disconnect_policy_defaults_to_keep_last_job() {
+        let config: DcentraldConfig = toml::from_str("[hash_on_disconnect]\nenabled = false\n")
+            .expect("legacy enabled-only block should deserialize");
+        assert_eq!(
+            config.hash_on_disconnect.policy,
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert!(!config.hash_on_disconnect.enabled);
+        config
+            .validate()
+            .expect("keep_last_job + enabled=false must still load (V1 mining unchanged)");
+    }
+
+    #[test]
+    fn hash_on_disconnect_pool_requested_is_refused() {
+        let config: DcentraldConfig = toml::from_str(
+            r#"
+[hash_on_disconnect]
+policy = "pool_requested"
+"#,
+        )
+        .expect("pool_requested should deserialize then fail validation");
+
+        let err = config
+            .validate()
+            .expect_err("pool_requested is not implemented");
+        assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
     fn hashboard_x21_aes_config_is_accepted_without_embedded_key() {
         let config: DcentraldConfig = toml::from_str(
             r#"
@@ -3804,8 +4182,7 @@ hashrate_step_ths = 11.0
         );
         let mut cfg: DcentraldConfig =
             toml::from_str(OVERLAY).expect("am3-s19kpro overlay etc/dcentrald.toml must parse");
-        cfg.normalize_legacy_fields()
-            .expect("overlay normalize");
+        cfg.normalize_legacy_fields().expect("overlay normalize");
         cfg.validate().expect("overlay validate");
         assert_eq!(cfg.mining.model.as_deref(), Some("s19k"));
         assert_eq!(cfg.mining.serial_chip_type.as_deref(), Some("BM1366"));
@@ -3815,6 +4192,95 @@ hashrate_step_ths = 11.0
         assert!(!cfg.autotuner.enabled);
         assert_eq!(cfg.platform.target(), Some("am3-aml-s19k"));
         assert_eq!(cfg.platform.board_target(), Some("am3-s19k"));
+    }
+
+    /// T21 remains management-only, but its baked configuration must survive
+    /// the strict schema loader rather than silently forcing generic fallback.
+    #[test]
+    fn am3_t21_overlay_is_schema_valid_but_mining_disabled() {
+        const OVERLAY: &str = include_str!(
+            "../../../br2_external_dcentos/board/amlogic/am3-t21/rootfs-overlay/etc/dcentrald.toml"
+        );
+        let mut cfg: DcentraldConfig =
+            toml::from_str(OVERLAY).expect("am3-t21 overlay must match DcentraldConfig schema");
+        cfg.normalize_legacy_fields().expect("T21 normalize");
+        cfg.validate()
+            .expect("T21 management-only config validates");
+        assert!(!cfg.mining_start_enabled());
+        assert_eq!(cfg.mining.model.as_deref(), Some("t21"));
+        assert_eq!(cfg.mining.serial_chip_type.as_deref(), Some("BM1368"));
+        assert_eq!(cfg.mining.serial_chip_count, Some(108));
+        assert_eq!(cfg.platform.target(), Some("am3-aml-t21"));
+        assert_eq!(cfg.platform.board_target(), Some("am3-t21"));
+
+        const TOPOLOGY: &str =
+            include_str!("../../dcentrald-silicon-profiles/src/hashboard_topology_v1_22_0.json");
+        let topology: serde_json::Value =
+            serde_json::from_str(TOPOLOGY).expect("desk topology registry must remain valid JSON");
+        let mut t21_profiles: Vec<(&str, &str, u64, u64)> = topology["boards"]
+            .as_array()
+            .expect("desk topology registry must contain boards")
+            .iter()
+            .filter_map(|row| {
+                let sku = row.get("sku")?.as_str()?;
+                if !matches!(sku, "BHB68701" | "BHB68703") {
+                    return None;
+                }
+                Some((
+                    sku,
+                    row.get("provenance")?.as_str()?,
+                    row.pointer("/chain/chains_per_unit")?.as_u64()?,
+                    row.pointer("/chain/chips_per_chain")?.as_u64()?,
+                ))
+            })
+            .collect();
+        t21_profiles.sort_unstable();
+        assert_eq!(
+            t21_profiles,
+            vec![
+                ("BHB68701", "desk_jig_db_experimental", 3, 108),
+                ("BHB68703", "desk_jig_db_experimental", 3, 108),
+            ]
+        );
+
+        const VNISH: &str =
+            include_str!("../../dcentrald-silicon-profiles/src/vnish_thermal_matrix_1_2_7.json");
+        let vnish: serde_json::Value =
+            serde_json::from_str(VNISH).expect("VNish thermal registry must remain valid JSON");
+        let mut vnish_t21_profiles: Vec<(&str, &str, u64, u64)> = vnish["models"]
+            .as_array()
+            .expect("VNish thermal registry must contain models")
+            .iter()
+            .filter_map(|row| {
+                if row.get("model_code")?.as_str()? != "t21"
+                    || row.get("marketing_name")?.as_str()? != "Antminer T21"
+                {
+                    return None;
+                }
+                Some((
+                    row.get("btm_model")?.as_str()?,
+                    row.get("provenance")?.as_str()?,
+                    row.get("chains_per_unit")?.as_u64()?,
+                    row.get("chips_per_chain")?.as_u64()?,
+                ))
+            })
+            .collect();
+        vnish_t21_profiles.sort_unstable();
+        assert_eq!(
+            vnish_t21_profiles,
+            vec![
+                ("BHB68701", "desk_vnish_firmware_experimental", 3, 108),
+                ("BHB68701-", "desk_vnish_firmware_experimental", 3, 108),
+                ("BHB68703", "desk_vnish_firmware_experimental", 3, 108),
+            ]
+        );
+        assert!(
+            t21_profiles
+                .iter()
+                .chain(vnish_t21_profiles.iter())
+                .all(|(_, _, _, count)| Some(*count as u8) == cfg.mining.serial_chip_count),
+            "disabled T21 hint must match every selected non-authorizing desk row"
+        );
     }
 
     /// Unknown keys under typed `[platform]` still fail closed (CE finding #1:
@@ -3856,18 +4322,26 @@ phantom_safety_flag = true
         );
         let host: DcentraldConfig =
             toml::from_str(HOST).expect("dcentrald_s19k.toml must parse as DcentraldConfig");
-        assert!(!host.mining.enabled, "host mining.enabled must stay false for Track 1");
+        assert!(
+            !host.mining.enabled,
+            "host mining.enabled must stay false for Track 1"
+        );
         assert_eq!(host.platform.target(), Some("am3-aml-s19k"));
         assert_eq!(host.platform.board_target(), Some("am3-s19k"));
-        host.validate().expect("dcentrald_s19k.toml should validate after parse");
+        host.validate()
+            .expect("dcentrald_s19k.toml should validate after parse");
         let overlay: DcentraldConfig =
             toml::from_str(OVERLAY).expect("am3-s19kpro overlay dcentrald.toml must parse");
-        assert!(!overlay.mining.enabled, "overlay mining.enabled must stay false");
+        assert!(
+            !overlay.mining.enabled,
+            "overlay mining.enabled must stay false"
+        );
         assert_eq!(overlay.platform.target(), Some("am3-aml-s19k"));
         assert_eq!(overlay.platform.board_target(), Some("am3-s19k"));
-        overlay.validate().expect("am3-s19kpro overlay dcentrald.toml should validate after parse");
+        overlay
+            .validate()
+            .expect("am3-s19kpro overlay dcentrald.toml should validate after parse");
     }
-
 
     // Phase 4C / EE Finding 5 #4 — am2 voltage clamp tests (2026-05-15)
     //
@@ -4188,6 +4662,11 @@ voltage_mv = 14800
             !config.hash_on_disconnect.enabled,
             "baked default hash_on_disconnect.enabled must be false for home/unattended safety"
         );
+        assert_eq!(
+            config.hash_on_disconnect.policy,
+            HashOnDisconnectPolicy::KeepLastJob,
+            "V1 hash-on-disconnect policy stays keep_last_job; enabled=false is not LuxOS work-cut"
+        );
         assert!(
             !config.mining.enabled,
             "baked default mining.enabled must be false — operator configures pool first"
@@ -4412,7 +4891,7 @@ voltage_mv = 14800
         assert_eq!(config.mining.serial_chip_type.as_deref(), Some("BM1370"));
         assert_eq!(
             config.mining.serial_chip_count,
-            Some(230),
+            Some(91),
             "S21 XP must not ride S21 Pro's 65-chip row"
         );
         assert!(!config.mining_start_enabled());
@@ -5792,7 +6271,7 @@ pub struct ApiConfig {
     #[serde(default)]
     pub cgminer_lan_writes: bool,
 
-    /// Supremacy S5.1 — gRPC server config. Default OFF until soak-proven.
+    /// gRPC server config. Default OFF until explicitly enabled.
     /// When `[api.grpc] enabled = true`, dcentrald spawns a tonic server on
     /// `port` (default 50051) alongside the REST/CGMiner APIs. See
     /// `dcentrald-api-grpc` for the v1 proto contract.
@@ -5837,10 +6316,10 @@ impl Default for ApiConfig {
     }
 }
 
-/// Supremacy S5.1 — gRPC API server config. Scaffold-priority: default OFF.
+/// gRPC API server config. Default OFF.
 /// When `enabled = true`, `dcentrald/src/main.rs` spawns the tonic server on
-/// `port` (default 50051) alongside REST + CGMiner. Reflection is on by
-/// default (no security cost; clients reflect over services already exposed).
+/// `port` (default 50051) alongside REST + CGMiner. Reflection is independently
+/// configurable and defaults on for client discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcApiConfig {
@@ -6309,16 +6788,38 @@ fn default_kick_interval() -> u32 {
 // Hash-on-disconnect configuration
 // ---------------------------------------------------------------------------
 
+/// Hash-on-disconnect configuration.
+///
+/// This is **not** a LuxOS `hash_on_disconnect` clone. Three behaviors
+/// ([`HashOnDisconnectPolicy`]):
+///
+/// 1. `keep_last_job` — V1 **disconnect-while-hashing** (default). ASICs keep
+///    hashing the last job. Does **not** cut hash as a safety stop.
+/// 2. `stop_on_disconnect` — LuxOS-style work-cut / ePIC idle. **Not** what
+///    the V1 `enabled` bool does. Serial AM2 still keys off `enabled=false`
+///    for a possible UART terminal-cut.
+/// 3. `pool_requested` — future; refused fail-closed.
+///
+/// The legacy `enabled` bool is a V1 **log note**. `false` does not stop V1
+/// hashing. `max_ntime_advance_s` is unused (not a LuxOS timer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HashOnDisconnectConfig {
-    /// Keep mining with last job when pool disconnects.
+    /// Legacy V1 log-note flag. Does **not** cut V1 hash as a safety stop.
+    /// Serial AM2 `false` can terminal-cut after a committed UART job — that
+    /// is a different surface from the V1 flag and from LuxOS.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Stop mining after this many seconds of disconnect.
+    /// Documented but unused. Not a LuxOS ntime/work-cut timer. Do not
+    /// treat a non-zero value as implemented stop-on-disconnect.
     #[serde(default = "default_max_ntime")]
     pub max_ntime_advance_s: u32,
+
+    /// Operator-facing trichotomy. Default [`HashOnDisconnectPolicy::KeepLastJob`]
+    /// preserves current V1 keep-last-job mining. `pool_requested` is refused.
+    #[serde(default)]
+    pub policy: HashOnDisconnectPolicy,
 }
 
 impl Default for HashOnDisconnectConfig {
@@ -6326,6 +6827,7 @@ impl Default for HashOnDisconnectConfig {
         Self {
             enabled: true,
             max_ntime_advance_s: default_max_ntime(),
+            policy: HashOnDisconnectPolicy::KeepLastJob,
         }
     }
 }
@@ -6552,6 +7054,11 @@ pub struct HomeNightModeConfig {
     /// Reduce power target by this percentage during night hours.
     #[serde(default = "default_power_reduction")]
     pub power_reduction_pct: u8,
+
+    /// Reduced frequency ceiling during night hours (MHz). Same default as
+    /// `[thermal.night_mode].max_frequency_mhz`. Decrease-only.
+    #[serde(default = "default_night_frequency")]
+    pub max_frequency_mhz: u16,
 }
 
 impl Default for HomeNightModeConfig {
@@ -6562,6 +7069,7 @@ impl Default for HomeNightModeConfig {
             end_hour: default_night_end(),
             max_fan_pwm: default_night_fan_pwm(),
             power_reduction_pct: default_power_reduction(),
+            max_frequency_mhz: default_night_frequency(),
         }
     }
 }
@@ -6711,6 +7219,10 @@ fn default_channel_type() -> String {
 // ---------------------------------------------------------------------------
 
 /// Job Declaration Protocol (JDP) configuration for SV2.
+///
+/// **Opt-in** (`enabled` default false). Supervisor `probe_once` is
+/// connectivity proof, not mining-work injection. Live accepted shares
+/// **BENCH_HOLD**; this is **not Braiins-parity** and **not** OCEAN DATUM.
 ///
 /// When enabled, the miner connects to a local bitcoind to construct its own
 /// block templates, enabling censorship resistance and custom transaction

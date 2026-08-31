@@ -218,6 +218,60 @@ pub fn process_job(
     Ok((merkle_root, midstate, header_tail))
 }
 
+/// Quality bar: does this nonce hash the template packed in a shipped
+/// Closed11d `21 36` TX (not a re-coded `WorkEntry`)?
+pub fn s19k_unpacked_tx_meets_share_target(
+    wire: &[u8],
+    nonce: u32,
+    version_bits: u16,
+    share_target: &[u8; 32],
+) -> Result<bool, &'static str> {
+    let fields = dcentrald_common::s19k_braiins_job::unpack_s19k_braiins_ghidra_job_wire(wire)?;
+    let rolled = dcentrald_common::s19k_braiins_job::s19k_braiins_midstate0_version(
+        fields.packed_ver0,
+        version_bits,
+    );
+    let header = build_block_header(
+        rolled,
+        &fields.prev_block_hash,
+        &fields.merkle_root,
+        fields.ntime,
+        fields.nbits,
+        nonce,
+    );
+    Ok(crate::work::validate_full_header(&header, share_target))
+}
+
+/// Same as [`s19k_unpacked_tx_meets_share_target`] for leftover dump hex.
+pub fn s19k_compact_tx_meets_share_target(
+    hex: &str,
+    nonce: u32,
+    version_bits: u16,
+    share_target: &[u8; 32],
+) -> Result<bool, &'static str> {
+    if hex.is_empty() {
+        return Err("compact TX hex is empty");
+    }
+    let wire = dcentrald_common::s19k_braiins_job::parse_s19k_compact_hex(hex)?;
+    s19k_unpacked_tx_meets_share_target(&wire, nonce, version_bits, share_target)
+}
+
+/// live444 leftover_header=4 leftover_hit=0: wrap-4 leftover `55 AA 21 36`
+/// hashed against POST-admit `latest_entry.share_target` only. leftover_header
+/// used retired history `candidate.share_target`. Hash the retired-generation
+/// 21 36 bytes (no compact-hex round-trip) against any of those targets so
+/// leftover_hit can re-accumulate after leftover-admit wipe.
+pub fn s19k_retired_generation_tx_meets_any_share_target(
+    wire: &[u8],
+    nonce: u32,
+    version_bits: u16,
+    targets: &[[u8; 32]],
+) -> bool {
+    targets.iter().any(|target| {
+        s19k_unpacked_tx_meets_share_target(wire, nonce, version_bits, target).unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +639,379 @@ mod tests {
         assert_eq!(&tail[4..8], &0xABCD_0000u32.to_le_bytes());
         assert_eq!(&tail[8..12], &0x1234_5678u32.to_le_bytes());
         assert_eq!(&tail[12..16], &[0u8; 4]);
+    }
+
+    /// live412 SHARE #1 was accepted on `...8bd0`. Reconstruct that header
+    /// from the logged RAW_NOTIFY and prove the same nonce misses `...8bd1`
+    /// (same prevhash, different coinbase/merkle/ntime). Quality bar for
+    /// leftover classification: a real share solves one generation only.
+    #[test]
+    fn s19k_live412_share1_meets_logged_8bd0_and_misses_8bd1() {
+        fn decode32(hex: &str) -> [u8; 32] {
+            let bytes = hex::decode(hex).expect("32-byte hex");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+        fn header_for(
+            coinbase1: &str,
+            coinbase2: &str,
+            branches: &[&str],
+            ntime_hex: &str,
+        ) -> [u8; 80] {
+            let coinbase = build_coinbase(
+                &hex::decode(coinbase1).unwrap(),
+                &hex::decode("7637ab6c").unwrap(),
+                &hex::decode("0800000000000000").unwrap(),
+                &hex::decode(coinbase2).unwrap(),
+            );
+            let coinbase_hash = sha256d(&coinbase);
+            let branches: Vec<[u8; 32]> = branches.iter().copied().map(decode32).collect();
+            let merkle = compute_merkle_root(&coinbase_hash, &branches);
+            let mut prev =
+                decode32("981b849e96f63334a06f451b5db3e19edbbe21fb000180b40000000000000000");
+            crate::work::reverse_endianness_per_word_pub(&mut prev);
+            let ntime = u32::from_str_radix(ntime_hex, 16).unwrap();
+            let nonce = u32::from_str_radix("4e3e900d", 16).unwrap();
+            build_block_header(
+                0x2004_0000, // logged rolled version (base 0x20000000 | 0x00040000)
+                &prev,
+                &merkle,
+                ntime,
+                0x1702_353d,
+                nonce,
+            )
+        }
+
+        let branches_8bd0 = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "b0ac5aee5bef18f0589fd5a3907e76179f7e26a169132fe97a7c9bfdf83da788",
+            "d54ce2e66dccd07ebe8a41a35348b5d38747517c5d7e595c4eaf5ce7fcf0f62c",
+            "9c8144f96ef79866a026958cf34ba1288bc25d563797eaefe5acc1418d4f4448",
+            "686775fe6da43db984adf12f946d21837778a23d5ce1928439d64c44d9245a21",
+            "5aeaf273c5c366025cd1103da5154c024203a1bb3f3d5188301020ed30cddefb",
+            "3a111ce39534f4e70306dec65db9cb886818560dd9f10a3df9690564afa2bb58",
+            "8362363130d1789246c8d8cb0d948426bbebb49dc36a9e18077cb84efc92e431",
+        ];
+        let branches_8bd1 = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "315bfab5e929b0d32f48135f85557f7e8122654eeff7d1f95276ef3830dfd4b7",
+            "9a796edbfc4afddaa4b17eb3397362f92e7d78422aad9b05a03dd05d0486f612",
+            "aa64bcfea8b3685ab146840364e915b5459162959467c87024be0b5f134063e2",
+            "387aa28bf8e58894ee2e8e2c381b7816331a125d3df13af10633d1c8748918d1",
+            "155178189ba9bcace429f6927677ba5ec26d21865537c4740c36c3465a745fa9",
+            "755f1a3d0aefe798bf8f36098e8b1b2aaf9bb770fb4782a70022f46a31df8186",
+            "cebee827338ec0a0f279056a47048b240df6be54cc5048c547d166378c5ccb71",
+        ];
+        let header_8bd0 = header_for(
+            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004b057826a04b314a4000c",
+            "0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe033f1f4c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f625985f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edccf768b44cc44adfd2655beb194dc252f2f4fb3d8dad646c96ee16d02a234872f9b00e00",
+            &branches_8bd0,
+            "6a8257b0",
+        );
+        let header_8bd1 = header_for(
+            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004ce57826a045286a5000c",
+            "0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe0309874c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f6449a5f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edcec9558f6a07a439844812c28b3c3ec89f53dca9d213d967200c12697298f943f9b00e00",
+            &branches_8bd1,
+            "6a8257ce",
+        );
+        let target = crate::work::difficulty_to_target(10_000.0);
+        assert!(
+            crate::work::validate_full_header(&header_8bd0, &target),
+            "live412 SHARE #1 0x4E3E900D must meet the logged 8bd0 notify"
+        );
+        assert!(
+            !crate::work::validate_full_header(&header_8bd1, &target),
+            "the same nonce must not meet the later 8bd1 notify"
+        );
+    }
+
+    /// live412 SHARE #2 was accepted on first-fill `...8bd1` (extranonce2
+    /// 0x51). Reconstruct it and prove it misses the earlier 8bd0 template.
+    #[test]
+    fn s19k_live412_share2_meets_logged_8bd1_and_misses_8bd0() {
+        fn decode32(hex: &str) -> [u8; 32] {
+            let bytes = hex::decode(hex).expect("32-byte hex");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+        fn header_for(
+            coinbase1: &str,
+            coinbase2: &str,
+            branches: &[&str],
+            ntime_hex: &str,
+            extra2: &str,
+            rolled: u32,
+            nonce_hex: &str,
+        ) -> [u8; 80] {
+            let coinbase = build_coinbase(
+                &hex::decode(coinbase1).unwrap(),
+                &hex::decode("7637ab6c").unwrap(),
+                &hex::decode(extra2).unwrap(),
+                &hex::decode(coinbase2).unwrap(),
+            );
+            let coinbase_hash = sha256d(&coinbase);
+            let branches: Vec<[u8; 32]> = branches.iter().copied().map(decode32).collect();
+            let merkle = compute_merkle_root(&coinbase_hash, &branches);
+            let mut prev =
+                decode32("981b849e96f63334a06f451b5db3e19edbbe21fb000180b40000000000000000");
+            crate::work::reverse_endianness_per_word_pub(&mut prev);
+            build_block_header(
+                rolled,
+                &prev,
+                &merkle,
+                u32::from_str_radix(ntime_hex, 16).unwrap(),
+                0x1702_353d,
+                u32::from_str_radix(nonce_hex, 16).unwrap(),
+            )
+        }
+        let branches_8bd0 = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "b0ac5aee5bef18f0589fd5a3907e76179f7e26a169132fe97a7c9bfdf83da788",
+            "d54ce2e66dccd07ebe8a41a35348b5d38747517c5d7e595c4eaf5ce7fcf0f62c",
+            "9c8144f96ef79866a026958cf34ba1288bc25d563797eaefe5acc1418d4f4448",
+            "686775fe6da43db984adf12f946d21837778a23d5ce1928439d64c44d9245a21",
+            "5aeaf273c5c366025cd1103da5154c024203a1bb3f3d5188301020ed30cddefb",
+            "3a111ce39534f4e70306dec65db9cb886818560dd9f10a3df9690564afa2bb58",
+            "8362363130d1789246c8d8cb0d948426bbebb49dc36a9e18077cb84efc92e431",
+        ];
+        let branches_8bd1 = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "315bfab5e929b0d32f48135f85557f7e8122654eeff7d1f95276ef3830dfd4b7",
+            "9a796edbfc4afddaa4b17eb3397362f92e7d78422aad9b05a03dd05d0486f612",
+            "aa64bcfea8b3685ab146840364e915b5459162959467c87024be0b5f134063e2",
+            "387aa28bf8e58894ee2e8e2c381b7816331a125d3df13af10633d1c8748918d1",
+            "155178189ba9bcace429f6927677ba5ec26d21865537c4740c36c3465a745fa9",
+            "755f1a3d0aefe798bf8f36098e8b1b2aaf9bb770fb4782a70022f46a31df8186",
+            "cebee827338ec0a0f279056a47048b240df6be54cc5048c547d166378c5ccb71",
+        ];
+        let cb1_8bd0 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004b057826a04b314a4000c";
+        let cb2_8bd0 = "0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe033f1f4c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f625985f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edccf768b44cc44adfd2655beb194dc252f2f4fb3d8dad646c96ee16d02a234872f9b00e00";
+        let cb1_8bd1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004ce57826a045286a5000c";
+        let cb2_8bd1 = "0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe0309874c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f6449a5f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edcec9558f6a07a439844812c28b3c3ec89f53dca9d213d967200c12697298f943f9b00e00";
+        let header_8bd1 = header_for(
+            cb1_8bd1,
+            cb2_8bd1,
+            &branches_8bd1,
+            "6a8257ce",
+            "5100000000000000",
+            0x205B_0000,
+            "e5d3c50d",
+        );
+        let header_8bd0 = header_for(
+            cb1_8bd0,
+            cb2_8bd0,
+            &branches_8bd0,
+            "6a8257b0",
+            "5100000000000000",
+            0x205B_0000,
+            "e5d3c50d",
+        );
+        let target = crate::work::difficulty_to_target(10_000.0);
+        assert!(
+            crate::work::validate_full_header(&header_8bd1, &target),
+            "live412 SHARE #2 0xE5D3C50D must meet the logged 8bd1 notify"
+        );
+        assert!(
+            !crate::work::validate_full_header(&header_8bd0, &target),
+            "SHARE #2 must not meet the earlier 8bd0 notify"
+        );
+    }
+
+    /// : a post-clean dump `tx_wire` is the shipped 21 36 packer.
+    /// Unpacking that wire and hashing SHARE #1 must meet the 8bd0 target —
+    /// the leftover bar is measured against the real TX, not a re-coded header.
+    #[test]
+    fn s19k_live412_share1_solves_unpacked_ghidra_tx_wire() {
+        fn decode32(hex: &str) -> [u8; 32] {
+            let bytes = hex::decode(hex).expect("32-byte hex");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+        let branches = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "b0ac5aee5bef18f0589fd5a3907e76179f7e26a169132fe97a7c9bfdf83da788",
+            "d54ce2e66dccd07ebe8a41a35348b5d38747517c5d7e595c4eaf5ce7fcf0f62c",
+            "9c8144f96ef79866a026958cf34ba1288bc25d563797eaefe5acc1418d4f4448",
+            "686775fe6da43db984adf12f946d21837778a23d5ce1928439d64c44d9245a21",
+            "5aeaf273c5c366025cd1103da5154c024203a1bb3f3d5188301020ed30cddefb",
+            "3a111ce39534f4e70306dec65db9cb886818560dd9f10a3df9690564afa2bb58",
+            "8362363130d1789246c8d8cb0d948426bbebb49dc36a9e18077cb84efc92e431",
+        ];
+        let coinbase = build_coinbase(
+            &hex::decode("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004b057826a04b314a4000c").unwrap(),
+            &hex::decode("7637ab6c").unwrap(),
+            &hex::decode("0800000000000000").unwrap(),
+            &hex::decode("0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe033f1f4c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f625985f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edccf768b44cc44adfd2655beb194dc252f2f4fb3d8dad646c96ee16d02a234872f9b00e00").unwrap(),
+        );
+        let merkle = compute_merkle_root(
+            &sha256d(&coinbase),
+            &branches.iter().copied().map(decode32).collect::<Vec<_>>(),
+        );
+        let mut prev = decode32("981b849e96f63334a06f451b5db3e19edbbe21fb000180b40000000000000000");
+        crate::work::reverse_endianness_per_word_pub(&mut prev);
+        let ntime = 0x6a82_57b0;
+        let nbits = 0x1702_353d;
+        let version = 0x2000_0000u32;
+        let wire = dcentrald_common::s19k_braiins_job::build_s19k_braiins_mining_on_work_wire(
+            8, version, prev, merkle, ntime, nbits,
+        );
+        let compact: String = wire.iter().map(|b| format!("{b:02X}")).collect();
+        let parsed =
+            dcentrald_common::s19k_braiins_job::parse_s19k_compact_hex(&compact).expect("dump hex");
+        let fields =
+            dcentrald_common::s19k_braiins_job::unpack_s19k_braiins_ghidra_job_wire(&parsed)
+                .expect("unpack dumped TX");
+        let rolled = dcentrald_common::s19k_braiins_job::s19k_braiins_midstate0_version(
+            fields.packed_ver0,
+            0x0020,
+        );
+        let header = build_block_header(
+            rolled,
+            &fields.prev_block_hash,
+            &fields.merkle_root,
+            fields.ntime,
+            fields.nbits,
+            0x4E3E_900D,
+        );
+        let target = crate::work::difficulty_to_target(10_000.0);
+        assert!(
+            crate::work::validate_full_header(&header, &target),
+            "SHARE #1 must solve the unpacked shipped 21 36 TX"
+        );
+        assert_eq!(fields.job_id, 8);
+        assert_eq!(fields.ntime, ntime);
+        assert_eq!(fields.merkle_root, merkle);
+        assert_eq!(fields.prev_block_hash, prev);
+        assert!(
+            s19k_compact_tx_meets_share_target(&compact, 0x4E3E_900D, 0x0020, &target)
+                .expect("quality-bar hash"),
+            "SHARE #1 must meet the unpacked shipped TX via the quality-bar helper"
+        );
+    }
+
+    /// The only held live412 on-wire dump is first-fill job_id 0 (extra2=00).
+    /// SHARE #1 is extra2=08. Unpacking the captured frame and hashing SHARE #1
+    /// against *that* merkle must miss — leftover measurement needs the
+    /// share's own TX, not the session's first FULL FRAME line.
+    #[test]
+    fn s19k_live412_share1_misses_captured_first_frame_merkle() {
+        const LIVE412_FIRST_FRAME: &str = "55 AA 21 36 00 01 00 00 00 00 3D 35 02 17 \
+B0 57 82 6A 76 F5 EF 1D 69 B7 B2 8E 1B A6 BC 50 CA 98 F0 6C 93 96 28 A6 8F 12 33 \
+DD E7 92 4A 00 85 62 E9 03 00 00 00 00 00 00 00 00 B4 80 01 00 FB 21 BE DB 9E E1 \
+B3 5D 1B 45 6F A0 34 33 F6 96 9E 84 1B 98 00 00 00 20 64 C2";
+        let parsed =
+            dcentrald_common::s19k_braiins_job::parse_s19k_compact_hex(LIVE412_FIRST_FRAME)
+                .expect("live412 spaced dump");
+        let fields =
+            dcentrald_common::s19k_braiins_job::unpack_s19k_braiins_ghidra_job_wire(&parsed)
+                .expect("unpack live412 frame");
+        let coinbase = build_coinbase(
+            &hex::decode("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703fab00e0004b057826a04b314a4000c").unwrap(),
+            &hex::decode("7637ab6c").unwrap(),
+            &hex::decode("0000000000000000").unwrap(),
+            &hex::decode("0a636b706f6f6c1375772f736f6c6f2e636b706f6f6c2e6f72672ffffffffe033f1f4c12000000001600146409983967fecf538c0e4b6f115a788c2c8660f625985f000000000016001451ed61d2f6aa260cc72cdf743e4e436a82c010270000000000000000266a24aa21a9edccf768b44cc44adfd2655beb194dc252f2f4fb3d8dad646c96ee16d02a234872f9b00e00").unwrap(),
+        );
+        let branches = [
+            "360b693dd2b3e2cf0c4d1426cbaec64a12e69a08a294b406e24db711b958089b",
+            "a2d051044a8c73346f2a76eb5a16dbfafca6a3f80d191d2da31cb5d2ecb3c16d",
+            "886277e0b77f2881366fdf306c523c899f1a64fd87ff056900c8037cfaff3010",
+            "1a1c8e09971ba90a9e1e955eab5fc2b94a1cf6a0534a9bc32dda6b06cd746f6b",
+            "b0ac5aee5bef18f0589fd5a3907e76179f7e26a169132fe97a7c9bfdf83da788",
+            "d54ce2e66dccd07ebe8a41a35348b5d38747517c5d7e595c4eaf5ce7fcf0f62c",
+            "9c8144f96ef79866a026958cf34ba1288bc25d563797eaefe5acc1418d4f4448",
+            "686775fe6da43db984adf12f946d21837778a23d5ce1928439d64c44d9245a21",
+            "5aeaf273c5c366025cd1103da5154c024203a1bb3f3d5188301020ed30cddefb",
+            "3a111ce39534f4e70306dec65db9cb886818560dd9f10a3df9690564afa2bb58",
+            "8362363130d1789246c8d8cb0d948426bbebb49dc36a9e18077cb84efc92e431",
+        ];
+        fn decode32(hex: &str) -> [u8; 32] {
+            let bytes = hex::decode(hex).expect("32-byte hex");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+        let merkle = compute_merkle_root(
+            &sha256d(&coinbase),
+            &branches.iter().copied().map(decode32).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            fields.merkle_root, merkle,
+            "captured first frame must be 8bd0 extra2=00, not merely the 8bd0 ntime"
+        );
+        let header = build_block_header(
+            0x2004_0000,
+            &fields.prev_block_hash,
+            &fields.merkle_root,
+            fields.ntime,
+            fields.nbits,
+            0x4E3E_900D,
+        );
+        let target = crate::work::difficulty_to_target(10_000.0);
+        assert!(
+            !crate::work::validate_full_header(&header, &target),
+            "SHARE #1 extra2=08 must not solve the captured job_id=0 first frame"
+        );
+        assert!(
+            !s19k_compact_tx_meets_share_target(LIVE412_FIRST_FRAME, 0x4E3E_900D, 0x0020, &target)
+                .expect("quality-bar hash of captured frame"),
+            "quality-bar helper must miss SHARE #1 on the captured job0 TX"
+        );
+        assert!(s19k_compact_tx_meets_share_target("", 0, 0, &target).is_err());
+    }
+
+    #[test]
+    fn s19k_live444_wrap4_leftover_21_36_meets_retired_target_not_only_latest() {
+        let merkle = [0x11u8; 32];
+        let mut prev = [0u8; 32];
+        prev[0] = 0x22;
+        let wire = dcentrald_common::s19k_braiins_job::build_s19k_braiins_mining_on_work_wire(
+            2,
+            0x2000_0000,
+            prev,
+            merkle,
+            0x6a82_57b0,
+            0x1702_353d,
+        );
+        let retired_target = [0xFFu8; 32];
+        let latest_target = [0u8; 32];
+        assert!(
+            s19k_unpacked_tx_meets_share_target(&wire, 0, 0, &retired_target).unwrap(),
+            "wrap-4 leftover 21 36 must meet retired history share_target"
+        );
+        assert!(
+            !s19k_unpacked_tx_meets_share_target(&wire, 0, 0, &latest_target).unwrap(),
+            "POST-admit latest_entry.share_target must not be the only leftover_hit gate"
+        );
+        assert!(
+            s19k_retired_generation_tx_meets_any_share_target(
+                &wire,
+                0,
+                0,
+                &[latest_target, retired_target],
+            ),
+            "leftover_hit must re-accumulate from wrap-4 leftover 21 36 vs retired target"
+        );
+        assert!(
+            !s19k_retired_generation_tx_meets_any_share_target(&wire, 0, 0, &[latest_target]),
+            "leftover_header-only (no retired 21 36 meet) must not leftover_hit"
+        );
     }
 }

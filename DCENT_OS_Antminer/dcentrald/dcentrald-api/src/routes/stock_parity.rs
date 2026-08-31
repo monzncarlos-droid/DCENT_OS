@@ -273,11 +273,23 @@ async fn post_network_hostname(
             .into_response();
     }
 
+    // Single source: TOML and `/etc/hostname` must not disagree after an
+    // operator POST. 4028 / `/api/network/info` read the OS file; the daemon
+    // display name reads TOML. Best-effort OS write — a read-only rootfs
+    // still has the TOML value.
+    if let Err(error) = std::fs::write("/etc/hostname", format!("{hostname}\n")) {
+        tracing::warn!(
+            error = %error,
+            hostname = %hostname,
+            "hostname persisted to daemon config; /etc/hostname write failed"
+        );
+    }
+
     Json(HostnameUpdateResponse {
         status: "ok",
         persisted: true,
         hostname,
-        note: "Saved to daemon config. The active OS hostname updates after the next daemon or host restart.",
+        note: "Saved to daemon config and /etc/hostname (single source). 4028 and network/info read the OS hostname.",
     })
     .into_response()
 }
@@ -975,8 +987,10 @@ mod tests {
 
     #[test]
     fn derive_model_known_chips() {
-        let mut hw = crate::HardwareInfo::default();
-        hw.chip_type = "BM1387".to_string();
+        let mut hw = crate::HardwareInfo {
+            chip_type: "BM1387".to_string(),
+            ..crate::HardwareInfo::default()
+        };
         assert_eq!(derive_model_label(&hw), "Antminer S9");
         hw.chip_type = "BM1362".to_string();
         assert_eq!(derive_model_label(&hw), "Antminer S19j Pro");
@@ -986,8 +1000,10 @@ mod tests {
 
     #[test]
     fn derive_model_unknown_chip_falls_back() {
-        let mut hw = crate::HardwareInfo::default();
-        hw.chip_type = "BM9999".to_string();
+        let hw = crate::HardwareInfo {
+            chip_type: "BM9999".to_string(),
+            ..crate::HardwareInfo::default()
+        };
         assert_eq!(derive_model_label(&hw), "Antminer (BM9999)");
     }
 

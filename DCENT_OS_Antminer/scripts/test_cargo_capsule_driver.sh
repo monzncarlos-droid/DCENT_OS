@@ -43,6 +43,10 @@ printf '%s\n' 'test-matrix' > "$SOURCE_REPO/DCENT_OS_Antminer/docs/architecture/
 printf '%s\n' '{"schema":1,"targets":[]}' \
     > "$SOURCE_REPO/DCENT_OS_Antminer/docs/architecture/hardware_enablement_matrix.json"
 printf '%s\n' '[test]' > "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/dcentrald_s21xp.toml"
+printf '%s\n' '#!/bin/sh' \
+    > "$SOURCE_REPO/DCENT_OS_Antminer/scripts/s19k_aarch64_compile_check.sh"
+printf '%s\n' '# fixture native build verifier' \
+    > "$SOURCE_REPO/DCENT_OS_Antminer/scripts/s19k_native_build_verify.py"
 printf '%s\n' 'snapshot-only schema source' > "$SOURCE_REPO/projects/dcent-schema/schema.txt"
 printf '%s\n' '{}' > "$SOURCE_REPO/knowledge-base/firmware-archive/stock-bitmain-manifest.json"
 : > "$SOURCE_REPO/knowledge-base/firmware-archive/stock-bitmain-manifest.json.sig"
@@ -105,17 +109,26 @@ if [ "$kind" = image ]; then
     if [ "$action" = inspect ]; then
         format=""; if [ "${1:-}" = --format ]; then format=$2; shift 2; fi
         tag=$1; [ -f "$state/images/$tag" ] || exit 1
-        invocation=$(cut -d'|' -f2 "$state/images/$tag")
+        recipe=$(cut -d'|' -f2 "$state/images/$tag")
+        base=$(cut -d'|' -f3- "$state/images/$tag")
         if [ "$format" = '{{.Id}}' ]; then
             printf '%s\n' "$digest"
         elif [ -n "$format" ]; then
-            printf '%s|%s\n' "$digest" "$invocation"
+            printf '%s|%s|%s\n' "$digest" "$recipe" "$base"
         fi
     elif [ "$action" = tag ]; then
         source=$1 target=$2
-        invocation=""
-        if [ -f "$state/images/$source" ]; then invocation=$(cut -d'|' -f2 "$state/images/$source"); fi
-        printf '%s|%s\n' "$digest" "$invocation" > "$state/images/$target"
+        record=""
+        if [ -f "$state/images/$source" ]; then
+            record=$(cat "$state/images/$source")
+        elif printf '%s\n' "$source" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            for candidate in "$state"/images/*; do
+                [ -f "$candidate" ] || continue
+                case "$(cat "$candidate")" in "$source"'|'*) record=$(cat "$candidate"); break;; esac
+            done
+        fi
+        [ -n "$record" ] || exit 1
+        printf '%s\n' "$record" > "$state/images/$target"
     elif [ "$action" = rm ]; then rm -f "$state/images/$1"; fi
     exit 0
 fi
@@ -171,12 +184,15 @@ if [ "$kind" = container ]; then
     exit 0
 fi
 if [ "$kind" = build ]; then
-    tag=""; invocation=""; context=""
+    tag=""; recipe=""; base=""; context=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -t) tag=$2; shift 2 ;;
             --label)
-                case "$2" in org.dcentral.dcentos.release-invocation-id=*) invocation=${2#*=};; esac
+                case "$2" in
+                    org.dcentral.dcentos.builder-recipe-sha256=*) recipe=${2#*=};;
+                    org.dcentral.dcentos.builder-base-reference=*) base=${2#*=};;
+                esac
                 shift 2 ;;
             *) context=$1; shift ;;
         esac
@@ -184,11 +200,12 @@ if [ "$kind" = build ]; then
     cat >/dev/null
     context="$(fake_shell_path "$context")"
     printf '%s\n' "$context" > "$state/observed-build-context"
-    printf '%s|%s\n' "$digest" "$invocation" > "$state/images/$tag"
+    printf '%s|%s|%s\n' "$digest" "$recipe" "$base" > "$state/images/$tag"
     exit 0
 fi
 if [ "$kind" = run ]; then
     name=""; invocation=""; results=""; source_mount=""; schema_mount=""; cargo_mount=""; image=""; capsule_mode=0
+    metadata_target="" manifest_public_key_hex=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --rm) shift ;;
@@ -208,6 +225,8 @@ if [ "$kind" = run ]; then
             -e)
                 case "$2" in
                     DCENT_CAPSULE_MODE=*) capsule_mode=${2#*=};;
+                    DCENT_METADATA_TARGET=*) metadata_target=${2#*=};;
+                    DCENT_MANIFEST_PUBLIC_KEY_HEX=*) manifest_public_key_hex=${2#*=};;
                 esac
                 shift 2 ;;
             sha256:*) image=$1; shift; break ;;
@@ -235,7 +254,7 @@ if [ "$kind" = run ]; then
         exit 143
     fi
     if [ "${FAKE_DOCKER_FAIL_RUN:-0}" = 1 ]; then exit 93; fi
-    triple=armv7-unknown-linux-musleabihf
+    triple=${metadata_target:-armv7-unknown-linux-musleabihf}
     release="$results/target/$triple/release"
     inventory="$results/target/release-inventory"
     mkdir -p "$release" "$inventory"
@@ -243,11 +262,19 @@ if [ "$kind" = run ]; then
     printf '{}\n' > "$inventory/$triple.metadata.json"
     printf 'rustc 1.90.0\ncargo 1.90.0\nbuilder_base_reference=test\nbuilder_image_id=%s\nbuilder_package_resolution=test\n' "$digest" > "$inventory/$triple.toolchain.txt"
     {
+        printf 'AR_aarch64_unknown_linux_musl=/usr/local/bin/zig-ar\n'
         printf 'CARGO_BUILD_PROFILE=release\n'
+        printf 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld\n'
+        printf 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C linker=rust-lld\n'
+        printf 'CARGO_TARGET_DIR=/cargo-target\n'
+        printf 'CC_aarch64_unknown_linux_musl=/usr/local/bin/zig-cc-target-musl\n'
         printf 'DCENT_BUILDER_BASE_REFERENCE=%s\n' "${DCENT_RUST_BUILDER_BASE:?}"
         printf 'DCENT_BUILDER_IMAGE_ID=%s\n' "$digest"
         printf 'DCENT_BUILDER_KIND=docker-cross\n'
-        printf 'DCENT_BUILDER_PACKAGE_RESOLUTION=apt-bookworm-live-not-reconstructibly-pinned\n'
+        printf 'DCENT_BUILDER_PACKAGE_RESOLUTION=official-zig-0.13.0-sha256-d45312e6\n'
+        printf 'DCENT_MANIFEST_KEY_ID=\n'
+        printf 'DCENT_MANIFEST_PUBLIC_KEY_HEX=%s\n' "$(printf 'a%.0s' {1..64})"
+        printf 'RUSTFLAGS=-C link-arg=-s -C target-cpu=cortex-a53 -C target-feature=+crt-static\n'
     } > "$inventory/$triple.compile-env.txt"
     if [ -n "$name" ]; then rm -f "$state/containers/$name"; fi
     exit 0
@@ -298,6 +325,7 @@ new_capsule() {
 }
 
 run_driver() {
+    local target=${1:-zynq}
     env \
         PATH="$FAKE_BIN:$PATH" \
         DCENT_DOCKER_BIN=docker \
@@ -313,7 +341,7 @@ run_driver() {
         DCENT_CAPSULE_CARGO_BUILD_INPUT_SNAPSHOT="${CARGO_BUILD_INPUT_SNAPSHOT_OVERRIDE:-$CARGO_BUILD_INPUT_SNAPSHOT}" \
         DCENT_MANIFEST_PUBLIC_KEY_HEX="$(printf 'a%.0s' {1..64})" \
         DCENT_RUST_BUILDER_BASE="rust-test@sha256:$(printf 'b%.0s' {1..64})" \
-        "$SOURCE_REPO/DCENT_OS_Antminer/scripts/build-dcentrald.sh" zynq
+        "$SOURCE_REPO/DCENT_OS_Antminer/scripts/build-dcentrald.sh" "$target"
 }
 
 LIVE_SENTINEL="$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/target/live-sentinel"
@@ -342,8 +370,53 @@ test "$(cat "$FAKE_STATE/observed-result-mount")" = "$RESULT_ROOT"
 grep -Fq "sha256:$(printf '1%.0s' {1..64})" "$DOCKER_LOG"
 test ! -e "$FAKE_STATE/volumes/$CARGO_VOLUME"
 test ! -e "$FAKE_STATE/images/dcentos-release-builder:$INVOCATION_ID"
-test -e "$FAKE_STATE/images/dcentos-cargo-cache:$(printf '1%.0s' {1..64})"
+test "$(find "$FAKE_STATE/images" -maxdepth 1 -type f -name 'dcentos-cargo-builder:*' | wc -l)" = 1
 test -f "$CARGO_BUILD_INPUT_SNAPSHOT"
+
+# The same authenticated Cargo capsule path must emit the AArch64 S19k native
+# candidate without weakening its split source/result/invocation authorities.
+new_capsule amlogic-success
+: > "$DOCKER_LOG"
+run_driver amlogic >/dev/null
+TRIPLE=aarch64-unknown-linux-musl
+grep -Fq "DCENT_MANIFEST_PUBLIC_KEY_HEX=$(printf 'a%.0s' {1..64})" "$DOCKER_LOG"
+for binary in dcentrald dcentos-init dcentos-discovery; do
+    test -f "$RESULT_ROOT/target/$TRIPLE/release/$binary"
+    test -f "$RESULT_ROOT/target/$TRIPLE/release/$binary.build-receipt.json"
+    grep -q '"schema_version":4' "$RESULT_ROOT/target/$TRIPLE/release/$binary.build-receipt.json"
+done
+PYTHONPATH="$SCRIPT_DIR" python3 - \
+    "$RESULT_ROOT/target/$TRIPLE/release/dcentrald.build-receipt.json" <<'PY'
+import json
+import sys
+import s19k_native_build_verify as verifier
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    receipt = json.load(handle)
+observed = verifier._manifest_key_contract(receipt, receipt["builder"])
+assert observed == "a" * 64
+assert receipt["build_environment"] == {
+    "DCENT_MANIFEST_KEY_ID": "",
+    "DCENT_MANIFEST_PUBLIC_KEY_HEX": observed,
+}
+PY
+test "$(python3 "$SCRIPT_DIR/release_result_stage.py" query --invocation-stage "$INVOCATION_STAGE" --field state "$RESULT_STAGE")" = sealed
+test "$(cat "$FAKE_STATE/observed-source-mount")" = "$SNAPSHOT_TREE/DCENT_OS_Antminer/dcentrald"
+test "$(cat "$FAKE_STATE/observed-result-mount")" = "$RESULT_ROOT"
+test ! -e "$FAKE_STATE/volumes/$CARGO_VOLUME"
+test ! -e "$FAKE_STATE/images/dcentos-release-builder:$INVOCATION_ID"
+test -f "$CARGO_BUILD_INPUT_SNAPSHOT"
+
+# A compatibility handoff target cannot enter the native AArch64 capsule
+# merely because every authority variable is present.
+new_capsule unsupported-s19k-tmp
+docker_lines_before="$(wc -l < "$DOCKER_LOG")"
+if run_driver s19k-tmp >"$TMPDIR_TEST/unsupported-s19k-tmp.out" 2>&1; then
+    echo 'unsupported s19k-tmp capsule unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -q 'supports only targets zynq and amlogic' "$TMPDIR_TEST/unsupported-s19k-tmp.out"
+test "$(wc -l < "$DOCKER_LOG")" = "$docker_lines_before"
 
 # The outer-owned descriptor is mandatory and must be split-authority v2.
 # Both failures occur before any Docker resource allocation.
@@ -406,7 +479,11 @@ for mode in failure signal; do
         rm -f "$FAKE_STATE/signal-ready"
         (FAKE_DOCKER_SIGNAL_RUN=1 run_driver >"$TMPDIR_TEST/$mode.out" 2>&1) &
         driver_pid=$!
-        for _attempt in $(seq 1 500); do
+        # The full offline aggregate can leave WSL CPU-starved after the
+        # compile/test phases. Give the fake-Docker child up to 30 seconds to
+        # publish readiness; this bounds fixture scheduling only, not a
+        # production cleanup or build timeout.
+        for _attempt in $(seq 1 1500); do
             [ -e "$FAKE_STATE/signal-ready" ] && break
             sleep 0.02
         done
@@ -441,6 +518,7 @@ if ! env PATH="$FAKE_BIN:$PATH" DCENT_DOCKER_BIN=docker \
 fi
 grep -q 'build receipt skipped' "$TMPDIR_TEST/development.out"
 test "$(cat "$LIVE_SENTINEL")" = do-not-touch
+TRIPLE=armv7-unknown-linux-musleabihf
 for binary in dcentrald dcentos-init dcentos-discovery; do
     test -f "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/target/$TRIPLE/release/$binary"
     test ! -e "$SOURCE_REPO/DCENT_OS_Antminer/dcentrald/target/$TRIPLE/release/$binary.build-receipt.json"

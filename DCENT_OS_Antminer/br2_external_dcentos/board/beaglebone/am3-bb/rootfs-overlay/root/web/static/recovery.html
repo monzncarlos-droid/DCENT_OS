@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCENT_OS AM3-BB Recovery</title>
+<!--
+  DCENT_OS static recovery page for am3-bb (BeagleBone / AM335x S19j Pro).
+
+  GOAL: when dcentrald is down, an operator who hits the unit's web port still
+  gets a self-contained rescue page. This overlay file wins over the inherited
+  amlogic recovery.html on am3-bb / am3-bb-s19jpro images.
+
+  HARD DESIGN RULES (do not regress):
+    * Single self-contained static HTML. Inline CSS only. NO JS framework, NO
+      external assets, NO network dependency to RENDER.
+    * Every rescue instruction is in the HTML BODY so the page is useful with
+      JavaScript disabled and with dcentrald completely dead.
+    * NO secrets / credentials on the page. Never print a password, key,
+      token, nonce, or stock default login.
+    * NO lifecycle mutation from this page. No nandwrite / flash_erase / dd
+      of NAND (including mtd4). NAND install/revert stays disabled until dated
+      live /proc/mtd evidence is admitted. Use SD recovery.
+    * Fund / donate link: https://d-central.tech/fund/
+-->
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #16181d;
+    --border: #2a2d36;
+    --text: #e8eaef;
+    --muted: #8a8f9a;
+    --orange: #FAA500;
+    --red: #ff4d4d;
+    --yellow: #ffce4d;
+    --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0 auto; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+         padding: 24px; line-height: 1.5; max-width: 880px; }
+  h1 { margin: 0 0 4px; font-size: 24px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px;
+       color: var(--muted); margin: 0 0 10px; }
+  .top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px;
+         flex-wrap: wrap; }
+  .top .ver { color: var(--muted); font-size: 13px; }
+  .banner { padding: 16px 20px; border-radius: 8px; margin-bottom: 20px;
+            font-weight: 600; font-size: 15px;
+            background: #2a0e0e; border: 1px solid #5a1e1e; color: var(--red); }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 16px 18px; margin-bottom: 16px; }
+  ol { margin: 0; padding-left: 22px; }
+  ol li { margin: 10px 0; }
+  code { font-family: var(--mono); font-size: 13px; background: #0a0b0d;
+         border: 1px solid var(--border); border-radius: 5px;
+         padding: 2px 7px; color: var(--orange); word-break: break-all; }
+  pre { font-family: var(--mono); font-size: 12.5px; background: #0a0b0d;
+        border: 1px solid var(--border); padding: 12px 14px; border-radius: 6px;
+        margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  .warn { color: var(--yellow); }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+  .footer a { color: var(--orange); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <h1>DCENT_OS AM3-BB Recovery</h1>
+  <span class="ver">BeagleBone / AM335x · rescue mode</span>
+</div>
+
+<div class="banner">
+  The mining daemon may be down, or this unit may be on the SD rescue path.
+  This page is static — it does not need dcentrald, and it never prints a
+  password or other credential.
+</div>
+
+<div class="panel">
+  <h2>Safe recovery order</h2>
+  <ol>
+    <li>Cut hash power / AC if the electrical disposition is unknown. Keep fans quiet; do not blast.</li>
+    <li>Prefer microSD recovery. The AM335x BootROM probes SD before eMMC/NAND on most Bitmain BB boards — no jumper.</li>
+    <li>Do not raw-write NAND. Never <code>dd</code>, <code>flash_erase</code>, or <code>nandwrite</code> (including mtd4). NAND install/revert is disabled until dated live <code>/proc/mtd</code> evidence is admitted.</li>
+    <li>If SD boot fails, use UART (115200 8N1, 3.3 V TTL only — not RS-232). JTAG is last resort.</li>
+  </ol>
+</div>
+
+<div class="panel">
+  <h2>1 · microSD rescue (default)</h2>
+  <ol>
+    <li>Admit the exact am3-bb / am3-bb-s19jpro SD payload on a trusted host with <code>scripts/safe_extract_am3_bb_payload.py</code>. Do not <code>tar xf</code> an unadmitted archive.</li>
+    <li>Format the card FAT32, label <code>boot</code>. Write <code>MLO</code> first, then <code>u-boot.img</code>, kernel, DTB, and the admitted ramdisk.</li>
+    <li>Power the miner off, insert the card, power on. If SD boot does not trigger, hold the IP-Reporter button at power-on until the control-board green LED blinks.</li>
+    <li>Complete the first-boot wizard on the LAN before SSH. This page never shows a login or password.</li>
+  </ol>
+  <div class="note warn">The SD tarball is not a NAND/sysupgrade package. Do not flash it to eMMC/NAND.</div>
+</div>
+
+<div class="panel">
+  <h2>2 · Inspect over the LAN (after wizard SSH)</h2>
+  <p>From a computer on the same network, connect as the account you provisioned
+  in the wizard (this page does not name a default password):</p>
+  <pre>ssh &lt;provisioned-user&gt;@&lt;this-miner-ip&gt;
+hostname
+/etc/init.d/S82dcentrald status
+/bin/sh /usr/libexec/dcentos/dcentrald-session-latch.sh status</pre>
+  <div class="note">Replace the address with the one in the browser URL bar. Logs: <code>tail -n 100 /tmp/dcentrald.log</code></div>
+</div>
+
+<div class="panel">
+  <h2>3 · UART if SD boot fails</h2>
+  <p>Use a 3.3 V USB-TTL adapter (FT232/CH340). AM335x is not 5 V tolerant.
+  Bitmain BB debug UART is typically a 3/4-pin header near the eMMC: GND / RX /
+  TX / (3.3 V — leave NC). Open a terminal at <code>115200 8N1</code>, no flow
+  control. Power the miner and break into U-Boot (spacebar in the first second).
+  Capture <code>printenv</code>; force SD boot from U-Boot rather than writing NAND.
+  If you are unsure, stop and contact D-Central — the unit is safer powered down
+  than with a guessed flash.</p>
+</div>
+
+<div class="panel">
+  <h2>4 · Do not raw-write storage</h2>
+  <p>If the daemon will not start, roll back by booting the admitted SD image.
+  Environment changes, when they are ever authorized, use <code>fw_setenv</code>
+  only — never raw NAND. am3-bb NAND install/revert remains disabled pending
+  live <code>/proc/mtd</code> evidence.</p>
+  <div class="note warn">Do not automate latch-clear or restart from this page.
+  A process exit is not proof that hashboard rails are off.</div>
+</div>
+
+<div class="footer">
+  DCENT_OS by D-Central Technologies —
+  <a href="https://d-central.tech/fund/">Fund / Donate</a> ·
+  <a href="https://d-central.tech/">d-central.tech</a>
+</div>
+
+</body>
+</html>

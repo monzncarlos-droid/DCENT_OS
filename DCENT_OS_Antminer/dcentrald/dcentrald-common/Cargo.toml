@@ -10,9 +10,11 @@ default = []
 # Destructive PIC command symbols must not link into normal firmware.
 recovery-tool = []
 
-# This crate is intentionally HAL-free, OS-free, and async-runtime-free, in the
-# same spirit as `dcentrald-api-types`. It must compile cleanly on Windows host
-# for fast unit-test cycles.
+# This crate is intentionally HAL-free, network-free, subprocess-free, and
+# async-runtime-free, in the same spirit as `dcentrald-api-types`. Four audited
+# modules own its narrow filesystem boundary: atomic publication, mutation and
+# thermal-lockout journals, and the S19k Bench-GO marker. It must compile
+# cleanly on Windows host for fast unit-test cycles.
 
 [dependencies]
 # Cross-firmware, host-safe hardware enablement contract. This is a local

@@ -1,0 +1,1027 @@
+{
+  "schema_version": 1,
+  "scope": "canaan-avalon-k210-production-readiness",
+  "description": "Evidence-bound K210 target and held-firmware-profile inventory. A target row never authorizes contact, energizing, firmware mutation, or production use.",
+  "management_contract": {
+    "state": "verified_offline_generic",
+    "evidence": [
+      "(held privately: HiveON ASIC Hub RE report — not republished; see DCENT_OS_AvalonMiner/README.md)",
+      "projects/dcent-toolbox/src/dcent_toolbox/backends/avalon_web.py"
+    ],
+    "boundary": "HiveON proves external stock-management compatibility through CGMiner 4028 and stock web/LuCI transports. It supplies no Canaan replacement firmware and proves no K210 chip-facing, thermal, power-cut, flash, or mining authority."
+  },
+  "discovery_contract": {
+    "state": "signed_read_only_schema_no_trust_anchor",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_discovery_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_read_only_discovery_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "signature_namespace": "dcent-k210-discovery-v1",
+    "required_evidence_kinds": [
+      "collection_log",
+      "controller_back_photo",
+      "controller_front_photo",
+      "cooling_topology_photo",
+      "hashboard_topology_record",
+      "miner_label_photo",
+      "psu_label_photo",
+      "stock_stats_response",
+      "stock_version_response"
+    ],
+    "trust_anchor": null,
+    "boundary": "The verifier snapshots caller-supplied discovery evidence into a canonical bundle, semantically verifies revision-bound A1246 stock/version/topology evidence and fully decoded bounded canonical PNG evidence, truthfully records the required stock power-down/restoration transition, and verifies an observer SSHSIG/Ed25519 signature. A receipt records past observations only and grants no future contact, configuration, reboot, power, cooling, hashing, write, install, or release authority. Photo decoding cannot replace human review of visible labels. No observer public key is pinned yet, so the canonical manifest cannot admit any discovery bundle or advance exact_model_identity."
+  },
+  "fixture_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_fixture_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_fixture_qualification_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "operator": {
+        "role": "k210_fixture_operator",
+        "namespace": "dcent-k210-fixture-operator-v1"
+      },
+      "reviewer": {
+        "role": "k210_fixture_ee_reviewer",
+        "namespace": "dcent-k210-fixture-reviewer-v1"
+      }
+    },
+    "trust_anchors": {
+      "operator": null,
+      "reviewer": null
+    },
+    "required_evidence_kinds": [
+      "completion_matrix",
+      "cooling_cutoff_record",
+      "discovery_receipt_copy",
+      "electrical_measurement_record",
+      "fixture_overview_photo",
+      "flash_fixture_record",
+      "identity_isolation_record",
+      "instrument_record",
+      "programmer_isolation_photo",
+      "qualification_log"
+    ],
+    "boundary": "The verifier snapshots evidence from a completed, separately authorized exact-unit A1246 fixture qualification and exact-joins the signed discovery receipt. Admission requires canonical semantic records for identity, signal levels/directions, back-power isolation, controller-only power, full-device read-only flash identification, cooling/cutoff custody, calibrated instruments, decoded PNG connection evidence, and all seven runbook dispositions, plus distinct operator and EE-reviewer SSHSIG keys. The receipt grants no future contact, power, probe, capture, read, write, install, hashing, release, or production authority and does not qualify thermal_power_safety or any production gate. No fixture keys are pinned, so the canonical manifest cannot admit a fixture bundle."
+  },
+  "capture_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_capture_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_passive_capture_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "operator": {
+        "role": "k210_capture_operator",
+        "namespace": "dcent-k210-capture-operator-v1"
+      },
+      "reviewer": {
+        "role": "k210_capture_reviewer",
+        "namespace": "dcent-k210-capture-reviewer-v1"
+      }
+    },
+    "trust_anchors": {
+      "operator": null,
+      "reviewer": null
+    },
+    "required_evidence_counts": {
+      "campaign_log": [1, 1],
+      "cooling_telemetry_record": [1, 1],
+      "cutoff_feedback_record": [1, 1],
+      "discovery_receipt_copy": [1, 1],
+      "fixture_receipt_copy": [1, 1],
+      "k210cap_artifact": [2, 2],
+      "physical_channel_map": [2, 2],
+      "source_csv": [2, 4],
+      "state_control_record": [1, 1],
+      "stock_identity_record": [1, 1],
+      "work_exchange_record": [1, 1]
+    },
+    "boundary": "The verifier snapshots a separately authorized, closed-chassis P1 passive-capture campaign and exact-joins signed discovery and fixture receipts. Admission requires the safe-idle and bounded-work states, the core eight physical signals at at least 50 MS/s, signed physical channel maps and source CSVs that reproduce both canonical .k210cap files byte-for-byte, independent hash-rail feedback, bounded pool-less stock work with job/status/nonce evidence, complete cooling custody, stable stock identity, empty stops/faults/deviations, and distinct operator/reviewer SSHSIG keys. P3 fixture traffic, zero-event bounded work, source-free artifacts, and mapping drift are ineligible. The receipt makes no codec or wire-contract claim, grants no future authority, and does not qualify asic_control or any production gate. No capture keys are pinned, so the canonical manifest cannot admit a capture bundle."
+  },
+  "a1246_variant_identity_contract": {
+    "state": "held_stock_profile_tuple_plus_observed_topology",
+    "evidence_ceiling": "A matched row binds an observed stock VERSION/HWTYPE/SWTYPE tuple and observed hashboard topology to one held firmware profile. It does not turn the mirror AUP into proof of the unit's physical ASIC markings, and label photographs still require observer review.",
+    "variants": [
+      {
+        "target_id": "a1246",
+        "profile_id": "a1246-a3200lc-2hash",
+        "marketing_model": "AvalonMiner A1246",
+        "hashboard_count": 2
+      },
+      {
+        "target_id": "a1246",
+        "profile_id": "a1246-a3201-2hash",
+        "marketing_model": "AvalonMiner A1246",
+        "hashboard_count": 2
+      },
+      {
+        "target_id": "a1246",
+        "profile_id": "a1246-a3201-temp65",
+        "marketing_model": "AvalonMiner A1246",
+        "hashboard_count": 3
+      },
+      {
+        "target_id": "a1246n",
+        "profile_id": "a1246n",
+        "marketing_model": "AvalonMiner A1246N",
+        "hashboard_count": 3
+      }
+    ]
+  },
+  "recovery_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_recovery_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_stock_recovery_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "operator": {
+        "role": "k210_recovery_operator",
+        "namespace": "dcent-k210-recovery-operator-v1"
+      },
+      "witness": {
+        "role": "k210_recovery_witness",
+        "namespace": "dcent-k210-recovery-witness-v1"
+      }
+    },
+    "trust_anchors": {
+      "operator": null,
+      "witness": null
+    },
+    "boundary": "The verifier snapshots evidence from a completed, separately authorized exact-unit stock recovery drill. Admission requires two matching full-device backup reads, two existing-flash-independent restore mechanisms including an external programmer, full readback plus stock cold-boot/identity proof for each, interrupted-restore recovery through the other path, and distinct operator/witness SSHSIG keys. The receipt grants no future contact, write, power, install, hashing, or release authority. No recovery keys are pinned, so the canonical manifest cannot admit a recovery bundle or advance stock_restore."
+  },
+  "boot_policy_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_boot_policy_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_boot_policy_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "operator": {
+        "role": "k210_boot_policy_operator",
+        "namespace": "dcent-k210-boot-operator-v1"
+      },
+      "witness": {
+        "role": "k210_boot_policy_witness",
+        "namespace": "dcent-k210-boot-witness-v1"
+      }
+    },
+    "trust_anchors": {
+      "operator": null,
+      "witness": null
+    },
+    "required_evidence_kinds": [
+      "efuse_record",
+      "flash_map_record",
+      "jtag_record",
+      "load_address_record",
+      "plaintext_probe_record",
+      "recovery_receipt_copy",
+      "rom_isp_record",
+      "safety_isolation_record",
+      "stock_postboot_record",
+      "stock_preboot_record"
+    ],
+    "boundary": "The verifier snapshots evidence from a completed, separately authorized exact-unit controller-only boot-policy measurement and exact-joins a signed recovery receipt. It admits positive or negative force-decrypt, plaintext-boot, load-address, ROM ISP, JTAG, and full flash-map outcomes; a negative result advances measurement completeness but cannot establish replacement-firmware compatibility. Hash power must remain physically disconnected with an independent cutoff asserted, stock state must be restored and re-identified, and distinct operator/witness SSHSIG keys are required. The receipt grants no future contact, probe, write, power, install, hashing, or release authority. No boot-policy keys are pinned, so the canonical manifest cannot admit a bundle or advance boot_policy."
+  },
+  "replacement_firmware_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_route_replacement_receipt.py",
+    "receipt_schema_version": 2,
+    "receipt_kind": "dcent_k210_route_replacement_firmware_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "builder": {
+        "role": "k210_route_replacement_builder",
+        "namespace": "dcent-k210-route-replacement-builder-v2"
+      },
+      "reviewer": {
+        "role": "k210_route_replacement_reviewer",
+        "namespace": "dcent-k210-route-replacement-reviewer-v2"
+      }
+    },
+    "trust_anchors": {
+      "builder": null,
+      "reviewer": null
+    },
+    "required_evidence_kinds": [
+      "board_profile_record",
+      "boot_policy_receipt_copy",
+      "boot_route_adjudication_copy",
+      "clean_room_review",
+      "connector_map_qualification",
+      "controller_firmware_artifact",
+      "controller_interface_qualification",
+      "cooling_interface_qualification",
+      "cutoff_interface_qualification",
+      "discovery_receipt_copy",
+      "firmware_aup",
+      "firmware_elf",
+      "firmware_raw",
+      "license_review",
+      "power_interface_qualification",
+      "recovery_interface_qualification",
+      "recovery_receipt_copy",
+      "reproducibility_log",
+      "sbom",
+      "signal_map_qualification",
+      "source_archive",
+      "source_manifest",
+      "sram_execution_qualification",
+      "sram_execution_trace",
+      "toolchain_manifest"
+    ],
+    "boundary": "The schema-2 verifier exact-joins signed discovery, stock-recovery, and boot-policy receipts, recomputes the four-route adjudication, and requires explicit builder/reviewer selection instead of automatic priority. AES0 requires reproducible ELF/raw/AUP artifacts and positive measured plaintext boot; ROM-ISP and JTAG require reproducible ELF/raw plus exact executable SRAM entry, size, trace, and route-specific execution qualification; a clean replacement controller requires a reproducible controller artifact plus exact connector, signal, power, cooling, cutoff, recovery, and aggregate interface qualification. Every branch includes source, toolchain, reproducibility, SPDX SBOM, license, and clean-room evidence under distinct builder/reviewer SSHSIG keys. The receipt grants no contact, debug, flash, install, power, cooling, hashing, release, or production authority. No route-replacement keys are pinned, so the canonical manifest cannot admit a bundle or advance replacement_firmware."
+  },
+  "rollback_contract": {
+    "state": "dual_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_route_rollback_receipt.py",
+    "receipt_schema_version": 2,
+    "receipt_kind": "dcent_k210_route_rollback_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "operator": {
+        "role": "k210_route_rollback_operator",
+        "namespace": "dcent-k210-route-rollback-operator-v2"
+      },
+      "witness": {
+        "role": "k210_route_rollback_witness",
+        "namespace": "dcent-k210-route-rollback-witness-v2"
+      }
+    },
+    "trust_anchors": {
+      "operator": null,
+      "witness": null
+    },
+    "required_evidence_kinds": [
+      "boot_policy_receipt_copy",
+      "boot_route_adjudication_copy",
+      "controller_disconnect_record",
+      "controller_reconnect_record",
+      "discovery_receipt_copy",
+      "full_readback_image",
+      "recovery_receipt_copy",
+      "route_replacement_receipt_copy",
+      "route_rollback_execution_record",
+      "route_rollback_interruption_record",
+      "sram_volatile_reset_record",
+      "stock_cold_boot_record",
+      "stock_identity_record"
+    ],
+    "boundary": "The schema-2 verifier exact-joins signed discovery, stock-recovery, boot-policy, route adjudication, and route-replacement receipts. Native AES0 requires interrupted update recovery plus full stock restore/readback; ROM-ISP and JTAG SRAM routes require controlled bootstrap abort, volatile SRAM reset, unchanged full stock flash, and stock cold boot; a clean replacement controller requires safe disconnect/isolation, stock-controller reconnection, unchanged stock flash, and stock cold boot. Every route requires independent admitted recovery, exact stock identity, candidate absence/no-clobber proof, and distinct rollback operator/witness SSHSIG keys. The receipt grants no future contact, debug, flash, install, power, cooling, hashing, release, or production authority. No route-rollback keys are pinned, so the canonical manifest cannot admit a bundle or advance rollback_recovery."
+  },
+  "bench_endurance_contract": {
+    "state": "multi_stage_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_bench_endurance_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_kind": "dcent_k210_bench_endurance_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "qualification_classes": [
+      "first_light",
+      "bounded_bench_mining",
+      "fault_endurance"
+    ],
+    "roles": {
+      "first_light_operator": {
+        "role": "k210_first_light_operator",
+        "namespace": "dcent-k210-first-light-operator-v1"
+      },
+      "first_light_protocol_reviewer": {
+        "role": "k210_first_light_protocol_reviewer",
+        "namespace": "dcent-k210-first-light-protocol-reviewer-v1"
+      },
+      "first_light_safety_reviewer": {
+        "role": "k210_first_light_ee_safety_reviewer",
+        "namespace": "dcent-k210-first-light-ee-safety-reviewer-v1"
+      },
+      "bench_operator": {
+        "role": "k210_bench_mining_operator",
+        "namespace": "dcent-k210-bench-mining-operator-v1"
+      },
+      "bench_witness": {
+        "role": "k210_bench_mining_witness",
+        "namespace": "dcent-k210-bench-mining-witness-v1"
+      },
+      "endurance_operator": {
+        "role": "k210_endurance_operator",
+        "namespace": "dcent-k210-endurance-operator-v1"
+      },
+      "endurance_witness": {
+        "role": "k210_endurance_witness",
+        "namespace": "dcent-k210-endurance-witness-v1"
+      }
+    },
+    "trust_anchors": {
+      "first_light_operator": null,
+      "first_light_protocol_reviewer": null,
+      "first_light_safety_reviewer": null,
+      "bench_operator": null,
+      "bench_witness": null,
+      "endurance_operator": null,
+      "endurance_witness": null
+    },
+    "required_evidence_kinds": [
+      "authorization_record",
+      "boot_policy_receipt_copy",
+      "bounded_mining_record",
+      "capture_receipt_copy",
+      "cooling_telemetry_record",
+      "cutoff_telemetry_record",
+      "discovery_receipt_copy",
+      "endurance_record",
+      "fault_campaign_record",
+      "first_light_record",
+      "fixture_receipt_copy",
+      "pool_session_record",
+      "prior_bench_receipt_copy",
+      "prior_first_light_receipt_copy",
+      "recovery_receipt_copy",
+      "route_replacement_receipt_copy",
+      "route_rollback_receipt_copy",
+      "runtime_telemetry_record",
+      "safety_record",
+      "session_log",
+      "share_accounting_record"
+    ],
+    "boundary": "One host-only schema emits three immutable, separately signed stages. First light exact-joins all discovery, fixture, capture, recovery, route-replacement, and route-rollback evidence and requires ordered safe-idle protocol checks plus independent cutoff, cooling, watchdog, and sensor admission before hash enable under distinct operator, protocol-reviewer, and EE/safety-reviewer keys. Bounded bench mining exact-joins a passing first-light receipt under new operator/witness keys. Fault endurance exact-joins a passing bench receipt under another new operator/witness pair and requires the complete fault campaign and soak. Every stage supports all four selected routes, binds both aggregate and deployable artifact digests, preserves signed negative outcomes, and grants no future authority. No stage keys are pinned, so the canonical manifest cannot admit these bundles or advance ASIC, thermal, bench, or endurance gates."
+  },
+  "release_contract": {
+    "state": "four_role_signed_schema_no_trust_anchors",
+    "verifier": "DCENT_OS_AvalonMiner/scripts/k210_release_receipt.py",
+    "receipt_schema_version": 1,
+    "preauthorization_kind": "dcent_k210_release_preauthorization",
+    "receipt_kind": "dcent_k210_release_capstone_receipt",
+    "signature_algorithm": "sshsig-ed25519",
+    "roles": {
+      "preauthorizer": {
+        "role": "k210_release_preauthorizer",
+        "namespace": "dcent-k210-release-preauthorizer-v1"
+      },
+      "reviewer": {
+        "role": "k210_release_reviewer",
+        "namespace": "dcent-k210-release-reviewer-v1"
+      },
+      "installer": {
+        "role": "k210_release_installer",
+        "namespace": "dcent-k210-release-installer-v1"
+      },
+      "witness": {
+        "role": "k210_release_install_witness",
+        "namespace": "dcent-k210-release-install-witness-v1"
+      }
+    },
+    "trust_anchors": {
+      "preauthorizer": null,
+      "reviewer": null,
+      "installer": null,
+      "witness": null
+    },
+    "permitted_actions": [
+      "boot_exact_replacement",
+      "exercise_upgrade_runbook",
+      "install_exact_replacement_artifact",
+      "restore_stock_on_failure",
+      "run_postinstall_acceptance",
+      "verify_full_readback",
+      "verify_preflight",
+      "verify_restore_runbook"
+    ],
+    "required_evidence_kinds": [
+      "artifact_custody_record",
+      "artifact_signing_record",
+      "install_execution_record",
+      "license_review_record",
+      "postinstall_acceptance_record",
+      "reproducibility_record",
+      "restore_runbook_record",
+      "sbom_record",
+      "upgrade_runbook_record"
+    ],
+    "boundary": "A standalone preauthorization signed before contact by distinct preauthorizer and reviewer keys exact-binds one admitted passing endurance chain, exact unit, selected v2 route, deployable artifact, interface qualification, no-clobber proof, permitted capstone actions, and validity window. Only that object may authorize one bounded install capstone; it grants no generic future authority and does not authorize the earlier first-light, bench, or endurance campaigns. The final receipt snapshots that preauthorization and endurance chain, exact-joins the immediate bench predecessor and every cumulative route field, records the completed install and acceptance evidence, and requires new distinct installer and witness keys. Only the verified final capstone can advance release_authority. No release keys are pinned, so the canonical manifest cannot admit either phase."
+  },
+  "update_transport_contract": {
+    "state": "verified_offline_reference",
+    "transport": "CGMiner API over TCP 4028",
+    "api_command": "ascset with parameter prefix 0,upgrade",
+    "default_page_bytes": 888,
+    "prechecks": [
+      "running firmware version",
+      "upgrade API version",
+      "supported HWTYPE",
+      "supported SWTYPE"
+    ],
+    "transfer_behavior": [
+      "AUP API-version-dependent header handling",
+      "little-endian binary header plus payload encoded as hexadecimal",
+      "server-reported offset resynchronization",
+      "bounded retry with smaller pages after invalid JSON"
+    ],
+    "postconditions": [
+      "stock reboot request",
+      "post-reboot version and uptime verification"
+    ],
+    "evidence": [
+      "",
+      "",
+      ""
+    ],
+    "boundary": "This is a held, offline reference implementation of the stock update transport. The gauntlet contains no live client and this contract grants no contact, install, flash, target-compatibility, recovery, or release authority."
+  },
+  "runtime_contract": {
+    "state": "no_std_policy_core_and_safe_idle_pipeline",
+    "crate": "DCENT_OS_AvalonMiner/k210-firmware/Cargo.toml",
+    "safety_supervisor": "DCENT_OS_AvalonMiner/k210-firmware/src/safety.rs",
+    "sentinel": "DCENT_OS_AvalonMiner/k210-firmware/src/bin/safe_idle_sentinel.rs",
+    "linker_script": "DCENT_OS_AvalonMiner/k210-firmware/k210-sentinel.ld",
+    "candidate_builder": "DCENT_OS_AvalonMiner/scripts/build_k210_candidate.py",
+    "freestanding_target": "riscv64gc-unknown-none-elf",
+    "capabilities": [
+      "ordered production-gate vocabulary",
+      "deterministic first-blocker computation",
+      "physical-model versus candidate/family refusal",
+      "recovery-first phase ordering",
+      "unconditional mutation refusal",
+      "generic fail-closed de-energized-domain safety proof with latched faults and independent-review-only success",
+      "freestanding RISC-V ELF linked at the public K210 ROM load base",
+      "byte-exact non-AES K210 wrapper and AUP-v2 envelope",
+      "offline candidate receipt with explicit no-install disposition"
+    ],
+    "boundary": "The crate includes a generic safety supervisor plus a desk-only safe-idle pipeline sentinel, startup assembly, and a public-SoC-fact linker script. The supervisor consumes normalized observations and has no model limits, hardware I/O, reset, or actuation authority; independent-review-only success is not physical safety proof. The crate contains no Avalon BSP, network, flash driver, GPIO, ASIC, cooling, PSU, or actuator implementation, and AES0 boot compatibility is unmeasured. It qualifies no production gate and no generated candidate is authorized for installation."
+  },
+  "production_gates": [
+    {
+      "id": "exact_model_identity",
+      "description": "Exact physical model, controller revision, ASIC family, cooling class, PSU, and hashboard topology are bound to evidence."
+    },
+    {
+      "id": "stock_restore",
+      "description": "An exact-unit stock backup or exact compatible stock image has been verified and a restore/readback drill has passed."
+    },
+    {
+      "id": "boot_policy",
+      "description": "K210 force-decrypt, ISP/JTAG lock, flash geometry, boot address, and recovery entry are measured on the target revision."
+    },
+    {
+      "id": "replacement_firmware",
+      "description": "A clean DCENT no_std K210 image builds reproducibly and packages as a target-bound AUP without restricted vendor code."
+    },
+    {
+      "id": "asic_control",
+      "description": "ASIC discovery, reset, PLL, work TX, nonce RX, and per-family bounds are independently implemented and hardware-validated."
+    },
+    {
+      "id": "thermal_power_safety",
+      "description": "Independent hash-power cut, fan/pump custody, PSU behavior, sensors, watchdogs, and fail-safe ordering are model-validated."
+    },
+    {
+      "id": "rollback_recovery",
+      "description": "Interrupted update, bad image, watchdog, brownout, and rollback paths recover without relying on the candidate firmware."
+    },
+    {
+      "id": "bench_mining",
+      "description": "First light, pool work, accepted shares, reject/error bounds, telemetry, configuration persistence, and reboot pass on hardware."
+    },
+    {
+      "id": "endurance_faults",
+      "description": "Thermal soak, network/pool churn, fan or pump loss, sensor faults, PSU faults, and long-run stability pass."
+    },
+    {
+      "id": "release_authority",
+      "description": "Artifact custody, reproducibility, signing, SBOM/license review, upgrade/restore runbooks, and per-model release approval pass."
+    }
+  ],
+  "targets": [
+    {
+      "id": "a1047",
+      "display_name": "AvalonMiner A1047",
+      "kind": "physical_model",
+      "generation": "A10",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3205",
+      "stock_profile": null,
+      "bench_state": "reported_available"
+    },
+    {
+      "id": "a1066",
+      "display_name": "AvalonMiner A1066",
+      "kind": "physical_model",
+      "generation": "A10",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3205",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1126",
+      "display_name": "AvalonMiner A1126",
+      "kind": "physical_model",
+      "generation": "A11",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3206",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1146",
+      "display_name": "AvalonMiner A1146",
+      "kind": "physical_model",
+      "generation": "A11",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3206",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1166",
+      "display_name": "AvalonMiner A1166",
+      "kind": "physical_model",
+      "generation": "A11",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3200",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1246",
+      "display_name": "AvalonMiner A1246",
+      "kind": "physical_model",
+      "generation": "A12",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3200",
+      "stock_profile": "a1246-a3200lc-2hash",
+      "bench_state": "reported_available"
+    },
+    {
+      "id": "a1246n",
+      "display_name": "AvalonMiner A1246N",
+      "kind": "physical_model",
+      "generation": "A12",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3200-Plus",
+      "stock_profile": "a1246n",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1246-a3201-temp65",
+      "display_name": "AvalonMiner A1246 A3201-Plus stock build, Temp65 (firmware family)",
+      "kind": "firmware_family",
+      "generation": "A12",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3201-Plus",
+      "stock_profile": "a1246-a3201-temp65",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1246-a3201-2hash",
+      "display_name": "AvalonMiner A1246 A3201-Plus stock build, Temp70 2HASH (firmware family)",
+      "kind": "firmware_family",
+      "generation": "A12",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3201-Plus",
+      "stock_profile": "a1246-a3201-2hash",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1266",
+      "display_name": "AvalonMiner A1266",
+      "kind": "physical_model",
+      "generation": "A12",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_portal_classification",
+      "controller_source": "",
+      "asic_family": "unknown",
+      "stock_profile": null,
+      "bench_state": "reported_available"
+    },
+    {
+      "id": "a1326",
+      "display_name": "AvalonMiner A1326",
+      "kind": "candidate_physical_model",
+      "generation": "A13",
+      "controller_soc": "K210-candidate",
+      "controller_evidence": "needs_exact_board_confirmation",
+      "controller_source": "https://static.canaan.io/uploads/supports_file/5_BIS_Certificate.pdf",
+      "asic_family": "unknown",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1346",
+      "display_name": "AvalonMiner A1346",
+      "kind": "physical_model",
+      "generation": "A13",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3200C-Plus",
+      "stock_profile": "a1346",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1346n",
+      "display_name": "AvalonMiner A1346N",
+      "kind": "physical_model",
+      "generation": "A13",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3200C-Plus",
+      "stock_profile": "a1346n",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1366",
+      "display_name": "AvalonMiner A1366",
+      "kind": "physical_model",
+      "generation": "A13",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "A3200-variant",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1446",
+      "display_name": "AvalonMiner A1446",
+      "kind": "physical_model",
+      "generation": "A14",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_documentary",
+      "controller_source": "",
+      "asic_family": "unknown",
+      "stock_profile": null,
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1466",
+      "display_name": "AvalonMiner A1466",
+      "kind": "physical_model",
+      "generation": "A14",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware_family",
+      "controller_source": "",
+      "asic_family": "A3198S",
+      "stock_profile": "a14x",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1466hs",
+      "display_name": "AvalonMiner A1466HS",
+      "kind": "physical_model",
+      "generation": "A14",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3198S",
+      "stock_profile": "a1466hs",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a14xi",
+      "display_name": "AvalonMiner A14xI firmware family",
+      "kind": "firmware_family",
+      "generation": "A14",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3198S",
+      "stock_profile": "a14xi",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1566",
+      "display_name": "AvalonMiner A1566",
+      "kind": "physical_model",
+      "generation": "A15",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware_family",
+      "controller_source": "",
+      "asic_family": "A3197S",
+      "stock_profile": "a15x",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a1566hs",
+      "display_name": "AvalonMiner A1566HS",
+      "kind": "physical_model",
+      "generation": "A15",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3197S",
+      "stock_profile": "a1566hs",
+      "bench_state": "unknown"
+    },
+    {
+      "id": "a15xi",
+      "display_name": "AvalonMiner A15xI firmware family",
+      "kind": "firmware_family",
+      "generation": "A15",
+      "controller_soc": "K210",
+      "controller_evidence": "confirmed_held_firmware",
+      "controller_source": "",
+      "asic_family": "A3197S",
+      "stock_profile": "a15xi",
+      "bench_state": "unknown"
+    }
+  ],
+  "firmware_profiles": [
+    {
+      "id": "a1246-a3200lc-2hash",
+      "firmware_version": "22062202_be77c30_a769bbf",
+      "asic_family": "A3200LC-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM3v2_X2"
+      ],
+      "sw_list": [
+        "MM315",
+        "MM315_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "407cd5f43efb22e55945ea0d2e76fed3bd9773f922a3106d2eaf9a477a4b3993",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 808909,
+      "aup_sha256": "6ec22eab5f781cbf646733edca8f1cf99ea0a4aeb9d451ec648384538ad666ac",
+      "payload_crc32": "0xa2099536",
+      "header_crc32": "0x4720322f",
+      "k210_app_size": 808672,
+      "k210_sha256": "ee1f33d71deefe7c182f5ae05a60b9ebac092e1eb29e8a569b2cecfdcabd6dcf"
+    },
+    {
+      "id": "a1246-a3201-temp65",
+      "firmware_version": "22011901_4ec6bb0_3e42b91",
+      "asic_family": "A3201-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM3v2_X3"
+      ],
+      "sw_list": [
+        "MM314",
+        "MM314_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "b1819e1728f7970c4614a9cb851ffcd3a0c840e9b4bf5b7e643fca8fe524c416",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 801037,
+      "aup_sha256": "16c999607fa2c937e90b06434abf292159e3d1b8ac78b58d57fa2e616bdfffb3",
+      "payload_crc32": "0x03825aac",
+      "header_crc32": "0x8f5431f1",
+      "k210_app_size": 800800,
+      "k210_sha256": "550fe5bf9311f36d8a8e1399dd68a3da10ed04f8a272f4c8fcac3de698d88587"
+    },
+    {
+      "id": "a1246-a3201-2hash",
+      "firmware_version": "22011902_4ec6bb0_3e42b91",
+      "asic_family": "A3201-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM3v2_X2"
+      ],
+      "sw_list": [
+        "MM314",
+        "MM314_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "5b0ca30a45e4c6574dab6a34624a780bd45d56abe8f8b76165e8ea073e0e19d3",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 801037,
+      "aup_sha256": "20f1679703dc66298acb1776d98a2f15de90d3c215aca9a3265ea0134b84c2ed",
+      "payload_crc32": "0xc65a9dd3",
+      "header_crc32": "0x730969f9",
+      "k210_app_size": 800800,
+      "k210_sha256": "107320db29996f5b7b88d98817180194ebb5cf243d94bb3d9bf973dd3dace43f"
+    },
+    {
+      "id": "a1246n",
+      "firmware_version": "23021601_66620f1_27c9e34",
+      "asic_family": "A3200-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM3v2_X3"
+      ],
+      "sw_list": [
+        "MM315",
+        "MM315_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "956f3935426a74539ad07e4901ac99583bcd9d6553ba445340bfa47eb0752aaf",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1069965,
+      "aup_sha256": "3157ce909f389985f0e8625b2b5d4bf28eb91f8619285bd08d12b6327d6d90fb",
+      "payload_crc32": "0xb85542f8",
+      "header_crc32": "0x9b03b09c",
+      "k210_app_size": 1069728,
+      "k210_sha256": "8ae09c647ed4ca8d94e63f1f441c5d1e45a89c36954aa5306fa5ef1cab6269d2"
+    },
+    {
+      "id": "a1346",
+      "firmware_version": "24041001_08b0955_0196aba",
+      "asic_family": "A3200C-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM4v1_X3"
+      ],
+      "sw_list": [
+        "MM317",
+        "MM317_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "ea4a836f975ea4ed5b1220d89644bc39c4fc704a2f76047c4068e8bfec28b3e6",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1082061,
+      "aup_sha256": "c35efbce4d9c6dca9637e7575c45bd3b8e81323b6d657552ff7707de0b4c17cc",
+      "payload_crc32": "0x135502dc",
+      "header_crc32": "0x38de92bf",
+      "k210_app_size": 1081824,
+      "k210_sha256": "e56594976e9584600805aa458fd5ca8c2d50e2eecfc4306ad226bb708f1e4752"
+    },
+    {
+      "id": "a1346n",
+      "firmware_version": "23052402_6d4cd98_52772d0",
+      "asic_family": "A3200C-Plus",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM3v2_X3"
+      ],
+      "sw_list": [
+        "MM317",
+        "MM317_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "684dc6767f2eff38e2cb2f13d9899b5a0e3376876f0b90d6513e8566387d1e8f",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1081229,
+      "aup_sha256": "377c938f59b52244ebabd5d353a6abda1f24b0925493390e3e105bf1744f19b6",
+      "payload_crc32": "0x93b2850b",
+      "header_crc32": "0x07af68ab",
+      "k210_app_size": 1080992,
+      "k210_sha256": "792577ed06f47747247ceb38dae947ba20a1724366232b28ef55b08905cbc92f"
+    },
+    {
+      "id": "a1466hs",
+      "firmware_version": "24102511_08b0955_aeae7e2t",
+      "asic_family": "A3198S",
+      "cooling": "liquid-cooled-or-hyper-power-unresolved",
+      "hw_list": [
+        "MM4v1_X3_LC"
+      ],
+      "sw_list": [
+        "MM318_X2",
+        "MM318_X2_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "ef1d0f9ef82ee8030b62afd42053adf44cdfc4db4f70e1a276f94de956e16f52",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1079373,
+      "aup_sha256": "28a4cf22cad7fbc75f4316bc684256c5bd135d71341a4726c92a8f118d89ee70",
+      "payload_crc32": "0xea1fe3c3",
+      "header_crc32": "0x93aebd1d",
+      "k210_app_size": 1079136,
+      "k210_sha256": "2fc96fd2789b66e6e69e7ae10133016441c4486bd4a9cd15d664bdaefac3ddd0"
+    },
+    {
+      "id": "a14x",
+      "firmware_version": "24061401_08b0955_841e057",
+      "asic_family": "A3198S",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM4v1_X3"
+      ],
+      "sw_list": [
+        "MM318_X2",
+        "MM318_X2_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "e69606341ea56a9927b8c929dac13756264de1d75a866c4251997bc96520076d",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1083533,
+      "aup_sha256": "2a52255858b6046afed527842b1a96ec46c7844cad573d25f174ff6248b9a0bc",
+      "payload_crc32": "0x0a2dbbc1",
+      "header_crc32": "0x3e222488",
+      "k210_app_size": 1083296,
+      "k210_sha256": "0393e634435c60f93e801dabd59a457df32876474836c1f69a31e5c4399f7809"
+    },
+    {
+      "id": "a14xi",
+      "firmware_version": "24043002_08b0955_e9f87ac",
+      "asic_family": "A3198S",
+      "cooling": "liquid-cooled-or-hyper-power-unresolved",
+      "hw_list": [
+        "MM4v1_X3_LC"
+      ],
+      "sw_list": [
+        "MM318_X2",
+        "MM318_X2_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "a2b49f19a93d294251dc9fa5299d315cdb6631b6d5f74d93896411c5ddaa9ec5",
+      "summary": "",
+      "aup": " (1).aup",
+      "aup_bytes": 1078925,
+      "aup_sha256": "de68bf38cf27a84c54cbc1364190508dc6a4de1cb28f60aa38ae41e177dae348",
+      "payload_crc32": "0xd53e20b9",
+      "header_crc32": "0x6964cc69",
+      "k210_app_size": 1078688,
+      "k210_sha256": "5f7817bca5e842a8cc16772c08736add8761e41b506e320f9ce3267c241f3f6b"
+    },
+    {
+      "id": "a1566hs",
+      "firmware_version": "24071901_25462b2_629a6f2t",
+      "asic_family": "A3197S",
+      "cooling": "liquid-cooled-or-hyper-power-unresolved",
+      "hw_list": [
+        "MM4v2_X3_LC"
+      ],
+      "sw_list": [
+        "MM319",
+        "MM319_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "9e2b56c43ee05d0f91675b473ebcebcc92b60a883ec6a77f73c7346c19974317",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1084173,
+      "aup_sha256": "d3ad130292c04e70eea484e004c406adb3fb1496ea32b48925e197c72759bbe5",
+      "payload_crc32": "0x99991e54",
+      "header_crc32": "0xf1aa82cd",
+      "k210_app_size": 1083936,
+      "k210_sha256": "81997fb06981d4071122bc0a38a857f453c54a62014def1a86f88d77d240e42a"
+    },
+    {
+      "id": "a15x",
+      "firmware_version": "24082801_25462b2_3a3e74f",
+      "asic_family": "A3197S",
+      "cooling": "air-cooled",
+      "hw_list": [
+        "MM4v2_X3"
+      ],
+      "sw_list": [
+        "MM319",
+        "MM319_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "74f293c9ade16559f79f431a4d367208379fc5a5186c9b0897ec2cdc942a294d",
+      "summary": "",
+      "aup": "",
+      "aup_bytes": 1086221,
+      "aup_sha256": "201e06a38b32cfe1ff5503b200b994c40a321b02aa94b5b38c96b55874703e47",
+      "payload_crc32": "0x5dba71f2",
+      "header_crc32": "0x20ef8007",
+      "k210_app_size": 1085984,
+      "k210_sha256": "38b46f8f9eeafb6f5aead2b809832a39cb93d7d1be286ad69c2f50f755370521"
+    },
+    {
+      "id": "a15xi",
+      "firmware_version": "24090201_25462b2_03d0d8f",
+      "asic_family": "A3197S",
+      "cooling": "liquid-cooled-or-hyper-power-unresolved",
+      "hw_list": [
+        "MM4v2_X3_LC"
+      ],
+      "sw_list": [
+        "MM319",
+        "MM319_OOW"
+      ],
+      "source_zip": "",
+      "source_zip_sha256": "9fa5ad9ce40ca1284462beaeb83ba1459291a47c96d0a8fb018a8f30695ca6b9",
+      "summary": "",
+      "aup": " (1).aup",
+      "aup_bytes": 1084301,
+      "aup_sha256": "f48d42c6c8942041735a209e585f6ad85d59c37ba480882ab1f521fcdec7ff75",
+      "payload_crc32": "0x8b6a49c0",
+      "header_crc32": "0x3f204022",
+      "k210_app_size": 1084064,
+      "k210_sha256": "82629c7be0c5b3812917974484942b0edd8c65aea9b1b630d647a86bca6743a6"
+    }
+  ]
+}

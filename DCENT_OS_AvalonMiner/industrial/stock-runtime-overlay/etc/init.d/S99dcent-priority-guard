@@ -1,0 +1,379 @@
+#!/bin/sh
+# Bounded btcminer management-thread priority guard (Nano 3 stock coexistence).
+#
+# This is admitted only for the exact held stock btcminer. It discovers the
+# complete management-thread set before changing any nice value, accepts only
+# the evidenced stock-demoted nice 10 or an already-corrected nice 0, and
+# post-checks every correction. A missing/duplicate target, unexpected nice,
+# process/hash drift, failed renice, or failed post-check terminates without a
+# success sentinel. The mining thread is never selected.
+#
+# The report is boot-local evidence, not a thermal/watchdog heartbeat or an
+# interlock. No lock or report is written unless /run is an exact tmpfs mount.
+
+case "${1:-}" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+# Literal production constants are intentionally not environment-overridable.
+# The host behavior test rewrites only these assignments in a private copy.
+enable_flag=/etc/dcentos/nano3-priority-guard.enabled
+proc_root=/proc
+run_root=/run
+mnt_mount=/mnt
+expected_btcminer_sha256=e6c11630a187d677f55178fa1dc7f2f1a52805856c538fae70cfbf0038ca6751
+startup_attempt_limit=90
+startup_sleep_seconds=2
+settle_sleep_seconds=5
+guard_pass_limit=60
+guard_pass_sleep_seconds=30
+
+[ -f "$enable_flag" ] || exit 0
+
+is_exact_mount() {
+    mount_path=$1
+    mount_type=${2:-}
+    awk -v path="$mount_path" -v type="$mount_type" '
+        $2 == path && (type == "" || $3 == type) { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$proc_root/mounts" 2>/dev/null
+}
+
+# This check precedes every writable operation, including the singleton lock.
+is_exact_mount "$run_root" tmpfs || exit 0
+
+guard_lock=$run_root/dcentos-priority-guard
+mkdir -m 0700 "$guard_lock" 2>/dev/null || exit 0
+
+(
+    umask 077
+    report=$run_root/dcentos-priority-guard.txt
+    observed_btcminer_sha256=unavailable
+    btcminer_hash_admitted=0
+    failure_reason=uninitialized
+
+    validate_unique_pid() {
+        pid_output=$(pidof btcminer 2>/dev/null)
+        if [ -z "$pid_output" ]; then
+            failure_reason=btcminer_missing
+            return 1
+        fi
+        case "$pid_output" in
+            *" "*) failure_reason=multiple_btcminer_pids; return 1 ;;
+            *[!0-9]*) failure_reason=invalid_btcminer_pid; return 1 ;;
+        esac
+        miner_pid=$pid_output
+        return 0
+    }
+
+    admit_running_binary() {
+        observed_btcminer_sha256=$(sha256sum \
+            "$proc_root/$miner_pid/exe" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        if [ -z "$observed_btcminer_sha256" ]; then
+            observed_btcminer_sha256=unavailable
+            btcminer_hash_admitted=0
+            failure_reason=btcminer_hash_unavailable
+            return 1
+        fi
+        if [ "$observed_btcminer_sha256" != "$expected_btcminer_sha256" ]; then
+            btcminer_hash_admitted=0
+            failure_reason=btcminer_hash_mismatch
+            return 1
+        fi
+        btcminer_hash_admitted=1
+        admitted_pid=$miner_pid
+        return 0
+    }
+
+    discover_complete_target_set() {
+        api_count=0
+        api_tid=
+        watchdog_thread_count=0
+        watchdog_thread_tid=
+        watchpool_threa_count=0
+        watchpool_threa_tid=
+
+        for task in "$proc_root/$miner_pid/task/"*; do
+            [ -r "$task/comm" ] || continue
+            read -r task_name < "$task/comm" || continue
+            task_tid=${task##*/}
+            case "$task_tid" in
+                ''|*[!0-9]*) failure_reason=invalid_target_tid; return 1 ;;
+            esac
+            case "$task_name" in
+                API)
+                    api_count=$((api_count + 1))
+                    api_tid=$task_tid
+                    ;;
+                watchdog_thread)
+                    watchdog_thread_count=$((watchdog_thread_count + 1))
+                    watchdog_thread_tid=$task_tid
+                    ;;
+                watchpool_threa)
+                    watchpool_threa_count=$((watchpool_threa_count + 1))
+                    watchpool_threa_tid=$task_tid
+                    ;;
+            esac
+        done
+
+        if [ "$api_count" -gt 1 ] ||
+           [ "$watchdog_thread_count" -gt 1 ] ||
+           [ "$watchpool_threa_count" -gt 1 ]; then
+            failure_reason=duplicate_target_thread
+            return 1
+        fi
+        if [ "$api_count" -ne 1 ] ||
+           [ "$watchdog_thread_count" -ne 1 ] ||
+           [ "$watchpool_threa_count" -ne 1 ]; then
+            failure_reason=missing_target_thread
+            return 1
+        fi
+        return 0
+    }
+
+    validate_same_pid_and_hash() {
+        validate_unique_pid || return 1
+        if [ "$miner_pid" != "$admitted_pid" ]; then
+            failure_reason=btcminer_pid_changed
+            return 1
+        fi
+        recheck_sha256=$(sha256sum \
+            "$proc_root/$miner_pid/exe" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        if [ "$recheck_sha256" != "$expected_btcminer_sha256" ]; then
+            observed_btcminer_sha256=${recheck_sha256:-unavailable}
+            btcminer_hash_admitted=0
+            failure_reason=btcminer_hash_changed
+            return 1
+        fi
+        observed_btcminer_sha256=$recheck_sha256
+        btcminer_hash_admitted=1
+        return 0
+    }
+
+    validate_task_identity() {
+        identity_tid=$1
+        identity_name=$2
+        [ -r "$proc_root/$miner_pid/task/$identity_tid/comm" ] || {
+            failure_reason=target_thread_disappeared
+            return 1
+        }
+        read -r observed_name < \
+            "$proc_root/$miner_pid/task/$identity_tid/comm" || {
+            failure_reason=target_comm_unreadable
+            return 1
+        }
+        [ "$observed_name" = "$identity_name" ] || {
+            failure_reason=target_comm_changed
+            return 1
+        }
+        return 0
+    }
+
+    read_task_nice() {
+        nice_tid=$1
+        task_nice=$(awk 'NR == 1 { print $19 }' \
+            "$proc_root/$miner_pid/task/$nice_tid/stat" 2>/dev/null)
+        [ -n "$task_nice" ] || {
+            failure_reason=target_nice_unreadable
+            return 1
+        }
+        return 0
+    }
+
+    validate_pre_nice() {
+        validate_tid=$1
+        read_task_nice "$validate_tid" || return 1
+        if [ "$task_nice" != 10 ] && [ "$task_nice" != 0 ]; then
+            failure_reason=unexpected_target_nice
+            return 1
+        fi
+        return 0
+    }
+
+    correct_and_postcheck() {
+        correction_tid=$1
+        correction_name=$2
+        correction_pre_nice=$3
+        validate_same_pid_and_hash || return 1
+        validate_task_identity "$correction_tid" "$correction_name" || return 1
+        read_task_nice "$correction_tid" || return 1
+        [ "$task_nice" = "$correction_pre_nice" ] || {
+            failure_reason=target_nice_changed_before_renice
+            return 1
+        }
+        if [ "$correction_pre_nice" = 10 ]; then
+            busybox renice -n 0 -p "$correction_tid" >/dev/null 2>&1 || {
+                failure_reason=renice_failed
+                return 1
+            }
+        fi
+        validate_same_pid_and_hash || return 1
+        validate_task_identity "$correction_tid" "$correction_name" || return 1
+        read_task_nice "$correction_tid" || return 1
+        [ "$task_nice" = 0 ] || {
+            failure_reason=renice_postcheck_failed
+            return 1
+        }
+        correction_post_nice=$task_nice
+        return 0
+    }
+
+    apply_once() {
+        pass_number=$1
+        validate_unique_pid || return 1
+        admit_running_binary || return 1
+        discover_complete_target_set || return 1
+
+        # Capture the complete pre-state before the first mutation. An
+        # unexpected priority in any target causes zero renice calls.
+        validate_pre_nice "$api_tid" || return 1
+        api_pre_nice=$task_nice
+        validate_pre_nice "$watchdog_thread_tid" || return 1
+        watchdog_thread_pre_nice=$task_nice
+        validate_pre_nice "$watchpool_threa_tid" || return 1
+        watchpool_threa_pre_nice=$task_nice
+
+        validate_same_pid_and_hash || return 1
+        validate_task_identity "$api_tid" API || return 1
+        validate_task_identity "$watchdog_thread_tid" watchdog_thread || return 1
+        validate_task_identity "$watchpool_threa_tid" watchpool_threa || return 1
+
+        original_api_tid=$api_tid
+        original_watchdog_thread_tid=$watchdog_thread_tid
+        original_watchpool_threa_tid=$watchpool_threa_tid
+        discover_complete_target_set || return 1
+        if [ "$api_tid" != "$original_api_tid" ] ||
+           [ "$watchdog_thread_tid" != "$original_watchdog_thread_tid" ] ||
+           [ "$watchpool_threa_tid" != "$original_watchpool_threa_tid" ]; then
+            failure_reason=target_set_changed_before_renice
+            return 1
+        fi
+
+        correct_and_postcheck "$api_tid" API "$api_pre_nice" || return 1
+        api_post_nice=$correction_post_nice
+        correct_and_postcheck "$watchdog_thread_tid" watchdog_thread \
+            "$watchdog_thread_pre_nice" || return 1
+        watchdog_thread_post_nice=$correction_post_nice
+        correct_and_postcheck "$watchpool_threa_tid" watchpool_threa \
+            "$watchpool_threa_pre_nice" || return 1
+        watchpool_threa_post_nice=$correction_post_nice
+
+        validate_same_pid_and_hash || return 1
+        discover_complete_target_set || return 1
+        if [ "$api_tid" != "$original_api_tid" ] ||
+           [ "$watchdog_thread_tid" != "$original_watchdog_thread_tid" ] ||
+           [ "$watchpool_threa_tid" != "$original_watchpool_threa_tid" ]; then
+            failure_reason=target_set_changed_after_renice
+            return 1
+        fi
+        validate_task_identity "$api_tid" API || return 1
+        validate_task_identity "$watchdog_thread_tid" watchdog_thread || return 1
+        validate_task_identity "$watchpool_threa_tid" watchpool_threa || return 1
+        read_task_nice "$api_tid" || return 1
+        [ "$task_nice" = 0 ] || {
+            failure_reason=api_final_nice_not_zero
+            return 1
+        }
+        read_task_nice "$watchdog_thread_tid" || return 1
+        [ "$task_nice" = 0 ] || {
+            failure_reason=watchdog_final_nice_not_zero
+            return 1
+        }
+        read_task_nice "$watchpool_threa_tid" || return 1
+        [ "$task_nice" = 0 ] || {
+            failure_reason=watchpool_final_nice_not_zero
+            return 1
+        }
+
+        echo "pass_${pass_number}_btcminer_pid=$miner_pid"
+        echo "pass_${pass_number}_target_api_tid=$api_tid"
+        echo "pass_${pass_number}_target_api_pre_nice=$api_pre_nice"
+        echo "pass_${pass_number}_target_api_post_nice=$api_post_nice"
+        echo "pass_${pass_number}_target_watchdog_thread_tid=$watchdog_thread_tid"
+        echo "pass_${pass_number}_target_watchdog_thread_pre_nice=$watchdog_thread_pre_nice"
+        echo "pass_${pass_number}_target_watchdog_thread_post_nice=$watchdog_thread_post_nice"
+        echo "pass_${pass_number}_target_watchpool_threa_tid=$watchpool_threa_tid"
+        echo "pass_${pass_number}_target_watchpool_threa_pre_nice=$watchpool_threa_pre_nice"
+        echo "pass_${pass_number}_target_watchpool_threa_post_nice=$watchpool_threa_post_nice"
+        echo "pass_${pass_number}_observed_btcminer_sha256=$observed_btcminer_sha256"
+        echo "pass_${pass_number}_btcminer_hash_admitted=1"
+        echo "pass_${pass_number}_all_targets_nice_zero=1"
+        if [ "$pass_number" -eq 1 ]; then
+            echo "guard_initial_admission=success"
+        fi
+        return 0
+    }
+
+    {
+        echo "schema=dcent-nano3-priority-guard-v2"
+        echo "profile=stock-coexistence-priority-guard"
+        echo "scope=btcminer-management-thread-nice-only"
+        echo "expected_btcminer_sha256=$expected_btcminer_sha256"
+        echo "run_tmpfs_verified=1"
+        echo "target_set=API,watchdog_thread,watchpool_threa"
+        echo "admitted_pre_nice=10,0"
+        echo "miner_thread_nice=unchanged_by_policy"
+        echo "guard_reassert_pass_limit=$guard_pass_limit"
+        echo "guard_reassert_interval_seconds=$guard_pass_sleep_seconds"
+
+        attempts=0
+        startup_failed=0
+        while [ "$attempts" -lt "$startup_attempt_limit" ]; do
+            if ! is_exact_mount "$mnt_mount"; then
+                failure_reason=mnt_not_mounted
+            elif validate_unique_pid; then
+                break
+            elif [ "$failure_reason" != btcminer_missing ]; then
+                startup_failed=1
+                break
+            fi
+            attempts=$((attempts + 1))
+            sleep "$startup_sleep_seconds"
+        done
+        if [ "$startup_failed" -eq 1 ] ||
+           [ "$attempts" -ge "$startup_attempt_limit" ]; then
+            echo "observed_btcminer_sha256=$observed_btcminer_sha256"
+            echo "btcminer_hash_admitted=0"
+            echo "guard_passes_completed=0"
+            echo "all_targets_nice_zero=0"
+            echo "guard_window_complete=0"
+            echo "guard_failure_reason=$failure_reason"
+            echo "guard_terminal=failure"
+            exit 0
+        fi
+
+        sleep "$settle_sleep_seconds"
+        completed=0
+        pass=1
+        while [ "$pass" -le "$guard_pass_limit" ]; do
+            if apply_once "$pass"; then
+                completed=$pass
+            else
+                break
+            fi
+            pass=$((pass + 1))
+            [ "$pass" -le "$guard_pass_limit" ] &&
+                sleep "$guard_pass_sleep_seconds"
+        done
+
+        echo "observed_btcminer_sha256=$observed_btcminer_sha256"
+        echo "btcminer_hash_admitted=$btcminer_hash_admitted"
+        echo "guard_passes_completed=$completed"
+        if [ "$completed" -eq "$guard_pass_limit" ]; then
+            echo "all_targets_nice_zero=1"
+            echo "guard_window_complete=1"
+            echo "guard_failure_reason=none"
+            echo "guard_terminal=success"
+        else
+            echo "all_targets_nice_zero=0"
+            echo "guard_window_complete=0"
+            echo "guard_failure_reason=$failure_reason"
+            echo "guard_terminal=failure"
+        fi
+    } > "$report" 2>&1
+
+    logger -t dcentos "priority guard finished; report at $report"
+) &
+
+exit 0

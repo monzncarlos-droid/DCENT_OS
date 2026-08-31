@@ -103,6 +103,8 @@ mod tests {
         assert_eq!(bytes.len(), BOOT_BIN_SIZE);
         admit_boot_header(&bytes).unwrap();
         assert!(!bytes.windows(4).any(|w| w == [0xAA, 0x99, 0x55, 0x66]));
-        assert!(bytes.windows(BOOT_STRING_7Z007S.len()).any(|w| w == BOOT_STRING_7Z007S.as_bytes()));
+        assert!(bytes
+            .windows(BOOT_STRING_7Z007S.len())
+            .any(|w| w == BOOT_STRING_7Z007S.as_bytes()));
     }
 }

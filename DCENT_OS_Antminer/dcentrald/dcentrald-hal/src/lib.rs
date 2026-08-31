@@ -15,11 +15,14 @@
 //! - `led`              - LED control via GPIO output register
 //! - `platform`         - Platform trait and auto-detection (Zynq S9/S19, Amlogic, BeagleBone)
 //! - `platform::config` - Runtime platform config (replaces hardcoded S9 constants)
+//! - `epic_umc_psu_v1` - pure, non-dispatching ePIC UMC proprietary PSU-v1 telemetry decoder
 //! - `serial`           - Standard Linux serial port with custom baud rate support
 //! - `serial_chain`     - Serial-based chain transport (NS16550A UART backend for ASIC comms)
 //! - `psu`              - APW PSU controller via I2C bus 1 (PMBus-like protocol, watchdog)
-//! - `psu_apw12_smbus`  - APW12 SMBus opcode driver for CV1835/AM335x BB/Amlogic S19j Pro (NOT for Zynq am2 — that uses `psu::Apw121215a`)
+//! - `psu_apw12_smbus`  - APW12 SMBus opcode driver for CV1835/AM335x BB/Amlogic S19j Pro (NOT for Zynq am2 — that uses `psu::Apw121215a`). SET_VOLTAGE is refused until the millivolt LSB is bound.
 //! - `psu_apw12_plus`   - quarantined APW12+ register-model evidence and exact framed-protocol builders; no production constructor.
+//! - `psu_apw9`         - fail-closed APW9 framed-I²C host codec (Toolbox port; no SET, no I²C).
+//! - `psu_routing`      - fail-closed APW8 routing row (no SET voltage; opcode/LSB unbound).
 //! - `psu_apw_uart_tunnel` - APW121215f framed UART-tunnel driver for the AM335x BB S19j Pro on S19J_IO_BOARD_V2_0 (the `a lab unit` unit). DIFFERENT framing from `psu_apw12_smbus`. Frame format LIVE-CONFIRMED (2026-05-12 ftrace on `a lab unit`); calibration read + watchdog-disable opcodes Ghidra-confirmed (2026-05-31); set-voltage payload still TODO.
 //! - `stock_fpga`       - Stock Bitmain FPGA register access (/dev/axi_fpga_dev, 352-byte flat space)
 //! - `stock_fpga_iic`   - Stock FPGA PIC I2C via IIC_COMMAND register (no /dev/i2c-*)
@@ -38,6 +41,7 @@ compile_error!("sim-hal is host-only and must never be compiled into ARM Linux f
 pub mod adc;
 pub mod board_control;
 pub mod chain_backend;
+pub mod epic_umc_psu_v1;
 pub mod fan;
 pub mod fpga_chain;
 pub mod fpga_chain_backend;
@@ -50,15 +54,18 @@ pub mod ina226;
 pub mod led;
 pub mod led_patterns;
 pub mod libgpiod;
+pub mod pl_surface;
 pub mod platform;
 pub mod pmbus;
 pub mod psu;
 pub mod psu_apw12_plus;
 pub mod psu_apw12_smbus;
+pub mod psu_apw9;
 pub mod psu_apw_uart_tunnel;
 pub mod psu_bypass_gate;
 pub mod psu_gpio_gate;
 pub mod psu_gpio_i2c;
+pub mod psu_routing;
 pub mod serial;
 pub mod serial_chain;
 /// G32: pure stock BC SetConfig plan → register I/O execute (T9+ VIL order).

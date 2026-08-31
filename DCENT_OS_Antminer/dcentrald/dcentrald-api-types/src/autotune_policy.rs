@@ -143,7 +143,12 @@ pub fn classify_chain_imbalance(
     thresholds: ChainImbalanceThresholds,
 ) -> ChainImbalanceClassification {
     let (warn, critical) = thresholds_for_metric(metric, &thresholds);
-    if thresholds.min_valid_chains < 2 || warn < 0.0 || critical < warn {
+    if thresholds.min_valid_chains < 2
+        || !warn.is_finite()
+        || !critical.is_finite()
+        || warn < 0.0
+        || critical < warn
+    {
         return ChainImbalanceClassification {
             metric,
             severity: ChainImbalanceSeverity::Invalid,
@@ -199,16 +204,31 @@ pub fn classify_chain_imbalance(
         };
     }
 
-    let (min_chain_id, min_value) = valid
+    let extrema = valid
         .iter()
         .copied()
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .expect("valid has at least min_valid_chains");
-    let (max_chain_id, max_value) = valid
-        .iter()
-        .copied()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .expect("valid has at least min_valid_chains");
+        .zip(
+            valid
+                .iter()
+                .copied()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)),
+        );
+    let Some(((min_chain_id, min_value), (max_chain_id, max_value))) = extrema else {
+        return ChainImbalanceClassification {
+            metric,
+            severity: ChainImbalanceSeverity::Invalid,
+            valid_chains: valid.len(),
+            min_chain_id: None,
+            max_chain_id: None,
+            min_value: None,
+            max_value: None,
+            skew: None,
+            threshold_warn: warn,
+            threshold_critical: critical,
+            reason: "internal_empty_valid_set".to_string(),
+        };
+    };
     let avg = valid.iter().map(|(_, value)| *value).sum::<f64>() / valid.len() as f64;
 
     let Some(skew) = skew_for_metric(metric, min_value, max_value, avg) else {
@@ -499,6 +519,28 @@ mod tests {
             ChainImbalanceThresholds::default(),
         );
         assert_eq!(invalid.severity, ChainImbalanceSeverity::Invalid);
+    }
+
+    #[test]
+    fn imbalance_classifier_refuses_non_finite_thresholds() {
+        let samples = [sample(6, 31.0), sample(7, 30.0)];
+        for (warn, critical) in [
+            (f64::NAN, 25.0),
+            (12.0, f64::NAN),
+            (f64::INFINITY, f64::INFINITY),
+            (12.0, f64::INFINITY),
+        ] {
+            let thresholds = ChainImbalanceThresholds {
+                hashrate_warn_pct: warn,
+                hashrate_critical_pct: critical,
+                ..ChainImbalanceThresholds::default()
+            };
+            let result =
+                classify_chain_imbalance(ChainImbalanceMetric::Hashrate, &samples, thresholds);
+            assert_eq!(result.severity, ChainImbalanceSeverity::Invalid);
+            assert_eq!(result.reason, "invalid_thresholds");
+            assert!(result.blocks_profile_step_up());
+        }
     }
 
     #[test]

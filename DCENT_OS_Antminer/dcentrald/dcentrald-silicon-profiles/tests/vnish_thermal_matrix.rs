@@ -8,7 +8,8 @@
 //! 2. provenance is the distinct VNish third-party-transcription variant on
 //!    every row — never ePIC, never live,
 //! 3. corroborations: chips/domain topology agrees with the ePIC registry
-//!    on all 36 overlapping SKUs and with the live catalog where they meet,
+//!    on all 39 overlapping SKUs (one pinned conflict, BHB56701) and with
+//!    the live catalog where they meet,
 //! 4. conflicts are RECORDED, not resolved: the 14-SKU chains 3-vs-4
 //!    disagreement, the A3HB70701 mux contradiction, the mux-bank
 //!    under-report, and the 2-vs-4 sensor-roster divergence all pin BOTH
@@ -208,13 +209,28 @@ fn provenance_is_vnish_desk_on_every_row_and_distinct_from_the_other_corpora() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn chip_and_domain_topology_agrees_with_the_epic_registry_on_all_36_overlaps() {
+fn chip_and_domain_topology_agrees_with_the_epic_registry_on_all_39_overlaps() {
     let mut overlapping = 0;
     for d in all_vnish_models() {
         let Some(e) = descriptor_by_sku(&d.btm_model) else {
             continue;
         };
         overlapping += 1;
+        // BHB56701 is the one pinned cross-corpus conflict: VNish labels it
+        // S19 XP with an 11-domain × 10-chip geometry (110 chips/chain); the
+        // ePIC v1.24.0 DB declares 10 domains × 7 (70). Both sides are
+        // internally consistent and both are recorded verbatim — the
+        // conflict is adjudicated at the catalog layer, never reconciled
+        // here by overwriting either.
+        if d.btm_model == "BHB56701" {
+            assert_eq!(d.chips_per_chain, 110);
+            assert_eq!(e.chain.chips_per_chain, 70);
+            assert_eq!(d.chips_per_domain, 10);
+            assert_eq!(e.chain.chips_per_domain, 7);
+            assert_eq!(d.domains_per_chain, 11);
+            assert_eq!(e.chain.domains_per_chain, 10);
+            continue;
+        }
         assert_eq!(
             d.chips_per_chain, e.chain.chips_per_chain,
             "{}: chips/chain",
@@ -231,15 +247,17 @@ fn chip_and_domain_topology_agrees_with_the_epic_registry_on_all_36_overlaps() {
             d.btm_model
         );
     }
-    // 36 of 77 VNish models overlap the 50-SKU ePIC roster; the other 41
+    // 39 of 77 VNish models overlap the 61-SKU ePIC roster (the v1.24.0
+    // delta added BHB56701, H6HB70801 and M1HB70602); of those 39, one
+    // (BHB56701) is the pinned conflict above and 38 agree. The other 38
     // (hydro/immersion, scrypt, S19a/S19i/T19-era, placeholder IDs) are new.
-    assert_eq!(overlapping, 36);
+    assert_eq!(overlapping, 39);
     assert_eq!(
         all_vnish_models()
             .iter()
             .filter(|d| descriptor_by_sku(&d.btm_model).is_none())
             .count(),
-        41
+        38
     );
 }
 
@@ -362,10 +380,11 @@ fn two_sensor_direct_rows_diverge_from_the_epic_four_sensor_board_bank() {
             );
         }
     }
-    // 6 mux-only under-reports (4 vs 8) + 17 two-sensor rows (2 vs 4,
-    // including A3HB70702/70703) = 23. A3HB70701 is NOT here — its rosters
+    // 7 mux-style under-reports (6 × 4-vs-8 plus the v1.24.0 immersion row
+    // M1HB70602 at 4 vs 8) + 17 two-sensor rows (2 vs 4, including
+    // A3HB70702/70703) = 24. A3HB70701 is NOT here — its rosters
     // are equal-sized but contradictory in kind (see its dedicated pin).
-    assert_eq!(divergent, 23);
+    assert_eq!(divergent, 24);
 }
 
 // ---------------------------------------------------------------------------

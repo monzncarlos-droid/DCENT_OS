@@ -39,6 +39,32 @@
 //!    sub-zero reading. [`decode_temp`] shifts signed, so negatives decode
 //!    correctly and no reading has to be discarded to hide an arithmetic bug.
 
+/// TI TMP1075 Device ID register value (`REG_DEVICE_ID` / 0x0F).
+pub const TMP1075_DEVICE_ID: u16 = 0x0075;
+
+/// A TI digital temperature sensor that shares the TMP75/TMP1075 register map
+/// for temperature (0x00) but is told apart by Device ID (0x0F).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiTempPart {
+    /// TMP1075 — Device ID 0x0075 at register 0x0F.
+    Tmp1075,
+    /// TMP75 / TMP175 / TMP275 family — no Device ID register (0x0F NACKs).
+    Tmp75Family,
+}
+
+/// Classify a TI digital temp sensor from an optional Device ID read.
+///
+/// `None` means register 0x0F NACKed (TMP75 family). `Some(0x0075)` is a
+/// TMP1075. Any other ID is unknown — do **not** treat it as a Hammer
+/// decode, and do **not** bind `TempSensorKind` from this alone.
+pub fn classify_ti_temp_part(device_id: Option<u16>) -> Option<TiTempPart> {
+    match device_id {
+        Some(TMP1075_DEVICE_ID) => Some(TiTempPart::Tmp1075),
+        None => Some(TiTempPart::Tmp75Family),
+        Some(_) => None,
+    }
+}
+
 /// Lowest strapped address of the family.
 pub const ADDR_BASE: u8 = 0x48;
 
@@ -245,6 +271,20 @@ mod tests {
     }
 
     // ── decode ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn device_id_distinguishes_tmp1075_from_tmp75_family() {
+        assert_eq!(
+            classify_ti_temp_part(Some(TMP1075_DEVICE_ID)),
+            Some(TiTempPart::Tmp1075)
+        );
+        assert_eq!(classify_ti_temp_part(None), Some(TiTempPart::Tmp75Family));
+        assert_eq!(
+            classify_ti_temp_part(Some(0xFFFF)),
+            None,
+            "unknown Device ID must not be claimed as TMP75 or TMP1075"
+        );
+    }
 
     #[test]
     fn positive_readings_decode_at_quarter_sixteenth_resolution() {

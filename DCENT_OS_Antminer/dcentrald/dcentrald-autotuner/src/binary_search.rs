@@ -260,7 +260,8 @@ impl BinarySearchTuner {
     /// to detect a dead chip but tolerant of natural variance.
     fn adaptive_min_samples(&self, freq_mhz: u16, difficulty: u32, window_s: f64) -> u64 {
         let expected_nps =
-            crate::chip_geometry::expected_nps_for_chip(self.chip_id, freq_mhz, difficulty);
+            crate::chip_geometry::expected_nps_for_chip(self.chip_id, freq_mhz, difficulty)
+                .unwrap_or(0.0);
         let expected_per_window = expected_nps * window_s;
         (expected_per_window * 0.3).max(4.0) as u64
     }
@@ -343,7 +344,8 @@ impl BinarySearchTuner {
             .unwrap_or(self.nominal_mhz);
 
         let expected_nps =
-            crate::chip_geometry::expected_nps_for_chip(self.chip_id, min_active_freq, difficulty);
+            crate::chip_geometry::expected_nps_for_chip(self.chip_id, min_active_freq, difficulty)
+                .unwrap_or(0.0);
         if expected_nps <= 0.0 {
             return 10.0;
         }

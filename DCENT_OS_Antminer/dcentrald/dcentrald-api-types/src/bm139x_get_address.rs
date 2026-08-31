@@ -1,4 +1,4 @@
-﻿//! BM1397/BM1398-class GetAddress sealed admission (0x52 dialect).
+//! BM1397/BM1398-class GetAddress sealed admission (0x52 dialect).
 //!
 //! Pure / host-testable. Parses cold GetAddress response bodies after the HAL
 //! has stripped the `AA 55` preamble. This is **not** the BM136x 9-byte
@@ -160,9 +160,8 @@ pub fn parse_bm139x_get_address_body(
     }
 
     let chip_id = u16::from_be_bytes([body[0], body[1]]);
-    let identity = AsicProtocolIdentity::from_chip_id(chip_id).ok_or(
-        Bm139xGetAddressResponseError::UnknownChipId { observed: chip_id },
-    )?;
+    let identity = AsicProtocolIdentity::from_chip_id(chip_id)
+        .ok_or(Bm139xGetAddressResponseError::UnknownChipId { observed: chip_id })?;
     match identity {
         AsicProtocolIdentity::Bm1397 | AsicProtocolIdentity::Bm1398 => {}
         other => {
@@ -442,8 +441,7 @@ mod tests {
     fn address_plan_and_chain_spec_agree_on_114() {
         assert_eq!(S19_PRO_NBP1901_CHAIN_SPEC.expected_chip_count, 114);
         assert_eq!(
-            crate::bm1398_protocol::S19_PRO_NBP1901_ADDRESS_PLAN
-                .hardware_address(113),
+            crate::bm1398_protocol::S19_PRO_NBP1901_ADDRESS_PLAN.hardware_address(113),
             Some(226)
         );
     }

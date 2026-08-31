@@ -21,8 +21,13 @@ set -euo pipefail
 
 TARGETS=(
     am2-s19jpro
+    am1-s9se
+    am1-s9k
     am2-s19pro
     am2-s17pro
+    am2-s17plus
+    am2-t17
+    am2-t17plus
     am3-s19kpro
     am3-s19xp
     am3-s19jxp
@@ -38,8 +43,13 @@ TARGETS=(
 
 declare -A TARBALL_FOR_TARGET=(
     [am2-s19jpro]="dcentos-sysupgrade-am2-s19jpro.tar"
+    [am1-s9se]="dcentos-sysupgrade-am1-s9se.tar"
+    [am1-s9k]="dcentos-sysupgrade-am1-s9k.tar"
     [am2-s19pro]="dcentos-sysupgrade-am2-s19pro.tar"
     [am2-s17pro]="dcentos-sysupgrade-am2-s17pro.tar"
+    [am2-s17plus]="dcentos-sysupgrade-am2-s17plus.tar"
+    [am2-t17]="dcentos-sysupgrade-am2-t17.tar"
+    [am2-t17plus]="dcentos-sysupgrade-am2-t17plus.tar"
     [am3-s19kpro]="dcentos-sysupgrade-am3-s19kpro.tar"
     [am3-s19xp]="dcentos-sysupgrade-am3-s19xp.tar"
     [am3-s19jxp]="dcentos-sysupgrade-am3-s19jxp.tar"

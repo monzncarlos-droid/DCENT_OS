@@ -54,6 +54,7 @@
 //! workflow invokes the script as a separate step.
 
 #![cfg(unix)]
+#![allow(clippy::await_holding_lock)]
 
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};

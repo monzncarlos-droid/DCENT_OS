@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! dcentrald-stratum: Stratum V1 mining protocol client
 //!
 //! Pure network protocol crate with no dependencies on other dcentrald crates.

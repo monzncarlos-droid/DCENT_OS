@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const LOG_RING_DIR_ENV: &str = "DCENTOS_LOG_RING_DIR";
@@ -213,10 +213,29 @@ impl PersistentLogRing {
 }
 
 pub fn default_log_ring_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var(LOG_RING_DIR_ENV) {
-        return PathBuf::from(dir);
+    default_log_ring_dir_for_policy(
+        crate::runtime_policy::ephemeral_runtime_enabled(),
+        std::env::var_os(LOG_RING_DIR_ENV).map(PathBuf::from),
+    )
+}
+
+fn default_log_ring_dir_for_policy(ephemeral: bool, configured: Option<PathBuf>) -> PathBuf {
+    if ephemeral {
+        // A temporary hardware-acceptance process must never inherit a
+        // persistent log destination from the stock daemon's environment.
+        // Keep an explicitly configured path only when it remains beneath the
+        // daemon-owned tmpfs namespace; otherwise force the canonical tmpfs
+        // ring. This mirrors the audit/metrics persistence policy.
+        return configured
+            .filter(|path| {
+                path.starts_with("/tmp/dcent")
+                    && path.components().all(|component| {
+                        !matches!(component, Component::ParentDir | Component::CurDir)
+                    })
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp/dcent/log"));
     }
-    PathBuf::from("/tmp/dcent/log")
+    configured.unwrap_or_else(|| PathBuf::from("/tmp/dcent/log"))
 }
 
 pub fn log_ring_disabled_by_env() -> bool {
@@ -299,6 +318,45 @@ mod tests {
             file_count: 2,
             file_size_bytes: size,
         }
+    }
+
+    #[test]
+    fn ephemeral_policy_cannot_inherit_a_persistent_log_ring_override() {
+        assert_eq!(
+            default_log_ring_dir_for_policy(true, Some(PathBuf::from("/data/dcent/log")),),
+            PathBuf::from("/tmp/dcent/log")
+        );
+        assert_eq!(
+            default_log_ring_dir_for_policy(true, Some(PathBuf::from("/etc/dcentos/log")),),
+            PathBuf::from("/tmp/dcent/log")
+        );
+    }
+
+    #[test]
+    fn ephemeral_policy_allows_only_the_owned_tmpfs_namespace() {
+        assert_eq!(
+            default_log_ring_dir_for_policy(true, Some(PathBuf::from("/tmp/dcent/track1-log")),),
+            PathBuf::from("/tmp/dcent/track1-log")
+        );
+        assert_eq!(
+            default_log_ring_dir_for_policy(true, Some(PathBuf::from("/tmp/dcentrald-lookalike")),),
+            PathBuf::from("/tmp/dcent/log")
+        );
+        assert_eq!(
+            default_log_ring_dir_for_policy(
+                true,
+                Some(PathBuf::from("/tmp/dcent/../../data/dcent/log")),
+            ),
+            PathBuf::from("/tmp/dcent/log")
+        );
+    }
+
+    #[test]
+    fn installed_runtime_preserves_an_explicit_log_ring_override() {
+        assert_eq!(
+            default_log_ring_dir_for_policy(false, Some(PathBuf::from("/data/dcent/log")),),
+            PathBuf::from("/data/dcent/log")
+        );
     }
 
     #[test]

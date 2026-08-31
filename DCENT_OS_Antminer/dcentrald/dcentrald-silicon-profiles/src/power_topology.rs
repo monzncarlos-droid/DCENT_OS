@@ -5,7 +5,7 @@
 //! # The two catalogs this module fuses
 //!
 //! 1. **Routing catalog** — [`crate::psus`] (`Psu` / `PsuCatalogEntry`,
-//!    15 rows): I²C address, control-protocol family, enable-GPIO pin,
+//!    16 rows): I²C address, control-protocol family, enable-GPIO pin,
 //!    max power, fleet usage. This is the catalog dispatch code keys on.
 //! 2. **Spec catalog** — `dcentrald_api_types::psu_model` (`ApwModel` /
 //!    `ApwSpec`, 18 rows): voltage/current/wattage envelopes, AC input,
@@ -128,6 +128,7 @@ pub const fn binding_for_protocol(protocol: PsuProtocol) -> HalControlBinding {
         PsuProtocol::PmBus => HalControlBinding::NoneAcApply,
         PsuProtocol::Unresolved
         | PsuProtocol::Apw9FramedI2c
+        | PsuProtocol::Apw8UnspecifiedI2c
         | PsuProtocol::BitmainProtoV1
         | PsuProtocol::BitmainProtoV2
         | PsuProtocol::Apw12PlusRegister => HalControlBinding::NoneUnimplemented,
@@ -177,6 +178,7 @@ pub const fn apw_models_for(psu: Psu) -> &'static [ApwModel] {
     match psu {
         Psu::Apw3PlusPlus => &[ApwModel::Apw3],
         Psu::Apw7 => &[ApwModel::Apw7],
+        Psu::Apw8 => &[ApwModel::Apw8HighV],
         Psu::Apw9 => &[ApwModel::Apw9],
         Psu::Apw12 => &[
             ApwModel::Apw12_1215a,
@@ -277,7 +279,7 @@ mod tests {
     #[test]
     fn every_catalog_row_has_a_descriptor() {
         assert_eq!(all_power_topologies().count(), ALL_PSUS.len());
-        assert_eq!(ALL_PSUS.len(), 15);
+        assert_eq!(ALL_PSUS.len(), 16);
     }
 
     // -- Binding derivation is exactly the protocol column ----------------
@@ -290,6 +292,7 @@ mod tests {
                 PsuProtocol::PmBus => HalControlBinding::NoneAcApply,
                 PsuProtocol::Unresolved
                 | PsuProtocol::Apw9FramedI2c
+                | PsuProtocol::Apw8UnspecifiedI2c
                 | PsuProtocol::BitmainProtoV1
                 | PsuProtocol::BitmainProtoV2
                 | PsuProtocol::Apw12PlusRegister => HalControlBinding::NoneUnimplemented,
@@ -381,6 +384,12 @@ mod tests {
         assert_eq!(apw9.catalog.protocol, PsuProtocol::Apw9FramedI2c);
         assert_eq!(apw9.control_binding, HalControlBinding::NoneUnimplemented);
         assert!(!apw9.pmbus_read_only_telemetry);
+        let apw8 = Psu::Apw8.power_topology();
+        assert_eq!(apw8.catalog.i2c_address, None);
+        assert_eq!(apw8.catalog.protocol, PsuProtocol::Apw8UnspecifiedI2c);
+        assert_eq!(apw8.control_binding, HalControlBinding::NoneUnimplemented);
+        assert!(!apw8.pmbus_read_only_telemetry);
+        assert_eq!(apw8.apw_models, &[ApwModel::Apw8HighV]);
     }
 
     // -- Cross-catalog identity evidence ----------------------------------

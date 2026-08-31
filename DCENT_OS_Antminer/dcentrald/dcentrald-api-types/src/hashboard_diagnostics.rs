@@ -173,9 +173,11 @@ pub fn classify_domain_voltages(domain_voltages_mv: &[u32]) -> HashboardFault {
             break;
         }
     }
-    if monotonic_dec
-        && domain_voltages_mv.first().unwrap() - domain_voltages_mv.last().unwrap() > 50
-    {
+    let cascade_delta_exceeds_threshold = domain_voltages_mv
+        .first()
+        .zip(domain_voltages_mv.last())
+        .is_some_and(|(first, last)| first.saturating_sub(*last) > 50);
+    if monotonic_dec && cascade_delta_exceeds_threshold {
         return HashboardFault::DomainCascadeResistance;
     }
     if max_below <= 50.0 && max_above <= 50.0 {

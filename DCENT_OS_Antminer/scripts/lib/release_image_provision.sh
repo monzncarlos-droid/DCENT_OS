@@ -290,6 +290,17 @@ dcent_provision_release_image() {
         echo "DCENTos post-build (${_dcent_label}): release image — removed first-boot-grace marker (no auto-SSH before a credential exists)"
     fi
 
+    # AM3-BB lab rescue SSH ships in the DEV overlay (`rescue_ssh_enabled`).
+    # Strip it from RELEASE images only — lab/DEV keep the rescue marker.
+    _dcent_rescue="${_dcent_config_dir}/rescue_ssh_enabled"
+    if dcent_release_path_exists "$_dcent_rescue"; then
+        if ! dcent_release_remove_exact_entry "$_dcent_rescue" "AM3-BB rescue SSH marker"; then
+            dcent_release_abort_marker "$_dcent_marker" "cannot strip AM3-BB rescue SSH marker"
+            return 1
+        fi
+        echo "DCENTos post-build (${_dcent_label}): release image — stripped AM3-BB rescue SSH marker"
+    fi
+
     # 2. Publish the runtime posture marker only after every prerequisite has
     #    passed. Unlinking the exact old name first is safe for symlinks and
     #    hardlinks: neither target inode is opened or rewritten.

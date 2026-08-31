@@ -1,9 +1,13 @@
 //! Amlogic A113D platform implementation.
 //!
 //! The Amlogic A113D (aarch64, quad Cortex-A53) is used in newer Antminer models:
-//!   - S19 XP, S19k Pro (with BM1366, NoPic on the verified .78 am3-aml unit)
-//!   - S21, S21 Pro, S21+, S21 XP (with BM1368/BM1370, NoPic)
-//!   - T21 (with BM1368)
+//!   - S19k Pro (BM1366, NoPic on the verified .78 am3-aml unit)
+//!   - S19 XP / S19j XP are refused: production UART routing is observed,
+//!     but deployed-board and PIC/PSU selection remain unresolved
+//!   - S21 and S21 Pro (with BM1368/BM1370, NoPic)
+//!   - S21 XP is refused: exact production routing contradicts the shared S21
+//!     third UART and its PIC/PSU selection is unresolved.
+//!   - T21 package evidence exists, but its controller/PIC/PSU profile is unresolved
 //!   - L9 (Scrypt, with BM1491)
 //!
 //! Key differences from Zynq:
@@ -15,10 +19,12 @@
 //!   - I2C via standard /dev/i2c-N
 //!   - Some models (S21) have NO PIC — voltage is frequency-controlled only
 //!
-//! GPIO mapping (verified on S21 at .135, 2026-04-11):
+//! GPIO mapping (plug/reset/LED/fan verified on S21 at .135, 2026-04-11):
 //!   - PLUG_DETECT: gpio439=CH0, gpio440=CH1, gpio441=CH2 (active HIGH, pulldown)
 //!   - BOARD_RESET: gpio454=CH0, gpio455=CH1, gpio456=CH2 (active LOW = reset)
-//!   - PSU_ENABLE:  gpio437 (active HIGH: 1=PSU ON, 0=OFF —  Q10, corrected 2026-05-21)
+//!   - PSU_ENABLE:  gpio437 is **board_target scoped**. Never one Amlogic
+//!     pin polarity. S19k / am3-s19k: software 0=ON, 1=OFF. S21-class NoPic:
+//!     1=ON / SafeOff=0. Software SafeOff is not VerifiedRailCut / DMM.
 //!   - LED_RED:     gpio438, LED_GREEN: gpio453 (active HIGH)
 //!   - FAN_TACH:    gpio447-450 (falling edge, 4 fans)
 //!
@@ -190,8 +196,8 @@ pub enum AmlogicNoPicProfile {
     S21,
 }
 
-const AML_BOOT_SAFE_RECEIPT: &str = "/run/dcentos/amlogic-boot-safe-state-v1";
-const AML_BOOT_SAFE_SCHEMA: &str = "dcentos.amlogic-safe-state/v1";
+const AML_BOOT_SAFE_RECEIPT: &str = "/run/dcentos/amlogic-boot-safe-state-v2";
+const AML_BOOT_SAFE_SCHEMA: &str = "dcentos.amlogic-safe-state/v2";
 const AML_BOOT_SAFE_RESOURCE: &str = "amlogic-gpio437-power-gate";
 const AML_BOOT_FAN_DUTY_NS: u32 = 30_000;
 const AML_BOOT_FAN_PERIOD_NS: u32 = 100_000;
@@ -252,12 +258,22 @@ fn parse_amlogic_boot_safe_handoff(source: &str) -> Result<AmlogicBootSafeHandof
         "fan1_duty_ns",
         "fan1_period_ns",
         "fan1_enabled",
+        "hashboard_reset_gpio454_direction",
+        "hashboard_reset_gpio454_active_low",
+        "hashboard_reset_gpio454_value",
+        "hashboard_reset_gpio455_direction",
+        "hashboard_reset_gpio455_active_low",
+        "hashboard_reset_gpio455_value",
+        "hashboard_reset_gpio456_direction",
+        "hashboard_reset_gpio456_active_low",
+        "hashboard_reset_gpio456_value",
+        "hashboard_reset_low_bitmap",
         "evidence_grade",
         "physical_rail_measured",
     ];
     if fields.len() != REQUIRED.len() || REQUIRED.iter().any(|key| !fields.contains_key(key)) {
         return Err(HalError::Platform(
-            "Amlogic boot-safe receipt fields do not match schema v1".into(),
+            "Amlogic boot-safe receipt fields do not match schema v2".into(),
         ));
     }
     let require = |key: &str, expected: &str| -> Result<()> {
@@ -285,6 +301,16 @@ fn parse_amlogic_boot_safe_handoff(source: &str) -> Result<AmlogicBootSafeHandof
     require("readback_value", commanded)?;
     require("fan0_enabled", "1")?;
     require("fan1_enabled", "1")?;
+    require("hashboard_reset_gpio454_direction", "out")?;
+    require("hashboard_reset_gpio454_active_low", "0")?;
+    require("hashboard_reset_gpio454_value", "0")?;
+    require("hashboard_reset_gpio455_direction", "out")?;
+    require("hashboard_reset_gpio455_active_low", "0")?;
+    require("hashboard_reset_gpio455_value", "0")?;
+    require("hashboard_reset_gpio456_direction", "out")?;
+    require("hashboard_reset_gpio456_active_low", "0")?;
+    require("hashboard_reset_gpio456_value", "0")?;
+    require("hashboard_reset_low_bitmap", "0x7")?;
     require("evidence_grade", "software-readback")?;
     require("physical_rail_measured", "false")?;
 
@@ -331,10 +357,7 @@ fn amlogic_handoff_identity_matches_profile(
         AmlogicNoPicProfile::S19k => platform == "am3-aml-s19k" && board_target == "am3-s19k",
         AmlogicNoPicProfile::S21 => matches!(
             (platform, board_target),
-            ("am3-aml-s21", "am3-s21")
-                | ("am3-aml-s21pro", "am3-s21pro")
-                | ("am3-aml-s21xp", "am3-s21xp")
-                | ("am3-aml-t21", "am3-t21")
+            ("am3-aml-s21", "am3-s21") | ("am3-aml-s21pro", "am3-s21pro")
         ),
     }
 }
@@ -342,10 +365,7 @@ fn amlogic_handoff_identity_matches_profile(
 fn amlogic_board_target_matches_profile(expected: AmlogicNoPicProfile, board_target: &str) -> bool {
     match expected {
         AmlogicNoPicProfile::S19k => board_target == "am3-s19k",
-        AmlogicNoPicProfile::S21 => matches!(
-            board_target,
-            "am3-s21" | "am3-s21pro" | "am3-s21xp" | "am3-t21"
-        ),
+        AmlogicNoPicProfile::S21 => matches!(board_target, "am3-s21" | "am3-s21pro"),
     }
 }
 
@@ -413,6 +433,15 @@ fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<S
     let fan1 = read_live("/sys/class/pwm/pwmchip0/pwm1/duty_cycle")?;
     let fan1_period = read_live("/sys/class/pwm/pwmchip0/pwm1/period")?;
     let fan1_enabled = read_live("/sys/class/pwm/pwmchip0/pwm1/enable")?;
+    let reset454_direction = read_live("/sys/class/gpio/gpio454/direction")?;
+    let reset454_active_low = read_live("/sys/class/gpio/gpio454/active_low")?;
+    let reset454_value = read_live("/sys/class/gpio/gpio454/value")?;
+    let reset455_direction = read_live("/sys/class/gpio/gpio455/direction")?;
+    let reset455_active_low = read_live("/sys/class/gpio/gpio455/active_low")?;
+    let reset455_value = read_live("/sys/class/gpio/gpio455/value")?;
+    let reset456_direction = read_live("/sys/class/gpio/gpio456/direction")?;
+    let reset456_active_low = read_live("/sys/class/gpio/gpio456/active_low")?;
+    let reset456_value = read_live("/sys/class/gpio/gpio456/value")?;
     let want_safe_off = if s19k_board_target_is_live_alias(board_target.as_str()) {
         "1"
     } else {
@@ -427,9 +456,18 @@ fn validate_amlogic_boot_safe_handoff(expected: AmlogicNoPicProfile) -> Result<S
         || fan1 != AML_BOOT_FAN_DUTY_NS.to_string()
         || fan1_period != AML_BOOT_FAN_PERIOD_NS.to_string()
         || fan1_enabled != "1"
+        || reset454_direction != "out"
+        || reset454_active_low != "0"
+        || reset454_value != "0"
+        || reset455_direction != "out"
+        || reset455_active_low != "0"
+        || reset455_value != "0"
+        || reset456_direction != "out"
+        || reset456_active_low != "0"
+        || reset456_value != "0"
     {
         return Err(HalError::Platform(format!(
-            "Amlogic boot-safe live revalidation failed: direction={direction:?} value={value:?} active_low={active_low:?} fan0={fan0:?}/{fan0_period:?}/{fan0_enabled:?} fan1={fan1:?}/{fan1_period:?}/{fan1_enabled:?}"
+            "Amlogic boot-safe live revalidation failed: direction={direction:?} value={value:?} active_low={active_low:?} fan0={fan0:?}/{fan0_period:?}/{fan0_enabled:?} fan1={fan1:?}/{fan1_period:?}/{fan1_enabled:?} reset454={reset454_direction:?}/{reset454_active_low:?}/{reset454_value:?} reset455={reset455_direction:?}/{reset455_active_low:?}/{reset455_value:?} reset456={reset456_direction:?}/{reset456_active_low:?}/{reset456_value:?}"
         )));
     }
     Ok(board_target)
@@ -439,12 +477,25 @@ impl AmlogicNoPicProfile {
     fn label(self) -> &'static str {
         match self {
             Self::S19k => "S19K/S19 XP Amlogic NoPic",
-            Self::S21 => "S21/T21 Amlogic NoPic",
+            Self::S21 => "S21-family Amlogic NoPic",
         }
+    }
+
+    /// Freeze GPIO437 polarity at profile admission. Retained power owners
+    /// must never re-read a mutable board marker after they have acquired
+    /// hardware custody: S19k SafeOff=1 is S21 ON, while S21 SafeOff=0 is
+    /// S19k ON.
+    fn psu_is_active_low(self) -> bool {
+        matches!(self, Self::S19k)
     }
 }
 
 /// Opaque admission proof for one physical Amlogic chain slot.
+///
+/// This is currently constructible only for the evidenced S21 UART-to-slot
+/// route. The held S19k corpus proves that ttyS1 can answer while physical
+/// slot 0 is absent, so S19k must remain unbound until ASIC-side EEPROM
+/// identity supplies a real tty-to-physical-slot relation.
 #[derive(Debug)]
 pub struct AmlogicNoPicAdmission {
     profile: AmlogicNoPicProfile,
@@ -459,9 +510,10 @@ impl AmlogicNoPicAdmission {
     /// bind it to the configured chain UART, and refuse every mismatch before
     /// GPIO, PWM, or management-I2C mutation.
     pub fn detect(expected: AmlogicNoPicProfile, serial_device: &str) -> Result<Self> {
-        let active_slot = amlogic_slot_from_serial_device(serial_device).ok_or_else(|| {
+        let active_slot = amlogic_slot_from_serial_device(expected, serial_device).ok_or_else(|| {
             HalError::Platform(format!(
-                "Amlogic NoPic admission does not recognize chain UART {serial_device:?}"
+                "Amlogic NoPic admission cannot bind {} chain UART {serial_device:?} to a physical slot; S19k tty-to-slot topology is unbound and S21 requires its evidenced tty route",
+                expected.label()
             ))
         })?;
         if !Path::new(serial_device).exists() {
@@ -503,12 +555,18 @@ impl AmlogicNoPicAdmission {
                 expected.label()
             )));
         }
+        if expected == AmlogicNoPicProfile::S19k {
+            return Err(HalError::Platform(
+                "S19k tty-to-physical-slot topology is unbound: held .88 evidence has ttyS1 answering 77 BM1366 chips while physical slot 0 is absent; use logical multi-UART discovery until unique ASIC-side EEPROM identity binds a slot"
+                    .to_string(),
+            ));
+        }
         if active_slot > 2 {
             return Err(HalError::Platform(format!(
                 "Amlogic NoPic active slot {active_slot} is outside the verified three-slot topology"
             )));
         }
-        if amlogic_slot_from_serial_device(serial_device) != Some(active_slot) {
+        if amlogic_slot_from_serial_device(expected, serial_device) != Some(active_slot) {
             return Err(HalError::Platform(format!(
                 "Amlogic NoPic serial endpoint {serial_device:?} does not resolve to admitted slot {active_slot}"
             )));
@@ -559,12 +617,392 @@ impl AmlogicNoPicAdmission {
     }
 }
 
-fn amlogic_slot_from_serial_device(serial_device: &str) -> Option<u8> {
-    match serial_device {
-        "/dev/ttyS1" => Some(0),
-        "/dev/ttyS2" => Some(1),
-        "/dev/ttyS3" | "/dev/ttyS4" => Some(2),
-        _ => None,
+/// Controller-facing logical-chain route recovered independently from stock
+/// and VNish S19k firmware. `logical_board_address` is the controller address
+/// reported by firmware; none of these fields claims connector-face geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kNativeLogicalChainRoute {
+    pub logical_chain: u8,
+    pub logical_board_address: u8,
+    pub uart: &'static str,
+    pub plug_gpio: u32,
+    pub reset_gpio: u32,
+}
+
+/// Complete logical route in stock chain order. A runtime admission selects
+/// the entries whose freshly checked plug/EEPROM population is present.
+pub const S19K_NATIVE_LOGICAL_CHAIN_ROUTES: [S19kNativeLogicalChainRoute; 3] = [
+    S19kNativeLogicalChainRoute {
+        logical_chain: 0,
+        logical_board_address: 1,
+        uart: "/dev/ttyS3",
+        plug_gpio: 439,
+        reset_gpio: 454,
+    },
+    S19kNativeLogicalChainRoute {
+        logical_chain: 1,
+        logical_board_address: 2,
+        uart: "/dev/ttyS2",
+        plug_gpio: 440,
+        reset_gpio: 455,
+    },
+    S19kNativeLogicalChainRoute {
+        logical_chain: 2,
+        logical_board_address: 3,
+        uart: "/dev/ttyS1",
+        plug_gpio: 441,
+        reset_gpio: 456,
+    },
+];
+pub const S19K_NATIVE_EXPECTED_CHIPS_PER_UART: u8 = 77;
+
+/// Read-only owner for the complete S19k fan-observation surface.
+///
+/// The wrapped Amlogic controller remains private so this capability cannot be
+/// converted into [`FanAccess`] and used to command PWM. It exposes only tach
+/// samples and current PWM readback.
+pub struct S19kNativeFanObservation {
+    fan: AmlogicFan,
+}
+
+impl S19kNativeFanObservation {
+    fn open() -> Result<Self> {
+        Ok(Self {
+            fan: AmlogicFan::new()?,
+        })
+    }
+
+    pub fn get_rpm(&self) -> u32 {
+        self.fan.get_rpm()
+    }
+
+    pub fn get_speed_pwm(&self) -> u8 {
+        self.fan.get_speed_pwm()
+    }
+
+    pub fn get_per_fan_rpm(&self) -> Vec<(u8, u32)> {
+        self.fan.get_per_fan_rpm()
+    }
+
+    pub fn fan_count(&self) -> u8 {
+        self.fan.fan_count()
+    }
+
+    pub fn tach_available(&self) -> bool {
+        self.fan.tach_available()
+    }
+}
+
+/// Opaque read-only platform admission for a freshly observed S19k population.
+///
+/// Unlike [`AmlogicNoPicAdmission`], this capability is aggregate. It proves
+/// every UART selected by controller-facing logical-chain evidence exists and
+/// at least one plug input is asserted. It retains the physical bitmap without
+/// claiming connector-face geometry. It can establish cooling and retained
+/// temperature observation, but it cannot mint a PSU-enable operation.
+#[derive(Debug)]
+pub struct S19kNativeAggregateAdmission {
+    board_target: String,
+    populated_slots: [bool; 3],
+}
+
+/// Profile-aware production admission for a checked S19k native population.
+/// Fields stay private so an aggregate observation cannot be upgraded by
+/// caller-selected UART or reset ordering.
+#[derive(Debug)]
+pub struct S19kNativePopulationAdmission {
+    aggregate: S19kNativeAggregateAdmission,
+    routes: Vec<S19kNativeLogicalChainRoute>,
+    generation: Arc<()>,
+}
+
+/// Checked proof that all three physical reset lines were asserted before a
+/// possible GPIO437/APW enable. The absent address-1 line is included.
+#[derive(Debug)]
+pub struct S19kNativeAllResetsAsserted {
+    reset_gpios: [u32; 3],
+}
+
+impl S19kNativeAllResetsAsserted {
+    pub fn reset_gpios(&self) -> [u32; 3] {
+        self.reset_gpios
+    }
+}
+
+/// Checked post-power reset release bound to the admitted population. Every
+/// absent logical chain is positively re-asserted before UART ownership.
+#[derive(Debug)]
+pub struct S19kNativePopulationResetRelease {
+    released: Vec<S19kNativeLogicalChainRoute>,
+    absent_reset_gpios: Vec<u32>,
+    power_writes_completed_at: Instant,
+    reset_release_completed_at: Instant,
+    power_status_word: Option<u16>,
+    generation: Arc<()>,
+}
+
+impl S19kNativePopulationResetRelease {
+    pub fn released(&self) -> &[S19kNativeLogicalChainRoute] {
+        &self.released
+    }
+
+    pub fn absent_reset_gpios(&self) -> &[u32] {
+        &self.absent_reset_gpios
+    }
+
+    pub fn power_writes_completed_at(&self) -> Instant {
+        self.power_writes_completed_at
+    }
+
+    pub fn power_status_word(&self) -> Option<u16> {
+        self.power_status_word
+    }
+
+    pub fn reset_release_completed_at(&self) -> Instant {
+        self.reset_release_completed_at
+    }
+}
+
+impl S19kNativeAggregateAdmission {
+    /// Bind the complete logical-chain table to S19k boot-safe identity before any
+    /// PSU, reset, PWM-command, UART, or management-I2C mutation. Checked plug
+    /// observation may export its read-only sysfs GPIO lines.
+    pub fn detect() -> Result<Self> {
+        let uart_available =
+            S19K_NATIVE_LOGICAL_CHAIN_ROUTES.map(|route| Path::new(route.uart).exists());
+        let observed = detect_amlogic_nopic_profile()?;
+        let board_target = validate_amlogic_boot_safe_handoff(AmlogicNoPicProfile::S19k)?;
+        let populated_slots = read_plug_topology_checked()?;
+        Self::from_profile_evidence(observed, &board_target, populated_slots, uart_available)
+    }
+
+    fn from_profile_evidence(
+        observed: AmlogicNoPicProfile,
+        board_target: &str,
+        populated_slots: [bool; 3],
+        uart_available: [bool; 3],
+    ) -> Result<Self> {
+        if observed != AmlogicNoPicProfile::S19k {
+            return Err(HalError::Platform(format!(
+                "native S19k aggregate admission observed incompatible {} identity",
+                observed.label()
+            )));
+        }
+        if !amlogic_board_target_matches_profile(AmlogicNoPicProfile::S19k, board_target) {
+            return Err(HalError::Platform(format!(
+                "native S19k aggregate admission refuses board target {board_target:?}"
+            )));
+        }
+        if let Some((index, route)) = S19K_NATIVE_LOGICAL_CHAIN_ROUTES
+            .iter()
+            .enumerate()
+            .find(|(index, _)| populated_slots[*index] && !uart_available[*index])
+        {
+            return Err(HalError::Platform(format!(
+                "native S19k aggregate admission requires populated logical chain {index} UART {}",
+                route.uart
+            )));
+        }
+        let populated_count = populated_slots.iter().filter(|present| **present).count();
+        if !(1..=S19K_NATIVE_LOGICAL_CHAIN_ROUTES.len()).contains(&populated_count) {
+            return Err(HalError::Platform(format!(
+                "native S19k aggregate admission requires one to three populated logical chains; observed {populated_slots:?} ({populated_count} populated)"
+            )));
+        }
+        Ok(Self {
+            board_target: board_target.to_owned(),
+            populated_slots,
+        })
+    }
+
+    pub fn board_target(&self) -> &str {
+        &self.board_target
+    }
+
+    pub fn logical_chain_routes(&self) -> Vec<S19kNativeLogicalChainRoute> {
+        S19K_NATIVE_LOGICAL_CHAIN_ROUTES
+            .iter()
+            .copied()
+            .filter(|route| self.populated_slots[route.logical_chain as usize])
+            .collect()
+    }
+
+    pub fn populated_slots(&self) -> [bool; 3] {
+        self.populated_slots
+    }
+
+    /// Establish retained bus-1 thermal observation without creating a PSU
+    /// enable capability. Future cold-start custody must separately promote
+    /// power authority after live APW/electrical evidence exists.
+    pub fn spawn_thermal_observation_service(&self) -> Result<AmlogicPowerThermalService> {
+        let mut service = AmlogicPowerThermalService::spawn_with_required_slots(
+            self.populated_slots,
+            AmlogicNoPicProfile::S19k,
+        )?;
+        service.psu_enable_operation_available = false;
+        Ok(service)
+    }
+
+    /// Acquire the complete four-tach read-only owner without exposing a PWM
+    /// command method.
+    pub fn open_fan_observation(&self) -> Result<Arc<S19kNativeFanObservation>> {
+        Ok(Arc::new(S19kNativeFanObservation::open()?))
+    }
+
+    /// Promote only the freshly selected subset of the fixed logical route.
+    /// Board-model admission remains the daemon's independent responsibility.
+    pub fn into_population(self) -> Result<S19kNativePopulationAdmission> {
+        let routes = self.logical_chain_routes();
+        if routes.is_empty() || routes.len() > S19K_NATIVE_LOGICAL_CHAIN_ROUTES.len() {
+            return Err(HalError::Platform(format!(
+                "native S19k population route is empty or oversized: {:?}",
+                self.populated_slots
+            )));
+        }
+        Ok(S19kNativePopulationAdmission {
+            aggregate: self,
+            routes,
+            generation: Arc::new(()),
+        })
+    }
+}
+
+impl S19kNativePopulationAdmission {
+    pub fn board_target(&self) -> &str {
+        self.aggregate.board_target()
+    }
+
+    pub fn populated_slots(&self) -> [bool; 3] {
+        self.aggregate.populated_slots()
+    }
+
+    pub fn logical_chain_routes(&self) -> &[S19kNativeLogicalChainRoute] {
+        &self.routes
+    }
+
+    /// Establish retained bus-1 thermal, rollback, terminal-SafeOff, and
+    /// one-shot GPIO437/APW ownership for the mapped native route.
+    pub fn spawn_power_thermal_service(&self) -> Result<AmlogicPowerThermalService> {
+        let mut service = AmlogicPowerThermalService::spawn_with_required_slots_and_generation(
+            self.populated_slots(),
+            AmlogicNoPicProfile::S19k,
+            Some(Arc::clone(&self.generation)),
+        )?;
+        service.psu_enable_operation_available = true;
+        Ok(service)
+    }
+
+    /// Open the retained four-channel command/tach controller. Unlike the
+    /// aggregate observation facade, this surface is available only after the
+    /// exact controller-facing population route has been admitted.
+    pub fn open_fan_controller(&self) -> Result<Arc<dyn FanAccess>> {
+        Ok(Arc::new(AmlogicFan::new()?))
+    }
+
+    pub fn assert_all_resets_checked(&self) -> Result<S19kNativeAllResetsAsserted> {
+        assert_s19k_native_all_resets_checked()
+    }
+
+    /// Release only the freshly observed populated routes after the one-shot
+    /// power operation completed. Any partial failure re-asserts all three reset
+    /// lines before returning an error so caller rollback can cut GPIO437.
+    pub fn release_mapped_resets_checked(
+        &self,
+        asserted: S19kNativeAllResetsAsserted,
+        power: ApwEnableReceipt,
+    ) -> Result<S19kNativePopulationResetRelease> {
+        if asserted.reset_gpios != [454, 455, 456] {
+            return Err(HalError::Platform(format!(
+                "native S19k pre-power reset proof drifted: {:?}",
+                asserted.reset_gpios
+            )));
+        }
+        let power_generation = power.s19k_native_generation.as_ref().ok_or_else(|| {
+            HalError::Platform(
+                "native S19k mapped reset release refused a generic/foreign APW receipt".into(),
+            )
+        })?;
+        if !Arc::ptr_eq(power_generation, &self.generation) {
+            return Err(HalError::Platform(
+                "native S19k mapped reset release refused an APW receipt from another cold-start generation"
+                    .into(),
+            ));
+        }
+        let release = (|| -> Result<Vec<u32>> {
+            for route in &self.routes {
+                let receipt = set_amlogic_board_reset_checked(route.logical_chain, false)?;
+                if receipt.gpio() != route.reset_gpio || receipt.asserted() {
+                    return Err(HalError::Platform(format!(
+                        "native S19k population reset release mismatch: chain={} gpio={} expected_gpio={} asserted={}",
+                        route.logical_chain,
+                        receipt.gpio(),
+                        route.reset_gpio,
+                        receipt.asserted()
+                    )));
+                }
+            }
+            let mut absent_reset_gpios = Vec::new();
+            for route in S19K_NATIVE_LOGICAL_CHAIN_ROUTES
+                .iter()
+                .filter(|route| !self.populated_slots()[route.logical_chain as usize])
+            {
+                let absent = set_amlogic_board_reset_checked(route.logical_chain, true)?;
+                if absent.gpio() != route.reset_gpio || !absent.asserted() {
+                    return Err(HalError::Platform(format!(
+                        "native S19k absent logical chain {} / GPIO{} did not remain reset-asserted",
+                        route.logical_chain, route.reset_gpio
+                    )));
+                }
+                absent_reset_gpios.push(route.reset_gpio);
+            }
+            Ok(absent_reset_gpios)
+        })();
+        let absent_reset_gpios = match release {
+            Ok(value) => value,
+            Err(primary) => {
+                return match assert_s19k_native_all_resets_checked() {
+                Ok(_) => Err(HalError::Platform(format!(
+                    "native S19k mapped reset release failed ({primary}); all resets re-asserted before GPIO437 rollback"
+                ))),
+                Err(rollback) => Err(HalError::Platform(format!(
+                    "native S19k mapped reset release failed ({primary}); reset rollback also failed ({rollback})"
+                ))),
+            };
+            }
+        };
+        Ok(S19kNativePopulationResetRelease {
+            released: self.routes.clone(),
+            absent_reset_gpios,
+            power_writes_completed_at: power.writes_completed_at,
+            reset_release_completed_at: Instant::now(),
+            power_status_word: power.status_word,
+            generation: Arc::clone(&self.generation),
+        })
+    }
+
+    /// Prove that a completed reset release still belongs to this exact
+    /// cold-start admission. This is consumed by the daemon's private joined
+    /// owner; callers cannot manufacture or clone either side.
+    pub fn owns_reset_release(&self, release: &S19kNativePopulationResetRelease) -> bool {
+        Arc::ptr_eq(&self.generation, &release.generation)
+    }
+}
+
+fn amlogic_slot_from_serial_device(
+    profile: AmlogicNoPicProfile,
+    serial_device: &str,
+) -> Option<u8> {
+    match profile {
+        // `.88`: plug topology [false,true,true], but ttyS1 and ttyS2 each
+        // answer 77 BM1366 chips. Therefore ttyS1->slot0 is directly false;
+        // no alternative S19k tty-to-slot permutation is proven offline.
+        AmlogicNoPicProfile::S19k => None,
+        AmlogicNoPicProfile::S21 => match serial_device {
+            "/dev/ttyS1" => Some(0),
+            "/dev/ttyS2" => Some(1),
+            "/dev/ttyS4" => Some(2),
+            _ => None,
+        },
     }
 }
 
@@ -1299,6 +1737,159 @@ impl FanAccess for AmlogicFan {
 /// Amlogic GPIO via sysfs.
 struct AmlogicGpio;
 
+/// Checked software evidence for one active-low Amlogic hashboard reset write.
+///
+/// This receipt proves only that the prepared sysfs line reported raw
+/// `active_low=0`, output direction, and the commanded logical value after the
+/// write. It does not claim an independently measured voltage at the board.
+#[derive(Debug)]
+pub struct AmlogicResetReceipt {
+    chain: u8,
+    gpio: u32,
+    asserted: bool,
+    commanded_value: u8,
+    observed_value: u8,
+    completed_at: Instant,
+}
+
+impl AmlogicResetReceipt {
+    pub fn chain(&self) -> u8 {
+        self.chain
+    }
+
+    pub fn gpio(&self) -> u32 {
+        self.gpio
+    }
+
+    pub fn asserted(&self) -> bool {
+        self.asserted
+    }
+
+    pub fn commanded_value(&self) -> u8 {
+        self.commanded_value
+    }
+
+    pub fn observed_value(&self) -> u8 {
+        self.observed_value
+    }
+
+    pub fn completed_at(&self) -> Instant {
+        self.completed_at
+    }
+}
+
+fn set_amlogic_board_reset_checked_at(
+    gpio_root: &Path,
+    chain: u8,
+    gpio: u32,
+    assert_reset: bool,
+) -> Result<AmlogicResetReceipt> {
+    let root = gpio_root.join(format!("gpio{gpio}"));
+    let direction_path = root.join("direction");
+    let active_low_path = root.join("active_low");
+    let value_path = root.join("value");
+
+    let direction = fs::read_to_string(&direction_path).map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} direction read failed: {error}"
+        ))
+    })?;
+    if direction.trim() != "out" {
+        return Err(HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} is not prepared as output: direction={:?}",
+            direction.trim()
+        )));
+    }
+
+    let active_low = fs::read_to_string(&active_low_path).map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} active_low read failed: {error}"
+        ))
+    })?;
+    if active_low.trim() != "0" {
+        return Err(HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} active_low={:?}; refusing to guess physical reset polarity",
+            active_low.trim()
+        )));
+    }
+
+    // Live S19k/S21 software evidence: raw 0 asserts HB reset, raw 1 releases.
+    let commanded_value = if assert_reset { 0 } else { 1 };
+    fs::write(&value_path, commanded_value.to_string()).map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} write {commanded_value} failed: {error}"
+        ))
+    })?;
+    let observed = fs::read_to_string(&value_path).map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} value readback failed: {error}"
+        ))
+    })?;
+    let observed_value = observed.trim().parse::<u8>().map_err(|error| {
+        HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} value readback {:?} is not a bit: {error}",
+            observed.trim()
+        ))
+    })?;
+    if observed_value != commanded_value {
+        return Err(HalError::Platform(format!(
+            "Amlogic HB{chain} reset GPIO{gpio} readback {observed_value} did not match commanded {commanded_value}"
+        )));
+    }
+
+    Ok(AmlogicResetReceipt {
+        chain,
+        gpio,
+        asserted: assert_reset,
+        commanded_value,
+        observed_value,
+        completed_at: Instant::now(),
+    })
+}
+
+/// Assert or release one prepared Amlogic hashboard reset and require checked
+/// software readback. The name-first resolver preserves GPIO454-456 only as
+/// legacy fallbacks; callers receive an error instead of a silent missed write.
+pub fn set_amlogic_board_reset_checked(
+    chain: u8,
+    assert_reset: bool,
+) -> Result<AmlogicResetReceipt> {
+    let gpio = resolve_reset_gpio_global(chain)?;
+    set_amlogic_board_reset_checked_at(Path::new("/sys/class/gpio"), chain, gpio, assert_reset)
+}
+
+/// Assert the complete S19k reset trio with checked readback. Every line is
+/// attempted even after an earlier failure; callers must still cut GPIO437,
+/// but no positive receipt is returned unless all three exact lines match.
+pub fn assert_s19k_native_all_resets_checked() -> Result<S19kNativeAllResetsAsserted> {
+    let mut reset_gpios = [0u32; 3];
+    let mut failures = Vec::new();
+    for chain in 0..3u8 {
+        match set_amlogic_board_reset_checked(chain, true) {
+            Ok(receipt) => {
+                let expected_gpio = GPIO_RESET_BASE + u32::from(chain);
+                if receipt.gpio() != expected_gpio || !receipt.asserted() {
+                    failures.push(format!(
+                        "chain{chain} returned gpio{} asserted={} (expected gpio{expected_gpio} asserted=true)",
+                        receipt.gpio(),
+                        receipt.asserted()
+                    ));
+                } else {
+                    reset_gpios[usize::from(chain)] = receipt.gpio();
+                }
+            }
+            Err(error) => failures.push(format!("chain{chain}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(HalError::Platform(format!(
+            "native S19k all-reset assertion incomplete: {}",
+            failures.join("; ")
+        )));
+    }
+    Ok(S19kNativeAllResetsAsserted { reset_gpios })
+}
+
 impl GpioAccess for AmlogicGpio {
     fn read_plug_detect(&self) -> [bool; 3] {
         let mut result = [false; 3];
@@ -1325,21 +1916,14 @@ impl GpioAccess for AmlogicGpio {
     }
 
     fn set_board_reset(&self, chain: u8, assert_reset: bool) {
-        let gpio = match resolve_reset_gpio_global(chain) {
-            Ok(n) => n,
-            Err(error) => {
-                tracing::error!(
-                    chain,
-                    error = %error,
-                    "Amlogic HB reset resolve failed; refusing write"
-                );
-                return;
-            }
-        };
-        let path = format!("/sys/class/gpio/gpio{}/value", gpio);
-        // Active LOW: 0 = assert reset, 1 = running
-        let value = if assert_reset { "0" } else { "1" };
-        let _ = fs::write(&path, value);
+        if let Err(error) = set_amlogic_board_reset_checked(chain, assert_reset) {
+            tracing::error!(
+                chain,
+                assert_reset,
+                error = %error,
+                "Amlogic HB reset checked write failed"
+            );
+        }
     }
 }
 
@@ -1347,30 +1931,29 @@ impl GpioAccess for AmlogicGpio {
 // PSU enable for cold boot
 // ---------------------------------------------------------------------------
 
-/// GPIO for PSU enable (PWR_EN, active HIGH: 1=ON, 0=OFF).
+/// GPIO for PSU enable (`PWR_CONTROL` / gpio437). Polarity is
+/// **board_target scoped** — never one Amlogic pin for all boards.
 ///
-/// POLARITY CORRECTED 2026-05-21 (EE C1 productionization-sweep finding).
-/// Previously this HAL wrote 0=ON / 1=OFF (active LOW, "PSU_nEN"). That was
-/// the pre- misreading; it disagreed with every other source of truth
-/// (gpio_maps.rs `AmlogicGpioMap`, vnish_cold_boot.rs `GPIO_PWR_EN`, the
-/// PRODUCTION-READINESS-MATRIX §4.4, and both  Amlogic GPIO tables).
+/// - S21-class NoPic: software 1=ON / SafeOff=0 ( Q10 VNish `S11board`
+///   `echo 1`, S21 `a lab unit` 2026-04-11).
+/// - S19k / am3-s19k: software 0=ON / 1=OFF (live 2026-08-12 + `a lab unit` RE).
+///   Applying S21 SafeOff=0 on am3-s19k **engages** the rail.
 ///
-/// Ground truth —  Q10 (RESOLVED 2026-05-10), direct firmware extract of
-/// VNish v1.2.7 `S11board` init (and stock-Bitmain bmminer matches it):
+/// Software sysfs SafeOff is not VerifiedRailCut and not DMM rail proof.
+/// Runtime write paths in this module already branch on
+/// [`s19k_board_target_is_live_alias`]; missing `board_target` refuses.
+///
+/// S21-class  Q10 (RESOLVED 2026-05-10), VNish v1.2.7 `S11board`:
 ///   `echo out > gpio437/direction; echo 1 > gpio437/value` and NO `active_low`
-///   file is written, so the kernel default (`active_low=0`) means `value=1`
-///   drives the SoC pin electrically HIGH = PSU ON. See
+///   file is written. That extract is S21/VNish start evidence, not a
+///   universal Amlogic polarity. See
 ///
-///   "PWR_EN active level — RESOLVED 2026-05-10 ( Q10)".
+///   and `dcentrald_common::s19k_am3_gpio437`.
 ///
-/// Why the old wrong polarity was never caught by accepted-share evidence:
-/// the S21 `a lab unit` 9-share run (2026-04-11) ran dcentrald ON TOP of already-
-/// running BraiinsOS, which had ALREADY driven gpio437 HIGH (PSU on). Native
-/// Amlogic cold boot from a PSU-OFF state has never been proven (Phase 3 is
-/// BLOCKED), and the old readback gate (write 0, read 0) was a self-consistent
-/// tautology that could not detect inverted polarity. The corrected level only
-/// matters on a true cold boot — which is exactly the production path this
-/// unblocks.
+/// Why S21 `a lab unit` accepted-share evidence cannot pin am3-s19k: that run
+/// executed dcentrald ON TOP of already-running BraiinsOS. Native Amlogic
+/// cold boot from a PSU-OFF state is still not DMM-proven. A write-0 /
+/// read-0 gate is a self-consistent tautology, not a polarity proof.
 ///
 /// GPIO is necessary but not sufficient for native cold boot. A captured
 /// S19K Pro `a lab unit` BraiinsOS NAND environment contains these U-Boot `preboot`
@@ -1439,13 +2022,28 @@ pub struct AmlogicPowerThermalLifecycleOwner {
     psu_commit: Arc<AmlogicPsuCommitAuthority>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AmlogicPsuCommitAuthority {
     terminal: AtomicBool,
     gpio_commit: Mutex<()>,
+    s19k_active_low: bool,
+    s19k_native_generation: Option<Arc<()>>,
 }
 
 impl AmlogicPsuCommitAuthority {
+    fn new(profile: AmlogicNoPicProfile, s19k_native_generation: Option<Arc<()>>) -> Self {
+        Self {
+            terminal: AtomicBool::new(false),
+            gpio_commit: Mutex::new(()),
+            s19k_active_low: profile.psu_is_active_low(),
+            s19k_native_generation,
+        }
+    }
+
+    fn s19k_active_low(&self) -> bool {
+        self.s19k_active_low
+    }
+
     fn latch_terminal(&self) {
         self.terminal.store(true, Ordering::SeqCst);
     }
@@ -1464,12 +2062,12 @@ impl AmlogicPsuCommitAuthority {
             Ok(commit) => commit,
             Err(poisoned) => {
                 let commit = poisoned.into_inner();
-                let rollback = disable_psu_checked();
+                let rollback = disable_psu_checked_for_polarity(self.s19k_active_low);
                 drop(commit);
                 return Err(HalError::Platform(match rollback {
-                    Ok(_) => "Amlogic PSU GPIO commit fence was poisoned; checked LOW rollback completed and enable was refused".into(),
+                    Ok(_) => "Amlogic PSU GPIO commit fence was poisoned; polarity-selected checked SafeOff rollback completed and enable was refused".into(),
                     Err(error) => format!(
-                        "Amlogic PSU GPIO commit fence was poisoned; enable was refused and checked LOW rollback failed ({error})"
+                        "Amlogic PSU GPIO commit fence was poisoned; enable was refused and polarity-selected checked SafeOff rollback failed ({error})"
                     ),
                 }));
             }
@@ -1504,16 +2102,16 @@ impl AmlogicPowerThermalLifecycleOwner {
         self.fence.latch_terminal_safe_off()
     }
 
-    /// Latch both mutation domains and complete the checked GPIO LOW operation
-    /// while holding the same commit fence used by the one-shot HIGH path.
-    /// Once this returns, no enable operation can commit a later HIGH write.
+    /// Latch both mutation domains and complete the SKU-selected checked GPIO
+    /// SafeOff operation while holding the same commit fence used by the
+    /// one-shot enable path. Once this returns, no later enable can commit.
     pub fn latch_terminal_and_disable_psu_checked(
         &self,
     ) -> Result<(TerminalSafeOffTransition, PsuSafeOffReceipt)> {
         self.psu_commit.latch_terminal();
         let transition = self.fence.latch_terminal_safe_off();
         let _gpio_commit = self.psu_commit.begin_terminal_cut();
-        let receipt = disable_psu_checked()?;
+        let receipt = disable_psu_checked_for_polarity(self.psu_commit.s19k_active_low())?;
         Ok((transition, receipt))
     }
 
@@ -1524,8 +2122,8 @@ impl AmlogicPowerThermalLifecycleOwner {
 }
 
 /// Move-only, one-shot composite PSU enable operation. A terminal owner sets
-/// the shared flag before fencing I2C, so a GPIO-high race is rechecked before
-/// the APW transaction and rolls GPIO437 back down.
+/// the shared flag before fencing I2C, so a GPIO-enable race is rechecked
+/// before the APW transaction and rolled back to SKU-selected SafeOff.
 pub struct AmlogicPsuEnableOperation {
     i2c: I2cServiceHandle,
     psu_commit: Arc<AmlogicPsuCommitAuthority>,
@@ -1533,18 +2131,19 @@ pub struct AmlogicPsuEnableOperation {
 
 /// Software evidence that both fixed APW enable writes completed. Optional
 /// STATUS_WORD is diagnostic only and does not prove physical rail voltage.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ApwEnableReceipt {
     writes_completed_at: Instant,
     status_word: Option<u16>,
+    s19k_native_generation: Option<Arc<()>>,
 }
 
 impl ApwEnableReceipt {
-    pub fn writes_completed_at(self) -> Instant {
+    pub fn writes_completed_at(&self) -> Instant {
         self.writes_completed_at
     }
 
-    pub fn status_word(self) -> Option<u16> {
+    pub fn status_word(&self) -> Option<u16> {
         self.status_word
     }
 }
@@ -1553,6 +2152,32 @@ impl AmlogicPowerThermalService {
     /// Reserve `/dev/i2c-1`, perform the checked BOS-3528 pinmux preparation
     /// under that reservation, and start one kernel-fd-only service.
     fn spawn(admission: &AmlogicNoPicAdmission) -> Result<Self> {
+        let mut service =
+            Self::spawn_with_required_slots(admission.populated_slots(), admission.profile())?;
+        service.psu_enable_operation_available = true;
+        Ok(service)
+    }
+
+    /// Track-1 leftover: own TMP75 on i2c-1 without taking a GPIO437 / PSU lease.
+    pub fn spawn_track1_temps(required_slots: [bool; 3]) -> Result<Self> {
+        let mut service =
+            Self::spawn_with_required_slots(required_slots, AmlogicNoPicProfile::S19k)?;
+        service.psu_enable_operation_available = false;
+        Ok(service)
+    }
+
+    fn spawn_with_required_slots(
+        required_slots: [bool; 3],
+        profile: AmlogicNoPicProfile,
+    ) -> Result<Self> {
+        Self::spawn_with_required_slots_and_generation(required_slots, profile, None)
+    }
+
+    fn spawn_with_required_slots_and_generation(
+        required_slots: [bool; 3],
+        profile: AmlogicNoPicProfile,
+        s19k_native_generation: Option<Arc<()>>,
+    ) -> Result<Self> {
         // The hashboard EEPROM write-denylist belongs HERE, not only on the
         // bus-0 helper. On am3-aml the AT24C-class hashboard EEPROMs answer on
         // bus 1 — this bus — so registering an empty denylist left the
@@ -1578,20 +2203,23 @@ impl AmlogicPowerThermalService {
             })?;
         let i2c = owner.request_handle();
         let fence = owner.terminal_fence();
-        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::default());
+        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::new(
+            profile,
+            s19k_native_generation,
+        ));
         // A synchronous control round-trip proves the worker opened its fd and
         // accepted the fixed timeout before any power or telemetry operation.
         i2c.set_timeout(10)?;
         Ok(Self {
             i2c,
-            required_slots: admission.populated_slots(),
+            required_slots,
             lifecycle_owner: Some(AmlogicPowerThermalLifecycleOwner {
                 owner,
                 fence,
                 psu_commit: Arc::clone(&psu_commit),
             }),
             psu_commit,
-            psu_enable_operation_available: true,
+            psu_enable_operation_available: false,
         })
     }
 
@@ -1629,13 +2257,52 @@ impl AmlogicPowerThermalService {
     }
 }
 
+/// Hold leftover rails-up fans at PWM 100 only under the daemon's explicit
+/// `--allow-loud` authority. Refusal occurs before any sysfs mutation.
+pub fn hold_track1_leftover_fans_pwm100(explicit_loud_authority: bool) -> Result<()> {
+    if !explicit_loud_authority {
+        return Err(HalError::Fan(
+            "Track-1 PWM 100 requires explicit --allow-loud authority".into(),
+        ));
+    }
+    const DUTY: &str = "100000";
+    for ch in ["pwm0", "pwm1"] {
+        let base = format!("/sys/class/pwm/pwmchip0/{ch}");
+        let _ = fs::write(format!("{base}/enable"), "1");
+        fs::write(format!("{base}/duty_cycle"), DUTY).map_err(|error| {
+            HalError::Fan(format!("Track-1 leftover {ch} PWM 100 write: {error}"))
+        })?;
+        let observed = fs::read_to_string(format!("{base}/duty_cycle")).map_err(|error| {
+            HalError::Fan(format!("Track-1 leftover {ch} PWM 100 readback: {error}"))
+        })?;
+        if observed.trim() != DUTY {
+            return Err(HalError::Fan(format!(
+                "Track-1 leftover {ch} PWM 100 readback mismatch: {}",
+                observed.trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Open the four-channel tach owner used by the S19k Track-1 leftover path.
+/// This does not change PWM, GPIO437, reset, or I2C state; callers must retain
+/// the owner and pair measurements with the explicit PWM100 hold.
+pub fn open_track1_leftover_fan_tach() -> Result<Arc<dyn FanAccess>> {
+    Ok(Arc::new(AmlogicFan::new()?))
+}
+
 struct AmlogicPsuGpioRollback {
     armed: bool,
+    s19k_active_low: bool,
 }
 
 impl AmlogicPsuGpioRollback {
-    fn armed() -> Self {
-        Self { armed: true }
+    fn armed(s19k_active_low: bool) -> Self {
+        Self {
+            armed: true,
+            s19k_active_low,
+        }
     }
 
     fn disarm(&mut self) {
@@ -1643,7 +2310,7 @@ impl AmlogicPsuGpioRollback {
     }
 
     fn attach_checked_rollback(&mut self, primary: HalError, operation: &'static str) -> HalError {
-        match disable_psu_checked() {
+        match disable_psu_checked_for_polarity(self.s19k_active_low) {
             Ok(_) => {
                 self.disarm();
                 primary
@@ -1658,10 +2325,10 @@ impl AmlogicPsuGpioRollback {
 impl Drop for AmlogicPsuGpioRollback {
     fn drop(&mut self) {
         if self.armed {
-            if let Err(error) = disable_psu_checked() {
+            if let Err(error) = disable_psu_checked_for_polarity(self.s19k_active_low) {
                 tracing::error!(
                     %error,
-                    "Amlogic PSU enable unwound with possible GPIO HIGH state; emergency checked LOW rollback failed"
+                    "Amlogic PSU enable unwound with possible enabled GPIO state; emergency polarity-selected checked SafeOff rollback failed"
                 );
             }
         }
@@ -1675,9 +2342,11 @@ impl AmlogicPsuEnableOperation {
     pub fn enable_psu(self) -> Result<ApwEnableReceipt> {
         let gpio_commit = self.psu_commit.begin_enable()?;
         // Arm before the first GPIO call: an unwind after any partial sysfs
-        // mutation must issue LOW while the commit fence is still held.
-        let mut rollback = AmlogicPsuGpioRollback::armed();
-        if let Err(enable_error) = enable_psu_gpio() {
+        // mutation must issue the SKU-selected SafeOff value while the commit
+        // fence is still held.
+        let s19k_active_low = self.psu_commit.s19k_active_low();
+        let mut rollback = AmlogicPsuGpioRollback::armed(s19k_active_low);
+        if let Err(enable_error) = enable_psu_gpio_for_polarity(s19k_active_low) {
             return Err(rollback.attach_checked_rollback(enable_error, "PSU GPIO enable failed"));
         }
         if self.psu_commit.is_terminal() {
@@ -1692,7 +2361,7 @@ impl AmlogicPsuEnableOperation {
         }
         if self.psu_commit.is_terminal() {
             let superseded = amlogic_psu_enable_superseded(
-                "terminal safe-off raced the APW transaction before GPIO HIGH commit",
+                "terminal safe-off raced the APW transaction before GPIO enable commit",
             );
             return Err(rollback
                 .attach_checked_rollback(superseded, "PSU enable was terminally superseded"));
@@ -1726,6 +2395,7 @@ impl AmlogicPsuEnableOperation {
         Ok(ApwEnableReceipt {
             writes_completed_at,
             status_word,
+            s19k_native_generation: self.psu_commit.s19k_native_generation.clone(),
         })
     }
 
@@ -1805,23 +2475,17 @@ impl AmlogicThermalPort {
     }
 }
 
-/// Enable the APW PSU output for cold boot.
+/// Resolve the PSU enable GPIO. Name-first `PWR_CONTROL`, legacy sysfs 437
+/// only when the DT name is absent.
 ///
-/// On S21, the PSU bring-up has two layers (polarity corrected 2026-05-21):
-///   - LOW  (0) = PSU disabled (safe init / shutdown)
-///   - HIGH (1) = PSU enabled (12V output active)
-///   - APW at I2C bus 1 / address 0x1f receives the stock U-Boot preboot
-///     enable sequence before ASIC probing.
-///
-/// Stock/VNish userspace drives gpio437 HIGH (`echo 1`) to enable hashboard
-/// power. Native DCENT_OS must also replay the APW I2C sequence because there
-/// is no bosminer/BraiinsOS rootfs in the final boot.
-/// Name-first `PWR_CONTROL`, legacy sysfs 437 only when the DT name is absent.
+/// gpio437 polarity is **board_target scoped** (not one Amlogic pin):
+///   - S21-class NoPic: 1=ON / SafeOff=0
+///   - S19k / am3-s19k: 0=ON / 1=OFF
+/// Software SafeOff is not VerifiedRailCut. S21/VNish `echo 1` is that
+/// board_target's start pattern, not a universal enable.
 pub fn resolve_psu_gpio_global() -> Result<u32> {
-    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(
-        "PWR_CONTROL",
-        GPIO_PSU_ENABLE,
-    )?;
+    let resolved =
+        crate::gpio_name_resolver::resolve_name_or_legacy("PWR_CONTROL", GPIO_PSU_ENABLE)?;
     s19k_am3_pwr_control_sysfs_n(resolved.global()).map_err(|e| HalError::Platform(e.into()))
 }
 
@@ -1838,8 +2502,7 @@ pub fn resolve_plug_gpio_global(slot: u32) -> Result<u32> {
             )));
         }
     };
-    let resolved =
-        crate::gpio_name_resolver::resolve_name_or_legacy(name, GPIO_PLUG_BASE + slot)?;
+    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(name, GPIO_PLUG_BASE + slot)?;
     s19k_am3_plug_sysfs_n(slot as u8, resolved.global()).map_err(|e| HalError::Platform(e.into()))
 }
 
@@ -1877,10 +2540,8 @@ fn resolve_fan_tach_gpio_global(slot: usize) -> Result<u32> {
             )));
         }
     };
-    let resolved = crate::gpio_name_resolver::resolve_name_or_legacy(
-        name,
-        GPIO_FAN_TACH_BASE + slot as u32,
-    )?;
+    let resolved =
+        crate::gpio_name_resolver::resolve_name_or_legacy(name, GPIO_FAN_TACH_BASE + slot as u32)?;
     s19k_am3_fan_tach_sysfs_n(slot as u8, resolved.global())
         .map_err(|e| HalError::Platform(e.into()))
 }
@@ -1930,7 +2591,7 @@ pub fn write_amlogic_status_led(red: bool, on: bool) -> Result<()> {
     Ok(())
 }
 
-fn enable_psu_gpio() -> Result<()> {
+fn enable_psu_gpio_for_polarity(s19k_active_low: bool) -> Result<()> {
     let n = resolve_psu_gpio_global()?;
     let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
 
@@ -1948,7 +2609,7 @@ fn enable_psu_gpio() -> Result<()> {
     // S21-class: direction "low" is SafeOff then value "1" enables.
     // am3-s19k T6: sysfs 0 engages — direction "low" would energize first.
     // Glitch-free SafeOff is direction "high" (1=OFF), then value "0" (ON).
-    if amlogic_board_target_is_s19k()? {
+    if s19k_active_low {
         fs::write(&dir_path, "high")
             .map_err(|e| HalError::Platform(format!("PSU GPIO direction: {}", e)))?;
         fs::write(&gpio_path, "0")
@@ -1968,7 +2629,7 @@ fn enable_psu_gpio() -> Result<()> {
         )));
     }
 
-    if amlogic_board_target_is_s19k()? {
+    if s19k_active_low {
         tracing::info!(
             "PSU GPIO {} driven 0 and read back engaged (am3-s19k T6 active-low enable)",
             n
@@ -1983,8 +2644,8 @@ fn enable_psu_gpio() -> Result<()> {
     Ok(())
 }
 
-fn read_psu_active_low_disabled_checked(n: u32) -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/active_low", n);
+fn read_psu_active_low_disabled_checked_at(gpio_root: &Path, n: u32) -> Result<()> {
+    let path = gpio_root.join(format!("gpio{n}/active_low"));
     let value = fs::read_to_string(&path)
         .map_err(|error| HalError::Platform(format!("PSU GPIO active_low readback: {error}")))?;
     if value.trim() == "0" {
@@ -1998,16 +2659,20 @@ fn read_psu_active_low_disabled_checked(n: u32) -> Result<()> {
     }
 }
 
-fn ensure_psu_active_low_disabled_checked(n: u32) -> Result<()> {
-    let path = format!("/sys/class/gpio/gpio{}/active_low", n);
+fn ensure_psu_active_low_disabled_checked_at(gpio_root: &Path, n: u32) -> Result<()> {
+    let path = gpio_root.join(format!("gpio{n}/active_low"));
     fs::write(&path, "0")
         .map_err(|error| HalError::Platform(format!("PSU GPIO active_low=0: {error}")))?;
-    read_psu_active_low_disabled_checked(n)
+    read_psu_active_low_disabled_checked_at(gpio_root, n)
 }
 
-/// Checked software safe-off evidence for GPIO437. This proves that the LOW
-/// sysfs write completed and a subsequent fallible sysfs read returned LOW; it
-/// does not claim an independently measured physical rail voltage.
+fn ensure_psu_active_low_disabled_checked(n: u32) -> Result<()> {
+    ensure_psu_active_low_disabled_checked_at(Path::new("/sys/class/gpio"), n)
+}
+
+/// Checked software safe-off evidence for GPIO437. This proves that the
+/// SKU-scoped sysfs SafeOff write completed and a subsequent fallible readback
+/// matched it; it does not claim an independently measured physical rail.
 #[derive(Debug)]
 pub struct PsuSafeOffReceipt {
     gpio: u32,
@@ -2024,7 +2689,7 @@ impl PsuSafeOffReceipt {
     }
 }
 
-/// Disable the APW PSU output and require a checked LOW readback.
+/// Resolve the persistent board identity used by generic PSU callers.
 fn amlogic_board_target_is_s19k() -> Result<bool> {
     let value = fs::read_to_string("/etc/dcentos/board_target").map_err(|error| {
         HalError::Platform(format!(
@@ -2040,30 +2705,26 @@ fn amlogic_board_target_is_s19k() -> Result<bool> {
     Ok(s19k_board_target_is_live_alias(trimmed))
 }
 
-pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
-    // Board identity first: never guess S21 SafeOff=0 on an unlabelled S19k.
-    let s19k = amlogic_board_target_is_s19k()?;
-    let n = resolve_psu_gpio_global()?;
-    let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
-    // Track-1 /tmp on Braiins never inherits enable_psu_gpio()'s export.
+fn disable_psu_checked_at(gpio_root: &Path, n: u32, s19k: bool) -> Result<PsuSafeOffReceipt> {
+    let gpio_path = gpio_root.join(format!("gpio{n}/value"));
+    // Track-1 /tmp on Braiins never inherits the polarity-bound enable's export.
     // Crash/planned-stop must export themselves; an unexported write is a miss.
-    if !std::path::Path::new(&gpio_path).exists() {
-        fs::write("/sys/class/gpio/export", format!("{}", n)).map_err(|e| {
-            HalError::Platform(format!("PSU GPIO export for SafeOff: {}", e))
-        })?;
+    if !gpio_path.exists() {
+        fs::write(gpio_root.join("export"), n.to_string())
+            .map_err(|e| HalError::Platform(format!("PSU GPIO export for SafeOff: {}", e)))?;
         std::thread::sleep(Duration::from_millis(100));
     }
-    if !std::path::Path::new(&gpio_path).exists() {
+    if !gpio_path.exists() {
         return Err(HalError::Platform(format!(
             "PSU GPIO {} still unexported after export; SafeOff write would be a silent miss",
             n
         )));
     }
-    ensure_psu_active_low_disabled_checked(n)?;
+    ensure_psu_active_low_disabled_checked_at(gpio_root, n)?;
     // S21-class SafeOff: direction "low" then value "0".
     // am3-s19k T6 SafeOff: direction "high" (1=OFF, glitch-free) then value "1".
     // Never direction "low" on s19k here — that would energize first.
-    let dir_path = format!("/sys/class/gpio/gpio{}/direction", n);
+    let dir_path = gpio_root.join(format!("gpio{n}/direction"));
     if s19k {
         fs::write(&dir_path, "high")
             .map_err(|e| HalError::Platform(format!("PSU GPIO SafeOff direction: {}", e)))?;
@@ -2077,28 +2738,43 @@ pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
     }
 
     std::thread::sleep(Duration::from_millis(50));
-    if read_psu_enabled_on(n)? {
+    if read_psu_enabled_on_with_polarity_at(gpio_root, n, s19k)? {
         return Err(HalError::Platform(format!(
             "PSU GPIO {} readback stayed engaged after disable",
             n
         )));
     }
 
-    if amlogic_board_target_is_s19k()? {
+    if s19k {
         tracing::info!(
             "PSU GPIO {} driven 1 and read back disengaged (am3-s19k T6 SafeOff)",
             n
         );
     } else {
-        tracing::info!(
-            "PSU GPIO {} driven LOW and read back LOW (PSU disabled)",
-            n
-        );
+        tracing::info!("PSU GPIO {} driven LOW and read back LOW (PSU disabled)", n);
     }
     Ok(PsuSafeOffReceipt {
         gpio: n,
         completed_at: Instant::now(),
     })
+}
+
+fn disable_psu_checked_for_polarity(s19k: bool) -> Result<PsuSafeOffReceipt> {
+    let n = resolve_psu_gpio_global()?;
+    disable_psu_checked_at(Path::new("/sys/class/gpio"), n, s19k)
+}
+
+pub fn disable_psu_checked() -> Result<PsuSafeOffReceipt> {
+    // Persistent/generic callers remain bound to the sealed board marker:
+    // never guess S21 SafeOff=0 on an unlabelled S19k.
+    disable_psu_checked_for_polarity(amlogic_board_target_is_s19k()?)
+}
+
+/// Process-scoped Track-1 S19k SafeOff. The exact Track-1 runtime admission is
+/// the identity authority; this function never reads `/etc` and can never
+/// fall back to the S21 write-0 polarity.
+pub fn disable_s19k_track1_psu_checked() -> Result<PsuSafeOffReceipt> {
+    disable_psu_checked_for_polarity(true)
 }
 
 /// Compatibility wrapper for callers that do not yet consume typed evidence.
@@ -2112,15 +2788,28 @@ pub fn read_psu_enabled_checked() -> Result<bool> {
     read_psu_enabled_on(n)
 }
 
+/// Process-scoped Track-1 S19k rail readback. The already-admitted Track-1
+/// route supplies the SKU identity, so this never consults a persistent marker
+/// and can never reinterpret raw `0` with the S21 active-high polarity.
+pub fn read_s19k_track1_psu_engaged_checked() -> Result<bool> {
+    let n = resolve_psu_gpio_global()?;
+    read_psu_enabled_on_with_polarity_at(Path::new("/sys/class/gpio"), n, true)
+}
+
 fn read_psu_enabled_on(n: u32) -> Result<bool> {
-    read_psu_active_low_disabled_checked(n)?;
-    let gpio_path = format!("/sys/class/gpio/gpio{}/value", n);
+    let s19k = amlogic_board_target_is_s19k()?;
+    read_psu_enabled_on_with_polarity_at(Path::new("/sys/class/gpio"), n, s19k)
+}
+
+fn read_psu_enabled_on_with_polarity_at(gpio_root: &Path, n: u32, s19k: bool) -> Result<bool> {
+    read_psu_active_low_disabled_checked_at(gpio_root, n)?;
+    let gpio_path = gpio_root.join(format!("gpio{n}/value"));
     let value = fs::read_to_string(&gpio_path)
         .map_err(|error| HalError::Platform(format!("PSU GPIO readback: {error}")))?;
-    let s19k = amlogic_board_target_is_s19k()?;
     parse_psu_gpio_engaged(&value, s19k)
 }
 
+#[cfg(test)]
 fn parse_psu_gpio_enabled(value: &str) -> Result<bool> {
     parse_psu_gpio_engaged(value, false)
 }
@@ -2149,12 +2838,10 @@ pub fn is_psu_enabled() -> bool {
 fn prepare_management_i2c_pinmux() -> std::io::Result<()> {
     let export_path = "/sys/class/gpio/export";
     let resolved = [
-        resolve_pinmux_gpio_global(true).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?,
-        resolve_pinmux_gpio_global(false).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?,
+        resolve_pinmux_gpio_global(true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+        resolve_pinmux_gpio_global(false)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
     ];
     for gpio in resolved {
         let gpio_dir = format!("/sys/class/gpio/gpio{}", gpio);
@@ -2458,12 +3145,16 @@ fn normalize_model_token(model: &str) -> String {
 fn config_for_dcentos_platform(marker: &str) -> Result<Option<PlatformConfig>> {
     let normalized = marker.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "am3-aml-s19k" | "am3-aml-s19kpro" | "am3-aml-s19xp" => {
+        "am3-aml-s19k" | "am3-aml-s19kpro" => {
             Ok(Some(PlatformConfig::s19k_amlogic()))
         }
+        "am3-aml-s19xp" | "am3-aml-s19jxp" => Err(HalError::Platform(
+            "S19 XP/S19j XP exact ttyS3/ttyS2/ttyS1 route does not settle deployed-board or PIC/PSU selection; refusing the S19k NoPic profile"
+                .to_string(),
+        )),
         // A bare, SKU-less `am3-aml` marker is a GENERIC A113D control-board
         // token, not an SKU. It must never inherit an SKU transport/energization
-        // profile: `am3-s21`/`am3-t21` are BM1368 while `am3-s21pro`/`am3-s21xp`
+        // profile: `am3-s21` is BM1368 while `am3-s21pro`/`am3-s21xp`
         // are BM1370 — different silicon on the same control board (verified in
         // `dcentrald-common` BoardDesc). Fail closed and let detection fall
         // through to the SKU-specific signals (`/etc/bosminer.toml` model, DTB),
@@ -2472,9 +3163,17 @@ fn config_for_dcentos_platform(marker: &str) -> Result<Option<PlatformConfig>> {
         // `nopic_profile_for_dcentos_marker` / handoff-identity layers, which
         // already treat bare `am3-aml` as unqualified.
         "am3-aml" => Ok(None),
-        "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp" | "am3-aml-t21" => {
+        "am3-aml-s21" | "am3-aml-s21pro" => {
             Ok(Some(PlatformConfig::s21_amlogic()))
         }
+        "am3-aml-s21xp" => Err(HalError::Platform(
+            "S21 XP exact ttyS3/ttyS2/ttyS1 route and unresolved PIC/PSU composition refuse the shared S21 NoPic/ttyS4 profile"
+                .to_string(),
+        )),
+        "am3-aml-t21" => Err(HalError::Platform(
+            "Amlogic T21 controller/PIC/PSU profile is unresolved; refusing S21 NoPic fallback"
+                .to_string(),
+        )),
         // These targets use a per-hashboard controller and cannot inherit a
         // NoPic profile merely because the control board is also A113D.
         "am3-aml-s19jpro" | "am3-aml-s19jproplus" => Err(HalError::Platform(format!(
@@ -2486,19 +3185,17 @@ fn config_for_dcentos_platform(marker: &str) -> Result<Option<PlatformConfig>> {
 
 fn nopic_profile_for_model_value(model: &str) -> Option<AmlogicNoPicProfile> {
     match normalize_model_token(model).as_str() {
-        "antminers19kpro"
-        | "antminers19kpronopic"
-        | "s19kpro"
-        | "s19kpronopic"
-        | "antminers19xp"
-        | "s19xp" => Some(AmlogicNoPicProfile::S19k),
-        "antminers21" | "antminers21pro" | "antminers21xp" | "antminers21+" | "antminert21"
-        | "s21" | "s21pro" | "s21xp" | "s21+" | "t21" => Some(AmlogicNoPicProfile::S21),
+        "antminers19kpro" | "antminers19kpronopic" | "s19kpro" | "s19kpronopic" => {
+            Some(AmlogicNoPicProfile::S19k)
+        }
+        "antminers21" | "antminers21pro" | "antminers21+" | "s21" | "s21pro" | "s21+" => {
+            Some(AmlogicNoPicProfile::S21)
+        }
         _ => None,
     }
 }
 
-fn nopic_profile_for_bosminer_toml(source: &str) -> Result<Option<AmlogicNoPicProfile>> {
+fn bosminer_model_value(source: &str) -> Result<Option<String>> {
     let document: toml::Value = toml::from_str(source).map_err(|error| {
         HalError::Platform(format!(
             "failed to parse /etc/bosminer.toml for Amlogic admission: {error}"
@@ -2507,24 +3204,54 @@ fn nopic_profile_for_bosminer_toml(source: &str) -> Result<Option<AmlogicNoPicPr
     let model = document
         .get("format")
         .and_then(|format| format.get("model"))
-        .and_then(toml::Value::as_str);
-    Ok(model.and_then(nopic_profile_for_model_value))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Ok(model)
+}
+
+fn nopic_profile_for_bosminer_toml(source: &str) -> Result<Option<AmlogicNoPicProfile>> {
+    Ok(bosminer_model_value(source)?
+        .as_deref()
+        .and_then(nopic_profile_for_model_value))
 }
 
 fn config_for_bosminer_model(source: &str) -> Result<Option<PlatformConfig>> {
-    Ok(match nopic_profile_for_bosminer_toml(source)? {
-        Some(AmlogicNoPicProfile::S19k) => Some(PlatformConfig::s19k_amlogic()),
-        Some(AmlogicNoPicProfile::S21) => Some(PlatformConfig::s21_amlogic()),
-        None => None,
-    })
+    let model = bosminer_model_value(source)?;
+    let normalized_model = model.as_deref().map(normalize_model_token);
+    if matches!(normalized_model.as_deref(), Some("antminert21" | "t21")) {
+        return Err(HalError::Platform(
+            "Amlogic T21 controller/PIC/PSU profile is unresolved; refusing lower-priority S21 fallback"
+                .to_string(),
+        ));
+    }
+    if matches!(normalized_model.as_deref(), Some("antminers21xp" | "s21xp")) {
+        return Err(HalError::Platform(
+            "S21 XP exact ttyS3/ttyS2/ttyS1 route and unresolved PIC/PSU composition refuse the shared S21 NoPic/ttyS4 profile"
+                .to_string(),
+        ));
+    }
+    if matches!(
+        normalized_model.as_deref(),
+        Some("antminers19xp" | "s19xp" | "antminers19jxp" | "s19jxp")
+    ) {
+        return Err(HalError::Platform(
+            "S19 XP/S19j XP exact ttyS3/ttyS2/ttyS1 route does not settle deployed-board or PIC/PSU selection; refusing the S19k NoPic profile"
+                .to_string(),
+        ));
+    }
+    Ok(
+        match model.as_deref().and_then(nopic_profile_for_model_value) {
+            Some(AmlogicNoPicProfile::S19k) => Some(PlatformConfig::s19k_amlogic()),
+            Some(AmlogicNoPicProfile::S21) => Some(PlatformConfig::s21_amlogic()),
+            None => None,
+        },
+    )
 }
 
 fn nopic_profile_for_dcentos_marker(marker: &str) -> Option<AmlogicNoPicProfile> {
     match marker.trim().to_ascii_lowercase().as_str() {
-        "am3-aml-s19k" | "am3-aml-s19kpro" | "am3-aml-s19xp" => Some(AmlogicNoPicProfile::S19k),
-        "am3-aml-s21" | "am3-aml-s21pro" | "am3-aml-s21xp" | "am3-aml-t21" => {
-            Some(AmlogicNoPicProfile::S21)
-        }
+        "am3-aml-s19k" | "am3-aml-s19kpro" => Some(AmlogicNoPicProfile::S19k),
+        "am3-aml-s21" | "am3-aml-s21pro" => Some(AmlogicNoPicProfile::S21),
         _ => None,
     }
 }
@@ -2610,6 +3337,11 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
             "Missing Amlogic model string; refusing to guess an unsafe platform profile"
                 .to_string(),
         ))
+    } else if normalized.contains("s19jxp") || normalized.contains("s19xp") {
+        Err(HalError::Platform(format!(
+            "S19 XP/S19j XP exact ttyS3/ttyS2/ttyS1 route does not settle deployed-board or PIC/PSU selection; refusing the S19k NoPic profile for '{}'",
+            model
+        )))
     } else if normalized.contains("s19jpro") {
         Err(HalError::Platform(
             format!(
@@ -2624,13 +3356,21 @@ fn detect_amlogic_model() -> Result<PlatformConfig> {
                 model
             ),
         ))
-    } else if normalized.contains("s19k") || normalized.contains("s19xp") {
+    } else if normalized.contains("s19k") {
         Ok(PlatformConfig::s19k_amlogic())
+    } else if normalized.contains("t21") {
+        Err(HalError::Platform(format!(
+            "Amlogic T21 controller/PIC/PSU profile is unresolved; refusing S21 NoPic fallback for '{}'",
+            model
+        )))
+    } else if normalized.contains("s21xp") {
+        Err(HalError::Platform(format!(
+            "S21 XP exact ttyS3/ttyS2/ttyS1 route and unresolved PIC/PSU composition refuse the shared S21 NoPic/ttyS4 profile for '{}'",
+            model
+        )))
     } else if normalized.contains("s21pro")
-        || normalized.contains("s21xp")
         || normalized.contains("s21plus")
         || normalized.contains("s21")
-        || normalized.contains("t21")
     {
         Ok(PlatformConfig::s21_amlogic())
     } else if normalized.contains("s19") {
@@ -2654,7 +3394,7 @@ mod tests {
 
     fn boot_safe_handoff_fixture() -> String {
         [
-            "schema=dcentos.amlogic-safe-state/v1",
+            "schema=dcentos.amlogic-safe-state/v2",
             "state=runtime-handoff",
             "boot_id=11111111-2222-3333-4444-555555555555",
             "platform=am3-aml-s21",
@@ -2670,6 +3410,16 @@ mod tests {
             "fan1_duty_ns=30000",
             "fan1_period_ns=100000",
             "fan1_enabled=1",
+            "hashboard_reset_gpio454_direction=out",
+            "hashboard_reset_gpio454_active_low=0",
+            "hashboard_reset_gpio454_value=0",
+            "hashboard_reset_gpio455_direction=out",
+            "hashboard_reset_gpio455_active_low=0",
+            "hashboard_reset_gpio455_value=0",
+            "hashboard_reset_gpio456_direction=out",
+            "hashboard_reset_gpio456_active_low=0",
+            "hashboard_reset_gpio456_value=0",
+            "hashboard_reset_low_bitmap=0x7",
             "evidence_grade=software-readback",
             "physical_rail_measured=false",
         ]
@@ -2726,6 +3476,18 @@ mod tests {
             ("fan1_duty_ns=30000", "fan1_duty_ns=100000"),
             ("fan0_period_ns=100000", "fan0_period_ns=30000"),
             ("fan1_enabled=1", "fan1_enabled=0"),
+            (
+                "hashboard_reset_gpio455_value=0",
+                "hashboard_reset_gpio455_value=1",
+            ),
+            (
+                "hashboard_reset_gpio455_active_low=0",
+                "hashboard_reset_gpio455_active_low=1",
+            ),
+            (
+                "hashboard_reset_low_bitmap=0x7",
+                "hashboard_reset_low_bitmap=0x3",
+            ),
         ] {
             let invalid = boot_safe_handoff_fixture().replace(mutation.0, mutation.1);
             assert!(
@@ -2739,6 +3501,19 @@ mod tests {
         assert!(parse_amlogic_boot_safe_handoff(&duplicate).is_err());
         let unknown = format!("{}\nunexpected=true", boot_safe_handoff_fixture());
         assert!(parse_amlogic_boot_safe_handoff(&unknown).is_err());
+        let legacy = boot_safe_handoff_fixture()
+            .replace(
+                "schema=dcentos.amlogic-safe-state/v2",
+                "schema=dcentos.amlogic-safe-state/v1",
+            )
+            .lines()
+            .filter(|line| !line.contains("hashboard_reset_gpio455_active_low"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            parse_amlogic_boot_safe_handoff(&legacy).is_err(),
+            "schema v1 must not silently preserve v2 reset-polarity authority"
+        );
     }
 
     #[test]
@@ -2748,12 +3523,7 @@ mod tests {
             "am3-aml-s19k",
             "am3-s19k"
         ));
-        for (platform, target) in [
-            ("am3-aml-s21", "am3-s21"),
-            ("am3-aml-s21pro", "am3-s21pro"),
-            ("am3-aml-s21xp", "am3-s21xp"),
-            ("am3-aml-t21", "am3-t21"),
-        ] {
+        for (platform, target) in [("am3-aml-s21", "am3-s21"), ("am3-aml-s21pro", "am3-s21pro")] {
             assert!(amlogic_handoff_identity_matches_profile(
                 AmlogicNoPicProfile::S21,
                 platform,
@@ -2763,8 +3533,10 @@ mod tests {
         for (platform, target) in [
             ("am3-aml", "am3-s21"),
             ("am3-aml-s21", "am3-s21xp"),
+            ("am3-aml-s21xp", "am3-s21xp"),
             ("am3-aml-s19jpro", "am3-s19jpro-aml"),
             ("am3-aml-s21-future", "am3-s21-future"),
+            ("am3-aml-t21", "am3-t21"),
         ] {
             assert!(!amlogic_handoff_identity_matches_profile(
                 AmlogicNoPicProfile::S21,
@@ -2790,7 +3562,12 @@ mod tests {
 
     #[test]
     fn psu_gpio_commit_fence_orders_terminal_cut_after_inflight_enable() {
-        let authority = Arc::new(AmlogicPsuCommitAuthority::default());
+        assert!(AmlogicPsuCommitAuthority::new(AmlogicNoPicProfile::S19k, None).s19k_active_low());
+        assert!(!AmlogicPsuCommitAuthority::new(AmlogicNoPicProfile::S21, None).s19k_active_low());
+        let authority = Arc::new(AmlogicPsuCommitAuthority::new(
+            AmlogicNoPicProfile::S21,
+            None,
+        ));
         let simulated_gpio_high = Arc::new(AtomicBool::new(false));
         let (enable_locked_tx, enable_locked_rx) = std::sync::mpsc::channel();
         let (release_enable_tx, release_enable_rx) = std::sync::mpsc::channel();
@@ -2839,11 +3616,8 @@ mod tests {
         for marker in [
             "am3-aml-s19k",
             "am3-aml-s19kpro",
-            "am3-aml-s19xp",
             "am3-aml-s21",
             "am3-aml-s21pro",
-            "am3-aml-s21xp",
-            "am3-aml-t21",
         ] {
             assert!(
                 config_for_dcentos_platform(marker).unwrap().is_some(),
@@ -2855,12 +3629,24 @@ mod tests {
                 .expect_err("S19j Pro must not inherit a NoPic transport profile");
             assert!(error.to_string().contains("dedicated controller profile"));
         }
+        let t21_error = config_for_dcentos_platform("am3-aml-t21")
+            .expect_err("T21 must not inherit the S21 NoPic profile");
+        assert!(t21_error.to_string().contains("profile is unresolved"));
+        let s21xp_error = config_for_dcentos_platform("am3-aml-s21xp")
+            .expect_err("S21 XP must not inherit the shared S21 NoPic profile");
+        assert!(s21xp_error.to_string().contains("ttyS3/ttyS2/ttyS1"));
+        for marker in ["am3-aml-s19xp", "am3-aml-s19jxp"] {
+            let error = config_for_dcentos_platform(marker)
+                .expect_err("X19 XP targets must not inherit the S19k NoPic profile");
+            assert!(error.to_string().contains("deployed-board or PIC/PSU"));
+        }
         assert!(config_for_dcentos_platform("future-amlogic")
             .unwrap()
             .is_none());
         // A bare, SKU-less `am3-aml` marker must fail closed: a generic A113D
-        // control-board token never inherits an SKU profile (am3-s21/am3-t21 =
-        // BM1368, am3-s21pro/am3-s21xp = BM1370). Queue rank 19 / H1 GAP-3.
+        // control-board token never inherits an SKU profile (am3-s21 is
+        // BM1368, am3-s21pro/am3-s21xp are BM1370, and T21 controller
+        // authority is unresolved). Queue rank 19 / H1 GAP-3.
         assert!(
             config_for_dcentos_platform("am3-aml").unwrap().is_none(),
             "generic am3-aml marker must not inherit the S21 SKU profile"
@@ -2869,18 +3655,33 @@ mod tests {
 
     #[test]
     fn bosminer_model_identity_covers_admitted_s19k_and_s21_families() {
-        for model in ["Antminer S19K Pro NoPic", "Antminer S19 XP"] {
+        for model in ["Antminer S19K Pro NoPic"] {
             let config = config_for_bosminer_model(&format!("[format]\nmodel = {model:?}"))
                 .unwrap()
                 .expect("S19K/S19 XP bosminer identity");
             assert_eq!(config.name, PlatformConfig::s19k_amlogic().name);
         }
-        for model in ["Antminer S21", "Antminer S21 Pro", "Antminer T21"] {
+        for model in ["Antminer S21", "Antminer S21 Pro"] {
             let config = config_for_bosminer_model(&format!("[format]\nmodel = {model:?}"))
                 .unwrap()
-                .expect("S21/T21 bosminer identity");
+                .expect("S21 bosminer identity");
             assert_eq!(config.name, PlatformConfig::s21_amlogic().name);
         }
+        let t21_error = config_for_bosminer_model("[format]\nmodel = 'Antminer T21'")
+            .expect_err("exact T21 evidence must stop lower-priority profile fallback");
+        assert!(t21_error.to_string().contains("profile is unresolved"));
+        let s21xp_error = config_for_bosminer_model("[format]\nmodel = 'Antminer S21 XP'")
+            .expect_err("S21 XP must not inherit the shared S21 NoPic profile");
+        assert!(s21xp_error.to_string().contains("ttyS3/ttyS2/ttyS1"));
+        assert_eq!(nopic_profile_for_model_value("s21xp"), None);
+        assert_eq!(nopic_profile_for_model_value("t21"), None);
+        for model in ["Antminer S19 XP", "Antminer S19j XP"] {
+            let error = config_for_bosminer_model(&format!("[format]\nmodel = {model:?}"))
+                .expect_err("X19 XP models must not inherit the S19k NoPic profile");
+            assert!(error.to_string().contains("deployed-board or PIC/PSU"));
+        }
+        assert_eq!(nopic_profile_for_model_value("s19xp"), None);
+        assert_eq!(nopic_profile_for_model_value("s19jxp"), None);
         assert!(config_for_bosminer_model("[format]\nnotes = 'S21 spare'")
             .unwrap()
             .is_none());
@@ -2894,12 +3695,45 @@ mod tests {
     }
 
     #[test]
-    fn nopic_admission_binds_detected_profile_and_physical_uart_slot() {
-        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS1"), Some(0));
-        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS2"), Some(1));
-        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS3"), Some(2));
-        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyS4"), Some(2));
-        assert_eq!(amlogic_slot_from_serial_device("/dev/ttyO1"), None);
+    fn nopic_admission_binds_s21_route_and_refuses_unbound_s19k_route() {
+        assert_eq!(
+            amlogic_slot_from_serial_device(AmlogicNoPicProfile::S21, "/dev/ttyS1"),
+            Some(0)
+        );
+        assert_eq!(
+            amlogic_slot_from_serial_device(AmlogicNoPicProfile::S21, "/dev/ttyS2"),
+            Some(1)
+        );
+        assert_eq!(
+            amlogic_slot_from_serial_device(AmlogicNoPicProfile::S21, "/dev/ttyS4"),
+            Some(2)
+        );
+        assert_eq!(
+            amlogic_slot_from_serial_device(AmlogicNoPicProfile::S21, "/dev/ttyS3"),
+            None
+        );
+        assert_eq!(
+            amlogic_slot_from_serial_device(AmlogicNoPicProfile::S21, "/dev/ttyO1"),
+            None
+        );
+        for path in ["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"] {
+            assert_eq!(
+                amlogic_slot_from_serial_device(AmlogicNoPicProfile::S19k, path),
+                None,
+                "S19k {path} must remain a logical endpoint, not a physical slot"
+            );
+        }
+
+        let s19k_error = AmlogicNoPicAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            0,
+            "/dev/ttyS1",
+            "am3-s19k",
+            AmlogicNoPicProfile::S19k,
+            [false, true, true],
+        )
+        .unwrap_err();
+        assert!(s19k_error.to_string().contains("topology is unbound"));
 
         let admission = AmlogicNoPicAdmission::from_profile_evidence(
             AmlogicNoPicProfile::S21,
@@ -2961,6 +3795,293 @@ mod tests {
             [true, true, false],
         )
         .is_err());
+    }
+
+    #[test]
+    fn s19k_native_population_admission_binds_all_controller_routes() {
+        assert_eq!(
+            S19K_NATIVE_LOGICAL_CHAIN_ROUTES.map(|route| (
+                route.uart,
+                route.logical_chain,
+                route.reset_gpio
+            )),
+            [
+                ("/dev/ttyS3", 0, 454),
+                ("/dev/ttyS2", 1, 455),
+                ("/dev/ttyS1", 2, 456),
+            ]
+        );
+        let held = S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            "am3-s19k",
+            [false, true, true],
+            [false, true, true],
+        )
+        .unwrap();
+        assert_eq!(held.board_target(), "am3-s19k");
+        assert_eq!(held.populated_slots(), [false, true, true]);
+        let population = held.into_population().unwrap();
+        assert_eq!(population.populated_slots(), [false, true, true]);
+        assert_eq!(
+            population
+                .logical_chain_routes()
+                .iter()
+                .map(|route| (route.uart, route.logical_chain, route.reset_gpio))
+                .collect::<Vec<_>>(),
+            vec![("/dev/ttyS2", 1, 455), ("/dev/ttyS1", 2, 456)]
+        );
+
+        // Every non-empty subset is selected from the immutable logical route.
+        for mask in 1u8..8 {
+            let topology = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+            let aggregate = S19kNativeAggregateAdmission::from_profile_evidence(
+                AmlogicNoPicProfile::S19k,
+                "am3-s19k",
+                topology,
+                [true, true, true],
+            )
+            .unwrap();
+            let selected = aggregate.logical_chain_routes();
+            assert_eq!(selected.len(), mask.count_ones() as usize);
+            assert!(selected
+                .iter()
+                .all(|route| topology[route.logical_chain as usize]));
+        }
+        assert!(S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            "am3-s19k",
+            [false, false, false],
+            [true, true, true],
+        )
+        .is_err());
+        // An absent chain's UART need not exist; a populated chain's UART must.
+        assert!(S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            "am3-s19k",
+            [false, true, true],
+            [false, true, true],
+        )
+        .is_ok());
+        for uart_available in [
+            [true, false, true],
+            [true, true, false],
+            [false, false, false],
+        ] {
+            assert!(S19kNativeAggregateAdmission::from_profile_evidence(
+                AmlogicNoPicProfile::S19k,
+                "am3-s19k",
+                [false, true, true],
+                uart_available,
+            )
+            .is_err());
+        }
+        assert!(S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S21,
+            "am3-s19k",
+            [false, true, true],
+            [true, true, true],
+        )
+        .is_err());
+        assert!(S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            "am3-s21",
+            [false, true, true],
+            [true, true, true],
+        )
+        .is_err());
+
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("impl S19kNativeAggregateAdmission")
+            .expect("aggregate S19k admission implementation");
+        let end = source[start..]
+            .find("impl S19kNativePopulationAdmission")
+            .map(|offset| start + offset)
+            .expect("aggregate S19k admission implementation end");
+        let body = &source[start..end];
+        assert!(body.contains("service.psu_enable_operation_available = false"));
+        assert!(!body.contains("service.psu_enable_operation_available = true"));
+        assert!(!body.contains("take_psu_enable_operation"));
+        assert!(!body.contains("set_amlogic_board_reset_checked"));
+        assert!(body.contains("Result<Arc<S19kNativeFanObservation>>"));
+        assert!(!body.contains("Result<Arc<dyn FanAccess>>"));
+
+        let population_start = end;
+        let population_end = source[population_start..]
+            .find("fn amlogic_slot_from_serial_device")
+            .map(|offset| population_start + offset)
+            .expect("population S19k admission implementation end");
+        let population_body = &source[population_start..population_end];
+        assert!(population_body.contains("service.psu_enable_operation_available = true"));
+        assert!(population_body.contains("Result<Arc<dyn FanAccess>>"));
+        assert!(population_body.contains("assert_s19k_native_all_resets_checked"));
+        assert!(population_body.contains("release_mapped_resets_checked"));
+        assert!(population_body.contains("S19K_NATIVE_LOGICAL_CHAIN_ROUTES"));
+
+        let observer_start = source
+            .find("impl S19kNativeFanObservation")
+            .expect("native S19k read-only fan observer implementation");
+        let observer_end = source[observer_start..]
+            .find("pub struct S19kNativeAggregateAdmission")
+            .map(|offset| observer_start + offset)
+            .expect("native S19k fan observer implementation end");
+        let observer = &source[observer_start..observer_end];
+        assert!(observer.contains("pub fn get_per_fan_rpm"));
+        assert!(observer.contains("pub fn get_speed_pwm"));
+        assert!(!observer.contains("pub fn set_speed"));
+        assert!(!observer.contains("impl FanAccess"));
+    }
+
+    #[test]
+    fn s19k_native_reset_release_refuses_foreign_power_generation_before_gpio_io() {
+        let mapped = S19kNativeAggregateAdmission::from_profile_evidence(
+            AmlogicNoPicProfile::S19k,
+            "am3-s19k",
+            [false, true, true],
+            [false, true, true],
+        )
+        .unwrap()
+        .into_population()
+        .unwrap();
+        let asserted = S19kNativeAllResetsAsserted {
+            reset_gpios: [454, 455, 456],
+        };
+        let foreign = ApwEnableReceipt {
+            writes_completed_at: Instant::now(),
+            status_word: None,
+            s19k_native_generation: Some(Arc::new(())),
+        };
+        let error = mapped
+            .release_mapped_resets_checked(asserted, foreign)
+            .unwrap_err();
+        assert!(error.to_string().contains("another cold-start generation"));
+
+        let source = include_str!("mod.rs");
+        assert!(source.contains("power: ApwEnableReceipt,"));
+        assert!(!source.contains("#[derive(Debug, Clone, Copy)]\npub struct ApwEnableReceipt"));
+        assert!(source.contains("Arc::ptr_eq(power_generation, &self.generation)"));
+    }
+
+    #[test]
+    fn checked_amlogic_reset_requires_prepared_raw_line_and_returns_readback() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dcentos-amlogic-reset-{}-{unique}",
+            std::process::id()
+        ));
+        let gpio = root.join("gpio454");
+        std::fs::create_dir_all(&gpio).unwrap();
+        std::fs::write(gpio.join("direction"), "out\n").unwrap();
+        std::fs::write(gpio.join("active_low"), "0\n").unwrap();
+        std::fs::write(gpio.join("value"), "1\n").unwrap();
+
+        let asserted = set_amlogic_board_reset_checked_at(&root, 0, 454, true).unwrap();
+        assert_eq!(asserted.chain(), 0);
+        assert_eq!(asserted.gpio(), 454);
+        assert!(asserted.asserted());
+        assert_eq!(asserted.commanded_value(), 0);
+        assert_eq!(asserted.observed_value(), 0);
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "0");
+
+        let released = set_amlogic_board_reset_checked_at(&root, 0, 454, false).unwrap();
+        assert!(!released.asserted());
+        assert_eq!(released.commanded_value(), 1);
+        assert_eq!(released.observed_value(), 1);
+        assert!(released.completed_at() >= asserted.completed_at());
+
+        std::fs::write(gpio.join("active_low"), "1\n").unwrap();
+        let polarity_error = set_amlogic_board_reset_checked_at(&root, 0, 454, true).unwrap_err();
+        assert!(polarity_error
+            .to_string()
+            .contains("refusing to guess physical reset polarity"));
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "1");
+
+        std::fs::write(gpio.join("active_low"), "0\n").unwrap();
+        std::fs::write(gpio.join("direction"), "in\n").unwrap();
+        let direction_error = set_amlogic_board_reset_checked_at(&root, 0, 454, true).unwrap_err();
+        assert!(direction_error
+            .to_string()
+            .contains("not prepared as output"));
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "1");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn track1_pwm100_refuses_without_explicit_loud_authority_before_io() {
+        let error = hold_track1_leftover_fans_pwm100(false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("explicit --allow-loud authority"));
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub fn hold_track1_leftover_fans_pwm100")
+            .expect("Track-1 PWM100 helper");
+        let body = &source[start..];
+        assert!(
+            body.find("if !explicit_loud_authority").unwrap() < body.find("fs::write").unwrap()
+        );
+    }
+
+    #[test]
+    fn track1_s19k_checked_cut_is_value_one_and_marker_independent() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dcentos-amlogic-track1-cut-{}-{unique}",
+            std::process::id()
+        ));
+        let gpio = root.join("gpio437");
+        std::fs::create_dir_all(&gpio).unwrap();
+        std::fs::write(gpio.join("direction"), "out\n").unwrap();
+        std::fs::write(gpio.join("active_low"), "1\n").unwrap();
+        std::fs::write(gpio.join("value"), "0\n").unwrap();
+
+        let receipt = disable_psu_checked_at(&root, 437, true).unwrap();
+        assert_eq!(receipt.gpio(), 437);
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("active_low")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gpio.join("direction")).unwrap(),
+            "high"
+        );
+        assert_eq!(std::fs::read_to_string(gpio.join("value")).unwrap(), "1");
+        assert!(!read_psu_enabled_on_with_polarity_at(&root, 437, true).unwrap());
+
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub fn disable_s19k_track1_psu_checked()")
+            .expect("explicit Track-1 S19k cut");
+        let end = source[start..]
+            .find("pub fn disable_psu()")
+            .map(|offset| start + offset)
+            .expect("explicit Track-1 S19k cut end");
+        let body = &source[start..end];
+        assert!(body.contains("disable_psu_checked_for_polarity(true)"));
+        assert!(!body.contains("/etc/dcentos"));
+        assert!(!body.contains("amlogic_board_target_is_s19k"));
+
+        let read_start = source
+            .find("pub fn read_s19k_track1_psu_engaged_checked()")
+            .expect("explicit Track-1 S19k rail readback");
+        let read_end = source[read_start..]
+            .find("fn read_psu_enabled_on(")
+            .map(|offset| read_start + offset)
+            .expect("explicit Track-1 S19k rail readback end");
+        let read_body = &source[read_start..read_end];
+        assert!(read_body.contains("read_psu_enabled_on_with_polarity_at"));
+        assert!(read_body.contains(", true)"));
+        assert!(!read_body.contains("amlogic_board_target_is_s19k"));
+        assert!(!read_body.contains("/etc/dcentos"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3095,7 +4216,10 @@ mod tests {
         .unwrap();
         let i2c = owner.request_handle();
         let fence = owner.terminal_fence();
-        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::default());
+        let psu_commit = Arc::new(AmlogicPsuCommitAuthority::new(
+            AmlogicNoPicProfile::S21,
+            None,
+        ));
         let mut service = AmlogicPowerThermalService {
             i2c,
             required_slots: [false, true, false],
@@ -3624,17 +4748,15 @@ mod tests {
         assert_eq!(p.voltage_controller(), VoltageControllerKind::NoPic);
     }
 
-    /// PSU enable polarity regression guard — GPIO 437 PWR_EN is active HIGH
-    /// (1=ON, 0=OFF), per  Q10 (VNish v1.2.7 `S11board` + stock bmminer).
+    /// PSU enable polarity regression guard — GPIO 437 is **board_target
+    /// scoped**. S21-class NoPic remains 1=ON / SafeOff=0 ( Q10).
+    /// am3-s19k / Braiins S19k Pro is 0=ON / 1=OFF. Never one Amlogic pin.
     ///
-    /// `enable_psu_gpio()`, `disable_psu()`, and `is_psu_enabled()` write/read
-    /// real sysfs paths, so they cannot run on the host. This source-level guard
-    /// instead pins the corrected polarity contract: the enable path drives the
-    /// pin to `"1"`, the disable path to `"0"`, and the enabled-readback treats
-    /// `"1"` as enabled. It exists so a future edit cannot silently re-invert the
-    /// HAL back to the pre- active-LOW misreading (EE C1, 2026-05-21).
-    /// Mirrors the active-HIGH constant in `gpio_maps.rs::AmlogicGpioMap` and
-    /// `vnish_cold_boot.rs::GPIO_PWR_EN`.
+    /// `enable_psu_gpio_for_polarity()`, `disable_psu()`, and
+    /// `is_psu_enabled()` write/read real sysfs paths, so they cannot run on the host. This source-level guard
+    /// pins both SKU write paths: S21 enable still contains `"1"` / disable
+    /// `"0"`; S19k branches through `amlogic_board_target_is_s19k`. Readback
+    /// is exercised per SKU below. Software SafeOff is not VerifiedRailCut.
     #[test]
     fn psu_enable_is_active_high_437() {
         let src = include_str!("mod.rs");
@@ -3642,7 +4764,7 @@ mod tests {
         // Enable path drives the value file HIGH.
         assert!(
             src.contains("fs::write(&gpio_path, \"1\")"),
-            "enable_psu_gpio must write \"1\" to enable (active HIGH, Wave 5 Q10)"
+            "polarity-bound enable S21-class path must still write \"1\""
         );
         assert!(
             src.contains("ensure_psu_active_low_disabled_checked(n)?;"),
@@ -3658,18 +4780,20 @@ mod tests {
         );
         assert!(
             src.contains("fs::write(&dir_path, \"low\")"),
-            "enable_psu_gpio must establish a glitch-free LOW before driving HIGH"
+            "polarity-bound enable must establish a glitch-free LOW before driving HIGH"
         );
         // Disable path drives the value file LOW.
         assert!(
             src.contains("fs::write(&gpio_path, \"0\")"),
-            "disable_psu must write \"0\" to disable (active HIGH, Wave 5 Q10)"
+            "disable_psu S21-class path must still write \"0\" (board_target scoped)"
         );
-        // Readback treats HIGH as enabled.
-        assert!(
-            src.contains("\"1\" => Ok(true)"),
-            "the checked GPIO parser must treat \"1\" (HIGH) as enabled (active HIGH, Wave 5 Q10)"
-        );
+        // Readback is SKU-scoped: S21-class is active high, while the held
+        // am3-s19k T6 route is active low. Exercise behavior instead of
+        // pinning the parser's source spelling.
+        assert!(parse_psu_gpio_engaged("1", false).unwrap());
+        assert!(!parse_psu_gpio_engaged("0", false).unwrap());
+        assert!(parse_psu_gpio_engaged("0", true).unwrap());
+        assert!(!parse_psu_gpio_engaged("1", true).unwrap());
         // The old active-LOW readback must be gone.
         assert!(
             !src.contains("\"0\" => Ok(true)"),

@@ -1,0 +1,60 @@
+#!/bin/sh
+# Manual-only launcher for the staged dcentrald-avalon binary.
+#
+# This file intentionally has no S?? prefix: stock rcS must never start the
+# daemon.  Nano 3's factory btcminer owns /dev/ttyS1 and does not use the
+# mm_pkg SysV transport implemented by the current daemon.
+
+DAEMON=/usr/libexec/dcentos/dcentrald-avalon
+PIDFILE=/var/run/dcentrald-avalon.pid
+LOG=/var/log/dcentrald-avalon.log
+CONFIG=/data/dcentrald-avalon.toml
+ARM_FILE=/data/dcentos/allow-unsupported-mm-pkg-takeover
+ARM_TEXT=I_ACCEPT_NANO3_MM_PKG_SHIM_RISK=1
+
+refuse() {
+    echo "REFUSED: $*" >&2
+    exit 1
+}
+
+start_daemon() {
+    [ -x "$DAEMON" ] || refuse "$DAEMON is missing"
+    mountpoint -q /data 2>/dev/null || refuse "/data is not mounted"
+    [ -s "$CONFIG" ] || refuse "copy and edit the example as $CONFIG first"
+    [ -f "$ARM_FILE" ] || refuse "explicit takeover arm file is absent"
+    [ "$(cat "$ARM_FILE" 2>/dev/null)" = "$ARM_TEXT" ] ||
+        refuse "takeover arm file content is invalid"
+    pidof btcminer >/dev/null 2>&1 &&
+        refuse "stock btcminer still owns mining, UI, network and /dev/ttyS1"
+    pidof dcentrald-avalon >/dev/null 2>&1 && refuse "already running"
+
+    # The arm file is one-shot.  Remove it before the daemon can touch IPC so
+    # a later restart requires a fresh, explicit operator decision.
+    rm -f "$ARM_FILE"
+    export DCENTRALD_AVALON_CONFIG="$CONFIG"
+    export RUST_LOG="${RUST_LOG:-debug}"
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- \
+        >>"$LOG" 2>&1 || refuse "start-stop-daemon failed"
+    echo "started laboratory daemon; inspect $LOG"
+}
+
+case "${1:-}" in
+    start)
+        start_daemon
+        ;;
+    stop)
+        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null || true
+        rm -f "$PIDFILE"
+        ;;
+    status)
+        if pidof dcentrald-avalon >/dev/null 2>&1; then
+            echo "dcentrald-avalon is running"
+        else
+            echo "dcentrald-avalon is stopped (expected stock-coexistence state)"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}" >&2
+        exit 1
+        ;;
+esac

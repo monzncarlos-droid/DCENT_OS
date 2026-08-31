@@ -1768,10 +1768,11 @@ mod work_dispatch_admission_tests {
     #[test]
     fn stock_v1_route_refusal_precedes_all_device_access() {
         let src = include_str!("stock_mining.rs");
-        let route_gate = src
+        let run = &src[src.find("pub async fn run").expect("StockMiner::run")..];
+        let route_gate = run
             .find("if !(primary_v1 && failover1_v1 && failover2_v1)")
             .expect("V1 route gate");
-        let device_open = src.find("StockFpga::open()").expect("stock FPGA open");
+        let device_open = run.find("StockFpga::open()").expect("stock FPGA open");
         assert!(route_gate < device_open);
     }
 

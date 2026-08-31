@@ -75,6 +75,36 @@ export interface ChainState {
 
 export type ChainTempSource = 'board_sensor' | 'soc_die_fallback';
 
+/**
+ * Provenance for legacy `chains` telemetry when it is aggregate-only rather
+ * than independently attributable physical hashboards.
+ */
+export type ChainsScope = 'aggregate_serial_runtime';
+
+/**
+ * Protocol/runtime evidence for one logical serial device path.
+ *
+ * This is intentionally not a physical chain/slot type and therefore carries
+ * no per-UART hashrate, accepted-share, voltage, or thermal attribution.
+ */
+export interface SerialEndpointState {
+  logical_path: string;
+  open_state: string;
+  tx_role: string;
+  tx_active: boolean;
+  getaddress_responses: number;
+  complete_77_at_work_baud: boolean;
+  work_frames_committed: number;
+  rx_wire_bytes: number;
+  rx_frames: number;
+  crc_rejected_frames: number;
+  buffered_rx_bytes: number;
+  valid_job_nonce_observations: number;
+  last_frame_rx_age_s?: number;
+  last_valid_job_nonce_age_s?: number;
+  parser_state: string;
+}
+
 export interface PerFanReading {
   id: number;
   rpm: number;
@@ -1189,6 +1219,8 @@ export interface StatusResponse {
   firmware_version: string;
   mode: OperatingMode;
   chains: ChainState[];
+  serial_endpoints?: SerialEndpointState[];
+  chains_scope?: ChainsScope;
   fans: FanState;
   pool: PoolState;
   share_efficiency?: PoolState['share_efficiency'];
@@ -2160,6 +2192,8 @@ export interface StatsResponse {
   rejected?: number;
   uptime_s: number;
   chains: StatsChain[];
+  serial_endpoints?: SerialEndpointState[];
+  chains_scope?: ChainsScope;
   share_accounting?: {
     totals_tracked: boolean;
     totals_scope: string;
@@ -2731,6 +2765,7 @@ export interface NightModeResponse {
   end_hour: number;
   max_fan_pwm: number;
   power_reduction_pct: number;
+  max_frequency_mhz?: number;
   active: boolean;
 }
 
@@ -2740,6 +2775,7 @@ export interface NightModeRequest {
   end_hour?: number;
   max_fan_pwm?: number;
   power_reduction_pct?: number;
+  max_frequency_mhz?: number;
 }
 
 // P2-4 (§4.E): captured at first-boot setup. Persists the electricity rate +
@@ -3176,6 +3212,8 @@ export interface WsStatsMessage {
   accepted: number;
   rejected: number;
   chains: ChainState[];
+  serial_endpoints?: SerialEndpointState[];
+  chains_scope?: ChainsScope;
   fans: FanState;
   pool: PoolState;
   power_watts?: number;

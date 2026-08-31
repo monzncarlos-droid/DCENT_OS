@@ -26,6 +26,8 @@
 set -e
 
 ROOTFS=""
+ROOTFS_ORIGINAL=""
+PACKAGE_INPUT_IS_TAR=0
 FORCE=0
 TEST_ONLY=0
 EXPECTED_BOARD=am1-s9
@@ -45,15 +47,30 @@ BOARD_TARGET_PATH="/etc/dcentos/board_target"
 CONF_MINER_TYPE_PATH="/config/CONF_MINER_TYPE"
 CONF_HARDWARE_ID_PATH="/config/CONF_HARDWARE_ID"
 PROC_CMDLINE_PATH="/proc/cmdline"
+PERSIST_HELPER="/usr/libexec/dcentos/sysupgrade-persistent-state.sh"
+TRANSACTION_LOCK_HELPER="/usr/libexec/dcentos/sysupgrade-transaction-lock.sh"
+TRANSACTION_WORKSPACE_HELPER="/usr/libexec/dcentos/sysupgrade-transaction-workspace.sh"
+PACKAGE_INPUT_HELPER="/usr/libexec/dcentos/sysupgrade-package-input.sh"
 ARCHIVE_ADMISSION_HELPER="/usr/libexec/dcentos/sysupgrade-archive-admission.sh"
 MANIFEST_JSON_HELPER="/usr/libexec/dcentos/sysupgrade-manifest-json.py"
+UBI_IDENTITY_HELPER="/usr/libexec/dcentos/sysupgrade-ubi-identity.sh"
+UBI_NODE_HELPER="/usr/libexec/dcentos/sysupgrade-ubi-node.sh"
 ZYNQ_GEOMETRY_HELPER="/usr/libexec/dcentos/sysupgrade-zynq-geometry.sh"
+UBOOT_ENV_ADMISSION_HELPER="/usr/libexec/dcentos/sysupgrade-uboot-env-admission.sh"
+SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
 DEPLOY_LOCK_HELPER="/usr/libexec/dcentos/dcentos-deploy-lock"
 DEPLOY_UPGRADE_GUARD="/usr/libexec/dcentos/dcentrald-deploy-upgrade-guard.sh"
-SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
-SYSUPGRADE_UPDATE_LOCK="/run/dcentos-sysupgrade.lock"
-SYSUPGRADE_UPDATE_LOCK_OWNED=0
-SYSUPGRADE_MUTATION_STARTED=0
+FW_ENV_CONFIG="/etc/fw_env.config"
+UBOOT_ENV_PROC_MTD="/proc/mtd"
+UBOOT_ENV_SYSFS_MTD_ROOT="/sys/class/mtd"
+UBOOT_ENV_MTD4_DEVICE="/dev/mtd4"
+PERSIST_SOURCE_ROOT="/data"
+PERSIST_MOUNT_ROOT=""
+PROC_MOUNTS_PATH="/proc/mounts"
+SYSUPGRADE_LOCK_DIR="/run/dcentos-sysupgrade.lock"
+SYSUPGRADE_WORKSPACE_ROOT="/tmp"
+PROC_ROOT="/proc"
+BOOT_ID_PATH="/proc/sys/kernel/random/boot_id"
 if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     SCRIPT_REALPATH=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
     if [ "$SCRIPT_REALPATH" = "/usr/sbin/sysupgrade" ]; then
@@ -75,9 +92,26 @@ if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" = "1" ]; then
     CONF_MINER_TYPE_PATH="${DCENT_SYSUPGRADE_CONF_MINER_TYPE_PATH:-$CONF_MINER_TYPE_PATH}"
     CONF_HARDWARE_ID_PATH="${DCENT_SYSUPGRADE_CONF_HARDWARE_ID_PATH:-$CONF_HARDWARE_ID_PATH}"
     PROC_CMDLINE_PATH="${DCENT_SYSUPGRADE_PROC_CMDLINE_PATH:-$PROC_CMDLINE_PATH}"
+    PERSIST_HELPER="${DCENT_SYSUPGRADE_PERSIST_HELPER:-$PERSIST_HELPER}"
+    TRANSACTION_LOCK_HELPER="${DCENT_SYSUPGRADE_TRANSACTION_LOCK_HELPER:-$TRANSACTION_LOCK_HELPER}"
+    TRANSACTION_WORKSPACE_HELPER="${DCENT_SYSUPGRADE_TRANSACTION_WORKSPACE_HELPER:-$TRANSACTION_WORKSPACE_HELPER}"
+    PACKAGE_INPUT_HELPER="${DCENT_SYSUPGRADE_PACKAGE_INPUT_HELPER:-$PACKAGE_INPUT_HELPER}"
     ARCHIVE_ADMISSION_HELPER="${DCENT_SYSUPGRADE_ARCHIVE_ADMISSION_HELPER:-$ARCHIVE_ADMISSION_HELPER}"
     MANIFEST_JSON_HELPER="${DCENT_SYSUPGRADE_MANIFEST_JSON_HELPER:-$MANIFEST_JSON_HELPER}"
+    UBI_IDENTITY_HELPER="${DCENT_SYSUPGRADE_UBI_IDENTITY_HELPER:-$UBI_IDENTITY_HELPER}"
+    UBI_NODE_HELPER="${DCENT_SYSUPGRADE_UBI_NODE_HELPER:-$UBI_NODE_HELPER}"
     ZYNQ_GEOMETRY_HELPER="${DCENT_SYSUPGRADE_ZYNQ_GEOMETRY_HELPER:-$ZYNQ_GEOMETRY_HELPER}"
+    UBOOT_ENV_ADMISSION_HELPER="${DCENT_SYSUPGRADE_UBOOT_ENV_ADMISSION_HELPER:-$UBOOT_ENV_ADMISSION_HELPER}"
+    SESSION_LATCH_HELPER="${DCENT_SYSUPGRADE_SESSION_LATCH_HELPER:-$SESSION_LATCH_HELPER}"
+    FW_ENV_CONFIG="${DCENT_SYSUPGRADE_FW_ENV_CONFIG:-$FW_ENV_CONFIG}"
+    UBOOT_ENV_PROC_MTD="${DCENT_SYSUPGRADE_UBOOT_ENV_PROC_MTD:-$UBOOT_ENV_PROC_MTD}"
+    UBOOT_ENV_SYSFS_MTD_ROOT="${DCENT_SYSUPGRADE_UBOOT_ENV_SYSFS_MTD_ROOT:-$UBOOT_ENV_SYSFS_MTD_ROOT}"
+    UBOOT_ENV_MTD4_DEVICE="${DCENT_SYSUPGRADE_UBOOT_ENV_MTD4_DEVICE:-$UBOOT_ENV_MTD4_DEVICE}"
+    PERSIST_SOURCE_ROOT="${DCENT_SYSUPGRADE_PERSIST_SOURCE_ROOT:-$PERSIST_SOURCE_ROOT}"
+    PROC_MOUNTS_PATH="${DCENT_SYSUPGRADE_PROC_MOUNTS_PATH:-$PROC_MOUNTS_PATH}"
+    SYSUPGRADE_LOCK_DIR="${DCENT_SYSUPGRADE_LOCK_DIR:-$SYSUPGRADE_LOCK_DIR}"
+    PROC_ROOT="${DCENT_SYSUPGRADE_PROC_ROOT:-$PROC_ROOT}"
+    BOOT_ID_PATH="${DCENT_SYSUPGRADE_BOOT_ID_PATH:-$BOOT_ID_PATH}"
 fi
 
 if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
@@ -94,6 +128,58 @@ if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
     }
 fi
 
+if [ ! -r "$PERSIST_HELPER" ]; then
+    echo "Error: persistent-state helper is missing or unreadable: $PERSIST_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-persistent-state.sh
+. "$PERSIST_HELPER"
+if ! command -v dcent_persist_preflight >/dev/null 2>&1 ||
+   ! command -v dcent_persist_stage >/dev/null 2>&1 ||
+   ! command -v dcent_persist_verify >/dev/null 2>&1; then
+    echo "Error: persistent-state helper did not provide its required API"
+    exit 1
+fi
+if [ ! -r "$TRANSACTION_LOCK_HELPER" ]; then
+    echo "Error: sysupgrade transaction-lock helper is missing or unreadable: $TRANSACTION_LOCK_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-transaction-lock.sh
+. "$TRANSACTION_LOCK_HELPER"
+if ! command -v dcent_sysupgrade_lock_acquire >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_lock_arm_env_commit >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_lock_abort_env_commit >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_lock_require_cleanup >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_lock_preserve >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_lock_release >/dev/null 2>&1; then
+    echo "Error: sysupgrade transaction-lock helper did not provide its required API"
+    exit 1
+fi
+if [ ! -r "$TRANSACTION_WORKSPACE_HELPER" ]; then
+    echo "Error: sysupgrade transaction-workspace helper is missing or unreadable: $TRANSACTION_WORKSPACE_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-transaction-workspace.sh
+. "$TRANSACTION_WORKSPACE_HELPER"
+if ! command -v dcent_sysupgrade_workspace_create >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_workspace_path >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_workspace_require_absent >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_workspace_cleanup >/dev/null 2>&1; then
+    echo "Error: sysupgrade transaction-workspace helper did not provide its required API"
+    exit 1
+fi
+if [ ! -r "$PACKAGE_INPUT_HELPER" ]; then
+    echo "Error: sysupgrade package-input helper is missing or unreadable: $PACKAGE_INPUT_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-package-input.sh
+. "$PACKAGE_INPUT_HELPER"
+if ! command -v dcent_sysupgrade_input_open >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_input_verify_unchanged >/dev/null 2>&1 ||
+   ! command -v dcent_sysupgrade_input_close >/dev/null 2>&1; then
+    echo "Error: sysupgrade package-input helper did not provide its required API"
+    exit 1
+fi
 if [ ! -r "$ARCHIVE_ADMISSION_HELPER" ]; then
     echo "Error: sysupgrade archive-admission helper is missing or unreadable: $ARCHIVE_ADMISSION_HELPER"
     exit 1
@@ -104,34 +190,125 @@ if ! command -v dcent_sysupgrade_archive_admit >/dev/null 2>&1; then
     echo "Error: sysupgrade archive-admission helper did not provide its required API"
     exit 1
 fi
-
 if [ ! -r "$MANIFEST_JSON_HELPER" ] || ! command -v python3 >/dev/null 2>&1; then
     echo "Error: semantic manifest admission requires python3 and $MANIFEST_JSON_HELPER"
     exit 1
 fi
+if [ ! -r "$UBI_IDENTITY_HELPER" ]; then
+    echo "Error: UBI identity helper is missing or unreadable: $UBI_IDENTITY_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-ubi-identity.sh
+. "$UBI_IDENTITY_HELPER"
+if ! command -v dcent_ubi_attachment_require_absent >/dev/null 2>&1 ||
+   ! command -v dcent_ubi_identity_admit >/dev/null 2>&1; then
+    echo "Error: UBI identity helper did not provide its required API"
+    exit 1
+fi
+if [ ! -r "$UBI_NODE_HELPER" ]; then
+    echo "Error: UBI node helper is missing or unreadable: $UBI_NODE_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-ubi-node.sh
+. "$UBI_NODE_HELPER"
+if ! command -v dcent_ubi_node_admit >/dev/null 2>&1; then
+    echo "Error: UBI node helper did not provide its required API"
+    exit 1
+fi
 
-release_pre_mutation_update_lock() {
-    if [ "$SYSUPGRADE_UPDATE_LOCK_OWNED" = "1" ] \
-       && [ "$SYSUPGRADE_MUTATION_STARTED" = "0" ]; then
-        [ -d "$SYSUPGRADE_UPDATE_LOCK" ] \
-            && [ ! -L "$SYSUPGRADE_UPDATE_LOCK" ] \
-            && rmdir "$SYSUPGRADE_UPDATE_LOCK" 2>/dev/null || true
-        SYSUPGRADE_UPDATE_LOCK_OWNED=0
-    fi
+dcent_ubi_attach_mtd() {
+    dcent_ubi_node_admit /sys/class/misc/ubi_ctrl/dev /dev ubi_ctrl || return 1
+    ubiattach -m "$1" -d "$2"
 }
+
+dcent_ubi_detach_device() {
+    dcent_ubi_node_admit /sys/class/misc/ubi_ctrl/dev /dev ubi_ctrl || return 1
+    ubidetach -d "$1"
+}
+
+dcent_ubi_device_admit() {
+    dcent_ubi_node_admit "/sys/class/ubi/ubi$1/dev" /dev "ubi$1"
+}
+
+dcent_ubi_volume_admit() {
+    dcent_ubi_node_admit "/sys/class/ubi/ubi${1}_${2}/dev" /dev "ubi${1}_${2}"
+}
+
+dcent_ubi_semantic_identity_admit() {
+    dcent_ubi_identity_admit /sys/class/ubi "$1" "$2" 3 \
+        dynamic dynamic dynamic
+}
+
+dcent_ubi_make_volume() {
+    _dcent_ubi_make_device=$1
+    shift
+    dcent_ubi_node_admit "/sys/class/ubi/ubi$_dcent_ubi_make_device/dev" \
+        /dev "ubi$_dcent_ubi_make_device" || return 1
+    ubimkvol "/dev/ubi$_dcent_ubi_make_device" "$@"
+}
+
+dcent_ubi_update_volume() {
+    _dcent_ubi_update_device=$1
+    _dcent_ubi_update_volume=$2
+    _dcent_ubi_update_source=$3
+    dcent_ubi_semantic_identity_admit "$_dcent_ubi_update_device" \
+        "$INACTIVE_MTD" || return 1
+    dcent_ubi_volume_admit "$_dcent_ubi_update_device" \
+        "$_dcent_ubi_update_volume" || return 1
+    ubiupdatevol \
+        "/dev/ubi${_dcent_ubi_update_device}_${_dcent_ubi_update_volume}" \
+        "$_dcent_ubi_update_source"
+}
+if [ ! -r "$UBOOT_ENV_ADMISSION_HELPER" ]; then
+    echo "Error: U-Boot environment admission helper is missing or unreadable: $UBOOT_ENV_ADMISSION_HELPER"
+    exit 1
+fi
+# shellcheck source=/usr/libexec/dcentos/sysupgrade-uboot-env-admission.sh
+. "$UBOOT_ENV_ADMISSION_HELPER"
+if ! command -v dcent_zynq_uboot_env_admit >/dev/null 2>&1; then
+    echo "Error: U-Boot environment admission helper did not provide its required API"
+    exit 1
+fi
+if [ ! -r "$SESSION_LATCH_HELPER" ]; then
+    echo "Error: hardware-session latch helper is missing or unreadable: $SESSION_LATCH_HELPER"
+    exit 1
+fi
 
 cleanup_package() {
-    release_pre_mutation_update_lock
-    if [ -n "$PACKAGE_DIR" ] && [ -d "$PACKAGE_DIR" ]; then
-        rm -rf "$PACKAGE_DIR"
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    if ! dcent_sysupgrade_input_close; then
+        echo "Error: sysupgrade package descriptor could not be closed safely" >&2
+        [ "$cleanup_status" -ne 0 ] || cleanup_status=1
+    fi
+    if ! dcent_sysupgrade_workspace_cleanup "$PROC_MOUNTS_PATH"; then
+        echo "Error: sysupgrade workspace cleanup is ambiguous; preserving workspace and transaction lock" >&2
+        case "${DCENT_SYSUPGRADE_LOCK_PHASE:-}" in
+            active)
+                dcent_sysupgrade_lock_require_cleanup || \
+                    echo "Error: could not publish cleanup-required transaction state" >&2
+                ;;
+        esac
+        [ "$cleanup_status" -ne 0 ] || cleanup_status=1
+    elif ! dcent_sysupgrade_lock_release; then
+        echo "Error: sysupgrade transaction lock could not be released safely" >&2
+        [ "$cleanup_status" -ne 0 ] || cleanup_status=1
+    fi
+    exit "$cleanup_status"
+}
+
+verify_sysupgrade_input_unchanged() {
+    [ "${DCENT_SYSUPGRADE_INPUT_OPEN:-0}" = 1 ] || return 0
+    if ! dcent_sysupgrade_input_verify_unchanged; then
+        echo "Error: sysupgrade input changed during its active read window: $ROOTFS_ORIGINAL"
+        return 1
     fi
 }
 
-terminate_sysupgrade() {
-    signal_exit=$1
-    trap - EXIT INT TERM
-    cleanup_package
-    exit "$signal_exit"
+verify_and_close_sysupgrade_input() {
+    verify_sysupgrade_input_unchanged || return 1
+    [ "${DCENT_SYSUPGRADE_INPUT_OPEN:-0}" = 1 ] || return 0
+    dcent_sysupgrade_input_close
 }
 
 manifest_field() {
@@ -462,17 +639,36 @@ validate_sysupgrade_tar_preextract() {
         return 1
     fi
 
-    tmp_avail_kb=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
-    case "$tmp_avail_kb" in ''|*[!0-9]*|0) echo "Error: cannot validate /tmp free space before tar extraction"; return 1 ;; esac
+    tmp_avail_kb=$(df -Pk "$DCENT_SYSUPGRADE_WORKSPACE" 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$tmp_avail_kb" in ''|*[!0-9]*|0) echo "Error: cannot validate workspace free space before tar extraction"; return 1 ;; esac
     tmp_avail_bytes=$((tmp_avail_kb * 1024))
+    # `df` free already excludes an uploaded tar resident on this same tmpfs.
+    # Packages are uncompressed and require their own kernel, so remaining
+    # scratch must hold one extraction of package_size plus filesystem slack.
+    # The raw-image path admits its optional active-kernel copy separately.
     tmp_required=$((package_size + SYSUPGRADE_TAR_SLACK_BYTES))
     if [ "$tmp_avail_bytes" -lt "$tmp_required" ]; then
-        echo "Error: /tmp has insufficient free space for sysupgrade package extraction ($tmp_avail_bytes bytes available < $tmp_required bytes required)."
+        echo "Error: the private workspace has insufficient free space for sysupgrade package extraction ($tmp_avail_bytes bytes available < $tmp_required bytes required)."
         echo "  Refusing before tar extraction."
         return 1
     fi
 
-    echo "  OK: sysupgrade package pre-extract size $package_size <= $ceiling bytes; /tmp free $tmp_avail_bytes bytes"
+    echo "  OK: sysupgrade package pre-extract size $package_size <= $ceiling bytes; workspace free $tmp_avail_bytes bytes"
+    return 0
+}
+
+workspace_require_free_bytes() {
+    _scratch_label=$1
+    _scratch_required=$2
+    _scratch_avail_kb=$(df -Pk "$DCENT_SYSUPGRADE_WORKSPACE" 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$_scratch_avail_kb" in
+        ''|*[!0-9]*|0) echo "Error: cannot validate workspace free space for $_scratch_label"; return 1 ;;
+    esac
+    _scratch_avail=$((_scratch_avail_kb * 1024))
+    if [ "$_scratch_avail" -lt "$_scratch_required" ]; then
+        echo "Error: private workspace has insufficient free space for $_scratch_label ($_scratch_avail bytes available < $_scratch_required bytes required)."
+        return 1
+    fi
     return 0
 }
 
@@ -503,9 +699,21 @@ payload_fits_ubi_volume() {
     return 0
 }
 
+# A signal trap runs with the status of the interrupted command; dash and
+# BusyBox ash may therefore present status 0 to a shared cleanup handler.
+# Translate signals to conventional nonzero statuses first, then let the one
+# EXIT trap perform the exact same resource cleanup path.
 trap cleanup_package EXIT
-trap 'terminate_sysupgrade 130' INT
-trap 'terminate_sysupgrade 143' TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+dcent_sysupgrade_lock_acquire "$SYSUPGRADE_LOCK_DIR" "$PROC_ROOT" "$BOOT_ID_PATH" || exit 1
+dcent_sysupgrade_workspace_create "$SYSUPGRADE_WORKSPACE_ROOT" || exit 1
+PACKAGE_WORK_DIR=$(dcent_sysupgrade_workspace_path package) || exit 1
+KERNEL_TEMP=$(dcent_sysupgrade_workspace_path active-kernel.bin) || exit 1
+ENV_PRE_TEMP=$(dcent_sysupgrade_workspace_path uboot-env-pre.txt) || exit 1
+FW_SETENV_SCRIPT=$(dcent_sysupgrade_workspace_path fw-setenv.env) || exit 1
+PERSIST_MOUNT_ROOT=$(dcent_sysupgrade_workspace_path inactive-data) || exit 1
 
 # Parse arguments
 for arg in "$@"; do
@@ -516,6 +724,7 @@ for arg in "$@"; do
         *) ROOTFS="$arg" ;;
     esac
 done
+ROOTFS_ORIGINAL=$ROOTFS
 
 # --- Detect current firmware slot ---
 CMDLINE=$(cat "$PROC_CMDLINE_PATH")
@@ -560,17 +769,36 @@ if [ -z "$ROOTFS" ]; then
     exit 1
 fi
 
-if [ ! -f "$ROOTFS" ]; then
-    echo "Error: $ROOTFS not found"
+case "$ROOTFS_ORIGINAL" in
+    /*) ;;
+    *)
+        echo "Error: sysupgrade input must be an absolute path (for example /tmp/dcentos-sysupgrade.tar)."
+        echo "  Relative paths are refused so package identity cannot depend on a mutable working directory."
+        exit 1
+        ;;
+esac
+if [ ! -f "$ROOTFS_ORIGINAL" ]; then
+    echo "Error: $ROOTFS_ORIGINAL not found"
     exit 1
 fi
+if ! dcent_sysupgrade_input_open "$ROOTFS_ORIGINAL"; then
+    echo "Error: sysupgrade input admission failed for $ROOTFS_ORIGINAL"
+    exit 1
+fi
+ROOTFS=$DCENT_SYSUPGRADE_INPUT_FD_PATH
 
 # Support verified sysupgrade tar packages in addition to raw squashfs images.
 if tar tf "$ROOTFS" >/dev/null 2>&1; then
+    PACKAGE_INPUT_IS_TAR=1
     validate_sysupgrade_tar_preextract "$ROOTFS" || exit 1
     validate_sysupgrade_tar_members "$ROOTFS" || exit 1
     echo "Detected sysupgrade package tar — extracting and verifying manifest..."
-    PACKAGE_DIR=$(mktemp -d /tmp/sysupgrade-pkg.XXXXXX 2>/dev/null || mktemp -d)
+    PACKAGE_DIR=$PACKAGE_WORK_DIR
+    dcent_sysupgrade_workspace_require_absent "$PACKAGE_DIR" || exit 1
+    mkdir -m 700 "$PACKAGE_DIR" || {
+        echo "Error: Failed to create private package extraction directory"
+        exit 1
+    }
     if ! tar xf "$ROOTFS" -C "$PACKAGE_DIR"; then
         echo "Error: Failed to extract sysupgrade tar package"
         exit 1
@@ -843,7 +1071,8 @@ if tar tf "$ROOTFS" >/dev/null 2>&1; then
         exit 1
     fi
 
-    echo "  Verified package manifest for board: ${PACKAGE_BOARD:-unknown}"
+    verify_and_close_sysupgrade_input || exit 1
+    echo "  Verified stable package manifest for board: ${PACKAGE_BOARD:-unknown}"
 elif [ "$ALLOW_LAB_UNSIGNED" != "1" ]; then
     echo "Error: Raw squashfs sysupgrade is blocked by default."
     echo "Use a packaged sysupgrade tar, or set DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 for controlled lab recovery."
@@ -879,12 +1108,16 @@ fi
 # Verify it looks like a squashfs (magic: hsqs = 0x73717368)
 MAGIC=$(hexdump -n 4 -e '4/1 "%02x"' "$ROOTFS" 2>/dev/null)
 if [ "$MAGIC" != "68737173" ]; then
-    echo "Error: $ROOTFS does not appear to be a squashfs image"
+    echo "Error: rootfs payload from $ROOTFS_ORIGINAL does not appear to be a squashfs image"
     echo "Expected magic: hsqs, got: $MAGIC"
     exit 1
 fi
 
-ROOTFS_SIZE=$(wc -c < "$ROOTFS")
+if [ "$PACKAGE_INPUT_IS_TAR" = 1 ]; then
+    ROOTFS_SIZE=$(wc -c < "$ROOTFS")
+else
+    ROOTFS_SIZE=$DCENT_SYSUPGRADE_INPUT_SIZE
+fi
 if ! dcent_zynq_geometry_require_payload_fit "$EXPECTED_BOARD" rootfs "$ROOTFS_SIZE"; then
     echo "Error: rootfs payload exceeds the evidence-backed package window."
     exit 1
@@ -904,7 +1137,8 @@ echo ""
 echo "  Current firmware: $CURRENT_FW (mtd$CURRENT_MTD) — running"
 echo "  Target firmware:  $INACTIVE_FW (mtd$INACTIVE_MTD) — will be updated"
 echo ""
-echo "  New rootfs: $ROOTFS ($ROOTFS_SIZE bytes)"
+echo "  Upgrade input: $ROOTFS_ORIGINAL"
+echo "  Rootfs payload: $ROOTFS ($ROOTFS_SIZE bytes)"
 if [ -n "$PACKAGE_MANIFEST" ]; then
     echo "  Package manifest: $PACKAGE_MANIFEST"
 fi
@@ -925,6 +1159,7 @@ echo "  and used to flip firmware back manually."
 echo ""
 
 if [ "$TEST_ONLY" = "1" ]; then
+    verify_and_close_sysupgrade_input || exit 1
     echo "Verification succeeded — test mode, no NAND writes performed."
     exit 0
 fi
@@ -935,8 +1170,7 @@ if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
         exit 1
     }
     . "$DEPLOY_UPGRADE_GUARD"
-    command -v dcent_deploy_upgrade_guard >/dev/null 2>&1 \
-        && dcent_deploy_upgrade_guard || exit 1
+    command -v dcent_deploy_upgrade_guard >/dev/null 2>&1         && dcent_deploy_upgrade_guard || exit 1
 fi
 
 if [ "$FORCE" -eq 0 ]; then
@@ -950,45 +1184,50 @@ else
     echo "  Force mode (-f): skipping confirmation"
 fi
 
-if [ "${DCENT_SYSUPGRADE_OFFLINE_HARNESS:-0}" != "1" ]; then
-    [ -x "$SESSION_LATCH_HELPER" ] || {
-        echo "Error: hardware-session admission helper is missing: $SESSION_LATCH_HELPER"
-        exit 1
-    }
-    if [ -e "$SYSUPGRADE_UPDATE_LOCK" ] || [ -L "$SYSUPGRADE_UPDATE_LOCK" ]; then
-        echo "Error: hardware-session update transaction is already active: $SYSUPGRADE_UPDATE_LOCK"
-        exit 1
-    fi
-    if ! (umask 077; mkdir "$SYSUPGRADE_UPDATE_LOCK"); then
-        echo "Error: cannot acquire hardware-session update transaction: $SYSUPGRADE_UPDATE_LOCK"
-        exit 1
-    fi
-    SYSUPGRADE_UPDATE_LOCK_OWNED=1
-    if ! chmod 700 "$SYSUPGRADE_UPDATE_LOCK" \
-       || [ "$(stat -c '%u:%a' "$SYSUPGRADE_UPDATE_LOCK" 2>/dev/null)" != "0:700" ]; then
-        echo "Error: hardware-session update transaction metadata is unsafe"
-        release_pre_mutation_update_lock
-        exit 1
-    fi
-    if ! "$SESSION_LATCH_HELPER" admit-update \
-        /data "$SYSUPGRADE_UPDATE_LOCK" "$CURRENT_MTD"; then
-        echo "Error: firmware transition blocked by hardware-session disposition"
-        release_pre_mutation_update_lock
-        exit 1
-    fi
-fi
-
 echo ""
+
+# A normal daemon session deliberately keeps an unresolved marker. Until a
+# typed SafeOff receipt exists, sysupgrade is manual-resolution-only: the
+# operator must stop the daemon, remove AC, verify rails, and deliberately
+# resolve the persistent latch. This check owns the same admission lock as S82,
+# while the already-held /run transaction lock blocks a new daemon start.
+dcent_persist_preflight "$PERSIST_SOURCE_ROOT" || {
+    echo "Error: active persistent state failed preflight validation."
+    echo "  Refusing before any inactive-slot mutation."
+    exit 1
+}
+/bin/sh "$SESSION_LATCH_HELPER" admit-update \
+    "$PERSIST_SOURCE_ROOT" "$SYSUPGRADE_LOCK_DIR" "$CURRENT_MTD" || {
+    echo "Error: sysupgrade requires a manually resolved hardware session."
+    echo "  Refusing before any inactive-slot mutation. Stop dcentrald, remove"
+    echo "  AC, verify approved rail SafeOff, resolve the session latch, then retry."
+    exit 1
+}
+if ! dcent_zynq_uboot_env_admit \
+    "$FW_ENV_CONFIG" "$UBOOT_ENV_PROC_MTD" \
+    "$UBOOT_ENV_SYSFS_MTD_ROOT" "$UBOOT_ENV_MTD4_DEVICE"; then
+    echo "Error: canonical U-Boot environment identity admission failed."
+    echo "  Refusing before any inactive-slot mutation."
+    exit 1
+fi
 
 # --- Step 1: Attach inactive MTD as UBI ---
 echo "[1/5] Attaching inactive slot (mtd$INACTIVE_MTD)..."
 
-# Detach first in case it's already attached from a previous attempt
-ubidetach -m "$INACTIVE_MTD" 2>/dev/null || true
-sleep 1
+if [ "$PACKAGE_INPUT_IS_TAR" -eq 0 ]; then
+    verify_sysupgrade_input_unchanged || exit 1
+fi
+
+# A pre-existing attachment is not owned by this transaction.  Refuse it;
+# never adopt it and never destroy it to make the desired number available.
+if ! dcent_ubi_attachment_require_absent /sys/class/ubi 1 "$INACTIVE_MTD"; then
+    echo "Error: inactive MTD or requested ubi1 number is already attached."
+    echo "  Refusing to detach an unowned UBI resource; reboot or reconcile the retained transaction receipt."
+    exit 1
+fi
 
 # Attach as UBI device number 1 (ubi0 is the running slot)
-if ! ubiattach -m "$INACTIVE_MTD" -d 1 2>/dev/null; then
+if ! dcent_ubi_attach_mtd "$INACTIVE_MTD" 1 2>/dev/null; then
     echo "Error: Failed to attach mtd$INACTIVE_MTD as UBI device"
     echo "The inactive slot may not have a valid UBI layout."
     echo ""
@@ -1000,24 +1239,15 @@ if ! ubiattach -m "$INACTIVE_MTD" -d 1 2>/dev/null; then
     exit 1
 fi
 
-# Create device nodes for the new UBI device (no devtmpfs on this kernel)
-echo "  Creating device nodes..."
-for ubi_path in /sys/class/ubi/ubi1*; do
-    [ -d "$ubi_path" ] || continue
-    name=$(basename "$ubi_path")
-    dev=$(cat "$ubi_path/dev" 2>/dev/null)
-    if [ -n "$dev" ]; then
-        major=${dev%%:*}
-        minor=${dev##*:}
-        mknod -m 660 "/dev/$name" c "$major" "$minor" 2>/dev/null || true
-    fi
-done
-
-# Verify volumes exist
-if [ ! -e /dev/ubi1_0 ] || [ ! -e /dev/ubi1_1 ]; then
-    echo "Error: Expected ubi1_0 (kernel) and ubi1_1 (rootfs) volumes"
-    echo "  ubi1_0: $(ls -la /dev/ubi1_0 2>/dev/null || echo 'NOT FOUND')"
-    echo "  ubi1_1: $(ls -la /dev/ubi1_1 2>/dev/null || echo 'NOT FOUND')"
+# Admit only the exact inactive device and semantic volume nodes.  Until the
+# transaction has a durable create-before-own resource ledger, missing nodes
+# fail closed rather than being created and left ambiguous after a signal.
+echo "  Admitting exact UBI device nodes..."
+if ! dcent_ubi_device_admit 1 ||
+   ! dcent_ubi_volume_admit 1 0 ||
+   ! dcent_ubi_volume_admit 1 1 ||
+   ! dcent_ubi_volume_admit 1 2; then
+    echo "Error: Expected exact ubi1 kernel/rootfs/rootfs_data device nodes"
     echo ""
     # A1c-2: unlike the am2 variant, the S9 script does not auto-create volumes on
     # a factory-blank slot — the S9 on-device sysupgrade is intentionally the
@@ -1030,10 +1260,10 @@ if [ ! -e /dev/ubi1_0 ] || [ ! -e /dev/ubi1_1 ]; then
     echo "    ubiattach -m $INACTIVE_MTD"
     echo "    ubimkvol /dev/ubi1 -N kernel -s 4MiB"
     echo "    ubimkvol /dev/ubi1 -N rootfs -m"
-    ubidetach -d 1 2>/dev/null || true
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
-echo "  OK: ubi1_0 (kernel) and ubi1_1 (rootfs) found"
+echo "  OK: exact root-only ubi1 device and semantic volume nodes admitted"
 
 # --- Step 1b: S9 UBI volume layout pre-flight (brick guard) ---
 KERNEL_LEBS=$(ubi_vol_lebs 1 0)
@@ -1061,21 +1291,29 @@ elif [ "$ROOTFS_LEBS" -lt "$EXPECTED_ROOTFS_LEBS" ]; then
     _UBI_LAYOUT_OK=0
 fi
 if [ -z "$ROOTFS_DATA_LEBS" ]; then
-    echo "  WARN: rootfs_data volume (ubi1_2) missing -- first boot will initialize."
+    echo "Error: rootfs_data volume (ubi1_2) is missing -- persistent state cannot survive the slot transition."
+    _UBI_LAYOUT_OK=0
 fi
 if [ "$_UBI_LAYOUT_OK" != "1" ]; then
     echo "ERROR: inactive slot UBI volumes do not match the expected $EXPECTED_BOARD template."
     echo "  Refusing before any ubiupdatevol call. Wrong UBI geometry = brick."
-    ubidetach -d 1 2>/dev/null || true
-    rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 /dev/ubi1_2 2>/dev/null || true
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
 echo "  OK: inactive UBI layout matches am1-s9 minimum template."
 
+# Bind the mutable ubi1 device number to the selected inactive MTD and the
+# semantic volume map immediately before entering any ubiupdatevol phase.
+if ! dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD"; then
+    echo "Error: inactive UBI identity admission failed; refusing all volume writes."
+    dcent_ubi_detach_device 1 2>/dev/null || true
+    exit 1
+fi
+echo "  OK: ubi1 identity is bound to mtd$INACTIVE_MTD and kernel/rootfs/rootfs_data."
+
 UBI_LEB_SIZE=$(ubi_dev_leb_size 1)
 if ! payload_fits_ubi_volume "rootfs" "$ROOTFS_SIZE" "$ROOTFS_LEBS" "$UBI_LEB_SIZE"; then
-    ubidetach -d 1 2>/dev/null || true
-    rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 /dev/ubi1_2 2>/dev/null || true
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
 
@@ -1089,34 +1327,49 @@ else
     KERNEL_SIZE=$(cat /sys/class/ubi/ubi0_0/data_bytes 2>/dev/null)
     if [ -z "$KERNEL_SIZE" ] || [ "$KERNEL_SIZE" -eq 0 ]; then
         echo "Error: Cannot determine kernel size from ubi0_0"
-        ubidetach -d 1 2>/dev/null || true
+        dcent_ubi_detach_device 1 2>/dev/null || true
         exit 1
     fi
-    dd if=/dev/ubi0_0 of=/tmp/kernel.bin bs=1M 2>/dev/null
-    KERNEL_SOURCE=/tmp/kernel.bin
+    if ! workspace_require_free_bytes "active-kernel scratch copy" \
+        "$((KERNEL_SIZE + SYSUPGRADE_TAR_SLACK_BYTES))"; then
+        dcent_ubi_detach_device 1 2>/dev/null || true
+        exit 1
+    fi
+    if ! dcent_sysupgrade_workspace_require_absent "$KERNEL_TEMP"; then
+        dcent_ubi_detach_device 1 2>/dev/null || true
+        exit 1
+    fi
+    dcent_ubi_semantic_identity_admit 0 "$CURRENT_MTD" || { echo "Error: active UBI identity changed before kernel copy"; dcent_ubi_detach_device 1 2>/dev/null || true; exit 1; }
+    dcent_ubi_volume_admit 0 0 || { echo "Error: active kernel node changed before copy"; dcent_ubi_detach_device 1 2>/dev/null || true; exit 1; }
+    if ! dd if=/dev/ubi0_0 of="$KERNEL_TEMP" bs=1M 2>/dev/null; then
+        echo "Error: Failed to copy the active kernel from ubi0_0"
+        rm -f "$KERNEL_TEMP"
+        dcent_ubi_detach_device 1 2>/dev/null || true
+        exit 1
+    fi
+    KERNEL_SOURCE=$KERNEL_TEMP
 fi
 echo "  Kernel size: $KERNEL_SIZE bytes"
 
 if ! payload_fits_ubi_volume "kernel" "$KERNEL_SIZE" "$KERNEL_LEBS" "$UBI_LEB_SIZE"; then
-    rm -f /tmp/kernel.bin
-    ubidetach -d 1 2>/dev/null || true
+    rm -f "$KERNEL_TEMP"
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
 
-SYSUPGRADE_MUTATION_STARTED=1
-if ! ubiupdatevol /dev/ubi1_0 "$KERNEL_SOURCE"; then
+if ! dcent_ubi_update_volume 1 0 "$KERNEL_SOURCE"; then
     echo "Error: Failed to write kernel to ubi1_0"
-    rm -f /tmp/kernel.bin
-    ubidetach -d 1 2>/dev/null || true
+    rm -f "$KERNEL_TEMP"
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
 echo "  Kernel written to ubi1_0"
 
 # --- Step 3: Write rootfs ---
 echo "[3/5] Writing rootfs to inactive slot ($ROOTFS_SIZE bytes)..."
-if ! ubiupdatevol /dev/ubi1_1 "$ROOTFS"; then
+if ! dcent_ubi_update_volume 1 1 "$ROOTFS"; then
     echo "Error: Failed to write rootfs to ubi1_1"
-    ubidetach -d 1 2>/dev/null || true
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
 fi
 echo "  Rootfs written to ubi1_1"
@@ -1125,25 +1378,38 @@ echo "  Rootfs written to ubi1_1"
 preflip_fail() {
     echo "Error: $1"
     echo "  U-Boot env NOT flipped; firmware still points at active firmware=$CURRENT_FW."
-    rm -f /tmp/kernel.bin /tmp/dcent_preflip_kernel.bin /tmp/dcent_preflip_rootfs.bin
-    ubidetach -d 1 2>/dev/null || true
+    rm -f "$KERNEL_TEMP"
+    umount "$PERSIST_MOUNT_ROOT" 2>/dev/null || true
+    rmdir "$PERSIST_MOUNT_ROOT" 2>/dev/null || true
+    dcent_ubi_detach_device 1 2>/dev/null || true
     exit 1
+}
+
+persist_mount_has_mode() {
+    _required_source=$1
+    _required_target=$2
+    _required_mode=$3
+    awk -v required_source="$_required_source" \
+        -v required_target="$_required_target" \
+        -v required_mode="$_required_mode" '
+        $1 == required_source && $2 == required_target && $3 == "ubifs" {
+            count = split($4, options, ",")
+            for (i = 1; i <= count; i++) {
+                if (options[i] == required_mode) found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$PROC_MOUNTS_PATH"
 }
 
 preflip_readback_hash() {
     _dev="$1"
     _size="$2"
-    _tmp="$3"
     _blocks=$(( (_size + 1048575) / 1048576 ))
     [ "$_blocks" -gt 0 ] || _blocks=1
-    rm -f "$_tmp"
-    if ! dd if="$_dev" of="$_tmp" bs=1048576 count="$_blocks" 2>/dev/null; then
-        rm -f "$_tmp"
-        return 1
-    fi
-    _hash=$(head -c "$_size" "$_tmp" | sha256sum | awk '{print $1}')
+    _hash=$(dd if="$_dev" bs=1048576 count="$_blocks" 2>/dev/null \
+        | head -c "$_size" | sha256sum | awk '{print $1}')
     _rc=$?
-    rm -f "$_tmp"
     [ "$_rc" -eq 0 ] && [ -n "$_hash" ] || return 1
     printf '%s\n' "$_hash"
 }
@@ -1156,7 +1422,7 @@ preflip_verify_volume() {
     [ -n "$_size" ] && [ "$_size" -gt 0 ] || preflip_fail "pre-flip readback cannot determine $_label payload size; env NOT flipped."
     _expected=$(sha256sum "$_source" | awk '{print $1}')
     [ -n "$_expected" ] || preflip_fail "pre-flip readback cannot hash $_label source; env NOT flipped."
-    _actual=$(preflip_readback_hash "$_dev" "$_size" "/tmp/dcent_preflip_${_label}.bin") || preflip_fail "pre-flip readback failed for $_label from $_dev; env NOT flipped."
+    _actual=$(preflip_readback_hash "$_dev" "$_size") || preflip_fail "pre-flip readback failed for $_label from $_dev; env NOT flipped."
     if [ "$_actual" != "$_expected" ]; then
         preflip_fail "pre-flip readback mismatch for $_label on $_dev; env NOT flipped."
     fi
@@ -1164,95 +1430,62 @@ preflip_verify_volume() {
 }
 
 echo "[3.25/5] Verifying inactive slot readback before U-Boot env flip..."
+dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD" || preflip_fail "inactive UBI identity changed before kernel readback."
+dcent_ubi_volume_admit 1 0 || preflip_fail "kernel volume node changed before readback."
 preflip_verify_volume kernel /dev/ubi1_0 "$KERNEL_SOURCE"
+dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD" || preflip_fail "inactive UBI identity changed before rootfs readback."
+dcent_ubi_volume_admit 1 1 || preflip_fail "rootfs volume node changed before readback."
 preflip_verify_volume rootfs /dev/ubi1_1 "$ROOTFS"
-rm -f /tmp/kernel.bin
+verify_and_close_sysupgrade_input || preflip_fail "sysupgrade input stability checkpoint failed after inactive-slot readback."
+rm -f "$KERNEL_TEMP"
 echo "  Pre-flip readback verified; U-Boot env still points at firmware=$CURRENT_FW"
 
-# --- Step 3.5: Sync persistent data to inactive slot ---
-echo "[3.5/5] Syncing persistent data to inactive slot..."
+# --- Step 3.5: Durably stage persistent data before any slot flip ---
+echo "[3.5/5] Staging and verifying persistent data on inactive slot..."
 
-# Check if rootfs_data volume exists on inactive UBI
-if [ -e /sys/class/ubi/ubi1_2 ]; then
-    # Create device node for ubi1_2 (rootfs_data)
-    dev=$(cat /sys/class/ubi/ubi1_2/dev 2>/dev/null)
-    if [ -n "$dev" ]; then
-        major=${dev%%:*}
-        minor=${dev##*:}
-        mknod -m 660 "/dev/ubi1_2" c "$major" "$minor" 2>/dev/null || true
-    fi
+[ -r "$PROC_MOUNTS_PATH" ] || preflip_fail "cannot read the mount table used for persistent-state admission."
+persist_mount_has_mode ubi0:rootfs_data "$PERSIST_SOURCE_ROOT" rw || \
+    preflip_fail "persistent-state source is not the exact active writable ubi0:rootfs_data UBIFS mount."
+[ -e /sys/class/ubi/ubi1_2 ] || \
+    preflip_fail "inactive rootfs_data volume is missing; persistent state cannot be carried across the slot transition."
 
-    # Mount inactive rootfs_data
-    mkdir -p /tmp/inactive_data
-    if mount -t ubifs ubi1:rootfs_data /tmp/inactive_data 2>/dev/null; then
-        # Create directory structure
-        mkdir -p /tmp/inactive_data/keys/dropbear
-        mkdir -p /tmp/inactive_data/config
-        mkdir -p /tmp/inactive_data/profiles
-        mkdir -p /tmp/inactive_data/logs
-        mkdir -p /tmp/inactive_data/overlay/etc/upper /tmp/inactive_data/overlay/etc/work
+dcent_sysupgrade_workspace_require_absent "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "inactive data mountpoint already exists."
+mkdir -m 700 "$PERSIST_MOUNT_ROOT" || preflip_fail "cannot create the inactive data mountpoint."
+dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD" || preflip_fail "inactive UBI identity changed before writable mount."
+dcent_ubi_volume_admit 1 2 || preflip_fail "inactive rootfs_data node changed before writable mount."
+mount -t ubifs -o rw ubi1:rootfs_data "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "cannot mount inactive rootfs_data read-write."
+persist_mount_has_mode ubi1:rootfs_data "$PERSIST_MOUNT_ROOT" rw || \
+    preflip_fail "inactive rootfs_data did not appear as the expected writable UBIFS mount."
+dcent_persist_stage "$PERSIST_SOURCE_ROOT" "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "persistent-state staging failed."
+sync || preflip_fail "sync failed after persistent-state staging."
+dcent_persist_verify "$PERSIST_SOURCE_ROOT" "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "writable-mount persistent-state verification failed."
+umount "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "cannot unmount inactive rootfs_data after the writable verification."
 
-        # Sync SSH keys (|| true: directory may be empty)
-        if [ -d /data/keys ]; then
-            cp -a /data/keys/* /tmp/inactive_data/keys/ 2>/dev/null || true
-            echo "  SSH keys synced"
-        fi
-        # Sync config (|| true: directory may be empty)
-        if [ -d /data/config ]; then
-            cp -a /data/config/* /tmp/inactive_data/config/ 2>/dev/null || true
-        fi
-        # Sync mining profiles (|| true: directory may be empty)
-        if [ -d /data/profiles ]; then
-            cp -a /data/profiles/* /tmp/inactive_data/profiles/ 2>/dev/null || true
-        fi
-        # Sync live runtime config (S82dcentrald prefers /data/dcentrald.toml over /etc)
-        if [ -f /data/dcentrald.toml ]; then
-            cp -a /data/dcentrald.toml /tmp/inactive_data/dcentrald.toml 2>/dev/null || true
-            echo "  Runtime dcentrald.toml synced"
-        fi
-        # Sync dashboard/onboarding/SSH state so an A/B self-update preserves the
-        # operator's dashboard password (auth.json), wizard-complete marker
-        # (onboarding.json), operator SSH keys (authorized_keys), and the
-        # S50dropbear enable flag (.ssh-enabled). cp -a /data/dcent/. captures
-        # the dotfiles a /data/dcent/* glob would miss; the -d guard skips a
-        # fresh unit that has no /data/dcent yet.
-        if [ -d /data/dcent ]; then
-            mkdir -p /tmp/inactive_data/dcent
-            cp -a /data/dcent/. /tmp/inactive_data/dcent/ 2>/dev/null || true
-            # Re-assert perms (cp -a preserves source perms, but harden in case
-            # the source was created loosely or the copy lost mode bits).
-            chmod 0700 /tmp/inactive_data/dcent 2>/dev/null || true
-            if [ -f /tmp/inactive_data/dcent/auth.json ]; then
-                chmod 0600 /tmp/inactive_data/dcent/auth.json 2>/dev/null || true
-            fi
-            echo "  Dashboard/onboarding/SSH state synced"
-        fi
-        # Save current SSH host keys directly
-        if [ -d /etc/dropbear ]; then
-            cp /etc/dropbear/dropbear_*_host_key /tmp/inactive_data/keys/dropbear/ 2>/dev/null || true
-            echo "  SSH host keys saved for new slot"
-        fi
-        # Save entropy seed
-        dd if=/dev/urandom of=/tmp/inactive_data/keys/random-seed bs=512 count=1 2>/dev/null
-        echo "  Entropy seed saved for new slot"
-
-        umount /tmp/inactive_data 2>/dev/null || true
-        rmdir /tmp/inactive_data 2>/dev/null || true
-        echo "  Persistent data synced to inactive slot"
-    else
-        echo "  Warning: Could not mount inactive rootfs_data (first boot will initialize)"
-    fi
-else
-    echo "  Note: No rootfs_data volume on inactive slot (will be created on first boot)"
-fi
+dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD" || preflip_fail "inactive UBI identity changed before read-only remount."
+dcent_ubi_volume_admit 1 2 || preflip_fail "inactive rootfs_data node changed before read-only remount."
+mount -t ubifs -o ro ubi1:rootfs_data "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "cannot remount inactive rootfs_data read-only."
+persist_mount_has_mode ubi1:rootfs_data "$PERSIST_MOUNT_ROOT" ro || \
+    preflip_fail "inactive rootfs_data did not appear as the expected read-only UBIFS mount."
+dcent_persist_verify "$PERSIST_SOURCE_ROOT" "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "read-only remount persistent-state verification failed."
+umount "$PERSIST_MOUNT_ROOT" || \
+    preflip_fail "cannot unmount inactive rootfs_data after the read-only verification."
+rmdir "$PERSIST_MOUNT_ROOT" || preflip_fail "cannot remove the inactive data mountpoint."
+echo "  Persistent state is durable and verified from a read-only remount"
 
 # --- Step 4: Detach and switch U-Boot ---
 echo "[4/5] Switching U-Boot to firmware $INACTIVE_FW..."
 
-# Detach the inactive UBI (no longer needed)
-ubidetach -d 1 2>/dev/null || true
-# Clean up device nodes
-rm -f /dev/ubi1 /dev/ubi1_0 /dev/ubi1_1 2>/dev/null || true
+# Detach is a durability boundary: no environment mutation follows unless the
+# inactive UBI has flushed and detached successfully.
+dcent_ubi_semantic_identity_admit 1 "$INACTIVE_MTD" || preflip_fail "inactive UBI identity changed before final detach."
+dcent_ubi_detach_device 1 || preflip_fail "inactive UBI detach failed after persistence verification."
 
 # SCOPE: this BASE zynq sysupgrade ships ONLY in the am1-s9 image. Every AM2
 # product (am2-s19jpro / am2-s19pro / am2-s17pro) appends its own
@@ -1316,15 +1549,10 @@ if ! command -v fw_printenv >/dev/null 2>&1; then
     _recovery_hint
     exit 1
 fi
-if [ ! -f /etc/fw_env.config ]; then
-    echo "Error: /etc/fw_env.config missing — fw_setenv has no MTD map."
-    echo "  No U-Boot env change attempted."
-    _recovery_hint
-    exit 1
-fi
-if ! grep -q '/dev/mtd4' /etc/fw_env.config; then
-    echo "Error: /etc/fw_env.config does not resolve to /dev/mtd4 — it"
-    echo "  must point at the same redundant env partition U-Boot reads."
+if ! dcent_zynq_uboot_env_admit \
+    "$FW_ENV_CONFIG" "$UBOOT_ENV_PROC_MTD" \
+    "$UBOOT_ENV_SYSFS_MTD_ROOT" "$UBOOT_ENV_MTD4_DEVICE"; then
+    echo "Error: canonical U-Boot environment identity changed before env access."
     echo "  No U-Boot env change attempted."
     _recovery_hint
     exit 1
@@ -1333,7 +1561,14 @@ fi
 # default environment") AND its current firmware= must equal the running slot
 # ($CURRENT_FW). If the live env is unreadable or inconsistent with the running
 # system, we do NOT mutate it (a corrupt/foreign env + a write = brick risk).
-_PRECHK=$(fw_printenv 2>&1)
+_PRECHK_RC=0
+_PRECHK=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || _PRECHK_RC=$?
+if [ "$_PRECHK_RC" -ne 0 ]; then
+    echo "Error: fw_printenv failed while reading the current U-Boot env."
+    echo "  Refusing to mutate an env that was not read successfully."
+    _recovery_hint
+    exit 1
+fi
 case "$_PRECHK" in
     *"Bad CRC"*|*"using default environment"*)
         echo "Error: fw_printenv reports an INVALID current U-Boot env"
@@ -1343,11 +1578,18 @@ case "$_PRECHK" in
         exit 1
         ;;
 esac
-_CUR_FW_NOW=$(fw_printenv firmware 2>/dev/null | sed -n 's/^firmware=//p')
-if [ -z "$_CUR_FW_NOW" ]; then
-    echo "Error: fw_printenv could not read the current firmware= value."
-    echo "  Refusing to flip without a confirmed live env. No U-Boot env"
-    echo "  change attempted."
+_CUR_FW_NOW=$(printf '%s\n' "$_PRECHK" | sed -n 's/^firmware=//p')
+_CUR_STG_NOW=$(printf '%s\n' "$_PRECHK" | sed -n 's/^upgrade_stage=//p')
+_CUR_FIRST_BOOT_NOW=$(printf '%s\n' "$_PRECHK" | sed -n 's/^first_boot=//p')
+_CUR_FW_COUNT=$(printf '%s\n' "$_PRECHK" | sed -n 's/^firmware=//p' | wc -l | tr -d ' ')
+_CUR_STG_COUNT=$(printf '%s\n' "$_PRECHK" | sed -n 's/^upgrade_stage=//p' | wc -l | tr -d ' ')
+_CUR_FIRST_COUNT=$(printf '%s\n' "$_PRECHK" | sed -n 's/^first_boot=//p' | wc -l | tr -d ' ')
+if [ "$_CUR_FW_COUNT" != 1 ] || [ "$_CUR_STG_COUNT" -gt 1 ] || \
+   [ "$_CUR_FIRST_COUNT" -gt 1 ] || [ -z "$_CUR_FW_NOW" ]; then
+    echo "Error: current boot-selector tuple is missing or duplicated."
+    echo "  Expected exactly one firmware= and at most one optional"
+    echo "  upgrade_stage= and first_boot= value."
+    echo "  No U-Boot env change attempted."
     _recovery_hint
     exit 1
 fi
@@ -1362,47 +1604,97 @@ fi
 # Forensic-only snapshot of the pre-flip env (harmless text; NOT a raw
 # ECC-blind image — we never restore a raw dd image). The genuine recovery
 # is `fw_setenv firmware $CURRENT_FW`.
-fw_printenv > /tmp/uboot_env_pre.txt 2>/dev/null || true
+dcent_sysupgrade_workspace_require_absent "$ENV_PRE_TEMP" || exit 1
+printf '%s\n' "$_PRECHK" >"$ENV_PRE_TEMP" || exit 1
 
-# THE FLIP — a single atomic libubootenv transaction. fw_setenv writes the
-# inactive redundant copy then atomically flips the active/obsolete flag —
-# there is no zero-valid-copy window, so a failed transaction leaves the prior
-# valid env intact. This preserves the EXISTING DCENT_OS A/B contract
+# THE FLIP — a single libubootenv redundant-environment transaction. The
+# library is designed to update the inactive copy before changing selection,
+# but an error return alone does not prove which complete tuple is durable.
+# Readback and the armed transaction journal resolve that ambiguity. This
+# preserves the EXISTING DCENT_OS A/B contract
 # (first_boot yes + upgrade_stage 0 + firmware <inactive>) — identical to the
 # old switch_firmware.py --with-stage semantics, only the write mechanism
 # changed. switch_firmware.py is no longer invoked on the write path.
-_FW_SETENV_SCRIPT="/tmp/dcent_fw_setenv_$$.env"
-cat >"$_FW_SETENV_SCRIPT" <<EOF
+dcent_sysupgrade_workspace_require_absent "$FW_SETENV_SCRIPT" || exit 1
+cat >"$FW_SETENV_SCRIPT" <<EOF
 first_boot=yes
 upgrade_stage=0
 firmware=${INACTIVE_FW}
 EOF
-if ! fw_setenv --script "$_FW_SETENV_SCRIPT"; then
-    rm -f "$_FW_SETENV_SCRIPT"
-    echo "Error: fw_setenv failed to apply the boot-selector flip."
-    echo "  libubootenv is redundant-copy-atomic: a failed transaction"
-    echo "  leaves the prior VALID env — this unit still boots its"
-    echo "  current/ACTIVE slot (firmware=$CURRENT_FW). SAFE to"
-    echo "  power-cycle. NO slot flip was committed."
-    _recovery_hint
+dcent_sysupgrade_lock_arm_env_commit || {
+    rm -f "$FW_SETENV_SCRIPT"
+    echo "Error: could not arm the boot-environment transaction journal."
+    exit 1
+}
+if ! fw_setenv -c "$FW_ENV_CONFIG" --script "$FW_SETENV_SCRIPT"; then
+    rm -f "$FW_SETENV_SCRIPT"
+    _POSTFAIL_RC=0
+    _POSTFAIL=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || _POSTFAIL_RC=$?
+    _POSTFAIL_FW=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^firmware=//p')
+    _POSTFAIL_STG=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^upgrade_stage=//p')
+    _POSTFAIL_FIRST=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^first_boot=//p')
+    _POSTFAIL_FW_COUNT=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^firmware=//p' | wc -l | tr -d ' ')
+    _POSTFAIL_STG_COUNT=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^upgrade_stage=//p' | wc -l | tr -d ' ')
+    _POSTFAIL_FIRST_COUNT=$(printf '%s\n' "$_POSTFAIL" | sed -n 's/^first_boot=//p' | wc -l | tr -d ' ')
+    _POSTFAIL_OLD_TUPLE=0
+    case "$_POSTFAIL" in
+        *"Bad CRC"*|*"using default environment"*) ;;
+        *)
+            if [ "$_POSTFAIL_RC" -eq 0 ] && \
+               [ "$_POSTFAIL_FW_COUNT" = 1 ] && \
+               [ "$_POSTFAIL_STG_COUNT" = "$_CUR_STG_COUNT" ] && \
+               [ "$_POSTFAIL_FIRST_COUNT" = "$_CUR_FIRST_COUNT" ] && \
+               [ "$_POSTFAIL_FW" = "$_CUR_FW_NOW" ] && \
+               [ "$_POSTFAIL_STG" = "$_CUR_STG_NOW" ] && \
+               [ "$_POSTFAIL_FIRST" = "$_CUR_FIRST_BOOT_NOW" ]; then
+                _POSTFAIL_OLD_TUPLE=1
+            fi
+            ;;
+    esac
+    if [ "$_POSTFAIL_OLD_TUPLE" = 1 ]; then
+        dcent_sysupgrade_lock_abort_env_commit || \
+            echo "WARNING: old env tuple is intact, but transaction journal disarm failed; same-boot retries remain blocked." >&2
+        echo "Error: fw_setenv failed, but one successful CRC-valid readback"
+        echo "  confirmed the complete prior boot-selector tuple. The active"
+        echo "  slot remains firmware=$CURRENT_FW."
+        _recovery_hint
+    else
+        echo "Error: fw_setenv failed and readback did not prove either complete"
+        echo "  boot-selector tuple. The environment may select either slot."
+        echo "  The armed journal is retained to block unsafe same-boot retries."
+        echo "  DO NOT power-cycle. Inspect a complete CRC-valid firmware=,"
+        echo "  upgrade_stage=, and first_boot= tuple from serial/SD recovery."
+    fi
     exit 1
 fi
-rm -f "$_FW_SETENV_SCRIPT"
+rm -f "$FW_SETENV_SCRIPT"
 
 # --- Post-flip verify (U-Boot's OWN criterion, read via fw_printenv) ---
-# (1) env CRC-valid, (2) firmware=$INACTIVE_FW, (3) upgrade_stage=0.
-# _VERIFY_OK defaults to 0 (fail), set 1 ONLY on positive triple-confirmation.
+# (1) env CRC-valid, (2) firmware=$INACTIVE_FW, (3) upgrade_stage=0,
+# (4) first_boot=yes. All fields come from one env snapshot so verification
+# cannot mix values from different redundant-copy generations.
+# _VERIFY_OK defaults to 0 (fail), set 1 ONLY on positive confirmation.
 # ANY fail / fw_printenv errored / inconclusive → FAIL-CLOSED exit 1, NO
-# [5/5], NO reboot. A failed atomic transaction leaves the prior valid copy.
+# [5/5], NO reboot. The armed journal remains until reboot/recovery.
 _VERIFY_OK=0
-_FWP=$(fw_printenv 2>&1)
+_FWP_RC=0
+_FWP=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || _FWP_RC=$?
+_FW_COUNT=$(printf '%s\n' "$_FWP" | sed -n 's/^firmware=//p' | wc -l | tr -d ' ')
+_STG_COUNT=$(printf '%s\n' "$_FWP" | sed -n 's/^upgrade_stage=//p' | wc -l | tr -d ' ')
+_FIRST_BOOT_COUNT=$(printf '%s\n' "$_FWP" | sed -n 's/^first_boot=//p' | wc -l | tr -d ' ')
 case "$_FWP" in
     *"Bad CRC"*|*"using default environment"*)
         _VERIFY_OK=0 ;;
     *)
-        _FW_VAL=$(fw_printenv firmware 2>/dev/null | sed -n 's/^firmware=//p')
-        _STG_VAL=$(fw_printenv upgrade_stage 2>/dev/null | sed -n 's/^upgrade_stage=//p')
-        if [ "$_FW_VAL" = "$INACTIVE_FW" ] && [ "$_STG_VAL" = "0" ]; then
+        _FW_VAL=$(printf '%s\n' "$_FWP" | sed -n 's/^firmware=//p')
+        _STG_VAL=$(printf '%s\n' "$_FWP" | sed -n 's/^upgrade_stage=//p')
+        _FIRST_BOOT_VAL=$(printf '%s\n' "$_FWP" | sed -n 's/^first_boot=//p')
+        if [ "$_FWP_RC" -eq 0 ] && \
+           [ "$_FW_COUNT" = 1 ] && [ "$_STG_COUNT" = 1 ] && \
+           [ "$_FIRST_BOOT_COUNT" = 1 ] && \
+           [ "$_FW_VAL" = "$INACTIVE_FW" ] && \
+           [ "$_STG_VAL" = "0" ] && \
+           [ "$_FIRST_BOOT_VAL" = "yes" ]; then
             _VERIFY_OK=1
         fi
         ;;
@@ -1410,20 +1702,22 @@ esac
 
 if [ "$_VERIFY_OK" != "1" ]; then
     echo "Error: U-Boot env verification FAILED — fw_printenv did NOT"
-    echo "  confirm a CRC-valid env with firmware=$INACTIVE_FW upgrade_stage=0"
+    echo "  confirm a CRC-valid env with firmware=$INACTIVE_FW upgrade_stage=0 first_boot=yes"
     echo "  after fw_setenv."
-    echo "WARNING: Firmware payload written. Because fw_setenv is"
-    echo "  redundant-copy-atomic, an UNCONFIRMED flip means the prior"
-    echo "  VALID env copy is still in place — this unit still boots its"
-    echo "  current/ACTIVE slot (firmware=$CURRENT_FW). NO slot flip was"
-    echo "  committed. Do NOT power-cycle into an expectation of the new slot."
-    echo "  Recovery (re-flip back via the SAME safe tool — never raw"
-    echo "  nandwrite of a dd image):"
-    echo "    fw_setenv firmware $CURRENT_FW"
-    echo "    fw_printenv firmware   # must report a CRC-valid firmware="
+    echo "WARNING: Firmware payload is written, but the boot-selector result"
+    echo "  is indeterminate. The env may select either slot; the armed journal"
+    echo "  remains to block unsafe same-boot retries. DO NOT power-cycle."
+    echo "  Inspect the complete CRC-valid firmware=, upgrade_stage=, and"
+    echo "  first_boot= tuple through serial/SD recovery. Repair all three"
+    echo "  fields in one fw_setenv --script transaction; never raw nandwrite."
     exit 1
 fi
-rm -f /tmp/uboot_env_pre.txt 2>/dev/null
+rm -f "$ENV_PRE_TEMP" 2>/dev/null
+
+# Keep the process-wide transaction lock in /run after the verified commit.
+# It disappears only on reboot, preventing a second writer from entering the
+# post-flip/pre-reboot interval if the reboot command is delayed or fails.
+dcent_sysupgrade_lock_preserve || exit 1
 
 echo "  U-Boot env updated: firmware=$INACTIVE_FW"
 

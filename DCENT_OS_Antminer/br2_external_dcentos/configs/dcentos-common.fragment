@@ -64,11 +64,16 @@ BR2_PACKAGE_READLINE=y
 BR2_PACKAGE_DROPBEAR=y
 
 # =============================================================================
-# Hardware diagnostic tools — same set on every product.
+# Hardware diagnostic defaults. Products without an admitted storage backend
+# must override persistent mutation packages to `not set` and prove that fact
+# in their resolved configuration.
 # Raw I2C command utilities are excluded; dcentrald owns controller buses.
 # mtd-utils  : NAND flash partition read/write (nandwrite, ubiformat, etc.).
 # ethtool    : network diagnostics.
-# strace     : kernel/syscall tracing for FPGA / serial / I2C debugging.
+# strace     : DEV/LAB convenience for FPGA / serial / I2C debugging. RELEASE
+#              images prune usr/bin/strace (and any leftover i2cget) in
+#              board/common/prune-runtime-research-tools.sh when
+#              DCENT_RELEASE_IMAGE=1. Do not re-enable BR2_PACKAGE_I2C_TOOLS.
 # util-linux : standard system utilities (lsblk, dmesg, etc.).
 # Zynq devmem remains a boot-lifecycle dependency until typed early-safety
 # helpers replace it; normal profiles, MCP, and REST do not invoke it.
@@ -81,8 +86,9 @@ BR2_PACKAGE_STRACE=y
 BR2_PACKAGE_UTIL_LINUX=y
 
 # =============================================================================
-# U-Boot env tools — REQUIRED on every product so S99upgrade can drive
-# fw_setenv / fw_printenv against the platform's U-Boot env partition.
+# U-Boot env tools — default for products with an admitted persistent U-Boot
+# environment backend. They are not universal: a product whose evidence shows
+# BuiltInVolatile or otherwise unowned storage must override both symbols off.
 #
 # Without these, S99upgrade falls into a fragile python+nandwrite fallback,
 # which is the brick-back vector documented in

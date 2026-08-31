@@ -151,10 +151,13 @@ The firmware is a multi-crate Rust workspace targeting `xtensa-esp32s3-espidf`:
   firmware at your MQTT broker and the miner appears in Home Assistant
   automatically — sensor entities for hashrate, ASIC temperature, input power,
   fan RPM, accepted/rejected shares and uptime, plus a mining-active
-  binary_sensor (the "Bitcoin space heater" surface). Outbound + publish-only;
-  it never touches mining or the safety paths and adds no HTTP handler.
-  *Status: implemented + host-unit-tested (the discovery/state payload builder)
-  and built for the device; live broker delivery is not yet field-proven.*
+  binary_sensor (the "Bitcoin space heater" surface). Telemetry is publish-only.
+  An additional default-off control surface can set autotuner watts, mode, and
+  chip-temperature target through a bounded non-blocking subscriber; it is
+  clamped and enabled only when deployment/board policy permits mutations.
+  Identity-only targets stay read-only and stale retained HA controls are
+  removed. No HTTP handler is added. *Status: implemented + host-unit-tested and
+  Xtensa-built; live broker/control delivery is not yet field-proven.*
   HA can also still poll the AxeOS-style REST API directly.
 - **Stratum V1, with optional Stratum V2 builds.** Non-V2 builds fail closed if
   a V2 pool is configured. SV2 is implemented and unit-tested; live delivery
@@ -383,6 +386,35 @@ uploads when the manifest is dishonest.
 `scripts/build-matrix.sh` and `scripts/build-matrix.ps1` default to the same six
 public Toolbox-installable targets. Internal/lab targets are opt-in so a public
 release run does not emit packages that Toolbox correctly refuses.
+
+All 37 compiled board identities and their release/evidence policies now come
+from `esp-targets.json`; packaging and CI no longer maintain parallel target
+lists. Run `python scripts/target_matrix.py readiness --scope all` for the honest
+per-model support view, or use the retrying offline workflow documented in
+[`docs/ESP_PRODUCTION_GAUNTLET.md`](docs/ESP_PRODUCTION_GAUNTLET.md). A green
+compile/package ledger is code readiness only—Lucky remains lab-only without
+bench proof, and Hammer remains identity-only/install-blocked until exact-SKU
+rail-cut and thermal evidence exists.
+
+Production promotion is receipt-bound, not a metadata label. Retained
+exact-SKU receipts and hashed gate artifacts live under `hardware-evidence/`;
+the validator requires a witnessed 72-hour soak, safe boot/power-cut/thermal,
+accepted-share, OTA rollback, and MQTT round-trip evidence. Package manifests
+carry the bound receipt ID and evidence-index SHA-256. Production readiness also
+requires the package version and update SHA-256 to equal the tested image and
+both package signatures to verify, so a registry-only edit, stale receipt, or unsigned build
+cannot promote an image.
+
+The exact-binary path is also fail-closed. `promotion_candidate.py` only creates
+qualification descriptors from a clean committed repository checkout, and the
+gauntlet can build one as a signed, explicitly non-publishable candidate. The
+future receipt ID is compiled into `/api/system/info`; packagers refuse an ELF
+that does not contain it. `hardware_session.py` then provides offline planning,
+exact operator authorization, resumable typed gate status, and witnessed
+finalization. See
+[`docs/ESP_PRODUCTION_GAUNTLET.md`](docs/ESP_PRODUCTION_GAUNTLET.md) and
+[`hardware-evidence/README.md`](hardware-evidence/README.md). No retained
+receipt exists yet, so no model is being newly claimed production-ready here.
 
 ---
 

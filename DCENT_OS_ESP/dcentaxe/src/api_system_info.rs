@@ -270,9 +270,10 @@ pub struct LoraInfoView {
 pub struct MqttView<'a> {
     pub enabled: bool,
     /// Whether the opt-in HA command surface (number/select/climate entities) is
-    /// armed (`config.mqtt.commands_enabled`, default-OFF). Read-only visibility
-    /// so tooling can tell whether the device will accept HA setpoint writes; no
-    /// secret is exposed. (ES-6)
+    /// effectively armed: the stored default-OFF operator request AND compiled /
+    /// runtime board deployment policy must both permit mutations. Read-only
+    /// visibility so tooling can tell whether the device will actually accept HA
+    /// setpoint writes; no secret is exposed. (ES-6)
     pub commands_enabled: bool,
     pub broker_host: &'a str,
     pub broker_port: u16,
@@ -302,6 +303,10 @@ pub struct DcentaxeExt<'a> {
     pub runtime_device_model: &'a str,
     pub build_device_model: &'a str,
     pub build_board_version: &'static str,
+    /// Build-bound support/evidence policy from the canonical ESP target
+    /// registry. This describes what this exact image is allowed to do and
+    /// what proof still blocks promotion; mutable NVS identity cannot widen it.
+    pub deployment: DeploymentView<'a>,
     pub autotuner: AutotunerView<'a>,
     pub power_limits: PowerLimitsView,
     pub schedule: serde_json::Value,
@@ -340,6 +345,22 @@ pub struct DcentaxeExt<'a> {
     /// omitted (honest null) when no temperature is available at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_source: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentView<'a> {
+    pub hardware_family: &'static str,
+    pub release_scope: &'static str,
+    pub support_tier: &'static str,
+    pub evidence_level: &'static str,
+    pub runtime_mode: &'static str,
+    pub install_policy: &'static str,
+    pub package_policy: &'static str,
+    pub flash_layout: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_receipt_id: Option<&'static str>,
+    pub production_blockers: &'a [String],
 }
 
 /// data-model-fields §2/§4: additive power-provenance + calibration honesty

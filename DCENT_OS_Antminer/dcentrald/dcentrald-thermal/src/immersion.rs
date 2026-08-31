@@ -63,6 +63,27 @@ pub struct ImmersionConfig {
     /// a default.
     #[serde(default)]
     pub acknowledge_air_cooled_override: bool,
+
+    /// **Immersion temperature-limit offset (°C). Default 0.** When immersion
+    /// mode is ACTIVE (see [`Self::decide`] → `fans_bypassed()`), the thermal
+    /// controller RAISES its target / hot / dangerous temperature thresholds
+    /// by this many degrees — the LuxOS `immersionswitch` / BraiinsOS immersion
+    /// behavior, where a dielectric-fluid rig safely runs its boards hotter
+    /// than an air-cooled chassis (no chassis-fan-noise trade-off, so the
+    /// operator can push the limits up).
+    ///
+    /// **SAFETY (non-negotiable):** the offset can NEVER push the dangerous /
+    /// critical hash-cut threshold past the absolute residential ceiling
+    /// (90 °C, `controller::ABSOLUTE_DANGEROUS_CEILING_C`). The controller
+    /// clamps the shifted dangerous threshold to that ceiling AFTER adding the
+    /// offset, so the hard hash-cut (`ThermalAction::EmergencyShutdown`) fires
+    /// in immersion mode at exactly the same absolute ceiling as on air — the
+    /// offset only widens the *sub-ceiling* operating band, never the ceiling
+    /// itself. When immersion is not active (default, or refused on an
+    /// air-cooled platform without the acknowledgement) this field has no
+    /// effect and thresholds are byte-identical to the air-cooled path.
+    #[serde(default)]
+    pub immersion_temp_offset_c: u8,
 }
 
 impl ImmersionConfig {
@@ -162,6 +183,9 @@ mod tests {
         let cfg = ImmersionConfig::default();
         assert!(!cfg.enabled);
         assert!(!cfg.acknowledge_air_cooled_override);
+        // Default temperature-limit offset is 0 — a default (air-cooled) config
+        // never shifts a single threshold.
+        assert_eq!(cfg.immersion_temp_offset_c, 0);
         // Default config never bypasses fans, regardless of platform.
         assert_eq!(cfg.decide(false), ImmersionDecision::Disabled);
         assert_eq!(cfg.decide(true), ImmersionDecision::Disabled);
@@ -174,6 +198,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: 0,
         };
         // Hydro / immersion rig (not air-cooled) → activates without an override.
         assert_eq!(cfg.decide(false), ImmersionDecision::Activated);
@@ -185,6 +210,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: 0,
         };
         // Air-cooled-looking platform, no acknowledgement → REFUSE (keep fans).
         assert_eq!(cfg.decide(true), ImmersionDecision::RefusedAirCooled);
@@ -199,6 +225,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: true,
+            immersion_temp_offset_c: 0,
         };
         assert_eq!(
             cfg.decide(true),
@@ -215,6 +242,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: 0,
         };
         // Declared external-loop medium → activates (a genuine hydro rig).
         assert_eq!(
@@ -266,6 +294,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: false,
             acknowledge_air_cooled_override: true,
+            immersion_temp_offset_c: 0,
         };
         assert_eq!(cfg.decide(false), ImmersionDecision::Disabled);
         assert_eq!(cfg.decide(true), ImmersionDecision::Disabled);

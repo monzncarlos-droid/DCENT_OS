@@ -18,6 +18,7 @@
 //! `?ticket=` when `[api].websocket_tickets = true`.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -39,6 +40,9 @@ use crate::atomic_io::atomic_write;
 /// Path where the auth credentials are persisted.
 const AUTH_FILE: &str = "/data/dcent/auth.json";
 const CORRUPT_AUTH_PASSWORD_HASH_SENTINEL: &str = "dcent-auth-corrupt-sessions-revoked";
+/// Hard ceiling for the credential document. The persisted model is bounded to
+/// 32 sessions, so a larger file is corruption or a local storage attack.
+const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Rate limit: max setup attempts per IP within the window.
 const SETUP_RATE_LIMIT_MAX: u8 = 3;
@@ -472,8 +476,16 @@ pub(crate) fn is_password_set_at(
     auth_path: &std::path::Path,
     release_marker: &std::path::Path,
 ) -> bool {
-    auth_path.exists()
-        || (is_release_image_at(release_marker) && corrupt_auth_quarantine_exists(auth_path))
+    let release_image = is_release_image_at(release_marker);
+    match std::fs::symlink_metadata(auth_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            release_image && corrupt_auth_quarantine_exists(auth_path)
+        }
+        // An indeterminate credential path must not reopen setup on a release
+        // image. Development retains its existing recoverable behavior.
+        Err(_) => release_image,
+    }
 }
 
 fn now_epoch_secs() -> u64 {
@@ -609,6 +621,47 @@ fn session_matches_token(session: &AuthSession, token: &str) -> bool {
     session.token_hash == token_hash && session_idle_ok_and_touch(&token_hash)
 }
 
+fn secure_read_auth_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth file must not be a symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth path must be a regular file",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTH_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_AUTH_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth file exceeds the bounded read ceiling",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Load auth data from disk.
 pub fn load_auth() -> Option<AuthData> {
     load_auth_at(
@@ -637,7 +690,7 @@ fn load_auth_with_release_posture_policy(
     release_image: bool,
     allow_persistent_mutation: bool,
 ) -> Option<AuthData> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match secure_read_auth_file(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if release_image && corrupt_auth_quarantine_exists(path) {
@@ -657,7 +710,7 @@ fn load_auth_with_release_posture_policy(
                 error = %err,
                 "could not read auth.json",
             );
-            return None;
+            return release_image.then(corrupt_auth_sentinel);
         }
     };
     let data = match String::from_utf8(bytes) {
@@ -873,20 +926,13 @@ fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
 
 /// Verify and (when possible) auto-correct the on-disk auth file/dir perms.
 ///
-/// SECURITY (W1.5, 2026-05-07): called once on daemon startup, before any
-/// socket binds. If the file is wider than 0o600 or the parent dir is wider
-/// than 0o700, this fn auto-corrects rather than failing closed — fail-closed
-/// would brick first-boot units that pre-existed before this hardening
-/// shipped, and that is a worse failure mode than a transient wide-perm
-/// window. Owner != uid 0 is logged at ERROR level (it should never happen
-/// on a production boot where dcentrald runs as root) but is also non-fatal,
-/// because lab hosts running cargo test under non-root must not crash here.
-///
-/// Returns Ok in all non-IO error paths. Only IO errors that prevent reading
-/// the metadata at all surface as Err — and even those become a startup
-/// warning, not a panic, because losing access to /data/dcent/auth.json on
-/// startup means the unit can still serve the dashboard's "set password"
-/// flow.
+/// SECURITY (W1.5 + ): called once on daemon startup, before any
+/// socket binds. Wider file/directory modes are auto-tightened for upgrades,
+/// while symlinks, special files, unexpected parent types, metadata failures,
+/// and chmod failures return an error. A genuinely absent parent/file remains
+/// valid first-boot state. Owner != uid 0 is still logged at ERROR level but
+/// remains non-fatal so non-root development builds retain their test posture;
+/// release ownership admission remains an explicit residual.
 pub fn verify_auth_file_perms() -> std::io::Result<()> {
     if OBSERVER_ONLY.load(Ordering::Acquire) {
         return Ok(());
@@ -899,16 +945,36 @@ pub fn verify_auth_file_perms() -> std::io::Result<()> {
 pub(crate) fn verify_auth_file_perms_at(path: &std::path::Path) -> std::io::Result<()> {
     // Parent dir: must be 0o700 (or tighter).
     if let Some(parent) = path.parent() {
-        if parent.exists() {
-            check_and_tighten(parent, 0o700, "auth parent dir");
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                check_and_tighten(parent, 0o700, "auth parent dir")?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "auth parent path must be an exact directory",
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
     }
     // Auth file: must be 0o600 (or tighter). If it does not exist yet (no
     // password configured), nothing to do — save_auth() will create it with
     // the right perms when the operator sets a password.
-    if path.exists() {
-        check_and_tighten(path, 0o600, "auth file");
-        check_owner_is_root(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            check_and_tighten(path, 0o600, "auth file")?;
+            check_owner_is_root(path);
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth path must be an exact regular file",
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
     Ok(())
 }
@@ -917,21 +983,9 @@ pub(crate) fn verify_auth_file_perms_at(path: &std::path::Path) -> std::io::Resu
 /// Logs a warning and bumps the perms-correction tracing event so operators
 /// can see drift via the diagnostic dashboard.
 #[cfg(unix)]
-fn check_and_tighten(path: &std::path::Path, wanted_mode: u32, label: &str) {
+fn check_and_tighten(path: &std::path::Path, wanted_mode: u32, label: &str) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(err) => {
-            tracing::warn!(
-                target: "auth_perms",
-                path = %path.display(),
-                error = %err,
-                "could not stat {} for perm check",
-                label,
-            );
-            return;
-        }
-    };
+    let metadata = std::fs::symlink_metadata(path)?;
     let actual = metadata.permissions().mode() & 0o777;
     if actual & !wanted_mode != 0 {
         // Wider than wanted — auto-correct.
@@ -943,21 +997,19 @@ fn check_and_tighten(path: &std::path::Path, wanted_mode: u32, label: &str) {
             "{} perms wider than expected — tightening",
             label,
         );
-        if let Err(err) = set_mode(path, wanted_mode) {
-            tracing::error!(
-                target: "auth_perms",
-                path = %path.display(),
-                error = %err,
-                "could not auto-tighten {} perms",
-                label,
-            );
-        }
+        set_mode(path, wanted_mode)?;
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn check_and_tighten(_path: &std::path::Path, _wanted_mode: u32, _label: &str) {
+fn check_and_tighten(
+    _path: &std::path::Path,
+    _wanted_mode: u32,
+    _label: &str,
+) -> std::io::Result<()> {
     // No-op on non-Unix dev hosts.
+    Ok(())
 }
 
 /// Log an ERROR if the auth file is not owned by root (uid 0). Non-fatal so
@@ -1543,7 +1595,12 @@ fn is_pre_setup_safe(path: &str, method: &Method) -> bool {
     if *method == Method::GET {
         let read_safe = path.starts_with("/api/status")
             || path.starts_with("/api/system/")
-            || path.starts_with("/api/config")
+            // Pre-setup must not leak pool worker / donation secrets
+            // (`/api/config/shared`, `/donation`, export).
+            || (path.starts_with("/api/config")
+                && !path.starts_with("/api/config/shared")
+                && !path.starts_with("/api/config/donation")
+                && !path.starts_with("/api/config/export"))
             || path.starts_with("/api/stats")
             || path.starts_with("/api/history")
             || path.starts_with("/api/home/")
@@ -1640,7 +1697,9 @@ fn header_origin_host(value: &str) -> &str {
 }
 
 fn is_allowed_dashboard_origin(origin_host: &str, host: &str) -> bool {
-    origin_host == host
+    // CSRF host allowlist (DESK_NOW 2026-08-19): Origin==Host is not enough
+    // after DNS rebinding. See csrf_allowlist.rs. Coordinator call site.
+    crate::csrf_allowlist::origin_matches_allowed_host(origin_host, host)
 }
 
 fn is_same_origin_setup_request(request: &Request<Body>) -> bool {
@@ -1648,6 +1707,9 @@ fn is_same_origin_setup_request(request: &Request<Body>) -> bool {
         Some(host) => host,
         None => return false,
     };
+    if !crate::csrf_allowlist::host_header_is_allowed(host) {
+        return false;
+    }
 
     if let Some(origin) = request
         .headers()
@@ -3663,7 +3725,10 @@ mod tests {
     /// to assert about.
     #[cfg(unix)]
     mod perms {
-        use super::super::{save_auth_at, verify_auth_file_perms_at, AuthData};
+        use super::super::{
+            load_auth_with_release_posture_policy, save_auth_at, verify_auth_file_perms_at,
+            AuthData, CORRUPT_AUTH_PASSWORD_HASH_SENTINEL, MAX_AUTH_FILE_BYTES,
+        };
         use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3780,6 +3845,58 @@ mod tests {
 
             assert_eq!(file_mode, 0o600);
             assert_eq!(dir_mode, 0o700);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn auth_symlinks_are_refused_and_release_reads_fail_closed() {
+            use std::os::unix::fs::symlink;
+
+            let root = scratch_dir("symlink");
+            let data_dir = root.join("data").join("dcent");
+            std::fs::create_dir_all(&data_dir).expect("mkdir");
+            let referent = root.join("attacker-auth.json");
+            let auth_path = data_dir.join("auth.json");
+            super::raw_write_file(
+                &referent,
+                br#"{"version":2,"password_hash":"attacker","api_token":null,"sessions":[]}"#,
+            );
+            symlink(&referent, &auth_path).expect("create auth symlink");
+
+            verify_auth_file_perms_at(&auth_path)
+                .expect_err("auth metadata preflight must reject a symlink");
+            assert!(load_auth_with_release_posture_policy(&auth_path, false, false).is_none());
+            let release = load_auth_with_release_posture_policy(&auth_path, true, false)
+                .expect("release symlink read must synthesize a locked sentinel");
+            assert_eq!(release.password_hash, CORRUPT_AUTH_PASSWORD_HASH_SENTINEL);
+            assert!(release.sessions.is_empty());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn auth_parent_symlink_and_oversized_document_fail_closed() {
+            use std::os::unix::fs::symlink;
+
+            let root = scratch_dir("parent-symlink");
+            let real_parent = root.join("real-parent");
+            let linked_parent = root.join("linked-parent");
+            std::fs::create_dir_all(&real_parent).expect("mkdir real auth parent");
+            symlink(&real_parent, &linked_parent).expect("create auth parent symlink");
+            let linked_auth = linked_parent.join("auth.json");
+            super::raw_write_file(&real_parent.join("auth.json"), b"{}");
+            verify_auth_file_perms_at(&linked_auth)
+                .expect_err("auth metadata preflight must reject a symlink parent");
+
+            let oversized = root.join("oversized-auth.json");
+            super::raw_write_file(
+                &oversized,
+                &vec![b'x'; usize::try_from(MAX_AUTH_FILE_BYTES).unwrap() + 1],
+            );
+            let release = load_auth_with_release_posture_policy(&oversized, true, false)
+                .expect("oversized release auth must synthesize a locked sentinel");
+            assert_eq!(release.password_hash, CORRUPT_AUTH_PASSWORD_HASH_SENTINEL);
 
             let _ = std::fs::remove_dir_all(&root);
         }

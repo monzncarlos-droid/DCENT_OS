@@ -23,11 +23,18 @@ mkdir -p "$SHIM"
 : > "$WORK/mtd4"
 : > "$WORK/fw_env.config"
 : > "$WORK/dcentrald"
+printf '%s\n' dcent-s99upgrade-offline-test-v1 >"$WORK/offline.marker"
+cat >"$WORK/uboot-env-admission.sh" <<'EOF'
+dcent_zynq_uboot_env_admit() { [ "$#" -eq 4 ]; }
+EOF
 chmod 0755 "$WORK/dcentrald"
 
 cat >"$SHIM/fw_printenv" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$S99_TEST_WORK/fw_printenv.log"
+[ "${1:-}" = -c ] || exit 96
+[ "${2:-}" = "$S99_TEST_WORK/fw_env.config" ] || exit 97
+shift 2
 if [ "${1:-}" = "upgrade_stage" ]; then
     echo "upgrade_stage=1"
     exit 0
@@ -41,6 +48,9 @@ EOF
 cat >"$SHIM/fw_setenv" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$S99_TEST_WORK/fw_setenv.log"
+[ "${1:-}" = -c ] || exit 96
+[ "${2:-}" = "$S99_TEST_WORK/fw_env.config" ] || exit 97
+shift 2
 exit 0
 EOF
 
@@ -100,6 +110,11 @@ PATH="$SHIM:$PATH" \
 S99_TEST_WORK="$WORK" \
 DCENTOS_MTD4_NODE="$WORK/mtd4" \
 DCENTOS_FW_ENV_CONFIG="$WORK/fw_env.config" \
+DCENTOS_S99_OFFLINE_TEST=1 \
+DCENTOS_S99_OFFLINE_MARKER="$WORK/offline.marker" \
+DCENTOS_UBOOT_ENV_ADMISSION_HELPER="$WORK/uboot-env-admission.sh" \
+DCENTOS_UBOOT_ENV_PROC_MTD="$WORK/proc-mtd" \
+DCENTOS_UBOOT_ENV_SYSFS_MTD_ROOT="$WORK/sys-class-mtd" \
 DCENTOS_DCENTRALD_BIN="$WORK/dcentrald" \
 DCENTOS_UPGRADE_COMMIT_MARKER="$WORK/commit-marker" \
 DCENTOS_BOOT_SUCCESS_WINDOW_S=1 \

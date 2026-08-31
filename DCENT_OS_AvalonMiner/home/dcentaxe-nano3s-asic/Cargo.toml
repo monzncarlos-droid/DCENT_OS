@@ -1,0 +1,20 @@
+[package]
+name = "dcentaxe-nano3s-asic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Avalon ASIC shim driver for DCENT_axe Avalon — wraps Canaan's asic_miner_e RT-Smart blob via 268-byte mm_pkg over SysV msgq"
+
+[lib]
+name = "dcentaxe_nano3s_asic"
+path = "src/lib.rs"
+
+[dependencies]
+dcent-avalon-proto.workspace = true
+# AsicDriver trait + MiningJob / AsicResult / AsicError / AsicModel + RegisterData.
+# `asic-avalon` feature exposes AsicModel::Avalon for our shim's identity.
+dcentaxe-asic = { path = "../../../DCENT_OS_ESP/dcentaxe-asic", features = ["asic-avalon"] }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true

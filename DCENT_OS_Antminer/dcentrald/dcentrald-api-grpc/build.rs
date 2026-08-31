@@ -1,5 +1,5 @@
-// Supremacy S5.1 — tonic-build generates Rust prost types + tonic service
-// scaffolding from `proto/dcent_v1.proto`. The generated code lands in
+// tonic-build generates Rust prost types + tonic service plumbing from
+// `proto/dcent_v1.proto`. The generated code lands in
 // `OUT_DIR/dcent.v1.rs` and is consumed by `lib.rs` via `tonic::include_proto!`.
 //
 // `file_descriptor_set_path` emits the binary FileDescriptorSet that

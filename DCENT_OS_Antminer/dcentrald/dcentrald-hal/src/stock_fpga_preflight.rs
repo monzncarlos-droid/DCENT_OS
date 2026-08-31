@@ -66,9 +66,13 @@ mod tests {
     #[test]
     fn live_receipt_has_no_offline_or_public_issuer() {
         let source = include_str!("stock_fpga_preflight.rs");
-        assert!(!source.contains("pub fn new("));
-        assert!(!source.contains("pub fn issue("));
-        assert!(!source.contains("pub fn mint("));
-        assert!(source.contains("retained_fabric_lease: OsI2cFabricLease"));
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("stock FPGA preflight source must contain production code");
+        assert!(!production.contains("pub fn new("));
+        assert!(!production.contains("pub fn issue("));
+        assert!(!production.contains("pub fn mint("));
+        assert!(production.contains("retained_fabric_lease: OsI2cFabricLease"));
     }
 }

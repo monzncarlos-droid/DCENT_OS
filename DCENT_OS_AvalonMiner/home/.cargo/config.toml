@@ -1,0 +1,81 @@
+# Cross-compilation settings for Canaan Avalon Nano 3 / Nano 3S / Mini 3
+#
+# Target SoC: Kendryte K230 (RISC-V Xuantie C908, dual-core, Linux+RT-Smart)
+# Linux little core: 800 MHz, riscv64gc-unknown-linux-gnu
+#
+# We're targeting the K230 *Linux* little core. The RT-Smart big core runs
+# Canaan's encrypted asic_miner_e blob (kept untouched in Phase 1 — see
+# ). DCENT_axe Avalon is the Linux-side Rust process that talks to
+# the blob via SysV msgq + 266-byte mm_pkg.
+#
+# Build:
+#   cargo build --release --target riscv64gc-unknown-linux-gnu
+# Verification check:
+#   cargo check --target riscv64gc-unknown-linux-gnu
+#
+# Cross-compile toolchain on Windows: zig-cc-riscv64.bat / zig-ar-riscv64.bat
+# (analog of the existing zig-cc-arm.bat / zig-cc-aarch64.bat in dcentos/).
+# To be added in a follow-up plan; Linux/CI uses the distro
+# `riscv64-linux-gnu-gcc` package.
+#
+#:
+#   - Target tier: Tier 2 with host tools (per rustc target-tier docs)
+#   - Known Rust gotchas on K230: mtime MMIO returns garbage (use rdtime),
+#     mhartid non-compliant (both harts return 0), FPU mstatus.FS not auto-init
+#   - All three apply to bare-metal RT-Smart side, NOT to this Linux little
+#     core target — Linux kernel handles them upstream of userspace.
+
+[target.riscv64gc-unknown-linux-gnu]
+# Default linker is rust-lld. This produces fully-compiled object files
+# successfully but FAILS at the final link step on Windows hosts that lack
+# a riscv64-linux-gnu sysroot — rust-lld can't resolve -lc / -lpthread /
+# -lm / -ldl / -lgcc_eh / -lutil / -lrt without one.
+#
+# To complete the cross-link on Windows, set CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:
+#
+#   set CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=C:\path-without-spaces\zig-cc-riscv64.bat
+#   set CC_riscv64gc_unknown_linux_gnu=C:\path-without-spaces\zig-cc-riscv64.bat
+#   set AR_riscv64gc_unknown_linux_gnu=C:\path-without-spaces\zig-ar-riscv64.bat
+#   cargo build --release --target riscv64gc-unknown-linux-gnu -p dcentaxe-nano3s
+#
+# (The wrapper bats live next to this file but their invocation through
+# `cmd /c` mis-splits paths containing spaces — set them via env var pointed
+# at a copy in a spaceless directory, OR use a Linux/CI host where
+# `riscv64-linux-gnu-gcc` from the distro Just Works as the linker.)
+#
+# `+crt-static` deliberately omitted: glibc is dynamically linked on the
+# Nano 3S / Mini 3 / Avalon Q rootfs (K230 SDK ships glibc). For a static
+# binary, switch the target to `riscv64gc-unknown-linux-musl`.
+linker = "rust-lld"
+
+# C cross-compiler env-var hint for crates with build.rs (sha2 is pure-Rust;
+# add as needed for crypto crates that link C, e.g. secp256k1 if we wire
+# Stratum V2 later):
+#
+#   set CC_riscv64gc_unknown_linux_gnu=%CD%\zig-cc-riscv64.bat
+#   set AR_riscv64gc_unknown_linux_gnu=%CD%\zig-ar-riscv64.bat
+#   cargo build --release --target riscv64gc-unknown-linux-gnu
+#
+# On Linux/CI:
+#   export CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc
+#   export AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar
+
+# --- K230 Linux, STATIC build (proven on Windows 2026-08-14) ---
+#
+# `riscv64gc-unknown-linux-musl` + rust-lld + crt-static links with NO
+# external toolchain (Rust bundles the musl CRT + compiler-rt), producing a
+# fully static RISC-V EXEC that runs on the K230's glibc rootfs — the same
+# static-musl posture as the Antminer dcentrald builds.
+#
+#   cargo build --release --target riscv64gc-unknown-linux-musl -p dcentaxe-nano3s
+#
+# Proven 2026-08-14: dcentaxe-nano3s -> 1,320,808-byte ELF64 RISC-V EXEC
+# (static). Note: the gnu/glibc zig lane is blocked on Windows hosts —
+# zig 0.13.0 cannot assemble the glibc riscv startup files
+# (`sysdeps/riscv/start-2.33.S: unknown directive`) — so musl is the
+# Windows-native lane; gnu remains the Linux/CI lane.
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]

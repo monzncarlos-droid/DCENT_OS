@@ -1,4 +1,4 @@
-# Package and guarded-install A113D identity for Antminer S19j XP.
+# Package-only management identity for Antminer S19j XP.
 # Exact held identity: fw-info model=s19j-xp/platform=aml/install_type=nand,
 # shared BM1366 A113D kernel/DTB bytes, BHB56XXX stock controller family.
 
@@ -17,12 +17,12 @@ voltage_mv = 13400
 version_rolling = true
 passthrough = false
 suggest_difficulty = 8192
-serial_device = "/dev/ttyS2"
 serial_chip_count = 110
 serial_chip_type = "BM1366"
 
 [platform]
 target = "am3-aml-s19jxp"
+board_target = "am3-s19jxp"
 
 [pool]
 url = ""
@@ -37,12 +37,12 @@ fan_min_pwm = 10
 fan_max_pwm = 30
 
 [watchdog]
-enabled = true
+enabled = false
 timeout_s = 30
 kick_interval_s = 5
 
 [hash_on_disconnect]
-enabled = true
+enabled = false
 
 [mode]
 active = "home"

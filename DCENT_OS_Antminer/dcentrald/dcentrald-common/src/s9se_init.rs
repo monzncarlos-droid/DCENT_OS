@@ -11,7 +11,9 @@ use crate::s9se_enum::{
 };
 use crate::s9se_regs::pack_enable_core_clock;
 use crate::s9se_vil::pack_chain_inactive_vil;
-use crate::s9se_work::{DHASH_MODE_RAW_TW, VIL_TW_WORDS};
+#[cfg(test)]
+use crate::s9se_work::DHASH_MODE_RAW_TW;
+use crate::s9se_work::VIL_TW_WORDS;
 
 /// S9k `check_asic_num`: success is `chain_asic_num == 60`.
 pub const EXPECTED_ASICS_PER_CHAIN: u8 = 60;

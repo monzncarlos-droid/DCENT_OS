@@ -95,6 +95,13 @@ pub struct WsStatsMessage {
     pub rejected: u64,
     /// Per-chain status.
     pub chains: Vec<WsChainStatus>,
+    /// Per-logical-UART protocol/runtime observations. Omitted for legacy and
+    /// non-serial publishers; never a physical-slot claim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serial_endpoints: Vec<crate::SerialEndpointState>,
+    /// Provenance for the legacy `chains` array when it is aggregate-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chains_scope: Option<String>,
     /// Fan status.
     pub fans: WsFanStatus,
     /// Pool connection status.
@@ -706,6 +713,8 @@ pub fn build_stats_message(
                 status: c.status.clone(),
             })
             .collect(),
+        serial_endpoints: state.serial_endpoints.clone(),
+        chains_scope: state.chains_scope.clone(),
         fans: WsFanStatus {
             pwm: state.fans.pwm,
             rpm: state.fans.rpm,
@@ -980,6 +989,62 @@ mod tests {
             "mode": "standard"
         }))
         .expect("MinerState donation fixture must deserialize")
+    }
+
+    #[test]
+    fn ws_legacy_frame_omits_and_defaults_logical_serial_observability() {
+        let state = miner_state_donating("", "");
+        let frame = build_stats_message(
+            &state,
+            &dcentrald_autotuner::LivePowerEstimate::default(),
+            0.0,
+        );
+        let value: serde_json::Value = serde_json::from_str(&frame).expect("parse stats frame");
+        assert!(value.get("serial_endpoints").is_none());
+        assert!(value.get("chains_scope").is_none());
+
+        let decoded: WsStatsMessage =
+            serde_json::from_value(value).expect("old stats frame must remain readable");
+        assert!(decoded.serial_endpoints.is_empty());
+        assert_eq!(decoded.chains_scope, None);
+    }
+
+    #[test]
+    fn ws_frame_propagates_independent_logical_uart_evidence() {
+        let mut state = miner_state_donating("", "");
+        state.chains_scope = Some(crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME.to_string());
+        state.serial_endpoints = vec![
+            crate::SerialEndpointState {
+                logical_path: "/dev/ttyS1".to_string(),
+                open_state: "open".to_string(),
+                tx_active: true,
+                parser_state: "synchronized".to_string(),
+                ..Default::default()
+            },
+            crate::SerialEndpointState {
+                logical_path: "/dev/ttyS2".to_string(),
+                open_state: "open".to_string(),
+                tx_active: false,
+                parser_state: "seeking_header".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let frame = build_stats_message(
+            &state,
+            &dcentrald_autotuner::LivePowerEstimate::default(),
+            0.0,
+        );
+        let value: serde_json::Value = serde_json::from_str(&frame).expect("parse stats frame");
+        assert_eq!(
+            value["chains_scope"],
+            crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME
+        );
+        assert_eq!(value["serial_endpoints"][0]["logical_path"], "/dev/ttyS1");
+        assert_eq!(value["serial_endpoints"][1]["logical_path"], "/dev/ttyS2");
+        assert!(value["serial_endpoints"][0].get("physical_slot").is_none());
+        assert!(value["serial_endpoints"][0].get("hashrate_ghs").is_none());
+        assert!(value["serial_endpoints"][0].get("accepted").is_none());
     }
 
     // TEL-2 ( masking) NEGATIVE regression: the live WS stats frame is

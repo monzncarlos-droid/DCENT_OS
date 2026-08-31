@@ -60,6 +60,7 @@
 // gate on `cfg(unix)` to keep Windows host builds green. The Linux CI
 // (`.github/workflows/dcentrald-api-tests.yml`) runs the full suite.
 #![cfg(unix)]
+#![allow(clippy::await_holding_lock)]
 
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};

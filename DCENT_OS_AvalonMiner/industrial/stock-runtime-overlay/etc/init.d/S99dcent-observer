@@ -1,0 +1,93 @@
+#!/bin/sh
+# One-shot, read-only Nano 3 coexistence inventory.
+#
+# Stock rcS invokes every S?? script before attaching /mnt (app), attempting
+# /data, and starting /mnt/heater/app/btcminer. Run the inventory in a
+# background waiter so the stock ordering and btcminer launch remain untouched.
+
+case "${1:-}" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+observer_lock=/run/dcentos-observer-worker
+mkdir -m 0700 "$observer_lock" 2>/dev/null || exit 0
+
+(
+    attempts=0
+    while [ "$attempts" -lt 90 ]; do
+        if mountpoint -q /mnt 2>/dev/null &&
+           pidof btcminer >/dev/null 2>&1; then
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 2
+    done
+
+    # Allow btcminer's normal networking/UI threads to settle.  This process
+    # performs no device opens, queue creation, signalling or configuration.
+    sleep 5
+
+    # Start the bounded scheduler diagnostic before the passive daemon call so
+    # a later observer hang cannot suppress the capture. This is explicitly not
+    # a thermal/fan/watchdog/rail heartbeat or permission to keep hashing.
+    health_snapshot=/etc/dcentos/nano3-health-snapshot.sh
+    if [ -x "$health_snapshot" ]; then
+        /bin/nice -n 19 "$health_snapshot" >/dev/null 2>&1 &
+    fi
+
+    umask 077
+    output=/tmp/dcentos-stock-coexistence.txt
+    {
+        echo "profile=stock-coexistence"
+        echo "observer=read-only"
+        echo "dcentrald_autostart=0"
+        if mountpoint -q /data 2>/dev/null; then
+            echo "data_mounted=1"
+        else
+            echo "data_mounted=0"
+        fi
+        printf 'btcminer_pid='
+        pidof btcminer 2>/dev/null || true
+        printf 'btcminer_sha256='
+        if [ -f /mnt/heater/app/btcminer ]; then
+            sha256sum /mnt/heater/app/btcminer | awk '{print $1}'
+        else
+            echo missing
+        fi
+        printf 'dcentrald_sha256='
+        sha256sum /usr/libexec/dcentos/dcentrald-avalon 2>/dev/null |
+            awk '{print $1}' || echo missing
+        echo "processes_begin"
+        ps
+        echo "processes_end"
+        echo "listeners_begin"
+        netstat -lnt 2>/dev/null || true
+        echo "listeners_end"
+        echo "sysv_queues_begin"
+        ipcs -q 2>/dev/null || true
+        echo "sysv_queues_end"
+        echo "chain_device_begin"
+        ls -l /dev/ttyS1 2>/dev/null || echo "/dev/ttyS1 missing"
+        echo "chain_device_end"
+        echo "chain_owner_begin"
+        lsof /dev/ttyS1 2>/dev/null || true
+        echo "chain_owner_end"
+        echo "dcentrald_observer_begin"
+        /usr/libexec/dcentos/dcentrald-avalon --stock-observer-once
+        echo "dcentrald_observer_rc=$?"
+        echo "dcentrald_observer_end"
+        echo "nano3_passive_safety_observer_begin"
+        # This separate branch reads only the held IIO temperature and PWM
+        # readback attributes. It explicitly omits timer5's control ioctl,
+        # watchdog, UART, interlock claims, and every actuator write.
+        /bin/nice -n 19 /usr/libexec/dcentos/dcentrald-avalon \
+            --nano3-read-only-observer-once
+        echo "nano3_passive_safety_observer_rc=$?"
+        echo "nano3_passive_safety_observer_end"
+    } >"$output" 2>&1
+    logger -t dcentos "stock coexistence inventory ready at $output"
+
+) &
+
+exit 0

@@ -1,11 +1,14 @@
-//! UB-06 (2026-08-02): data-driven hashboard topology registry — 50 SKUs.
+//! UB-06 (2026-08-02): data-driven hashboard topology registry — 61 SKUs
+//! (50 from the v1.22.0 ePIC jig DB + the 11-row v1.24.0 delta, W3
+//! 2026-08-25).
 //!
 //! # What this is
 //!
 //! A **declarative, capability-first** hashboard descriptor registry keyed by
 //! Bitmain SKU string. It replaces the "add another enum arm" growth pattern of
 //! [`crate::hashboards::Hashboard`] for topology/identity data: adding
-//! hashboard #51 is a **data row** in the checked-in JSON, not new Rust code.
+//! hashboard #51 is a **data row** in the checked-in JSON, not new Rust code
+//! (the v1.24.0 delta proves the point: 11 new SKUs, zero enum variants).
 //! The legacy [`crate::hashboards::Hashboard`] enum and its `catalog()` remain
 //! load-bearing for existing callers and are untouched; a regression test below
 //! pins that this registry never silently disagrees with a live-measured
@@ -120,6 +123,52 @@
 //! `observed_eeprom_preambles` is a list and is attestation-only (empty =
 //! no held sample for that SKU, not "no preamble").
 //!
+//! # v1.24.0 delta (W3 roster-completion, 2026-08-25)
+//!
+//! `src/hashboard_topology_v1_24_0_delta.json` adds the **11 new-in-v1.24.0
+//! base model_ids** decoded from the held amlogic stock-board binary
+//!
+//! (sha256 `cb3c84f2…617e`, build `f7feb46c`): `TS007`, `BHB56601`,
+//! `BHB56701` (S19 XP class, BM1366), `M1HB70602` (S21 XP Imm, BM1370),
+//! `A3HB70505` (S21 XP), `A3HB70608`/`A3HB70609` (S21 Pro+),
+//! `A3HB70705`/`A3HB70707`/`A3HB70708` (S21++), and `H6HB70801` — an
+//! id absent from BOTH ePIC READMEs (unpublished/forthcoming SKU;
+//! PSU `APW11` per the binary's `power` block). Per-record file offsets
+//! are recorded in the delta file header.
+//!
+//! **Decode method + validation.** The v1.24.0 DB records are
+//! `0x8c <len:u8> <str>` length-prefixed blobs in the region
+//! `0x1093aab–0x10b7ab0`, with per-record key interning (`6a <u32-le>`
+//! refs / `68 <id>` ids whose first use per record is spelled in full),
+//! `4b`=u8 / `4d`=u16-le / `88`/`89`=bool scalars, `7d`/`75` struct and
+//! `5d 94 28`…`65` / `5d 94`…`61` array framing. The decoder was
+//! validated by re-decoding **all 50 v1.22.0 records from the same
+//! binary and diffing against the armada's checked-in evidence JSON:
+//! zero differences on every imported field** (the only v1.24.0 changes
+//! are PSU `power.version` list growth — not imported — and two 9-byte
+//! `0x95` annotation blobs of unknown semantics at `0x10a34ab` and
+//! `0x10b34b6`, both inside v1.22.0-carried records, skipped during
+//! decode and recorded in the delta header).
+//!
+//! **v1.24.0 schema novelties carried by `H6HB70801` only** (imported
+//! verbatim, test-pinned):
+//! - the record declares **no `pic` block at all** — the first roster row
+//!   with no `PIC1704` claim (this is a fact about ePIC's record, not a
+//!   DCENT controller-routing claim; divergence #6 semantics unchanged).
+//! - its 7 `switchsensor` entries use a NEW format: `[index, type, iic,
+//!   channal]` (+ optional trailing `asic`) — an explicit I²C-switch
+//!   **channel** number instead of quadrant `x`/`y` placement labels,
+//!   and the bank mixes `LM75A` (2, one at `0x48`) with **`TMP451`**
+//!   (5) — a device type absent from the entire v1.22.0 corpus.
+//! - `asic_addr_interval = 1` (the only non-2 vendor stride besides
+//!   NBS1902's 3), `chain_domain_num = 17` × `domain_asic_num = 5` = 85
+//!   chips, and a 10×9 `tpl` grid with 5 unpopulated cells.
+//!
+//! The K/X EEPROM sub-variants (`BHB68703K`/`BHB68703X` are new in
+//! v1.24.0) are deliberately NOT rows here: they exist only as EEPROM
+//! templates (`X <u32-le> <str>` framing), not as full DB records, and
+//! the v1.22.0 import set the precedent of rostering base ids only.
+//!
 //! # Regenerating the data file
 //!
 //! `src/hashboard_topology_v1_22_0.json` is generated — do not hand-edit.
@@ -186,31 +235,41 @@
 //! deliberately not modeled. `hw_version` / `sw_version` / `processor` are
 //! ePIC build metadata and are not imported.
 //!
-//! # Sensor banks (rank-33 sensor-topology import, 2026-08-03)
+//! # Sensor banks (rank-33 sensor-topology import, 2026-08-03; counts
+//! refreshed for the v1.24.0 delta, W3 2026-08-25)
 //!
-//! Three distinct LM75A banks exist in the source DB:
+//! Three distinct sensor banks exist in the source DB (LM75A-only in
+//! v1.22.0; the v1.24.0 `H6HB70801` adds TMP451 — see §"v1.24.0 delta"):
 //!
 //! - `board_sensors` (jig `chain.pic.sensor`): exactly **4 per board on all
-//!   50 rows**, direct 7-bit addresses `0x48..=0x4B`. "Read via the PIC" is
-//!   the JIG's access model only — see divergence #6; DCENT platform code
-//!   owns the actual access path.
+//!   50 v1.22.0 rows and the 10 old-format v1.24.0 delta rows** (0 on
+//!   H6HB70801, which has no `pic` block), direct 7-bit addresses
+//!   `0x48..=0x4B`. "Read via the PIC" is the JIG's access model only —
+//!   see divergence #6; DCENT platform code owns the actual access path.
 //! - `ctrl_board_sensors` (jig `chain.ctrlboardsensor`): a pair at
-//!   `0x48` (right/top) + `0x4C` (left/top) on **33 of 50** rows.
-//! - `switch_sensors` (jig `chain.switchsensor`): **4 per board on 9 of 50
-//!   rows** (36 entries; all BM1370 A3HB705xx/A3HB706xx), every one an LM75A
-//!   at `0x4C` reached **through an on-board I2C switch/mux** and anchored to
-//!   a specific chip position (`anchor_asic`). The direct bank on those same
-//!   boards occupies `0x48..=0x4B`, so the shared `0x4C` address is only
-//!   unambiguous behind the switch — a reader that ignores the mux CANNOT
-//!   see this bank. `power_by_ctrlboard` is imported verbatim where present;
-//!   **A3HB70601 omits it and orders its `index`→`anchor_asic` mapping
-//!   differently from its six A3HB706xx siblings** (transcription defect,
-//!   pinned in tests, imported verbatim).
+//!   `0x48` (right/top) + `0x4C` (left/top) on **33 of 50** v1.22.0 rows
+//!   and 6 of the 11 delta rows (TS007, BHB56601, BHB56701,
+//!   A3HB707{05,07,08}).
+//! - `switch_sensors` (jig `chain.switchsensor`): the old-format bank is
+//!   **4 per board on 9 of 50 v1.22.0 rows + 4 delta rows** (52 entries;
+//!   all BM1370 A3HB705xx/A3HB706xx + M1HB70602), every one an LM75A
+//!   at `0x4C` reached **through an on-board I2C switch/mux** and anchored
+//!   to a specific chip position (`anchor_asic`). The direct bank on those
+//!   same boards occupies `0x48..=0x4B`, so the shared `0x4C` address is
+//!   only unambiguous behind the switch — a reader that ignores the mux
+//!   CANNOT see this bank. `power_by_ctrlboard` is imported verbatim where
+//!   present; **A3HB70601 omits it and orders its `index`→`anchor_asic`
+//!   mapping differently from its six A3HB706xx siblings** (transcription
+//!   defect, pinned in tests, imported verbatim). H6HB70801's 7-entry
+//!   `channal`-addressed bank is a different shape (module docs
+//!   §"v1.24.0 delta").
 //!
-//! The widely-quoted "266 LM75A instances" figure counts only the two direct
-//! banks (200 board + 66 ctrl); the switch bank raises the true total to
-//! **302**. The thermal abstraction over this data lives in
-//! [`crate::sensor_topology`].
+//! The widely-quoted "266 LM75A instances" figure counts only the two
+//! direct v1.22.0 banks (200 board + 66 ctrl); the v1.22.0 switch bank
+//! raises that corpus's true total to **302**. The v1.24.0 delta adds 40
+//! board + 12 ctrl + 23 switch entries (16 old-format + 7 H6), for a
+//! 61-row grand total of **377 declared sensor instances**. The thermal
+//! abstraction over this data lives in [`crate::sensor_topology`].
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -220,8 +279,13 @@ use dcentrald_common::chain_transport::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The generated data file (see module docs for the generator command).
+/// The generated v1.22.0 data file (see module docs for the generator
+/// command).
 const TOPOLOGY_JSON: &str = include_str!("hashboard_topology_v1_22_0.json");
+
+/// The generated v1.24.0 delta data file — the 11 new-in-v1.24.0 base
+/// model_ids (see module docs §"v1.24.0 delta" for decode provenance).
+const TOPOLOGY_JSON_V124_DELTA: &str = include_str!("hashboard_topology_v1_24_0_delta.json");
 
 /// Provenance of a registry row. Downstream code and the dashboard MUST use
 /// this to label desk-derived rows honestly — none of the current rows are
@@ -233,6 +297,14 @@ pub enum DescriptorProvenance {
     /// (Bitmain-derived, ePIC-transcribed, real typos). Experimental;
     /// never present this as live-verified hardware identity.
     DeskJigDbExperimental,
+    /// Derived offline from the held ePIC UMC OS v1.24.0 (build
+    /// `f7feb46c`) amlogic `bms-miner` per-model DB records — the
+    /// 11-new-SKU delta decoded 2026-08-25 and validated by re-decoding
+    /// all 50 v1.22.0 records from the same binary with zero diffs on
+    /// imported fields. Same caveats as [`Self::DeskJigDbExperimental`]:
+    /// Bitmain-derived, ePIC-transcribed, never outranks a DCENT
+    /// measurement, never presented as live-verified.
+    DeskJigDbV124Experimental,
     /// Derived offline from VNish 1.2.7 firmware model JSONs
     /// (`hwscan --gen-model-info`, re-armada 2026-04-25 corpus) — a
     /// **THIRD-PARTY TRANSCRIPTION** of Bitmain data by VNish, distinct from
@@ -341,17 +413,31 @@ pub struct SwitchSensorPlacement {
     /// The chip position this sensor is thermally anchored to (jig `asic`).
     /// Coordinate convention (0- vs 1-based, tpl-grid vs chain-order) is NOT
     /// adjudicated — carried verbatim; do not derive placement math from it
-    /// without a live cross-check.
-    pub anchor_asic: u16,
+    /// without a live cross-check. `None` on the v1.24.0 `H6HB70801`
+    /// new-format entries that omit it (only its TMP451 at `index: 2`
+    /// carries one, `asic: 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_asic: Option<u16>,
     /// Horizontal position label, DB-verbatim (`"left"` / `"right"`).
-    pub x: String,
+    /// `None` on the v1.24.0 `H6HB70801` new-format bank, which carries a
+    /// `channal` number instead of placement labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
     /// Vertical position label, DB-verbatim (`"top"` / `"bottom"`).
-    pub y: String,
+    /// `None` on the v1.24.0 `H6HB70801` new-format bank (see [`Self::x`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
     /// Jig `power_by_ctrlboard`, imported verbatim where the source record
     /// carries it. `None` = the source record omits the field (A3HB70601),
     /// which is a transcription gap, NOT "false".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_by_ctrlboard: Option<bool>,
+    /// v1.24.0 `H6HB70801` only: the explicit I²C-switch **channel** the
+    /// sensor sits behind (0..=6 on that board). `None` on every v1.22.0
+    /// row (that corpus identifies the bank only by the shared `0x4C`
+    /// address). Spelling is DB-verbatim (`channal`), ePIC's own typo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channal: Option<u8>,
 }
 
 /// One chip's slot in a per-domain placement list (NBP1901/NBS1902 use this
@@ -390,18 +476,27 @@ pub struct HashboardDescriptor {
     /// corroborated by DCENT live page reads at 0x50-class addresses).
     pub eeprom: DevicePlacement,
     /// ⚠ **VENDOR CLAIM ONLY — never controller-routing authority.** The DB
-    /// declares `PIC1704 @ 0x20` on all 50 rows, which CONTRADICTS DCENT
-    /// live evidence on S21 (BHB68xxx): `a lab unit` is NoPic (TAS5782M DACs,
+    /// declares `PIC1704 @ 0x20` on all 50 v1.22.0 rows and all 10
+    /// old-format v1.24.0 delta rows, which CONTRADICTS DCENT live
+    /// evidence on S21 (BHB68xxx): `a lab unit` is NoPic (TAS5782M DACs,
     /// [`crate::pics::Pic::S21AmlogicNoPic`]). See module docs, divergence
     /// #6. DCENT platform code remains the sole authority for which voltage
     /// controller a live platform actually drives.
-    pub vendor_declared_pic: DevicePlacement,
+    ///
+    /// `None` on `H6HB70801` — the one roster record (v1.24.0 delta)
+    /// whose `chain` block carries **no `pic` section at all**. That is a
+    /// fact about ePIC's record (and consistent with a NoPic-class board),
+    /// not a DCENT controller-routing claim.
+    pub vendor_declared_pic: Option<DevicePlacement>,
     /// On-hashboard temperature sensors (read via the PIC in the jig model).
     pub board_sensors: Vec<SensorPlacement>,
     /// Control-board sensors (present on 33/50 rows).
     pub ctrl_board_sensors: Vec<SensorPlacement>,
-    /// I2C-switch/mux-reached sensors (present on 9/50 rows, 36 entries,
-    /// all BM1370 A3HB boards). See module docs §"Sensor banks".
+    /// I2C-switch/mux-reached sensors (9/50 v1.22.0 rows carry the old
+    /// 4-entry LM75A@`0x4C` bank, all BM1370 A3HB boards, plus 4 v1.24.0
+    /// delta rows with the same bank shape; `H6HB70801` carries the
+    /// new-format 7-entry `channal` bank — see module docs §"v1.24.0
+    /// delta"). See module docs §"Sensor banks".
     pub switch_sensors: Vec<SwitchSensorPlacement>,
     /// EEPROM preambles actually observed for this SKU in the 20 held decoded
     /// pages. ATTESTATION ONLY: empty means "no held sample", and a SKU may
@@ -499,28 +594,39 @@ struct Registry {
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        // The data file is generated + checked in + test-pinned; a parse
+        // Both data files are generated + checked in + test-pinned; a parse
         // failure is a build-data defect, not a runtime condition.
-        let file: TopologyFile = serde_json::from_str(TOPOLOGY_JSON)
-            .expect("hashboard_topology_v1_22_0.json is checked-in generated data and must parse");
-        assert_eq!(
-            file.schema, "dcent-hashboard-topology-v1",
-            "unexpected topology data schema"
-        );
-        let by_sku = file
-            .boards
+        let parse = |json: &str, name: &str| {
+            let file: TopologyFile = serde_json::from_str(json).unwrap_or_else(|e| {
+                panic!("{name} is checked-in generated data and must parse: {e}")
+            });
+            assert_eq!(
+                file.schema, "dcent-hashboard-topology-v1",
+                "{name}: unexpected topology data schema"
+            );
+            file.boards
+        };
+        let mut boards = parse(TOPOLOGY_JSON, "hashboard_topology_v1_22_0.json");
+        boards.extend(parse(
+            TOPOLOGY_JSON_V124_DELTA,
+            "hashboard_topology_v1_24_0_delta.json",
+        ));
+        let by_sku: HashMap<String, usize> = boards
             .iter()
             .enumerate()
             .map(|(i, b)| (b.sku.clone(), i))
             .collect();
-        Registry {
-            boards: file.boards,
-            by_sku,
-        }
+        assert_eq!(
+            by_sku.len(),
+            boards.len(),
+            "duplicate SKU across the v1.22.0 roster and the v1.24.0 delta"
+        );
+        Registry { boards, by_sku }
     })
 }
 
-/// All registry rows, sorted by SKU (50 as of the v1.22.0 import).
+/// All registry rows (50 v1.22.0 + 11 v1.24.0 delta = 61), v1.22.0 file
+/// order first, delta order second (both sorted by SKU).
 pub fn all_descriptors() -> &'static [HashboardDescriptor] {
     &registry().boards
 }
@@ -547,8 +653,24 @@ mod tests {
     use dcentrald_common::chain_transport::AddrIntervalSource;
 
     #[test]
-    fn registry_parses_and_has_exactly_50_boards() {
-        assert_eq!(all_descriptors().len(), 50);
+    fn registry_parses_and_has_exactly_61_boards() {
+        // 50 v1.22.0 rows + the 11-row v1.24.0 delta, provenance-split
+        // exactly as the two source files declare.
+        assert_eq!(all_descriptors().len(), 61);
+        assert_eq!(
+            all_descriptors()
+                .iter()
+                .filter(|d| d.provenance == DescriptorProvenance::DeskJigDbExperimental)
+                .count(),
+            50
+        );
+        assert_eq!(
+            all_descriptors()
+                .iter()
+                .filter(|d| d.provenance == DescriptorProvenance::DeskJigDbV124Experimental)
+                .count(),
+            11
+        );
     }
 
     #[test]
@@ -565,11 +687,13 @@ mod tests {
     #[test]
     fn counts_by_chip_family_match_the_evidence_db() {
         // v1.22.0 roster: 16 BM1362 + 11 BM1366 + 8 BM1368 + 13 BM1370
-        // + 2 BM1398P = 50.
+        // + 2 BM1398P = 50. v1.24.0 delta: +3 BM1366 (TS007, BHB56601,
+        // BHB56701) +8 BM1370 (M1HB70602, A3HB70505, A3HB706{08,09},
+        // A3HB707{05,07,08}, H6HB70801) = 61.
         assert_eq!(descriptors_for_chip("BM1362").len(), 16);
-        assert_eq!(descriptors_for_chip("BM1366").len(), 11);
+        assert_eq!(descriptors_for_chip("BM1366").len(), 14);
         assert_eq!(descriptors_for_chip("BM1368").len(), 8);
-        assert_eq!(descriptors_for_chip("BM1370").len(), 13);
+        assert_eq!(descriptors_for_chip("BM1370").len(), 21);
         assert_eq!(descriptors_for_chip("BM1398P").len(), 2);
         // DCENT spelling resolves the same two NB* boards.
         assert_eq!(descriptors_for_chip("BM1398").len(), 2);
@@ -577,12 +701,28 @@ mod tests {
 
     #[test]
     fn all_rows_are_desk_experimental_provenance() {
-        // No row may claim live verification — the import is desk evidence.
+        // No row may claim live verification — both imports are desk
+        // evidence, each labelled with its own source-DB provenance.
         for d in all_descriptors() {
-            assert_eq!(
-                d.provenance,
-                DescriptorProvenance::DeskJigDbExperimental,
+            assert!(
+                matches!(
+                    d.provenance,
+                    DescriptorProvenance::DeskJigDbExperimental
+                        | DescriptorProvenance::DeskJigDbV124Experimental
+                ),
                 "{} must carry desk/Experimental provenance",
+                d.sku
+            );
+            assert_ne!(
+                d.provenance,
+                DescriptorProvenance::LiveMeasuredDcent,
+                "{} must never claim live measurement",
+                d.sku
+            );
+            assert_ne!(
+                d.provenance,
+                DescriptorProvenance::DeskVnishFirmwareExperimental,
+                "{} is not a VNish-derived row",
                 d.sku
             );
         }
@@ -650,15 +790,23 @@ mod tests {
 
     #[test]
     fn all_boards_carry_the_vendor_declared_eeprom_and_pic_claims() {
-        // All 50 v1.22.0 rows DECLARE: AT24C02D EEPROM @ 7-bit 0x50 (live-
-        // corroborated), PIC1704 @ 0x20 (a VENDOR CLAIM that contradicts the
-        // live-proven S21 NoPic finding — see module docs divergence #6; the
-        // field name keeps that dishonesty impossible to consume silently).
+        // All 50 v1.22.0 rows + all 10 old-format v1.24.0 delta rows
+        // DECLARE: AT24C02D EEPROM @ 7-bit 0x50 (live-corroborated),
+        // PIC1704 @ 0x20 (a VENDOR CLAIM that contradicts the live-proven
+        // S21 NoPic finding — see module docs divergence #6; the field
+        // name keeps that dishonesty impossible to consume silently).
         for d in all_descriptors() {
             assert_eq!(d.eeprom.device, "AT24C02D", "{}", d.sku);
             assert_eq!(d.eeprom.i2c_addr, 0x50, "{}", d.sku);
-            assert_eq!(d.vendor_declared_pic.device, "PIC1704", "{}", d.sku);
-            assert_eq!(d.vendor_declared_pic.i2c_addr, 0x20, "{}", d.sku);
+            if d.sku == "H6HB70801" {
+                // The one record with NO pic section at all (module docs
+                // §"v1.24.0 delta") — pinned so the None is deliberate.
+                assert_eq!(d.vendor_declared_pic, None, "{}", d.sku);
+                continue;
+            }
+            let pic = d.vendor_declared_pic.as_ref().unwrap();
+            assert_eq!(pic.device, "PIC1704", "{}", d.sku);
+            assert_eq!(pic.i2c_addr, 0x20, "{}", d.sku);
             // Sensor corpus is LM75A at 7-bit 0x48..=0x4C throughout.
             for s in d.board_sensors.iter().chain(&d.ctrl_board_sensors) {
                 assert_eq!(s.device, "LM75A", "{}", d.sku);
@@ -670,7 +818,8 @@ mod tests {
                 );
             }
             // Direct board bank is exactly 4 sensors at 0x48..=0x4B on every
-            // row; the switch bank is LM75A at exactly 0x4C on every entry.
+            // old-format row; the switch bank is LM75A at exactly 0x4C on
+            // every old-format entry.
             assert_eq!(d.board_sensors.len(), 4, "{}", d.sku);
             for s in &d.board_sensors {
                 assert!(
@@ -685,6 +834,60 @@ mod tests {
                 assert_eq!(s.i2c_addr, 0x4C, "{}", d.sku);
             }
         }
+    }
+
+    /// The v1.24.0 `H6HB70801` record's new-format sensor bank, imported
+    /// verbatim: 7 mux entries addressed by explicit switch CHANNEL, mixing
+    /// 2 LM75A (one at 0x48) with 5 TMP451 (a device absent from the whole
+    /// v1.22.0 corpus), no placement labels, and a single anchored entry.
+    #[test]
+    fn h6hb70801_carries_the_new_format_channel_addressed_sensor_bank() {
+        let d = descriptor_by_sku("H6HB70801").unwrap();
+        assert_eq!(
+            d.provenance,
+            DescriptorProvenance::DeskJigDbV124Experimental
+        );
+        assert!(d.board_sensors.is_empty());
+        assert!(d.ctrl_board_sensors.is_empty());
+        assert_eq!(d.switch_sensors.len(), 7);
+        let lm75: Vec<_> = d
+            .switch_sensors
+            .iter()
+            .filter(|s| s.device == "LM75A")
+            .collect();
+        let tmp451: Vec<_> = d
+            .switch_sensors
+            .iter()
+            .filter(|s| s.device == "TMP451")
+            .collect();
+        assert_eq!(lm75.len(), 2);
+        assert_eq!(tmp451.len(), 5);
+        // One LM75A sits at 0x48 — outside the v1.22.0 old-bank domain
+        // (0x4C) — and one TMP451 carries the only asic anchor.
+        assert!(lm75.iter().any(|s| s.i2c_addr == 0x48));
+        assert!(lm75.iter().any(|s| s.i2c_addr == 0x4C));
+        assert!(tmp451.iter().all(|s| s.i2c_addr == 0x4C));
+        // Channel numbers 0..=6, each exactly once; no placement labels.
+        let mut chans: Vec<u8> = d
+            .switch_sensors
+            .iter()
+            .map(|s| s.channal.expect("H6 entries all carry channal"))
+            .collect();
+        chans.sort_unstable();
+        assert_eq!(chans, [0, 1, 2, 3, 4, 5, 6]);
+        for s in &d.switch_sensors {
+            assert_eq!(s.x, None, "{}", d.sku);
+            assert_eq!(s.y, None, "{}", d.sku);
+        }
+        // Exactly one entry is anchored (index 2, asic 0); the rest omit it.
+        let anchored: Vec<_> = d
+            .switch_sensors
+            .iter()
+            .filter(|s| s.anchor_asic.is_some())
+            .collect();
+        assert_eq!(anchored.len(), 1);
+        assert_eq!(anchored[0].index, 2);
+        assert_eq!(anchored[0].anchor_asic, Some(0));
     }
 
     #[test]
@@ -729,6 +932,110 @@ mod tests {
                 .vendor_declared_addr_interval,
             2
         );
+
+        // H6HB70801 (v1.24.0 delta, unpublished SKU) — BM1370, 85 chips
+        // as 17 domains x 5, vendor stride 1 (unique), no pic claim.
+        let d = descriptor_by_sku("H6HB70801").unwrap();
+        assert_eq!(d.chip.name, "BM1370");
+        assert_eq!(d.chain.chips_per_chain, 85);
+        assert_eq!(d.chain.domains_per_chain, 17);
+        assert_eq!(d.chain.chips_per_domain, 5);
+        assert_eq!(d.chip.vendor_declared_addr_interval, 1);
+        assert_eq!((d.chain.rows, d.chain.columns), (10, 9));
+        assert_eq!(d.vendor_declared_pic, None);
+    }
+
+    /// W3 (2026-08-25): every v1.24.0 delta row, pinned against the
+    /// amlogic-binary decode (sha256 cb3c84f2…; per-record offsets in the
+    /// delta file header). One block per SKU so a transcription slip in the
+    /// JSON turns exactly one block red. Attribution: Bitmain-derived,
+    /// ePIC-transcribed reference data — never authority over a DCENT live
+    /// measurement (caveat 3), and no row here admits hardware.
+    #[test]
+    fn v1_24_0_delta_rows_match_the_binary_decode() {
+        let expect = |sku: &str| descriptor_by_sku(sku).unwrap();
+        for d in all_descriptors()
+            .iter()
+            .filter(|d| d.provenance == DescriptorProvenance::DeskJigDbV124Experimental)
+        {
+            // Delta-wide invariants: every new row declares the standard
+            // EEPROM + (except H6) the PIC1704 vendor claim, has no held
+            // EEPROM sample, and carries the v1.24.0 provenance label.
+            assert_eq!(d.eeprom.device, "AT24C02D", "{}", d.sku);
+            assert_eq!(d.eeprom.i2c_addr, 0x50, "{}", d.sku);
+            assert!(d.observed_eeprom_preambles.is_empty(), "{}", d.sku);
+        }
+
+        // --- S19 XP class, BM1366 (asic block matches the v1.22.0 BHB568xx
+        // siblings exactly: 112 big / 894 small / 8 per core / 1 domain) ---
+        let d = expect("TS007");
+        assert_eq!(d.chip.name, "BM1366");
+        assert_eq!(d.chip.chip_id, 0x1366);
+        assert_eq!(d.chain.chips_per_chain, 80);
+        assert_eq!((d.chain.rows, d.chain.columns), (10, 8));
+        assert_eq!(d.chain.chains_per_unit, 4); // fixture-style 4 (divergence #4 family)
+        assert_eq!(d.chip.vendor_declared_addr_interval, 2);
+
+        let d = expect("BHB56601");
+        assert_eq!(d.chip.name, "BM1366");
+        assert_eq!(d.chain.chips_per_chain, 99);
+        assert_eq!((d.chain.rows, d.chain.columns), (11, 9));
+        assert_eq!(d.chain.chains_per_unit, 3);
+        assert_eq!(d.ctrl_board_sensors.len(), 2);
+
+        let d = expect("BHB56701");
+        assert_eq!(d.chip.name, "BM1366");
+        assert_eq!(d.chain.chips_per_chain, 70);
+        assert_eq!((d.chain.rows, d.chain.columns), (10, 7));
+        assert_eq!(d.chain.chains_per_unit, 3);
+
+        // --- S21 XP / S21 XP Imm, BM1370, 91 chips (13x7, 13 domains x 7),
+        // old-format 4-entry switch bank ---
+        for sku in ["A3HB70505", "M1HB70602"] {
+            let d = expect(sku);
+            assert_eq!(d.chip.name, "BM1370", "{sku}");
+            assert_eq!(d.chain.chips_per_chain, 91, "{sku}");
+            assert_eq!((d.chain.rows, d.chain.columns), (13, 7), "{sku}");
+            assert_eq!(d.chain.domains_per_chain, 13, "{sku}");
+            assert_eq!(d.switch_sensors.len(), 4, "{sku}");
+            assert_eq!(d.ctrl_board_sensors.len(), 0, "{sku}");
+            assert_eq!(d.chip.vendor_declared_addr_interval, 2, "{sku}");
+        }
+
+        // --- S21 Pro+, BM1370, 65 chips (13x5) — geometry matches the
+        // v1.22.0 A3HB706xx siblings ---
+        for sku in ["A3HB70608", "A3HB70609"] {
+            let d = expect(sku);
+            assert_eq!(d.chip.name, "BM1370", "{sku}");
+            assert_eq!(d.chain.chips_per_chain, 65, "{sku}");
+            assert_eq!((d.chain.rows, d.chain.columns), (13, 5), "{sku}");
+            assert_eq!(d.chain.domains_per_chain, 13, "{sku}");
+            assert_eq!(d.switch_sensors.len(), 4, "{sku}");
+        }
+
+        // --- S21++, BM1370, 55 chips (11x5) — matches the v1.22.0
+        // A3HB7070x siblings; ctrl-board pair instead of a switch bank ---
+        for sku in ["A3HB70705", "A3HB70707", "A3HB70708"] {
+            let d = expect(sku);
+            assert_eq!(d.chip.name, "BM1370", "{sku}");
+            assert_eq!(d.chain.chips_per_chain, 55, "{sku}");
+            assert_eq!((d.chain.rows, d.chain.columns), (11, 5), "{sku}");
+            assert_eq!(d.switch_sensors.len(), 0, "{sku}");
+            assert_eq!(d.ctrl_board_sensors.len(), 2, "{sku}");
+        }
+
+        // --- H6HB70801 (unpublished): BM1370, 85 = 17 domains x 5, stride 1
+        // (the only vendor-1 stride in the roster), APW11 PSU per the
+        // binary's power block (not imported — PSU lives in `psus` land) ---
+        let d = expect("H6HB70801");
+        assert_eq!(d.chip.name, "BM1370");
+        assert_eq!(d.chip.chip_id, 0x1370);
+        assert_eq!(d.chain.chips_per_chain, 85);
+        assert_eq!(d.chain.domains_per_chain, 17);
+        assert_eq!(d.chain.chips_per_domain, 5);
+        assert_eq!(d.chain.chains_per_unit, 3);
+        assert_eq!(d.chip.vendor_declared_addr_interval, 1);
+        assert_eq!(d.switch_sensors.len(), 7);
     }
 
     /// Coordinator trap #1 / H2 §G-2 / queue rank 25: the vendor-declared
@@ -759,8 +1066,10 @@ mod tests {
                 divergent.push(d.sku.as_str());
             }
         }
-        // The exact H2 §G-2 divergence set — 16 boards, all where ePIC's
-        // flat `2` undercuts our computed stride.
+        // The exact H2 §G-2 divergence set (16 v1.22.0 boards, all where
+        // ePIC's flat `2` undercuts our computed stride) PLUS the 8 v1.24.0
+        // delta rows with the same property (6 more flat-2 undercuts +
+        // H6HB70801's vendor-1 + BHB56701/TS007/A3HB706xx 2-vs-3).
         let expected = [
             "A3HB40601",
             "A3HB70601",
@@ -769,15 +1078,23 @@ mod tests {
             "A3HB70605",
             "A3HB70606",
             "A3HB70607",
+            "A3HB70608",
+            "A3HB70609",
             "A3HB70701",
             "A3HB70702",
             "A3HB70703",
+            "A3HB70705",
+            "A3HB70707",
+            "A3HB70708",
             "BHB42803",
+            "BHB56701",
             "BHB56901",
             "BHB56902",
             "BHB56903",
             "BHB56906",
             "BHB56907",
+            "H6HB70801",
+            "TS007",
         ];
         divergent.sort_unstable();
         assert_eq!(
@@ -786,22 +1103,38 @@ mod tests {
         );
     }
 
-    /// UB-25 adjudication, pinned across the whole 50-row roster.
+    /// UB-25 adjudication, pinned across the whole 61-row roster.
     ///
     /// Partitions every SKU into exactly one of: agrees-everywhere (fallback),
     /// declared (jig + ePIC beat the formula), ePIC-is-the-outlier (fallback,
-    /// already equals the jig), or unresolved three-way split (fallback,
-    /// corroborated by nobody). If any bucket drifts, re-adjudicate — do not
-    /// re-balance the expected lists to make this pass.
+    /// already equals the jig), unresolved three-way split (fallback,
+    /// corroborated by nobody), or — v1.24.0 delta rows only — PENDING
+    /// adjudication (see below). If any bucket drifts, re-adjudicate — do
+    /// not re-balance the expected lists to make this pass.
+    ///
+    /// The v1.24.0 delta's 5 pending rows sit on the computed fallback
+    /// because the rank-25 DECLARED table lives in
+    /// `dcentrald_common::chain_transport` and admitting new SKUs there is
+    /// deliberately out of the silicon-profiles lane's scope. Four are the
+    /// classic two-source case (jig + ePIC agree on 2 against the formula's
+    /// 3 — future DECLARED candidates); `H6HB70801` is a new three-way
+    /// split (jig 2 · ePIC 1 · formula 3 — a future UNRESOLVED candidate
+    /// alongside A3HB40601). Conservative by construction: the fallback
+    /// never energizes anything.
     #[test]
     fn resolved_addr_interval_partitions_the_roster_as_adjudicated() {
         use dcentrald_common::chain_transport::{
             bitmain_jig_addr_interval, bm1397plus_addr_interval,
         };
 
+        const PENDING_V124_TWO_SOURCE: &[&str] = &["A3HB70608", "A3HB70609", "BHB56701", "TS007"];
+        const PENDING_V124_THREE_WAY: &[&str] = &["H6HB70801"];
+
         let mut declared: Vec<&str> = Vec::new();
         let mut epic_outlier: Vec<&str> = Vec::new();
         let mut unresolved: Vec<&str> = Vec::new();
+        let mut pending_two_source: Vec<&str> = Vec::new();
+        let mut pending_three_way: Vec<&str> = Vec::new();
         let mut agrees = 0usize;
 
         for d in all_descriptors() {
@@ -834,14 +1167,31 @@ mod tests {
                     if d.addr_interval_is_unresolved() {
                         unresolved.push(d.sku.as_str());
                     } else if vendor != formula {
-                        // Only legal when the jig backs OUR value, not ePIC's.
-                        assert_eq!(
-                            jig,
-                            Some(formula),
-                            "{}: fallback kept against ePIC without jig backing",
-                            d.sku
-                        );
-                        epic_outlier.push(d.sku.as_str());
+                        if PENDING_V124_TWO_SOURCE.contains(&d.sku.as_str()) {
+                            // jig + ePIC agree against the formula — the
+                            // rank-25 DECLARED-candidate shape, awaiting
+                            // admission in dcentrald-common (out of scope
+                            // for the delta lane).
+                            assert_eq!(jig, Some(vendor), "{}", d.sku);
+                            assert_ne!(jig, Some(formula), "{}", d.sku);
+                            pending_two_source.push(d.sku.as_str());
+                        } else if PENDING_V124_THREE_WAY.contains(&d.sku.as_str()) {
+                            // jig 2 · ePIC 1 · formula 3 — never guessed.
+                            assert_ne!(jig, Some(vendor), "{}", d.sku);
+                            assert_ne!(jig, Some(formula), "{}", d.sku);
+                            assert_ne!(vendor, formula, "{}", d.sku);
+                            pending_three_way.push(d.sku.as_str());
+                        } else {
+                            // Only legal when the jig backs OUR value, not
+                            // ePIC's.
+                            assert_eq!(
+                                jig,
+                                Some(formula),
+                                "{}: fallback kept against ePIC without jig backing",
+                                d.sku
+                            );
+                            epic_outlier.push(d.sku.as_str());
+                        }
                     } else {
                         agrees += 1;
                     }
@@ -851,6 +1201,7 @@ mod tests {
         declared.sort_unstable();
         epic_outlier.sort_unstable();
         unresolved.sort_unstable();
+        pending_two_source.sort_unstable();
 
         assert_eq!(
             declared,
@@ -870,14 +1221,35 @@ mod tests {
             ],
             "declared set drifted — re-adjudicate against both sources"
         );
-        // ePIC's flat `2` is wrong here; jig and formula both say 4.
-        assert_eq!(epic_outlier, ["A3HB70701", "A3HB70702", "A3HB70703"]);
+        // ePIC's flat `2` is wrong here; jig and formula both say 4. The
+        // three v1.22.0 A3HB7070x rows plus the three new S21++ rows.
+        assert_eq!(
+            epic_outlier,
+            [
+                "A3HB70701",
+                "A3HB70702",
+                "A3HB70703",
+                "A3HB70705",
+                "A3HB70707",
+                "A3HB70708",
+            ]
+        );
         // jig 4 · ePIC 2 · formula 7 — never guessed.
         assert_eq!(unresolved, ["A3HB40601"]);
-        // 12 declared + 3 ePIC-outlier + 1 unresolved = the 16-board G-2 set.
-        assert_eq!(declared.len() + epic_outlier.len() + unresolved.len(), 16);
-        assert_eq!(agrees, 34);
-        assert_eq!(agrees + 16, all_descriptors().len());
+        assert_eq!(pending_two_source, PENDING_V124_TWO_SOURCE);
+        assert_eq!(pending_three_way, PENDING_V124_THREE_WAY);
+        // 12 declared + 6 ePIC-outlier + 1 unresolved + 5 pending = the
+        // 24-board G-2 divergence set.
+        assert_eq!(
+            declared.len()
+                + epic_outlier.len()
+                + unresolved.len()
+                + pending_two_source.len()
+                + pending_three_way.len(),
+            24
+        );
+        assert_eq!(agrees, 37);
+        assert_eq!(agrees + 24, all_descriptors().len());
     }
 
     /// The two catalog-`Exact` rows the queue named by SKU now resolve to the

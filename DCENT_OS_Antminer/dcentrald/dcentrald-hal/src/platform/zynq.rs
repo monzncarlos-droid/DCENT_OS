@@ -37,6 +37,7 @@ use crate::fpga_chain::FpgaChain;
 use crate::glitch_monitor::BraiinsGlitchMonitor;
 use crate::gpio::{GpioController, GpioLayout};
 use crate::i2c::I2cBus;
+use crate::pl_surface::{parse_uio_sysfs_hex, PlSurfaceReport};
 use crate::{HalError, Result};
 
 /// am2-s17 family PSU gate GPIO.
@@ -152,6 +153,11 @@ pub struct UioInfo {
     pub number: u8,
     /// Device name from sysfs.
     pub name: String,
+    /// `/sys/class/uio/uioN/maps/map0/addr` when the kernel published it.
+    /// Never filled from a hardcoded AXI table (including ePIC DT).
+    pub physaddr: Option<u64>,
+    /// `/sys/class/uio/uioN/maps/map0/size` when the kernel published it.
+    pub size: Option<u64>,
 }
 
 /// Zynq platform implementation.
@@ -166,6 +172,9 @@ pub struct ZynqPlatform {
     chain_uio_bases: HashMap<u8, u8>,
     /// Detected Zynq product/capability route (S9, S17, or S19 family).
     variant: ZynqVariant,
+    /// Kernel-published PL surfaces (name + map0 addr/size). BUILD_ID is
+    /// unread at census — MMIO is not opened here.
+    pl_surfaces: Vec<PlSurfaceReport>,
 }
 
 impl ZynqPlatform {
@@ -252,6 +261,12 @@ impl ZynqPlatform {
         }
 
         let chain_uio_bases = admit_chain_uio_topology(&devices, variant, chain_ids)?;
+        let pl_surfaces = pl_surface_reports_from_uio(&devices);
+        tracing::info!(
+            count = pl_surfaces.len(),
+            mapped_chains = chain_uio_bases.len(),
+            "Collected PL surface reports from UIO sysfs (BUILD_ID unread at census)"
+        );
 
         Ok(Self {
             fan_uio,
@@ -259,12 +274,19 @@ impl ZynqPlatform {
             glitch_monitor_uio,
             chain_uio_bases,
             variant,
+            pl_surfaces,
         })
     }
 
     /// Get the detected Zynq sub-platform variant.
     pub fn variant(&self) -> ZynqVariant {
         self.variant
+    }
+
+    /// Kernel-published PL surfaces from UIO sysfs. `build_id` is `None`
+    /// until a chain backend performs an explicit MMIO read.
+    pub fn pl_surfaces(&self) -> &[PlSurfaceReport] {
+        &self.pl_surfaces
     }
 
     /// Open the am2 board-control IP (hashboard reset, plug-detect, PSU enable).
@@ -579,14 +601,37 @@ fn scan_uio_devices() -> Result<Vec<UioInfo>> {
                 let name = fs::read_to_string(&name_path)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|_| format!("uio{}", number));
+                let physaddr = read_uio_map0_hex(uio_dir, &dir_name, "addr");
+                let size = read_uio_map0_hex(uio_dir, &dir_name, "size");
 
-                devices.push(UioInfo { number, name });
+                devices.push(UioInfo {
+                    number,
+                    name,
+                    physaddr,
+                    size,
+                });
             }
         }
     }
 
     devices.sort_by_key(|d| d.number);
     Ok(devices)
+}
+
+fn read_uio_map0_hex(uio_dir: &str, dir_name: &str, leaf: &str) -> Option<u64> {
+    let path = format!("{uio_dir}/{dir_name}/maps/map0/{leaf}");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse_uio_sysfs_hex(&s))
+}
+
+fn pl_surface_reports_from_uio(devices: &[UioInfo]) -> Vec<PlSurfaceReport> {
+    devices
+        .iter()
+        .map(|device| {
+            PlSurfaceReport::from_sysfs(device.name.clone(), device.physaddr, device.size)
+        })
+        .collect()
 }
 
 /// Find a UIO device number by its exact kernel sysfs name.
@@ -628,6 +673,11 @@ fn chain_role(name: &str, chain_id: u8) -> Option<usize> {
 /// deliberately-unbound slot is the absence of a chain, never evidence of a
 /// corrupt fabric. A fabric with zero usable chains still fails closed.
 ///
+/// Name-based discovery is the **only** admission path. There is no S9
+/// positional fallback (chain 6/7/8 → UIO 1/5/9). An unnamed census used to
+/// map chain6 onto uio0 `fan-control` when the off-by-one 0/4/8 table was
+/// live; the 1/5/9 table is the live S9 census, not a substitute for names.
+///
 /// Pure over a device census so the live topologies above are host-testable.
 fn admit_chain_uio_topology(
     devices: &[UioInfo],
@@ -654,34 +704,10 @@ fn admit_chain_uio_topology(
         }
     }
 
-    // Fallback: if name-based discovery fails entirely, use positional mapping.
-    if chain_uio_bases.is_empty() {
-        match variant {
-            ZynqVariant::S9 if devices.len() >= 12 => {
-                // Bases 1/5/9, NOT 0/4/8.
-                //
-                // The live S9 census is uio0 `fan-control`, uio1-4 `chain6-*`,
-                // uio5-8 `chain7-*`, uio9-12 `chain8-*`, uio13
-                // `miner-glitch-monitor`
-                // (:97-106`,
-                // corroborated by `LIVE_RECON_FLEET.md`). The canonical driver
-                // table agrees: `dcentrald-asic/src/drivers/mod.rs` pins
-                // `uio_bases: &[1, 5, 9]` for BM1387/S9.
-                //
-                // The previous 0/4/8 mapping was off by one and put chain6 on
-                // uio0 — the FAN-CONTROL block. Since `FpgaChain::open` maps
-                // `base..base+3`, that fallback would have issued hash-chain
-                // command/FIFO writes into the fan controller. Only reachable
-                // when name-based discovery fails entirely, which is why it
-                // survived unnoticed.
-                tracing::warn!("Name-based UIO discovery failed, using S9 positional fallback");
-                chain_uio_bases.insert(6, 1);
-                chain_uio_bases.insert(7, 5);
-                chain_uio_bases.insert(8, 9);
-            }
-            _ => {}
-        }
-    }
+    // DESK_NOW 2026-08-19: positional S9 mapping (chain 6/7/8 → UIO 1/5/9)
+    // is forbidden. Name-based discovery is the only path. An unnamed or
+    // incomplete census fails closed below rather than writing hash-chain
+    // commands into uio0 fan-control.
 
     if chain_uio_bases.is_empty() {
         return Err(HalError::Platform(format!(
@@ -984,6 +1010,17 @@ mod tests {
         UioInfo {
             number,
             name: name.to_string(),
+            physaddr: None,
+            size: None,
+        }
+    }
+
+    fn uio_mapped(number: u8, name: &str, physaddr: u64, size: u64) -> UioInfo {
+        UioInfo {
+            number,
+            name: name.to_string(),
+            physaddr: Some(physaddr),
+            size: Some(size),
         }
     }
 
@@ -1412,18 +1449,19 @@ mod tests {
         );
     }
 
-    /// The S9 positional fallback must never place a chain on uio0, which the
-    /// live census shows is `fan-control`. `FpgaChain::open` maps
-    /// `base..base+3`, so an off-by-one here writes hash-chain commands into
-    /// the fan controller.
+    /// Named S9 census still maps the live 1/5/9 bases. Unnamed devices must
+    /// **not** fall back to those numbers — that path used to write chain
+    /// commands into uio0 `fan-control` when the table was 0/4/8.
     #[test]
-    fn s9_positional_fallback_uses_live_bases_and_never_maps_a_chain_onto_fan_control() {
-        // 14 unnamed devices: name-based discovery finds nothing, so the
-        // positional fallback is the only path that can populate the map.
-        let unnamed: Vec<UioInfo> = (0..14).map(|n| uio(n, "unknown-ip")).collect();
-        let mapped = admit_chain_uio_topology(&unnamed, ZynqVariant::S9, &S9_CHAIN_IDS)
-            .expect("S9 positional fallback must still apply for a >=12 device census");
-
+    fn s9_named_census_maps_live_bases_unnamed_census_fails_closed() {
+        let mut named = Vec::new();
+        named.push(uio(0, "fan-control"));
+        for (chain_id, base) in [(6, 1), (7, 5), (8, 9)] {
+            named.extend(chain_group(chain_id, base));
+        }
+        named.push(uio(13, "miner-glitch-monitor"));
+        let mapped = admit_chain_uio_topology(&named, ZynqVariant::S9, &S9_CHAIN_IDS)
+            .expect("named S9 chain6/7/8 groups must still be admitted");
         assert_eq!(mapped.get(&6), Some(&1), "chain6 base is uio1, not uio0");
         assert_eq!(mapped.get(&7), Some(&5));
         assert_eq!(mapped.get(&8), Some(&9));
@@ -1431,6 +1469,34 @@ mod tests {
             !mapped.values().any(|&base| base == 0),
             "uio0 is fan-control on live S9 — no chain may be mapped onto it"
         );
+
+        let unnamed: Vec<UioInfo> = (0..14).map(|n| uio(n, "unknown-ip")).collect();
+        let err = admit_chain_uio_topology(&unnamed, ZynqVariant::S9, &S9_CHAIN_IDS)
+            .expect_err("unnamed S9 census must fail closed, not map 1/5/9");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no complete hash-chain UIO group"),
+            "empty-map error path: {msg}"
+        );
+    }
+
+    #[test]
+    fn pl_surface_reports_use_sysfs_fields_and_never_invent_axi_addresses() {
+        let devices = vec![
+            uio_mapped(1, "chain6-common", 0x43C0_0000, 0x1000),
+            uio(0, "fan-control"),
+        ];
+        let reports = pl_surface_reports_from_uio(&devices);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].name, "chain6-common");
+        assert_eq!(reports[0].physaddr, Some(0x43C0_0000));
+        assert_eq!(reports[0].size, Some(0x1000));
+        assert_eq!(reports[0].build_id, None);
+        assert_eq!(reports[1].name, "fan-control");
+        assert_eq!(reports[1].physaddr, None);
+        assert_eq!(reports[1].size, None);
+        assert_ne!(reports[1].physaddr, Some(0x4127_0000));
+        assert_ne!(reports[1].physaddr, Some(0x43C0_0000));
     }
 
     #[test]

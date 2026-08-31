@@ -39,8 +39,10 @@ provision_release() {
 TARGET="${TEST_ROOT}/dev-regular"
 make_target "$TARGET" dcentral
 printf 'stale\n' > "${TARGET}/etc/dcentos/release-image"
+printf 'lab-rescue\n' > "${TARGET}/etc/dcentos/rescue_ssh_enabled"
 provision_dev "$TARGET" || fail_test "dev build rejected removable regular marker"
 [ ! -e "${TARGET}/etc/dcentos/release-image" ] || fail_test "dev marker survived"
+[ -f "${TARGET}/etc/dcentos/rescue_ssh_enabled" ] || fail_test "DEV lab rescue SSH marker was stripped"
 
 TARGET="${TEST_ROOT}/dev-directory"
 make_target "$TARGET" dcentral
@@ -97,8 +99,10 @@ fi
 TARGET="${TEST_ROOT}/locked-release"
 make_target "$TARGET" '*'
 printf 'grace\n' > "${TARGET}/etc/dcentos/first-boot-grace"
+printf 'am3-bb-s19jpro rescue SSH enabled for lab bring-up\n' > "${TARGET}/etc/dcentos/rescue_ssh_enabled"
 provision_release "$TARGET" || fail_test "locked release was rejected"
 [ ! -e "${TARGET}/etc/dcentos/first-boot-grace" ] || fail_test "grace marker survived"
+[ ! -e "${TARGET}/etc/dcentos/rescue_ssh_enabled" ] || fail_test "AM3-BB rescue SSH marker survived RELEASE provision"
 [ -f "${TARGET}/etc/dcentos/release-image" ] || fail_test "release marker is absent"
 [ ! -L "${TARGET}/etc/dcentos/release-image" ] || fail_test "release marker is a symlink"
 [ "$(stat -c '%h' "${TARGET}/etc/dcentos/release-image")" = 1 ] || fail_test "release marker is multiply linked"

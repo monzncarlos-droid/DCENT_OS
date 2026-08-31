@@ -74,7 +74,8 @@ DCENT_OS/
 └── firmware/
     ├── antminer/     → industrial Antminers (S9 → S21): Rust dcentrald daemon + Buildroot Linux + dashboard + docs/
     ├── esp/          → ESP32-S3 Bitaxe-class miners (BM1397/1366/1368/1370): original Rust firmware + MCP
-    ├── avalon/       → Avalon (Canaan) support — in development (see DCENT_OS_AvalonMiner/README.md)
+    ├── avalon/       → Avalon (Canaan) K230/K210 — experimental port: board support, daemon crates,
+    │                    recovery tooling, gauntlets (see DCENT_OS_AvalonMiner/README.md)
     └── whatsminer/   → WhatsMiner (MicroBT) support — in development (see DCENT_OS_WhatsMiner/README.md)
 ```
 
@@ -82,7 +83,7 @@ DCENT_OS/
 |---|---|---|
 | **Antminer** S9 / S17 / S19 / S19 Pro / S19j Pro / S21 | `DCENT_OS_Antminer/` | **Supported** — **mining achieved on multiple models** (accepted pool shares on our bench); see the honest per-model matrix in [`DCENT_OS_Antminer/docs/PLATFORMS.md`](DCENT_OS_Antminer/docs/PLATFORMS.md) (mining achieved vs bring-up vs blocked, and which proofs are still untested on the latest binaries). |
 | **Bitaxe-class** Max / Ultra / Supra / Gamma / Hex Ultra / Hex Supra (ESP32-S3) | `DCENT_OS_ESP/` | **Supported** — Gamma live-verified; others driver- and host-tested. Built-in MCP (AI-control) server. |
-| **Avalon** (Canaan) | `DCENT_OS_AvalonMiner/` | **In development** — architecture scaffolded; no mining claim yet. |
+| **Avalon** (Canaan) Nano 3 / K230 / K210 | `DCENT_OS_AvalonMiner/` | **Experimental** — the real port is published here. DCENT_OS userspace, persistence, and recovery are live-proven on a Nano 3 while **stock `btcminer` retained all hardware ownership**; the hashrate and accepted shares in that milestone were stock's, not ours. **No accepted-share proof for DCENT_OS's own mining path**, and unattended production is closed. See [`DCENT_OS_AvalonMiner/README.md`](DCENT_OS_AvalonMiner/README.md). |
 | **WhatsMiner** (MicroBT) | `DCENT_OS_WhatsMiner/` | **In development** — reverse engineering + bring-up underway; no mining claim yet. |
 
 We publish an **honest readiness taxonomy**: *mining achieved* means accepted pool shares on real
@@ -152,7 +153,8 @@ All under one roof at **[github.com/DCentralTech](https://github.com/DCentralTec
 layer: mining, tools, hardware, communication.
 
 - **[DCENT_OS](https://github.com/DCentralTech/DCENT_OS)** — this repo: open-source mining firmware for
-  industrial Antminers and ESP32 Bitaxe-class miners (Avalon + WhatsMiner scaffolded).
+  industrial Antminers and ESP32 Bitaxe-class miners, plus an experimental Avalon (Canaan) port
+  (WhatsMiner scaffolded).
 - **[DCENT_Toolbox](https://github.com/DCentralTech/DCENT_Toolbox)** — the open-source bench tool: scan,
   unlock, audit, flash, and prove — from your own machine.
 - **[DCENT_axe](https://github.com/DCentralTech/DCENT_axe)** — open-hardware Bitaxe-class boards

@@ -75,12 +75,19 @@ pub const S21_VCO_HOLD: S21VcoHoldProfile = S21VcoHoldProfile {
 pub enum S21VcoHoldError {
     AutotuneMustStayDisabled,
     DomainClimbMustStayDisabled,
-    ClampModeMustBeJigClamp { observed: String },
+    ClampModeMustBeJigClamp {
+        observed: String,
+    },
     /// Climb/autotune refuse: sealed F/V + power telemetry still required.
     SealedFvEnvelopeRequired,
     HwThresholdFloatDefaultDeskPending,
-    VcoOutsideSearchClamp { vco_mhz: f64, refdiv: u32 },
-    VcoOutsideProgramWindow { vco_mhz: f64 },
+    VcoOutsideSearchClamp {
+        vco_mhz: f64,
+        refdiv: u32,
+    },
+    VcoOutsideProgramWindow {
+        vco_mhz: f64,
+    },
 }
 
 impl core::fmt::Display for S21VcoHoldError {
@@ -157,7 +164,6 @@ pub fn jig_clamp_encode_high_band(vco_mhz: f64) -> Result<bool, S21VcoHoldError>
     admit_jig_clamp_program_vco(vco_mhz)?;
     Ok(vco_mhz >= S21_VCO_ENCODE_BAND_SPLIT_MHZ)
 }
-
 
 /// True when `sku` is in the Lead-listed public jig reuse set.
 pub fn jig_clamp_windows_apply_to_sku(sku: &str) -> bool {

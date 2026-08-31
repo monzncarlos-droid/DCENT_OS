@@ -47,6 +47,9 @@ pub enum PsuProtocol {
     /// DCENT_OS ships no APW9 backend, telemetry reader, or voltage-command
     /// encoder. Consumers must fail closed.
     Apw9FramedI2c,
+    /// APW8 S15/T15. First-party guide documents I²C PIC + EN active-low;
+    /// opcode/LSB is unbound. No SET voltage. Consumers must fail closed.
+    Apw8UnspecifiedI2c,
     /// Bitmain proprietary v1 — opcode-based SMBus on the older Zynq
     /// boards. Used by APW111721b/c, APW11A1216-1a, APW11Go, NBS1902.
     BitmainProtoV1,
@@ -125,6 +128,9 @@ pub enum Psu {
     Apw3PlusPlus,
     /// APW7 — fixed-output PSU with no signal/control terminal.
     Apw7,
+    /// APW8 — S15 / T15. Guide I²C PIC + EN active-low; opcode/LSB unbound.
+    /// Fail-closed: no SET voltage, no shipped backend.
+    Apw8,
     /// APW9 — S17 / S17 Pro, proprietary framed I²C, 3600 W.
     Apw9,
     /// APW10 — transitional, PMBus, ~3300 W. Catalog placeholder; RE2
@@ -183,6 +189,21 @@ impl Psu {
                 enable_gpio: None,
                 used_in: &["S9", "S9i", "L3+", "D3", "T9+", "Z9"],
                 verification_partial: false,
+            },
+            Psu::Apw8 => PsuCatalogEntry {
+                model: "APW8",
+                // Software observation 0x10 exists in bm1391 evidence; it is
+                // not a bound production address. Leave None so dispatch
+                // cannot probe or SET.
+                i2c_address: None,
+                protocol: PsuProtocol::Apw8UnspecifiedI2c,
+                // Guide p.6 prints 16.32-20.04 V / 95 A, not a wattage
+                // ceiling we will invent here.
+                max_power_w: 0,
+                nominal_voltage_v: 0,
+                enable_gpio: None,
+                used_in: &["S15", "T15"],
+                verification_partial: true,
             },
             Psu::Apw9 => PsuCatalogEntry {
                 model: "APW9",
@@ -377,11 +398,12 @@ impl Psu {
 /// path; not referenced by any live path in this crate or `dcentrald`.
 pub const S21XP_POWER_DOWN_HOLD_MS: u32 = 2000;
 
-/// Every PSU in the catalog (15 entries: 14 distinct + APW121215a, with
+/// Every PSU in the catalog (16 entries: 15 distinct + APW121215a, with
 /// APW111721b/c counted as two SKUs sharing one protocol).
 pub const ALL_PSUS: &[Psu] = &[
     Psu::Apw3PlusPlus,
     Psu::Apw7,
+    Psu::Apw8,
     Psu::Apw9,
     Psu::Apw10,
     Psu::Apw11,
@@ -403,8 +425,8 @@ mod tests {
 
     #[test]
     fn all_psus_present() {
-        // 15 PSU entries — covers RE2 §5.1 plus existing Apw121215a.
-        assert_eq!(ALL_PSUS.len(), 15);
+        // 16 PSU entries — covers RE2 §5.1 plus existing Apw121215a + APW8.
+        assert_eq!(ALL_PSUS.len(), 16);
     }
 
     #[test]
@@ -499,6 +521,19 @@ mod tests {
         );
         let gpio = cat.enable_gpio.expect("held stock code pins APW9 enable");
         assert_eq!(gpio.pin, 907);
+    }
+
+    #[test]
+    fn apw8_is_fail_closed_with_no_set_authority() {
+        let cat = Psu::Apw8.catalog();
+        assert_eq!(cat.model, "APW8");
+        assert_eq!(cat.protocol, PsuProtocol::Apw8UnspecifiedI2c);
+        assert_eq!(cat.i2c_address, None);
+        assert!(cat.enable_gpio.is_none());
+        assert_eq!(cat.used_in, &["S15", "T15"]);
+        assert!(cat.verification_partial);
+        assert_eq!(cat.max_power_w, 0);
+        assert_eq!(cat.nominal_voltage_v, 0);
     }
 
     #[test]

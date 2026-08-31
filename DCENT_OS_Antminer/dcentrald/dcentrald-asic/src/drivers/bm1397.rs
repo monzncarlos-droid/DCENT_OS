@@ -859,11 +859,14 @@ impl ChipDriver for Bm1397Driver {
         // nonce decode `BHB07601_check_nonce@20DC4` computes
         // `which_asic = (uint8)(buf[1] >> 14) / gChain_Asic_Interval` — confirming DCENT's
         // existing `nonce_word2 >> 14` field. The stride is simply `256 / chips_per_chain`
-        // (48 -> 5, matching the hardcode). Per-model BM1397 chip counts (operator-confirmed
-        // 2026-06-10): T17 = 30/chain -> interval 8, T17+ = 45 -> 5, S17 jig BHB07601 = 48
-        // -> 5, S17+ = 65 -> 3. So DCENT's `address_interval = 256 / chip_count` formula is
-        // CORRECT and chip-count-general — the on-binary constant is just the 48-chip
-        // instance, NOT a hidden permutation. No behavior change; gap closed.
+        // (48 -> 5, matching the hardcode). Per-model BM1397 chip counts
+        // (stock-RE 2026-08-27, A1 §V2): T17 = 30/chain -> interval 8,
+        // T17+ = 44 -> 5 (44, not 45: stock `07702_pattern_44.txt` + VNish 3.0.5
+        // factory tables; see the pinned test below), S17 jig BHB07601 = 48
+        // -> 5, S17+ = 65 -> 3. So DCENT's `address_interval = 256 / chip_count`
+        // formula is CORRECT and chip-count-general — the on-binary constant is
+        // just the 48-chip instance, NOT a hidden permutation. No behavior
+        // change; gap closed.
         // Source: goldmine `deliverables/RANKS_40_50_DESK_RE.md` (rank 49 / C02).
         //
         // BM1397 job_id extraction: byte7 & 0xFC (upper 6 bits = job_id).
@@ -1032,18 +1035,30 @@ mod ranks_40_50_desk_re_tests {
 
     /// Rank 49 — `gChain_Asic_Interval` is `256 / chips_per_chain`. The S17 jig
     /// hardcodes 5 for the 48-ASIC BHB07601 (BM1397) board (`read_config@183E4`).
-    /// Per-model BM1397 chip counts (operator-confirmed 2026-06-10) all satisfy it.
+    /// Per-model BM1397 chip counts all satisfy it.
+    ///
+    /// T17+ is **44**, not 45 — corrected 2026-08-27 (campaign
+    /// `2026-08-27-antminer17-unlock-armada`, A1 stock-RE verdict V2 "HIGH"):
+    /// stock T17+ bmminer pattern file `/dev/07702_pattern_44.txt`
+    /// (.rodata @0x8089c) and VNish 3.0.5 factory `bitmain-chip-freq{1,2,3}`
+    /// = 44 columns each agree on 3 chains × 44 = 132; `floor(256/44) = 5`.
+    /// Full evidence:
+    /// (condensed:  §V2).
     #[test]
     fn bm1397_address_interval_matches_jig_and_models() {
         let interval = |chips: u32| 256 / chips;
         assert_eq!(interval(48), 5); // S17 jig BHB07601 hardcode @ read_config@183E4
         assert_eq!(interval(30), 8); // Antminer T17
-        assert_eq!(interval(45), 5); // Antminer T17+
+        assert_eq!(interval(44), 5); // Antminer T17+ (44 chips; A1 V2 — 45 was wrong)
         assert_eq!(interval(65), 3); // Antminer S17+
                                      // All addresses (chip_idx * interval) stay within the 8-bit nonce field.
-        for &chips in &[30u32, 45, 48, 65] {
+        for &chips in &[30u32, 44, 48, 65] {
             let max_addr = (chips - 1) * interval(chips);
             assert!(max_addr <= 0xFF, "{chips} chips overflow 8-bit address");
         }
+        // 45 is REFUSED as a model geometry: the interval formula still yields 5,
+        // but no held stock/VNish artifact declares a 45-chip T17+ chain. Keep the
+        // correct chip count pinned so the old operator note cannot silently return.
+        assert_ne!(interval(45), 8, "45-chip T17+ note is retired; use 44");
     }
 }

@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# DCENTos post-build script - am3-s21xp (S21 Amlogic NoPic variant)
+# DCENTos post-build script - am3-s21xp management-only evidence target
 #
 
 set -e
@@ -149,28 +149,15 @@ echo "am3-aml-s21xp"  > "${TARGET_DIR}/etc/dcentos/board_family"
 echo "am3-s21xp"      > "${TARGET_DIR}/etc/dcentos/board_target"
 echo "am3-aml-s21xp"  > "${TARGET_DIR}/etc/dcentos/platform"
 
-# The AM3 revert helpers source lib/am3_geometry.sh beside /usr/sbin.
-AM3_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/am3_geometry.sh"
-if [ -f "$AM3_GEOMETRY_SRC" ]; then
-    mkdir -p "${TARGET_DIR}/usr/sbin/lib"
-    cp "$AM3_GEOMETRY_SRC" "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh"
-    chmod 644 "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh" 2>/dev/null || true
-    echo "DCENTos post-build (am3-s21xp): installed am3_geometry.sh for revert helpers"
-else
-    echo "DCENTos post-build (am3-s21xp): WARNING: am3_geometry.sh not found at $AM3_GEOMETRY_SRC" >&2
+MUTATION_POLICY=$(tr -d ' \t\r\n' < "${TARGET_DIR}/etc/dcentos/mutation_policy" 2>/dev/null || true)
+if [ "$MUTATION_POLICY" != management-only ]; then
+    echo "DCENTos post-build (am3-s21xp): ERROR: missing management-only mutation policy" >&2
+    exit 1
 fi
 
-#  W12-B: install the per-platform revert script keyed by
-# PROFILE_TABLE.amlogic-a113d-bm1368.revert_script (W23 rename). Code-complete but
-# `verified_revertable: false` until W20 live test on the office S21.
-REVERT_S21_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock_am3_aml_s21.sh"
-if [ -f "$REVERT_S21_SRC" ]; then
-    cp "$REVERT_S21_SRC" "${TARGET_DIR}/usr/sbin/revert_to_stock_am3_aml_s21.sh"
-    chmod +x "${TARGET_DIR}/usr/sbin/revert_to_stock_am3_aml_s21.sh" 2>/dev/null || true
-    echo "DCENTos post-build (am3-s21xp): installed revert_to_stock_am3_aml_s21.sh from scripts/"
-else
-    echo "DCENTos post-build (am3-s21xp): WARNING: revert_to_stock_am3_aml_s21.sh not found at $REVERT_S21_SRC" >&2
-fi
+# Do not stage shared AM3 flash geometry or the base-S21 revert helper. Exact
+# S21 XP production UART/PIC evidence contradicts that inherited platform
+# composition, and no S21 XP storage/recovery route is admitted.
 
 #  W12-B: also ship the stock-Bitmain manifest (parity with
 # zynq board post-build). The daemon probes /etc/dcentos/ first.

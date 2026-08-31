@@ -1,5 +1,6 @@
-//! UB-26 (2026-08-03): declarative hashboard **identity** catalog — 50 SKUs,
-//! keyed by exact `model_id`.
+//! UB-26 (2026-08-03): declarative hashboard **identity** catalog — 61 SKUs
+//! (50 v1.22.0 + the 11-row v1.24.0 delta, W3 2026-08-25), keyed by exact
+//! `model_id`.
 //!
 //! # What this is, and what problem it closes
 //!
@@ -7,15 +8,19 @@
 //! (`sku` → chip name + chips/chain + EEPROM preamble + products it ships in).
 //! It is reachable only through the [`crate::hashboards::Hashboard`] **enum**,
 //! which carries **20** variants — 16 real Bitmain SKUs plus 4 pre-AT24C02D
-//! placeholders. The held roster is **50** SKUs, so **34 catalogued hashboards
-//! had no identity row at all** (H3 §1.1, independently recomputed there as a
-//! set difference; the older "32 missing" figure counts against ePIC's 48
-//! published `model_id`s and omits `NBP1901`/`NBS1902`).
+//! placeholders. The held roster is **61** SKUs (50 from the v1.22.0 ePIC jig
+//! DB + the 11 new-in-v1.24.0 base ids decoded from the v1.24.0 amlogic
+//! `bms-miner`), so **45 catalogued hashboards have no identity row in the
+//! enum** (34 per H3 §1.1 + the 11 v1.24.0 delta SKUs; the older "32 missing"
+//! figure counts against ePIC's 48 published `model_id`s and omits
+//! `NBP1901`/`NBS1902`).
 //!
-//! This module supplies those 34 as **data**, not code. Adding hashboard #51
-//! is a row in `hashboard_topology_v1_22_0.json` — zero enum variants, zero
-//! `match` arms, zero prefix edits. The legacy enum and its `catalog()` are
-//! **untouched and still authoritative** wherever they have a row.
+//! This module supplies those 45 as **data**, not code. Adding hashboard #51
+//! is a row in `hashboard_topology_v1_22_0.json` (or, as the v1.24.0 delta
+//! proved, a row in `hashboard_topology_v1_24_0_delta.json`) — zero enum
+//! variants, zero `match` arms, zero prefix edits. The legacy enum and its
+//! `catalog()` are **untouched and still authoritative** wherever they have
+//! a row.
 //!
 //! # Composition, not duplication — every field is traceable to a corpus
 //!
@@ -76,10 +81,18 @@
 //!   `dcentrald_api_types::hashboard_eeprom::DEPLOYED_SKU_IDENTITY_POLICY`,
 //!   which is deliberately narrower (validated SKUs only) and is not widened
 //!   by anything here.
-//! - **The roster is v1.22.0-only.** Absence of a SKU proves nothing. The
-//!   wider held corpus (VNish's 77 models — hydro/immersion, L7/L9 scrypt,
-//!   BHB28xxx) is covered by [`crate::vnish_thermal`], keyed by `btm_model`;
-//!   only the 36 that are also ePIC roster SKUs join here.
+//! - **The roster is v1.22.0 + the v1.24.0 delta.** Absence of a SKU proves
+//!   nothing. The wider held corpus (VNish's 77 models — hydro/immersion,
+//!   L7/L9 scrypt, BHB28xxx) is covered by [`crate::vnish_thermal`], keyed
+//!   by `btm_model`. The v1.24.0 delta interacts with it three ways:
+//!   8 of the 11 delta SKUs have no VNish row and stay `used_in: None`
+//!   (rule 3); `M1HB70602` and `H6HB70801` have VNish rows whose geometry
+//!   corroborates the ePIC decode exactly (91 and 85 chips/chain — the
+//!   only two-source-corroborated delta rows) and contribute their VNish
+//!   marketing names; and `BHB56701` CONFLICTS — ePIC says 70 chips/chain
+//!   (10×7 grid, internally consistent), VNish says 110 — imported at the
+//!   ePIC value with no VNish corroboration, conflict recorded and
+//!   test-pinned, never reconciled desk-side.
 //! - **`chains_per_unit` is deliberately NOT a column.** ePIC says `4` on the
 //!   BHB42xxx/NB\* rows where VNish says `3` and DCENT live units have 3
 //!   hashboard slots. Both sides are recorded verbatim in their own modules;
@@ -127,24 +140,29 @@ pub struct HashboardIdentityRow {
     /// ASIC family in **DCENT spelling** (`BM1398`, not ePIC's `BM1398P`).
     pub chip_name: String,
     /// Adjudicated chips per hashboard chain. Equals
-    /// [`Self::epic_declared_chips_per_chain`] on all 50 rows today; the two
+    /// [`Self::epic_declared_chips_per_chain`] on all 61 rows today (the one
+    /// held conflict is with VNish, not ePIC — BHB56701, pinned in tests);
+    /// the two
     /// are separate columns so a future DCENT correction is *visible* instead
     /// of silently overwriting the desk evidence.
     pub chips_per_chain: u16,
-    /// The ePIC jig DB's own `chain_asic_num`, always present (all 50 roster
+    /// The ePIC jig DB's own `chain_asic_num`, always present (all 61 roster
     /// rows are ePIC rows). Kept verbatim.
     pub epic_declared_chips_per_chain: u16,
     /// Where `chip_name` / `chips_per_chain` came from.
     pub authority: IdentityAuthority,
     /// Every desk corpus that **independently** declares the same
-    /// `chips_per_chain`. Always contains
-    /// [`DescriptorProvenance::DeskJigDbExperimental`]; contains
-    /// [`DescriptorProvenance::DeskVnishFirmwareExperimental`] on the 36 rows
-    /// the VNish 1.2.7 matrix also covers. Corroboration only — never used to
-    /// *derive* a value.
+    /// `chips_per_chain`. Always contains the row's own source-DB
+    /// provenance ([`DescriptorProvenance::DeskJigDbExperimental`] on the
+    /// 50 v1.22.0 rows, [`DescriptorProvenance::DeskJigDbV124Experimental`]
+    /// on the 11 delta rows); contains
+    /// [`DescriptorProvenance::DeskVnishFirmwareExperimental`] on the 38
+    /// rows the VNish 1.2.7 matrix also covers (BHB56701 is matrix-covered
+    /// but conflicting, so it does not corroborate). Corroboration only —
+    /// never used to *derive* a value.
     pub corroborating_desk_corpora: Vec<DescriptorProvenance>,
     /// Marketing product this board ships in (VNish `marketing_name`).
-    /// **`None` on 14 of 50 rows** = no held corpus names a product for this
+    /// **`None` on 27 of 61 rows** = no held corpus names a product for this
     /// SKU. Never inherited from a sibling SKU (module docs, rule 3).
     pub used_in: Option<String>,
     /// Provenance of [`Self::used_in`]; `None` exactly when `used_in` is
@@ -157,7 +175,8 @@ pub struct HashboardIdentityRow {
     /// which is the standing proof that a SKU does not map to a format.
     pub observed_eeprom_preambles: Vec<[u8; 2]>,
     /// Whether a [`crate::hashboards::Hashboard`] enum variant exists for this
-    /// SKU today. `false` on exactly the 34 rows this module adds.
+    /// SKU today. `false` on exactly the 45 rows this module adds (34
+    /// v1.22.0 + 11 v1.24.0 delta).
     pub has_legacy_enum_variant: bool,
 }
 
@@ -245,7 +264,10 @@ fn catalog() -> &'static Catalog {
                 };
 
                 let vnish = vnish_model_by_btm(&d.sku);
-                let mut corroborating = vec![DescriptorProvenance::DeskJigDbExperimental];
+                // The row's own source DB is always the primary corroboration
+                // entry — DeskJigDbExperimental for v1.22.0 rows,
+                // DeskJigDbV124Experimental for the 11 delta rows.
+                let mut corroborating = vec![d.provenance];
                 if vnish.is_some_and(|v| v.chips_per_chain == chips_per_chain) {
                     corroborating.push(DescriptorProvenance::DeskVnishFirmwareExperimental);
                 }
@@ -298,7 +320,15 @@ fn catalog() -> &'static Catalog {
     })
 }
 
-/// Every identity row, sorted by `model_id` (50 as of the v1.22.0 roster).
+/// The total roster this catalog covers: 50 ePIC UMC OS v1.22.0 base
+/// `model_id`s + the 11 new-in-v1.24.0 ids (W3, 2026-08-25). Any drift
+/// between the checked-in topology data files and this constant turns
+/// [`crate::hashboard_catalog::tests::roster_count_matches_the_pinned_constant`]
+/// red — adding or removing a row without touching the constant (or vice
+/// versa) is caught, never silent.
+pub const CATALOG_ROSTER_COUNT: usize = 61;
+
+/// Every identity row, sorted by `model_id` (50 v1.22.0 + 11 v1.24.0 delta).
 pub fn all_hashboard_identities() -> &'static [HashboardIdentityRow] {
     &catalog().rows
 }
@@ -528,6 +558,47 @@ mod tests {
         // --- BM1398 / NB* (the two non-`model_id` jig records) — both NEW ---
         ("NBP1901", "BM1398", 114, Some("Antminer S19 Pro"), 0, false),
         ("NBS1902", "BM1398", 76, Some("Antminer S19"), 0, false),
+        // --- v1.24.0 delta (W3 2026-08-25): the 11 new-in-v1.24.0 base ids,
+        // decoded from the amlogic bms-miner. `used_in` is None unless the
+        // held VNish 1.2.7 matrix has a per-model row (it does for
+        // BHB56701, H6HB70801, M1HB70602 — the latter two corroborating
+        // the decode's geometry exactly). No held EEPROM pages, no legacy
+        // enum variants. ---
+        ("A3HB70505", "BM1370", 91, None, 0, false), // S21 XP
+        ("A3HB70608", "BM1370", 65, None, 0, false), // S21 Pro+
+        ("A3HB70609", "BM1370", 65, None, 0, false), // S21 Pro+
+        ("A3HB70705", "BM1370", 55, None, 0, false), // S21++
+        ("A3HB70707", "BM1370", 55, None, 0, false), // S21++
+        ("A3HB70708", "BM1370", 55, None, 0, false), // S21++
+        ("BHB56601", "BM1366", 99, None, 0, false),  // S19 XP
+        (
+            // VNish names it S19 XP but claims 110 chips/chain vs ePIC's
+            // 70 — conflict pinned in
+            // `bhb56701_vnish_chips_conflict_is_pinned_not_reconciled`.
+            "BHB56701",
+            "BM1366",
+            70,
+            Some("Antminer S19 XP"),
+            0,
+            false,
+        ),
+        (
+            "H6HB70801",
+            "BM1370",
+            85,
+            Some("Antminer S21e Hydro"),
+            0,
+            false,
+        ),
+        (
+            "M1HB70602",
+            "BM1370",
+            91,
+            Some("Antminer S21 XP Imm"),
+            0,
+            false,
+        ),
+        ("TS007", "BM1366", 80, None, 0, false), // S19 XP
     ];
 
     /// The 34 SKUs H3 §1.1 measured as having no `HashboardCatalogEntry`.
@@ -569,13 +640,30 @@ mod tests {
         "NBS1902",
     ];
 
+    /// The 11 new-in-v1.24.0 base model_ids (W3, 2026-08-25), transcribed
+    /// from the L3 delta-mine roster adjudication — NOT recomputed from the
+    /// topology data files this module joins.
+    const V124_DELTA_11: &[&str] = &[
+        "A3HB70505",
+        "A3HB70608",
+        "A3HB70609",
+        "A3HB70705",
+        "A3HB70707",
+        "A3HB70708",
+        "BHB56601",
+        "BHB56701",
+        "H6HB70801",
+        "M1HB70602",
+        "TS007",
+    ];
+
     /// One assertion per SKU over every declared field. Mutating any single
     /// value in the underlying JSON, the join, or this table turns it red.
     #[test]
     fn every_row_matches_the_hand_transcribed_expectation_table() {
         assert_eq!(
             EXPECTED.len(),
-            50,
+            61,
             "expectation table must cover the roster"
         );
         for &(model_id, chip, chips, used_in, preambles, legacy) in EXPECTED {
@@ -600,7 +688,7 @@ mod tests {
 
     #[test]
     fn catalog_covers_the_whole_roster_with_unique_keys() {
-        assert_eq!(all_hashboard_identities().len(), 50);
+        assert_eq!(all_hashboard_identities().len(), CATALOG_ROSTER_COUNT);
         let mut seen = std::collections::HashSet::new();
         for r in all_hashboard_identities() {
             assert!(seen.insert(r.model_id.as_str()), "duplicate {}", r.model_id);
@@ -608,19 +696,33 @@ mod tests {
         }
     }
 
-    /// The 34 rows this module adds are EXACTLY H3 §1.1's measured set — not
-    /// 32 (that figure counts against ePIC's 48 published `model_id`s and drops
-    /// `NBP1901`/`NBS1902`), and not padded with anything invented.
+    /// The drift catcher the W3 lane introduced: the roster count is pinned
+    /// to a named constant so adding/removing a row in either topology data
+    /// file without updating [`CATALOG_ROSTER_COUNT`] (or vice versa) is a
+    /// test failure, never a silent gap.
     #[test]
-    fn the_new_rows_are_exactly_the_thirty_four_h3_measured_as_missing() {
+    fn roster_count_matches_the_pinned_constant() {
+        assert_eq!(all_hashboard_identities().len(), CATALOG_ROSTER_COUNT);
+        assert_eq!(CATALOG_ROSTER_COUNT, 61);
+    }
+
+    /// The 45 rows this module adds are EXACTLY H3 §1.1's measured 34-set
+    /// plus the 11 v1.24.0 delta ids — not 32 (that figure counts against
+    /// ePIC's 48 published `model_id`s and drops `NBP1901`/`NBS1902`), and
+    /// not padded with anything invented.
+    #[test]
+    fn the_new_rows_are_exactly_the_h3_34_plus_the_v1_24_0_delta_11() {
         let mut added: Vec<&str> = all_hashboard_identities()
             .iter()
             .filter(|r| !r.has_legacy_enum_variant)
             .map(|r| r.model_id.as_str())
             .collect();
         added.sort_unstable();
-        assert_eq!(added.len(), 34);
-        assert_eq!(added, H3_MISSING_34);
+        let mut expected: Vec<&str> = H3_MISSING_34.to_vec();
+        expected.extend_from_slice(V124_DELTA_11);
+        expected.sort_unstable();
+        assert_eq!(added.len(), 45);
+        assert_eq!(added, expected);
         // ...and the complement is exactly the 16 that already had rows.
         assert_eq!(
             all_hashboard_identities()
@@ -670,17 +772,24 @@ mod tests {
         assert_eq!(chip_family_for_model_id("BHB68xxx"), None);
     }
 
-    /// Rule 2. Every row carries its provenance, and the 34 ePIC-derived rows
-    /// are labelled `EpicTranscribed` — never presented as measured.
+    /// Rule 2. Every row carries its provenance, and the 45 ePIC-derived
+    /// rows are labelled `EpicTranscribed` — never presented as measured.
     #[test]
     fn epic_derived_rows_carry_epic_transcribed_provenance() {
         for r in all_hashboard_identities() {
-            // Every roster row is an ePIC row, so the jig DB is always in the
-            // corroboration list.
-            assert!(
-                r.corroborating_desk_corpora
-                    .contains(&DescriptorProvenance::DeskJigDbExperimental),
-                "{}: missing ePIC provenance",
+            // Every roster row is an ePIC row, so its own source DB is
+            // always the primary corroboration entry: the v1.22.0 jig DB
+            // for the 50 original rows, the v1.24.0 binary decode for the
+            // 11 delta rows.
+            let primary = if V124_DELTA_11.contains(&r.model_id.as_str()) {
+                DescriptorProvenance::DeskJigDbV124Experimental
+            } else {
+                DescriptorProvenance::DeskJigDbExperimental
+            };
+            assert_eq!(
+                r.corroborating_desk_corpora.first(),
+                Some(&primary),
+                "{}: missing its own source-DB provenance",
                 r.model_id
             );
             // No row may claim a live-measured provenance — none qualifies.
@@ -710,7 +819,7 @@ mod tests {
                 .iter()
                 .filter(|r| r.is_epic_transcribed_only())
                 .count(),
-            34
+            45
         );
     }
 
@@ -719,7 +828,10 @@ mod tests {
     /// they have is identical to those siblings — yet no held corpus names
     /// their product, so they stay `None`. The corrected BHB42701/BHB428 rows
     /// also stay `None` because their VNish names are unified-roster
-    /// co-location, not unique product observations.
+    /// co-location, not unique product observations. 8 of the 11 v1.24.0
+    /// delta rows stay `None` too: no held corpus names their product
+    /// (the ePIC READMEs are not an independent product corpus, and rule 3
+    /// bars inheriting the family name their `model_name` implies).
     #[test]
     fn used_in_is_absent_rather_than_inherited_from_a_sibling() {
         let mut unnamed: Vec<&str> = all_hashboard_identities()
@@ -732,9 +844,15 @@ mod tests {
             unnamed,
             [
                 "A3HB40601",
+                "A3HB70505",
                 "A3HB70605",
                 "A3HB70606",
                 "A3HB70607",
+                "A3HB70608",
+                "A3HB70609",
+                "A3HB70705",
+                "A3HB70707",
+                "A3HB70708",
                 "BHB42611",
                 "BHB42632",
                 "BHB42701",
@@ -744,12 +862,14 @@ mod tests {
                 "BHB42821",
                 "BHB42831",
                 "BHB42841",
+                "BHB56601",
                 "BHB56807",
                 "BHB56814",
                 "BHB56901",
                 "BHB56906",
                 "BHB68601",
                 "BHB68705",
+                "TS007",
             ],
             "the unnamed set drifted — a product name was either found or invented"
         );
@@ -791,10 +911,12 @@ mod tests {
                 assert_eq!(v.chips_per_chain, r.chips_per_chain, "{}", r.model_id);
             }
         }
-        // 36 of the 50 roster SKUs appear in the VNish 1.2.7 matrix, and all
-        // 36 agree — two independent third-party transcriptions of the same
-        // upstream data, with zero conflicts.
-        assert_eq!(vnish_corroborated, 36);
+        // 36 of the 50 v1.22.0-roster SKUs appear in the VNish 1.2.7 matrix
+        // and all agree; the v1.24.0 delta adds two more corroborated rows
+        // (M1HB70602, H6HB70801) — the third VNish-overlapping delta SKU,
+        // BHB56701, conflicts (110 vs 70 chips/chain) and is pinned, not
+        // reconciled, in the test below. 38 of 61, zero conflicts elsewhere.
+        assert_eq!(vnish_corroborated, 38);
     }
 
     /// Rule 5. No stride is stored here; resolution goes through the SSOT, and
@@ -875,9 +997,9 @@ mod tests {
             assert_eq!(hashboard_identity(sku).unwrap().chip_name, "BM1398");
         }
         assert_eq!(identities_for_chip("BM1362").len(), 16);
-        assert_eq!(identities_for_chip("BM1366").len(), 11);
+        assert_eq!(identities_for_chip("BM1366").len(), 14);
         assert_eq!(identities_for_chip("BM1368").len(), 8);
-        assert_eq!(identities_for_chip("BM1370").len(), 13);
+        assert_eq!(identities_for_chip("BM1370").len(), 21);
         assert_eq!(identities_for_chip("BM1398").len(), 2);
         // ePIC's own spelling resolves to the same two rows.
         assert_eq!(identities_for_chip("BM1398P").len(), 2);
@@ -887,7 +1009,7 @@ mod tests {
                 + identities_for_chip("BM1368").len()
                 + identities_for_chip("BM1370").len()
                 + identities_for_chip("BM1398").len(),
-            50
+            CATALOG_ROSTER_COUNT
         );
     }
 

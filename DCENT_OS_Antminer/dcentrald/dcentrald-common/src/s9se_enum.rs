@@ -8,6 +8,9 @@
 //! buffers and does not treat enum as mining.
 
 use crate::s9se_vil::{pack_chain_inactive_vil, pack_set_address_vil};
+use crate::serial_chain_proof::{
+    ChainCoverageCertificate, ChainCoverageError, PacedEnumerationPolicy,
+};
 
 pub const S9SE_CHIPS_PER_CHAIN: u8 = 60;
 pub const S9SE_ADDR_INTERVAL: u8 = 2;
@@ -34,6 +37,20 @@ pub enum S9SeEnumError {
 pub struct S9SeAddressProgram {
     pub inactive: [u8; 5],
     pub set_address: Vec<[u8; 5]>,
+    pub pacing: Option<PacedEnumerationPolicy>,
+}
+
+impl S9SeAddressProgram {
+    pub fn expected_addresses(&self) -> Vec<u8> {
+        self.set_address.iter().map(|frame| frame[2]).collect()
+    }
+
+    pub fn certify_coverage(
+        &self,
+        observed: &[u8],
+    ) -> Result<ChainCoverageCertificate, ChainCoverageError> {
+        ChainCoverageCertificate::certify(&self.expected_addresses(), observed)
+    }
 }
 
 /// `for i in 0..chips { i * interval }` last address.
@@ -95,7 +112,18 @@ pub fn plan_s9se_address_program() -> Result<S9SeAddressProgram, S9SeEnumError> 
     Ok(S9SeAddressProgram {
         inactive: pack_chain_inactive_vil(),
         set_address,
+        pacing: None,
     })
+}
+
+/// Bind a caller-selected nonzero pacing policy to the exact desk program.
+/// No S19k cadence is inherited into BM1393 by default.
+pub fn plan_s9se_paced_address_program(
+    pacing: PacedEnumerationPolicy,
+) -> Result<S9SeAddressProgram, S9SeEnumError> {
+    let mut plan = plan_s9se_address_program()?;
+    plan.pacing = Some(pacing);
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -139,5 +167,9 @@ mod tests {
         assert_eq!(plan.set_address[0][2], 0x02);
         assert_eq!(plan.set_address[59][2], 0x78);
         assert_eq!(plan.set_address[59][0], 0x40);
+        assert!(plan.certify_coverage(&plan.expected_addresses()).is_ok());
+        assert!(plan
+            .certify_coverage(&plan.expected_addresses()[..59])
+            .is_err());
     }
 }

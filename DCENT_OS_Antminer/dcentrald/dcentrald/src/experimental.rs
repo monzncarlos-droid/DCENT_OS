@@ -48,9 +48,10 @@ use std::path::Path;
 ///
 /// - Every Amlogic image launches with `--serial-mining` and so reaches this
 ///   loader, but of their stock models only `s21pro` and `s21xp` resolve to an
-///   Experimental chip (BM1370); `s21`/`t21` (BM1368), `s19jpro` (BM1362) and
+///   Experimental chip (BM1370); `s21` (BM1368), `s19jpro` (BM1362) and
 ///   `s19k` (BM1366) are Production, and BM1370 is the only Experimental chip
-///   with a native dispatch site.
+///   with a native dispatch site. T21 is management-only with unresolved
+///   controller/PIC/PSU authority and cannot reach this loader.
 /// - `am2-s19j` auto-routes to the hybrid miner and `am3-bb-s19jpro` to the
 ///   AM3-BB miner; neither path loads this file at all.
 /// - `am2-s17p` is refused by the TD-003 board-target gate before the loader.
@@ -93,7 +94,7 @@ pub struct ExperimentalConfig {
     /// the exact name for ecosystem familiarity).
     pub rambo_mode_max_bad_responses: u8,
 
-    /// On NoPic miners (S21/T21/S19K Pro NoPic / S19 XP / S19J XP) the
+    /// On admitted NoPic miners (S21/S19K Pro NoPic / S19 XP / S19J XP) the
     /// PSU rails are always-on; bosminer refuses to disable individual
     /// hashboards because the rail can't be cut without cutting all
     /// chains together. When `true`, dcentrald will mark a single dead
@@ -261,8 +262,9 @@ mod tests {
     ///
     /// Both entries are BM1370 (`0x1370`) boards. `include_str!` binds the
     /// exact shipped bytes, so these tests fail if a template is edited into
-    /// granting authority, is line-ending-corrupted, or stops documenting the
-    /// chip id it exists for.
+    /// granting authority or is line-ending-corrupted. Only the S21 Pro still
+    /// documents a possible operator opt-in; the evidence-only S21 XP target
+    /// must explicitly document that the template cannot grant authority.
     const SHIPPED_TEMPLATES: &[(&str, &str)] = &[
         (
             "am3-s21pro",
@@ -328,24 +330,39 @@ mod tests {
         }
     }
 
-    /// The template only earns its place if it documents the exact opt-in for
-    /// the chip its board actually resolves to. `0x1370` is decimal `4976`.
+    /// The S21 Pro template documents the exact opt-in for the chip its board
+    /// resolves to. `0x1370` is decimal `4976`.
     ///
     /// This pins the decimal spelling as the single canonical form so there is
     /// exactly one thing to review on an operator-facing safety document. It is
     /// NOT a claim that hex is rejected: TOML 1.0 accepts `0x1370` and the
     /// pinned `toml` crate parses it to the identical id.
     #[test]
-    fn shipped_experimental_templates_document_the_bm1370_opt_in() {
+    fn shipped_experimental_templates_document_exact_bm1370_authority_posture() {
         let opt_in = format!(
             "# executable_asic_chip_ids = [{}]",
             dcentrald_asic::drivers::bm1370::CHIP_ID
         );
+        let s21pro = SHIPPED_TEMPLATES
+            .iter()
+            .find(|(board, _)| *board == "am3-s21pro")
+            .map(|(_, template)| *template)
+            .expect("shipped S21 Pro template");
+        assert!(
+            s21pro.contains(&opt_in),
+            "am3-s21pro template must show the commented BM1370 opt-in line"
+        );
+
+        let s21xp = SHIPPED_TEMPLATES
+            .iter()
+            .find(|(board, _)| *board == "am3-s21xp")
+            .map(|(_, template)| *template)
+            .expect("shipped S21 XP template");
+        assert!(!s21xp.contains(&opt_in));
+        assert!(s21xp.contains("This file contains no executable ASIC opt-in"));
+        assert!(s21xp.contains("Editing this file cannot override"));
+
         for (board, template) in SHIPPED_TEMPLATES {
-            assert!(
-                template.contains(&opt_in),
-                "{board} template must show the commented BM1370 opt-in line"
-            );
             assert!(
                 !template.contains("[0x1370]"),
                 "{board} template must not suggest a hex literal TOML integer"

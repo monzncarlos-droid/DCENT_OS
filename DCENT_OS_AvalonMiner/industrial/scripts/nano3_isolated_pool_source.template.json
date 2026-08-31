@@ -1,0 +1,27 @@
+{
+  "schema": "dcent.nano3.isolated-pool-session-source.v1",
+  "purpose": "nano3_attended_soak_isolated_pool_transaction_only",
+  "bundle_id": null,
+  "provenance": "draft_does_not_authorize",
+  "plan": null,
+  "plan_signature_base64": null,
+  "operator_ack": null,
+  "operator_signature_base64": null,
+  "unit_identity_receipt": null,
+  "topology_receipt": null,
+  "observer_envelope": null,
+  "observer_signature_base64": null,
+  "meter_signature_base64": null,
+  "runner_evidence_reference": {
+    "path": null,
+    "bytes": null,
+    "sha256": null
+  },
+  "pool_acceptance_contract_reference": {
+    "path": null,
+    "bytes": null,
+    "sha256": null
+  },
+  "credential_commitment_key_path": null,
+  "credential_commitment_key_receipt": null
+}

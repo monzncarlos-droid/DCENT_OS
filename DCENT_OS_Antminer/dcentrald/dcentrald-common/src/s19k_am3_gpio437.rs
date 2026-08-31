@@ -33,26 +33,17 @@ pub const S19K_AM3_PWR_CONTROL_LEGACY_GLOBAL: u32 = 437;
 
 /// Sysfs global after name-first resolve. Name hit without a chip base
 /// must not silently become 437.
-pub fn s19k_am3_pwr_control_sysfs_n(
-    resolved_global: Option<u32>,
-) -> Result<u32, &'static str> {
-    resolved_global.ok_or(
-        "PWR_CONTROL name hit without gpiochip base; refuse guessing sysfs 437",
-    )
+pub fn s19k_am3_pwr_control_sysfs_n(resolved_global: Option<u32>) -> Result<u32, &'static str> {
+    resolved_global.ok_or("PWR_CONTROL name hit without gpiochip base; refuse guessing sysfs 437")
 }
 
 /// Sysfs global after name-first plug resolve. Name hit without a chip
 /// base must not silently become 439+slot. Slot >= 3 is refused.
-pub fn s19k_am3_plug_sysfs_n(
-    slot: u8,
-    resolved_global: Option<u32>,
-) -> Result<u32, &'static str> {
+pub fn s19k_am3_plug_sysfs_n(slot: u8, resolved_global: Option<u32>) -> Result<u32, &'static str> {
     if slot >= 3 {
         return Err("S19k/S21 have 3 plug slots; refuse slot>=3");
     }
-    resolved_global.ok_or(
-        "plug DT name hit without gpiochip base; refuse guessing 439+slot",
-    )
+    resolved_global.ok_or("plug DT name hit without gpiochip base; refuse guessing 439+slot")
 }
 
 /// Sysfs global after name-first reset resolve. Name hit without a chip
@@ -64,9 +55,7 @@ pub fn s19k_am3_reset_sysfs_n(
     if chain >= 3 {
         return Err("S19k has 3 hashboards; refuse HB3_RESET as a 4th slot");
     }
-    resolved_global.ok_or(
-        "reset DT name hit without gpiochip base; refuse guessing 454+chain",
-    )
+    resolved_global.ok_or("reset DT name hit without gpiochip base; refuse guessing 454+chain")
 }
 
 /// Sysfs global after name-first fan-tach resolve. Name hit without a
@@ -78,37 +67,25 @@ pub fn s19k_am3_fan_tach_sysfs_n(
     if slot >= 4 {
         return Err("Amlogic has 4 fan tach slots; refuse slot>=4");
     }
-    resolved_global.ok_or(
-        "fan tach DT name hit without gpiochip base; refuse guessing 447+slot",
-    )
+    resolved_global.ok_or("fan tach DT name hit without gpiochip base; refuse guessing 447+slot")
 }
 
 /// Sysfs global after name-first LED resolve. Name hit without a chip
 /// base must not silently become 438/453.
-pub fn s19k_am3_led_sysfs_n(
-    resolved_global: Option<u32>,
-) -> Result<u32, &'static str> {
-    resolved_global.ok_or(
-        "LED DT name hit without gpiochip base; refuse guessing 438/453",
-    )
+pub fn s19k_am3_led_sysfs_n(resolved_global: Option<u32>) -> Result<u32, &'static str> {
+    resolved_global.ok_or("LED DT name hit without gpiochip base; refuse guessing 438/453")
 }
 
 /// Sysfs global after name-first I2C pinmux resolve. Name hit without a
 /// chip base must not silently become 476/477.
-pub fn s19k_am3_pinmux_sysfs_n(
-    resolved_global: Option<u32>,
-) -> Result<u32, &'static str> {
-    resolved_global.ok_or(
-        "I2C pinmux DT name hit without gpiochip base; refuse guessing 476/477",
-    )
+pub fn s19k_am3_pinmux_sysfs_n(resolved_global: Option<u32>) -> Result<u32, &'static str> {
+    resolved_global.ok_or("I2C pinmux DT name hit without gpiochip base; refuse guessing 476/477")
 }
 
 /// Zynq/BCB100 plug label is not the Amlogic primary key.
 pub fn refuse_hb0_plug_as_amlogic_primary(name: &str) -> Result<(), &'static str> {
     if name == S19K_AM3_REFUSED_ZYNQ_PLUG_NAME {
-        return Err(
-            "HB0_PLUG is Zynq/BCB100; Amlogic plug names are CH0_PLUG/CH1_PLUG/CH2_PLUG",
-        );
+        return Err("HB0_PLUG is Zynq/BCB100; Amlogic plug names are CH0_PLUG/CH1_PLUG/CH2_PLUG");
     }
     Ok(())
 }
@@ -116,9 +93,7 @@ pub fn refuse_hb0_plug_as_amlogic_primary(name: &str) -> Result<(), &'static str
 /// bosminer publishes HB3_RESET. S19k is a 3-board chassis.
 pub fn refuse_hb3_reset_as_s19k_fourth_board(name: &str) -> Result<(), &'static str> {
     if name == S19K_AM3_REFUSED_FOURTH_RESET_NAME {
-        return Err(
-            "HB3_RESET exists in bosminer; S19k has 3 boards — refuse as 4th slot",
-        );
+        return Err("HB3_RESET exists in bosminer; S19k has 3 boards — refuse as 4th slot");
     }
     Ok(())
 }
@@ -130,12 +105,8 @@ pub const BOSMINER_GPIOCHIP_PREFIX: &[u8] = b"/dev/gpiochip";
 pub const BOSMINER_OPEN_PIN_OUT: &[u8] = b"open pin out";
 pub const BOSMINER_PIN_NAME_NOT_FOUND: &[u8] = b"BUG: pin name  not found!";
 pub const BOSMINER_PWR_CONTROL_LABEL: &[u8] = b"PWR_CONTROL";
-pub const BOSMINER_HB_RESET_LABELS: [&[u8]; 4] = [
-    b"HB0_RESET",
-    b"HB1_RESET",
-    b"HB2_RESET",
-    b"HB3_RESET",
-];
+pub const BOSMINER_HB_RESET_LABELS: [&[u8]; 4] =
+    [b"HB0_RESET", b"HB1_RESET", b"HB2_RESET", b"HB3_RESET"];
 
 fn blob_has(blob: &[u8], needle: &[u8]) -> bool {
     blob.windows(needle.len()).any(|w| w == needle)
@@ -320,61 +291,74 @@ pub fn am3_s19k_install_safe_off_value() -> u8 {
 
 /// : `disable_psu_checked` must export GPIO437 before writing SafeOff.
 /// Track-1 crash/planned-stop on Braiins never calls `enable_psu_gpio`.
-pub fn admit_s19k_disable_psu_checked_exports_before_write(
-    hal: &str,
-) -> Result<(), &'static str> {
-    let start = hal
-        .find("pub fn disable_psu_checked()")
-        .ok_or("missing disable_psu_checked")?;
-    let rest = &hal[start..];
-    let end = rest
-        .find("pub fn disable_psu()")
-        .ok_or("cannot bound disable_psu_checked")?;
-    let body = &rest[..end];
-    if !body.contains("/sys/class/gpio/export") {
+pub fn admit_s19k_disable_psu_checked_exports_before_write(hal: &str) -> Result<(), &'static str> {
+    let write_start = hal
+        .find("fn disable_psu_checked_at(")
+        .ok_or("missing polarity-bound disable implementation")?;
+    let write_end = hal[write_start..]
+        .find("fn disable_psu_checked_for_polarity")
+        .map(|offset| write_start + offset)
+        .ok_or("cannot bound polarity-bound disable implementation")?;
+    let write_body = &hal[write_start..write_end];
+    if !write_body.contains("gpio_root.join(\"export\")") {
         return Err("disable_psu_checked must export GPIO437 when unexported");
     }
-    if !body.contains("still unexported after export") {
+    if !write_body.contains("still unexported after export") {
         return Err("unexported GPIO437 after export must fail closed");
     }
-    if body.contains("enable_psu_gpio()?;") || body.contains("let _ = enable_psu_gpio") {
+    if write_body.contains("enable_psu_gpio()?;") || write_body.contains("let _ = enable_psu_gpio")
+    {
         return Err("disable_psu_checked must not call enable_psu_gpio");
     }
-    let identity = body
-        .find("amlogic_board_target_is_s19k")
-        .ok_or("disable must classify board_target before write")?;
-    let export = body
-        .find("/sys/class/gpio/export")
+    let export = write_body
+        .find("gpio_root.join(\"export\")")
         .ok_or("missing export")?;
-    let dir_high = body
+    let dir_high = write_body
         .find("fs::write(&dir_path, \"high\")")
         .ok_or("s19k SafeOff must set direction high")?;
-    let write1 = body
+    let write1 = write_body
         .find("fs::write(&gpio_path, \"1\")")
         .ok_or("missing s19k SafeOff write 1")?;
-    if identity > export {
-        return Err("board_target must precede GPIO437 export");
-    }
     if export > write1 {
         return Err("export must precede SafeOff value write");
     }
     if dir_high > write1 {
         return Err("s19k direction high must precede value 1");
     }
+    let generic_start = hal
+        .find("pub fn disable_psu_checked()")
+        .ok_or("missing generic disable_psu_checked")?;
+    let explicit_start = hal[generic_start..]
+        .find("pub fn disable_s19k_track1_psu_checked()")
+        .map(|offset| generic_start + offset)
+        .ok_or("missing explicit Track-1 S19k disable")?;
+    let generic = &hal[generic_start..explicit_start];
+    if !generic.contains("amlogic_board_target_is_s19k()?") {
+        return Err("generic disable must remain bound to persistent board_target");
+    }
+    let explicit_end = hal[explicit_start..]
+        .find("pub fn disable_psu()")
+        .map(|offset| explicit_start + offset)
+        .ok_or("cannot bound explicit Track-1 S19k disable")?;
+    let explicit = &hal[explicit_start..explicit_end];
+    if !explicit.contains("disable_psu_checked_for_polarity(true)")
+        || explicit.contains("amlogic_board_target_is_s19k")
+        || explicit.contains("/etc/dcentos")
+    {
+        return Err("Track-1 disable must be fixed to S19k polarity without marker reads");
+    }
     Ok(())
 }
 
 /// : disable/enable must resolve `PWR_CONTROL` before sysfs 437.
-pub fn admit_s19k_hal_resolves_pwr_control_before_sysfs(
-    hal: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_hal_resolves_pwr_control_before_sysfs(hal: &str) -> Result<(), &'static str> {
     admit_s19k_disable_psu_checked_exports_before_write(hal)?;
     let start = hal
-        .find("pub fn disable_psu_checked()")
-        .ok_or("missing disable_psu_checked")?;
+        .find("fn disable_psu_checked_for_polarity")
+        .ok_or("missing polarity-bound disable resolver")?;
     let end = hal[start..]
-        .find("pub fn disable_psu()")
-        .ok_or("cannot bound disable_psu_checked")?;
+        .find("pub fn disable_psu_checked()")
+        .ok_or("cannot bound polarity-bound disable resolver")?;
     let body = &hal[start..start + end];
     if !body.contains("resolve_psu_gpio_global") {
         return Err("disable_psu_checked must resolve PSU GPIO before export");
@@ -388,20 +372,125 @@ pub fn admit_s19k_hal_resolves_pwr_control_before_sysfs(
     if !hal.contains("GPIO_PSU_ENABLE") {
         return Err("HAL must keep 437 as explicit legacy fallback");
     }
-    let identity = body
-        .find("amlogic_board_target_is_s19k")
-        .ok_or("missing board_target")?;
     let resolve = body
         .find("resolve_psu_gpio_global")
         .ok_or("missing resolve")?;
-    let export = body
-        .find("/sys/class/gpio/export")
-        .ok_or("missing export")?;
-    if identity > resolve {
-        return Err("board_target must precede PWR_CONTROL resolve");
+    let delegate = body
+        .find("disable_psu_checked_at")
+        .ok_or("missing polarity-bound write delegate")?;
+    if resolve > delegate {
+        return Err("PWR_CONTROL resolve must precede sysfs SafeOff delegate");
     }
-    if resolve > export {
-        return Err("PWR_CONTROL resolve must precede sysfs export");
+    Ok(())
+}
+
+/// Retained NoPic power custody must freeze the admitted board profile through
+/// enable, unwind rollback, poisoned-lock rollback, and terminal SafeOff.
+/// Re-reading `/etc/dcentos/board_target` in any of those paths creates a
+/// polarity TOCTOU: each SKU's SafeOff value energizes the other SKU.
+pub fn admit_amlogic_retained_power_owner_freezes_profile_polarity(
+    hal: &str,
+) -> Result<(), &'static str> {
+    if hal.contains("fn enable_psu_gpio() -> Result<()>") {
+        return Err(
+            "generic marker-selected GPIO437 enable must not exist after profile admission",
+        );
+    }
+    let profile_start = hal
+        .find("impl AmlogicNoPicProfile")
+        .ok_or("missing Amlogic NoPic profile implementation")?;
+    let profile_end = hal[profile_start..]
+        .find("pub struct AmlogicNoPicAdmission")
+        .map(|offset| profile_start + offset)
+        .ok_or("cannot bound Amlogic NoPic profile implementation")?;
+    let profile = &hal[profile_start..profile_end];
+    if !profile.contains("fn psu_is_active_low(self) -> bool")
+        || !profile.contains("matches!(self, Self::S19k)")
+    {
+        return Err("Amlogic profile must own immutable GPIO437 polarity");
+    }
+
+    let authority_start = hal
+        .find("struct AmlogicPsuCommitAuthority")
+        .ok_or("missing Amlogic PSU commit authority")?;
+    let authority_end = hal[authority_start..]
+        .find("fn amlogic_psu_enable_superseded")
+        .map(|offset| authority_start + offset)
+        .ok_or("cannot bound Amlogic PSU commit authority")?;
+    let authority = &hal[authority_start..authority_end];
+    for needle in [
+        "s19k_active_low: bool",
+        "fn new(profile: AmlogicNoPicProfile, s19k_native_generation: Option<Arc<()>>)",
+        "s19k_active_low: profile.psu_is_active_low()",
+        "disable_psu_checked_for_polarity(self.s19k_active_low)",
+    ] {
+        if !authority.contains(needle) {
+            return Err("Amlogic PSU commit authority lost admitted-polarity custody");
+        }
+    }
+    if authority.contains("disable_psu_checked()")
+        || authority.contains("amlogic_board_target_is_s19k")
+    {
+        return Err("Amlogic PSU commit authority must not re-read generic marker polarity");
+    }
+
+    let service_start = hal
+        .find("impl AmlogicPowerThermalService")
+        .ok_or("missing Amlogic power/thermal service implementation")?;
+    let service_end = hal[service_start..]
+        .find("pub fn hold_track1_leftover_fans_pwm100")
+        .map(|offset| service_start + offset)
+        .ok_or("cannot bound Amlogic power/thermal service implementation")?;
+    let service = &hal[service_start..service_end];
+    // The commit-authority call site binds the admitted profile (plus the
+    // native-generation fence); match it whitespace-tolerantly so rustfmt
+    // line-wrapping cannot break the custody needle.
+    let service_bound = service.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !service.contains("admission.populated_slots(), admission.profile()")
+        || !service_bound
+            .contains("AmlogicPsuCommitAuthority::new( profile, s19k_native_generation, )")
+    {
+        return Err("retained Amlogic service must bind the admitted profile to its PSU owner");
+    }
+
+    let lifecycle_start = hal
+        .find("impl AmlogicPowerThermalLifecycleOwner")
+        .ok_or("missing Amlogic power lifecycle owner")?;
+    let lifecycle_end = hal[lifecycle_start..]
+        .find("pub struct AmlogicPsuEnableOperation")
+        .map(|offset| lifecycle_start + offset)
+        .ok_or("cannot bound Amlogic power lifecycle owner")?;
+    let lifecycle = &hal[lifecycle_start..lifecycle_end];
+    if !lifecycle.contains("disable_psu_checked_for_polarity(self.psu_commit.s19k_active_low())")
+        || lifecycle.contains("disable_psu_checked()")
+        || lifecycle.contains("amlogic_board_target_is_s19k")
+    {
+        return Err("terminal Amlogic SafeOff must use the retained admitted polarity");
+    }
+
+    let rollback_start = hal
+        .find("struct AmlogicPsuGpioRollback")
+        .ok_or("missing Amlogic PSU rollback owner")?;
+    let operation_end = hal[rollback_start..]
+        .find("impl AmlogicThermalPort")
+        .map(|offset| rollback_start + offset)
+        .ok_or("cannot bound Amlogic PSU rollback and enable operation")?;
+    let operation = &hal[rollback_start..operation_end];
+    for needle in [
+        "s19k_active_low: bool",
+        "disable_psu_checked_for_polarity(self.s19k_active_low)",
+        "let s19k_active_low = self.psu_commit.s19k_active_low()",
+        "AmlogicPsuGpioRollback::armed(s19k_active_low)",
+        "enable_psu_gpio_for_polarity(s19k_active_low)",
+    ] {
+        if !operation.contains(needle) {
+            return Err("Amlogic enable/rollback path lost retained admitted polarity");
+        }
+    }
+    if operation.contains("disable_psu_checked()")
+        || operation.contains("if amlogic_board_target_is_s19k")
+    {
+        return Err("Amlogic enable/rollback owner must not re-select polarity after admission");
     }
     Ok(())
 }
@@ -468,18 +557,31 @@ pub fn admit_s19k_hal_resolves_plug_reset_by_name(hal: &str) -> Result<(), &'sta
     if detect.contains("GPIO_PLUG_BASE +") {
         return Err("read_plug_detect must not use integer plug base as primary");
     }
-    let reset_start = hal
-        .find("fn set_board_reset(&self")
-        .ok_or("missing set_board_reset")?;
-    let reset_end = hal[reset_start..]
-        .find("let _ = fs::write(&path, value);")
-        .ok_or("cannot bound set_board_reset")?;
-    let reset = &hal[reset_start..reset_start + reset_end];
-    if !reset.contains("resolve_reset_gpio_global") {
-        return Err("set_board_reset must call resolve_reset_gpio_global");
+    let checked_reset_start = hal
+        .find("pub fn set_amlogic_board_reset_checked(")
+        .ok_or("missing checked Amlogic reset API")?;
+    // Bound at the sibling receipt-assertion helper (its `GPIO_RESET_BASE +`
+    // use is an expected-value cross-check of the receipt, not resolution);
+    // the checked reset API itself must stay name-first.
+    let checked_reset_end = hal[checked_reset_start..]
+        .find("pub fn assert_s19k_native_all_resets_checked")
+        .ok_or("cannot bound checked Amlogic reset API")?;
+    let checked_reset = &hal[checked_reset_start..checked_reset_start + checked_reset_end];
+    if !checked_reset.contains("resolve_reset_gpio_global") {
+        return Err("checked Amlogic reset must call resolve_reset_gpio_global");
     }
-    if reset.contains("GPIO_RESET_BASE +") {
-        return Err("set_board_reset must not use integer reset base as primary");
+    if checked_reset.contains("GPIO_RESET_BASE +") {
+        return Err("checked Amlogic reset must not use integer reset base as primary");
+    }
+    let trait_reset_start = hal
+        .find("fn set_board_reset(&self")
+        .ok_or("missing GpioAccess set_board_reset")?;
+    let trait_reset = &hal[trait_reset_start..hal.len().min(trait_reset_start + 700)];
+    if !trait_reset.contains("set_amlogic_board_reset_checked") {
+        return Err("GpioAccess reset wrapper must use the checked Amlogic reset API");
+    }
+    if trait_reset.contains("let _ = fs::write") {
+        return Err("Amlogic reset must not discard a sysfs write result");
     }
     Ok(())
 }
@@ -639,29 +741,77 @@ pub fn admit_s19k_track1_arms_teardown_without_enable(src: &str) -> Result<(), &
     Ok(())
 }
 
-/// : Track-1 must start the SoC watchdog after teardown arm,
-/// without `prepare_enable` / `enable_psu` / `require_armed`.
-pub fn admit_s19k_track1_arms_watchdog_without_enable(
-    src: &str,
-) -> Result<(), &'static str> {
-    let Some(start) = src.find("arm_s19k_track1_teardown();") else {
-        return Err("Track-1 teardown arm missing");
+/// Track-1 must positively admit and retain the SoC watchdog without taking a
+/// PSU power lease. While stock still owns the energized rails, it must then
+/// revalidate both live-hardware and exact-process identity plus GPIO437
+/// engagement with the reset+cut guard still unarmed. Only immediately before
+/// the exact signal may it assume inherited rails and arm that closeout guard.
+pub fn admit_s19k_track1_arms_watchdog_without_enable(src: &str) -> Result<(), &'static str> {
+    let Some(run_start) = src.find("pub async fn run(&mut self) -> Result<()> {") else {
+        return Err("serial run body missing");
     };
-    let window = src[start..]
-        .split("} else if passthrough {")
-        .next()
-        .ok_or("Track-1 watchdog window has no passthrough seam")?;
-    if !window.contains("start_before_energizing") {
-        return Err("Track-1 must start SoC watchdog after teardown arm");
+    let run = &src[run_start..];
+    let Some(guard) = run.find("S19kTrack1RunCloseoutGuard::prepare(") else {
+        return Err("Track-1 result-error closeout guard preparation missing");
+    };
+    let Some(track1_start) =
+        run.find("let watchdog_start = SafetyWatchdogOwner::start_before_energizing(")
+    else {
+        return Err("Track-1 exact watchdog-to-stock-handoff window missing");
+    };
+    let track1_end = run[track1_start..]
+        .find("let mut s19k_active_tx_paths")
+        .map(|offset| track1_start + offset)
+        .ok_or("Track-1 handoff window has no UART boundary")?;
+    let window = &run[track1_start..track1_end];
+    let Some(watchdog) = window.find("start_before_energizing") else {
+        return Err("Track-1 must start SoC watchdog before stock-process signal");
+    };
+    if guard >= track1_start + watchdog {
+        return Err("Track-1 closeout guard must be prepared before SoC watchdog startup");
     }
     if window.contains("prepare_enable(") || window.contains("enable_psu(") {
         return Err("Track-1 watchdog must not take a power lease");
     }
-    if window.contains("require_armed") {
-        return Err("Track-1 must not require_armed (native energize only)");
+    let owner = window
+        .find("let (mut watchdog_owner, admission)")
+        .ok_or("Track-1 must retain the newly started watchdog owner")?;
+    let positive = window
+        .find("WatchdogAdmission::Armed(receipt) => receipt")
+        .ok_or("Track-1 must require a positive Armed watchdog admission")?;
+    let live_identity_revalidate = window
+        .find("let immediate = s19k_capture_and_require_bound_live_identity()")
+        .ok_or("Track-1 must recapture live hardware identity before closeout arm")?;
+    let process_revalidate = window
+        .find("expected.require_exact_tree_at(Path::new(\"/proc\"))?")
+        .ok_or("Track-1 must revalidate exact stock identity before closeout arm")?;
+    let gpio_revalidate = window
+        .find("S19k Track-1 refuses stock handoff because GPIO437 changed before SIGKILL")
+        .ok_or("Track-1 must revalidate GPIO437 engagement before closeout arm")?;
+    let inherited = window
+        .find(".assume_inherited_rails()")
+        .ok_or("Track-1 must arm reset+cut closeout immediately before stock signal")?;
+    let retained = window
+        .find("nopic_watchdog = Some(watchdog_owner)")
+        .ok_or("Track-1 must transfer its positively admitted watchdog owner to closeout")?;
+    let kill = window
+        .find(".sigkill_and_wait(")
+        .ok_or("Track-1 must signal the exact J3-owned process and confirm exit")?;
+    if watchdog >= owner
+        || owner >= positive
+        || positive >= live_identity_revalidate
+        || live_identity_revalidate >= process_revalidate
+        || process_revalidate >= gpio_revalidate
+        || gpio_revalidate >= retained
+        || retained >= inherited
+        || inherited >= kill
+    {
+        return Err("Track-1 must start/own/admit watchdog, revalidate live hardware/process/GPIO while stock owns rails, transfer watchdog to closeout, arm closeout, then kill through the exact J3 lease");
     }
-    if !window.contains("nopic_watchdog = Some(watchdog_owner)") {
-        return Err("Track-1 must retain the watchdog owner when armed");
+    if !window.contains("requested_timeout_s = receipt.requested_timeout_s")
+        || !window.contains("effective_timeout_s = receipt.effective_timeout_s")
+    {
+        return Err("Track-1 must consume and report the typed Armed watchdog receipt");
     }
     if !src.contains("s19k_track1_mark_watchdog_liveness") {
         return Err("Track-1 must feed watchdog liveness without GPIO writes");
@@ -669,25 +819,51 @@ pub fn admit_s19k_track1_arms_watchdog_without_enable(
     Ok(())
 }
 
-/// Opt-in planned-stop GPIO437 SafeOff. Unset/empty = no write (bosminer restart).
+/// Defense-in-depth planned-stop GPIO437 SafeOff selector. Unset/empty and
+/// exact `1` all require SafeOff; no environment token grants rail retention.
 pub const S19K_TRACK1_STOP_SAFEOFF_ENV: &str = "DCENT_S19K_TRACK1_STOP_SAFEOFF";
 
 pub fn s19k_track1_planned_stop_safeoff_from_env(
     value: Option<&str>,
 ) -> Result<bool, &'static str> {
     match value {
-        None | Some("") => Ok(false),
-        Some("1") => Ok(true),
-        Some(_) => Err("DCENT_S19K_TRACK1_STOP_SAFEOFF must be 1 or unset"),
+        None | Some("") | Some("1") => Ok(true),
+        Some(_) => Err("DCENT_S19K_TRACK1_STOP_SAFEOFF must be 1 or unset; rail retention is not an environment-authorized operation"),
     }
 }
 
-pub fn admit_s19k_track1_planned_stop_default_is_no_write() -> Result<(), &'static str> {
-    if s19k_track1_planned_stop_safeoff_from_env(None)? {
-        return Err("unset env must not write GPIO437 on planned stop");
+/// Fan mutation allowed from the shared NoPic panic hook after its checked
+/// identity-scoped power cut. A failed cut must never reduce airflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kNoPicPanicFanAction {
+    CoastAfterCheckedCut,
+    RetainTrack1ExplicitPwm100,
+    HoldTrack1HomeCap,
+    LeaveUnchanged,
+}
+
+pub fn s19k_nopic_panic_fan_action(
+    track1_armed: bool,
+    checked_cut_succeeded: bool,
+    explicit_loud_authority: bool,
+) -> S19kNoPicPanicFanAction {
+    if checked_cut_succeeded {
+        S19kNoPicPanicFanAction::CoastAfterCheckedCut
+    } else if track1_armed && explicit_loud_authority {
+        S19kNoPicPanicFanAction::RetainTrack1ExplicitPwm100
+    } else if track1_armed {
+        S19kNoPicPanicFanAction::HoldTrack1HomeCap
+    } else {
+        S19kNoPicPanicFanAction::LeaveUnchanged
     }
-    if s19k_track1_planned_stop_safeoff_from_env(Some(""))? {
-        return Err("empty env must not write GPIO437 on planned stop");
+}
+
+pub fn admit_s19k_track1_planned_stop_default_is_safeoff() -> Result<(), &'static str> {
+    if !s19k_track1_planned_stop_safeoff_from_env(None)? {
+        return Err("unset env must require GPIO437 SafeOff on planned stop");
+    }
+    if !s19k_track1_planned_stop_safeoff_from_env(Some(""))? {
+        return Err("empty env must require GPIO437 SafeOff on planned stop");
     }
     if !s19k_track1_planned_stop_safeoff_from_env(Some("1"))? {
         return Err("DCENT_S19K_TRACK1_STOP_SAFEOFF=1 must request SafeOff");
@@ -698,22 +874,30 @@ pub fn admit_s19k_track1_planned_stop_default_is_no_write() -> Result<(), &'stat
     Ok(())
 }
 
-/// Production operator-stop must consult the opt-in helper, not write always.
-pub fn admit_s19k_production_planned_stop_is_opt_in(src: &str) -> Result<(), &'static str> {
+/// Production operator-stop must call the reset-before-cut helper. No env-only
+/// rail-retention escape hatch exists.
+pub fn admit_s19k_production_planned_stop_is_fail_closed(src: &str) -> Result<(), &'static str> {
     if !src.contains("s19k_track1_maybe_planned_stop_safeoff") {
         return Err("operator-stop must call Track-1 planned-stop helper");
     }
     if !src.contains(S19K_TRACK1_STOP_SAFEOFF_ENV) {
-        return Err("planned-stop SafeOff must be env opt-in");
+        return Err("planned-stop SafeOff must preserve the explicit runner marker");
+    }
+    if !src.contains("Ok(true) => s19k_track1_terminal_safeoff()") {
+        return Err("planned stop must use checked reset-before-cut SafeOff");
+    }
+    if src.contains("planned stop leaves GPIO437 engaged") {
+        return Err("planned stop must not retain rails without a typed live owner");
     }
     Ok(())
 }
 
-/// Track-1 passthrough: keep rails (value 0) via `kill -9`, never S99 stop.
+/// Track-1 passthrough: GPIO437 must remain engaged (value 0) across the
+/// daemon-owned exact stock-process handoff; S99 stop is never this handoff.
 pub fn passthrough_must_keep_gpio437_engaged(observed: u8) -> Result<(), &'static str> {
     if observed != S19K_AM3_GPIO437_VALUE_ON {
         return Err(
-            "Track-1 passthrough: GPIO437 is not engaged (want 0). S99 stop drives 1=OFF; use kill -9",
+            "Track-1 passthrough: GPIO437 is not engaged (want 0). S99 stop drives 1=OFF; exact daemon-owned handoff is unavailable",
         );
     }
     Ok(())
@@ -747,21 +931,35 @@ pub fn parse_s19k_gpio_timeline_line(line: &str) -> Option<S19kGpioTimelineSampl
     }
     Some(S19kGpioTimelineSample {
         gpio437: bit(line, "g437=")?,
-        plugs: [bit(line, "g439=")?, bit(line, "g440=")?, bit(line, "g441=")?],
-        hb_reset: [bit(line, "g454=")?, bit(line, "g455=")?, bit(line, "g456=")?],
+        plugs: [
+            bit(line, "g439=")?,
+            bit(line, "g440=")?,
+            bit(line, "g441=")?,
+        ],
+        hb_reset: [
+            bit(line, "g454=")?,
+            bit(line, "g455=")?,
+            bit(line, "g456=")?,
+        ],
     })
 }
 
 /// `a lab unit` 2025-12-04 init: GPIO437 starts DISABLE, later ENGAGE; three plugs.
 pub fn classify_s19k_78_gpio_timeline(lines: &[&str]) -> Result<(), &'static str> {
-    let samples: Vec<_> = lines.iter().filter_map(|l| parse_s19k_gpio_timeline_line(l)).collect();
+    let samples: Vec<_> = lines
+        .iter()
+        .filter_map(|l| parse_s19k_gpio_timeline_line(l))
+        .collect();
     if samples.len() < 2 {
         return Err("gpio.timeline needs at least two parseable samples");
     }
     if samples[0].gpio437 != S19K_AM3_GPIO437_VALUE_OFF {
         return Err(".78 timeline must start GPIO437=1 (PSU Disable)");
     }
-    if !samples.iter().any(|s| s.gpio437 == S19K_AM3_GPIO437_VALUE_ON) {
+    if !samples
+        .iter()
+        .any(|s| s.gpio437 == S19K_AM3_GPIO437_VALUE_ON)
+    {
         return Err(".78 timeline never shows GPIO437=0 (PSU Enable)");
     }
     if !samples.iter().any(|s| s.plugs == [1, 1, 1]) {
@@ -786,9 +984,10 @@ pub fn admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(
     if samples.len() < 2 {
         return Err("gpio.timeline needs at least two parseable samples");
     }
-    if samples.iter().any(|s| {
-        s.hb_reset[0] != s.hb_reset[1] || s.hb_reset[1] != s.hb_reset[2]
-    }) {
+    if samples
+        .iter()
+        .any(|s| s.hb_reset[0] != s.hb_reset[1] || s.hb_reset[1] != s.hb_reset[2])
+    {
         return Err(".78 gpio.timeline HB reset 454/455/456 must stay ganged");
     }
     let first_on = samples
@@ -798,18 +997,17 @@ pub fn admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(
     if first_on.hb_reset != [0, 0, 0] {
         return Err("first GPIO437=0 still has HB reset asserted (454/455/456=0)");
     }
-    if !samples.iter().any(|s| {
-        s.gpio437 == S19K_AM3_GPIO437_VALUE_ON && s.hb_reset == [1, 1, 1]
-    }) {
+    if !samples
+        .iter()
+        .any(|s| s.gpio437 == S19K_AM3_GPIO437_VALUE_ON && s.hb_reset == [1, 1, 1])
+    {
         return Err(".78 timeline must later release HB reset as a ganged 1/1/1");
     }
     Ok(())
 }
 
 pub fn refuse_s19k_78_first_psu_engage_as_hb_reset_released() -> Result<(), &'static str> {
-    Err(
-        "first GPIO437=0 is not HB-reset released; .78 line 58 is still 454/455/456=0",
-    )
+    Err("first GPIO437=0 is not HB-reset released; .78 line 58 is still 454/455/456=0")
 }
 
 pub fn refuse_s19k_78_per_chain_reset_as_bosminer_observed() -> Result<(), &'static str> {
@@ -835,9 +1033,7 @@ pub const VNISH_S19K_AML_S11_PWR_EN_BOOT_VALUE: u8 = 1;
 /// VNish `start` writes 1. That matches DCENT am3-s19k **software** SafeOff
 /// and also matches HAL S21/VNish **ON** on a different SKU. Not DMM proof.
 pub fn refuse_vnish_s11_start_as_electrical_safeoff() -> Result<(), &'static str> {
-    Err(
-        "VNish S11 echo 1 is not DMM SafeOff; HAL S21/VNish start pattern is ON on other SKUs",
-    )
+    Err("VNish S11 echo 1 is not DMM SafeOff; HAL S21/VNish start pattern is ON on other SKUs")
 }
 
 /// Admit the extracted VNish S19k AML S11board boot write is sysfs 1.
@@ -938,10 +1134,7 @@ mod tests {
             classify_s19k_am3_gpio437(Some(1)),
             S19kAm3Gpio437Rail::DisabledOrCooldown
         );
-        assert_eq!(
-            classify_s19k_am3_gpio437(None),
-            S19kAm3Gpio437Rail::Unknown
-        );
+        assert_eq!(classify_s19k_am3_gpio437(None), S19kAm3Gpio437Rail::Unknown);
         assert!(admit_s19k_am3_gpio437_board_target("am3-s19k").is_ok());
         assert!(admit_s19k_am3_gpio437_board_target("am3-s21").is_err());
         assert!(admit_s19k_am3_gpio437_board_target("am3-bb").is_err());
@@ -955,9 +1148,13 @@ mod tests {
         assert!(s19k_am3_pwr_control_sysfs_n(None).is_err());
         let hal = include_str!("../../dcentrald-hal/src/platform/amlogic/mod.rs");
         assert!(admit_s19k_hal_resolves_pwr_control_before_sysfs(hal).is_ok());
+        assert!(admit_amlogic_retained_power_owner_freezes_profile_polarity(hal).is_ok());
         assert!(admit_s19k_hal_resolves_plug_reset_by_name(hal).is_ok());
         assert_eq!(S19K_AM3_PLUG_DT_NAMES, ["CH0_PLUG", "CH1_PLUG", "CH2_PLUG"]);
-        assert_eq!(S19K_AM3_RESET_DT_NAMES, ["HB0_RESET", "HB1_RESET", "HB2_RESET"]);
+        assert_eq!(
+            S19K_AM3_RESET_DT_NAMES,
+            ["HB0_RESET", "HB1_RESET", "HB2_RESET"]
+        );
         assert!(s19k_am3_plug_sysfs_n(0, Some(439)).is_ok());
         assert!(s19k_am3_plug_sysfs_n(0, None).is_err());
         assert!(s19k_am3_plug_sysfs_n(3, Some(442)).is_err());
@@ -1039,10 +1236,99 @@ mod tests {
             "arm_s19k_track1_teardown();\nprepare_enable(\nenable_psu(\n} else if passthrough {"
         )
         .is_err());
-        assert!(admit_s19k_track1_planned_stop_default_is_no_write().is_ok());
-        assert!(admit_s19k_production_planned_stop_is_opt_in(serial).is_ok());
-        assert!(!s19k_track1_planned_stop_safeoff_from_env(None).unwrap());
+        assert!(admit_s19k_track1_planned_stop_default_is_safeoff().is_ok());
+        assert!(admit_s19k_production_planned_stop_is_fail_closed(serial).is_ok());
+        assert!(s19k_track1_planned_stop_safeoff_from_env(None).unwrap());
+        assert!(s19k_track1_planned_stop_safeoff_from_env(Some("")).unwrap());
         assert!(s19k_track1_planned_stop_safeoff_from_env(Some("1")).unwrap());
+        assert_eq!(
+            s19k_nopic_panic_fan_action(true, true, false),
+            S19kNoPicPanicFanAction::CoastAfterCheckedCut
+        );
+        assert_eq!(
+            s19k_nopic_panic_fan_action(true, false, true),
+            S19kNoPicPanicFanAction::RetainTrack1ExplicitPwm100
+        );
+        assert_eq!(
+            s19k_nopic_panic_fan_action(true, false, false),
+            S19kNoPicPanicFanAction::HoldTrack1HomeCap
+        );
+        assert_eq!(
+            s19k_nopic_panic_fan_action(false, false, false),
+            S19kNoPicPanicFanAction::LeaveUnchanged
+        );
+        let panic_start = serial
+            .find("pub fn nopic_panic_hook_best_effort_teardown()")
+            .expect("NoPic panic hook");
+        let panic_end = serial[panic_start..]
+            .find("trait Am2FirstStagePowerCut")
+            .map(|offset| panic_start + offset)
+            .expect("NoPic panic hook end");
+        let panic_hook = &serial[panic_start..panic_end];
+        assert!(
+            panic_hook
+                .find("assert_s19k_native_all_resets_checked")
+                .unwrap()
+                < panic_hook.find("disable_s19k_track1_psu_checked").unwrap(),
+        );
+        assert!(panic_hook.contains("let track1_armed"));
+        assert!(panic_hook.contains("native_armed || track1_armed"));
+        assert!(panic_hook.contains("S19kNoPicPanicFanAction::RetainTrack1ExplicitPwm100"));
+        assert!(panic_hook.contains("S19kNoPicPanicFanAction::HoldTrack1HomeCap"));
+        assert!(panic_hook.contains("hold_track1_leftover_fans_pwm100(true)"));
+        assert!(!panic_hook.contains("disable_psu();"));
+        let planned_start = serial
+            .find("fn s19k_track1_maybe_planned_stop_safeoff() -> Result<()>")
+            .expect("planned-stop helper");
+        let planned_end = serial[planned_start..]
+            .find("struct Track1HostBaudRestore")
+            .map(|offset| planned_start + offset)
+            .expect("planned-stop helper end");
+        let planned = &serial[planned_start..planned_end];
+        assert!(planned.contains("Ok(true) => s19k_track1_terminal_safeoff()"));
+        assert!(!planned.contains("disable_psu_checked"));
+        let safeoff_start = serial
+            .find("fn s19k_track1_reset_then_cut_checked()")
+            .expect("Track-1 reset+cut SafeOff");
+        let safeoff_end = serial[safeoff_start..]
+            .find("pub(crate) fn s19k_track1_recovery_safeoff(")
+            .map(|offset| safeoff_start + offset)
+            .expect("Track-1 reset+cut SafeOff end");
+        let safeoff = &serial[safeoff_start..safeoff_end];
+        assert!(safeoff.contains("disable_s19k_track1_psu_checked"));
+        assert!(!safeoff.contains("disable_psu_checked()"));
+        assert!(serial.contains("s19k_track1_reset_then_cut_checked().map(|_| ())"));
+        assert!(serial.contains("impl Drop for S19kTrack1RunCloseoutGuard"));
+        assert!(serial.contains("S19kTrack1RunCloseoutGuard::prepare("));
+        let track1 = serial
+            .split("pub async fn run(&mut self) -> Result<()> {")
+            .nth(1)
+            .expect("Track-1 runtime arm");
+        assert!(
+            track1.find("S19kTrack1RunCloseoutGuard::prepare(").unwrap()
+                < track1.find("let nopic = is_nopic(&self.config)?;").unwrap()
+        );
+        assert!(
+            track1.find("S19kTrack1RunCloseoutGuard::prepare(").unwrap()
+                < track1
+                    .find("SerialChainBackend::open_passthrough_bm1366")
+                    .unwrap()
+        );
+        assert!(track1.contains("self.explicit_loud_fan_authority"));
+        assert!(track1.contains("requires explicit --allow-loud authority"));
+        assert!(track1.contains("WatchdogAdmission::Armed(receipt) => receipt"));
+        assert!(track1.contains("nopic_watchdog = Some(watchdog_owner);"));
+        assert!(track1.contains("expected.open_both_signal_leases_checked()?"));
+        assert!(track1.contains(".assume_inherited_rails()"));
+        assert!(track1.contains("S19kStockProcessRole::Supervisor"));
+        assert!(track1.contains("S19kStockProcessRole::Bosminer"));
+        let main = include_str!("../../dcentrald/src/main.rs");
+        assert!(main.contains(
+            "let explicit_loud_fan_authority = args.iter().any(|a| a == \"--allow-loud\");"
+        ));
+        assert!(main.contains("explicit_loud_fan_authority,"));
+        assert!(serial.contains("if terminal_result.is_ok()"));
+        assert!(serial.contains("guard.disarm();"));
         assert!(admit_s19k_track1_mining_on_does_not_write_gpio437(
             "PASSTHROUGH BM1366\ndisable_psu_checked()\n} else if passthrough {"
         )
@@ -1065,16 +1351,14 @@ mod tests {
         assert!(classify_s19k_78_gpio_timeline(&[cold, hot]).is_ok());
         assert!(passthrough_must_not_pulse_hb_reset().is_err());
         let released = "1777484738.%N g437=0 g438=0 g439=1 g440=1 g441=1 g447=1 g448=0 g449=0 g450=0 g453=1 g454=1 g455=1 g456=1";
-        assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[
-            cold, hot, released
-        ])
-        .is_ok());
+        assert!(
+            admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[cold, hot, released]).is_ok()
+        );
         assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[cold, hot]).is_err());
         let split = "1777484738.%N g437=0 g438=0 g439=1 g440=1 g441=1 g447=1 g448=0 g449=0 g450=0 g453=1 g454=1 g455=0 g456=1";
-        assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[
-            cold, hot, split
-        ])
-        .is_err());
+        assert!(
+            admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[cold, hot, split]).is_err()
+        );
         assert!(refuse_s19k_78_first_psu_engage_as_hb_reset_released().is_err());
         assert!(refuse_s19k_78_per_chain_reset_as_bosminer_observed().is_err());
         assert!(refuse_s19k_78_gpio_timeline_as_dmm_rail().is_err());
@@ -1139,18 +1423,92 @@ mod tests {
     }
 
     #[test]
+    fn retained_power_owner_rejects_every_post_admission_polarity_reselection() {
+        let hal = include_str!("../../dcentrald-hal/src/platform/amlogic/mod.rs");
+        assert!(admit_amlogic_retained_power_owner_freezes_profile_polarity(hal).is_ok());
+
+        for (from, to) in [
+            (
+                "s19k_active_low: profile.psu_is_active_low(),",
+                "s19k_active_low: false,",
+            ),
+            (
+                "disable_psu_checked_for_polarity(self.psu_commit.s19k_active_low())?",
+                "disable_psu_checked()?",
+            ),
+            (
+                "enable_psu_gpio_for_polarity(s19k_active_low)",
+                "enable_psu_gpio()",
+            ),
+        ] {
+            assert!(hal.contains(from), "missing mutation anchor {from:?}");
+            let mutated = hal.replacen(from, to, 1);
+            assert!(
+                admit_amlogic_retained_power_owner_freezes_profile_polarity(&mutated).is_err(),
+                "retained-polarity gate accepted mutation {from:?} -> {to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn track1_watchdog_contract_revalidates_before_inherited_rail_closeout_arm() {
+        fn source(sequence: &str) -> String {
+            format!(
+                "pub async fn run(&mut self) -> Result<()> {{\n\
+                 let guard = S19kTrack1RunCloseoutGuard::prepare(authority);\n\
+                 {sequence}\n\
+                 let mut s19k_active_tx_paths = Vec::new();\n\
+                 }}\n\
+                 fn s19k_track1_mark_watchdog_liveness() {{}}"
+            )
+        }
+
+        let watchdog = "let watchdog_start = SafetyWatchdogOwner::start_before_energizing();\n\
+                        let (mut watchdog_owner, admission) = watchdog_start;\n\
+                        let receipt = match admission { WatchdogAdmission::Armed(receipt) => receipt };\n\
+                        requested_timeout_s = receipt.requested_timeout_s;\n\
+                        effective_timeout_s = receipt.effective_timeout_s;";
+        let revalidate = "let immediate = s19k_capture_and_require_bound_live_identity();\n\
+                          expected.require_exact_tree_at(Path::new(\"/proc\"))?;\n\
+                          S19k Track-1 refuses stock handoff because GPIO437 changed before SIGKILL;\n\
+                          nopic_watchdog = Some(watchdog_owner);";
+        let arm_and_kill = ".assume_inherited_rails();\n\
+                            j3_lease.sigkill_and_wait(";
+
+        let admitted = source(&format!("{watchdog}\n{revalidate}\n{arm_and_kill}"));
+        assert!(admit_s19k_track1_arms_watchdog_without_enable(&admitted).is_ok());
+
+        let stale_post_arm_revalidation =
+            source(&format!("{watchdog}\n{arm_and_kill}\n{revalidate}"));
+        assert!(
+            admit_s19k_track1_arms_watchdog_without_enable(&stale_post_arm_revalidation).is_err()
+        );
+
+        let missing_positive = admitted.replace(
+            "WatchdogAdmission::Armed(receipt) => receipt",
+            "WatchdogAdmission::DisabledByConfiguration => receipt",
+        );
+        assert!(admit_s19k_track1_arms_watchdog_without_enable(&missing_positive).is_err());
+
+        let missing_gpio_revalidation = admitted.replace(
+            "S19k Track-1 refuses stock handoff because GPIO437 changed before SIGKILL",
+            "GPIO observation omitted",
+        );
+        assert!(
+            admit_s19k_track1_arms_watchdog_without_enable(&missing_gpio_revalidation).is_err()
+        );
+    }
+
+    #[test]
     fn s19k_gpio_timeline_hb_reset_ganged_after_psu() {
         let cold = "1777484698.%N g437=1 g438=0 g439=1 g440=1 g441=1 g447=0 g448=0 g449=0 g450=0 g453=1 g454=0 g455=0 g456=0";
         let first_on = "1777484731.%N g437=0 g438=1 g439=1 g440=1 g441=1 g447=0 g448=0 g449=0 g450=1 g453=0 g454=0 g455=0 g456=0";
         let released = "1777484738.%N g437=0 g438=0 g439=1 g440=1 g441=1 g447=1 g448=0 g449=0 g450=0 g453=1 g454=1 g455=1 g456=1";
-        assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[
-            cold, first_on, released
-        ])
-        .is_ok());
-        assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[
-            cold, first_on
-        ])
-        .is_err());
+        assert!(
+            admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[cold, first_on, released])
+                .is_ok()
+        );
+        assert!(admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu(&[cold, first_on]).is_err());
         assert!(refuse_s19k_78_first_psu_engage_as_hb_reset_released().is_err());
         assert!(refuse_s19k_78_per_chain_reset_as_bosminer_observed().is_err());
         assert!(refuse_s19k_78_gpio_timeline_as_dmm_rail().is_err());

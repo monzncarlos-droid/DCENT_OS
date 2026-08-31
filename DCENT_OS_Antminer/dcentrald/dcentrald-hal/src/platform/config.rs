@@ -7,8 +7,10 @@
 //! For Zynq S9: chains [6,7,8], PICs at [0x55,0x56,0x57], UIO-based
 //! For Zynq S17/S17e: chains [6,7,8], dsPIC33 at [0x20,0x21,0x22], UIO-based
 //! For Zynq S17+/T17/T17+: chains [6,7,8], PIC16 at [0x50,0x51,0x52], UIO-based
-//! For Amlogic S21/S19k: chains [0,1,2], NO PICs, serial /dev/ttyS1, /dev/ttyS2,
-//! /dev/ttyS4 (ttyS3 is not a chain UART on the verified AXG DTB)
+//! For Amlogic S21: chains [0,1,2], NO PICs, serial /dev/ttyS1, /dev/ttyS2,
+//! /dev/ttyS4 (ttyS3 is not a chain UART on the verified S21 AXG DTB)
+//! For Amlogic S19k: chains [0,1,2], NO PICs, serial /dev/ttyS1, /dev/ttyS2,
+//! /dev/ttyS3 (ttyS4 is an S21 path and is refused for S19k)
 //! For CVitek S19k: chains [0,1,2], PICs at [0x50,0x51,0x52], serial + uart_trans
 //! For Braiins BCB100: STM32MP15 / Cortex-A7, direct Linux UART. GPIO, fan,
 //! PSU, and PIC mapping are not live-verified yet, so the default config is
@@ -21,10 +23,9 @@ use serde::{Deserialize, Serialize};
 /// resolved path with `tracing::info!`. Returns `None` if no candidate
 /// is openable.
 ///
-/// This is a workaround for the wave-9-era platform-config drift where
-/// the S19k Pro Amlogic chain-2 device was quietly renamed (config.rs:518
-/// ttyS3 → ttyS4). The runtime probe surfaces whichever device the live
-/// firmware actually exposes, instead of failing silently.
+/// Candidate order is platform-specific: S21 retains its historical AXG
+/// fallback, while S19k is restricted to the held ttyS3 endpoint so a missing
+/// node fails closed instead of opening the S21-only ttyS4 path.
 ///
 ///  W10-E (2026-05-06): converts a silent-failure drift into a
 /// self-diagnostic boot log.
@@ -145,7 +146,7 @@ pub enum ChainTransport {
 pub const AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 2] = ["/dev/ttyS4", "/dev/ttyS3"];
 /// S19k `a lab unit` dmesg: meson ttyS1+S2+S3 are the hash UARTs. ttyS4 is the
 /// S21 AXG third port, not the S19k third hash UART.
-pub const S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 2] = ["/dev/ttyS3", "/dev/ttyS4"];
+pub const S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 1] = ["/dev/ttyS3"];
 
 /// Candidate serial devices for an Amlogic chain in priority order.
 pub fn amlogic_tty_candidate_order(chain: &ChainConfig) -> Vec<String> {
@@ -156,12 +157,15 @@ pub fn amlogic_tty_candidate_order(chain: &ChainConfig) -> Vec<String> {
 
     match chain.chain_id {
         2 => {
-            let prefs = if declared == "/dev/ttyS3" {
+            let prefs: &[&str] = if declared == "/dev/ttyS3" {
                 &S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES
             } else {
                 &AMLOGIC_CHAIN2_TTY_CANDIDATES
             };
-            prefs.iter().map(|candidate| (*candidate).to_string()).collect()
+            prefs
+                .iter()
+                .map(|candidate| (*candidate).to_string())
+                .collect()
         }
         _ => vec![declared.to_string()],
     }
@@ -797,6 +801,10 @@ impl PlatformConfig {
     /// - Voltage: TAS5782M kernel-managed at i2c-0 0x49/0x4A/0x4B (DTB).
     /// - PSU: APW121215f (fw=0x76) on i2c-1.
     /// - Temp: LM75BCCnCopy on i2c-1 (inlets 0x48-0x4A, outlets 0x4C-0x4E).
+    /// - UART paths are logical endpoints, not physical slot identities. Held
+    ///   `.88` has ttyS1 answering while plug GPIO439/slot0 is absent, so the
+    ///   per-chain physical GPIO fields stay `None` until ASIC-side EEPROM
+    ///   identity supplies a unique tty-to-slot binding.
     pub fn s19k_amlogic() -> Self {
         Self {
             name: "Antminer S19K Pro NoPic (Amlogic)".to_string(),
@@ -808,9 +816,9 @@ impl PlatformConfig {
                         baud: 115200,
                     },
                     pic_address: None, // NoPic — TAS5782M kernel-managed
-                    i2c_bus: 0,
-                    plug_detect_gpio: Some(439),
-                    enable_gpio: Some(454),
+                    i2c_bus: 1,
+                    plug_detect_gpio: None,
+                    enable_gpio: None,
                 },
                 ChainConfig {
                     chain_id: 1,
@@ -819,14 +827,13 @@ impl PlatformConfig {
                         baud: 115200,
                     },
                     pic_address: None,
-                    i2c_bus: 0,
-                    plug_detect_gpio: Some(440),
-                    enable_gpio: Some(455),
+                    i2c_bus: 1,
+                    plug_detect_gpio: None,
+                    enable_gpio: None,
                 },
                 // S19k Pro NoPic Amlogic chain-2 device:
                 // `a lab unit` dmesg: meson ttyS3 @ ff804000 irq 14 is a hash UART
                 // (bosminer 0→9600→115200). ttyS4 is the S21 AXG third port.
-                // Runtime probe still tries ttyS4 second if the node exists.
                 ChainConfig {
                     chain_id: 2,
                     transport: ChainTransport::Serial {
@@ -834,9 +841,9 @@ impl PlatformConfig {
                         baud: 115200,
                     },
                     pic_address: None,
-                    i2c_bus: 0,
-                    plug_detect_gpio: Some(441),
-                    enable_gpio: Some(456),
+                    i2c_bus: 1,
+                    plug_detect_gpio: None,
+                    enable_gpio: None,
                 },
             ],
             fan: FanConfig {
@@ -1290,6 +1297,27 @@ mod tests {
     }
 
     #[test]
+    fn s19k_amlogic_uart_endpoints_do_not_claim_disproven_physical_slots() {
+        let cfg = PlatformConfig::s19k_amlogic();
+        for chain in &cfg.chains {
+            assert_eq!(
+                chain.i2c_bus, 1,
+                "S19k management EEPROM/TMP75 evidence is on Linux i2c-1"
+            );
+            assert_eq!(
+                chain.plug_detect_gpio, None,
+                "logical UART endpoint {} must not claim a physical plug GPIO",
+                chain.chain_id
+            );
+            assert_eq!(
+                chain.enable_gpio, None,
+                "logical UART endpoint {} must not claim a physical reset GPIO",
+                chain.chain_id
+            );
+        }
+    }
+
+    #[test]
     fn s21_amlogic_uses_verified_axg_chain_uarts() {
         let cfg = PlatformConfig::s21_amlogic();
         let devices: Vec<&str> = cfg
@@ -1317,7 +1345,13 @@ mod tests {
             .expect("s19k chain 2");
         assert_eq!(
             amlogic_tty_candidate_order(&s19k_chain2),
-            vec!["/dev/ttyS3", "/dev/ttyS4"]
+            vec!["/dev/ttyS3"]
+        );
+        assert!(
+            !amlogic_tty_candidate_order(&s19k_chain2)
+                .iter()
+                .any(|path| path == "/dev/ttyS4"),
+            "S19k must fail closed when ttyS3 is unavailable, never fall through to S21 ttyS4"
         );
         let s21_chain2 = PlatformConfig::s21_amlogic()
             .chains

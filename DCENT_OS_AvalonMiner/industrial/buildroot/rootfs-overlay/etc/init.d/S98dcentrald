@@ -1,0 +1,36 @@
+#!/bin/sh
+# DCENT dcentrald hold service (busybox rcS style).
+#
+# The original Nano 3 uses a native /dev/ttyS1 protocol. The currently staged
+# daemon implements the Nano 3S/industrial mm_pkg transport and does not yet
+# own Nano 3 cooling, sensors, watchdog, display, Wi-Fi, or an independent
+# hash-power cut. Autostart must therefore fail closed until the native runtime
+# and its custody/safety acceptance gates are complete.
+
+DAEMON=/usr/bin/dcentrald
+PIDFILE=/var/run/dcentrald.pid
+LOG=/var/log/dcentrald.log
+
+case "$1" in
+	start)
+		echo "dcentrald: HELD (Nano 3 native transport/safety custody not production-ready)"
+		logger -t dcentos \
+			'dcentrald autostart held: Nano 3 native transport/safety custody incomplete'
+		;;
+	stop)
+		printf "Stopping dcentrald: "
+		if [ -f "$PIDFILE" ]; then
+			kill "$(cat "$PIDFILE")" 2>/dev/null
+			rm -f "$PIDFILE"
+		fi
+		echo "OK"
+		;;
+	restart)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

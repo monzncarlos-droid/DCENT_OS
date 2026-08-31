@@ -23,8 +23,11 @@ S9_PACKAGE=${DCENT_NANDSIM_S9_PACKAGE:-$DEFAULT_S9_PACKAGE}
 S19JPRO_PACKAGE=${DCENT_NANDSIM_S19JPRO_PACKAGE:-$DEFAULT_S19JPRO_PACKAGE}
 RELEASE_KEY=${DCENT_RELEASE_PUBKEY_FILE:-}
 RELEASE_KEY_HEX=${DCENT_RELEASE_PUBKEY_HEX:-$BETA_PUBKEY_HEX}
+AM2_UBI_BUNDLE=${DCENT_AM2_UBI_BUNDLE:-}
 TMP_RELEASE_KEY_DIR=
 PROBE_ONLY=0
+GEOMETRY_ONLY=0
+SYSUPGRADE_ONLY=0
 DISABLE_KVM=1
 REQUIRE_NANDSIM=${DCENT_REQUIRE_NANDSIM:-1}
 
@@ -45,6 +48,10 @@ Options:
   --memory SIZE            VM memory passed to vng (default: 2048M)
   --cpus N                 VM CPU count passed to vng (default: 2)
   --probe-only             Only prove the VM has nandsim/UBI/userspace support
+  --geometry-only          Prove only the exact AM2 UBI geometry tuple; requires
+                           --target am2-s19jpro and --am2-ubi-bundle
+  --am2-ubi-bundle DIR     Verified offline no-fastmap UBI/UBIFS module bundle
+  --sysupgrade-only        Run only the forward sysupgrade harness (skip reverse and first-install)
   --require-nandsim        Supported workflow flag; guest harnesses fail instead
                            of skip when nandsim/UBI support is unavailable
   --enable-kvm             Do not pass --disable-kvm to vng
@@ -60,6 +67,7 @@ Environment defaults:
   DCENT_NANDSIM_S19JPRO_PACKAGE
   DCENT_RELEASE_PUBKEY_FILE
   DCENT_RELEASE_PUBKEY_HEX
+  DCENT_AM2_UBI_BUNDLE
 EOF
 }
 
@@ -143,9 +151,12 @@ while [ "$#" -gt 0 ]; do
         --s9-package) S9_PACKAGE=${2:-}; shift 2 ;;
         --s19jpro-package) S19JPRO_PACKAGE=${2:-}; shift 2 ;;
         --release-key) RELEASE_KEY=${2:-}; shift 2 ;;
+        --am2-ubi-bundle) AM2_UBI_BUNDLE=${2:-}; shift 2 ;;
         --memory) MEMORY=${2:-}; shift 2 ;;
         --cpus) CPUS=${2:-}; shift 2 ;;
         --probe-only) PROBE_ONLY=1; shift ;;
+        --geometry-only) GEOMETRY_ONLY=1; shift ;;
+        --sysupgrade-only) SYSUPGRADE_ONLY=1; shift ;;
         --require-nandsim) REQUIRE_NANDSIM=1; shift ;;
         --enable-kvm) DISABLE_KVM=0; shift ;;
         --disable-kvm) DISABLE_KVM=1; shift ;;
@@ -159,6 +170,14 @@ case "$TARGET" in
     am2-s19jpro-zynq) TARGET=am2-s19jpro ;;
     *) die "unsupported --target '$TARGET' (expected both, am1-s9, or am2-s19jpro)" ;;
 esac
+[ "$PROBE_ONLY" != 1 ] || [ "$GEOMETRY_ONLY" != 1 ] || \
+    die "--probe-only and --geometry-only are mutually exclusive"
+if [ "$GEOMETRY_ONLY" = 1 ]; then
+    [ "$TARGET" = am2-s19jpro ] || \
+        die "--geometry-only requires --target am2-s19jpro"
+    [ -n "$AM2_UBI_BUNDLE" ] || \
+        die "--geometry-only requires --am2-ubi-bundle"
+fi
 
 command -v vng >/dev/null 2>&1 || die "virtme-ng vng is required"
 command -v sed >/dev/null 2>&1 || die "sed is required"
@@ -171,10 +190,37 @@ if [ -z "$KERNEL" ]; then
 fi
 [ -f "$KERNEL" ] || die "kernel not found: $KERNEL"
 
+MODULE_SETUP=
+if [ -n "$AM2_UBI_BUNDLE" ]; then
+    for cmd in cmp modinfo python3; do
+        command -v "$cmd" >/dev/null 2>&1 || \
+            die "$cmd is required to verify the module bundle"
+    done
+    AM2_UBI_BUNDLE=$(abs_path "$AM2_UBI_BUNDLE")
+    BUNDLE_LOCK="$SCRIPT_DIR/virtme/am2-ubi/inputs.lock.json"
+    BUNDLE_VERIFY="$SCRIPT_DIR/virtme/am2-ubi/verify_manifest.py"
+    [ -d "$AM2_UBI_BUNDLE" ] || die "AM2 UBI bundle not found: $AM2_UBI_BUNDLE"
+    [ -f "$AM2_UBI_BUNDLE/manifest.json" ] || die "AM2 UBI bundle has no manifest"
+    [ -f "$AM2_UBI_BUNDLE/inputs.lock.json" ] || die "AM2 UBI bundle has no input lock"
+    cmp -s "$BUNDLE_LOCK" "$AM2_UBI_BUNDLE/inputs.lock.json" || \
+        die "AM2 UBI bundle input lock differs from the repository authority"
+    python3 "$BUNDLE_VERIFY" verify-bundle \
+        --manifest "$AM2_UBI_BUNDLE/manifest.json" \
+        --lock "$BUNDLE_LOCK" \
+        --bundle-dir "$AM2_UBI_BUNDLE" >/dev/null || \
+        die "AM2 UBI bundle verification failed"
+    python3 "$BUNDLE_VERIFY" verify-kernel \
+        --lock "$BUNDLE_LOCK" --kernel "$KERNEL" >/dev/null || \
+        die "virtme kernel differs from the exact module-bundle ABI authority"
+    UBI_MODULE_Q=$(shell_quote "$AM2_UBI_BUNDLE/ubi-nofastmap.ko")
+    UBIFS_MODULE_Q=$(shell_quote "$AM2_UBI_BUNDLE/ubifs-nofastmap.ko")
+    MODULE_SETUP="if grep -Eq '^(ubi|ubifs) ' /proc/modules; then echo 'ERROR: stock UBI/UBIFS module was preloaded' >&2; exit 1; fi; modprobe mtd; insmod $UBI_MODULE_Q; insmod $UBIFS_MODULE_Q; if test -e /sys/module/ubi/parameters/fm_autoconvert; then echo 'ERROR: loaded UBI module exposes fastmap' >&2; exit 1; fi; if ! test -e /sys/module/ubi/parameters/mtd; then echo 'ERROR: loaded UBI module lacks its mtd parameter' >&2; exit 1; fi; echo OFFLINE_NANDSIM_MODULE_PAIR_OK"
+fi
+
 S9_PACKAGE=$(abs_path "$S9_PACKAGE")
 S19JPRO_PACKAGE=$(abs_path "$S19JPRO_PACKAGE")
 
-if [ "$PROBE_ONLY" != "1" ]; then
+if [ "$PROBE_ONLY" != "1" ] && [ "$GEOMETRY_ONLY" != "1" ]; then
     for cmd in dirname mktemp openssl rm tail tar tr wc xxd; do
         command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required"
     done
@@ -226,17 +272,30 @@ run_guest_cmd() {
     return "$rc"
 }
 
+GUEST_PREFIX="set -e; cd $PROJECT_Q; export DCENT_SYSUPGRADE_OFFLINE_CONTAINER=1"
+if [ -n "$MODULE_SETUP" ]; then
+    GUEST_PREFIX="$GUEST_PREFIX; $MODULE_SETUP"
+fi
+
 if [ "$PROBE_ONLY" = "1" ]; then
-    GUEST_CMD="set -e; cd $PROJECT_Q; sh scripts/test_s99upgrade_failed_health_no_commit.sh; bash scripts/sysupgrade_offline_nandsim_harness.sh --probe-only$NANDSIM_REQUIRE_ARG; bash scripts/stage1_first_install_offline_nandsim_harness.sh --probe-only$NANDSIM_REQUIRE_ARG"
+    GUEST_CMD="$GUEST_PREFIX; sh scripts/test_s99upgrade_failed_health_no_commit.sh; bash scripts/sysupgrade_offline_nandsim_harness.sh --probe-only$NANDSIM_REQUIRE_ARG; bash scripts/stage1_first_install_offline_nandsim_harness.sh --probe-only$NANDSIM_REQUIRE_ARG"
     run_guest_cmd "$TARGET" "$GUEST_CMD"
+elif [ "$GEOMETRY_ONLY" = "1" ]; then
+    GUEST_CMD="$GUEST_PREFIX; bash scripts/sysupgrade_offline_nandsim_harness.sh --geometry-only --target am2-s19jpro$NANDSIM_REQUIRE_ARG"
+    run_guest_cmd "$TARGET-geometry" "$GUEST_CMD"
 else
-    GUEST_PREFIX="set -e; cd $PROJECT_Q; export DCENT_SYSUPGRADE_OFFLINE_CONTAINER=1"
     S99_FAILED_HEALTH_CMD="sh scripts/test_s99upgrade_failed_health_no_commit.sh"
-    AM1_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9-reverse; bash scripts/stage1_first_install_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --workdir /tmp/dcent-first-install-proof-am1-s9"
-    # AM2 coverage is deliberately limited to DCENT_OS-source A/B writer
-    # directions. Vendor-source first install has no authenticated capsule and
-    # must not be simulated by injecting the virtme host's dependency closure.
-    AM2_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro-reverse"
+    AM1_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9"
+    AM2_GUEST_CMD="$GUEST_PREFIX; $S99_FAILED_HEALTH_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro"
+    if [ "$SYSUPGRADE_ONLY" != "1" ]; then
+        AM1_GUEST_CMD="$AM1_GUEST_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am1-s9 --package $S9_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am1-s9-reverse; bash scripts/stage1_first_install_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --target am1-s9 --package $S9_PACKAGE_Q --workdir /tmp/dcent-first-install-proof-am1-s9"
+        # AM2 coverage is deliberately limited to DCENT_OS-source A/B writer
+        # directions. Vendor-source first install has no authenticated capsule
+        # and must not be simulated by injecting the virtme host's dependency
+        # closure (CE-026 fail-closed boundary;
+        # ../dcent-toolbox/docs/AM2_FIRST_INSTALL_CAPSULE.md).
+        AM2_GUEST_CMD="$AM2_GUEST_CMD; bash scripts/sysupgrade_offline_nandsim_harness.sh$NANDSIM_REQUIRE_ARG --current-fw 1 --target am2-s19jpro --package $S19JPRO_PACKAGE_Q --release-key $RELEASE_KEY_Q --workdir /tmp/dcent-nandsim-proof-am2-s19jpro-reverse"
+    fi
     case "$TARGET" in
         both)
             run_guest_cmd am1-s9 "$AM1_GUEST_CMD"

@@ -30,6 +30,10 @@ fn daemon_arms_immersion_on_the_production_controller() {
          orphan (config accepted, controller never armed). If the wiring was \
          intentionally moved, update this pin to the new call site."
     );
+    assert!(
+        DAEMON_SRC.contains("sup.enable_immersion("),
+        "daemon.rs must also arm the thermal supervisor's immersion offset"
+    );
     // The config the call consumes must be captured from the daemon's own
     // parsed config, not constructed ad hoc.
     assert!(

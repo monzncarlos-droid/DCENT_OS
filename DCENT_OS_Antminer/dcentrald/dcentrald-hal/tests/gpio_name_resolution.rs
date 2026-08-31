@@ -318,12 +318,18 @@ fn missing_sysfs_root_yields_no_chips_and_name_lookup_fails_closed() {
 // ---------------------------------------------------------------------------
 
 /// No production source outside the new module (and the lib.rs declaration)
-/// references the resolver: proof that this change landed the CAPABILITY
-/// only and rewired zero call sites. The migration pass that flips call
-/// sites must consciously delete/adjust this pin.
+/// references the resolver — EXCEPT the one deliberate reviewed migration
+/// pass: commit 13915439a (S19k native owner) rewired the Amlogic platform
+/// module's PSU/plug/fan resolution name-first through
+/// `resolve_name_or_legacy` with legacy sysfs fallback. Any further rewiring
+/// must extend the reviewed set consciously, not sneak in.
 #[test]
 fn no_call_site_is_rewired_yet() {
     let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    // 2026-08-28 C1 convergence: the migration pass this fence was waiting
+    // for (per the original comment: "must consciously delete/adjust this
+    // pin") landed for platform/amlogic/mod.rs only.
+    const REWIRED_BY_REVIEWED_PASS: &[&str] = &["platform/amlogic/mod.rs"];
     let mut offenders = Vec::new();
     let mut stack = vec![src_root.clone()];
     while let Some(dir) = stack.pop() {
@@ -345,6 +351,9 @@ fn no_call_site_is_rewired_yet() {
             // The module itself and the lib.rs declaration are the only
             // permitted references.
             if rel == "gpio_name_resolver.rs" || rel == "lib.rs" {
+                continue;
+            }
+            if REWIRED_BY_REVIEWED_PASS.contains(&rel.as_str()) {
                 continue;
             }
             // libgpiod.rs may MENTION the resolver in a doc pointer, but must

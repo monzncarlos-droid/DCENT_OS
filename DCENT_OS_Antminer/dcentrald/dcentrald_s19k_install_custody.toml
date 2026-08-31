@@ -1,0 +1,52 @@
+# Credential-free first-install custody policy for the exact held S19k Pro.
+# This policy is valid only with --s19k-install-custody-safeoff and the
+# content-bound Track-1 J0-J3 runner. It grants no pool, UART, reset, ASIC, or
+# mining-work authority.
+
+[general]
+hostname = "dcent-s19k-install-custody"
+log_level = "info"
+
+[platform]
+target = "am3-aml-s19k"
+board_target = "am3-s19k"
+
+[pool]
+url = ""
+worker = ""
+password = ""
+sv2_url = ""
+protocol = "sv1"
+smart_failover_enabled = false
+smart_failover_drive = false
+
+[mining]
+enabled = false
+model = "s19k"
+passthrough = true
+serial_device = "/dev/ttyS2"
+serial_chip_count = 77
+serial_chip_type = "BM1366"
+
+[donation]
+enabled = false
+percent = 0.0
+pool_url = ""
+worker = ""
+password = ""
+fallback_enabled = false
+fallback_pool_url = ""
+fallback_worker = ""
+fallback_password = ""
+cycle_duration_s = 3600
+
+[watchdog]
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
+
+[hash_on_disconnect]
+enabled = false
+
+[job_declaration]
+enabled = false

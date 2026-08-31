@@ -2,6 +2,15 @@
 //!
 //! Native SV2 Mining Device client with Noise_NX encryption.
 //! Ported from the proven DCENT_axe (ESP32) implementation.
+//!
+//! # Honesty (DESK_NOW rank 12)
+//!
+//! This client is **opt-in** (`protocol = "sv2"` / `"v2"`, or Auto with a
+//! pool `sv2_url`). Host mock-pool harnesses exist. **Live accepted shares
+//! are BENCH_HOLD** — not a production SV2 mining path and **not
+//! Braiins-parity** Job Declaration. JD `probe_once` is a supervisor
+//! connectivity probe (opt-in, `JdConfig.enabled` default false), not
+//! mining-work injection. OCEAN DATUM is not implemented.
 
 #[cfg(feature = "sv2")]
 pub mod adapter;

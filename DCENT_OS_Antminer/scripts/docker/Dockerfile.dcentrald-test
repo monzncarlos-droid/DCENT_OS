@@ -1,7 +1,9 @@
-# Pin the linux/amd64 manifest, not the mutable multi-architecture index. The
-# Zig archive below is likewise x86_64, so this pair is one reproducible host
-# toolchain even when the Docker daemon itself runs on another architecture.
+# Pin the linux/amd64 rustc 1.90.0 manifest, not a mutable tag (rust:1.90,
+# rust:1.90-bookworm, rust:latest, rust:1.95-bookworm are quarantined).
+# The Zig archive below is likewise x86_64, so this pair is one reproducible
+# host toolchain even when the Docker daemon itself runs on another architecture.
 FROM rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+RUN rustc -vV | grep -E '^release: 1\.90\.0$'
 
 LABEL org.dcentral.dcentos.zig.version="0.13.0" \
       org.dcentral.dcentos.zig.sha256="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"

@@ -3,8 +3,10 @@
 //! Pure pack/parse. No open, no mining.
 //! Job CRC5: ESP-Miner `crc5(frame[2..], 9) == 0` remainder is the BM1366
 //! RX check. RTL payload-only init `0x1B` is **refused** as a drop
-//! (fails every held BM136x job frame). No retained **BM1366** nonce
-//! vector yet — remainder is proven on live BM1362 + S21 BM1368.
+//! condition (it fails every held BM136x job frame). Two retained live `.88`
+//! S19k/BM1366 JobNonce frames prove the 11-byte shape and ESP full-frame
+//! remainder-zero check; they do not by themselves prove Braiins fill
+//! job/version/attribution semantics.
 //!
 //! GetAddress TX (BM1397+ / BM136x, **not** BM1387 `0x54`):
 //! `55 AA 52 05 00 00 0A`
@@ -76,8 +78,16 @@ pub enum S19kUartRxKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum S19kUartRxError {
-    Length { observed: usize },
+    Length {
+        observed: usize,
+    },
     BadPreamble,
+    /// A complete `AA 55` response candidate whose ESP/BM1366 full-frame
+    /// CRC5 remainder is non-zero.  Such a candidate is framing evidence
+    /// only; it must never affect enumeration, register state, or shares.
+    BadCrc {
+        remainder: u8,
+    },
 }
 
 pub fn pack_get_address_uart() -> [u8; 7] {
@@ -101,14 +111,30 @@ pub const HELD_BM1368_S21_JOB: [u8; 11] = [
 /// Live AM3-BB BM1362 job frames from `a lab unit` 2026-05-14 accepted-share log.
 /// Comparative family evidence, **not** S19k BM1366.
 pub const HELD_BM1362_JOB_FRAMES: &[[u8; 11]] = &[
-    [0xAA, 0x55, 0x3E, 0x00, 0x17, 0xBE, 0x01, 0x3E, 0x10, 0x5E, 0x9C],
-    [0xAA, 0x55, 0x32, 0x00, 0xE3, 0xB3, 0x00, 0x3C, 0x58, 0x54, 0x95],
-    [0xAA, 0x55, 0x7C, 0x01, 0x09, 0x6F, 0x01, 0x31, 0x04, 0xD9, 0x9E],
-    [0xAA, 0x55, 0x00, 0x01, 0x68, 0x37, 0x00, 0x6F, 0x02, 0x9F, 0x99],
-    [0xAA, 0x55, 0x6C, 0x02, 0x14, 0xFE, 0x00, 0x7B, 0x01, 0x7B, 0x85],
-    [0xAA, 0x55, 0x26, 0x02, 0x03, 0xD1, 0x01, 0x44, 0x70, 0xC4, 0x84],
-    [0xAA, 0x55, 0x50, 0x02, 0x64, 0x92, 0x01, 0x2C, 0x00, 0x2C, 0x9F],
-    [0xAA, 0x55, 0x54, 0x02, 0x67, 0x11, 0x00, 0x10, 0x55, 0x58, 0x91],
+    [
+        0xAA, 0x55, 0x3E, 0x00, 0x17, 0xBE, 0x01, 0x3E, 0x10, 0x5E, 0x9C,
+    ],
+    [
+        0xAA, 0x55, 0x32, 0x00, 0xE3, 0xB3, 0x00, 0x3C, 0x58, 0x54, 0x95,
+    ],
+    [
+        0xAA, 0x55, 0x7C, 0x01, 0x09, 0x6F, 0x01, 0x31, 0x04, 0xD9, 0x9E,
+    ],
+    [
+        0xAA, 0x55, 0x00, 0x01, 0x68, 0x37, 0x00, 0x6F, 0x02, 0x9F, 0x99,
+    ],
+    [
+        0xAA, 0x55, 0x6C, 0x02, 0x14, 0xFE, 0x00, 0x7B, 0x01, 0x7B, 0x85,
+    ],
+    [
+        0xAA, 0x55, 0x26, 0x02, 0x03, 0xD1, 0x01, 0x44, 0x70, 0xC4, 0x84,
+    ],
+    [
+        0xAA, 0x55, 0x50, 0x02, 0x64, 0x92, 0x01, 0x2C, 0x00, 0x2C, 0x9F,
+    ],
+    [
+        0xAA, 0x55, 0x54, 0x02, 0x67, 0x11, 0x00, 0x10, 0x55, 0x58, 0x91,
+    ],
 ];
 
 /// BM13xx *response* CRC5 (not the host-command poly/init `0x05`/`0x1F`).
@@ -209,8 +235,7 @@ pub const S19K_LIVE88_S2_LEFTOVER_JOB_NONCE: [u8; 11] = [
 ];
 
 /// Pinned 2026-08-15 from live `.88` ttyS1 leftover (Track-1 preflight).
-pub const S19K_HELD_BM1366_JOB_NONCE: Option<&[u8]> =
-    Some(&S19K_LIVE88_S1_LEFTOVER_JOB_NONCE);
+pub const S19K_HELD_BM1366_JOB_NONCE: Option<&[u8]> = Some(&S19K_LIVE88_S1_LEFTOVER_JOB_NONCE);
 
 /// Retired: a live S19k JobNonce now exists. Kept so host_verify still
 /// finds the symbol. Call [`admit_s19k_live88_held_bm1366_job_nonce`].
@@ -270,7 +295,10 @@ pub fn admit_s21_held_uart_chip_id_is_1368_not_1366(blob: &[u8]) -> Result<(), &
     if n68 != S21_HELD_UART_CA1368_COUNT {
         return Err("held S21 UART must have 108 0x1368 ChipAddress pairs");
     }
-    if !blob.windows(UART_RESP_LEN).any(|w| w == S21_HELD_CHIPADDRESS_1368) {
+    if !blob
+        .windows(UART_RESP_LEN)
+        .any(|w| w == S21_HELD_CHIPADDRESS_1368)
+    {
         return Err("held S21 UART missing first 0x1368 ChipAddress frame");
     }
     Ok(())
@@ -305,7 +333,10 @@ pub enum S19kRxCrcStatus {
     EspRemainderOk,
     CommandMatch,
     JobMatchExperimental,
-    Mismatch { expected: u8, observed: u8 },
+    Mismatch {
+        expected: u8,
+        observed: u8,
+    },
 }
 
 /// Verify RX CRC. ESP remainder-0 is the BM1366 check (`receive_work`).
@@ -337,14 +368,14 @@ pub fn verify_bm1366_uart_rx_crc(frame: &[u8]) -> Result<S19kRxCrcStatus, S19kUa
             Ok(S19kRxCrcStatus::CommandMatch)
         }
     } else {
-        Ok(S19kRxCrcStatus::Mismatch {
-            expected,
-            observed,
-        })
+        Ok(S19kRxCrcStatus::Mismatch { expected, observed })
     }
 }
 
 /// Classify one 11-byte UART response. Does **not** verify response CRC5.
+///
+/// This is intentionally retained as a structural decoder for offline RE.
+/// Runtime admission must use [`classify_bm1366_uart_rx_checked`].
 pub fn classify_bm1366_uart_rx(frame: &[u8]) -> Result<S19kUartRxKind, S19kUartRxError> {
     if frame.len() != UART_RESP_LEN {
         return Err(S19kUartRxError::Length {
@@ -368,6 +399,25 @@ pub fn classify_bm1366_uart_rx(frame: &[u8]) -> Result<S19kUartRxKind, S19kUartR
     } else {
         Ok(command_reply_from_frame(frame))
     }
+}
+
+/// Admit and classify one BM1366 response.
+///
+/// ESP-Miner's receive path validates the CRC over every byte after `AA 55`,
+/// including the trailer, and accepts only remainder zero.  Keeping that
+/// check in the returned type prevents callers from accidentally treating a
+/// merely-shaped frame as ASIC state or a nonce.
+pub fn classify_bm1366_uart_rx_checked(frame: &[u8]) -> Result<S19kUartRxKind, S19kUartRxError> {
+    let remainder = esp_rx_crc5_remainder(frame)?;
+    if frame.len() != UART_RESP_LEN {
+        return Err(S19kUartRxError::Length {
+            observed: frame.len(),
+        });
+    }
+    if remainder != 0 {
+        return Err(S19kUartRxError::BadCrc { remainder });
+    }
+    classify_bm1366_uart_rx(frame)
 }
 
 /// ESP-Miner command layout. GetAddress-shaped 0x1366 replies also
@@ -428,6 +478,95 @@ pub fn enum_asic_addrs_from_rx(frames: &[S19kUartRxKind]) -> Vec<u8> {
         .collect()
 }
 
+/// Strict GetAddress population evidence. Any mixed command/nonce traffic,
+/// wrong chip identity, or inconsistent value/responder address contaminates
+/// the window instead of contributing to enum completeness or short-chain
+/// diagnostics.
+fn strict_bm1366_get_address_addrs(frames: &[S19kUartRxKind]) -> Option<Vec<u8>> {
+    let mut addrs = Vec::with_capacity(frames.len());
+    for frame in frames {
+        match *frame {
+            S19kUartRxKind::ChipAddress {
+                chip_id: 0x1366,
+                value_address,
+                responder_address,
+            } if value_address == responder_address => addrs.push(responder_address),
+            _ => return None,
+        }
+    }
+    Some(addrs)
+}
+
+/// CRC-admitted, unique BM1366 GetAddress geometry for native init.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S19kBm1366EnumCoverage {
+    pub addresses: Vec<u8>,
+    pub duplicate_frames: usize,
+}
+
+/// Admit a HAL response-body collection as BM1366 enumeration geometry.
+///
+/// Raw response count is insufficient: duplicate replies, wrong chip IDs,
+/// invalid address stride, and CRC-bad bodies must not satisfy the Rambo
+/// population threshold.
+pub fn admit_bm1366_enum_response_bodies(
+    bodies: &[Vec<u8>],
+    expected_chip_count: u8,
+    address_interval: u8,
+    minimum_unique: usize,
+) -> Result<S19kBm1366EnumCoverage, &'static str> {
+    if expected_chip_count == 0 || address_interval == 0 {
+        return Err("BM1366 enum geometry must be non-zero");
+    }
+    if minimum_unique > usize::from(expected_chip_count) {
+        return Err("BM1366 minimum unique responses exceeds expected population");
+    }
+    let mut seen = [false; 256];
+    let mut addresses = Vec::new();
+    let mut duplicate_frames = 0usize;
+    for body in bodies {
+        if body.len() != BM1366_UART_RESP_BODY_LEN {
+            return Err("BM1366 enum response body is not 9 bytes");
+        }
+        let mut frame = [0u8; UART_RESP_LEN];
+        frame[..2].copy_from_slice(&UART_RESP_PREAMBLE);
+        frame[2..].copy_from_slice(body);
+        let kind = classify_bm1366_uart_rx_checked(&frame)
+            .map_err(|_| "BM1366 enum response failed framing or CRC admission")?;
+        let S19kUartRxKind::ChipAddress {
+            chip_id: 0x1366,
+            value_address,
+            responder_address,
+        } = kind
+        else {
+            return Err("BM1366 enum response is not a 0x1366 ChipAddress");
+        };
+        if value_address != responder_address {
+            return Err("BM1366 ChipAddress value/responder address mismatch");
+        }
+        if responder_address % address_interval != 0
+            || usize::from(responder_address / address_interval) >= usize::from(expected_chip_count)
+        {
+            return Err("BM1366 ChipAddress is outside expected stride geometry");
+        }
+        let index = usize::from(responder_address);
+        if seen[index] {
+            duplicate_frames = duplicate_frames.saturating_add(1);
+        } else {
+            seen[index] = true;
+            addresses.push(responder_address);
+        }
+    }
+    addresses.sort_unstable();
+    if addresses.len() < minimum_unique {
+        return Err("too few unique CRC-valid BM1366 ChipAddress responses");
+    }
+    Ok(S19kBm1366EnumCoverage {
+        addresses,
+        duplicate_frames,
+    })
+}
+
 /// : GetAddress completeness is not the same as ChipAddressOk.
 /// One `0x1366` reply proves the **port** answered. Braiins `a lab unit` still
 /// demands 77 unique `read_register(0x0)` addresses (interval 2).
@@ -440,13 +579,17 @@ pub enum S19kChipEnumCompleteness {
 }
 
 /// Unique asic addresses in a GetAddress observation.
-pub fn classify_s19k_chip_enum_complete(
-    obs: &S19kUartRxObservation,
-) -> S19kChipEnumCompleteness {
+pub fn classify_s19k_chip_enum_complete(obs: &S19kUartRxObservation) -> S19kChipEnumCompleteness {
     match obs {
         S19kUartRxObservation::Silence { .. } => S19kChipEnumCompleteness::Silence,
         S19kUartRxObservation::Frames { frames, .. } => {
-            let addrs = enum_asic_addrs_from_rx(frames);
+            // Complete77 is a work-TX promotion token, not merely evidence
+            // that 77 addressed command replies happened to be buffered.
+            // Refuse stale register replies, nonce contamination, wrong chip
+            // IDs, and internally inconsistent GetAddress values.
+            let Some(addrs) = strict_bm1366_get_address_addrs(frames) else {
+                return S19kChipEnumCompleteness::NotEnum;
+            };
             if addrs.is_empty() {
                 return S19kChipEnumCompleteness::NotEnum;
             }
@@ -464,8 +607,7 @@ pub fn classify_s19k_chip_enum_complete(
                     got = got.saturating_add(1);
                 }
             }
-            if got == crate::s19k_bosminer_enum::S19K_BHB56902_CHIP_COUNT && missing.is_none()
-            {
+            if got == crate::s19k_bosminer_enum::S19K_BHB56902_CHIP_COUNT && missing.is_none() {
                 S19kChipEnumCompleteness::Complete77
             } else {
                 S19kChipEnumCompleteness::Short {
@@ -487,19 +629,13 @@ pub fn refuse_one_chipaddress_as_77_chip_complete(
         S19kChipEnumCompleteness::Short { got: 1, .. } => {
             Err("one 0x1366 ChipAddress is port-answered, not 77-chip complete")
         }
-        S19kChipEnumCompleteness::Short { got, .. } => Err(
-            if got == 0 {
-                "zero unique enum addrs is not 77-chip complete"
-            } else {
-                "short read_register(0x0) enum is not 77-chip complete"
-            },
-        ),
-        S19kChipEnumCompleteness::Silence => {
-            Err("GetAddress silence is not 77-chip complete")
-        }
-        S19kChipEnumCompleteness::NotEnum => {
-            Err("non-enum RX is not 77-chip complete")
-        }
+        S19kChipEnumCompleteness::Short { got, .. } => Err(if got == 0 {
+            "zero unique enum addrs is not 77-chip complete"
+        } else {
+            "short read_register(0x0) enum is not 77-chip complete"
+        }),
+        S19kChipEnumCompleteness::Silence => Err("GetAddress silence is not 77-chip complete"),
+        S19kChipEnumCompleteness::NotEnum => Err("non-enum RX is not 77-chip complete"),
     }
 }
 
@@ -758,7 +894,8 @@ pub fn refuse_rx_byte5_as_register_address(off: usize) -> Result<(), &'static st
     Ok(())
 }
 
-/// Chip address from a job nonce (BE interpret, bits 24:17). Interval=2 SoT.
+/// ESP/AMTC-dialect chip address from a job nonce (BE interpret, bits 24:17).
+/// Do not use this for Braiins fill; its BM1366 callback partitions bits 9..24.
 pub fn chip_addr_from_nonce_be(nonce_be: u32) -> u8 {
     ((nonce_be >> 17) & 0xff) as u8
 }
@@ -767,9 +904,13 @@ pub fn core_id_from_nonce_be(nonce_be: u32) -> u8 {
     ((nonce_be >> 25) & 0x7f) as u8
 }
 
-/// ASIC index on interval=2 boards. Refuse public floor=3.
+/// ESP/AMTC-dialect ASIC index on S19k interval-2 boards.
 pub fn asic_index_from_nonce_be(nonce_be: u32) -> u8 {
     chip_addr_from_nonce_be(nonce_be) / 2
+}
+
+pub fn refuse_esp_amtc_nonce_attribution_as_braiins_fill() -> Result<(), &'static str> {
+    Err("ESP/AMTC bits17..24 /2 attribution is not Bosminer BM1366 FUN_009256ac")
 }
 
 /// Stream-level observation. Distinguishes silence from framing from ASIC.
@@ -789,8 +930,14 @@ pub enum S19kUartRxObservation {
     ShortFrame { at: usize, available: usize },
     /// One or more classified 11-byte frames.
     Frames {
+        /// Only CRC-admitted frames.  A frame in this vector is safe to use
+        /// for enumeration/register/share semantics.
         frames: Vec<S19kUartRxKind>,
+        /// Diagnostic status for every complete `AA 55` candidate, including
+        /// rejected candidates.
         crc: Vec<S19kRxCrcStatus>,
+        /// Complete candidates rejected by the ESP remainder-zero gate.
+        crc_bad: usize,
         trailing_unparsed: usize,
     },
 }
@@ -929,9 +1076,7 @@ pub fn refuse_s19k_rxbuf_leftover_aa_plus_tx55_as_jobnonce(
     frame[2..].copy_from_slice(&bodies[0]);
     match classify_bm1366_uart_rx(&frame) {
         Ok(S19kUartRxKind::JobNonce { .. }) => Ok(()),
-        Ok(_) => Err(
-            "held S3 last-AA + TX 55 AA is CommandReply desync, not JobNonce",
-        ),
+        Ok(_) => Err("held S3 last-AA + TX 55 AA is CommandReply desync, not JobNonce"),
         Err(_) => Err("stitched frame is not JobNonce"),
     }
 }
@@ -948,9 +1093,7 @@ pub fn admit_s19k_production_flush_rx_after_getaddress_nopreamble(
     src: &str,
 ) -> Result<(), &'static str> {
     if !src.contains("flush leftover RX after empty GetAddress") {
-        return Err(
-            "Track-1 must flush RxBuffer after empty GetAddress before the next TX",
-        );
+        return Err("Track-1 must flush RxBuffer after empty GetAddress before the next TX");
     }
     if !src.contains("HAL last-byte AA") {
         return Err("flush comment must name HAL last-byte AA stitch");
@@ -960,13 +1103,9 @@ pub fn admit_s19k_production_flush_rx_after_getaddress_nopreamble(
 
 /// FastUART `52 05 00 28` TX is also `55 AA`. Empty 0x28 RX must flush
 /// the same leftover-`AA` seed before 115200 retry or work TX.
-pub fn admit_s19k_production_flush_rx_after_fastuart_empty(
-    src: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_production_flush_rx_after_fastuart_empty(src: &str) -> Result<(), &'static str> {
     if !src.contains("flush leftover RX after empty FastUART") {
-        return Err(
-            "Track-1 must flush RxBuffer after empty FastUART 0x28 before the next TX",
-        );
+        return Err("Track-1 must flush RxBuffer after empty FastUART 0x28 before the next TX");
     }
     Ok(())
 }
@@ -1075,9 +1214,9 @@ pub fn refuse_esp_a4_reply_as_fill_rearm_ok(kind: S19kUartRxKind) -> Result<(), 
     Ok(())
 }
 
-/// Synthetic JobNonce with trailer bit7=1. CRC is not a drop (T4).
+/// Synthetic CRC-valid JobNonce with trailer bit7=1.
 pub fn bm1366_fill_job_nonce_uart(raw_job_byte: u8) -> [u8; 11] {
-    [
+    let mut frame = [
         UART_RESP_PREAMBLE[0],
         UART_RESP_PREAMBLE[1],
         0x00,
@@ -1089,7 +1228,17 @@ pub fn bm1366_fill_job_nonce_uart(raw_job_byte: u8) -> [u8; 11] {
         0x00,
         0x00,
         JOB_TRAILER_BIT,
-    ]
+    ];
+    // The trailer carries the discriminator in bit7 and the CRC in bits4:0.
+    // Brute-forcing the 32-value field keeps this fixture visibly tied to the
+    // same remainder-zero admission rule used for real RX.
+    for low in 0u8..=0x1f {
+        frame[10] = JOB_TRAILER_BIT | low;
+        if esp_asic_crc5(&frame[2..]) == 0 {
+            return frame;
+        }
+    }
+    unreachable!("five-bit BM1366 CRC field has no remainder-zero value")
 }
 
 /// BM1366 UART body after `AA 55` is 9. Wire total is 11.
@@ -1191,7 +1340,8 @@ pub fn refuse_constructed_fill_body7_as_job_nonce(
     raw_job: u8,
 ) -> Result<(), &'static str> {
     let rx = bm1366_fill_job_nonce_uart(raw_job);
-    let cut = s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
+    let cut =
+        s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
     if cut.len() != S19K_HAL_BODY7_WIRE_CUT {
         return Err("HAL body-7 wire cut must be 9 bytes");
     }
@@ -1209,7 +1359,8 @@ pub fn refuse_constructed_fill_body7_observe_as_job_or_silence(
     raw_job: u8,
 ) -> Result<(), &'static str> {
     let rx = bm1366_fill_job_nonce_uart(raw_job);
-    let cut = s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
+    let cut =
+        s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
     let obs = observe_bm1366_uart_rx(cut, 10);
     if matches!(obs, S19kUartRxObservation::Silence { .. }) {
         return Err("constructed fill body-7 cut is not Silence");
@@ -1271,9 +1422,7 @@ pub fn classify_s19k_bm1366_rx_after(
                 }
             }
             S19kUartRxObservation::NoPreamble {
-                first8,
-                first8_len,
-                ..
+                first8, first8_len, ..
             } if *first8_len >= 3 && first8[..3] == HELD_78_CAP_SERIAL_S3 => {
                 S19kRxDiag::FramingOrEcho
             }
@@ -1281,18 +1430,12 @@ pub fn classify_s19k_bm1366_rx_after(
             | S19kUartRxObservation::HostPreambleEcho { .. }
             | S19kUartRxObservation::ShortFrame { .. } => S19kRxDiag::FramingOrEcho,
             S19kUartRxObservation::Frames { frames, .. } => {
-                let addrs = enum_asic_addrs_from_rx(frames);
+                let Some(addrs) = strict_bm1366_get_address_addrs(frames) else {
+                    return S19kRxDiag::FramingOrEcho;
+                };
                 if frames.len() >= 2 && first_missing_enum_addr(&addrs, 2, 77).is_some() {
                     S19kRxDiag::ChainFailShortEnum
-                } else if frames.iter().any(|k| {
-                    matches!(
-                        k,
-                        S19kUartRxKind::ChipAddress {
-                            chip_id: 0x1366,
-                            ..
-                        }
-                    )
-                }) {
+                } else if !addrs.is_empty() {
                     S19kRxDiag::ChipAddressOk
                 } else {
                     S19kRxDiag::FramingOrEcho
@@ -1302,15 +1445,7 @@ pub fn classify_s19k_bm1366_rx_after(
         S19kRxExpectedAfter::GetAddress115200Retry => match obs {
             S19kUartRxObservation::Silence { .. } => S19kRxDiag::GetAddressSilenceAt115200,
             S19kUartRxObservation::Frames { frames, .. } => {
-                if frames.iter().any(|k| {
-                    matches!(
-                        k,
-                        S19kUartRxKind::ChipAddress {
-                            chip_id: 0x1366,
-                            ..
-                        }
-                    )
-                }) {
+                if strict_bm1366_get_address_addrs(frames).is_some_and(|addrs| !addrs.is_empty()) {
                     S19kRxDiag::ChipHeardAt115200
                 } else {
                     S19kRxDiag::FramingOrEcho
@@ -1375,7 +1510,11 @@ pub fn classify_s19k_bm1366_rx_after(
                     )
                 }) {
                     S19kRxDiag::FramingOrEcho
-                } else if frames.iter().copied().any(s19k_rearm_reply_is_ticket_or_hcn) {
+                } else if frames
+                    .iter()
+                    .copied()
+                    .any(s19k_rearm_reply_is_ticket_or_hcn)
+                {
                     S19kRxDiag::RearmRegOk
                 } else {
                     S19kRxDiag::Inconclusive
@@ -1399,8 +1538,9 @@ pub fn classify_s19k_bm1366_rx_after(
             _ => S19kRxDiag::FramingOrEcho,
         },
         S19kRxExpectedAfter::Reset | S19kRxExpectedAfter::ChainInactive => match obs {
-            S19kUartRxObservation::Silence { .. }
-            | S19kUartRxObservation::Frames { .. } => S19kRxDiag::Inconclusive,
+            S19kUartRxObservation::Silence { .. } | S19kUartRxObservation::Frames { .. } => {
+                S19kRxDiag::Inconclusive
+            }
             _ => S19kRxDiag::FramingOrEcho,
         },
     }
@@ -1418,9 +1558,7 @@ pub fn classify_s19k_dual_uart_rx_after(
     let d2 = classify_s19k_bm1366_rx_after(after, s2, baud);
     match after {
         S19kRxExpectedAfter::WorkDispatch => match (d1, d2) {
-            (S19kRxDiag::JobNonceFillOk, S19kRxDiag::JobNonceFillOk) => {
-                S19kRxDiag::JobNonceFillOk
-            }
+            (S19kRxDiag::JobNonceFillOk, S19kRxDiag::JobNonceFillOk) => S19kRxDiag::JobNonceFillOk,
             (S19kRxDiag::JobNonceFillOk, S19kRxDiag::Silence)
             | (S19kRxDiag::Silence, S19kRxDiag::JobNonceFillOk) => {
                 S19kRxDiag::SinglePortNotDualProof
@@ -1511,7 +1649,9 @@ pub fn classify_s19k_dual_uart_rx_after(
 /// One required port JobNonce + one Silence is not 2-board work proof.
 pub fn refuse_one_port_work_as_dual_chain_proof(diag: S19kRxDiag) -> Result<(), &'static str> {
     if diag == S19kRxDiag::SinglePortNotDualProof {
-        return Err("one required tty JobNonce/ChipAddress, the other silent; not dual-chain proof");
+        return Err(
+            "one required tty JobNonce/ChipAddress, the other silent; not dual-chain proof",
+        );
     }
     Ok(())
 }
@@ -1564,7 +1704,9 @@ pub fn admit_s19k_115200_fastuart_28_is_typed(src: &str) -> Result<(), &'static 
         .find("S19kRxExpectedAfter::FastUart28At115200 => match obs")
         .ok_or("missing FastUart28At115200 match")?;
     let rest = &src[start..];
-    let end = rest.find("S19kRxExpectedAfter::WorkDispatch").unwrap_or(rest.len());
+    let end = rest
+        .find("S19kRxExpectedAfter::WorkDispatch")
+        .unwrap_or(rest.len());
     let body = &rest[..end];
     if body.contains("ChipFastUartUnread") {
         return Err("115200 FastUART 0x28 silence must not be ChipFastUartUnread");
@@ -1606,7 +1748,9 @@ pub fn admit_s19k_115200_getaddress_silence_is_typed(src: &str) -> Result<(), &'
         .find("S19kRxExpectedAfter::GetAddress115200Retry => match obs")
         .ok_or("missing GetAddress115200Retry match")?;
     let rest = &src[start..];
-    let end = rest.find("S19kRxExpectedAfter::FastUart28").unwrap_or(rest.len());
+    let end = rest
+        .find("S19kRxExpectedAfter::FastUart28")
+        .unwrap_or(rest.len());
     let body = &rest[..end];
     if body.contains("ChipFastUartUnread") {
         return Err("115200 GetAddress silence must not be ChipFastUartUnread");
@@ -1720,7 +1864,8 @@ pub fn admit_fill_work_id_tx_rx_correlate(
     if tx_wire[0..4] != CLOSED_11D_PREFIX {
         return Err("CLOSED_11D_PREFIX drift");
     }
-    let kind = classify_bm1366_uart_rx(rx_frame).map_err(|_| "RX is not an 11-byte UART frame")?;
+    let kind = classify_bm1366_uart_rx_checked(rx_frame)
+        .map_err(|_| "RX is not a CRC-valid 11-byte UART frame")?;
     let S19kUartRxKind::JobNonce { raw_job_byte, .. } = kind else {
         return Err("RX is not JobNonce");
     };
@@ -1759,6 +1904,8 @@ pub fn observe_bm1366_uart_rx(buf: &[u8], window_ms: u32) -> S19kUartRxObservati
     }
     let mut frames = Vec::new();
     let mut crc = Vec::new();
+    let mut crc_bad = 0usize;
+    let mut complete_candidates = 0usize;
     let mut i = first;
     while i + UART_RESP_LEN <= buf.len() {
         if buf[i] != UART_RESP_PREAMBLE[0] || buf[i + 1] != UART_RESP_PREAMBLE[1] {
@@ -1766,16 +1913,24 @@ pub fn observe_bm1366_uart_rx(buf: &[u8], window_ms: u32) -> S19kUartRxObservati
             continue;
         }
         let slice = &buf[i..i + UART_RESP_LEN];
-        match classify_bm1366_uart_rx(slice) {
+        complete_candidates += 1;
+        let status = verify_bm1366_uart_rx_crc(slice).unwrap_or(S19kRxCrcStatus::NotChecked);
+        crc.push(status);
+        match classify_bm1366_uart_rx_checked(slice) {
             Ok(kind) => {
                 frames.push(kind);
-                crc.push(verify_bm1366_uart_rx_crc(slice).unwrap_or(S19kRxCrcStatus::NotChecked));
                 i += UART_RESP_LEN;
+            }
+            Err(S19kUartRxError::BadCrc { .. }) => {
+                crc_bad += 1;
+                // A false preamble may overlap the next valid frame.  Move
+                // one byte, not one whole candidate, to preserve resync.
+                i += 1;
             }
             Err(_) => i += 1,
         }
     }
-    if frames.is_empty() {
+    if frames.is_empty() && complete_candidates == 0 {
         return S19kUartRxObservation::ShortFrame {
             at: first,
             available: buf.len() - first,
@@ -1785,6 +1940,7 @@ pub fn observe_bm1366_uart_rx(buf: &[u8], window_ms: u32) -> S19kUartRxObservati
         trailing_unparsed: buf.len() - i,
         frames,
         crc,
+        crc_bad,
     }
 }
 
@@ -1838,10 +1994,11 @@ pub fn format_rx_observation(obs: &S19kUartRxObservation) -> String {
         S19kUartRxObservation::Frames {
             frames,
             crc,
+            crc_bad,
             trailing_unparsed,
         } => {
             format!(
-                "S19K_RX frames={} crc={:?} trailing={trailing_unparsed} first={:?}",
+                "S19K_RX frames={} crc_bad={crc_bad} crc={:?} trailing={trailing_unparsed} first={:?}",
                 frames.len(),
                 crc,
                 frames.first()
@@ -1860,8 +2017,14 @@ mod tests {
 
     #[test]
     fn get_address_is_55_aa_52_not_54_or_53() {
-        assert_eq!(pack_get_address_uart(), [0x55, 0xAA, 0x52, 0x05, 0x00, 0x00, 0x0A]);
-        assert_ne!(&pack_get_address_uart()[2..], &[0x54, 0x05, 0x00, 0x00, 0x0A]);
+        assert_eq!(
+            pack_get_address_uart(),
+            [0x55, 0xAA, 0x52, 0x05, 0x00, 0x00, 0x0A]
+        );
+        assert_ne!(
+            &pack_get_address_uart()[2..],
+            &[0x54, 0x05, 0x00, 0x00, 0x0A]
+        );
         assert_ne!(pack_get_address_uart(), CHAIN_INACTIVE_UART);
         assert_eq!(cmd_get_address_bcast(), [0x52, 0x05, 0x00, 0x00, 0x0A]);
         assert_eq!(cmd_chain_inactive_bcast(), [0x53, 0x05, 0x00, 0x00, 0x03]);
@@ -1938,9 +2101,19 @@ mod tests {
                 assert_eq!(small_core, 0x04);
                 eprintln!("S19K_UART_RX_JOB_ID {job_id:#04x}");
                 assert_eq!(version_be, 0x0304);
-                assert_eq!(chip_addr_from_nonce_be(nonce_be), ((0x6096_394C >> 17) & 0xff) as u8);
-                assert_eq!(core_id_from_nonce_be(nonce_be), ((0x6096_394C >> 25) & 0x7f) as u8);
-                assert_eq!(asic_index_from_nonce_be(nonce_be), chip_addr_from_nonce_be(nonce_be) / 2);
+                assert_eq!(
+                    chip_addr_from_nonce_be(nonce_be),
+                    ((0x6096_394C >> 17) & 0xff) as u8
+                );
+                assert_eq!(
+                    core_id_from_nonce_be(nonce_be),
+                    ((0x6096_394C >> 25) & 0x7f) as u8
+                );
+                assert_eq!(
+                    asic_index_from_nonce_be(nonce_be),
+                    chip_addr_from_nonce_be(nonce_be) / 2
+                );
+                assert!(refuse_esp_amtc_nonce_attribution_as_braiins_fill().is_err());
             }
             other => panic!("expected JobNonce, got {other:?}"),
         }
@@ -1967,7 +2140,10 @@ mod tests {
     #[test]
     fn hunter_distinguishes_host_echo_garbage_and_chip_address() {
         let echo = observe_bm1366_uart_rx(&[0x00, 0x55, 0xAA, 0x21, 0x36], 10);
-        assert!(matches!(echo, S19kUartRxObservation::HostPreambleEcho { at: 1 }));
+        assert!(matches!(
+            echo,
+            S19kUartRxObservation::HostPreambleEcho { at: 1 }
+        ));
 
         let garbage = observe_bm1366_uart_rx(&[0x00, 0x00, 0xFF, 0x11], 10);
         assert!(matches!(
@@ -1984,18 +2160,131 @@ mod tests {
             }
         ));
 
-        let frame = [
-            0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
+        let frame = bm1366_chip_address_uart(0x02);
         match observe_bm1366_uart_rx(&frame, 10) {
             S19kUartRxObservation::Frames { frames, .. } => {
                 assert!(matches!(
                     frames[0],
-                    S19kUartRxKind::ChipAddress { chip_id: 0x1366, .. }
+                    S19kUartRxKind::ChipAddress {
+                        chip_id: 0x1366,
+                        ..
+                    }
                 ));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn held_s19k_job_nonces_require_remainder_zero_and_reject_every_one_bit_error() {
+        for golden in [
+            S19K_LIVE88_S1_LEFTOVER_JOB_NONCE,
+            S19K_LIVE88_S2_LEFTOVER_JOB_NONCE,
+        ] {
+            assert_eq!(esp_rx_crc5_remainder(&golden).unwrap(), 0);
+            assert!(matches!(
+                classify_bm1366_uart_rx_checked(&golden),
+                Ok(S19kUartRxKind::JobNonce { .. })
+            ));
+            for bit in 0..72 {
+                let mut corrupt = golden;
+                corrupt[2 + bit / 8] ^= 1 << (bit % 8);
+                assert!(matches!(
+                    classify_bm1366_uart_rx_checked(&corrupt),
+                    Err(S19kUartRxError::BadCrc { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn crc_bad_complete_candidates_are_diagnostic_only() {
+        let mut bad = bm1366_fill_job_nonce_uart(0x48);
+        bad[2] ^= 0x01;
+        let obs = observe_bm1366_uart_rx(&bad, 10);
+        match &obs {
+            S19kUartRxObservation::Frames {
+                frames, crc_bad, ..
+            } => {
+                assert!(frames.is_empty());
+                assert_eq!(*crc_bad, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            classify_s19k_chip_enum_complete(&obs),
+            S19kChipEnumCompleteness::NotEnum
+        );
+        assert!(admit_fill_work_id_tx_rx_correlate(&[0x55, 0xAA, 0x21, 0x36, 0x48], &bad).is_err());
+    }
+
+    #[test]
+    fn native_enum_requires_crc_valid_unique_stride_geometry() {
+        let bodies = (0u8..77)
+            .map(|index| bm1366_chip_address_uart(index * 2)[2..].to_vec())
+            .collect::<Vec<_>>();
+        let complete = admit_bm1366_enum_response_bodies(&bodies, 77, 2, 77).unwrap();
+        assert_eq!(complete.addresses.len(), 77);
+        assert_eq!(complete.duplicate_frames, 0);
+
+        let duplicates = vec![bodies[0].clone(); 77];
+        assert!(admit_bm1366_enum_response_bodies(&duplicates, 77, 2, 69).is_err());
+
+        assert!(admit_bm1366_enum_response_bodies(&bodies[..68], 77, 2, 69).is_err());
+        assert!(admit_bm1366_enum_response_bodies(&bodies[..69], 77, 2, 69).is_ok());
+
+        let mut corrupt = bodies.clone();
+        corrupt[12][0] ^= 1;
+        assert!(admit_bm1366_enum_response_bodies(&corrupt, 77, 2, 69).is_err());
+
+        let mut wrong_stride = bodies[..69].to_vec();
+        wrong_stride[1] = bm1366_chip_address_uart(3)[2..].to_vec();
+        assert!(admit_bm1366_enum_response_bodies(&wrong_stride, 77, 2, 69).is_err());
+
+        let mut wrong_chip = bodies[..69].to_vec();
+        wrong_chip[0] = bm1366_command_reply_uart(0x1367_0000, 0, 0)[2..].to_vec();
+        assert!(admit_bm1366_enum_response_bodies(&wrong_chip, 77, 2, 69).is_err());
+    }
+
+    #[test]
+    fn complete77_refuses_stale_register_reply_geometry() {
+        let bytes = (0u8..77)
+            .flat_map(|index| bm1366_command_reply_uart(0x0000_115A, index * 2, 0x28).into_iter())
+            .collect::<Vec<_>>();
+        let obs = observe_bm1366_uart_rx(&bytes, 10);
+        assert_eq!(
+            classify_s19k_chip_enum_complete(&obs),
+            S19kChipEnumCompleteness::NotEnum,
+            "77 CRC-valid addressed register replies are not GetAddress population proof"
+        );
+        assert_eq!(
+            classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::GetAddress, &obs, Ok(())),
+            S19kRxDiag::FramingOrEcho,
+            "stale addressed replies must not become short-chain diagnostics"
+        );
+        assert_eq!(
+            classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::GetAddress115200Retry, &obs, Ok(()),),
+            S19kRxDiag::FramingOrEcho,
+            "stale addressed replies must not prove a chip heard at 115200"
+        );
+    }
+
+    #[test]
+    fn complete77_refuses_one_mixed_command_reply() {
+        let mut bytes = (0u8..76)
+            .flat_map(|index| bm1366_chip_address_uart(index * 2).into_iter())
+            .collect::<Vec<_>>();
+        bytes.extend_from_slice(&bm1366_command_reply_uart(0x0000_115A, 152, 0x28));
+        let obs = observe_bm1366_uart_rx(&bytes, 10);
+        assert_eq!(
+            classify_s19k_chip_enum_complete(&obs),
+            S19kChipEnumCompleteness::NotEnum,
+            "mixed stale command traffic must contaminate, not complete, GetAddress enumeration"
+        );
+        assert_eq!(
+            classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::GetAddress, &obs, Ok(())),
+            S19kRxDiag::FramingOrEcho,
+        );
     }
 
     #[test]
@@ -2027,7 +2316,9 @@ mod tests {
         assert!(refuse_rx_byte5_as_register_address(7).is_ok());
         // read_register(0x0) reply: value=0x13660000, asic=0x04, reg=0x00
         // still ChipAddress because chip_id high-16 is 0x1366 and reg=0.
-        let mut enum0 = [0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let mut enum0 = [
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+        ];
         enum0[10] = command_response_crc5(&enum0[2..10]);
         match classify_bm1366_uart_rx(&enum0).unwrap() {
             S19kUartRxKind::ChipAddress {
@@ -2041,7 +2332,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Different register: CommandReply, not ChipAddress.
-        let mut reg10 = [0xAA, 0x55, 0x00, 0x00, 0x11, 0x5A, 0x08, 0x10, 0x00, 0x00, 0x00];
+        let mut reg10 = [
+            0xAA, 0x55, 0x00, 0x00, 0x11, 0x5A, 0x08, 0x10, 0x00, 0x00, 0x00,
+        ];
         reg10[10] = command_response_crc5(&reg10[2..10]);
         match classify_bm1366_uart_rx(&reg10).unwrap() {
             S19kUartRxKind::CommandReply {
@@ -2074,9 +2367,10 @@ mod tests {
     fn held_bm136x_job_frames_pass_esp_remainder_not_rtl_1b() {
         assert_eq!(esp_asic_crc5(&[0x52, 0x05, 0x00, 0x00]), 0x0A);
         assert_eq!(ESP_BM1366_CHIP_ID_RX_LEN, UART_RESP_LEN);
-        assert_eq!(HELD_BM1368_S21_JOB, [
-            0xAA, 0x55, 0x60, 0x96, 0x39, 0x4C, 0x02, 0x14, 0x03, 0x04, 0x8E,
-        ]);
+        assert_eq!(
+            HELD_BM1368_S21_JOB,
+            [0xAA, 0x55, 0x60, 0x96, 0x39, 0x4C, 0x02, 0x14, 0x03, 0x04, 0x8E,]
+        );
         assert!(admit_esp_rx_crc5_remainder(&HELD_BM1368_S21_JOB).is_ok());
         assert!(refuse_held_bm1362_job_as_bm1366_vector(0x1362).is_err());
         assert!(refuse_held_bm1362_job_as_bm1366_vector(0x1368).is_err());
@@ -2130,9 +2424,11 @@ mod tests {
 
         let baud_3m = classify_s19k_uart_baud_dialect(BRAIINS_PASSTHROUGH_BAUD, None).map(|_| ());
         assert!(baud_3m.is_ok());
-        let baud_3001 =
-            classify_s19k_uart_baud_dialect(BRAIINS_PASSTHROUGH_BAUD, Some)
-                .map(|_| ());
+        let baud_3001 = classify_s19k_uart_baud_dialect(
+            BRAIINS_PASSTHROUGH_BAUD,
+            Some,
+        )
+        .map(|_| ());
         assert!(baud_3001.is_err());
         let baud_esp =
             classify_s19k_uart_baud_dialect(BRAIINS_PASSTHROUGH_BAUD, Some(PUBLIC_FASTUART_VALUE))
@@ -2189,7 +2485,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let fu_obs = observe_bm1366_uart_rx(&fu_frame, 10);
-        assert_eq!(extract_s19k_fastuart_reg28_from_obs(&fu_obs), Some(0x0000_3001));
+        assert_eq!(
+            extract_s19k_fastuart_reg28_from_obs(&fu_obs),
+            Some(0x0000_3001)
+        );
         assert_eq!(
             classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::FastUart28, &fu_obs, baud_3m),
             S19kRxDiag::FastUartRegOk
@@ -2222,7 +2521,9 @@ mod tests {
             ),
             S19kRxDiag::ChipHeardAt115200
         );
-        assert!(expected_rx_after(S19kRxExpectedAfter::GetAddress115200Retry).contains("restore 3M"));
+        assert!(
+            expected_rx_after(S19kRxExpectedAfter::GetAddress115200Retry).contains("restore 3M")
+        );
         assert_eq!(
             classify_s19k_bm1366_rx_after(
                 S19kRxExpectedAfter::FastUart28At115200,
@@ -2269,7 +2570,10 @@ mod tests {
         );
 
         let s3 = observe_bm1366_uart_rx(&HELD_78_CAP_SERIAL_S3, 10);
-        assert!(matches!(s3, S19kUartRxObservation::NoPreamble { nbytes: 3, .. }));
+        assert!(matches!(
+            s3,
+            S19kUartRxObservation::NoPreamble { nbytes: 3, .. }
+        ));
         assert_eq!(
             classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::GetAddress, &s3, baud_3m),
             S19kRxDiag::FramingOrEcho
@@ -2317,17 +2621,21 @@ mod tests {
             classify_s19k_chip_enum_complete(&complete_obs),
             S19kChipEnumCompleteness::Complete77
         );
-        assert!(refuse_one_chipaddress_as_77_chip_complete(
-            S19kChipEnumCompleteness::Complete77
-        )
-        .is_ok());
-        assert!(refuse_one_chipaddress_as_77_chip_complete(
-            classify_s19k_chip_enum_complete(&short_obs)
-        )
-        .is_err());
+        assert!(
+            refuse_one_chipaddress_as_77_chip_complete(S19kChipEnumCompleteness::Complete77)
+                .is_ok()
+        );
+        assert!(
+            refuse_one_chipaddress_as_77_chip_complete(classify_s19k_chip_enum_complete(
+                &short_obs
+            ))
+            .is_err()
+        );
         let hal_bodies = extract_s19k_hal_bm1366_bodies(&complete_bytes);
         assert_eq!(hal_bodies.len(), 77);
-        assert!(hal_bodies.iter().all(|b| b.len() == BM1366_UART_RESP_BODY_LEN));
+        assert!(hal_bodies
+            .iter()
+            .all(|b| b.len() == BM1366_UART_RESP_BODY_LEN));
         assert_eq!(hal_bodies[0][0..2], [0x13, 0x66]);
         let body7 = extract_s19k_aa55_bodies(&complete_bytes[..UART_RESP_LEN], 7);
         assert_eq!(body7.len(), 1);
@@ -2335,20 +2643,21 @@ mod tests {
         assert!(refuse_s19k_hal_body7_extract_as_bm1366_frame().is_err());
         let body11 = extract_s19k_aa55_bodies(&complete_bytes[..UART_RESP_LEN], 11);
         assert!(body11.is_empty(), "body_len=11 hunts 13-byte wire");
-        let hal_obs = crate::s19k_braiins_chain_discover::observe_get_address_bodies(&hal_bodies, 10);
+        let hal_obs =
+            crate::s19k_braiins_chain_discover::observe_get_address_bodies(&hal_bodies, 10);
         assert_eq!(
             classify_s19k_chip_enum_complete(&hal_obs),
             S19kChipEnumCompleteness::Complete77
         );
-        assert!(admit_s19k_hal_bodies_77_complete(classify_s19k_chip_enum_complete(
-            &hal_obs
-        ))
-        .is_ok());
+        assert!(
+            admit_s19k_hal_bodies_77_complete(classify_s19k_chip_enum_complete(&hal_obs)).is_ok()
+        );
         let mut short_bodies = Vec::new();
         for addr in [0u8, 4, 6, 8, 10, 12, 14, 16] {
             short_bodies.push(bm1366_chip_address_uart(addr)[2..].to_vec());
         }
-        let short_hal = crate::s19k_braiins_chain_discover::observe_get_address_bodies(&short_bodies, 10);
+        let short_hal =
+            crate::s19k_braiins_chain_discover::observe_get_address_bodies(&short_bodies, 10);
         assert!(matches!(
             classify_s19k_chip_enum_complete(&short_hal),
             S19kChipEnumCompleteness::Short { missing: 0x02, .. }
@@ -2442,7 +2751,9 @@ mod tests {
                 assert_eq!(raw_job_byte, 2);
                 assert_eq!(job_id, 2 & BM1366_JOB_ID_MASK);
                 assert_eq!(job_id, 0);
-                assert!(refuse_esp_masked_job_id_as_braiins_fill_work_id(job_id, raw_job_byte).is_err());
+                assert!(
+                    refuse_esp_masked_job_id_as_braiins_fill_work_id(job_id, raw_job_byte).is_err()
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -2471,18 +2782,13 @@ mod tests {
             JobWirePrefixKind::FpgaEspLiveMiss
         );
         assert_eq!(
-            classify_s19k_bm1366_rx_after(
-                S19kRxExpectedAfter::WorkDispatch2156,
-                &silence,
-                baud_3m
-            ),
+            classify_s19k_bm1366_rx_after(S19kRxExpectedAfter::WorkDispatch2156, &silence, baud_3m),
             S19kRxDiag::WrongJobShapeSilence
         );
-        assert!(refuse_zero_nonce_after_2156_as_parser_proof(
-            &LIVE_20260812_FPGA_PREFIX,
-            &silence
-        )
-        .is_err());
+        assert!(
+            refuse_zero_nonce_after_2156_as_parser_proof(&LIVE_20260812_FPGA_PREFIX, &silence)
+                .is_err()
+        );
         assert!(refuse_zero_nonce_after_2156_as_parser_proof(&tx, &silence).is_ok());
         assert!(expected_rx_after(S19kRxExpectedAfter::WorkDispatch2156).contains("21 56"));
 
@@ -2545,7 +2851,9 @@ mod tests {
             ),
             S19kRxDiag::SinglePortNotDualProof
         );
-        assert!(refuse_one_port_work_as_dual_chain_proof(S19kRxDiag::SinglePortNotDualProof).is_err());
+        assert!(
+            refuse_one_port_work_as_dual_chain_proof(S19kRxDiag::SinglePortNotDualProof).is_err()
+        );
         assert!(refuse_one_port_work_as_dual_chain_proof(S19kRxDiag::JobNonceFillOk).is_ok());
         assert_eq!(
             classify_s19k_dual_uart_rx_after(
@@ -2591,13 +2899,15 @@ mod tests {
     fn s19k_rxbuf_leftover_aa_plus_tx55_is_not_jobnonce() {
         let mut tx = S19K_CLOSED_SEND_WORK_PREFIX.to_vec();
         tx.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        assert!(refuse_s19k_rxbuf_leftover_aa_plus_tx55_as_jobnonce(
-            &HELD_78_CAP_SERIAL_S3,
-            &tx
-        )
-        .is_err());
+        assert!(
+            refuse_s19k_rxbuf_leftover_aa_plus_tx55_as_jobnonce(&HELD_78_CAP_SERIAL_S3, &tx)
+                .is_err()
+        );
         assert!(refuse_s19k_held_s3_aa_as_preamble_seed().is_err());
-        assert_eq!(s19k_hal_rxbuf_keep_last_byte(&HELD_78_CAP_SERIAL_S3), vec![0xAA]);
+        assert_eq!(
+            s19k_hal_rxbuf_keep_last_byte(&HELD_78_CAP_SERIAL_S3),
+            vec![0xAA]
+        );
         const SERIAL: &str = include_str!("../../dcentrald/src/serial_mining.rs");
         assert!(admit_s19k_production_flush_rx_after_getaddress_nopreamble(SERIAL).is_ok());
         assert!(admit_s19k_production_flush_rx_after_fastuart_empty(SERIAL).is_ok());
@@ -2607,9 +2917,8 @@ mod tests {
 
     #[test]
     fn s19k_s21_held_uart_is_1368_not_1366_jobnonce() {
-        const ASIC: &[u8] = include_bytes!(
-            "../../../../../"
-        );
+        const ASIC: &[u8] =
+            include_bytes!("../../../../../");
         const CMD: &[u8] = include_bytes!(
             "../../../../../"
         );

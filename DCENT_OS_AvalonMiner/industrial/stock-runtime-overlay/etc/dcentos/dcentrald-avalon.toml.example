@@ -1,0 +1,27 @@
+# Nano 3 stock-chain laboratory configuration.
+#
+# This file is deliberately not installed at the daemon's canonical
+# /data/dcentrald-avalon.toml path.  The factory Nano 3 runs the monolithic
+# btcminer process, which owns /dev/ttyS1, the display, thermals, Wi-Fi and the
+# web UI.  The current dcentrald-avalon binary expects the Nano 3S/industrial
+# mm_pkg SysV queue instead and must not run alongside btcminer.
+#
+# To conduct an explicitly authorized takeover experiment, first stop
+# btcminer, copy this file to /data/dcentrald-avalon.toml, edit the pool
+# settings, and follow /etc/init.d/dcentrald's guarded start instructions.
+
+[pool]
+# A local closed port prevents an unedited laboratory config from contacting
+# an external pool if the transport handshake unexpectedly succeeds.
+url = "127.0.0.1"
+port = 1
+worker_name = "disabled.nano3-observation"
+password = "x"
+version_rolling = true
+suggest_difficulty = 0
+
+[miner]
+# The Nano 3 has ten ASICs.  Frequency remains at the driver's minimum for a
+# future takeover experiment; this is not authorization to energize them.
+frequency_mhz = 100.0
+asic_count = 10

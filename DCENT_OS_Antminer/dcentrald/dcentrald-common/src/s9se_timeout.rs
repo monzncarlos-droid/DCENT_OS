@@ -66,12 +66,7 @@ pub fn stock_timeout(
 }
 
 pub fn stock_timeout_s9se(freq_mhz: u32) -> Result<u32, S9SeTimeoutError> {
-    stock_timeout(
-        freq_mhz,
-        STOCK_TIMEOUT_PERCENT,
-        S9SE_ADDR_INTERVAL,
-        208,
-    )
+    stock_timeout(freq_mhz, STOCK_TIMEOUT_PERCENT, S9SE_ADDR_INTERVAL, 208)
 }
 
 /// `set_time_out_control` word. Not a write permit.

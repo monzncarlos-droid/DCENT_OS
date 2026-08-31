@@ -2760,6 +2760,7 @@ export const FIXTURES: Record<string, unknown> = {
     "end_hour": 7,
     "max_fan_pwm": 30,
     "power_reduction_pct": 20,
+    "max_frequency_mhz": 400,
     "active": false
   },
   "/api/heater": {

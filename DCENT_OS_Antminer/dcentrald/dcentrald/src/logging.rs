@@ -111,6 +111,10 @@ pub fn init_logging(level: &str) -> Result<()> {
             ))
         });
 
+    let ansi = dcentrald_common::s19k_am3_install::s19k_track1_tracing_ansi_enabled(
+        std::env::var("RUST_LOG_STYLE").ok().as_deref(),
+    );
+
     if !log_ring_disabled_by_env() {
         match PersistentLogRing::open_default() {
             Ok(ring) => {
@@ -118,6 +122,7 @@ pub fn init_logging(level: &str) -> Result<()> {
                     .with_env_filter(env_filter)
                     .with_writer(RingTeeMakeWriter::new(ring))
                     .with_timer(RtcAwareTimer::new())
+                    .with_ansi(ansi)
                     .with_target(true)
                     .with_thread_ids(false)
                     .with_file(false)
@@ -138,6 +143,7 @@ pub fn init_logging(level: &str) -> Result<()> {
     fmt()
         .with_env_filter(env_filter)
         .with_timer(RtcAwareTimer::new())
+        .with_ansi(ansi)
         .with_target(true)
         .with_thread_ids(false)
         .with_file(false)

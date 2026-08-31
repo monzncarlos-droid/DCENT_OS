@@ -5,14 +5,22 @@
 //! from a Template Provider, asks the pool-side JDS for mining-job tokens,
 //! declares or advertises the custom job, then serves standard SV2 work to
 //! downstream devices.
+//!
+//! # Honesty (DESK_NOW rank 12)
+//!
+//! [`JdClient::probe_once`] is **opt-in** (`JdConfig.enabled` default
+//! false). It is a supervisor / connectivity probe — **not** mining-work
+//! injection, **not** live accepted-share proof, and **not Braiins-parity**
+//! Job Declaration. Live SV2 accepted shares remain **BENCH_HOLD**. This
+//! module is SV2 JDP/TDP, **not** OCEAN DATUM
+//! ([`crate::types::DATUM_PROTOCOL_SUPPORTED`] is false).
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use super::auth::{
-    parse_authority_key_from_sv2_url, sv2_insecure_no_noise, sv2_tp_require_noise,
-    AuthorityKeyError,
+    admit_authority_key_for_peer, sv2_insecure_no_noise_for_peer, sv2_tp_require_noise,
 };
 use super::framing::{Sv2Frame, Sv2FrameHeader, FRAME_HEADER_SIZE};
 use super::noise::NoiseSession;
@@ -56,9 +64,15 @@ impl Default for JdMode {
 }
 
 /// Job Declaration Client configuration.
+///
+/// **Opt-in.** [`JdConfig::enabled`] defaults to `false`. Enabling this
+/// does not prove live SV2 mining or Braiins JD parity. See
+/// [`JdClient::probe_once`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JdConfig {
+    /// Supervisor probe + JD session. Default `false` (opt-in). Not a
+    /// live-mining or DATUM switch.
     pub enabled: bool,
     pub mode: JdMode,
     pub bitcoind_rpc_url: String,
@@ -229,6 +243,10 @@ pub struct CustomJobCandidateKey {
 }
 
 /// Job Declaration Client state holder.
+///
+/// Opt-in supervisor client. [`Self::probe_once`] is connectivity/setup
+/// proof, not mining-work injection. Live accepted shares **BENCH_HOLD**;
+/// not Braiins-parity; not DATUM.
 pub struct JdClient {
     config: JdConfig,
 }
@@ -291,12 +309,17 @@ impl JdClient {
 
     /// Run one bounded live JD/TDP session probe.
     ///
-    /// This is intentionally a supervisor proof, not yet mining-work injection:
+    /// **Opt-in** (`JdConfig.enabled` default false). This is intentionally a
+    /// supervisor / connectivity proof, **not** mining-work injection:
     /// it connects to the configured Template Provider and Job Declarator,
     /// sends Common `SetupConnection`, and for the Template Provider sends
     /// `CoinbaseOutputConstraints`. The downstream custom-job bridge is kept
     /// gated until both sessions are healthy and a full template/job-declare
     /// pipeline is merged.
+    ///
+    /// Host mock-pool tests pin the Noise round-trip. **Live accepted shares
+    /// are BENCH_HOLD.** This is **not Braiins-parity** Job Declaration and
+    /// **not** OCEAN DATUM.
     pub async fn probe_once(&self) -> JdStatus {
         let mut status = self.status();
         let now = unix_now_s();
@@ -1101,13 +1124,14 @@ impl JdConn {
         .map_err(|error| format!("{} connect failed: {}", label, error))?;
         let _ = stream.set_nodelay(true);
 
-        let host_is_loopback = host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false);
+        let peer_is_loopback = stream
+            .peer_addr()
+            .map(|address| address.ip().is_loopback())
+            .unwrap_or(false);
 
-        if sv2_insecure_no_noise() {
+        if sv2_insecure_no_noise_for_peer(peer_is_loopback)
+            .map_err(|error| format!("{}: {}", label, error))?
+        {
             warn!(
                 endpoint = label,
                 "JD: DCENT_SV2_INSECURE_NO_NOISE set — connecting in CLEARTEXT (lab/mock only)"
@@ -1119,7 +1143,7 @@ impl JdConn {
             });
         }
 
-        if is_template_provider && host_is_loopback && !sv2_tp_require_noise() {
+        if is_template_provider && peer_is_loopback && !sv2_tp_require_noise() {
             info!(
                 endpoint = label,
                 %host,
@@ -1132,27 +1156,26 @@ impl JdConn {
             });
         }
 
-        // Secure path: Noise_NX handshake, with authority-key pinning from
-        // the URL when present (TOFU + WARN otherwise — same posture as the
-        // mining client).
+        // Secure path: Noise_NX handshake with authority-key pinning. A local
+        // mock peer may use TOFU; a remote peer must carry an exact key.
         let mut noise = NoiseSession::new();
-        match parse_authority_key_from_sv2_url(url) {
-            Ok(key) => {
+        match admit_authority_key_for_peer(url, peer_is_loopback) {
+            Ok(Some(key)) => {
                 noise.pool_authority_key = Some(*key.as_bytes());
                 info!(
                     endpoint = label,
                     "JD: pinned authority key from URL — server certificate will be verified"
                 );
             }
-            Err(AuthorityKeyError::NotPresent) => {
+            Ok(None) => {
                 warn!(
                     endpoint = label,
-                    "JD: no authority key in URL — Noise handshake in TOFU mode (MITM possible)"
+                    "JD: loopback peer has no authority key — local test session is using TOFU"
                 );
             }
             Err(e) => {
                 return Err(format!(
-                    "{}: URL carries an invalid authority key ({}). Refusing to connect.",
+                    "{}: authority-key admission failed ({}). Refusing to connect.",
                     label, e
                 ));
             }
@@ -1896,6 +1919,17 @@ mod tests {
         fn jd_endpoint_parser_never_panics_on_arbitrary_text(url in ".{0,512}") {
             let _ = parse_tcp_endpoint(&url);
         }
+    }
+
+    #[tokio::test]
+    async fn probe_once_is_opt_in_disabled_by_default_not_mining() {
+        assert!(!JdConfig::default().enabled);
+        let status = JdClient::new(JdConfig::default()).probe_once().await;
+        assert!(!status.enabled);
+        assert_eq!(status.runtime_state, "disabled");
+        assert!(!status.connected);
+        assert!(!status.custom_job_injection_active);
+        assert!(!crate::types::DATUM_PROTOCOL_SUPPORTED);
     }
 
     #[test]
@@ -2857,49 +2891,24 @@ mod tests {
         Some(out)
     }
 
-    /// Locate a usable `bitcoind`/`bitcoin-cli` pair. Honors
-    /// `DCENT_SV2_JD_REGTEST_BITCOIND` (path to `bitcoind`), else probes
-    /// the common Windows / *nix install locations. Returns `None` (test
-    /// degrades to the high-fidelity-mock path) when not found.
+    /// Admit an explicitly selected `bitcoind`/`bitcoin-cli` pair.
+    ///
+    /// Merely having Bitcoin Core installed must never make an ordinary test
+    /// run spawn a node. The real-regtest branch therefore requires
+    /// `DCENT_SV2_JD_REGTEST_BITCOIND`; otherwise the test deterministically
+    /// uses its in-process high-fidelity mock.
     fn find_bitcoind() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let candidates: Vec<std::path::PathBuf> =
-            if let Ok(p) = std::env::var("DCENT_SV2_JD_REGTEST_BITCOIND") {
-                vec![std::path::PathBuf::from(p)]
-            } else {
-                vec![
-                    "C:/Program Files/Bitcoin/daemon/bitcoind.exe".into(),
-                    "/usr/bin/bitcoind".into(),
-                    "/usr/local/bin/bitcoind".into(),
-                    "bitcoind".into(),
-                ]
-            };
-        for d in candidates {
-            let cli = {
-                let s = d.to_string_lossy();
-                std::path::PathBuf::from(
-                    s.replace("bitcoind.exe", "bitcoin-cli.exe")
-                        .replace("bitcoind", "bitcoin-cli"),
-                )
-            };
-            if d.exists() && cli.exists() {
-                return Some((d, cli));
-            }
-            // PATH-resolved "bitcoind" with no extension: verify it is
-            // actually runnable before trusting it. A clean checkout / CI
-            // without bitcoind installed must degrade to the high-fidelity
-            // mock template (the `None` arm below), never panic on spawn.
-            if d.to_string_lossy() == "bitcoind"
-                && std::process::Command::new(&d)
-                    .arg("-version")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok()
-            {
-                return Some((d.clone(), std::path::PathBuf::from("bitcoin-cli")));
-            }
+        let d = std::path::PathBuf::from(std::env::var("DCENT_SV2_JD_REGTEST_BITCOIND").ok()?);
+        let s = d.to_string_lossy();
+        let cli = std::path::PathBuf::from(
+            s.replace("bitcoind.exe", "bitcoin-cli.exe")
+                .replace("bitcoind", "bitcoin-cli"),
+        );
+        if d.is_file() && cli.is_file() {
+            Some((d, cli))
+        } else {
+            None
         }
-        None
     }
 
     /// End-to-end JD/TDP proof. With a real regtest `bitcoind` it sources

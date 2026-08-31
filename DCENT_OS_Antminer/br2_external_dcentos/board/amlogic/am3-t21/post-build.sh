@@ -1,13 +1,12 @@
 #!/bin/sh
 #
-# DCENTos post-build script — am3-t21 (T21 Amlogic NoPic variant)
+# DCENTos post-build script — am3-t21 (T21 Amlogic scaffold)
 # D-Central Technologies, Phase 4B (2026-05-15)
 #
 # Sibling of board/amlogic/am3-s21/post-build.sh. Same overlay-on-overlay
 # pattern, same aarch64 toolchain, same shared `board/amlogic/rootfs-overlay/`
-# base layer. T21 is the lower-tier S21 sibling on the same A113D carrier
-# (BM1368 + NoPic TAS5782M); product identity is the only meaningful
-# difference vs S21.
+# base layer. Held firmware proves an Amlogic T21 target, but controller-specific
+# PIC, PSU, rail, and reset behavior remains unresolved and non-authorizing.
 #
 # Overlay-on-overlay (see defconfig): Buildroot applies the shared
 # board/amlogic/rootfs-overlay/ FIRST, then this board's rootfs-overlay on
@@ -148,28 +147,16 @@ echo "am3-aml-t21"  > "${TARGET_DIR}/etc/dcentos/board_family"
 echo "am3-t21"      > "${TARGET_DIR}/etc/dcentos/board_target"
 echo "am3-aml-t21"  > "${TARGET_DIR}/etc/dcentos/platform"
 
-# The AM3 revert helpers source lib/am3_geometry.sh beside /usr/sbin.
-AM3_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/am3_geometry.sh"
-if [ -f "$AM3_GEOMETRY_SRC" ]; then
-    mkdir -p "${TARGET_DIR}/usr/sbin/lib"
-    cp "$AM3_GEOMETRY_SRC" "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh"
-    chmod 644 "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh" 2>/dev/null || true
-    echo "DCENTos post-build (am3-t21): installed am3_geometry.sh for revert helpers"
-else
-    echo "DCENTos post-build (am3-t21): WARNING: am3_geometry.sh not found at $AM3_GEOMETRY_SRC" >&2
+MUTATION_POLICY=$(tr -d ' \t\r\n' < "${TARGET_DIR}/etc/dcentos/mutation_policy" 2>/dev/null || true)
+if [ "$MUTATION_POLICY" != management-only ]; then
+    echo "DCENTos post-build (am3-t21): ERROR: missing management-only mutation policy" >&2
+    exit 1
 fi
 
-# Phase 4C deliverable. The script may not exist yet when Phase 4B
-# scaffolding lands; warn but do not fail. Once Phase 4C ships
-# revert_to_stock_am3_aml_t21.sh, this becomes a hard install.
-REVERT_T21_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/revert_to_stock_am3_aml_t21.sh"
-if [ -f "$REVERT_T21_SRC" ]; then
-    cp "$REVERT_T21_SRC" "${TARGET_DIR}/usr/sbin/revert_to_stock_am3_aml_t21.sh"
-    chmod +x "${TARGET_DIR}/usr/sbin/revert_to_stock_am3_aml_t21.sh" 2>/dev/null || true
-    echo "DCENTos post-build (am3-t21): installed revert_to_stock_am3_aml_t21.sh from scripts/"
-else
-    echo "DCENTos post-build (am3-t21): WARNING: revert_to_stock_am3_aml_t21.sh not found (Phase 4C pending) at $REVERT_T21_SRC" >&2
-fi
+# Do not stage the generic AM3 geometry or T21 revert helper. Their retained
+# sources encode an S19K/S21 rootfs window that has not been proven on any T21
+# controller variant. Recovery becomes shippable only with T21-specific flash,
+# write/readback, boot, and rollback evidence.
 
 # Stock-Bitmain manifest (parity with zynq board post-build).
 MANIFEST_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../../../knowledge-base/firmware-archive/stock-bitmain-manifest.json"

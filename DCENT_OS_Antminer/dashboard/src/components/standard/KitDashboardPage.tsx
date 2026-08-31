@@ -96,7 +96,7 @@ export function KitDashboardPage(props: KitDashboardPageProps) {
 
   return (
     <div className="page-content standard-dashboard-stack standard-stagger">
-      {/* Safety: circuit overdraw warning (gated on declared circuit). */}
+      {/* Safety: circuit overdraw warning (declared cap, or undeclared 1440 W). */}
       <CircuitWarning
         currentWatts={liveCircuitWatts > 0 ? liveCircuitWatts : null}
         voltageV={props.circuit.voltage}

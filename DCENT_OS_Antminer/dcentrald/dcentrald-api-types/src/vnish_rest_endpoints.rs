@@ -71,15 +71,24 @@ pub enum VnishEndpoint {
     PoolsSet,
     AutotunePresetsGet,
     AutotunePresetsSet,
+    AutotuneReset,
+    AutotuneResetAll,
     Metrics,
     FactoryInfo,
+    Chains,
     MiningRestart,
     MiningPause,
     MiningResume,
     MiningStop,
     MiningStart,
+    MiningSwitchPool,
     SystemReboot,
     FindMiner,
+    SettingsBackup,
+    SettingsRestore,
+    Model,
+    AuthCheck,
+    Notes,
     Upgrade,
     FactoryReset,
     RestoreStock,
@@ -115,15 +124,24 @@ pub fn descriptor(endpoint: VnishEndpoint) -> VnishEndpointDescriptor {
         PoolsSet => (Post, "/api/v1/pools", Bearer_, Write),
         AutotunePresetsGet => (Get, "/api/v1/autotune/presets", Bearer_, Read),
         AutotunePresetsSet => (Post, "/api/v1/autotune/presets", Bearer_, Write),
+        AutotuneReset => (Post, "/api/v1/autotune/reset", Bearer_, Write),
+        AutotuneResetAll => (Post, "/api/v1/autotune/reset-all", Bearer_, Write),
         Metrics => (Get, "/api/v1/metrics", Bearer_, Read),
-        FactoryInfo => (Get, "/api/v1/factory-info", Bearer_, Read),
+        FactoryInfo => (Get, "/api/v1/chains/factory-info", Bearer_, Read),
+        Chains => (Get, "/api/v1/chains", Bearer_, Read),
         MiningRestart => (Post, "/api/v1/mining/restart", Bearer_, Lifecycle),
         MiningPause => (Post, "/api/v1/mining/pause", Bearer_, Lifecycle),
         MiningResume => (Post, "/api/v1/mining/resume", Bearer_, Lifecycle),
         MiningStop => (Post, "/api/v1/mining/stop", Bearer_, Lifecycle),
         MiningStart => (Post, "/api/v1/mining/start", Bearer_, Lifecycle),
+        MiningSwitchPool => (Post, "/api/v1/mining/switch-pool", Bearer_, Lifecycle),
         SystemReboot => (Post, "/api/v1/system/reboot", Bearer_, Lifecycle),
         FindMiner => (Post, "/api/v1/find-miner", Bearer_, Write),
+        SettingsBackup => (Get, "/api/v1/settings/backup", Bearer_, Read),
+        SettingsRestore => (Post, "/api/v1/settings/restore", Bearer_, Write),
+        Model => (Get, "/api/v1/model", Bearer_, Read),
+        AuthCheck => (Get, "/api/v1/auth-check", Bearer_, Read),
+        Notes => (Get, "/api/v1/notes", Bearer_, Read),
         // Upgrade: writes a new firmware to flash. Without successful
         // signing-oracle verification this can brick — classify
         // Destructive so the dashboard requires confirmation.
@@ -168,15 +186,24 @@ pub const ALL_ENDPOINTS: &[VnishEndpoint] = &[
     VnishEndpoint::PoolsSet,
     VnishEndpoint::AutotunePresetsGet,
     VnishEndpoint::AutotunePresetsSet,
+    VnishEndpoint::AutotuneReset,
+    VnishEndpoint::AutotuneResetAll,
     VnishEndpoint::Metrics,
     VnishEndpoint::FactoryInfo,
+    VnishEndpoint::Chains,
     VnishEndpoint::MiningRestart,
     VnishEndpoint::MiningPause,
     VnishEndpoint::MiningResume,
     VnishEndpoint::MiningStop,
     VnishEndpoint::MiningStart,
+    VnishEndpoint::MiningSwitchPool,
     VnishEndpoint::SystemReboot,
     VnishEndpoint::FindMiner,
+    VnishEndpoint::SettingsBackup,
+    VnishEndpoint::SettingsRestore,
+    VnishEndpoint::Model,
+    VnishEndpoint::AuthCheck,
+    VnishEndpoint::Notes,
     VnishEndpoint::Upgrade,
     VnishEndpoint::FactoryReset,
     VnishEndpoint::RestoreStock,
@@ -188,9 +215,11 @@ mod tests {
 
     #[test]
     fn catalog_count_matches_re_doc() {
-        // VNISH_REVERSE_ENGINEERING.md §3.1 lists 25 distinct REST endpoints
-        // (1 auth + 14 GET + 7 POST + 3 system).
-        assert_eq!(ALL_ENDPOINTS.len(), 25);
+        // 1.2.6 pyasic-era catalog was 25. VNish 1.2.7 OpenAPI (`api-doc.json`)
+        // adds autotune reset, chains, switch-pool, settings backup/restore,
+        // model, auth-check, and notes. Warranty/apikeys/lock-others stay out
+        // (do-not-clone / not a DCENT product surface).
+        assert_eq!(ALL_ENDPOINTS.len(), 34);
     }
 
     #[test]
@@ -235,6 +264,7 @@ mod tests {
             VnishEndpoint::MiningResume,
             VnishEndpoint::MiningStop,
             VnishEndpoint::MiningStart,
+            VnishEndpoint::MiningSwitchPool,
             VnishEndpoint::SystemReboot,
         ] {
             let d = descriptor(endpoint);
@@ -346,10 +376,28 @@ mod tests {
 
     #[test]
     fn factory_info_is_read_only() {
-        // /api/v1/factory-info exposes serial/board-type/PSU info — read.
+        // 1.2.7 OpenAPI: GET /api/v1/chains/factory-info (not /factory-info).
         let d = descriptor(VnishEndpoint::FactoryInfo);
         assert_eq!(d.kind, VnishEndpointKind::Read);
         assert_eq!(d.method, VnishMethod::Get);
+        assert_eq!(d.path, "/api/v1/chains/factory-info");
+    }
+
+    #[test]
+    fn vnish_1_2_7_extras_are_catalogued() {
+        assert_eq!(
+            descriptor(VnishEndpoint::AutotuneReset).path,
+            "/api/v1/autotune/reset"
+        );
+        assert_eq!(
+            descriptor(VnishEndpoint::MiningSwitchPool).path,
+            "/api/v1/mining/switch-pool"
+        );
+        assert_eq!(
+            descriptor(VnishEndpoint::SettingsBackup).path,
+            "/api/v1/settings/backup"
+        );
+        assert_eq!(descriptor(VnishEndpoint::Chains).path, "/api/v1/chains");
     }
 
     #[test]

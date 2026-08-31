@@ -1,0 +1,36 @@
+[package]
+name = "dcent-avalon-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Canaan Avalon protocol primitives shared between DCENT_axe Avalon (Nano 3/3S/Mini 3) and DCENT_OS Avalon (industrial A14xx/A15xx/A16xx/Avalon Q)"
+license = "GPL-3.0"
+repository = "https://github.com/d-central"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.10", optional = true }
+csv = { version = "=1.4.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+serde = ["dep:serde"]
+# Pure held-binary TX serialization research only. This feature adds no I/O
+# and leaves the Nano 3 profile's native transmit/mining authority false.
+nano3-native-tx-research = ["dep:sha2"]
+# File-only conversion of operator-exported Saleae UART analyzer CSVs. The CLI
+# rejects device/symlink paths and contains no serial, USB, network, or TX code.
+nano3-capture-cli = ["nano3-native-tx-research", "dep:csv"]
+
+[lib]
+name = "dcent_avalon_proto"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nano3-n3cap"
+path = "src/bin/nano3_n3cap.rs"
+required-features = ["nano3-capture-cli"]

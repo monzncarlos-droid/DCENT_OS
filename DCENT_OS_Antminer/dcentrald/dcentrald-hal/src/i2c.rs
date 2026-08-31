@@ -981,10 +981,11 @@ impl I2cBus {
 
     /// Combined write-then-read using I2C_RDWR ioctl (repeated START).
     ///
-    /// This is CRITICAL for PIC communication — separate write() + read()
-    /// transactions return garbage (I2C address echo) instead of the actual
-    /// PIC response. The I2C_RDWR ioctl sends both messages in one kernel
-    /// call with a repeated START condition between write and read.
+    /// EEPROM offset reads, PMBus, and LM75 temperature-register probes need
+    /// this kernel combined transfer. Do **not** call it on PIC16F1704
+    /// (S9 0x55..=0x57) — repeated START wedges the MSSP parser (brick-class).
+    /// PIC16 `pic_read_voltage` / `pic_get_version` write preamble+cmd, then
+    /// issue a separate one-byte `read`.
     pub fn write_read(&mut self, write_data: &[u8], read_buf: &mut [u8]) -> Result<()> {
         self.validate_raw_fabric_owner()?;
         let addr = self.current_addr.unwrap_or(0);
@@ -1222,29 +1223,27 @@ impl I2cBus {
         self.pic_command(addr, pic_cmd::ENABLE)
     }
 
-    /// Read actual voltage from DC-DC (bmminer cmd 0x08, I2C_RDWR).
+    /// Read actual voltage from DC-DC (bmminer cmd 0x08).
+    ///
+    /// PIC16F1704 MSSP: never combined I2C_RDWR. Write preamble+cmd with the
+    /// same `pic_command` primitive as ENABLE/JUMP, then a separate one-byte
+    /// `read` (same as `pic_read_raw`).
     pub fn pic_read_voltage(&mut self, addr: u8) -> Result<u8> {
-        self.set_slave(addr)?;
-        let cmd = [
-            pic_cmd::PREAMBLE[0],
-            pic_cmd::PREAMBLE[1],
-            pic_cmd::READ_VOLTAGE,
-        ];
+        self.pic_command(addr, pic_cmd::READ_VOLTAGE)?;
         let mut buf = [0u8; 1];
-        self.write_read(&cmd, &mut buf)?;
+        self.read(&mut buf)?;
         Ok(buf[0])
     }
 
-    /// Get PIC firmware version (bmminer cmd 0x04, I2C_RDWR).
+    /// Get PIC firmware version (bmminer cmd 0x04).
+    ///
+    /// PIC16F1704 MSSP: never combined I2C_RDWR. Write preamble+cmd with the
+    /// same `pic_command` primitive as ENABLE/JUMP, then a separate one-byte
+    /// `read` (same as `pic_read_raw`).
     pub fn pic_get_version(&mut self, addr: u8) -> Result<u8> {
-        self.set_slave(addr)?;
-        let cmd = [
-            pic_cmd::PREAMBLE[0],
-            pic_cmd::PREAMBLE[1],
-            pic_cmd::GET_VERSION,
-        ];
+        self.pic_command(addr, pic_cmd::GET_VERSION)?;
         let mut buf = [0u8; 1];
-        self.write_read(&cmd, &mut buf)?;
+        self.read(&mut buf)?;
         Ok(buf[0])
     }
 
@@ -2601,10 +2600,10 @@ unsafe fn devmem_i2c_read_inner(
 // I2C Service — serialized single-thread I2C bus access
 // ---------------------------------------------------------------------------
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod pic16_admission;
 mod pic16_runtime;
@@ -2627,6 +2626,119 @@ const PIC16_ADMISSION_IDLE: u64 = 0;
 const PIC16_ADMISSION_ACTIVE_BIT: u64 = 1 << 63;
 const PIC16_ADMISSION_TOKEN_MAX: u64 = PIC16_ADMISSION_ACTIVE_BIT - 1;
 const PIC16_RUNTIME_MAX_ENDPOINTS: usize = 3;
+
+/// Protocol operation that most recently completed successfully against an
+/// endpoint through the serialized I2C owner.
+///
+/// This is intentionally an operation classification, not device identity.
+/// A successful controller-shaped exchange can prove that an endpoint
+/// acknowledged that operation; it cannot by itself prove a controller model,
+/// board identity, calibration state, or health verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I2cObservedOperation {
+    PicHeartbeat,
+    PicVoltageCommand,
+    PicSafeOff,
+    DspicVoltageCommand,
+    PicBootloaderStateRead,
+    GenericWrite,
+    GenericBytewiseWrite,
+    GenericRead,
+    HashboardEepromRead,
+    Lm75TemperatureRead,
+    GenericWriteRead,
+    CompoundTransaction,
+}
+
+impl I2cObservedOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PicHeartbeat => "pic_heartbeat",
+            Self::PicVoltageCommand => "pic_voltage_command",
+            Self::PicSafeOff => "pic_safe_off",
+            Self::DspicVoltageCommand => "dspic_voltage_command",
+            Self::PicBootloaderStateRead => "pic_bootloader_state_read",
+            Self::GenericWrite => "generic_write",
+            Self::GenericBytewiseWrite => "generic_bytewise_write",
+            Self::GenericRead => "generic_read",
+            Self::HashboardEepromRead => "hashboard_eeprom_read",
+            Self::Lm75TemperatureRead => "lm75_temperature_read",
+            Self::GenericWriteRead => "generic_write_read",
+            Self::CompoundTransaction => "compound_transaction",
+        }
+    }
+
+    /// Conservative protocol role supported by the operation shape alone.
+    pub const fn endpoint_role(self) -> &'static str {
+        match self {
+            Self::HashboardEepromRead => "hashboard_eeprom_endpoint",
+            Self::Lm75TemperatureRead => "temperature_sensor_endpoint",
+            Self::PicHeartbeat
+            | Self::PicVoltageCommand
+            | Self::PicSafeOff
+            | Self::DspicVoltageCommand
+            | Self::PicBootloaderStateRead => "controller_protocol_endpoint",
+            Self::GenericWrite
+            | Self::GenericBytewiseWrite
+            | Self::GenericRead
+            | Self::GenericWriteRead
+            | Self::CompoundTransaction => "unclassified_endpoint",
+        }
+    }
+}
+
+/// One positive endpoint observation retained by the serialized I2C owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I2cEndpointObservation {
+    pub address: u8,
+    pub last_successful_operation: I2cObservedOperation,
+    pub last_observed_at_ms: u64,
+    pub successful_operation_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct I2cObservationState {
+    sequence: u64,
+    endpoints: BTreeMap<u8, I2cEndpointObservation>,
+}
+
+/// Read-only view of observations retained by one exact service lifetime.
+///
+/// The reader has no request sender and therefore cannot open, scan, probe, or
+/// mutate the bus. Dropping/replacing a service lifetime also replaces the
+/// observation authority exposed by its reader.
+#[derive(Clone)]
+pub struct I2cObservationReader {
+    bus: u8,
+    safety: Arc<I2cSafetyAuthority>,
+}
+
+/// Point-in-time clone of one service lifetime's retained positive evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I2cServiceObservationSnapshot {
+    pub bus: u8,
+    pub sequence: u64,
+    pub endpoints: Vec<I2cEndpointObservation>,
+}
+
+impl I2cObservationReader {
+    pub const fn bus(&self) -> u8 {
+        self.bus
+    }
+
+    pub fn snapshot(&self) -> I2cServiceObservationSnapshot {
+        let observations = self
+            .safety
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        I2cServiceObservationSnapshot {
+            bus: self.bus,
+            sequence: observations.sequence,
+            endpoints: observations.endpoints.values().cloned().collect(),
+        }
+    }
+}
 
 /// Firmware type indicator (mirrors PicFirmware enum without depending on dcentrald-asic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2960,6 +3072,9 @@ struct I2cSafetyAuthority {
     /// Active batch and monotonic managed-address history share one lock so
     /// worker-start gates cannot observe a half-published authority transfer.
     pic16_service_state: Mutex<Pic16ServiceAuthorityState>,
+    /// Successful endpoint operations already performed by this exact
+    /// serialized owner. Failures are deliberately not converted into absence.
+    observations: Mutex<I2cObservationState>,
     /// PIC16 cleanup could not prove the physical rails safe. This is
     /// deliberately separate from the generic terminal lifecycle barrier.
     pic16_shutdown_unresolved: AtomicBool,
@@ -2980,12 +3095,41 @@ impl Default for I2cSafetyAuthority {
             pic16_active_batch_epoch: AtomicU64::new(0),
             pic16_batch_sequence: AtomicU64::new(0),
             pic16_service_state: Mutex::new(Pic16ServiceAuthorityState::default()),
+            observations: Mutex::new(I2cObservationState::default()),
             pic16_shutdown_unresolved: AtomicBool::new(false),
         }
     }
 }
 
 impl I2cSafetyAuthority {
+    fn record_successful_observation(
+        &self,
+        address: u8,
+        operation: I2cObservedOperation,
+        observed_at_ms: u64,
+    ) {
+        let mut observations = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        observations.sequence = observations.sequence.saturating_add(1);
+        observations
+            .endpoints
+            .entry(address)
+            .and_modify(|entry| {
+                entry.last_successful_operation = operation;
+                entry.last_observed_at_ms = observed_at_ms;
+                entry.successful_operation_count =
+                    entry.successful_operation_count.saturating_add(1);
+            })
+            .or_insert(I2cEndpointObservation {
+                address,
+                last_successful_operation: operation,
+                last_observed_at_ms: observed_at_ms,
+                successful_operation_count: 1,
+            });
+    }
+
     fn capture(&self, intent: I2cOperationIntent) -> std::result::Result<u64, &'static str> {
         loop {
             let before = self.generation.load(Ordering::SeqCst);
@@ -3282,6 +3426,123 @@ fn i2c_fabric_registry() -> &'static Mutex<HashMap<I2cFabricRegistryKey, I2cFabr
     static REGISTRY: OnceLock<Mutex<HashMap<I2cFabricRegistryKey, I2cFabricRegistryEntry>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Public, read-only projection of one fabric-registry entry's current
+/// disposition. Produced by [`snapshot_i2c_fabric_dispositions`] so the daemon
+/// can build the DURABLE mutation-disposition journal
+/// (`dcentrald_common::mutation_disposition`) at controlled teardown. The HAL
+/// itself performs NO disk IO for this — pointer identity is unsafe for
+/// persistent quarantine tombstones (see `I2cBusOps::service_identity`), so the
+/// durable record is built one layer up from this typed snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I2cFabricDispositionSnapshot {
+    /// Stable textual fabric identity (for example `linux-adapter-0`).
+    pub fabric_key: String,
+    /// Process-local allocation counter of the owning entry (diagnostic
+    /// binding only, never an authority).
+    pub allocation_id: u64,
+    pub endpoint_class: I2cFabricEndpointClass,
+    pub disposition: I2cFabricDispositionState,
+}
+
+/// Which kind of registry owner holds the fabric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I2cFabricEndpointClass {
+    RuntimeService,
+    RawLease,
+}
+
+/// Faithful projection of the registry state. `Clean` means no
+/// driver/MMIO/GPIO side effect has happened yet; `Active` means a live owner
+/// whose crash disposition is covered by the supervisor session latch;
+/// `Mutated` and `Quarantined` are the states the durable journal must
+/// preserve across `panic=abort` / SIGKILL / power loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I2cFabricDispositionState {
+    Clean,
+    Active,
+    Mutated,
+    Quarantined(I2cFabricQuarantineDisposition),
+}
+
+/// Public mirror of the internal quarantine reason roster. Kept in exact
+/// lockstep with `I2cServiceQuarantineReason`; the conversion below is
+/// exhaustive so adding an internal reason without a public mirror is a
+/// compile error, never a silently dropped disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I2cFabricQuarantineDisposition {
+    PreparationAborted,
+    WorkerPanicked,
+    UnresolvedPic16State,
+    UnexpectedLeaseDrop,
+    RegistryInvariantLost,
+}
+
+impl From<I2cServiceQuarantineReason> for I2cFabricQuarantineDisposition {
+    fn from(reason: I2cServiceQuarantineReason) -> Self {
+        match reason {
+            I2cServiceQuarantineReason::PreparationAborted => Self::PreparationAborted,
+            I2cServiceQuarantineReason::WorkerPanicked => Self::WorkerPanicked,
+            I2cServiceQuarantineReason::UnresolvedPic16State => Self::UnresolvedPic16State,
+            I2cServiceQuarantineReason::UnexpectedLeaseDrop => Self::UnexpectedLeaseDrop,
+            I2cServiceQuarantineReason::RegistryInvariantLost => Self::RegistryInvariantLost,
+        }
+    }
+}
+
+/// Snapshot the current process-local fabric-registry dispositions as typed,
+/// read-only data. This does not change quarantine transition logic, takes no
+/// lock beyond the registry mutex, performs no IO, and never mutates an
+/// entry. Deterministically ordered by fabric key then allocation id so the
+/// journal built from it is stable.
+pub fn snapshot_i2c_fabric_dispositions() -> Vec<I2cFabricDispositionSnapshot> {
+    let registry = i2c_fabric_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot: Vec<I2cFabricDispositionSnapshot> = registry
+        .iter()
+        .map(|(key, entry)| {
+            let fabric_key = match key {
+                I2cFabricRegistryKey::PhysicalFabric(fabric) => fabric.to_string(),
+                #[cfg(feature = "sim-hal")]
+                I2cFabricRegistryKey::SimulatedBus { bus, backend } => {
+                    format!("sim-bus-{bus}-backend-{backend}")
+                }
+            };
+            match entry {
+                I2cFabricRegistryEntry::RuntimeService {
+                    allocation, state, ..
+                } => I2cFabricDispositionSnapshot {
+                    fabric_key,
+                    allocation_id: *allocation,
+                    endpoint_class: I2cFabricEndpointClass::RuntimeService,
+                    disposition: match state {
+                        I2cServiceRegistryState::PreparingClean => I2cFabricDispositionState::Clean,
+                        I2cServiceRegistryState::PreparingMutated => {
+                            I2cFabricDispositionState::Mutated
+                        }
+                        I2cServiceRegistryState::Active => I2cFabricDispositionState::Active,
+                        I2cServiceRegistryState::Quarantined(reason) => {
+                            I2cFabricDispositionState::Quarantined((*reason).into())
+                        }
+                    },
+                },
+                I2cFabricRegistryEntry::Raw { allocation, .. } => I2cFabricDispositionSnapshot {
+                    fabric_key,
+                    allocation_id: *allocation,
+                    endpoint_class: I2cFabricEndpointClass::RawLease,
+                    disposition: I2cFabricDispositionState::Active,
+                },
+            }
+        })
+        .collect();
+    snapshot.sort_by(|a, b| {
+        a.fabric_key
+            .cmp(&b.fabric_key)
+            .then(a.allocation_id.cmp(&b.allocation_id))
+    });
+    snapshot
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4250,6 +4511,56 @@ pub(crate) enum I2cRequest {
         compensation: Vec<I2cTransactionStep>,
         reply_tx: mpsc::SyncSender<Result<I2cConditionalSafeOffOutcome>>,
     },
+}
+
+fn transaction_has_wire_operation(steps: &[I2cTransactionStep]) -> bool {
+    steps.iter().any(|step| {
+        matches!(
+            step,
+            I2cTransactionStep::Write(_)
+                | I2cTransactionStep::WriteByteByByte(_)
+                | I2cTransactionStep::Read(_)
+                | I2cTransactionStep::ReadFrame { .. }
+                | I2cTransactionStep::WriteRead { .. }
+        )
+    })
+}
+
+/// Return a positive-observation label only when a successful reply proves
+/// that this exact request included endpoint I/O. Admission acknowledgements,
+/// multi-endpoint scheduled rounds, timeout changes, and controller recovery
+/// are excluded because their submit reply does not prove one exact endpoint.
+fn observable_operation(request: &I2cRequest) -> Option<I2cObservedOperation> {
+    match request {
+        I2cRequest::Heartbeat { .. } => Some(I2cObservedOperation::PicHeartbeat),
+        I2cRequest::SetVoltage { .. } | I2cRequest::Pic16SetVoltageOnly { .. } => {
+            Some(I2cObservedOperation::PicVoltageCommand)
+        }
+        I2cRequest::DisableVoltage { .. } => Some(I2cObservedOperation::PicSafeOff),
+        I2cRequest::SetVoltageMv { .. } => Some(I2cObservedOperation::DspicVoltageCommand),
+        I2cRequest::Pic16JumpIfBootloader { .. } => {
+            Some(I2cObservedOperation::PicBootloaderStateRead)
+        }
+        I2cRequest::WriteBytes { .. } => Some(I2cObservedOperation::GenericWrite),
+        I2cRequest::WriteByteByte { .. } => Some(I2cObservedOperation::GenericBytewiseWrite),
+        I2cRequest::ReadBytes { .. } => Some(I2cObservedOperation::GenericRead),
+        I2cRequest::ReadHashboardEepromSpan { .. } => {
+            Some(I2cObservedOperation::HashboardEepromRead)
+        }
+        I2cRequest::ReadLm75TemperatureRegister { .. } => {
+            Some(I2cObservedOperation::Lm75TemperatureRead)
+        }
+        I2cRequest::WriteRead { .. } => Some(I2cObservedOperation::GenericWriteRead),
+        I2cRequest::Transaction { steps, .. } if transaction_has_wire_operation(steps) => {
+            Some(I2cObservedOperation::CompoundTransaction)
+        }
+        I2cRequest::Pic16Admission { .. }
+        | I2cRequest::Pic16HeartbeatRound { .. }
+        | I2cRequest::SetTimeout { .. }
+        | I2cRequest::RecoverUnmanagedBus { .. }
+        | I2cRequest::Transaction { .. }
+        | I2cRequest::ConditionalSafeOffPlan { .. } => None,
+    }
 }
 
 /// Handle for sending I2C requests to the service thread.
@@ -6006,6 +6317,30 @@ enum I2cSubmissionAuthority<'a> {
 }
 
 impl I2cServiceHandle {
+    /// Obtain a sender-free reader for positive observations already retained
+    /// by this exact serialized service lifetime.
+    pub fn observation_reader(&self) -> I2cObservationReader {
+        I2cObservationReader {
+            bus: self.bus,
+            safety: Arc::clone(&self.safety),
+        }
+    }
+
+    fn record_successful_observation(&self, address: u8, operation: Option<I2cObservedOperation>) {
+        let Some(operation) = operation else {
+            return;
+        };
+        if address > 0x7f {
+            return;
+        }
+        let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        let observed_at_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.safety
+            .record_successful_observation(address, operation, observed_at_ms);
+    }
+
     /// I2C bus owned by this serialized service lifetime.
     ///
     /// Exposed so opaque endpoint capabilities can be checked against the
@@ -6165,6 +6500,7 @@ impl I2cServiceHandle {
         budget: I2cRequestBudget,
         authority: I2cSubmissionAuthority<'_>,
     ) -> Result<T> {
+        let observation_operation = observable_operation(&req);
         let is_admission_start = matches!(&req, I2cRequest::Pic16Admission { .. });
         let expected = match &authority {
             I2cSubmissionAuthority::Current => None,
@@ -6266,11 +6602,15 @@ impl I2cServiceHandle {
                 addr,
                 detail: "I2C unit-test service channel closed".into(),
             })?;
-            return reply_rx.recv().unwrap_or(Err(HalError::I2c {
+            let result = reply_rx.recv().unwrap_or(Err(HalError::I2c {
                 bus: self.bus,
                 addr,
                 detail: "I2C unit-test service reply dropped".into(),
             }));
+            if result.is_ok() {
+                self.record_successful_observation(addr, observation_operation);
+            }
+            return result;
         }
 
         // The second arm is `#[cfg(test)]`, so this reads as a one-arm match in a
@@ -6327,7 +6667,12 @@ impl I2cServiceHandle {
 
         let remaining = reply_deadline.saturating_duration_since(Instant::now());
         match reply_rx.recv_timeout(remaining) {
-            Ok(result) => result,
+            Ok(result) => {
+                if result.is_ok() {
+                    self.record_successful_observation(addr, observation_operation);
+                }
+                result
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(HalError::I2c {
                 bus: self.bus,
                 addr,
@@ -8043,6 +8388,112 @@ fn map_async_i2c_join<T>(
 #[cfg(test)]
 mod i2c_service_deadline_tests {
     use super::*;
+
+    #[test]
+    fn retained_endpoint_observations_require_successful_exact_service_replies() {
+        let (handle, rx) = I2cServiceHandle::for_unit_tests();
+        let reader = handle.observation_reader();
+
+        let success_handle = handle.clone();
+        let success = std::thread::spawn(move || success_handle.read_bytes(0x55, 1));
+        match rx
+            .recv()
+            .expect("successful request should reach test owner")
+        {
+            I2cRequest::ReadBytes { addr, reply_tx, .. } => {
+                assert_eq!(addr, 0x55);
+                reply_tx
+                    .send(Ok(vec![0xA5]))
+                    .expect("successful reply receiver");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        assert_eq!(
+            success
+                .join()
+                .expect("successful caller")
+                .expect("successful service reply"),
+            vec![0xA5]
+        );
+
+        let failed_handle = handle.clone();
+        let failed = std::thread::spawn(move || failed_handle.read_bytes(0x56, 1));
+        match rx.recv().expect("failed request should reach test owner") {
+            I2cRequest::ReadBytes { addr, reply_tx, .. } => {
+                assert_eq!(addr, 0x56);
+                reply_tx
+                    .send(Err(HalError::I2c {
+                        bus: 0,
+                        addr,
+                        detail: "synthetic NACK".to_string(),
+                    }))
+                    .expect("failed reply receiver");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        assert!(failed.join().expect("failed caller").is_err());
+
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.bus, 0);
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(snapshot.endpoints[0].address, 0x55);
+        assert_eq!(
+            snapshot.endpoints[0].last_successful_operation,
+            I2cObservedOperation::GenericRead
+        );
+        assert_eq!(snapshot.endpoints[0].successful_operation_count, 1);
+        assert!(snapshot.endpoints[0].last_observed_at_ms > 0);
+        assert!(snapshot
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.address != 0x56));
+    }
+
+    #[test]
+    fn observation_classifier_excludes_non_endpoint_and_ack_only_requests() {
+        let (timeout_tx, _timeout_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            observable_operation(&I2cRequest::SetTimeout {
+                timeout_jiffies: 10,
+                reply_tx: timeout_tx,
+            }),
+            None
+        );
+
+        let (transaction_tx, _transaction_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            observable_operation(&I2cRequest::Transaction {
+                addr: 0x20,
+                steps: vec![I2cTransactionStep::SleepMs(1)],
+                reply_tx: transaction_tx,
+            }),
+            None
+        );
+
+        let (conditional_tx, _conditional_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            observable_operation(&I2cRequest::ConditionalSafeOffPlan {
+                addr: 0x20,
+                prelude: vec![I2cTransactionStep::Write(vec![0x01])],
+                primary: vec![I2cTransactionStep::Write(vec![0x02])],
+                compensation: vec![I2cTransactionStep::Write(vec![0x03])],
+                reply_tx: conditional_tx,
+            }),
+            None,
+            "typed Ok(outcome) can contain all-failed phases and is not positive endpoint proof"
+        );
+
+        let (read_tx, _read_rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            observable_operation(&I2cRequest::ReadHashboardEepromSpan {
+                addr: 0x50,
+                span: HashboardEepromSpan::IdentityPrefix,
+                reply_tx: read_tx,
+            }),
+            Some(I2cObservedOperation::HashboardEepromRead)
+        );
+    }
 
     #[cfg(feature = "sim-hal")]
     fn next_test_service_identity() -> usize {
@@ -13468,6 +13919,63 @@ mod lockdown_surface_tests {
     #[test]
     fn miner_identity_read_has_no_caller_selected_transport_fields() {
         let _f: fn() -> Result<Vec<u8>> = read_secondary_bus_miner_identity_eeprom;
+    }
+}
+
+#[cfg(test)]
+mod pic16_smbus_split_tests {
+    /// PIC16 GET_VERSION / READ_VOLTAGE must never use combined I2C_RDWR.
+    /// Slice only those two helpers so EEPROM/PMBus `write_read` callers and
+    /// this assertion text cannot poison the contract (AM3-BB RESET source-
+    /// order pattern).
+    #[test]
+    fn pic16_voltage_and_version_helpers_do_not_use_combined_write_read() {
+        let source = include_str!("i2c.rs");
+        let voltage = slice_pub_fn(source, "pub fn pic_read_voltage(");
+        let version = slice_pub_fn(source, "pub fn pic_get_version(");
+        assert_pic16_query_is_split_write_then_read(voltage, "pic_read_voltage");
+        assert_pic16_query_is_split_write_then_read(version, "pic_get_version");
+    }
+
+    fn slice_pub_fn<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing {signature}"));
+        let body = source[start..]
+            .split("\n    pub ")
+            .next()
+            .unwrap_or_else(|| panic!("{signature} body"));
+        assert!(
+            body.len() < 1_500,
+            "{signature} slice widened to {} bytes — boundary drifted",
+            body.len()
+        );
+        body
+    }
+
+    fn assert_pic16_query_is_split_write_then_read(body: &str, name: &str) {
+        // Split the forbidden token so this test cannot self-match if a
+        // future edit widens the function slice into this module.
+        let combined = concat!("write", "_read(");
+        assert!(
+            !body.contains(combined),
+            "{name} must not call combined I2C_RDWR write_read"
+        );
+        assert!(
+            !body.contains("write_read_at("),
+            "{name} must not call write_read_at"
+        );
+        let write_at = body
+            .find("self.pic_command(")
+            .or_else(|| body.find("self.write_exact("))
+            .unwrap_or_else(|| panic!("{name} must write preamble+cmd"));
+        let read_at = body
+            .find("self.read(")
+            .unwrap_or_else(|| panic!("{name} must issue a separate read"));
+        assert!(
+            write_at < read_at,
+            "{name} must write preamble+cmd before the separate response read"
+        );
     }
 }
 

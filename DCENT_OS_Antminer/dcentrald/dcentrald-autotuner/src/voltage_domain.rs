@@ -172,6 +172,31 @@ pub fn topology_for_chip(
             verified_from_re: true,
         }),
 
+        // S19k Pro/BM1366 BHB56902: the held AMTC Config.ini states
+        // Asic_Num=77, Voltage_Domain=11, Asic_Num_Per_Voltage_Domain=7,
+        // Has_Pic=false. Chip ID alone is not enough because S19 XP uses the
+        // same BM1366 family with 110 chips / 10 per domain.
+        (0x1366, 77)
+            if matches!(
+                controller,
+                VoltageControllerKind::Unknown | VoltageControllerKind::NoPic
+            ) =>
+        {
+            Some(VoltageDomainTopology {
+                profile_key: "bm1366-s19kpro-bhb56902-77x11".to_string(),
+                chip_id,
+                chips_per_chain,
+                domains_per_chain: 11,
+                chips_per_domain: 7,
+                controller: VoltageControllerKind::NoPic,
+                verified_from_re: true,
+            })
+        }
+
+        // A PIC/dsPIC/DAC/PMBus claim contradicts the exact BHB56902 NoPic
+        // evidence and must not create a verified S19k voltage topology.
+        (0x1366, 77) => None,
+
         // S21/T21/BM1368: 108 chips, 12 domains, 9 chips per domain.
         (0x1368, 108) => Some(VoltageDomainTopology {
             profile_key: "bm1368-s21-108x12".to_string(),
@@ -230,6 +255,29 @@ mod tests {
         assert_eq!(domains[37].chip_start, 74);
         assert_eq!(domains[37].chip_end, 75);
         assert_eq!(topology.domain_for_chip(0, 75).unwrap().domain_id, 37);
+    }
+
+    #[test]
+    fn expands_s19kpro_voltage_domains_without_aliasing_s19xp() {
+        let topology = topology_for_chip(0x1366, 77, "nopic")
+            .expect("held BHB56902 topology is exact for 77 chips");
+        let domains = topology.domains_for_chain(2);
+
+        assert_eq!(topology.profile_key, "bm1366-s19kpro-bhb56902-77x11");
+        assert_eq!(topology.controller, VoltageControllerKind::NoPic);
+        assert_eq!(domains.len(), 11);
+        assert_eq!(domains[0].chip_start, 0);
+        assert_eq!(domains[0].chip_end, 6);
+        assert_eq!(domains[10].chip_start, 70);
+        assert_eq!(domains[10].chip_end, 76);
+        assert!(domains.iter().all(|domain| domain.chip_count() == 7));
+
+        let xp = topology_for_chip(0x1366, 110, "nopic").expect("S19 XP topology");
+        assert_eq!(xp.chips_per_domain, 10);
+        assert_ne!(xp.profile_key, topology.profile_key);
+
+        assert!(topology_for_chip(0x1366, 77, "dspic").is_none());
+        assert!(topology_for_chip(0x1366, 76, "nopic").is_none());
     }
 
     #[test]

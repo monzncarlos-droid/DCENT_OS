@@ -108,7 +108,14 @@ pub fn pic_iic_dev_addr(chain: u8) -> u8 {
 
 /// `write_pic_iic` FPGA command word. Not a bus permit.
 pub fn pack_write_pic_iic(chain: u8, data: u8) -> u32 {
-    crate::s9se_fpga::pack_zynq_iic(pic_iic_dev_addr(chain), PIC_IIC_WHICH, false, false, 0, data)
+    crate::s9se_fpga::pack_zynq_iic(
+        pic_iic_dev_addr(chain),
+        PIC_IIC_WHICH,
+        false,
+        false,
+        0,
+        data,
+    )
 }
 
 pub fn refuse_t11a_chain_swap_on_s9se(apply_swap: bool) -> Result<(), S9SePicError> {

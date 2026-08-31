@@ -110,6 +110,11 @@ const icons: Record<string, React.ReactNode> = {
       <path d="M10 8v4M10 14.5v0.01" />
     </svg>
   ),
+  fund: (
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 17s-6.5-4-6.5-8.2A3.7 3.7 0 0110 5.2a3.7 3.7 0 016.5 3.6C16.5 13 10 17 10 17z" />
+    </svg>
+  ),
   collapse: (
     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 4l-5 6 5 6" />
@@ -344,6 +349,27 @@ export function Sidebar({ mobileOpen, onNavigate, sidebarId, sidebarRef }: Sideb
           </div>
         ))}
 
+        <Tooltip
+          placement="right"
+          content={
+            visuallyCollapsed
+              ? <><b>Fund</b> — Keep this open firmware alive (Bitcoin or card).</>
+              : 'Keep this open firmware alive — Bitcoin or card.'
+          }
+        >
+          <a
+            className="nav-item"
+            href="https://d-central.tech/fund/go?source=dcent_os&placement=sidebar_nav"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Fund the Sovereign Stack"
+            style={{ textDecoration: 'none', color: 'inherit' }}
+          >
+            <span className="nav-icon" aria-hidden="true">{icons.fund}</span>
+            {!visuallyCollapsed && <span className="nav-label">Fund</span>}
+          </a>
+        </Tooltip>
+
         <div className="sidebar-mode-slot">
           {!visuallyCollapsed ? (
             <ModeSwitch
@@ -377,6 +403,15 @@ export function Sidebar({ mobileOpen, onNavigate, sidebarId, sidebarRef }: Sideb
             Version
             <br />DCENT_OS {version}
             {build && (<><br />build {build}</>)}
+            <br />
+            <a
+              href="https://d-central.tech/fund/go?source=dcent_os&placement=sidebar_footer"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: 'var(--accent, #FAA500)', textDecoration: 'none', fontWeight: 600 }}
+            >
+              Fund
+            </a>
           </div>
         )}
         <button

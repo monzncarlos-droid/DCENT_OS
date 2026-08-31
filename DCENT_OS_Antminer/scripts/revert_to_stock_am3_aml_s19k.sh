@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# revert_to_stock_am3_aml_s19k.sh — Revert an S19k Pro (Amlogic A113D,
-# BM1366, BHB56902 hashboards) from DCENTos back to stock Bitmain
-# firmware.
+# revert_to_stock_am3_aml_s19k.sh — legacy evidence-only classifier for a
+# hypothetical S19k Pro Amlogic ARM64 uImage window payload. It does not
+# establish stock payload identity and cannot return a unit to stock.
 #
 #  W12-B sibling of revert_to_stock_am3_aml_s21.sh. Same
 # Amlogic uImage flash mechanism as S21, using scripts/lib/am3_geometry.sh. The
@@ -10,9 +10,10 @@
 # and doesn't change the flash primitives. Per
 # .
 #
-# verified_revertable: false in PROFILE_TABLE.amlogic-a113d-bm1366 (W23 rename) —
-# CODE-COMPLETE but NOT live-tested.  will run the full loop on
-# the office S19k Pro before flipping that flag.
+# The exact held evidence-bound stock route is the encrypted three-member
+# AML factory-SD package admitted by s19k_aml_stock_recovery_plan.py. This
+# legacy classifier cannot validate uImage CRC or vendor identity. Target
+# mutation is intentionally unreachable (`CLEAR_FOR_FLASH=false`); this is not a code-complete revert.
 #
 # Usage:
 #   ./revert_to_stock_am3_aml_s19k.sh [--dry-run] <firmware_image.tar.gz> <sha256>
@@ -28,23 +29,44 @@ if [ ! -r "$SCRIPT_DIR/lib/am3_geometry.sh" ]; then
 fi
 . "$SCRIPT_DIR/lib/am3_geometry.sh"
 
-DOWNLOAD_DIR="/tmp/stock_firmware_am3_aml_s19k"
-MAX_EXTRACTED_KB="${DCENT_STOCK_REVERT_MAX_EXTRACTED_KB:-262144}"
 ROOTFS_MTD="$DCENT_AM3_ROOTFS_MTD"
 ROOTFS_OFFSET="$DCENT_AM3_ROOTFS_OFFSET_HEX"
 UIMAGE_MAGIC_HEX="27051956"
+MAX_ARCHIVE_BYTES=67108864
+MAX_UIMAGE_BYTES=41943040
+PLATFORM_FILE=${DCENTOS_PLATFORM_FILE:-/etc/dcentos-platform}
+BOARD_TARGET_FILE=${DCENTOS_BOARD_TARGET_FILE:-/etc/dcentos/board_target}
 DRY_RUN=false
 if [ "${1:-}" = "--dry-run" ]; then
     DRY_RUN=true
     shift
 fi
 
+command -v mktemp >/dev/null 2>&1 || {
+    echo "ERROR: mktemp missing; refusing non-private stock-revert classification" >&2
+    exit 1
+}
+umask 077
+REVERT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/dcent-s19k-stock-revert.XXXXXX") || {
+    echo "ERROR: could not create private stock-revert transaction directory" >&2
+    exit 1
+}
+EXTRACT_DIR="$REVERT_TMP/extracted"
+REVERT_PLAN="$REVERT_TMP/REVERT_COMMIT_PLAN.txt"
+cleanup_revert_tmp() {
+    rm -rf "$REVERT_TMP" 2>/dev/null || true
+}
+trap cleanup_revert_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 # /242: firstboot-only is refused. Plan names recover_env.
-# dry_run writes the plan before GPIO/nandwrite and exits 0.
+# dry_run writes and prints the plan from a private transaction directory
+# before GPIO/nandwrite and exits 0. No fixed /tmp path is removed or replaced.
 write_revert_commit_plan() {
     _dry=$1
     _nand=$2
-    REVERT_PLAN="/tmp/REVERT_COMMIT_PLAN.txt"
     {
         echo "schema=dcentos.amlogic-stock-image-revert/v1"
         echo "nandwrite_target=root"
@@ -55,6 +77,10 @@ write_revert_commit_plan() {
         echo "bootm_mtd2=false"
         echo "mix_flag_02=false"
         echo "uimage_write_is_not_recover_to_stock=true"
+        echo "legacy_uimage_classifier_only=true"
+        echo "uimage_crc_verified=false"
+        echo "stock_payload_identity_verified=false"
+        echo "vendor_factory_sd_is_only_evidence_bound_stock_route=true"
         echo "stock_return=recover_env_nandrecovery"
         echo "recover_env_source=nandrecovery_env.bin"
         echo "recover_env_ram=0x01060000"
@@ -69,11 +95,12 @@ write_revert_commit_plan() {
         echo "execute=CLEAR_FOR_FLASH"
         echo "clear_for_flash=false"
     } > "$REVERT_PLAN"
-    echo "  wrote $REVERT_PLAN dry_run=$_dry nandwrite=$_nand"
+    echo "  private_plan=$REVERT_PLAN dry_run=$_dry nandwrite=$_nand"
+    cat "$REVERT_PLAN"
 }
 
 echo "==============================================================="
-echo "  DCENTos -> Stock Bitmain Firmware Revert (S19k Pro / am3-aml)"
+echo "  REFUSED legacy ARM64 uImage classifier (S19k Pro / am3-aml)"
 echo "==============================================================="
 echo ""
 
@@ -96,32 +123,41 @@ case "$EXPECTED_SHA256" in
     *[!0-9a-f]*) echo "ERROR: expected SHA-256 is not hex" >&2; exit 1 ;;
 esac
 
-if [ ! -f "$FW_IMAGE" ]; then
-    echo "ERROR: Firmware image not found: $FW_IMAGE"
+if [ ! -f "$FW_IMAGE" ] || [ -L "$FW_IMAGE" ]; then
+    echo "ERROR: firmware image must be a real regular file, not a symlink: $FW_IMAGE"
     exit 1
 fi
 
-echo "Firmware image: $FW_IMAGE"
+echo "Untrusted candidate archive: $FW_IMAGE"
 echo "Image size: $(ls -lh "$FW_IMAGE" | awk '{print $5}')"
 echo ""
+FW_ARCHIVE_LEN=$(wc -c < "$FW_IMAGE" | tr -d ' \t\r\n')
+case "$FW_ARCHIVE_LEN" in
+    ''|*[!0-9]*)
+        echo "ERROR: cannot determine candidate archive size" >&2
+        exit 1
+        ;;
+esac
+if [ "$FW_ARCHIVE_LEN" -gt "$MAX_ARCHIVE_BYTES" ]; then
+    echo "ERROR: candidate archive is $FW_ARCHIVE_LEN bytes, above private-copy cap $MAX_ARCHIVE_BYTES" >&2
+    exit 1
+fi
 
 echo "Step 0: identity / geometry preflight (before REVERT prompt)..."
 if [ -r /etc/dcentos/tmp_deploy ]; then
     echo "ERROR: /etc/dcentos/tmp_deploy leftover — refuse stock revert after /tmp bench deploy" >&2
     exit 1
 fi
-if [ ! -r /etc/dcentos/board_target ]; then
-    echo "ERROR: missing live /etc/dcentos/board_target; refuse fail-open stock revert" >&2
+if [ ! -r "$PLATFORM_FILE" ] || [ ! -r "$BOARD_TARGET_FILE" ]; then
+    echo "ERROR: missing exact live platform:target identity; refuse stock revert" >&2
     exit 1
 fi
-BT=$(tr -d ' \t\r\n' < /etc/dcentos/board_target)
-case "$BT" in
-    am3-s19k|am3-s19kpro|am3-aml-s19kpro) ;;
-    *)
-        echo "ERROR: live board_target='$BT' is not am3-s19k; refuse fail-open stock revert" >&2
-        exit 1
-        ;;
-esac
+LIVE_PLATFORM=$(tr -d ' \t\r\n' < "$PLATFORM_FILE")
+BT=$(tr -d ' \t\r\n' < "$BOARD_TARGET_FILE")
+if [ "$LIVE_PLATFORM:$BT" != "am3-aml-s19k:am3-s19k" ]; then
+    echo "ERROR: live platform:target='$LIVE_PLATFORM:$BT' is not exact am3-aml-s19k:am3-s19k; refuse stock revert" >&2
+    exit 1
+fi
 OFFSET_DEC=$((ROOTFS_OFFSET))
 SIZE_SUM_WINDOW_DEC=$((0x05700000))
 SIZE_SUM_FLAG_DEC=$((0x05300000))
@@ -139,56 +175,93 @@ if [ "$OFFSET_DEC" -ne "$ADMITTED_LOCAL_DEC" ]; then
     echo "ERROR: $ROOTFS_OFFSET is not admitted local 0x05100000 (nandrootfs − physical mtd5 0x06700000)" >&2
     exit 1
 fi
-echo "  identity=$BT tmp_deploy=absent rootfs_offset=$ROOTFS_OFFSET"
+echo "  identity=$LIVE_PLATFORM:$BT tmp_deploy=absent rootfs_offset=$ROOTFS_OFFSET"
 
 if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum missing; refusing expected-SHA stock revert." >&2
     exit 1
 fi
-ACTUAL_SHA256=$(sha256sum "$FW_IMAGE" | awk '{print $1}' | tr 'A-F' 'a-f')
+PRIVATE_FW="$REVERT_TMP/stock-candidate.tar.gz"
+cp "$FW_IMAGE" "$PRIVATE_FW" || {
+    echo "ERROR: failed to snapshot firmware into the private transaction" >&2
+    exit 1
+}
+chmod 0600 "$PRIVATE_FW" 2>/dev/null || true
+ACTUAL_SHA256=$(sha256sum "$PRIVATE_FW" | awk '{print $1}' | tr 'A-F' 'a-f')
 if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-    echo "ERROR: firmware SHA-256 drift before extraction." >&2
+    echo "ERROR: private firmware snapshot SHA-256 does not match authority argv." >&2
     echo "  expected: $EXPECTED_SHA256" >&2
     echo "  actual:   $ACTUAL_SHA256" >&2
     exit 1
 fi
-echo "Firmware SHA-256 verified at extraction time."
+echo "Firmware SHA-256 verified on private immutable-for-this-process snapshot."
 
-echo "Step 1: Extracting firmware archive (classify before REVERT)..."
-EXTRACT_DIR="/tmp/stock_extract"
-trap 'rm -rf /tmp/stock_extract 2>/dev/null' EXIT
-rm -rf "$EXTRACT_DIR"
-mkdir -p "$EXTRACT_DIR"
-tar --no-same-owner --no-same-permissions --no-overwrite-dir \
-    -xzf "$FW_IMAGE" -C "$EXTRACT_DIR"
-
-EXTRACTED_KB=$(du -sk "$EXTRACT_DIR" | awk '{print $1}')
-if [ "$EXTRACTED_KB" -gt "$MAX_EXTRACTED_KB" ]; then
-    echo "ERROR: extracted firmware tree is ${EXTRACTED_KB} KiB, above cap ${MAX_EXTRACTED_KB} KiB"
-    rm -rf "$EXTRACT_DIR"
+echo "Step 1: Streaming the single named uImage candidate (classify before REVERT)..."
+TOC="$REVERT_TMP/archive.toc"
+TOC_VERBOSE="$REVERT_TMP/archive.verbose"
+CANDIDATES="$REVERT_TMP/uimage.candidates"
+(ulimit -f 2048 && tar -tzf "$PRIVATE_FW" > "$TOC") || {
+    echo "ERROR: firmware archive TOC is unreadable" >&2
+    exit 1
+}
+(ulimit -f 4096 && tar -tvzf "$PRIVATE_FW" > "$TOC_VERBOSE") || {
+    echo "ERROR: firmware archive typed TOC is unreadable" >&2
+    exit 1
+}
+if [ ! -s "$TOC" ]; then
+    echo "ERROR: firmware archive TOC is empty" >&2
     exit 1
 fi
-if find "$EXTRACT_DIR" -type f -links +1 -print -quit 2>/dev/null | grep -q .; then
-    echo "ERROR: firmware archive contains hard-linked files; refusing destructive revert"
-    rm -rf "$EXTRACT_DIR"
+if LC_ALL=C grep -Eq '^h' "$TOC_VERBOSE"; then
+    echo "ERROR: firmware archive contains hard-linked files; refusing streamed classification" >&2
     exit 1
 fi
-
-UIMAGE=$(find "$EXTRACT_DIR" -type f \( -name 'rootfs_uImage*' -o -name '*uImage*' -o -name 'rootfs*.bin' \) | head -1)
-if [ -z "$UIMAGE" ]; then
-    echo "ERROR: No rootfs uImage found in firmware archive"
-    rm -rf "$EXTRACT_DIR"
+if LC_ALL=C grep -Eq '^[lbcps]' "$TOC_VERBOSE"; then
+    echo "ERROR: firmware archive contains link or device members; refusing streamed classification" >&2
     exit 1
 fi
-UIMAGE_REAL=$(readlink -f "$UIMAGE")
-case "$UIMAGE_REAL" in
-    "$EXTRACT_DIR"/*) ;;
-    *)
-        echo "ERROR: uImage symlink escapes extract dir: $UIMAGE -> $UIMAGE_REAL"
-        rm -rf "$EXTRACT_DIR"
-        exit 1
-        ;;
-esac
+if LC_ALL=C grep -nEv '^[A-Za-z0-9._/+@=-]+/?$' "$TOC" >/dev/null 2>&1; then
+    echo "ERROR: archive contains a non-canonical member name; refuse extraction" >&2
+    exit 1
+fi
+while IFS= read -r MEMBER; do
+    case "$MEMBER" in
+        /*|-*|*/-*|..|../*|*/..|*/../*)
+            echo "ERROR: archive member escapes its root: $MEMBER" >&2
+            exit 1
+            ;;
+    esac
+done < "$TOC"
+DUPLICATE_MEMBER=$(sort "$TOC" | uniq -d | head -n 1)
+if [ -n "$DUPLICATE_MEMBER" ]; then
+    echo "ERROR: archive repeats member name: $DUPLICATE_MEMBER" >&2
+    exit 1
+fi
+grep -E '(^|/)(rootfs_uImage[^/]*|[^/]*uImage[^/]*|rootfs[^/]*\.bin)$' "$TOC" > "$CANDIDATES" || true
+CANDIDATE_COUNT=$(wc -l < "$CANDIDATES" | tr -d ' \t\r\n')
+if [ "$CANDIDATE_COUNT" != 1 ]; then
+    echo "ERROR: firmware archive must contain exactly one uImage-like candidate (got $CANDIDATE_COUNT)" >&2
+    exit 1
+fi
+UIMAGE_MEMBER=$(sed -n '1p' "$CANDIDATES")
+UIMAGE_REAL="$REVERT_TMP/uimage.candidate"
+# BusyBox 1.37 tar `-O` streams the named member to stdout. It avoids materializing
+# archive paths, links, devices, or sibling files even in this refused classifier.
+# RLIMIT_FSIZE caps the private output before a compressed payload can fill /tmp.
+(ulimit -f 81920 && tar -xOzf "$PRIVATE_FW" -- "$UIMAGE_MEMBER" > "$UIMAGE_REAL") || {
+    echo "ERROR: could not stream the exact uImage candidate from the private archive" >&2
+    rm -f "$UIMAGE_REAL"
+    exit 1
+}
+[ -f "$UIMAGE_REAL" ] && [ ! -L "$UIMAGE_REAL" ] || {
+    echo "ERROR: private uImage candidate is not a regular file" >&2
+    exit 1
+}
+POST_EXTRACT_SHA256=$(sha256sum "$PRIVATE_FW" | awk '{print $1}' | tr 'A-F' 'a-f')
+[ "$POST_EXTRACT_SHA256" = "$ACTUAL_SHA256" ] || {
+    echo "ERROR: private firmware snapshot changed during classification" >&2
+    exit 1
+}
 
 HEAD8=$(head -c 8 "$UIMAGE_REAL" | od -An -tx1 | tr -d ' \n')
 case "$HEAD8" in
@@ -211,12 +284,26 @@ if [ "$ARCH_HEX" != "16" ]; then
     exit 1
 fi
 UIMAGE_LEN=$(wc -c < "$UIMAGE_REAL" | tr -d ' \t\r\n')
-if [ "$UIMAGE_LEN" -gt 41943040 ]; then
+if [ "$UIMAGE_LEN" -gt "$MAX_UIMAGE_BYTES" ]; then
     echo "ERROR: uImage ${UIMAGE_LEN} B exceeds 0x02800000 window; refuse nandwrite" >&2
     rm -rf "$EXTRACT_DIR"
     exit 1
 fi
-echo "  payload uImage IH_ARCH=ARM64 size=$UIMAGE_LEN admitted"
+IH_SIZE=$(dd if="$UIMAGE_REAL" bs=1 skip=12 count=4 2>/dev/null | \
+    od -An -tu1 | awk '{ print ($1 * 16777216) + ($2 * 65536) + ($3 * 256) + $4 }')
+case "$IH_SIZE" in
+    ''|*[!0-9]*)
+        echo "ERROR: uImage header does not contain a readable big-endian ih_size" >&2
+        exit 1
+        ;;
+esac
+EXPECTED_UIMAGE_LEN=$((IH_SIZE + 64))
+if [ "$UIMAGE_LEN" -ne "$EXPECTED_UIMAGE_LEN" ]; then
+    echo "ERROR: uImage length=$UIMAGE_LEN does not exactly equal 64+ih_size=$EXPECTED_UIMAGE_LEN" >&2
+    exit 1
+fi
+echo "  payload uImage IH_ARCH=ARM64 exact_header_length=$UIMAGE_LEN classified"
+echo "  classifier limits: CRC and stock payload identity are unverified; NAND mutation remains refused"
 
 if [ "$DRY_RUN" = true ]; then
     echo "[DRY RUN] writing REVERT_COMMIT_PLAN before GPIO/nandwrite..."
@@ -224,11 +311,11 @@ if [ "$DRY_RUN" = true ]; then
     write_revert_commit_plan true false
     echo "[DRY RUN] no GPIO write, no nandwrite; refusing firstboot-only"
     echo "This nandwrite is NOT recover_to_stock and does NOT boot mtd2."
-    rm -rf "$EXTRACT_DIR" "$DOWNLOAD_DIR"
+    rm -rf "$EXTRACT_DIR"
     exit 0
 fi
 
-echo "WARNING: This will write stock Bitmain firmware to $ROOTFS_MTD"
+echo "WARNING: This would write an identity-unproven ARM64 uImage to $ROOTFS_MTD"
 echo "         offset $ROOTFS_OFFSET (uImage rootfs). This nandwrite is"
 echo "         NOT recover_to_stock / mtd2. firstboot-only commit is refused."
 echo ""
@@ -251,12 +338,11 @@ if [ "$CLEAR_FOR_FLASH" != true ]; then
     echo "Stock-return is recover_to_stock (recover_env + nand erase.part nvdata)." >&2
     echo "This script does NOT arm flag 0x02 and does NOT fw_setenv firstboot." >&2
     echo "Use s19k_write_recovery_flag.sh --value 0x02 after CRC-admitting nandrecovery_env.bin." >&2
-    rm -rf "$EXTRACT_DIR" "$DOWNLOAD_DIR"
+    rm -rf "$EXTRACT_DIR"
     exit 1
 fi
 
 trap 'echo "INTERRUPTED -- forcing reboot via sysrq to recover into a clean boot state."; echo b > /proc/sysrq-trigger 2>/dev/null || reboot -f' INT TERM HUP
-trap 'rm -rf /tmp/stock_extract 2>/dev/null' EXIT
 
 echo "Step 1c: NAND/env tool preflight (before any NAND write)..."
 if ! command -v nandwrite >/dev/null 2>&1; then
@@ -327,5 +413,5 @@ echo "This nandwrite is NOT recover_to_stock and does NOT boot mtd2." >&2
 echo "Stock-return is recover_to_stock (recover_env + nand erase.part nvdata)." >&2
 echo "This script does NOT arm flag 0x02 and does NOT fw_setenv firstboot." >&2
 echo "Use s19k_write_recovery_flag.sh --value 0x02 after CRC-admitting nandrecovery_env.bin." >&2
-rm -rf "$EXTRACT_DIR" "$DOWNLOAD_DIR"
+rm -rf "$EXTRACT_DIR"
 exit 1

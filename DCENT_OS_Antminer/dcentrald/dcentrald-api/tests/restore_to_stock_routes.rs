@@ -1026,9 +1026,8 @@ Size:        525 LEBs (66662400 bytes, 63.5 MiB)
 State:       OK
 Name:        rootfs_data
 ";
-    assert_eq!(
+    assert!(
         leb_counts_match_in_ubinfo(good, 7).expect("parse"),
-        true,
         "well-formed S9 layout must pass the LEB-mirror check"
     );
 }
@@ -1048,9 +1047,8 @@ Volume ID:   2 (on ubi1)
 Size:        525 LEBs (66662400 bytes, 63.5 MiB)
 Name:        rootfs_data
 ";
-    assert_eq!(
-        leb_counts_match_in_ubinfo(drifted, 7).expect("parse"),
-        false,
+    assert!(
+        !leb_counts_match_in_ubinfo(drifted, 7).expect("parse"),
         "23-LEB kernel volume (the live .39 incident from 2026-04-17) \
          must fail the LEB-mirror check"
     );
@@ -1069,9 +1067,8 @@ Volume ID:   1 (on ubi1)
 Size:        166 LEBs (21077504 bytes, 20.1 MiB)
 Name:        rootfs
 ";
-    assert_eq!(
-        leb_counts_match_in_ubinfo(missing, 7).expect("parse"),
-        false,
+    assert!(
+        !leb_counts_match_in_ubinfo(missing, 7).expect("parse"),
         "missing rootfs_data volume must fail the LEB-mirror check"
     );
 }
@@ -1573,6 +1570,7 @@ fn test_ioc_scan_no_8mib_cap() {
 /// instead we use the DTU detector (DCENT-2026-013) which IS scoped to
 /// `usr/bin/*` and `cgminer` by Python's `_iter_binary_search_paths`
 /// + named-binary loop. This is the correct parity test for "scanner
+///
 /// walks binaries despite size cap".
 #[test]
 fn test_ioc_scan_includes_cgminer_binary() {
@@ -1603,7 +1601,7 @@ fn test_ioc_scan_atlas_key_in_large_authorized_keys() {
     // 9 MiB padded authorized_keys with the atlas key at the end.
     let mut blob = b"# DCENT_OS test fixture\n".to_vec();
     // Pad with non-key data to push the file past 8 MiB.
-    blob.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+    blob.extend(std::iter::repeat_n(b'#', 9 * 1024 * 1024));
     blob.extend_from_slice(b"\nssh-rsa AAAAB3...= atlas@anthill.farm\n");
 
     let root = make_tree(&[("root/.ssh/authorized_keys", &blob)]);

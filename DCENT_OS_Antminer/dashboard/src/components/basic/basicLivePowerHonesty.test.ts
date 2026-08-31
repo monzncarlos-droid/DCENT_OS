@@ -90,6 +90,19 @@ describe('basic heater live power honesty', () => {
     expect(thermostat).toContain('W est.');
   });
 
+  it('subtracts donation and pool fee from heater Bitcoin value and never mixes heat-credit into sats', () => {
+    expect(earningCard).toContain('applyTakeRates');
+    expect(earningCard).toContain('DEFAULT_DONATION_PERCENT');
+    expect(earningCard).toContain('Bitcoin {usingProjection ? \'projected\' : \'earned\'} (net)');
+    expect(heatingValue).toContain('applyTakeRates');
+    expect(heatingValue).toContain('const electricityCost = powerWatts > 0');
+    expect(heatingValue).toContain('Live wall-power unavailable; net excludes electricity cost.');
+    expect(heatingValue).toContain('Optional seasonal heat-credit (not Bitcoin)');
+    expect(heatingValue).toContain('Today\'s net Bitcoin value');
+    expect(heatingValue).not.toContain('so net = sats earned');
+    expect(heatingValue).not.toContain('Using for heat?');
+  });
+
   it('labels Basic BTU output as estimated unless it is backed by live wall power', () => {
     expect(bigReadouts).toContain('const btuIsLive = liveWallPower > 0');
     expect(bigReadouts).toContain("btuIsLive ? ' BTU/h' : ' BTU/h est.'");

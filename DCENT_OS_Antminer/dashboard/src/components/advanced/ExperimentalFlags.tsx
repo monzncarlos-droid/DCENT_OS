@@ -17,9 +17,9 @@ export interface FlagDef {
 const HARDWARE_FLAGS: FlagDef[] = [
   {
     key: 'asicboost',
-    label: 'AsicBoost',
-    description: 'Enable version-rolling AsicBoost for ~20% hashrate improvement.',
-    warning: 'Pool must support AsicBoost (most major pools do). MiscControl bit 7 will be set.',
+    label: 'Overt version rolling (BIP320)',
+    description: 'Pool-negotiated BIP320 version rolling. This is not a +20% hashrate boost.',
+    warning: 'Pool must support version-rolling (most major pools do). MiscControl bit 7 is the hardware enable; it does not add terahash.',
   },
   {
     key: 'custom_fan_curve',

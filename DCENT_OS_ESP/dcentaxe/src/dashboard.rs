@@ -822,6 +822,9 @@ body.col .crumbs .crumb-root,body.col .crumbs .crumb-sep{display:none}
   <div><b>Safe Mode active.</b> <span id="safeModeDetail">Mining is disabled until you clear the task-watchdog counter.</span></div>
   <button class="btn btn-danger btn-sm" onclick="clearSafeMode()">Clear &amp; Reboot</button>
  </div>
+ <div id="deploymentBanner" class="alert" style="display:none;align-items:center;gap:12px;background:rgba(250,165,0,0.08);border-color:rgba(250,165,0,0.35);color:var(--accent)">
+  <div><b id="deploymentTitle">Restricted image.</b> <span id="deploymentDetail"></span></div>
+ </div>
  <div id="coredumpBanner" class="alert" style="display:none;align-items:center;justify-content:space-between;gap:12px;background:rgba(255,165,0,0.08);border-color:rgba(255,165,0,0.3);color:var(--accent)">
   <div><b>Panic coredump stored.</b> Retrieve the ELF before a new crash overwrites it.</div>
   <div style="display:flex;gap:8px">
@@ -1329,6 +1332,11 @@ body.col .crumbs .crumb-root,body.col .crumbs .crumb-sep{display:none}
    <div class="kv-flex-row"><span class="text-dim">Partition</span><span id="partition">--</span></div>
    <div class="kv-flex-row"><span class="text-dim">Build</span><span id="sysBuild">--</span></div>
    <div class="kv-flex-row"><span class="text-dim">Reset Reason</span><span id="resetReason">--</span></div>
+   <div class="kv-flex-row"><span class="text-dim">Hardware Family</span><span id="sysHardwareFamily">--</span></div>
+   <div class="kv-flex-row"><span class="text-dim">Runtime Policy</span><span id="sysRuntimePolicy">--</span></div>
+   <div class="kv-flex-row"><span class="text-dim">Install Policy</span><span id="sysInstallPolicy">--</span></div>
+   <div class="kv-flex-row"><span class="text-dim">Evidence</span><span id="sysEvidence">--</span></div>
+   <div class="kv-flex-row"><span class="text-dim">Production Blockers</span><span id="sysProductionBlockers">--</span></div>
   </div>
   <div class="btn-row">
    <button class="btn btn-ghost btn-sm" onclick="copyDevInfo()">Copy Info</button>
@@ -2466,6 +2474,22 @@ function update(d){
  if(d.safeMode){S('resetReason',(d.resetReason||'?')+' \u00B7 SAFE MODE')}
  // Build stamp — git hash + local build time (seconds since epoch → local date).
  var build='';if(d.gitHash){build=d.gitHash+(d.gitDirty?'+dirty':'')}if(d.buildEpoch){var bd=new Date(d.buildEpoch*1000);build+=(build?' \u00B7 ':'')+bd.toISOString().slice(0,10)}S('sysBuild',build||'--');
+ var dep=d.dcentaxe&&d.dcentaxe.deployment;
+ if(dep){
+  var blockers=Array.isArray(dep.productionBlockers)?dep.productionBlockers:[];
+  S('sysHardwareFamily',dep.hardwareFamily||'--');
+  S('sysRuntimePolicy',(dep.runtimeMode||'--')+' \u00B7 '+(dep.supportTier||'unknown'));
+  S('sysInstallPolicy',(dep.installPolicy||'--')+' \u00B7 '+(dep.releaseScope||'unknown'));
+  S('sysEvidence',dep.evidenceLevel||'--');
+  S('sysProductionBlockers',blockers.length?blockers.join(', '):'None recorded');
+  var db=E('deploymentBanner'),restricted=dep.runtimeMode!=='mining'||dep.installPolicy==='blocked'||dep.installPolicy==='lab-only';
+  if(db&&restricted){
+   var title=dep.installPolicy==='blocked'?'Installation blocked.':dep.runtimeMode==='identity-only'?'Diagnostic image.':'Lab-only image.';
+   var detail=dep.runtimeMode==='identity-only'?'Mining is disabled; identity and monitoring remain available.':'Exact-SKU bench promotion is required before field use.';
+   if(blockers.length){var shown=blockers.slice(0,3).join(', ');detail+=' Pending: '+shown+(blockers.length>3?' +'+(blockers.length-3)+' more.':'.')}
+   S('deploymentTitle',title);S('deploymentDetail',detail);db.style.display='flex'
+  }else if(db){db.style.display='none'}
+ }
 
  if(d.dcentaxe&&d.dcentaxe.powerLimits){var pl=d.dcentaxe.powerLimits;if(pl.maxFrequency)_maxFreq=pl.maxFrequency;if(pl.maxVoltageMv)_maxVolt=pl.maxVoltageMv;if(pl.maxPowerW)_maxW=pl.maxPowerW}
  if(!_oc){E('ocEnable').checked=!!d.overclockEnabled;E('ocWarn').style.display=d.overclockEnabled?'block':'none'}

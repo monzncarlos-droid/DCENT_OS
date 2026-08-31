@@ -26,6 +26,9 @@ MAX_JSON_NODES = 4096
 MAX_VERSION_BYTES = 128
 MAX_VERSION_PARTS = 16
 MAX_VERSION_PART_BYTES = 32
+PACKAGE_ONLY_DENIED_TARGETS = frozenset(
+    {"am3-s19xp", "am3-s19jxp", "am3-s21xp", "am3-t21"}
+)
 
 KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
 DECIMAL = r"(?:0|[1-9][0-9]*)"
@@ -186,6 +189,63 @@ def require_payload_binding(
             )
 
 
+def require_package_authority(
+    manifest: dict[str, Any], expected_board: str
+) -> None:
+    """Admit either an installable package or an exact non-installable recipe.
+
+    ``installable=false`` is not a weaker spelling of install authority.  It is
+    accepted only for explicitly enumerated package-only targets whose Toolbox
+    metadata is entirely non-dispatching.  This lets offline tooling verify the
+    archive's hashes and structure without borrowing a sibling board's storage
+    geometry or mutation route.
+    """
+
+    if manifest.get("board") != expected_board:
+        raise AdmissionError("manifest board does not match the expected board")
+    if manifest.get("board_target") != expected_board:
+        raise AdmissionError("manifest board_target does not match the expected board")
+
+    installable = manifest.get("installable")
+    if type(installable) is not bool:
+        raise AdmissionError("installable must be a JSON boolean")
+
+    toolbox = manifest.get("toolbox")
+    if installable:
+        if isinstance(toolbox, dict) and toolbox.get("install_mode") == "package_only_denied":
+            raise AdmissionError(
+                "installable=true contradicts toolbox.install_mode=package_only_denied"
+            )
+        return
+
+    if expected_board not in PACKAGE_ONLY_DENIED_TARGETS:
+        raise AdmissionError(
+            f"installable=false package-only validation is not admitted for {expected_board}"
+        )
+    if not isinstance(toolbox, dict):
+        raise AdmissionError("non-installable package requires a toolbox object")
+
+    expected_fields: dict[str, Any] = {
+        "install_command": None,
+        "update_command": None,
+        "upload_endpoint": None,
+        "board_target_header": None,
+        "requires_inactive_slot": False,
+        "install_mode": "package_only_denied",
+        "target_side_sysupgrade": False,
+    }
+    for field, expected_value in expected_fields.items():
+        if field not in toolbox:
+            raise AdmissionError(
+                f"non-installable package requires toolbox.{field}"
+            )
+        actual = toolbox.get(field)
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            raise AdmissionError(
+                f"non-installable package requires toolbox.{field}={expected_value!r}"
+            )
+
+
 def _bounded_parts(value: str, separator: str) -> list[str]:
     parts = re.split(separator, value)
     if len(parts) > MAX_VERSION_PARTS:
@@ -316,6 +376,9 @@ def main(argv: list[str] | None = None) -> int:
     payload_parser.add_argument("expected_path")
     payload_parser.add_argument("expected_size", type=int)
     payload_parser.add_argument("expected_sha256")
+    authority_parser = subparsers.add_parser("verify-package-authority")
+    authority_parser.add_argument("manifest", type=Path)
+    authority_parser.add_argument("expected_board")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
@@ -324,13 +387,18 @@ def main(argv: list[str] | None = None) -> int:
             print(compare_versions(args.candidate, args.current))
         elif args.command == "read-version-file":
             print(read_version_file(args.path))
-        else:
+        elif args.command == "verify-payload":
             require_payload_binding(
                 admit_manifest(args.manifest),
                 args.payload_name,
                 args.expected_path,
                 args.expected_size,
                 args.expected_sha256,
+            )
+        else:
+            require_package_authority(
+                admit_manifest(args.manifest),
+                args.expected_board,
             )
     except AdmissionError as exc:
         print(f"sysupgrade manifest admission: {exc}", file=sys.stderr)

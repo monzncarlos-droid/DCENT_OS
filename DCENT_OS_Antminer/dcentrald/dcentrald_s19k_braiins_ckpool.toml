@@ -62,10 +62,12 @@ password = "x"
 cycle_duration_s = 3600
 
 [watchdog]
-enabled = false
+enabled = true
+timeout_s = 30
+kick_interval_s = 5
 
 [hash_on_disconnect]
-enabled = true
+enabled = false
 
 [mode]
 active = "standard"

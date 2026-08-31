@@ -1,9 +1,13 @@
 //! Rank-33 (2026-08-03): integration pins for the declarative sensor
-//! topology and the shared coverage type.
+//! topology and the shared coverage type. Counts refreshed for the v1.24.0
+//! delta (W3 2026-08-25).
 //!
-//! Proves, against the checked-in v1.22.0 registry data:
-//! 1. every one of the 50 SKUs yields a sensor set with the corpus shape,
-//! 2. the 36 I²C-mux (`switchsensor`) entries round-trip losslessly,
+//! Proves, against the checked-in registry data:
+//! 1. every one of the 60 representable SKUs yields a sensor set with the
+//!    corpus shape (`H6HB70801` is excluded from the thermal model — its
+//!    channel-addressed bank has no quadrant labels; its data stays in the
+//!    topology registry),
+//! 2. the 52 I²C-mux (`switchsensor`) entries round-trip losslessly,
 //! 3. the shared `SensorSweep`/`SweepLedger` type expresses all three
 //!    existing bespoke coverage shapes (`AmlogicTemperatureCoverage`,
 //!    `Am3BbThermalSnapshot`, ESP `MuxedDieFold`) — mapping-only; the call
@@ -25,16 +29,24 @@ use dcentrald_silicon_profiles::sensor_topology::{
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_fifty_skus_yield_a_sensor_set() {
-    assert_eq!(all_sensor_topologies().len(), 50);
+fn all_sixty_representable_skus_yield_a_sensor_set() {
+    // 50 v1.22.0 + 10 old-format v1.24.0 delta rows; H6HB70801's
+    // channel-addressed bank is excluded (fail-closed, pinned in the unit
+    // tests of `sensor_topology`).
+    assert_eq!(all_sensor_topologies().len(), 60);
     for d in all_descriptors() {
-        let t = sensor_topology_for_sku(&d.sku).expect("every registry SKU resolves");
+        let Some(t) = sensor_topology_for_sku(&d.sku) else {
+            assert_eq!(d.sku, "H6HB70801", "{}: unexpected exclusion", d.sku);
+            continue;
+        };
         // Fail-closed builder agrees with the cached registry.
         let rebuilt = try_build_sensor_topology(d).expect("pinned corpus builds");
         assert_eq!(&rebuilt, t, "{}", d.sku);
-        // Direct hashboard bank: exactly 4 on every board, 0x48..=0x4B.
+        // Direct hashboard bank: exactly 4 on every representable board,
+        // 0x48..=0x4B.
         assert_eq!(t.expected_direct_per_hashboard(), 4, "{}", d.sku);
-        // Sensor identity is LM75A throughout the corpus.
+        // Sensor identity is LM75A throughout the representable corpus
+        // (TMP451 appears only on the excluded H6 bank).
         for s in &t.sensors {
             assert_eq!(s.device, "LM75A", "{}", d.sku);
             assert!(
@@ -57,19 +69,23 @@ fn corpus_totals_match_the_evidence_db_including_the_mux_bank() {
         ctrl += u32::from(t.expected_ctrl_board());
         muxed += u32::from(t.expected_muxed_per_hashboard());
     }
-    // The widely-quoted "266 LM75A instances" counts only the direct banks;
-    // the switchsensor mux bank raises the true declared total to 302.
-    assert_eq!(direct_board, 200);
-    assert_eq!(ctrl, 66);
-    assert_eq!(direct_board + ctrl, 266);
-    assert_eq!(muxed, 36);
-    assert_eq!(direct_board + ctrl + muxed, 302);
-    // Ctrl-board pair (0x48 right/top + 0x4C left/top) on exactly 33 rows.
+    // v1.22.0 corpus: the widely-quoted "266 LM75A instances" counts only
+    // the direct banks; the switchsensor mux bank raised that corpus's
+    // declared total to 302. The v1.24.0 delta adds 40 direct + 12 ctrl +
+    // 16 muxed (the 7 H6 channel-bank entries are excluded from the
+    // thermal model), for a 60-row total of 370.
+    assert_eq!(direct_board, 240);
+    assert_eq!(ctrl, 78);
+    assert_eq!(direct_board + ctrl, 318);
+    assert_eq!(muxed, 52);
+    assert_eq!(direct_board + ctrl + muxed, 370);
+    // Ctrl-board pair (0x48 right/top + 0x4C left/top) on exactly 39 rows
+    // (33 v1.22.0 + TS007/BHB56601/BHB56701/A3HB707{05,07,08}).
     let with_ctrl = all_sensor_topologies()
         .iter()
         .filter(|t| t.expected_ctrl_board() > 0)
         .count();
-    assert_eq!(with_ctrl, 33);
+    assert_eq!(with_ctrl, 39);
     for t in all_sensor_topologies() {
         let n = t.expected_ctrl_board();
         assert!(n == 0 || n == 2, "{}: ctrl bank is a pair or absent", t.sku);
@@ -80,20 +96,24 @@ fn corpus_totals_match_the_evidence_db_including_the_mux_bank() {
 // 2. Muxed entries round-trip
 // ---------------------------------------------------------------------------
 
-const MUX_SKUS: [&str; 9] = [
+const MUX_SKUS: [&str; 13] = [
     "A3HB70501",
     "A3HB70502",
     "A3HB70503",
+    "A3HB70505",
     "A3HB70601",
     "A3HB70602",
     "A3HB70603",
     "A3HB70605",
     "A3HB70606",
     "A3HB70607",
+    "A3HB70608",
+    "A3HB70609",
+    "M1HB70602",
 ];
 
 #[test]
-fn mux_bank_exists_on_exactly_the_nine_a3hb_boards() {
+fn mux_bank_exists_on_exactly_the_thirteen_old_format_boards() {
     for t in all_sensor_topologies() {
         let expected = if MUX_SKUS.contains(&t.sku.as_str()) {
             4
@@ -128,7 +148,13 @@ fn muxed_entries_round_trip_through_descriptor_and_serde() {
                 } => {
                     assert_eq!(i2c_addr, raw.i2c_addr, "{sku}");
                     assert_eq!(i2c_addr, 0x4C, "{sku}");
-                    assert_eq!(anchor_asic, raw.anchor_asic, "{sku}");
+                    // Old-format entries always carry an anchor (only the
+                    // excluded H6 channel-bank omits it).
+                    assert_eq!(
+                        anchor_asic,
+                        raw.anchor_asic.expect("{sku}: anchor"),
+                        "{sku}"
+                    );
                     assert_eq!(power_by_ctrlboard, raw.power_by_ctrlboard, "{sku}");
                 }
                 SensorTransport::DirectI2c { .. } => panic!("{sku}: mux spec lost its transport"),
@@ -148,9 +174,12 @@ fn muxed_entries_round_trip_through_descriptor_and_serde() {
 
 #[test]
 fn mux_anchor_chips_are_pinned_per_family() {
-    // A3HB705xx (91-chip boards) anchor at chips {1, 7, 43, 68};
-    // A3HB706xx (65-chip boards) anchor at chips {5, 18, 40, 48}.
-    for sku in ["A3HB70501", "A3HB70502", "A3HB70503"] {
+    // A3HB705xx (91-chip boards) anchor at chips {1, 7, 43, 68} — the
+    // v1.24.0 A3HB70505 joins the family set exactly; the immersion
+    // M1HB70602 (also 91 chips) has its own set {0, 6, 48, 76}.
+    // A3HB706xx (65-chip boards) anchor at chips {5, 18, 40, 48} — the
+    // v1.24.0 A3HB70608/A3HB70609 join the family set exactly.
+    for sku in ["A3HB70501", "A3HB70502", "A3HB70503", "A3HB70505"] {
         let t = sensor_topology_for_sku(sku).unwrap();
         let mut anchors: Vec<u16> = t
             .muxed_sensors()
@@ -169,6 +198,8 @@ fn mux_anchor_chips_are_pinned_per_family() {
         "A3HB70605",
         "A3HB70606",
         "A3HB70607",
+        "A3HB70608",
+        "A3HB70609",
     ] {
         let t = sensor_topology_for_sku(sku).unwrap();
         let mut anchors: Vec<u16> = t
@@ -181,6 +212,16 @@ fn mux_anchor_chips_are_pinned_per_family() {
         anchors.sort_unstable();
         assert_eq!(anchors, vec![5, 18, 40, 48], "{sku}");
     }
+    let t = sensor_topology_for_sku("M1HB70602").unwrap();
+    let mut anchors: Vec<u16> = t
+        .muxed_sensors()
+        .map(|s| match s.transport {
+            SensorTransport::I2cMuxed { anchor_asic, .. } => anchor_asic,
+            _ => unreachable!(),
+        })
+        .collect();
+    anchors.sort_unstable();
+    assert_eq!(anchors, vec![0, 6, 48, 76], "immersion board anchors");
 }
 
 /// Transcription defect pin (same posture as the BHB42803 transposition pin):
@@ -202,7 +243,12 @@ fn a3hb70601_transcription_defect_is_pinned_not_reconciled() {
         let mut v: Vec<(u8, u16)> = d
             .switch_sensors
             .iter()
-            .map(|s| (s.index, s.anchor_asic))
+            .map(|s| {
+                (
+                    s.index,
+                    s.anchor_asic.expect("old-format entries carry anchors"),
+                )
+            })
             .collect();
         v.sort_unstable();
         v

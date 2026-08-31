@@ -13,6 +13,9 @@
 #                            BOARD for exactly one manifest.
 #   DIST_DIR                 Package root to search when MANIFEST is omitted.
 #   BOARD                    Board target used to narrow manifest discovery.
+#   DCENT_OTA_E2E_CANDIDATE  Non-publishable promotion candidate descriptor.
+#   DCENT_OTA_E2E_QUALIFICATION_CONFIRM=qualification-<boardTarget>
+#                            Required even for offline candidate validation.
 #
 # Live gates:
 #   DCENT_OTA_E2E_LIVE=1     Allow HTTP contact with a device.
@@ -26,6 +29,9 @@
 #   COM_PORT                 Serial port for espflash.
 #   DCENT_OTA_E2E_FLASH_CONFIRM=flash-<boardTarget>
 #                            Required confirmation for serial flash.
+#   DCENT_OTA_E2E_QUALIFICATION_LIVE_CONFIRM=live-qualification-<boardTarget>
+#                            Additional opt-in for contacting hardware with a
+#                            qualification-only candidate package.
 #
 # This script consumes the current package manifest shape emitted by
 # package-firmware.sh/ps1 and uses the dashboard OTA headers:
@@ -77,7 +83,19 @@ trap 'rm -f "$plan_file" "$body_file"' EXIT
 body_file=$(mktemp)
 
 PYTHON=${PYTHON:-python}
-"$PYTHON" "$SCRIPT_DIR/verify_ota_package.py" "$MANIFEST"
+CANDIDATE=${DCENT_OTA_E2E_CANDIDATE:-}
+if [ -n "$CANDIDATE" ]; then
+    [ -f "$CANDIDATE" ] || fail "Promotion candidate descriptor not found: $CANDIDATE"
+    candidate_board=$("$PYTHON" "$SCRIPT_DIR/promotion_candidate.py" lookup "$CANDIDATE" board_target)
+    [ "${DCENT_OTA_E2E_QUALIFICATION_CONFIRM:-}" = "qualification-$candidate_board" ] || \
+        fail "Set DCENT_OTA_E2E_QUALIFICATION_CONFIRM=qualification-$candidate_board"
+    "$PYTHON" "$SCRIPT_DIR/verify_ota_package.py" \
+        --allow-qualification-candidate \
+        --candidate "$CANDIDATE" \
+        "$MANIFEST"
+else
+    "$PYTHON" "$SCRIPT_DIR/verify_ota_package.py" "$MANIFEST"
+fi
 
 python - "$MANIFEST" "$plan_file" <<'PY'
 import hashlib
@@ -187,6 +205,11 @@ EOF
 if [ "${DCENT_OTA_E2E_LIVE:-0}" != "1" ]; then
     log "Offline manifest/header validation passed. Set DCENT_OTA_E2E_LIVE=1 for device contact."
     exit 0
+fi
+
+if [ -n "$CANDIDATE" ] && \
+   [ "${DCENT_OTA_E2E_QUALIFICATION_LIVE_CONFIRM:-}" != "live-qualification-$BOARD_TARGET" ]; then
+    fail "Set DCENT_OTA_E2E_QUALIFICATION_LIVE_CONFIRM=live-qualification-$BOARD_TARGET"
 fi
 
 : "${IP:?set IP for live OTA test}"

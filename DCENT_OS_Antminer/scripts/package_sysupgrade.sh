@@ -163,6 +163,9 @@ build_nand_kernel_fit() {
             compression = "none";
             load = <0x00008000>;
             entry = <0x00008000>;
+            hash-1 {
+                algo = "sha256";
+            };
         };
         fdt {
             description = "Antminer S9 Device Tree (BraiinsOS)";
@@ -170,6 +173,9 @@ build_nand_kernel_fit() {
             type = "flat_dt";
             arch = "arm";
             compression = "none";
+            hash-1 {
+                algo = "sha256";
+            };
         };
     };
     configurations {
@@ -397,9 +403,15 @@ esac
 if is_release_status "$PACKAGE_STATUS" && ! is_truthy "${DCENT_RELEASE_IMAGE:-0}"; then
     error "release-status package requires DCENT_RELEASE_IMAGE=1 (release-image hardening); release-root signatures are reserved for fully hardened release profiles (CE-183)."
 fi
+# Public/customer tarball gate (DESK_NOW 2026-08-19): also fail when
+# DCENT_PUBLIC_ARTIFACT/DCENT_CUSTOMER_IMAGE is set without RELEASE.
+# Lab/DEV (`lab_unsigned`, flags unset) is a no-op.
+DCENT_PACKAGE_STATUS="$PACKAGE_STATUS"
+. "$SCRIPT_DIR/lib/public_artifact_release_gate.sh"
+dcent_require_release_image_for_public_artifact \
+    || error "public/customer firmware artifact requires DCENT_RELEASE_IMAGE=1"
 
 DCENT_BUILD_TARGET="${DCENT_BUILD_TARGET:-$BOARD_NAME}"
-DCENT_PACKAGE_STATUS="$PACKAGE_STATUS"
 dcent_release_require_signed_authority_profile "$SIGNING_KEY" ||
     error "Invalid release-root signing authority profile."
 dcent_release_provenance_init || error "Invalid or missing release provenance."

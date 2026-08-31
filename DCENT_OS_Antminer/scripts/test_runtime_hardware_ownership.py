@@ -626,6 +626,9 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
         self.assertIn("root usr usr/bin usr/sbin", prune)
         self.assertIn('"$TARGET_DIR/usr/sbin/switch_firmware.py"', prune)
         self.assertIn('"$TARGET_DIR/usr/sbin/switch_firmware.sh"', prune)
+        self.assertIn("DCENT_RELEASE_IMAGE", prune)
+        self.assertIn("usr/bin/strace", prune)
+        self.assertIn("usr/sbin/i2cget", prune)
 
     def test_raw_boot_environment_transformers_are_host_only(self) -> None:
         self.assertFalse(TARGET_SWITCH_FIRMWARE.exists())
@@ -660,13 +663,25 @@ class RuntimeHardwareOwnershipTests(unittest.TestCase):
             (target / "usr/bin/dcent-shell").write_text("shell\n")
             (target / "usr/sbin/switch_firmware.py").write_text("raw\n")
             (target / "usr/sbin/switch_firmware.sh").write_text("raw\n")
+            (target / "usr/bin/strace").write_text("strace\n")
+            (target / "usr/sbin/i2cget").write_text("i2cget\n")
             (target / "etc/preserved").write_text("safe\n")
 
-            subprocess.run(["sh", str(PRUNE), str(target)], check=True)
+            env = os.environ.copy()
+            env.pop("DCENT_RELEASE_IMAGE", None)
+            subprocess.run(["sh", str(PRUNE), str(target)], check=True, env=env)
             self.assertFalse((target / "root/tools").exists())
             self.assertFalse((target / "usr/bin/dcent-shell").exists())
             self.assertFalse((target / "usr/sbin/switch_firmware.py").exists())
             self.assertFalse((target / "usr/sbin/switch_firmware.sh").exists())
+            self.assertEqual((target / "usr/bin/strace").read_text(), "strace\n")
+            self.assertEqual((target / "usr/sbin/i2cget").read_text(), "i2cget\n")
+            self.assertEqual((target / "etc/preserved").read_text(), "safe\n")
+
+            env["DCENT_RELEASE_IMAGE"] = "1"
+            subprocess.run(["sh", str(PRUNE), str(target)], check=True, env=env)
+            self.assertFalse((target / "usr/bin/strace").exists())
+            self.assertFalse((target / "usr/sbin/i2cget").exists())
             self.assertEqual((target / "etc/preserved").read_text(), "safe\n")
 
             root_result = subprocess.run(

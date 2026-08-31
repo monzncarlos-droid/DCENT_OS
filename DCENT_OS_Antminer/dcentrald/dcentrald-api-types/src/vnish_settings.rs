@@ -8,7 +8,7 @@
 //! module ships the typed payload shapes for the most-used endpoints:
 //! - `VnishSettingsResponse` ← `GET /api/v1/settings`
 //! - `VnishChipsResponse` ← `GET /api/v1/chips`
-//! - `VnishFactoryInfoResponse` ← `GET /api/v1/factory-info`
+//! - `VnishFactoryInfoResponse` ← `GET /api/v1/chains/factory-info`
 //!
 //! Field names match the verbatim JSON examples from VNISH_REVERSE_ENGINEERING.md
 //! lines 487-672. dcent-toolbox uses these for parity comparisons; the
@@ -129,7 +129,7 @@ pub struct VnishChipsResponse {
 // Factory info response
 // ---------------------------------------------------------------------------
 
-/// `GET /api/v1/factory-info` response. Carries the factory-burned
+/// `GET /api/v1/chains/factory-info` response. Carries the factory-burned
 /// identifiers operator sees on the unit's serial sticker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VnishFactoryInfoResponse {

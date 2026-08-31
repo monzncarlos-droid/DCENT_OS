@@ -8,12 +8,9 @@
 #   scripts/build_amlogic_native_install.sh --variant s19jpro-aml
 #   scripts/build_amlogic_native_install.sh --variant s19jproplus
 #   scripts/build_amlogic_native_install.sh --variant s19kpro
-#   scripts/build_amlogic_native_install.sh --variant s19xp
-#   scripts/build_amlogic_native_install.sh --variant s19jxp
+# S19 XP / S19j XP / S21 XP are package-only and intentionally refused.
 #   scripts/build_amlogic_native_install.sh --variant s21
 #   scripts/build_amlogic_native_install.sh --variant s21pro
-#   scripts/build_amlogic_native_install.sh --variant s21xp
-#   scripts/build_amlogic_native_install.sh --variant t21
 #   scripts/build_amlogic_native_install.sh --variant s21 --lab-unsigned
 #
 # The package must already exist under --output-dir (default: output/). Non-S9
@@ -26,7 +23,7 @@ OUTPUT_DIR=""
 LAB_UNSIGNED=0
 
 usage() {
-    echo "Usage: $(basename "$0") --variant s19jpro-aml|s19jproplus|s19kpro|s19xp|s19jxp|s21|s21pro|s21xp|t21 [--output-dir DIR] [--lab-unsigned]" >&2
+    echo "Usage: $(basename "$0") --variant s19jpro-aml|s19jproplus|s19kpro|s21|s21pro [--output-dir DIR] [--lab-unsigned]" >&2
     echo "       Extracts an existing validated sysupgrade tarball; does not build one." >&2
 }
 
@@ -102,19 +99,9 @@ case "$VARIANT" in
         ROOT_MEMBER="sysupgrade-am3-s19k/root"
         BIN_NAME="dcentos-amlogic-s19kpro.bin"
         ;;
-    s19xp)
-        TARGET="am3-s19xp"
-        BOARD_PKG_NAME="am3-s19xp"
-        TAR_NAME="dcentos-sysupgrade-am3-s19xp.tar"
-        ROOT_MEMBER="sysupgrade-am3-s19xp/root"
-        BIN_NAME="dcentos-amlogic-s19xp.bin"
-        ;;
-    s19jxp|s19j-xp)
-        TARGET="am3-s19jxp"
-        BOARD_PKG_NAME="am3-s19jxp"
-        TAR_NAME="dcentos-sysupgrade-am3-s19jxp.tar"
-        ROOT_MEMBER="sysupgrade-am3-s19jxp/root"
-        BIN_NAME="dcentos-amlogic-s19jxp.bin"
+    s19xp|s19jxp|s19j-xp)
+        echo "ERROR: S19 XP/S19j XP are NOT-IMPLEMENTED package-only targets; native install extraction is refused" >&2
+        exit 2
         ;;
     s21)
         TARGET="am3-s21"
@@ -130,22 +117,8 @@ case "$VARIANT" in
         ROOT_MEMBER="sysupgrade-am3-s21pro/root"
         BIN_NAME="dcentos-amlogic-s21pro.bin"
         ;;
-    s21xp)
-        TARGET="am3-s21xp"
-        BOARD_PKG_NAME="am3-s21xp"
-        TAR_NAME="dcentos-sysupgrade-am3-s21xp.tar"
-        ROOT_MEMBER="sysupgrade-am3-s21xp/root"
-        BIN_NAME="dcentos-amlogic-s21xp.bin"
-        ;;
-    t21)
-        TARGET="am3-t21"
-        BOARD_PKG_NAME="am3-t21"
-        TAR_NAME="dcentos-sysupgrade-am3-t21.tar"
-        ROOT_MEMBER="sysupgrade-am3-t21/root"
-        BIN_NAME="dcentos-amlogic-t21.bin"
-        ;;
     *)
-        echo "ERROR: unsupported Amlogic variant: $VARIANT (supported: s19jpro-aml, s19jproplus, s19kpro, s19xp, s19jxp, s21, s21pro, s21xp, t21)" >&2
+        echo "ERROR: unsupported Amlogic variant: $VARIANT (supported: s19jpro-aml, s19jproplus, s19kpro, s21, s21pro; S19 XP/S19j XP/S21 XP are package-only)" >&2
         exit 1
         ;;
 esac
@@ -198,6 +171,7 @@ TARBALL="$OUTPUT_DIR/$TAR_NAME"
 
 DCENT_ALLOW_UNSIGNED_SYSUPGRADE="${DCENT_ALLOW_UNSIGNED_SYSUPGRADE:-0}" \
 DCENT_PACKAGE_STATUS="${DCENT_PACKAGE_STATUS:-release}" \
+DCENT_REQUIRE_INSTALLABLE_PACKAGE=1 \
     bash "$SCRIPT_DIR/pre_flash_validate.sh" --package-only "$TARBALL" "$BOARD_PKG_NAME"
 
 TMPDIR="$(mktemp -d)"

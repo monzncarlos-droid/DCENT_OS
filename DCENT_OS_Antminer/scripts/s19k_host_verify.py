@@ -4,11 +4,13 @@
 Does not replace cargo test. Checks CRC5 vectors, SafeOff polarity, dual-port
 policy, and script string pins. Exit 0 only if all assertions pass.
 """
+
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import struct
+import sys
 from pathlib import Path
 import zlib
 
@@ -37,18 +39,30 @@ def main() -> int:
     assert resp_crc5(frame[2:10], 0x1B) != frame[10] & 0x1F
     assert resp_crc5(b"", 0x03) == 0x03
 
-    install = (ROOT / "scripts/install_amlogic_persistent.sh").read_text(encoding="utf-8", errors="replace")
+    install = (ROOT / "scripts/install_amlogic_persistent.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "GPIO437_SAFE_OFF=1" in install
     assert "am3-s19k-active-low" in install
-    assert install.find("Step 7b/10: GPIO437 PWR_EN SafeOff") < install.find(
-        'ssh_run "flash_erase $ROOTFS_MTD'
+    safeoff_at = install.find("Step 7b/10: GPIO437 PWR_EN SafeOff")
+    combined_writer_at = install.find(
+        "    flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT || exit 1"
+    )
+    assert (
+        safeoff_at != -1
+        and combined_writer_at != -1
+        and safeoff_at < combined_writer_at
     )
 
-    lab = (ROOT / "scripts/amlogic_lab_rootfs.sh").read_text(encoding="utf-8", errors="replace")
+    lab = (ROOT / "scripts/amlogic_lab_rootfs.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "am3-s19k-active-low" in lab
     assert "drive LOW) before NAND" not in lab
     assert "refuse GPIO437 SafeOff without proven board identity" in lab
-    assert "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite" in lab
+    assert (
+        "CLEAR_FOR_FLASH=false - refusing gpio437 SafeOff/flash_erase/nandwrite" in lab
+    )
     assert "--lab-only is not a FLASH override" in lab
     assert "admit_s19k_lab_rootfs_script_execute_refuses_nandwrite" in (
         ROOT / "dcentrald/dcentrald-common/src/s19k_am3_install.rs"
@@ -75,7 +89,7 @@ def main() -> int:
     assert "WANT_SAFE_OFF=1" in s37
     assert "IDENTITY_ROOT/board_target" in s37
     assert "GPIO437 refuse: missing or unsealed board_target=" in s37
-    assert "am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp|am3-t21)" in s37
+    assert "am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp)" in s37
 
     job = (ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_job.rs").read_text(
         encoding="utf-8"
@@ -143,7 +157,10 @@ def main() -> int:
     assert "BOSMINER_FPGA_0X10000_MOVZ_INSN: u32 = 0x52A0_0029" in job
     assert "BOSMINER_WORKER_NEW_SAVES_X6_INSN: u32 = 0xAA06_03FA" in job
     assert "BOSMINER_AM3_COMBO_BUG_LINE: u16 = 57" in job
-    assert 'BOSMINER_AM3_RS: &str = "open/bosminer/bosminer-am2-s17/src/hardware/am3.rs"' in job
+    assert (
+        'BOSMINER_AM3_RS: &str = "open/bosminer/bosminer-am2-s17/src/hardware/am3.rs"'
+        in job
+    )
     assert "controlboard/aml.rs" in job
     assert "admit_bosminer_bm1366_uses_am3_uart_registry_factory" in job
     assert "refuse_bm1366_exclusive_uart_registry_size" in job
@@ -407,8 +424,12 @@ def main() -> int:
     assert "BOSMINER_C8_TAG1_CBNZ_INSN: u32 = 0x3500_0C68" in job
     assert "BOSMINER_C8_ASYNC_DONE_BL_INSN: u32 = 0x97ED_F490" in job
     assert "BOSMINER_ASYNC_DONE_HELPER_ADD_INSN: u32 = 0x9111_C108" in job
-    assert "BOSMINER_ASYNC_DONE_MSG: &str = \"`async fn` resumed after completion\"" in job
-    assert "BOSMINER_ASYNC_PANIC_MSG: &str = \"`async fn` resumed after panicking\"" in job
+    assert (
+        'BOSMINER_ASYNC_DONE_MSG: &str = "`async fn` resumed after completion"' in job
+    )
+    assert (
+        'BOSMINER_ASYNC_PANIC_MSG: &str = "`async fn` resumed after panicking"' in job
+    )
     assert "BOSMINER_C8_TAG_COMPLETED: u8 = 1" in job
     assert "BOSMINER_C8_TAG_PANICKED: u8 = 2" in job
     assert "BOSMINER_C8_TAG_SUSPENDED: u8 = 3" in job
@@ -420,7 +441,10 @@ def main() -> int:
     assert "BOSMINER_C8_POLL_BM1397_LINE: u16 = 147" in job
     assert "BOSMINER_C8_POLL_VT230_LDR_INSN: u32 = 0xF941_1908" in job
     assert "BOSMINER_C8_POLL_ADD30_INSN: u32 = 0x9100_C260" in job
-    assert "BOSMINER_BM136X_FIELDSET_MSG: &str = \"FieldSet corrupted (this is a bug)\"" in job
+    assert (
+        'BOSMINER_BM136X_FIELDSET_MSG: &str = "FieldSet corrupted (this is a bug)"'
+        in job
+    )
     assert "admit_bosminer_plus230_is_ctx_ptr_and_1a8_wrap_fields" in job
     assert "refuse_plus230_as_vtable_or_1a8_end_as_interior" in job
     assert "BOSMINER_C8_STATE_ZERO_F8_INSN: u32 = 0x3903_E27F" in job
@@ -455,7 +479,7 @@ def main() -> int:
     assert "BOSMINER_TIMESPEC_NOW_LINE_137: u16 = 137" in job
     assert "BOSMINER_DURATION_NEW_STR10_INSN: u32 = 0xB900_1268" in job
     assert "BOSMINER_HC_PLUS260_MOVZ_INSN: u32 = 0x5280_0020" in job
-    assert "BOSMINER_INVALID_TIMESTAMP_MSG: &str = \"invalid timestamp\"" in job
+    assert 'BOSMINER_INVALID_TIMESTAMP_MSG: &str = "invalid timestamp"' in job
     assert "admit_bosminer_c0d4ac_is_48_and_37_split_fpga_uart_wrap" in job
     assert "refuse_168_as_full_c0d4ac_or_fpga_as_uart_only" in job
     assert "BOSMINER_C0D4AC_SIZE: u16 = 0x48" in job
@@ -479,7 +503,7 @@ def main() -> int:
     assert "BOSMINER_HC_PLUS230_NESTED_CMD_BL_INSN: u32 = 0x97F0_73D7" in job
     assert "BOSMINER_METRICS_223_LINE: u16 = 223" in job
     assert "BOSMINER_METRICS_223_BL_INSN: u32 = 0x942C_2E2B" in job
-    assert "BOSMINER_METRICS_STOP_WATCH: &str = \"stop_watch\"" in job
+    assert 'BOSMINER_METRICS_STOP_WATCH: &str = "stop_watch"' in job
     assert "BOSMINER_HASHES_TIME_MEAN_ELEMENTS: u8 = 2" in job
     assert "admit_bosminer_c0d4ac_is_copy_and_workpair_is_wrap_sibling" in job
     assert "refuse_c0d4ac_as_workpair_or_named_from_drop_glue" in job
@@ -488,7 +512,10 @@ def main() -> int:
     assert "BOSMINER_WORKPAIR_LINE_110: u16 = 110" in job
     assert "BOSMINER_WORKPAIR_110_ADRP_INSN: u32 = 0xD000_7084" in job
     assert "BOSMINER_C0D4E0_BL_HITS: usize = 1" in job
-    assert "BOSMINER_WORKPAIR_RS: &str = \"open/bosminer/bosminer-hal/src/workpair.rs\"" in job
+    assert (
+        'BOSMINER_WORKPAIR_RS: &str = "open/bosminer/bosminer-hal/src/workpair.rs"'
+        in job
+    )
     assert "admit_bosminer_230_is_vt40_x0_and_poll_stores_fut40" in job
     assert "refuse_230_as_ticket_mask_or_work_time_or_poll_mutating_hc" in job
     assert "BOSMINER_HASHCHAIN_TICKET_LINE: u16 = 298" in job
@@ -497,7 +524,9 @@ def main() -> int:
     assert "BOSMINER_HC_PLUS230_CONSUMER_LDR230_INSN: u32 = 0xF941_1900" in job
     assert "BOSMINER_HASHCHAIN_TICKET_ADRP_INSN: u32 = 0xF000_8C02" in job
     assert (
-        "BOSMINER_HASHCHAIN_TICKET_LOG: &str =\n    \"Setting ticket mask register for difficulty\""
+        'BOSMINER_HASHCHAIN_TICKET_LOG: &str = "Setting ticket mask register for difficulty"'
+        in job
+        or 'BOSMINER_HASHCHAIN_TICKET_LOG: &str =\n    "Setting ticket mask register for difficulty"'
         in job
     )
     assert "admit_bosminer_238_is_fat_vtable_and_clone_installs_pair" in job
@@ -515,8 +544,8 @@ def main() -> int:
     assert "BOSMINER_CMD_119_LINE: u16 = 119" in job
     assert "BOSMINER_HASHCHAIN_336_LINE: u16 = 336" in job
     assert "BOSMINER_FAT_SLOT30_X1_LDR_INSN: u32 = 0xF940_0A61" in job
-    assert "BOSMINER_HAL_COMMAND_MODULE: &str = \"bosminer_hal::command\"" in job
-    assert "BOSMINER_HASHCHIP_LABEL: &str = \"Hashchip:\"" in job
+    assert 'BOSMINER_HAL_COMMAND_MODULE: &str = "bosminer_hal::command"' in job
+    assert 'BOSMINER_HASHCHIP_LABEL: &str = "Hashchip:"' in job
     assert "admit_bosminer_fat_pairs_are_dyn_future_poll18_not_cmd700" in job
     assert "refuse_fat_pairs_as_result_or_cmd700_poll" in job
     assert "BOSMINER_JUMP_TABLE_CMD700_BL_HITS: usize = 0" in job
@@ -580,7 +609,7 @@ def main() -> int:
     assert "BOSMINER_FN11F2764_BL_HITS: usize = 557" in job
     assert "BOSMINER_FN11F2764_MOVZ1_PREV_HITS: usize = 537" in job
     assert "BOSMINER_FN11F2764_LDXR_INSN: u32 = 0x085F_FC08" in job
-    assert "BOSMINER_REFCOUNT_OVERFLOW_MSG: &str = \"reference count overflow!\"" in job
+    assert 'BOSMINER_REFCOUNT_OVERFLOW_MSG: &str = "reference count overflow!"' in job
     assert "BOSMINER_JT_PLUS68_STR_INSN: u32 = 0xF900_3660" in job
     assert "BOSMINER_JT_PLUS108_OFF: u16 = 0x108" in job
     assert "BOSMINER_FN11F26F8_TO_764_DELTA: u16 = 0x6C" in job
@@ -595,7 +624,9 @@ def main() -> int:
     assert "BOSMINER_PARK_1226_COL: u16 = 58" in job
     assert "BOSMINER_FN11F2764_TLS_BL_INSN: u32 = 0x9400_AF7E" in job
     assert (
-        "BOSMINER_PARK_RS_SUFFIX: &str =\n    \"parking_lot_core-0.9.10/src/parking_lot.rs\""
+        'BOSMINER_PARK_RS_SUFFIX: &str = "parking_lot_core-0.9.10/src/parking_lot.rs"'
+        in job
+        or 'BOSMINER_PARK_RS_SUFFIX: &str =\n    "parking_lot_core-0.9.10/src/parking_lot.rs"'
         in job
     )
     assert "admit_bosminer_slot28_is_zero_arg_fat_future" in job
@@ -876,7 +907,9 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "S19kDualWorkRxJoin" in discover
     assert "admit_s19k_production_joins_dual_uart_after_fill" in discover
-    serial = (ROOT / "dcentrald/dcentrald/src/serial_mining.rs").read_text(encoding="utf-8")
+    serial = (ROOT / "dcentrald/dcentrald/src/serial_mining.rs").read_text(
+        encoding="utf-8"
+    )
     assert "dual_work_rx.record(" in serial
     assert "S19k dual-UART WorkDispatch join (does not drop this nonce)" in serial
     assert "SinglePortNotDualProof" in rx
@@ -886,7 +919,9 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "refuse_s19k_backup_ledger_without_nandrecovery_sidecar" in install_rs
     assert "backup ledger missing nandrecovery_env sidecar" in install_rs
-    restore = (ROOT / "scripts/restore_amlogic_mtd5_from_backup.sh").read_text(encoding="utf-8")
+    restore = (ROOT / "scripts/restore_amlogic_mtd5_from_backup.sh").read_text(
+        encoding="utf-8"
+    )
     assert "nandrecovery_env.bin" in restore
     assert "nand_env.bak is not recover_env" in restore
     assert "s19k_nand_env_crc.py" in restore
@@ -909,22 +944,22 @@ def main() -> int:
     assert "admit_s19k_restore_script_sidecar_sha256" in install_rs
     assert "refuse_s19k_hashless_ledger_formatter_as_restore_complete" in install_rs
     assert "admit_s19k_hashed_ledger_formatter_emits_sidecar_sha" in install_rs
-    job_rs = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_job.rs"
-    ).read_text(encoding="utf-8")
+    job_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_job.rs").read_text(
+        encoding="utf-8"
+    )
     assert "admit_s19k_bosminer_scan_scripts" in job_rs
-    memcpy_scan = (
-        ROOT / "scripts/s19k_scan_bosminer_memcpy_sizes.py"
-    ).read_text(encoding="utf-8")
+    memcpy_scan = (ROOT / "scripts/s19k_scan_bosminer_memcpy_sizes.py").read_text(
+        encoding="utf-8"
+    )
     assert "Does not close T1" in memcpy_scan
     assert "0x36" in memcpy_scan
     assert "0x56" in memcpy_scan
     assert "U86_AT_0xe80871" in (
         ROOT / "scripts/s19k_scan_bosminer_genericarray.py"
     ).read_text(encoding="utf-8")
-    assert "55AA2136" in (
-        ROOT / "scripts/s19k_scan_bosminer_job_bytes.py"
-    ).read_text(encoding="utf-8")
+    assert "55AA2136" in (ROOT / "scripts/s19k_scan_bosminer_job_bytes.py").read_text(
+        encoding="utf-8"
+    )
     assert "missing nandrecovery_env_sha256" in restore
     assert "nandrecovery_env.bin sha256 drift" in restore
     assert "nandrecovery_env_sha256_ok=true" in restore
@@ -944,9 +979,9 @@ def main() -> int:
     assert "S19kRxExpectedAfter::InitRearm" in (
         ROOT / "dcentrald/dcentrald/src/serial_mining.rs"
     ).read_text(encoding="utf-8", errors="replace")
-    rx_rs = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs"
-    ).read_text(encoding="utf-8")
+    rx_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_uart_rx.rs").read_text(
+        encoding="utf-8"
+    )
     assert "RearmRegOk" in rx_rs
     assert "SetAddressEcho" in rx_rs
     assert "bm1366_rearm_ticket_reply_uart" in rx_rs
@@ -956,7 +991,9 @@ def main() -> int:
     assert "note_empty_if_unseen" in (
         ROOT / "dcentrald/dcentrald/src/serial_mining.rs"
     ).read_text(encoding="utf-8", errors="replace")
-    hal = (ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs").read_text(encoding="utf-8")
+    hal = (ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs").read_text(
+        encoding="utf-8"
+    )
     assert "pub const BM1366_UART_RESP_BODY_LEN: usize = 9" in hal
     assert "const DEFAULT_RESP_BODY_LEN: usize = 7" in hal
     assert "admit_bosminer_11f2de4_is_acquire_poll" in job
@@ -1132,7 +1169,7 @@ def main() -> int:
     assert "refuse_stp_xzr_as_hashchain_228_default" in job
     assert "refuse_1200524_as_memset" in job
     assert "refuse_wzr_228_stores_as_hashchain" in job
-    assert "refuse_836c20_as_hashchain_228" in job
+    assert "refuse_ticket_mask_836c20_as_hashchain_228" in job
     assert "BOSMINER_STP_XZR_220_228_NONSP_HITS: usize = 0" in job
     assert "BOSMINER_STR_XZR_228_NONSP_HITS: usize = 7" in job
     assert "BOSMINER_STR_XZR_228_INSN: u32 = 0xF901_167F" in job
@@ -1217,7 +1254,7 @@ def main() -> int:
     assert "BOSMINER_BOX300_SRC_LDR_INSN: u32 = 0xF941_3298" in job
     assert "BOSMINER_BOX300_MOVZ_INSN: u32 = 0x5280_6000" in job
     assert "BOSMINER_STR260_HITS: usize = 52" in job
-    assert "BOSMINER_BAUD260_INSN: u32 = 0xF901_3148" in job
+    assert "BOSMINER_TICKET_MASK260_INSN: u32 = 0xF901_3148" in job
     assert "admit_bosminer_705464_stores_src_at_3b0" in job
     assert "admit_bosminer_705464_copies_hc_to_2e0" in job
     assert "refuse_3b0_as_hashchain_pointer" in job
@@ -1341,7 +1378,7 @@ def main() -> int:
     assert "refuse_factory4_as_pack56_type" in job
     assert "refuse_workpair_as_pack56_type" in job
     assert "BOSMINER_TYPEINFO_SIZE56_HITS: usize = 0" in job
-    assert "BOSMINER_HAL_WORKPAIR_TYPE: &str = \"bosminer_hal::workpair\"" in job
+    assert 'BOSMINER_HAL_WORKPAIR_TYPE: &str = "bosminer_hal::workpair"' in job
     assert "refuse_bm136x_panic_site_as_job_packer" in job
     assert "BOSMINER_BM136X_PANIC_BL_CALLERS: usize = 0" in job
     assert "refuse_zero_bl_callers_as_packer_entry" in job
@@ -1361,28 +1398,43 @@ def main() -> int:
     serial = (ROOT / "dcentrald/dcentrald/src/serial_mining.rs").read_text(
         encoding="utf-8"
     )
+    production_serial = serial.split("\n#[cfg(test)]\nmod tests {", 1)[0]
     assert "plan_s19k_braiins_mining_on_ports" in serial
     assert "passthrough && is_bm1366" in serial
     assert "SerialWorkTransport::Multi" in serial
-    assert "let serial = if passthrough && is_bm1366" in serial
+    assert "let serial = if braiins_bm1366_passthrough_handoff" in production_serial
+    assert "let serial = if passthrough && is_bm1366" not in production_serial
     assert "parse_bm1366_share_from_body" not in serial
-    assert "hunt_s19k_bm1366_fill_from_tagged_slot" in serial
+    assert "hunt_s19k_bm1366_fill_from_admitted_tx_path" in serial
     assert "S19kOutstandingFillTx" in serial
     assert "insert_wire" in serial
+    assert "insert_wire_retiring" in serial
+    assert "refuse_s19k_wrap7_same_id_drop_without_retire" in serial
     assert "outstanding_s19k_tx.len() >= 32" not in serial
-    assert "qualify_bm1366_braiins_fill_from_body(&resp[..9], share.job_id" not in serial
+    assert (
+        "qualify_bm1366_braiins_fill_from_body(&resp[..9], share.job_id" not in serial
+    )
     assert "SerialMiningEngineBookkeeping::s19k_braiins_fill" in serial
     assert "admit_s19k_braiins_fill_share_job_id_in_history" in serial
     assert "reconstruct_s19k_send_work_wire" in serial
-    bm1366_arm = serial.split("let serial = if passthrough && is_bm1366", 1)[1]
-    bm1366_arm = bm1366_arm.split("} else if passthrough {", 1)[0]
+    transport_tail = production_serial.split(
+        "let serial = if braiins_bm1366_passthrough_handoff", 1
+    )[1]
+    bm1366_arm, generic_tail = transport_tail.split("} else if passthrough {", 1)
     assert "open_passthrough(0, &serial_device)" not in bm1366_arm
+    assert "open_passthrough_bm1366(i as u8, path)" in bm1366_arm
+    generic_arm = generic_tail.split("} else if is_bm1398 {", 1)[0]
+    bm1366_refusal = generic_arm.find("if is_bm1366 {")
+    generic_open = generic_arm.find("open_passthrough(0, &serial_device)")
+    assert 0 <= bm1366_refusal < generic_open
+    assert "S19k BM1366 must use Track-1 multi-tty" in generic_arm
     nonce_arm = serial.split("Wave 246: tagged tty", 1)[1]
     nonce_arm = nonce_arm.split("if flags & 0x80 == 0", 1)[0]
     assert "nonce = share.nonce_le" in nonce_arm
-    assert "hunt_s19k_bm1366_fill_from_tagged_slot" in nonce_arm
+    assert "hunt_s19k_bm1366_fill_from_admitted_tx_path" in nonce_arm
     assert "hit.path" in nonce_arm
-    assert "0u16, // fill log 0" in nonce_arm
+    assert "0u16, // fill log 0: not ESP BIP320 body[6:7]" not in nonce_arm
+    assert "share.version_bits as u16" in nonce_arm
     assert "0u8, // fill midstates=1" in nonce_arm
     assert "0x80, // fill hunt" in nonce_arm
     assert "share.midstate_num" not in nonce_arm
@@ -1405,10 +1457,21 @@ def main() -> int:
     deploy_sh = (ROOT / "scripts/dcentrald_s19k_tmp_deploy.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "mining_key passthrough true" in deploy_sh
+    assert "import tomllib" in deploy_sh
+    assert 'platform = document.get("platform")' in deploy_sh
+    assert 'mining = document.get("mining")' in deploy_sh
+    assert "requires the operator's explicit --allow-loud authority" in deploy_sh
     assert "NativeMiningOn" in deploy_sh
     assert "admit_s19k_armhf_elf" in deploy_sh
     assert "e_machine" in deploy_sh
+    assert "--expected-artifact-sha256)" in deploy_sh
+    assert "--expected-artifact-bytes)" in deploy_sh
+    assert "operator_artifact_pin=$ARTIFACT_OPERATOR_PIN" in deploy_sh
+    assert "expected_artifact_sha256=$EXPECTED_ARTIFACT_SHA256" in deploy_sh
+    assert "expected_artifact_bytes=$EXPECTED_ARTIFACT_BYTES" in deploy_sh
+    assert (
+        "selected artifact does not match exact sealed operator authority" in deploy_sh
+    )
     deploy_rs_text = (
         ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_tmp_deploy.rs"
     ).read_text(encoding="utf-8")
@@ -1421,38 +1484,51 @@ def main() -> int:
     assert "admit_s19k_tmp_deploy_script_musl_static" in deploy_rs_text
     assert "admit_s19k_tmp_deploy_board_target" in deploy_rs_text
     assert "admit_s19k_tmp_deploy_post_scp" in deploy_rs_text
-    assert "dcentos.s19k-tmp-deploy/v2" in deploy_rs_text
+    assert "dcentos.s19k-tmp-deploy/v12" in deploy_rs_text
+    assert "operator_artifact_pin=required-and-matched" in deploy_rs_text
+    assert "expected_artifact_sha256={sha256_hex}" in deploy_rs_text
+    assert "expected_artifact_bytes={bytes}" in deploy_rs_text
+    assert "runtime_receipt_schema=dcentos.s19k-tmp-runtime/v5" in deploy_rs_text
+    assert (
+        "runtime_lock=board-global-atomic-mkdir+v6-artifact-bound-owner+"
+        "typed-pending-retention" in deploy_rs_text
+    )
+    assert "custody_observer_sha256" in deploy_rs_text
+    assert "custody_observer_bytes" in deploy_rs_text
+    assert "stock_restart_helper_sha256" in deploy_rs_text
+    assert "stock_restart_helper_bytes" in deploy_rs_text
+    assert (
+        "live_identity_schema=dcentos.s19k-braiins-live-identity/v2" in deploy_rs_text
+    )
+    assert (
+        "live_identity_profile_rule=mutually-exclusive-complete-tuple" in deploy_rs_text
+    )
+    assert (
+        "live_identity_profile_live88_two_bhb56903_slots_2_3="
+        "2xBHB56903@2,3+addr1-undetected-placeholder+"
+        "eeprom-0x50-absent-0x51-0x52-0511" in deploy_rs_text
+    )
+    assert "resets=454:0,455:0,456:0 psu=437:1" in deploy_rs_text
+    assert "resets=472:0,473:0,474:0 psu=437:1" not in deploy_rs_text
+    assert (
+        "live_identity_profile_held78_three_bhb56902_slots_1_2_3="
+        "3xBHB56902@1,2,3+eeprom-0x50-0x51-0x52-0511" in deploy_rs_text
+    )
+    assert "entry_in_executable_load" in deploy_sh
+    assert "phnum in (0, 0xffff)" in deploy_sh
+    assert "p_offset + p_filesz > len(blob)" in deploy_sh
     assert "sha256=" in deploy_sh
     assert "bytes=" in deploy_sh
     assert "post_scp=sha256sum" in deploy_sh
     assert "admit_s19k_tmp_deploy_post_scp" in deploy_sh
     assert deploy_sh.find("scp -O") < deploy_sh.find("admit_s19k_tmp_deploy_post_scp")
-    assert deploy_sh.find("admit_s19k_tmp_deploy_post_scp") < deploy_sh.find("chmod 755")
+    assert deploy_sh.find("admit_s19k_tmp_deploy_post_scp") < deploy_sh.find(
+        "chmod 755"
+    )
     assert "WrongBoardTarget" in deploy_rs_text
     assert "am3-s19kpro" in deploy_sh
     assert "am3-aml-s19kpro" in deploy_sh
 
-    def admit_armhf_elf(hdr: bytes) -> bool:
-        return (
-            len(hdr) >= 20
-            and hdr[:4] == b"\x7fELF"
-            and hdr[4] == 1
-            and int.from_bytes(hdr[18:20], "little") == 40
-        )
-
-    fake = bytearray(20)
-    fake[0:4] = b"\x7fELF"
-    fake[4] = 1
-    fake[18:20] = (40).to_bytes(2, "little")
-    assert admit_armhf_elf(bytes(fake))
-    fake[4] = 2
-    assert not admit_armhf_elf(bytes(fake))
-    elf = (
-        ROOT
-        / "dcentrald/target/armv7-unknown-linux-musleabihf/release/dcentrald"
-    )
-    if elf.is_file():
-        assert admit_armhf_elf(elf.read_bytes()[:20])
     discover = (
         ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs"
     ).read_text(encoding="utf-8")
@@ -1528,7 +1604,7 @@ def main() -> int:
     )
     assert "passthrough = true" in ckpool
     assert "enabled = true" in ckpool
-    assert "CLEAR_FOR_FLASH=false — refusing flash_erase/nandwrite/fw_setenv" in install
+    assert "CLEAR_FOR_FLASH=false - refusing flash_erase/nandwrite/fw_setenv" in install
     assert "admit_s19k_78_daemonc_elf" in install_rs
     assert "admit_s19k_stock_upgrade_cgi" in install_rs
     assert "S19K_78_DAEMONC_PORC_STR_OFF: u64 = 0xF54" in install_rs
@@ -1562,8 +1638,7 @@ def main() -> int:
     assert "refuse_s21_androidboot_firstboot_as_uboot_firstboot" in install_rs
     assert "refuse_s21_held_s97_as_firstboot_bootcmd" in install_rs
     s99 = (
-        ROOT
-        / "br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade"
+        ROOT / "br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade"
     ).read_text(encoding="utf-8", errors="replace")
     assert "U-Boot reverts to mtd2" not in s99
     assert "Two parallel U-Boot revert mechanisms" not in s99
@@ -1575,7 +1650,9 @@ def main() -> int:
     assert "s19k_firstboot_is_wal_companion_only" in s99
     assert "proceeding to 0x02->0x03" in s99
     assert "recover_to_stock is already disarmed by flag 0x03" in s99
-    assert "S19K_STOCK_UPDATEPORC_PREFIX: &str = \"/usr/sbin/updateporc.sh \"" in install_rs
+    assert (
+        'S19K_STOCK_UPDATEPORC_PREFIX: &str = "/usr/sbin/updateporc.sh "' in install_rs
+    )
     assert "S19K_STOCK_DAEMONC_LISTEN_PORT: u16 = 22322" in install_rs
     assert "S19K_78_DAEMONC_CMP_C8_INSN: u32 = 0xE350_00C8" in install_rs
     daemonc = (
@@ -1587,6 +1664,10 @@ def main() -> int:
     if daemonc.is_file():
         db = daemonc.read_bytes()
         assert len(db) == 7240
+        assert (
+            hashlib.sha256(db).hexdigest()
+            == "a8f3c4c3e505dbee636c1f4919029470ef77fa3590fe6cbf462a49eae07b8e8e"
+        )
         assert db[:4] == b"\x7fELF"
         assert db[4] == 1
         assert int.from_bytes(db[18:20], "little") == 40
@@ -1604,19 +1685,13 @@ def main() -> int:
         assert struct.unpack_from("<I", db, 0xEBC)[0] == 0xE35000C8
         if update_daemon.is_file():
             assert update_daemon.read_bytes() == db
-    mtd2 = (
-        ROOT.parents[1]
-        / ""
-    )
+    mtd2 = ROOT.parents[1] / ""
     if mtd2.is_file():
         mb = mtd2.read_bytes()
         assert len(mb) == 52_428_800
         assert mb.find(b"updateporc") < 0
         assert mb[2_097_152 : 2_097_152 + 8] == b"ANDROID!"
-    mtd3 = (
-        ROOT.parents[1]
-        / ""
-    )
+    mtd3 = ROOT.parents[1] / ""
     if mtd3.is_file():
         m3 = mtd3.read_bytes()
         assert len(m3) == 5_242_880
@@ -1648,9 +1723,9 @@ def main() -> int:
         assert "nandwrite -p -s" in s97t
         assert 'BOS_MODE" = "nand"' in s97t
         assert "nanddump -s $LOCAL_RECOVERY_FLAGS_OFFSET_BOS_LAYOUT -l 1" in s97t
-        assert s97t.find("nanddump -s $LOCAL_RECOVERY_FLAGS_OFFSET_BOS_LAYOUT -l 1") < s97t.find(
-            "flash_erase"
-        )
+        assert s97t.find(
+            "nanddump -s $LOCAL_RECOVERY_FLAGS_OFFSET_BOS_LAYOUT -l 1"
+        ) < s97t.find("flash_erase")
         assert "RECOVERY_FLAG_INSTALLED" not in s97t
     cgi = (
         ROOT.parents[1]
@@ -1669,9 +1744,9 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "S19kSilenceClass" in preflight
     assert "RailsDisabled" in preflight
-    enum_rs = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_bosminer_enum.rs"
-    ).read_text(encoding="utf-8")
+    enum_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_bosminer_enum.rs").read_text(
+        encoding="utf-8"
+    )
     assert "S19K_BHB56902_CHIP_COUNT: u32 = 77" in enum_rs
     assert "parse_s19k_bosminer_enum_fault" in enum_rs
     assert "refuse_s19k_78_bosminer_log_as_fastuart_proof" in enum_rs
@@ -1687,9 +1762,58 @@ def main() -> int:
         assert "control board platform:am3-aml" in log_text
         assert "BHB56902" in log_text
         assert log_text.count("Set baud rate") == 0
+    departure_log = (
+        ROOT.parents[1] / "tmp/s19k-departure-capture-20260821/logs/bosminer.log"
+    )
+    if departure_log.is_file():
+        departure_bytes = departure_log.read_bytes()
+        assert len(departure_bytes) == 182_833
+        assert hashlib.sha256(departure_bytes).hexdigest() == (
+            "98453e18d012e18adf726d7276f7d1d4a53c3546696a2b5950248138f6668b93"
+        )
+        departure_text = departure_bytes.decode("utf-8", errors="replace")
+        cycles = departure_text.split("PSU: Enable")
+        assert len(cycles) == 9, "eight complete captured rail-enable cycles"
+        for cycle in cycles[1:]:
+            for chain in (2, 3):
+                assert (
+                    cycle.count(
+                        f"CHAIN/{chain}: Discovered 77 chips (expected 77 chips)"
+                    )
+                    == 1
+                )
+                assert (
+                    cycle.count(
+                        f"CHAIN/{chain}: Set baud rate @ requested: 3125000, actual: 3125000"
+                    )
+                    == 1
+                )
+                assert (
+                    cycle.count(
+                        f"CHAIN/{chain}: Monitor watchdog temperature task started"
+                    )
+                    == 1
+                )
+        final_cycle = cycles[-1]
+        assert (
+            final_cycle.find("CHAIN/2: Initializing hashchain")
+            < final_cycle.find("CHAIN/2: Discovered 77 chips (expected 77 chips)")
+            < final_cycle.find(
+                "CHAIN/2: Set baud rate @ requested: 3125000, actual: 3125000"
+            )
+            < final_cycle.find("CHAIN/2: Monitor watchdog temperature task started")
+        )
+        assert (
+            final_cycle.find("CHAIN/3: Initializing hashchain")
+            < final_cycle.find("CHAIN/3: Discovered 77 chips (expected 77 chips)")
+            < final_cycle.find(
+                "CHAIN/3: Set baud rate @ requested: 3125000, actual: 3125000"
+            )
+            < final_cycle.find("CHAIN/3: Monitor watchdog temperature task started")
+        )
     assert "classify_s19k_passthrough_silence" in serial
     assert "s19k_passthrough_rearm_writes" in serial
-    assert "S19K_AML_ADDR_INTERVAL" in serial
+    assert "native_program.address_interval" in serial
     assert "if is_bm1366" in serial
     assert "is_bm1366," in serial
     assert "if is_bm1366 {" in serial
@@ -1698,7 +1822,9 @@ def main() -> int:
     rolled = serial.split("fn serial_rolled_version(", 1)[1]
     rolled = rolled.split("fn serial_build_header(", 1)[0]
     assert "is_bm1366: bool" in rolled
-    assert "s19k_braiins_midstate0_version(entry.version, version_bits_raw)" in rolled
+    assert "s19k_braiins_midstate0_version" in rolled
+    assert "entry.version" in rolled
+    assert "version_bits_raw" in rolled
     assert rolled.find("s19k_braiins_midstate0_version") < rolled.find(
         "bip320_reconstruct_rolled_version"
     )
@@ -1715,7 +1841,16 @@ def main() -> int:
     assert "eraseblock_start=" in flag_sh
     assert "rewriter=eraseblock_rewrite" in flag_sh
     assert "--fixture-in" in flag_sh
-    assert "byte_in_block must be 0" in flag_sh
+    assert "byte_in_block=$EB_OFF_HEX" in flag_sh
+    assert flag_sh.count("candidate_required=full-0x20000-byte-eraseblock") == 3
+    assert flag_sh.count("candidate_source=host-fixture-only") == 3
+    assert flag_sh.count("write_command=false") == 3
+    assert (
+        flag_sh.count("readback_required=full-0x20000-byte-sha256-and-byte-compare")
+        == 3
+    )
+    assert "mode=execute-eraseblock-rewrite" not in flag_sh
+    assert "byte_in_block must be 0" not in flag_sh
     assert "planned_not_executed" not in flag_sh
     assert "proc_mtd=" in install
     assert "recovery_flag_local=" in install
@@ -1727,12 +1862,16 @@ def main() -> int:
     assert "s19k_passthrough_rearm_writes" in init_seq
     assert "refuse_esp_9000ffff_as_braiins_fill_rearm" in init_seq
     assert "admit_s19k_passthrough_rearm_omits_version_roll" in init_seq
-    assert '"ticket_mask_diff256" | "hash_counting_s19k" | "version_roll"' not in init_seq
+    assert "admit_s19k_midrun_rearm_includes_analog_mux" in init_seq
+    assert (
+        '"ticket_mask_diff256" | "hash_counting_s19k" | "version_roll"' not in init_seq
+    )
+    assert '"ticket_mask_diff256" | "hash_counting_s19k" | "analog_mux"' in init_seq
     assert "ESP_BM1366_VERSION_ROLL_MASK: u32 = 0x9000_FFFF" in init_seq
     assert "steps.push(step_from_write(*VERSION_ROLL_BCAST_WRITE))" not in init_seq
-    engine = (
-        ROOT / "dcentrald/dcentrald-common/src/serial_work_engine.rs"
-    ).read_text(encoding="utf-8")
+    engine = (ROOT / "dcentrald/dcentrald-common/src/serial_work_engine.rs").read_text(
+        encoding="utf-8"
+    )
     assert "S19K_AML_ADDR_INTERVAL" in engine
     assert "fn s19k_braiins_fill()" in engine
     assert "admit_s19k_passthrough_work_tx" in serial
@@ -1776,10 +1915,12 @@ def main() -> int:
     assert "refuse_bm1366_3001_as_s19k_braiins_3m" in init_seq
     assert "refuse_bm1362_3011_as_s19k_braiins_3m" in init_seq
     assert "refuse_bosminer_movz_3001_as_fastuart" in init_seq
-    assert "refuse_bosminer_am2_set_baud_as_s19k_aml" in init_seq
+    assert "refuse_bosminer_ticket_mask_future_as_fastuart" in init_seq
     assert "BOSMINER_COMMAND_RS_READ_REGISTER_FN_VA: u64 = 0x008A_9044" in init_seq
     assert "BOSMINER_UART_BE4_SEND_FN_VA: u64 = 0x008A_200C" in init_seq
-    assert "BOSMINER_AM2_SET_BAUD_FN_VA: u64 = 0x0083_6934" in init_seq
+    assert "BOSMINER_TICKET_MASK_FUTURE_FN_VA: u64 = 0x0083_6934" in init_seq
+    assert "admit_bosminer_bm1366_stock_baud_static" in init_seq
+    assert "BOSMINER_BM1366_FASTUART_3M125: u32 = 0x0000_3011" in init_seq
     assert "BOSMINER_SETCFG_51_09_00_28_HITS: usize = 0" in init_seq
     assert "refuse_bosminer_file_setcfg_28_as_s19k_fastuart" in init_seq
     assert "refuse_uart_be4_send_callers_as_s19k_aml_fastuart" in init_seq
@@ -1797,6 +1938,7 @@ def main() -> int:
     assert "refuse_bm1366_packed_dispatch_as_named_fastuart" in init_seq
     assert "BOSMINER_BM1366_PACKED_DISPATCH_FN_VA: u64 = 0x008D_823C" in init_seq
     assert "BOSMINER_BM1366_DISPATCH_BL_HITS: usize = 48" in init_seq
+    assert "BOSMINER_BM1366_DISPATCH_BL_IN_LOC_CLUSTER: usize = 31" in init_seq
     assert "admit_bosminer_blr_x8_is_fat_ptr_vtable0" in init_seq
     assert "refuse_blr_x8_as_named_text_write_reg" in init_seq
     assert "refuse_dispatch_arc_like_as_uart_write" in init_seq
@@ -1866,13 +2008,13 @@ def main() -> int:
     assert "linux_b3000000_speed_t" in init_seq
     assert "BOSMINER_HOST_3M_MOVZ_HITS: usize = 4" in init_seq
     assert "BOSMINER_B3000000_SPEED_T: u32 = 0x100D" in init_seq
-    assert "admit_bosminer_bm1366_reg28_6000f" in init_seq
-    assert "admit_bosminer_bm1366_reg28_clone" in init_seq
-    assert "pack_s19k_bm1366_loc_cluster_reg28_uart" in init_seq
-    assert "refuse_bm1366_reg28_6000f_as_host_3m" in init_seq
-    assert "refuse_bm1366_reg28_6000f_as_bible_3001" in init_seq
-    assert "BOSMINER_BM1366_REG28_VALUE: u32 = 0x0006_000F" in init_seq
-    assert "BOSMINER_BM1366_REG28_LOC_LINE: u32 = 241" in init_seq
+    assert "admit_bosminer_bm1397_reg28_0600000f" in init_seq
+    assert "admit_bosminer_bm1396_reg28_0600000f" in init_seq
+    assert "pack_legacy_s17_reg28_uart" in init_seq
+    assert "refuse_legacy_s17_reg28_0600000f_as_bm1366" in init_seq
+    assert "BOSMINER_LEGACY_S17_REG28_VALUE: u32 = 0x0600_000F" in init_seq
+    assert "BOSMINER_BM1397_REG28_LOC_LINE: u32 = 103" in init_seq
+    assert "BOSMINER_BM1396_REG28_LOC_LINE: u32 = 101" in init_seq
     assert "format_s19k_install_commit_plan" in install_rs
     assert "refuse_s19k_firstboot_only_as_install_commit" in install_rs
     assert "InstallArm" in install_rs
@@ -1880,20 +2022,22 @@ def main() -> int:
     assert "admit_s19k_install_commit_plan" in install_rs
     assert "admit_s19k_recovery_flag_script_plans_install_arm" in install_rs
     assert "admit_s19k_install_script_writes_install_commit_geometry" in install_rs
-    install_sh_w285 = (
-        ROOT / "scripts/install_amlogic_persistent.sh"
-    ).read_text(encoding="utf-8", errors="replace")
+    install_sh_w285 = (ROOT / "scripts/install_amlogic_persistent.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "write_install_commit_plan()" in install_sh_w285
     assert "uboot_action=FirstBosThenSetFlag2" in install_sh_w285
     assert "eraseblock_index=" in install_sh_w285
     assert "eraseblock_start=" in install_sh_w285
     assert "byte_in_block=" in install_sh_w285
-    assert "write_install_commit_plan \"dry_run=true\"" in install_sh_w285
+    assert 'write_install_commit_plan "dry_run=true"' in install_sh_w285
     assert install_sh_w285.find("write_install_commit_plan()") < install_sh_w285.find(
-        "write_install_commit_plan \"dry_run=true\""
+        'write_install_commit_plan "dry_run=true"'
     )
-    assert install_sh_w285.find("write_install_commit_plan \"dry_run=true\"") < install_sh_w285.find(
-        "CLEAR_FOR_FLASH=false — refusing flash_erase/nandwrite/fw_setenv"
+    assert install_sh_w285.find(
+        'write_install_commit_plan "dry_run=true"'
+    ) < install_sh_w285.find(
+        "CLEAR_FOR_FLASH=false - refusing flash_erase/nandwrite/fw_setenv"
     )
     assert "bootm_mtd2=false" in install_rs
     flag_sh_w284 = (ROOT / "scripts/s19k_write_recovery_flag.sh").read_text(
@@ -1908,9 +2052,14 @@ def main() -> int:
         "recovery flag 0x01 is FLASH NOT_YET here (use INSTALL_COMMIT_PLAN)"
         not in flag_sh_w284
     )
-    assert flag_sh_w284.find("recovery flag 0x01 execute is FLASH NOT_YET") < flag_sh_w284.find(
-        'flash_erase /dev/mtd5 "$EB_START_HEX" 1'
+    assert flag_sh_w284.find(
+        "recovery flag 0x01 execute is FLASH NOT_YET"
+    ) < flag_sh_w284.find("intent=InstallArm")
+    assert "rewrite_recovery_flag_fixture()" in flag_sh_w284
+    assert flag_sh_w284.find("rewrite_recovery_flag_fixture()") < flag_sh_w284.find(
+        "intent=InstallArm"
     )
+    assert 'flash_erase /dev/mtd5 "$EB_START_HEX" 1' not in flag_sh_w284
     assert "format_s19k_recover_to_stock_plan" in install_rs
     assert "plan_s19k_recover_to_stock" in install_rs
     assert "admit_s19k_install_script_writes_recover_to_stock_plan" in install_rs
@@ -1921,9 +2070,9 @@ def main() -> int:
     assert "admit_s19k_recover_script_execute_refuses_nandwrite" in install_rs
     assert "S19K_RECOVER_WALK_SCHEMA" in install_rs
     assert "S19K_RECOVER_DRY_STEP0" in install_rs
-    recover_sh = (
-        ROOT / "scripts/recover_amlogic_to_stock.sh"
-    ).read_text(encoding="utf-8", errors="replace")
+    recover_sh = (ROOT / "scripts/recover_amlogic_to_stock.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "--dry-run" in recover_sh
     assert "--verify-only" in recover_sh
     assert "RECOVER_TO_STOCK_PLAN.txt" in recover_sh
@@ -1931,51 +2080,72 @@ def main() -> int:
     assert "s19k_nand_env_crc.py" in recover_sh
     assert "nandrecovery_env.bin CRC32 mismatch" in recover_sh
     assert "nand_env.bak is not recover_env" in recover_sh
-    assert "[DRY RUN] walking RECOVER_TO_STOCK_PLAN before GPIO/nandwrite/fw_setenv/env import" in recover_sh
+    assert (
+        "[DRY RUN] walking RECOVER_TO_STOCK_PLAN before GPIO/nandwrite/fw_setenv/env import"
+        in recover_sh
+    )
     assert "schema=dcentos.amlogic-recover-walk/v1" in recover_sh
-    assert "dry_step0=nand read 01060000 ${nandrecovery_env_offset} ${env_size}; env default -a; env import -d -c 01060000 0x10000; env save" in recover_sh
+    assert (
+        "dry_step0=nand read 01060000 ${nandrecovery_env_offset} ${env_size}; env default -a; env import -d -c 01060000 0x10000; env save"
+        in recover_sh
+    )
     assert "dry_step1=nand erase.part nvdata" in recover_sh
     assert "dry_step2=reset" in recover_sh
     assert "nandwrite=false" in recover_sh
     assert "fw_setenv=false" in recover_sh
     assert "env_import=false" in recover_sh
-    assert "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite" in recover_sh
+    assert (
+        "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite"
+        in recover_sh
+    )
     assert "Type 'RECOVER'" in recover_sh
-    assert "missing live /etc/dcentos/board_target" in recover_sh
+    assert "missing live canonical platform/board_target pair" in recover_sh
+    assert "is not exact am3-aml-s19k:am3-s19k" in recover_sh
     assert "gpio437 SafeOff (am3-s19k-active-low, value=1)" in recover_sh
-    assert "missing live /proc/mtd; refuse geometry-blind recover-to-stock" in recover_sh
+    assert (
+        "missing live /proc/mtd; refuse geometry-blind recover-to-stock" in recover_sh
+    )
     assert "if [ -r /proc/mtd ]; then" not in recover_sh
     assert "\nfw_setenv firstboot 1\n" not in recover_sh
-    assert recover_sh.find("Type 'RECOVER'") < recover_sh.find(
+    recover_execute = recover_sh.split(
+        'if [ "${DCENT_S19K_RECOVER_EXECUTE:-0}" != 1 ]', 1
+    )[1]
+    assert recover_execute.find("Type 'RECOVER'") < recover_execute.find(
         "CLEAR_FOR_FLASH=false — refusing"
     )
-    assert recover_sh.find("CLEAR_FOR_FLASH=false — refusing") < recover_sh.find(
-        "missing live /etc/dcentos/board_target"
-    )
-    assert recover_sh.find("CLEAR_FOR_FLASH=false — refusing") < recover_sh.find(
+    assert recover_execute.find(
+        "CLEAR_FOR_FLASH=false — refusing"
+    ) < recover_execute.find("require_exact_live_s19k_identity /etc/dcentos")
+    assert recover_execute.find(
+        "require_exact_live_s19k_identity /etc/dcentos"
+    ) < recover_execute.find("gpio437 SafeOff (am3-s19k-active-low, value=1)")
+    assert recover_execute.find(
         "gpio437 SafeOff (am3-s19k-active-low, value=1)"
-    )
-    assert recover_sh.find("gpio437 SafeOff (am3-s19k-active-low, value=1)") < recover_sh.find(
+    ) < recover_execute.find(
         "missing live /proc/mtd; refuse geometry-blind recover-to-stock"
     )
-    assert recover_sh.find("missing live /proc/mtd; refuse geometry-blind recover-to-stock") < recover_sh.find(
-        "nandwrite -p /dev/mtd5"
-    )
-    assert recover_sh.find("[DRY RUN]") < recover_sh.find("nandwrite -p /dev/mtd5")
+    assert recover_execute.find(
+        "missing live /proc/mtd; refuse geometry-blind recover-to-stock"
+    ) < recover_execute.find("nandwrite -p /dev/mtd5")
     assert "recover_amlogic_to_stock.sh" in (
         ROOT / "scripts/install_amlogic_persistent.sh"
     ).read_text(encoding="utf-8", errors="replace")
     assert "admit_s19k_install_script_runs_recover_dry_run" in install_rs
-    install_sh_w288 = (
-        ROOT / "scripts/install_amlogic_persistent.sh"
-    ).read_text(encoding="utf-8", errors="replace")
+    install_sh_w288 = (ROOT / "scripts/install_amlogic_persistent.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert (
         'sh "$RECOVER_RUNNER" --artifact-dir "$ARTIFACT_DIR" --dry-run'
         in install_sh_w288
     )
-    assert "recover-to-stock --dry-run failed; refusing successful backup" in install_sh_w288
+    assert (
+        "recover-to-stock --dry-run failed; refusing successful backup"
+        in install_sh_w288
+    )
     assert "RECOVER_WALK.txt" in install_sh_w288
-    assert install_sh_w288.find("RECOVER_TO_STOCK_PLAN.txt written") < install_sh_w288.find(
+    assert install_sh_w288.find(
+        "RECOVER_TO_STOCK_PLAN.txt written"
+    ) < install_sh_w288.find(
         'sh "$RECOVER_RUNNER" --artifact-dir "$ARTIFACT_DIR" --dry-run'
     )
     assert install_sh_w288.find(
@@ -1991,24 +2161,31 @@ def main() -> int:
     assert "--fixture-in" in install_sh_w288
     assert "recovery_flag_eb.0x01.bin" in install_sh_w288
     assert "INSTALL_COMMIT_WALK.txt" in install_sh_w288
-    assert "recovery-flag 0x01 fixture walk failed; refusing successful backup" in install_sh_w288
+    assert (
+        "recovery-flag 0x01 fixture walk failed; refusing successful backup"
+        in install_sh_w288
+    )
     assert "admit_s19k_install_script_admits_flag_01_bytes" in install_rs
     assert "admit_s19k_walked_flag_01_fixture" in install_rs
     assert "0x01 fixture-out length" in install_sh_w288
     assert "0x01 fixture-out byte0=" in install_sh_w288
     assert "(want 01)" in install_sh_w288
-    assert install_sh_w288.find("0x01 fixture-out missing after walk") < install_sh_w288.find(
-        "0x01 fixture-out length"
-    )
+    assert install_sh_w288.find(
+        "0x01 fixture-out missing after walk"
+    ) < install_sh_w288.find("0x01 fixture-out length")
     assert install_sh_w288.find("0x01 fixture-out length") < install_sh_w288.find(
         "0x01 fixture-out byte0="
     )
-    assert install_sh_w288.find("0x01 fixture-out byte0=") < install_sh_w288.find("[BACKUP-ONLY]")
+    assert install_sh_w288.find("0x01 fixture-out byte0=") < install_sh_w288.find(
+        "[BACKUP-ONLY]"
+    )
     flag_invoke = install_sh_w288.find('sh "$FLAG_HELPER" --value 0x01')
     backup_only = install_sh_w288.find("[BACKUP-ONLY]")
     assert flag_invoke != -1 and backup_only != -1 and flag_invoke < backup_only
     assert "--execute" not in install_sh_w288[flag_invoke:backup_only]
-    assert install_sh_w288.find("dcent_am3_extract_recovery_flag_eraseblock") < flag_invoke
+    assert (
+        install_sh_w288.find("dcent_am3_extract_recovery_flag_eraseblock") < flag_invoke
+    )
     assert "walk_s19k_recover_to_stock_artifact" in install_rs
     assert "construct_s19k_nandrecovery_env_fixture" in (
         ROOT / "dcentrald/dcentrald-common/src/s19k_nand_env.rs"
@@ -2096,10 +2273,22 @@ def main() -> int:
     assert "admit_s19k_aml_dtb_alias_meson1_enc" in install_rs
     assert "parse_s19k_aml_verify_item" in install_rs
     assert "S19K_AML_UPGRADE_ITEM4_AML_DTB_OFF: u64 = 1_647_360" in install_rs
-    assert 'S19K_AML_DTB_ENC_SHA1_HEX: &[u8; 40] = b"8e1890fd2c43f6e7e10cc04b23c2073e88d7ab1b"' in install_rs
-    assert 'S19K_AML_BOOT_SHA1_HEX: &[u8; 40] = b"97107df8e67ce465c3d71a7816d32b7b86f71d8e"' in install_rs
-    assert 'S19K_AML_BOOTLOADER_SHA1_HEX: &[u8; 40] = b"377d37642c69b9b7665cac669361693755bec457"' in install_rs
-    assert 'S19K_AML_RECOVERY_SHA1_HEX: &[u8; 40] = b"b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"' in install_rs
+    assert (
+        'S19K_AML_DTB_ENC_SHA1_HEX: &[u8; 40] = b"8e1890fd2c43f6e7e10cc04b23c2073e88d7ab1b"'
+        in install_rs
+    )
+    assert (
+        'S19K_AML_BOOT_SHA1_HEX: &[u8; 40] = b"97107df8e67ce465c3d71a7816d32b7b86f71d8e"'
+        in install_rs
+    )
+    assert (
+        'S19K_AML_BOOTLOADER_SHA1_HEX: &[u8; 40] = b"377d37642c69b9b7665cac669361693755bec457"'
+        in install_rs
+    )
+    assert (
+        'S19K_AML_RECOVERY_SHA1_HEX: &[u8; 40] = b"b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"'
+        in install_rs
+    )
     assert "classify_s19k_aml_verify_hex" in install_rs
     assert "admit_s19k_aml_verify_pair" in install_rs
     assert "admit_s19k_aml_upgrade_verify_item" in install_rs
@@ -2213,7 +2402,9 @@ def main() -> int:
     assert "refuse_s19k_bl2_customer_id_as_78_chassis" in install_rs
     assert 'S19K_BL2_SDIO_DEBUG: &[u8] = b"sdio debug board detected"' in install_rs
     assert "S19K_BL2_SDIO_DEBUG_OFF: usize = 43_177" in install_rs
-    assert 'S19K_BL2_CUSTOMER_ID: &[u8] = b"ERROR! Customer ID not match!"' in install_rs
+    assert (
+        'S19K_BL2_CUSTOMER_ID: &[u8] = b"ERROR! Customer ID not match!"' in install_rs
+    )
     assert "S19K_BL2_CUSTOMER_ID_OFF: usize = 43_236" in install_rs
     assert "admit_s19k_bl2_memdump_bl2z" in install_rs
     assert "refuse_s19k_bl2_memdump_as_nandrecovery" in install_rs
@@ -2243,9 +2434,12 @@ def main() -> int:
     assert "parse_s19k_bl2_err_sha_labels" in install_rs
     assert "refuse_s19k_bl2_err_sha_as_verify_sha1" in install_rs
     assert "refuse_s19k_bl2_err_sha_as_decrypt_key" in install_rs
-    assert 'S19K_BL2_ERR_SHA_TABLE: &[u8] =' in install_rs
+    assert "S19K_BL2_ERR_SHA_TABLE: &[u8] =" in install_rs
     assert "S19K_BL2_ERR_SHA_TABLE_OFF: usize = 43_464" in install_rs
-    assert 'b"Err:sha5\\n\\x00Err:sha4\\n\\x00Err:sha3\\n\\x00Err:sha1\\n\\x00Err:sha2\\n\\x00"' in install_rs
+    assert (
+        'b"Err:sha5\\n\\x00Err:sha4\\n\\x00Err:sha3\\n\\x00Err:sha1\\n\\x00Err:sha2\\n\\x00"'
+        in install_rs
+    )
     assert "admit_s19k_bl2_never_be_here_skip_usb" in install_rs
     assert "refuse_s19k_bl2_never_be_here_as_operator_install" in install_rs
     assert "refuse_s19k_bl2_skip_usb_as_aml_install" in install_rs
@@ -2260,7 +2454,10 @@ def main() -> int:
     assert "refuse_s19k_bl2_reg_dump_as_hash_uart" in install_rs
     assert "refuse_s19k_bl2_reg_dump_as_nandrecovery" in install_rs
     assert "S19K_BL2_DUMP_TABLE_OFF: usize = 43_577" in install_rs
-    assert 'b"-W[0x\\x00]:0x\\x00,R:0x\\x00DATA\\x00ADDR\\x00ADDR2\\x00ADDR3\\x00\\nTotal Size 0x\\x00FULL\\x00FULL2"' in install_rs
+    assert (
+        'b"-W[0x\\x00]:0x\\x00,R:0x\\x00DATA\\x00ADDR\\x00ADDR2\\x00ADDR3\\x00\\nTotal Size 0x\\x00FULL\\x00FULL2"'
+        in install_rs
+    )
     assert "S19K_AML_UPGRADE_ITEM18_VERIFY_REC_OFF: u64 = 23_134_344" in install_rs
     assert "refuse_s19k_aml_dtb_as_plaintext_fdt" in install_rs
     assert "refuse_s19k_aml_dtb_as_gpio437" in install_rs
@@ -2270,8 +2467,13 @@ def main() -> int:
     assert "S19K_AML_UPGRADE_ITEM17_RECOVERY_OFF: u64 = 17_069_704" in install_rs
     assert "parse_s19k_android_amlsecu_stamp_raw" in install_rs
     assert "classify_s19k_amlsecu_time" in install_rs
-    assert 'S19K_FACTORY_AMLSECU_BOOT_TIME: &[u8; 16] = b"2023111515304766"' in install_rs
-    assert 'S19K_FACTORY_AMLSECU_RECOVERY_TIME: &[u8; 16] = b"2023111515304721"' in install_rs
+    assert (
+        'S19K_FACTORY_AMLSECU_BOOT_TIME: &[u8; 16] = b"2023111515304766"' in install_rs
+    )
+    assert (
+        'S19K_FACTORY_AMLSECU_RECOVERY_TIME: &[u8; 16] = b"2023111515304721"'
+        in install_rs
+    )
     assert "admit_s19k_factory_android_boot_header" in install_rs
     assert "S19K_FACTORY_BOOT_RAMDISK_SIZE: u32 = 0x0068_6800" in install_rs
     assert "S19K_FACTORY_BOOT_RAMDISK_OFF: usize = 0x5C_1000" in install_rs
@@ -2304,6 +2506,7 @@ def main() -> int:
     )
     if aml_sd.is_file():
         import zipfile
+
         with zipfile.ZipFile(aml_sd) as z:
             names = set(z.namelist())
             assert names == {
@@ -2332,9 +2535,9 @@ def main() -> int:
             assert item7[0x120:0x12C] == b"aml_sdc_burn"
             assert int.from_bytes(item7[0x10:0x18], "little") == 2495824
             assert int.from_bytes(item7[0x18:0x20], "little") == 818688
-            assert img[2495824:2495824 + 818688] == z.read("aml_sdc_burn.UBOOT.ENC")
-            item11 = img[16222176:16222176 + 818688]
-            item7 = img[2495824:2495824 + 818688]
+            assert img[2495824 : 2495824 + 818688] == z.read("aml_sdc_burn.UBOOT.ENC")
+            item11 = img[16222176 : 16222176 + 818688]
+            item7 = img[2495824 : 2495824 + 818688]
             assert len(item11) == len(item7) == 818688
             assert item11 != item7
             assert item11[:2] != item7[:2]
@@ -2351,19 +2554,19 @@ def main() -> int:
             assert item1[0x120:0x127] == b"DDR_ENC"
             assert int.from_bytes(item1[0x10:0x18], "little") == 60160
             assert int.from_bytes(item1[0x18:0x20], "little") == 49152
-            assert img[11008:11008 + 49152] != img[60160:60160 + 49152]
+            assert img[11008 : 11008 + 49152] != img[60160 : 60160 + 49152]
             item3 = img[0x40 + 3 * 0x240 : 0x40 + 4 * 0x240]
             assert item3[0x20:0x23] == b"USB"
             assert item3[0x120:0x129] == b"UBOOT_ENC"
             assert int.from_bytes(item3[0x10:0x18], "little") == 878336
             assert int.from_bytes(item3[0x18:0x20], "little") == 769024
-            assert img[109312:109312 + 32] != img[878336:878336 + 32]
+            assert img[109312 : 109312 + 32] != img[878336 : 878336 + 32]
             item8 = img[0x40 + 8 * 0x240 : 0x40 + 9 * 0x240]
             assert item8[0x20:0x23] == b"ini"
             assert item8[0x120:0x12C] == b"aml_sdc_burn"
             assert int.from_bytes(item8[0x10:0x18], "little") == 3314512
             assert int.from_bytes(item8[0x18:0x20], "little") == 602
-            ini = img[3314512:3314512 + 602]
+            ini = img[3314512 : 3314512 + 602]
             assert b"aml_upgrade_package.img" in ini
             assert b"erase_bootloader    = 1" in ini
             item13 = img[0x40 + 13 * 0x240 : 0x40 + 14 * 0x240]
@@ -2373,19 +2576,22 @@ def main() -> int:
             item16 = img[0x40 + 16 * 0x240 : 0x40 + 17 * 0x240]
             assert item16[0x20:0x24] == b"conf"
             assert item16[0x120:0x128] == b"platform"
-            plat = img[17069496:17069496 + 202]
+            plat = img[17069496 : 17069496 + 202]
             assert plat.startswith(b"Platform:0x0811")
             assert b"Encrypt_reg:0xff800228" in plat
-            usb = img[109312:109312 + 769024]
-            sdc = img[1677136:1677136 + 818688]
-            assert sdc[725584:725584 + 8] == b"GPIOAO_3"
+            usb = img[109312 : 109312 + 769024]
+            sdc = img[1677136 : 1677136 + 818688]
+            assert sdc[725584 : 725584 + 8] == b"GPIOAO_3"
             assert sdc[725575:725592] == b"gpio \xf0\x38\x98 GPIOAO_3"
             assert 818688 - 725584 == 93104
             assert 769024 - 675920 == 93104
             assert len(sdc) - len(usb) == 49664
             assert sdc[49664:] == usb
             pref = sdc[:49664]
-            assert b"Built : 10:38:43, Apr 14 2020. axg gf27ed33 - jenkins@walle02-sh" in pref
+            assert (
+                b"Built : 10:38:43, Apr 14 2020. axg gf27ed33 - jenkins@walle02-sh"
+                in pref
+            )
             assert b"BL2" in pref
             assert b"NAND init" in pref
             assert b"Rsv\x00eMMC\x00NAND\x00SPI\x00SD\x00USB\x00UNKNOWN" in pref
@@ -2466,7 +2672,10 @@ def main() -> int:
             assert b"Get saradc sample Error. Cnt_" not in usb
             assert pref[42384:42390] == b"rank: "
             assert pref[42560:42586] == b"DDR3\x00\x00DDR4\x00\x00LPDDR3\x00\x00LPDDR2"
-            assert pref[42588:42629] == b"Rank0 16bit\x00\x00Rank0\x00\x00Rank0+1\x00\x00Rank01 16bit"
+            assert (
+                pref[42588:42629]
+                == b"Rank0 16bit\x00\x00Rank0\x00\x00Rank0+1\x00\x00Rank01 16bit"
+            )
             assert pref[42924:42947] == b"DDR init fail, reset..."
             assert b"rank: " not in usb
             assert b"DDR3" not in usb
@@ -2723,40 +2932,63 @@ def main() -> int:
             assert b"PWR_CONTROL" not in usb
             assert b"recover_env" not in usb
             assert b"nandrecovery" not in usb
-            import hashlib
-            aml_dtb = img[1647360:1647360 + 29728]
+            aml_dtb = img[1647360 : 1647360 + 29728]
             assert aml_dtb[:2] != b"\x1f\x8b"
             assert aml_dtb[:4] != b"AML_"
             assert aml_dtb[:4] != bytes.fromhex("d00dfeed")
-            assert hashlib.sha1(aml_dtb).hexdigest() == "8e1890fd2c43f6e7e10cc04b23c2073e88d7ab1b"
+            assert (
+                hashlib.sha1(aml_dtb).hexdigest()
+                == "8e1890fd2c43f6e7e10cc04b23c2073e88d7ab1b"
+            )
             item15 = img[0x40 + 15 * 0x240 : 0x40 + 16 * 0x240]
             assert item15[0x20:0x23] == b"dtb"
             assert item15[0x120:0x12A] == b"meson1_ENC"
             assert int.from_bytes(item15[0x10:0x18], "little") == 1647360
             assert int.from_bytes(item15[0x18:0x20], "little") == 29728
-            verify5 = img[1677088:1677088 + 48]
+            verify5 = img[1677088 : 1677088 + 48]
             assert verify5 == b"sha1sum 8e1890fd2c43f6e7e10cc04b23c2073e88d7ab1b"
-            boot_blob = img[3315120:3315120 + 12907008]
-            rec_blob = img[17069704:17069704 + 6064640]
-            bl_blob = img[16222176:16222176 + 818688]
-            assert hashlib.sha1(boot_blob).hexdigest() == "97107df8e67ce465c3d71a7816d32b7b86f71d8e"
-            assert hashlib.sha1(bl_blob).hexdigest() == "377d37642c69b9b7665cac669361693755bec457"
-            assert hashlib.sha1(rec_blob).hexdigest() == "b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"
-            assert img[16222128:16222128 + 48] == b"sha1sum 97107df8e67ce465c3d71a7816d32b7b86f71d8e"
-            assert img[17040864:17040864 + 48] == b"sha1sum 377d37642c69b9b7665cac669361693755bec457"
-            assert img[23134344:23134344 + 48] == b"sha1sum b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"
+            boot_blob = img[3315120 : 3315120 + 12907008]
+            rec_blob = img[17069704 : 17069704 + 6064640]
+            bl_blob = img[16222176 : 16222176 + 818688]
+            assert (
+                hashlib.sha1(boot_blob).hexdigest()
+                == "97107df8e67ce465c3d71a7816d32b7b86f71d8e"
+            )
+            assert (
+                hashlib.sha1(bl_blob).hexdigest()
+                == "377d37642c69b9b7665cac669361693755bec457"
+            )
+            assert (
+                hashlib.sha1(rec_blob).hexdigest()
+                == "b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"
+            )
+            assert (
+                img[16222128 : 16222128 + 48]
+                == b"sha1sum 97107df8e67ce465c3d71a7816d32b7b86f71d8e"
+            )
+            assert (
+                img[17040864 : 17040864 + 48]
+                == b"sha1sum 377d37642c69b9b7665cac669361693755bec457"
+            )
+            assert (
+                img[23134344 : 23134344 + 48]
+                == b"sha1sum b6441d919a9e3c2ad6e503fe21b6ca0e361ac4c3"
+            )
             assert b"gpio437" not in aml_dtb
             assert b"PWR_CONTROL" not in aml_dtb
-            meson_gz = img[17040928:17040928 + 28568]
+            meson_gz = img[17040928 : 17040928 + 28568]
             assert meson_gz[:2] == b"\x1f\x8b"
             import gzip
+
             meson = gzip.decompress(meson_gz)
             assert len(meson) == 114688
             assert meson[:4] == b"AML_"
             assert int.from_bytes(meson[4:8], "little") == 2
             assert int.from_bytes(meson[8:12], "little") == 2
             assert int.from_bytes(meson[12 + 48 : 12 + 52], "little") == 0x800
-            assert int.from_bytes(meson[12 + 56 + 48 : 12 + 56 + 52], "little") == 0x10800
+            assert (
+                int.from_bytes(meson[12 + 56 + 48 : 12 + 56 + 52], "little") == 0x10800
+            )
             assert b"PWR_CONTROL" not in meson
             assert b"gpio437" not in meson
             assert b"gpio-line-names" not in meson
@@ -2781,10 +3013,10 @@ def main() -> int:
             g1 = meson[0x800 : 0x800 + 0x10000]
             assert b"tas5707" in g1
             assert b"mcu6350" not in g1
-            item4 = img[1647360:1647360 + 4]
+            item4 = img[1647360 : 1647360 + 4]
             assert item4[:2] != b"\x1f\x8b"
-            boot = img[3315120:3315120 + 12907008]
-            rec = img[17069704:17069704 + 6064640]
+            boot = img[3315120 : 3315120 + 12907008]
+            rec = img[17069704 : 17069704 + 6064640]
             assert boot[:8] == b"ANDROID!"
             assert rec[:8] == b"ANDROID!"
             assert int.from_bytes(boot[8:12], "little") == 6031360
@@ -2801,7 +3033,7 @@ def main() -> int:
             assert 2048 + 6031360 == 0x5C1000
             assert 2048 + 6031360 + 6842368 == 12875776
             assert boot[0x5C1000:0x5C1002] != b"\x1f\x8b"
-            second = boot[12875776:12875776 + 30720]
+            second = boot[12875776 : 12875776 + 30720]
             assert len(second) == 30720
             assert second[:4] == bytes.fromhex("27847e00")
             assert not second.startswith(b"ANDROID!")
@@ -2822,7 +3054,7 @@ def main() -> int:
             assert boot[0x410:0x420] == b"2023111515304766"
             assert b"updateporc" not in boot
             assert b"updateporc" not in rec
-            assert boot[2048:2048 + 64] == rec[2048:2048 + 64]
+            assert boot[2048 : 2048 + 64] == rec[2048 : 2048 + 64]
     assert "refuse_s19k_20231108_bmu_as_plaintext_porc" in install_rs
     assert "parse_s19k_single_bmu_toc" in install_rs
     assert "parse_s19k_android_boot_header" in install_rs
@@ -2844,12 +3076,15 @@ def main() -> int:
     assert "refuse_xilinx_arm32_uimage_as_s19k_aml" in install_rs
     assert "UIMAGE_ARCH_ARM64: u8 = 22" in install_rs
     assert 'name: "stock_config"' in install_rs
-    assert 'name: "reserved"' not in install_rs.split("pub const S19K_NAND_MAP", 1)[1].split(
-        "pub enum S19kInstallCarrier", 1
-    )[0]
-    nand_env_rs = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_nand_env.rs"
-    ).read_text(encoding="utf-8")
+    assert (
+        'name: "reserved"'
+        not in install_rs.split("pub const S19K_NAND_MAP", 1)[1].split(
+            "pub enum S19kInstallCarrier", 1
+        )[0]
+    )
+    nand_env_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_nand_env.rs").read_text(
+        encoding="utf-8"
+    )
     assert "admit_s21_held_proc_mtd_matches_78" in nand_env_rs
     assert "classify_s19k_uboot_interrupt" in nand_env_rs
     assert "classify_s19k_uboot_flag_action" in nand_env_rs
@@ -2910,10 +3145,13 @@ def main() -> int:
     assert "admit_s19k_restore_execute_live_proc_mtd" in install_rs
     assert "admit_s19k_recovery_flag_script_execute_refuses_nandwrite" in install_rs
     assert "admit_s19k_restore_execute" in install_rs
-    restore_sh = (
-        ROOT / "scripts/restore_amlogic_mtd5_from_backup.sh"
-    ).read_text(encoding="utf-8", errors="replace")
-    assert "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite" in restore_sh
+    restore_sh = (ROOT / "scripts/restore_amlogic_mtd5_from_backup.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert (
+        "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite"
+        in restore_sh
+    )
     assert restore_sh.find("Type 'RESTORE'") < restore_sh.find(
         "CLEAR_FOR_FLASH=false — refusing"
     )
@@ -2925,51 +3163,63 @@ def main() -> int:
     assert restore_sh.find("CLEAR_FOR_FLASH=false — refusing") < restore_sh.find(
         "missing live /proc/mtd; refuse geometry-blind restore"
     )
-    assert restore_sh.find("missing live /proc/mtd; refuse geometry-blind restore") < restore_sh.find(
-        "gpio437 SafeOff (am3-s19k-active-low, value=1)"
-    )
+    assert restore_sh.find(
+        "missing live /proc/mtd; refuse geometry-blind restore"
+    ) < restore_sh.find("gpio437 SafeOff (am3-s19k-active-low, value=1)")
     assert "--dry-run" in revert_sh
     assert "[DRY RUN] writing REVERT_COMMIT_PLAN before GPIO/nandwrite" in revert_sh
     assert "dry_run=true" in revert_sh
     assert revert_sh.find("[DRY RUN]") < revert_sh.find("nandwrite -p -s")
     assert revert_sh.find("[DRY RUN]") < revert_sh.find("gpio437 SafeOff")
-    assert "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/nandwrite/fw_setenv" in revert_sh
+    assert (
+        "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/nandwrite/fw_setenv"
+        in revert_sh
+    )
     assert "write_revert_commit_plan false false" in revert_sh
-    assert revert_sh.find("Type 'REVERT'") < revert_sh.find("CLEAR_FOR_FLASH=false — refusing")
-    assert revert_sh.find("CLEAR_FOR_FLASH=false — refusing") < revert_sh.find("nandwrite -p -s")
-    assert revert_sh.find("CLEAR_FOR_FLASH=false — refusing") < revert_sh.find("gpio437 SafeOff")
+    assert revert_sh.find("Type 'REVERT'") < revert_sh.find(
+        "CLEAR_FOR_FLASH=false — refusing"
+    )
+    assert revert_sh.find("CLEAR_FOR_FLASH=false — refusing") < revert_sh.find(
+        "nandwrite -p -s"
+    )
+    assert revert_sh.find("CLEAR_FOR_FLASH=false — refusing") < revert_sh.find(
+        "gpio437 SafeOff"
+    )
     flag_sh = (ROOT / "scripts/s19k_write_recovery_flag.sh").read_text(
         encoding="utf-8", errors="replace"
     )
     assert "NOT a direct bootm of mtd2" in flag_sh
     assert "NOT fw_setenv firstboot" in flag_sh
-    assert "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite" in flag_sh
-    assert flag_sh.find('if [ "${DCENT_S19K_RECOVERY_FLAG_EXECUTE:-0}" != 1 ]') < flag_sh.find(
+    assert (
+        "CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite"
+        in flag_sh
+    )
+    assert flag_sh.find(
+        'if [ "${DCENT_S19K_RECOVERY_FLAG_EXECUTE:-0}" != 1 ]'
+    ) < flag_sh.find("missing exact live platform:target identity")
+    assert flag_sh.find("missing exact live platform:target identity") < flag_sh.find(
         "CLEAR_FOR_FLASH=false — refusing"
     )
-    assert flag_sh.find("CLEAR_FOR_FLASH=false — refusing") < flag_sh.find(
-        "missing live /etc/dcentos/board_target"
-    )
-    assert flag_sh.find("CLEAR_FOR_FLASH=false — refusing") < flag_sh.find(
-        "gpio437 SafeOff (am3-s19k-active-low, value=1)"
-    )
-    assert flag_sh.find("CLEAR_FOR_FLASH=false — refusing") < flag_sh.find(
-        'flash_erase /dev/mtd5 "$EB_START_HEX" 1'
-    )
-    assert flag_sh.find("CLEAR_FOR_FLASH=false — refusing") < flag_sh.find(
-        'nandwrite -p -s "$EB_START_HEX" /dev/mtd5'
-    )
+    assert "is not exact am3-aml-s19k:am3-s19k" in flag_sh
+    assert "one_byte_execute_retired=true" in flag_sh
+    assert "full_eraseblock_candidate_required=true" in flag_sh
+    assert 'flash_erase /dev/mtd5 "$EB_START_HEX" 1' not in flag_sh
+    assert 'nandwrite -p -s "$EB_START_HEX" /dev/mtd5' not in flag_sh
     install_sh = (ROOT / "scripts/install_amlogic_persistent.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "U-Boot will revert to mtd2 stock_system if first boot fails" not in install_sh
+    assert (
+        "U-Boot will revert to mtd2 stock_system if first boot fails" not in install_sh
+    )
     assert "RECOVER_TO_STOCK_PLAN.txt" in install_sh
     assert "schema=dcentos.amlogic-recover-to-stock/v1" in install_sh
     assert "RECOVER_EXECUTE_REFUSE.txt" in install_sh
     assert install_sh.find("BACKUP_LEDGER.txt written") < install_sh.find(
         "RECOVER_TO_STOCK_PLAN.txt"
     )
-    assert install_sh.find("RECOVER_TO_STOCK_PLAN.txt") < install_sh.find("[BACKUP-ONLY]")
+    assert install_sh.find("RECOVER_TO_STOCK_PLAN.txt") < install_sh.find(
+        "[BACKUP-ONLY]"
+    )
     assert "recover_to_stock" in install_sh
     assert "refuse_boot_bos_as_mtd5_uimage_write" in nand_env_rs
     assert "refuse_s19k_78_mtd3_as_reserved" in nand_env_rs
@@ -2994,9 +3244,9 @@ def main() -> int:
         assert b"firstboot=1" in envb
         assert b"${firstboot}" not in envb
         assert b"androidboot.firstboot=1" in envb
-    dtb_rs = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_aml_dtb.rs"
-    ).read_text(encoding="utf-8")
+    dtb_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_aml_dtb.rs").read_text(
+        encoding="utf-8"
+    )
     assert "classify_s19k_uboot_nand_device" in dtb_rs
     assert "refuse_s19k_78_linux_mtd_as_uboot_nvdata" in dtb_rs
     assert "refuse_s19k_20231115_emmc_nvdata_as_aml_nand" in dtb_rs
@@ -3028,14 +3278,14 @@ def main() -> int:
     assert "S19K_AXG_AOBUS_MUX: u32 = 0xFF80_0014" in dtb_rs
     assert "S19K_AXG_VENDOR_GPIOCHIP_BASE: u32 = 411" in dtb_rs
     assert "S19K_AXG_GPIOA0_LOCAL: u32 = 26" in dtb_rs
-    assert "S19K_USB_UBOOT_GPIOAO3_OFF: usize = 675_920" in dtb_rs
-    assert "S19K_USB_UBOOT_GPIO_WORD_OFF: usize = 675_911" in dtb_rs
+    assert "S19K_USB_UBOOT_GPIOAO3_OFF: usize = 675_925" in dtb_rs
+    assert "S19K_USB_UBOOT_GPIO_WORD_OFF: usize = 675_916" in dtb_rs
     assert "admit_s19k_usb_uboot_gpioao3_offset" in dtb_rs
     assert "admit_s19k_usb_uboot_packed_gpio_word" in dtb_rs
     assert "refuse_s19k_usb_uboot_contiguous_gpio_cmd" in dtb_rs
     assert "refuse_s19k_usb_uboot_gpioao_as_pin_table" in dtb_rs
-    assert "S19K_SDC_UBOOT_GPIOAO3_OFF: usize = 725_584" in dtb_rs
-    assert "S19K_UBOOT_GPIOAO3_FROM_END: usize = 93_104" in dtb_rs
+    assert "S19K_SDC_UBOOT_GPIOAO3_OFF: usize = 725_589" in dtb_rs
+    assert "S19K_UBOOT_GPIOAO3_FROM_END: usize = 93_099" in dtb_rs
     assert "admit_s19k_uboot_packed_gpioao3_seq" in dtb_rs
     assert "admit_s19k_usb_uboot_packed_console" in dtb_rs
     assert "refuse_s19k_usb_uboot_packed_as_nand_env" in dtb_rs
@@ -3103,7 +3353,10 @@ def main() -> int:
     assert "refuse_s19k_usb_cortex_task_as_nandrecovery" in dtb_rs
     assert 'S19K_USB_UBOOT_EXCEPTION: &[u8] = b"=== %s EXCEPTION:"' in dtb_rs
     assert "S19K_USB_UBOOT_EXCEPTION_OFF: usize = 41_822" in dtb_rs
-    assert 'S19K_USB_UBOOT_PSTACK: &[u8] = b"=========== Process Stack Contents ==========="' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_PSTACK: &[u8] = b"=========== Process Stack Contents ==========="'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_PSTACK_OFF: usize = 41_995" in dtb_rs
     assert 'S19K_USB_UBOOT_CORTEX_TASK: &[u8] = b"core/cortex-m/task.c"' in dtb_rs
     assert "S19K_USB_UBOOT_CORTEX_TASK_OFF: usize = 42_807" in dtb_rs
@@ -3171,7 +3424,9 @@ def main() -> int:
     assert "refuse_s19k_usb_empty_efuse_as_otp_decrypt" in dtb_rs
     assert 'S19K_USB_UBOOT_TIMERFORADC: &[u8] = b"TIMERFORADCTASK"' in dtb_rs
     assert "S19K_USB_UBOOT_TIMERFORADC_OFF: usize = 43_041" in dtb_rs
-    assert 'S19K_USB_UBOOT_EMPTY_EFUSE: &[u8] = b"empty chip, efuse not burned."' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_EMPTY_EFUSE: &[u8] = b"empty chip, efuse not burned."' in dtb_rs
+    )
     assert "S19K_USB_UBOOT_EMPTY_EFUSE_OFF: usize = 43_064" in dtb_rs
     assert "admit_s19k_usb_uboot_es_chip_dvfs" in dtb_rs
     assert "refuse_s19k_usb_es_chip_dvfs_as_hash_uart" in dtb_rs
@@ -3231,7 +3486,9 @@ def main() -> int:
     assert "refuse_s19k_usb_efuse_pw_en_as_otp_decrypt" in dtb_rs
     assert 'S19K_USB_UBOOT_CPU_CLK_RESUME: &[u8] = b"cpu clk resume rate"' in dtb_rs
     assert "S19K_USB_UBOOT_CPU_CLK_RESUME_OFF: usize = 43_735" in dtb_rs
-    assert 'S19K_USB_UBOOT_HIGH_TASK_INIT_DVFS: &[u8] = b"high_task_init_dvfs"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_HIGH_TASK_INIT_DVFS: &[u8] = b"high_task_init_dvfs"' in dtb_rs
+    )
     assert "S19K_USB_UBOOT_HIGH_TASK_INIT_DVFS_OFF: usize = 43_888" in dtb_rs
     assert 'S19K_USB_UBOOT_BL30_THERMAL: &[u8] = b"bl30:thermal"' in dtb_rs
     assert "S19K_USB_UBOOT_BL30_THERMAL_OFF: usize = 44_496" in dtb_rs
@@ -3244,13 +3501,22 @@ def main() -> int:
     assert "refuse_s19k_usb_dvfstbl_jtag_trim_as_nandrecovery" in dtb_rs
     assert "refuse_s19k_usb_efuse_bits_disabled_as_otp_decrypt" in dtb_rs
     assert "refuse_s19k_usb_bl30_thermal_trim_as_hash_thermal" in dtb_rs
-    assert 'S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL: &[u8] = b"high_task_init_dvfstbl"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL: &[u8] = b"high_task_init_dvfstbl"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL_OFF: usize = 43_908" in dtb_rs
     assert 'S19K_USB_UBOOT_DISABLE_M3_JTAG: &[u8] = b"disable M3 JTAG"' in dtb_rs
     assert "S19K_USB_UBOOT_DISABLE_M3_JTAG_OFF: usize = 43_952" in dtb_rs
-    assert 'S19K_USB_UBOOT_EFUSE_BITS_DISABLED: &[u8] = b"WARNING! efuse bits is disabled"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_EFUSE_BITS_DISABLED: &[u8] = b"WARNING! efuse bits is disabled"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_EFUSE_BITS_DISABLED_OFF: usize = 44_004" in dtb_rs
-    assert 'S19K_USB_UBOOT_BL30_THERMAL_TRIM: &[u8] = b"bl30:thermal disable trim"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_BL30_THERMAL_TRIM: &[u8] = b"bl30:thermal disable trim"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_BL30_THERMAL_TRIM_OFF: usize = 44_496" in dtb_rs
     assert "admit_s19k_usb_uboot_a53_gxl_thermal" in dtb_rs
     assert "refuse_s19k_usb_a53_gxl_thermal_as_hash_uart" in dtb_rs
@@ -3263,7 +3529,10 @@ def main() -> int:
     assert "S19K_USB_UBOOT_ENABLE_M3_JTAG_OFF: usize = 44_037" in dtb_rs
     assert 'S19K_USB_UBOOT_BL30_THERMAL_CALIB: &[u8] = b"bl30:thermal_calib"' in dtb_rs
     assert "S19K_USB_UBOOT_BL30_THERMAL_CALIB_OFF: usize = 44_540" in dtb_rs
-    assert 'S19K_USB_UBOOT_GXL_ES_THERMAL: &[u8] = b"bl30: GXL ES chip disable thermal"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_GXL_ES_THERMAL: &[u8] = b"bl30: GXL ES chip disable thermal"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_GXL_ES_THERMAL_OFF: usize = 44_949" in dtb_rs
     assert "admit_s19k_usb_uboot_a53_ao_untrimmed" in dtb_rs
     assert "refuse_s19k_usb_a53_ao_untrimmed_as_hash_uart" in dtb_rs
@@ -3274,9 +3543,15 @@ def main() -> int:
     assert "S19K_USB_UBOOT_ENABLE_A53_JTAG_OFF: usize = 44_068" in dtb_rs
     assert 'S19K_USB_UBOOT_JTAG_TO_AO: &[u8] = b" to AO"' in dtb_rs
     assert "S19K_USB_UBOOT_JTAG_TO_AO_OFF: usize = 44_052" in dtb_rs
-    assert 'S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR: &[u8] = b"bl30:ERROR: thermal_calib"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR: &[u8] = b"bl30:ERROR: thermal_calib"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR_OFF: usize = 44_578" in dtb_rs
-    assert 'S19K_USB_UBOOT_BL30_UNTRIMMED: &[u8] = b"bl30:This chip has not trimmed thermal"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_BL30_UNTRIMMED: &[u8] = b"bl30:This chip has not trimmed thermal"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_BL30_UNTRIMMED_OFF: usize = 44_695" in dtb_rs
     assert "admit_s19k_usb_uboot_ee_pw_axg" in dtb_rs
     assert "refuse_s19k_usb_ee_pw_axg_as_hash_uart" in dtb_rs
@@ -3286,9 +3561,15 @@ def main() -> int:
     assert "refuse_s19k_usb_bl30_axg_ver_as_miner_identity" in dtb_rs
     assert 'S19K_USB_UBOOT_JTAG_TO_EE: &[u8] = b" to EE"' in dtb_rs
     assert "S19K_USB_UBOOT_JTAG_TO_EE_OFF: usize = 44_060" in dtb_rs
-    assert 'S19K_USB_UBOOT_INCORRECT_PASSWORD: &[u8] = b"Error: Incorrect password"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_INCORRECT_PASSWORD: &[u8] = b"Error: Incorrect password"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_INCORRECT_PASSWORD_OFF: usize = 44_118" in dtb_rs
-    assert 'S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA: &[u8] = b"bl30:thermal_calibration_data"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA: &[u8] = b"bl30:thermal_calibration_data"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF: usize = 44_807" in dtb_rs
     assert 'S19K_USB_UBOOT_BL30_AXG_VER: &[u8] = b"bl30:axg ver"' in dtb_rs
     assert "S19K_USB_UBOOT_BL30_AXG_VER_OFF: usize = 44_738" in dtb_rs
@@ -3304,7 +3585,10 @@ def main() -> int:
     assert "S19K_USB_UBOOT_PLEASE_TRY_AGAIN_OFF: usize = 44_145" in dtb_rs
     assert 'S19K_USB_UBOOT_BL30_AXG_THERMAL0: &[u8] = b"bl30:axg thermal0"' in dtb_rs
     assert "S19K_USB_UBOOT_BL30_AXG_THERMAL0_OFF: usize = 44_765" in dtb_rs
-    assert 'S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR: &[u8] = b"bl30:thermal init err"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR: &[u8] = b"bl30:thermal init err"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF: usize = 44_784" in dtb_rs
     assert "admit_s19k_usb_uboot_scpi_ddr_gcm" in dtb_rs
     assert "refuse_s19k_usb_gcm_tag_as_android_decrypt" in dtb_rs
@@ -3318,7 +3602,10 @@ def main() -> int:
     assert "S19K_USB_UBOOT_SCPI_CSS_OFF: usize = 45_328" in dtb_rs
     assert 'S19K_USB_UBOOT_DDR_SUSPEND: &[u8] = b"Enter ddr suspend"' in dtb_rs
     assert "S19K_USB_UBOOT_DDR_SUSPEND_OFF: usize = 45_483" in dtb_rs
-    assert 'S19K_USB_UBOOT_OTP_BLOCK11: &[u8] = b"--> UPDATE MVN in OTP BLOCK_11"' in dtb_rs
+    assert (
+        'S19K_USB_UBOOT_OTP_BLOCK11: &[u8] = b"--> UPDATE MVN in OTP BLOCK_11"'
+        in dtb_rs
+    )
     assert "S19K_USB_UBOOT_OTP_BLOCK11_OFF: usize = 45_261" in dtb_rs
     assert 'S19K_USB_UBOOT_BL30_AXG_STAMP: &[u8] = b"axg_v1.1.3494-9ec8345"' in dtb_rs
     assert "S19K_USB_UBOOT_BL30_AXG_STAMP_OFF: usize = 46_256" in dtb_rs
@@ -3409,7 +3696,10 @@ def main() -> int:
                 pth = "/".join(x for x in path if x)
                 if pth == "mtd_nand" and pname == "plat-names":
                     plats = [x.decode("ascii") for x in val.split(b"\x00") if x]
-                elif pth in ("mtd_nand/bootloader", "mtd_nand/nandnormal") and pname == "chip_num":
+                elif (
+                    pth in ("mtd_nand/bootloader", "mtd_nand/nandnormal")
+                    and pname == "chip_num"
+                ):
                     chips[pth.rsplit("/", 1)[-1]] = int.from_bytes(val[:4], "big")
                 elif pth == "mtd_nand/nand_partition/nvdata" and pname == "offset":
                     nv_off = int.from_bytes(val[:8], "big")
@@ -3447,9 +3737,14 @@ def main() -> int:
         crc = int.from_bytes(neb[:4], "little")
         assert crc == 0x471D6B1A
         assert (zlib.crc32(neb[4:]) & 0xFFFFFFFF) == crc
-        env_txt = neb[4:].split(b"\x00\x00", 1)[0].replace(b"\x00", b"\n").decode("ascii")
+        env_txt = (
+            neb[4:].split(b"\x00\x00", 1)[0].replace(b"\x00", b"\n").decode("ascii")
+        )
         assert "bootdelay=1" in env_txt
-        assert "bootcmd=run try_to_boot_bos_normally; run try_to_boot_bos_after_install; run recover_to_stock" in env_txt
+        assert (
+            "bootcmd=run try_to_boot_bos_normally; run try_to_boot_bos_after_install; run recover_to_stock"
+            in env_txt
+        )
         assert "nand erase.part nvdata" in env_txt
         assert "nand device 1" in env_txt
         assert "nandrecovery_env_offset=0x00000B000000" in env_txt
@@ -3485,28 +3780,43 @@ def main() -> int:
     wire_try = (ROOT / "scripts/s19k_braiins_wire_try.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "am3-s19k 0=ON 1=OFF" in wire_try
-    assert "RE-4C polarity unresolved" not in wire_try
-    assert "S19K_PORT_RX ttyS1=" in wire_try
-    assert "not dual-chain or 2-board proof" in wire_try
-    assert "probe /dev/ttyS3" in wire_try
-    assert "probe /dev/ttyS0" not in wire_try
+    assert "legacy S19k wire-try is retired" in wire_try
+    assert "dcentrald_s19k_tmp_deploy.sh" in wire_try
+    assert "exit 64" in wire_try
+    for forbidden in (
+        "ssh",
+        "scp",
+        "stty",
+        "/dev/tty",
+        "/sys/class/gpio",
+        "\\x55\\xAA",
+    ):
+        assert forbidden not in wire_try
     deploy = (ROOT / "scripts/dcentrald_s19k_tmp_deploy.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "Refuse mining-on /tmp deploy" in deploy
+    assert (
+        "Refuse mining-on; exact handoff requires stock-held engaged rails." in deploy
+    )
     assert "--dry-run" in deploy
     assert "TMP_DEPLOY_PLAN" in deploy
     assert "hard_float=true" in deploy
     assert "pt_interp=none" in deploy
     assert "musl_static=true" in deploy
     assert "ld-linux" in deploy
-    assert deploy.find("[DRY RUN]") < deploy.find("ssh $SSH_OPTS")
+    assert deploy.find("[DRY RUN]") < deploy.find("ssh_trial()")
+    assert "StrictHostKeyChecking=yes" in deploy
+    assert "UserKnownHostsFile=$KNOWN_HOSTS" in deploy
+    assert "StrictHostKeyChecking=no" not in deploy
     assert "GPIO437=1 means PSU OFF" in deploy
-    assert "mining_key()" in deploy
+    assert "DCENT_S19K_LIVE_IDENTITY" in deploy
+    assert "content-bound helper returned no exact live S19k identity receipt" in deploy
     assert "refuse single-port /tmp deploy" in deploy
-    assert "bosminer still running" in deploy
-    assert 's && $0 ~ "^[[:space:]]*" key' in deploy
+    assert "exact daemon-owned handoff requires one live bosminer" in deploy
+    assert (
+        "handoff_identity=supervisor+child-pid+start+ppid+pgrp+session+comm+exe+argv-sha256"
+        in deploy
+    )
     held_s37_cap = (
         ROOT.parents[1]
         / ""
@@ -3546,9 +3856,29 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "S19K_AM3_GPIO437_VALUE_OFF" in nopic_beta
     assert "refuse_re4c_safe_off_as_am3_s19k_cut(gpio_safe_off_value)" in nopic_beta
-    gpio = (
-        ROOT / "dcentrald/dcentrald-common/src/s19k_am3_gpio437.rs"
-    ).read_text(encoding="utf-8")
+    assert (
+        "S19K_BM1366_BAUD_HZ: u32 = BOSMINER_BM1366_REQUESTED_FAST_BAUD"
+        in nopic_beta
+    )
+    assert (
+        "S19K_BM1366_HOST_BAUD_HZ: u32 = BOSMINER_BM1366_AML_HOST_BAUD"
+        in nopic_beta
+    )
+    assert (
+        "S19K_BM1366_FASTUART_VALUE: u32 = BOSMINER_BM1366_FASTUART_3M125"
+        in nopic_beta
+    )
+    assert "S19K_BM1366_JIG_BAUD_HZ: u32 = 12_000_000" in nopic_beta
+    assert "admit_s19k_bm1366_stock_baud_pair" in nopic_beta
+    daemon_rs = (ROOT / "dcentrald/dcentrald/src/daemon.rs").read_text(
+        encoding="utf-8"
+    )
+    assert "admit_s19k_bm1366_stock_baud_pair(" in daemon_rs
+    assert "S19K_BM1366_HOST_BAUD_HZ" in daemon_rs
+    assert "S19K_BM1366_FASTUART_VALUE" in daemon_rs
+    gpio = (ROOT / "dcentrald/dcentrald-common/src/s19k_am3_gpio437.rs").read_text(
+        encoding="utf-8"
+    )
     assert "parse_s19k_gpio_timeline_line" in gpio
     assert "passthrough_must_not_pulse_hb_reset" in gpio
     assert "admit_s19k_78_gpio_timeline_hb_reset_ganged_after_psu" in gpio
@@ -3567,6 +3897,41 @@ def main() -> int:
     )
     if bos.is_file():
         bb = bos.read_bytes()
+        assert hashlib.sha256(bb).hexdigest() == (
+            "5a49dcbe2e2d9f4fb047eca856e71440bd73fc020a817e808b5af3b45a7c8707"
+        )
+        # Exact S19k/BM1366 stock baud identity chain. Chip-id 0x1366 selects
+        # the factory/vtable whose +0x50 method builds FastUartReg. The common
+        # selector admits 1M and 3.125M; BM1366 mode=2 packs 3.125M as 0x3011.
+        assert struct.unpack_from("<Q", bb, 0x016BDAE8)[0] == 0x8DBDF4
+        assert struct.unpack_from("<Q", bb, 0x015B7B00 + 0x50)[0] == 0x8DD3B8
+        assert struct.unpack_from("<QQ", bb, 0x00EE8010) == (4, 0x28)
+        assert struct.unpack_from("<I", bb, 0x004DD3D8)[0] == 0x9400F713
+        assert struct.unpack_from("<I", bb, 0x004DD414)[0] == 0x5280004A
+        assert struct.unpack_from("<I", bb, 0x004DD418)[0] == 0x390053EA
+        assert struct.unpack_from("<I", bb, 0x004DD468)[0] == 0x97FDC649
+        assert struct.unpack_from("<I", bb, 0x0051B034)[0] == 0xF109013F
+        assert struct.unpack_from("<I", bb, 0x0051B03C)[0] == 0x5295E109
+        assert struct.unpack_from("<I", bb, 0x0051B040)[0] == 0x72A005E9
+        assert struct.unpack_from("<I", bb, 0x004376FC)[0] == 0xF9402929
+        assert struct.unpack_from("<I", bb, 0x00437704)[0] == 0xD63F0120
+        assert struct.unpack_from("<I", bb, 0x00437BC8)[0] == 0xF9401928
+        assert struct.unpack_from("<QQQQQQ", bb, 0x015AB508) == (
+            0x0131B8D5,
+            6,
+            0x0131B8DB,
+            29,
+            0x0131B8F8,
+            10,
+        )
+        assert (
+            bb[0x00F1B8D5 : 0x00F1B8D5 + 45]
+            == b"CHAIN/: Set baud rate @ requested: , actual: "
+        )
+        # FUN_00836934 was previously mislabeled as set-baud. Its descriptor
+        # is len=4/reg=0x14 and its log text is the ticket-mask message.
+        assert struct.unpack_from("<QQ", bb, 0x00EE7E20) == (4, 0x14)
+        assert b"Setting ticket mask register for difficulty " in bb
         off = 0x015920A6
         assert bb[off : off + 4] == bytes.fromhex("0000115A")
         assert bb[0x013B0A28 : 0x013B0A28 + 6] == bytes.fromhex("280000003011")
@@ -3588,7 +3953,68 @@ def main() -> int:
         assert struct.unpack_from("<Q", bb, 0x015B7EA8)[0] == 0x8DC828
         assert struct.unpack_from("<Q", bb, 0x015B7EB0)[0] == 0x013232F5
         assert struct.unpack_from("<Q", bb, 0x015B7EB8)[0] == 54
-        assert bb[0x011FD4AE : 0x011FD4B4] == bytes.fromhex("80009000ffff")
+        assert struct.unpack_from("<Q", bb, 0x015B7EC0)[0] == 0x000000400000005D
+        assert struct.unpack_from("<QQQQ", bb, 0x015B7EC8) == (
+            0x8D87F8,
+            0x128,
+            8,
+            0x8DCFBC,
+        )
+        bm1366_poll_ranges = (
+            (0x8DCFBC, 0x8DD3B8),
+            (0x8DD4C8, 0x8DD5B8),
+            (0x8DD63C, 0x8DE218),
+            (0x8DE274, 0x8DE3E8),
+            (0x8DE430, 0x8DE93C),
+            (0x8DE984, 0x8DED90),
+        )
+        dispatch_target = 0x8D823C
+        dispatch_bl_count = 0
+        for start, end in bm1366_poll_ranges:
+            for pc in range(start, end, 4):
+                insn = struct.unpack_from("<I", bb, pc - 0x400000)[0]
+                if insn & 0xFC000000 != 0x94000000:
+                    continue
+                imm26 = insn & 0x03FFFFFF
+                if imm26 & 0x02000000:
+                    imm26 -= 0x04000000
+                if pc + (imm26 << 2) == dispatch_target:
+                    dispatch_bl_count += 1
+        assert dispatch_bl_count == 31
+        assert struct.unpack_from("<QQQQ", bb, 0x015B80A8) == (
+            0x013234D2,
+            54,
+            0x0000004000000067,
+            0x8D85A0,
+        )
+        assert struct.unpack_from("<QQQQ", bb, 0x015B80C0) == (
+            0x8D85A0,
+            0x148,
+            8,
+            0x8DF138,
+        )
+        assert struct.unpack_from("<I", bb, 0x004DF2A8)[0] == 0x528001E1
+        assert struct.unpack_from("<I", bb, 0x004DF2B0)[0] == 0x52800500
+        assert struct.unpack_from("<I", bb, 0x004DF2B4)[0] == 0x72A0C001
+        assert struct.unpack_from("<I", bb, 0x004DF2B8)[0] == 0x940C4FF5
+        assert struct.unpack_from("<QQQQ", bb, 0x015AC768) == (
+            0x0131C3B8,
+            54,
+            0x0000004000000065,
+            0x83EAF0,
+        )
+        assert struct.unpack_from("<QQQQ", bb, 0x015AC780) == (
+            0x83EAF0,
+            0x148,
+            8,
+            0x846384,
+        )
+        assert struct.unpack_from("<I", bb, 0x004464F4)[0] == 0x528001E1
+        assert struct.unpack_from("<I", bb, 0x004464FC)[0] == 0x52800500
+        assert struct.unpack_from("<I", bb, 0x00446500)[0] == 0x72A0C001
+        assert struct.unpack_from("<I", bb, 0x00446504)[0] == 0x940EB362
+        assert 0x0F | (0x600 << 16) == 0x0600000F
+        assert bb[0x011FD4AE:0x011FD4B4] == bytes.fromhex("80009000ffff")
         assert struct.unpack_from("<I", bb, 0x00A7A568)[0] == 0x52801488
         assert struct.unpack_from("<I", bb, 0x00A7A56C)[0] == 0xB8686808
         assert struct.unpack_from("<I", bb, 0x0051BEB4)[0] == 0xD10103FF
@@ -3783,7 +4209,10 @@ def main() -> int:
         assert b"Hashchip: no response for read_register" in bb
         assert b"Modifying MiscCtrl for chip" in bb
         assert b"open/utils-rs/serial-driver/src/antminer_aml.rs" in bb
-        assert bb[0x00F20197 : 0x00F20197 + 45] == b"values were not written correctly to register"
+        assert (
+            bb[0x00F20197 : 0x00F20197 + 45]
+            == b"values were not written correctly to register"
+        )
         assert bb[0x00EEC448 : 0x00EEC448 + 4] == bytes.fromhex("55AA2136")
         assert b"BUG: asking for non-existing version index" in bb
         assert b"packed_struct-0.10.1/src/packing.rs" in bb
@@ -3813,7 +4242,10 @@ def main() -> int:
         assert b"HB2_RESET" in bb
         assert b"HB3_RESET" in bb
         assert b"invalid midstate count logarithm" in bb
-        assert b"assertion failed: self.work_id < Self::get_work_id_count(midstate_count)" in bb
+        assert (
+            b"assertion failed: self.work_id < Self::get_work_id_count(midstate_count)"
+            in bb
+        )
         assert b"assertion failed: work_id < self.registry_size" in bb
         assert b"open/bosminer/bosminer-hal/src/registry.rs" in bb
         # FUN_0092f200 VA 0x0092f200 is first-LOAD file 0x52f200.
@@ -3822,9 +4254,13 @@ def main() -> int:
         assert struct.unpack_from("<I", bb, 0x007F6454)[0] == 0xA903DB68
         assert bb[0x007E7084 : 0x007E7084 + 4] != b"\x00" * 4
         # : Worker memcpy size 0x1c8; AND#0xFF;RET exists; ctor mask 0xE0000020.
-        assert struct.unpack_from("<I", bb, 0x004F2550)[0] == 0x52803902  # MOVZ W2,#0x1C8
+        assert (
+            struct.unpack_from("<I", bb, 0x004F2550)[0] == 0x52803902
+        )  # MOVZ W2,#0x1C8
         assert bb[0x00CAF790 : 0x00CAF790 + 8] == bytes.fromhex("001c0012c0035fd6")
-        assert struct.unpack_from("<I", bb, 0x00503810)[0] == 0x72BC0009  # MOVK W9,#0xE000,LSL#16
+        assert (
+            struct.unpack_from("<I", bb, 0x00503810)[0] == 0x72BC0009
+        )  # MOVK W9,#0xE000,LSL#16
         # : five AM3 factories MOVZ W10,#0x100; LSRV X6,X10,X8.
         for off in (0x004767E8, 0x00476D70, 0x004772F8, 0x00477880, 0x00477E08):
             assert struct.unpack_from("<I", bb, off)[0] == 0x5280200A
@@ -3835,7 +4271,10 @@ def main() -> int:
         # Worker::new FUN_00903534+0x20 mov x26,x6 (count).
         assert struct.unpack_from("<I", bb, 0x00503554)[0] == 0xAA0603FA
         assert b"open/bosminer/bosminer-am2-s17/src/hardware/am3.rs" in bb
-        assert b"open/bosminer/bosminer-am2-s17/src/hardware/antminer/controlboard/aml.rs" in bb
+        assert (
+            b"open/bosminer/bosminer-am2-s17/src/hardware/antminer/controlboard/aml.rs"
+            in bb
+        )
         assert b"BUG: Combination architecture-control board not supported" in bb
         # : FUN_008d6cf0 MOVZ W10,#0x1366; same factory as 1362/1368/1370.
         assert struct.unpack_from("<I", bb, 0x004D6D00)[0] == 0x52826C48  # #0x1362
@@ -3848,7 +4287,9 @@ def main() -> int:
         # : FUN_0083ca30 REV16 W10,W10 then STR packed UartRelayReg.
         assert struct.unpack_from("<I", bb, 0x0043CAB0)[0] == 0x5AC0094A
         assert struct.unpack_from("<I", bb, 0x0043CAF4)[0] == 0xB9000008
-        assert struct.unpack_from("<I", bb, 0x0043CA98)[0] == 0x39400AC8  # LDRB W8,[X22,#2]
+        assert (
+            struct.unpack_from("<I", bb, 0x0043CA98)[0] == 0x39400AC8
+        )  # LDRB W8,[X22,#2]
         assert b"UartRelayReg" in bb
         assert b"nonce_gap_en" in bb
         assert b"ro_relay_en" in bb
@@ -3856,8 +4297,12 @@ def main() -> int:
         assert b"Enabling UART relay chip:" in bb
         # : pack-caller LSL X1,X9,X10; work-response parse; clone fn.
         assert struct.unpack_from("<I", bb, 0x0051C00C)[0] == 0x9ACA2121
-        assert struct.unpack_from("<I", bb, 0x0051C000)[0] == 0xF940482B  # LDR X11,[X1,#0x90]
-        assert struct.unpack_from("<I", bb, 0x0051C0DC)[0] == 0xF9404428  # LDR X8,[X1,#0x88]
+        assert (
+            struct.unpack_from("<I", bb, 0x0051C000)[0] == 0xF940482B
+        )  # LDR X11,[X1,#0x90]
+        assert (
+            struct.unpack_from("<I", bb, 0x0051C0DC)[0] == 0xF9404428
+        )  # LDR X8,[X1,#0x88]
         for va in (
             0x00843B80,
             0x00845FA0,
@@ -4041,8 +4486,7 @@ def main() -> int:
         assert struct.unpack_from("<I", bb, 0x00D5C784)[0] == 0xF94056B4
         assert struct.unpack_from("<I", bb, 0x00D5C788)[0] == 0xF90046A8
         assert (
-            bb[0x0120B3A6 : 0x0120B3A6 + 36]
-            == b"panic in a destructor during cleanup"
+            bb[0x0120B3A6 : 0x0120B3A6 + 36] == b"panic in a destructor during cleanup"
         )
         # : thunk2 is size-product tail to 0xbc9e18; 0x626aac second arm X8+0x20.
         assert struct.unpack_from("<I", bb, 0x00E9B1E4)[0] == 0xD100C3FF
@@ -4342,13 +4786,9 @@ def main() -> int:
         assert struct.unpack_from("<I", bb, 0x004D69B8)[0] == 0x2A1F03E0
         assert struct.unpack_from("<I", bb, 0x004D69E0)[0] == 0x52800020
         assert (
-            bb[0x0120EAAA : 0x0120EAAA + 35]
-            == b"`async fn` resumed after completion"
+            bb[0x0120EAAA : 0x0120EAAA + 35] == b"`async fn` resumed after completion"
         )
-        assert (
-            bb[0x0120EACD : 0x0120EACD + 34]
-            == b"`async fn` resumed after panicking"
-        )
+        assert bb[0x0120EACD : 0x0120EACD + 34] == b"`async fn` resumed after panicking"
         assert (
             bb[0x00F229BE : 0x00F229BE + 55]
             == b"/build/source/open/bosminer/bosminer-hal/src/command.rs"
@@ -4366,7 +4806,11 @@ def main() -> int:
                 k = 1
                 while k < 5:
                     w2 = struct.unpack_from("<I", bb, off + 4 * k)[0]
-                    if (w2 >> 22) == 0x1C4 and ((w2 >> 5) & 0x1F) == rt and (w2 & 0x1F) == 31:
+                    if (
+                        (w2 >> 22) == 0x1C4
+                        and ((w2 >> 5) & 0x1F) == rt
+                        and (w2 & 0x1F) == 31
+                    ):
                         if ((w2 >> 10) & 0xFFF) == 3:
                             cmp3 += 1
                         break
@@ -4419,10 +4863,7 @@ def main() -> int:
         assert struct.unpack_from("<I", bb, 0x015B7C6C)[0] == 18
         assert struct.unpack_from("<I", bb, 0x015B8160)[0] == 147
         assert struct.unpack_from("<I", bb, 0x015B8164)[0] == 72
-        assert (
-            bb[0x00F23243 : 0x00F23243 + 34]
-            == b"FieldSet corrupted (this is a bug)"
-        )
+        assert bb[0x00F23243 : 0x00F23243 + 34] == b"FieldSet corrupted (this is a bug)"
         # : +0x230 is ctx pointer; wrap 0x1a8 interior + exclusive end.
         assert struct.unpack_from("<I", bb, 0x004DD094)[0] == 0xF9400668
         assert struct.unpack_from("<I", bb, 0x004DD09C)[0] == 0xF9001A7F
@@ -4517,8 +4958,7 @@ def main() -> int:
             == b"/rustc/17067e9ac6d7ecb70e50f92c1944e545188d2359/library/core/src/time.rs"
         )
         assert (
-            bb[0x01206E6E : 0x01206E6E + 36]
-            == b"library/std/src/sys/pal/unix/time.rs"
+            bb[0x01206E6E : 0x01206E6E + 36] == b"library/std/src/sys/pal/unix/time.rs"
         )
         assert bb[0x01206E5D : 0x01206E5D + 17] == b"invalid timestamp"
         # : c0d4ac is 0x48; 37 BLs = 6 FPGA + 25 UART + 6 wrap.
@@ -4938,8 +5378,13 @@ def main() -> int:
         assert struct.unpack_from("<Q", bb, 0x015AB2F8)[0] == 157
         assert struct.unpack_from("<I", bb, 0x015AB300)[0] == 434
         assert struct.unpack_from("<I", bb, 0x015AB304)[0] == 51
-        assert bb[0x00F1B62A : 0x00F1B62A + 157].endswith(b"tokio-1.45.1/src/sync/mutex.rs")
-        assert bb[0x00F1B6C7 : 0x00F1B6C7 + 40] == b"internal error: entered unreachable code"
+        assert bb[0x00F1B62A : 0x00F1B62A + 157].endswith(
+            b"tokio-1.45.1/src/sync/mutex.rs"
+        )
+        assert (
+            bb[0x00F1B6C7 : 0x00F1B6C7 + 40]
+            == b"internal error: entered unreachable code"
+        )
         # : fat-host +0x240 is 0x70-ptr; Mutex at +0x28; not HashChain 1e8.
         assert struct.unpack_from("<I", bb, 0x004370C0)[0] == 0xF9400268
         assert struct.unpack_from("<I", bb, 0x004370C8)[0] == 0xF940A509
@@ -5101,14 +5546,20 @@ def main() -> int:
         assert struct.unpack_from("<I", bb, 0x0051C0E0)[0] == 0x5AC00B00
         assert struct.unpack_from("<I", bb, 0x0051C0DC)[0] == 0xF9404428
         assert struct.unpack_from("<I", bb, 0x0051C0E4)[0] == 0xD63F0100
-        assert struct.unpack_from("<I", bb, 0x0051C0E8)[0] == 0x394202A8  # LDRB [X21,#0x80]
+        assert (
+            struct.unpack_from("<I", bb, 0x0051C0E8)[0] == 0x394202A8
+        )  # LDRB [X21,#0x80]
         assert struct.unpack_from("<I", bb, 0x0051C0EC)[0] == 0x7100051F  # CMP #1
         assert struct.unpack_from("<I", bb, 0x0051C0F4)[0] == 0xAA0003F6  # MOV X22,X0
         assert struct.unpack_from("<I", bb, 0x0051C120)[0] == 0xAA1603E1  # MOV X1,X22
         # : +0x80!=1 cold path is bm1398_6x.rs:344 work-type panic.
         assert struct.unpack_from("<I", bb, 0x0051C1B0)[0] == 0xB0005040  # ADRP X0
-        assert struct.unpack_from("<I", bb, 0x0051C1B4)[0] == 0x91123C00  # ADD X0,#0x48F
-        assert struct.unpack_from("<I", bb, 0x0051C1C0)[0] == 0x52800601  # MOVZ W1,#0x30
+        assert (
+            struct.unpack_from("<I", bb, 0x0051C1B4)[0] == 0x91123C00
+        )  # ADD X0,#0x48F
+        assert (
+            struct.unpack_from("<I", bb, 0x0051C1C0)[0] == 0x52800601
+        )  # MOVZ W1,#0x30
         assert (
             bb[0x00F2548F : 0x00F2548F + 48]
             == b"BUG: Midstates work type in version-rolling mode"
@@ -5903,9 +6354,11 @@ def main() -> int:
                     look = off - 4
                     while look >= 0 and off - look <= 64:
                         lw = struct.unpack_from("<I", bb, look)[0]
-                        if (lw >> 22) == 0x3E5 and ((lw >> 10) & 0xFFF) * 8 == 0x260 and (
-                            lw & 0x1F
-                        ) == xt:
+                        if (
+                            (lw >> 22) == 0x3E5
+                            and ((lw >> 10) & 0xFFF) * 8 == 0x260
+                            and (lw & 0x1F) == xt
+                        ):
                             saw = True
                             break
                         look -= 4
@@ -5920,7 +6373,9 @@ def main() -> int:
                         sw = struct.unpack_from("<I", bb, look)[0]
                         sxn = (sw >> 5) & 0x1F
                         if sxn != 31:
-                            if (sw >> 22) == 0x3E4 and ((sw >> 10) & 0xFFF) * 8 == 0x260:
+                            if (sw >> 22) == 0x3E4 and (
+                                (sw >> 10) & 0xFFF
+                            ) * 8 == 0x260:
                                 movz300_near += 1
                             if (sw & 0xFFC00000) == 0xB9000000 and (
                                 (sw >> 10) & 0xFFF
@@ -5978,7 +6433,9 @@ def main() -> int:
                         call3_str260 += 1
                     if (w >> 22) == 0x3E4 and ((w >> 10) & 0xFFF) * 8 == 0x228:
                         call3_str228 += 1
-                    if (w & 0xFFC00000) == 0xB9000000 and ((w >> 10) & 0xFFF) * 4 == 0x228:
+                    if (w & 0xFFC00000) == 0xB9000000 and (
+                        (w >> 10) & 0xFFF
+                    ) * 4 == 0x228:
                         call3_str228 += 1
                 off += 4
         off = 0
@@ -6299,9 +6756,9 @@ def main() -> int:
         assert len(bmu_b) == 12_792_832
         assert bmu_b[0] == 0x26
         assert int.from_bytes(bmu_b[0x16:0x18], "big") == 451
-        assert bmu_b[0x18:0x18 + 26] == b"-----BEGIN PUBLIC KEY-----"
+        assert bmu_b[0x18 : 0x18 + 26] == b"-----BEGIN PUBLIC KEY-----"
         assert bmu_b[0x418:0x41C] == bytes.fromhex("022e5ae0")
-        assert hashlib.sha256(bmu_b[0x18:0x18 + 451]).hexdigest() == (
+        assert hashlib.sha256(bmu_b[0x18 : 0x18 + 451]).hexdigest() == (
             "f03c6e8345cb3cfec6792b3ef545cc2e2166661492683c20e8f0166aba8c8ad0"
         )
         cv_pub = (
@@ -6312,7 +6769,7 @@ def main() -> int:
         if cv_pub.is_file():
             cvb = cv_pub.read_bytes()
             assert len(cvb) == 451
-            assert cvb != bmu_b[0x18:0x18 + 451]
+            assert cvb != bmu_b[0x18 : 0x18 + 451]
             try:
                 from cryptography.hazmat.primitives import hashes, serialization
                 from cryptography.hazmat.primitives.asymmetric import padding
@@ -6320,12 +6777,14 @@ def main() -> int:
                 key = serialization.load_pem_public_key(cvb)
                 try:
                     key.verify(
-                        bmu_b[0x418:0x418 + 256],
-                        bmu_b[0x18:0x18 + 451],
+                        bmu_b[0x418 : 0x418 + 256],
+                        bmu_b[0x18 : 0x18 + 451],
                         padding.PKCS1v15(),
                         hashes.SHA256(),
                     )
-                    raise AssertionError("held CVCtrl bitmain.pub must not verify 20231108 miner.pem.sig")
+                    raise AssertionError(
+                        "held CVCtrl bitmain.pub must not verify 20231108 miner.pem.sig"
+                    )
                 except Exception as exc:
                     assert type(exc).__name__ == "InvalidSignature"
             except ImportError:
@@ -6335,7 +6794,7 @@ def main() -> int:
         assert int.from_bytes(bmu_b[0x80C:0x810], "little") == 0x01080000
         assert int.from_bytes(bmu_b[0x810:0x814], "little") == 0x0066A000
         assert int.from_bytes(bmu_b[0x824:0x828], "little") == 2048
-        assert b"init=/sbin/init" in bmu_b[0x800:0x800 + 80]
+        assert b"init=/sbin/init" in bmu_b[0x800 : 0x800 + 80]
         assert bmu_b[1304] == 1
         assert bmu_b[1309] == 9
         assert int.from_bytes(bmu_b[1310:1314], "big") == 12_790_272
@@ -6404,9 +6863,9 @@ def main() -> int:
     assert "fixture_value=0x03" in flag_sh_w286
     assert "SuccessfulKeepBos plan/fixture only" in flag_sh_w286
     assert "eraseblock_index=" in flag_sh_w286
-    assert flag_sh_w286.find("recovery flag 0x03 execute is FLASH NOT_YET") < flag_sh_w286.find(
-        'flash_erase /dev/mtd5 "$EB_START_HEX" 1'
-    )
+    assert "recovery flag 0x03 execute is FLASH NOT_YET" in flag_sh_w286
+    assert 'flash_erase /dev/mtd5 "$EB_START_HEX" 1' not in flag_sh_w286
+    assert 'nandwrite -p -s "$EB_START_HEX" /dev/mtd5' not in flag_sh_w286
     assert flag_sh_w286.find("rewrite_recovery_flag_fixture()") < flag_sh_w286.find(
         "intent=SuccessfulKeepBos"
     )
@@ -6418,14 +6877,16 @@ def main() -> int:
     assert "admit_s19k_s99_leftover_01_is_error" in install_rs
     assert "S99_AMLOGIC_OTA08_IDENTITIES" in install_rs
     s99 = (
-        ROOT
-        / "br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade"
+        ROOT / "br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade"
     ).read_text(encoding="utf-8", errors="replace")
     assert "AMLOGIC_RAW_NAND_RECOVERY_FLAG_EXCEPTION" in s99
     assert "require_amlogic_ota08_identity" in s99
     assert "missing live $BOARD_TARGET_FILE" in s99
     assert "am3-s19k|am3-s19kpro|am3-aml-s19kpro" in s99
-    assert "am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp|am3-t21" in s99
+    assert "am3-aml-s19k:am3-s19k" in s99
+    assert "am3-aml-s19jpro:am3-s19jpro-aml" in s99
+    assert "am3-aml-s21:am3-s21" in s99
+    assert "am3-aml-s21pro:am3-s21pro" in s99
     assert "OLD=$(read_recovery_flag)" in s99
     assert "ERROR: recovery flag readback = $NEW (expected 0x03)" in s99
     assert "WARN: recovery flag readback" not in s99
@@ -6530,15 +6991,14 @@ def main() -> int:
     assert "admit_s19k_20231108_pem_sig_head" in install_rs
     assert "admit_s19k_held_root_does_not_verify_pem_sig" in install_rs
     assert "refuse_s19k_unverified_pem_sig_as_nand_grant" in install_rs
-    assert "HELD_FILEPARSER_SHA256_INIT: &str = \"SHA256_Init\"" in install_rs
+    assert 'HELD_FILEPARSER_SHA256_INIT: &str = "SHA256_Init"' in install_rs
     assert "S19K_MINER_PEM_SIG_HELD_ROOT_VERIFIED: bool = false" in install_rs
     assert "S19K_20231108_MINER_PEM_LEN: usize = 451" in install_rs
     assert "refuse_aml_sdc_burn_as_dcent" in install_rs
     assert "refuse_s19k_cvctrl_sd2nand_as_aml_nand" in install_rs
     assert "CvitekSd2NandFactory" in install_rs
     nand_layout = (
-        ROOT.parents[1]
-        / "projects/dcent-toolbox/src/dcent_toolbox/core/nand_layout.py"
+        ROOT.parents[1] / "projects/dcent-toolbox/src/dcent_toolbox/core/nand_layout.py"
     ).read_text(encoding="utf-8")
     assert "AMLOGIC_ROOTFS_OFFSET = 0x05100000" in nand_layout
     assert "AMLOGIC_RECOVERY_FLAG_OFFSET = 0x04D00000" in nand_layout
@@ -6562,23 +7022,380 @@ def main() -> int:
     )
     assert restore.find("gpio437 SafeOff") < restore.find('nandwrite -p "$ROOTFS_MTD"')
     assert "nandwrite -p -s" not in restore
-    assert "7-part map blocked" in restore
+    assert "backup ledger geometry is not exact S19k .78" in restore
     assert "admit ledger board_target=" in restore
     assert "BACKUP_LEDGER missing mtd5_len" in restore
-    assert "missing live /etc/dcentos/board_target" in restore
+    assert "missing live canonical platform/board_target pair" in restore
     assert "tmp_deploy leftover" in restore
     assert "admit_s19k_restore_live_board_target" in install_rs
     assert "refuse_s19k_restore_tmp_deploy_stamp" in install_rs
     deploy_sh = (ROOT / "scripts/dcentrald_s19k_tmp_deploy.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "/etc/dcentos/tmp_deploy" in deploy_sh
+    assert "/etc/dcentos/tmp_deploy" not in deploy_sh
+    assert "dcentrald_s19k_tmp_remote_run.sh" in deploy_sh
     trial_sh = (ROOT / "scripts/dcentrald_s19k_tmp_trial.sh").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "/etc/dcentos/tmp_deploy" in trial_sh
-    assert "admit_s19k_tmp_deploy_board_target" in trial_sh
-    assert "am3-s19kpro" in trial_sh
+    assert 'exec "$SCRIPT_DIR/dcentrald_s19k_tmp_deploy.sh"' in trial_sh
+    remote_trial = (ROOT / "scripts/dcentrald_s19k_tmp_remote_run.sh").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "/etc/dcentos" not in remote_trial
+    assert "runtime_active" in remote_trial
+    assert "persistent_mutation=false" in remote_trial
+    assert "trap 'stop_child 130' 2" in remote_trial
+    assert (
+        '"$TRIAL_BIN" --config "$TRIAL_CFG" --serial-mining --allow-loud \\'
+        in remote_trial
+    )
+    for custody_arg in (
+        '--s19k-bos-tools-pid "$BOUND_SUPERVISOR_PID"',
+        '--s19k-bos-tools-start "$BOUND_SUPERVISOR_START"',
+        '--s19k-bos-tools-ppid "$BOUND_SUPERVISOR_PPID"',
+        '--s19k-bos-tools-pgrp "$BOUND_SUPERVISOR_PGRP"',
+        '--s19k-bos-tools-session "$BOUND_SUPERVISOR_SESSION"',
+        '--s19k-bos-tools-exe "$BOUND_SUPERVISOR_EXE"',
+        '--s19k-bos-tools-cmdline-sha256 "$BOUND_SUPERVISOR_CMDLINE_SHA"',
+        '--s19k-bos-tools-cmdline-bytes "$BOUND_SUPERVISOR_CMDLINE_BYTES"',
+        '--s19k-bosminer-pid "$BOUND_BOSMINER_PID"',
+        '--s19k-bosminer-start "$BOUND_BOSMINER_START"',
+        '--s19k-bosminer-ppid "$BOUND_BOSMINER_PPID"',
+        '--s19k-bosminer-pgrp "$BOUND_BOSMINER_PGRP"',
+        '--s19k-bosminer-session "$BOUND_BOSMINER_SESSION"',
+        '--s19k-bosminer-exe "$BOUND_BOSMINER_EXE"',
+        '--s19k-bosminer-cmdline-sha256 "$BOUND_BOSMINER_CMDLINE_SHA"',
+        '--s19k-bosminer-cmdline-bytes "$BOUND_BOSMINER_CMDLINE_BYTES"',
+    ):
+        assert custody_arg in remote_trial
+    assert "DCENTOS_EPHEMERAL_RUNTIME=1" in remote_trial
+    assert "DCENT_S19K_TRACK1_STOP_SAFEOFF=1" in remote_trial
+    assert "verify_bound_file" in remote_trial
+    # Attempt-10 hard-ceiling backstop (2026-08-28 lifecycle audit): the
+    # historical blanket "never SIGKILL" invariant is superseded by an exact
+    # one — the ONLY kill -KILL anywhere in the remote trial is the trial
+    # ceiling's identity-fenced SIGKILL of the exact daemon child inside
+    # enforce_trial_ceiling_exit, and it can never name stock supervisor
+    # processes. Mirrors scripts/test_s19k_tmp_deploy_safety.py's pin.
+    assert remote_trial.count("kill -KILL") == 1
+    _ceiling_fn = remote_trial[
+        remote_trial.index("enforce_trial_ceiling_exit() {"): remote_trial.index(
+            "set_expected_safeoff_receipt()"
+        )
+    ]
+    assert 'kill -KILL "$CHILD_PID" 2>/dev/null' in _ceiling_fn
+    assert "exact_dcentrald_child_matches" in _ceiling_fn
+    assert "stale temporary runtime receipt" in remote_trial
+    assert (
+        'BOUNDED_TRANSCRIPT_RECEIPT="$TRIAL_DIR/runtime_bounded_work_transcript"'
+        in remote_trial
+    )
+    assert "dcentos.s19k-bounded-work-transcript/v1" in remote_trial
+    assert "semantic_verification=host-required" in remote_trial
+    assert (
+        'NO_WORK_TRANSCRIPT_RECEIPT="$TRIAL_DIR/runtime_handoff_no_work_transcript"'
+        in remote_trial
+    )
+    assert "dcentos.s19k-handoff-no-work-transcript/v1" in remote_trial
+    assert (
+        "semantic_verification=host-plus-independent-instruments-required"
+        in remote_trial
+    )
+    assert 'exec 6< "$STARTUP_DAEMON_TRANSCRIPT"' in remote_trial
+    assert '"$@" 6>&- 9>&-' in remote_trial
+    assert remote_trial.count("clear_runtime_obligation_after_safeoff ||") >= 2
+    assert remote_trial.count("publish_handoff_no_work_transcript_receipt") >= 3
+    assert remote_trial.count("publish_bounded_work_transcript_receipt") >= 3
+    for closeout in (
+        "clear_runtime_obligation_after_safeoff || exit 1\n"
+        '        publish_handoff_no_work_transcript_receipt "$EXIT_CODE"',
+        "clear_runtime_obligation_after_safeoff || exit 1\n"
+        '    publish_handoff_no_work_transcript_receipt "$CHILD_STATUS"',
+    ):
+        assert closeout in remote_trial
+    assert 'ENDURANCE_EVIDENCE_DIR="$TRIAL_DIR/endurance_evidence"' in remote_trial
+    assert "endurance-work-proof" in remote_trial
+    assert "S19K_ENDURANCE_ACK_OK" in remote_trial
+    assert "publish_endurance_work_receipt" in remote_trial
+    assert "publish_endurance_failure_receipt" in remote_trial
+    assert "dcentos.s19k-endurance-work-receipt/v1" in remote_trial
+    assert "dcentos.s19k-endurance-daemon-terminal/v1" in remote_trial
+    assert "dcentos.s19k-endurance-failure-receipt/v1" in remote_trial
+    assert "dcentos.s19k-endurance-daemon-failure/v1" in remote_trial
+    endurance_rs = (ROOT / "dcentrald/dcentrald/src/s19k_endurance.rs").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "pub(crate) const S19K_ENDURANCE_MIN_S: u64 = 24 * 60 * 60" in endurance_rs
+    assert "pub(crate) const S19K_ENDURANCE_MAX_S: u64 = 26 * 60 * 60" in endurance_rs
+    assert "S19K_ENDURANCE_ACK_TIMEOUT_S: u64 = 5 * 60" in endurance_rs
+    assert "hash_bound_field" in endurance_rs
+    assert "no-clobber-hard-link-after-fsync" in endurance_rs
+    assert "publish_failure_terminal" in endurance_rs
+    assert "fail-after-checked-safeoff" in endurance_rs
+    endurance_collect = (ROOT / "scripts/s19k_endurance_collect.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    endurance_verify = (ROOT / "scripts/s19k_endurance_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    endurance_baseline = (ROOT / "scripts/s19k_endurance_baseline.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "StrictHostKeyChecking=yes" in endurance_collect
+    assert "GlobalKnownHostsFile=/dev/null" in endurance_collect
+    assert "host-create-new-fsync" in endurance_collect
+    assert "S19K_ENDURANCE_COLLECTION_OK" in endurance_collect
+    assert "S19K_ENDURANCE_CONTROLLED_FAILURE_EVIDENCE_OK" in endurance_collect
+    assert "--resume-failure" in endurance_collect
+    assert "resume_failure" in endurance_collect
+    assert "manifest-first transaction" in endurance_collect
+    assert "clean_stale_publication_scratch" in endurance_collect
+    assert "POSIX directory fsync" in endurance_collect
+    assert "verify_against_baseline" in endurance_collect
+    assert "phase3_provenance" in endurance_collect
+    assert '"dry_run": "false"' in endurance_verify
+    assert 'BASELINE_SCHEMA = "dcentos.s19k-endurance-baseline/v4"' in endurance_verify
+    assert "verify_phase3_provenance" in endurance_verify
+    assert "phase3_baseline_builder_sha256" in endurance_verify
+    assert (
+        'FINAL_RECEIPT_SCHEMA = "dcentos.s19k-endurance-host-verification/v1"'
+        in endurance_verify
+    )
+    assert "TARGET_RECEIPT_KEYS" in endurance_verify
+    assert "TARGET_FAILURE_RECEIPT_KEYS" in endurance_verify
+    assert "verify_failure_final" in endurance_verify
+    assert (
+        "first endurance segment does not begin at the admitted observation origin"
+        in endurance_verify
+    )
+    assert "accepted-share evidence is incomplete" in endurance_verify
+    assert (
+        "SafeOff receipt does not prove reset-low / PSU-off terminal state"
+        in endurance_verify
+    )
+    assert "gather_phase3_provenance" in endurance_baseline
+    assert "bounded.verify" in endurance_baseline
+    assert "physical.verify_evidence" in endurance_baseline
+    assert "phase3_physical_verification_id" in endurance_baseline
+    assert "no-clobber-hard-link-after-fsync" in endurance_baseline
+    stock_restart = (
+        ROOT / "scripts/dcentrald_s19k_stock_restart_from_safeoff.sh"
+    ).read_text(encoding="utf-8", errors="replace")
+    for census_source in (remote_trial, stock_restart):
+        assert '[ -L "$FD" ] || [ -e "$FD" ] || continue' in census_source
+        assert '[ -e "$FD" ] || [ -L "$FD" ] || continue' not in census_source
+        census_start = census_source.index("collect_all_task_effect_snapshot() {")
+        census_end = census_source.index("\n}\n", census_start)
+        census = census_source[census_start:census_end]
+        argv_loop = census.index("for PROC_ARG in $CMDLINE; do")
+        assert census.index("set -f", 0, argv_loop) < argv_loop
+        assert census.index("set +f", argv_loop) > argv_loop
+    assert "filter_custody_relevant_task_effects() (\n    set -f" in remote_trial
+    assert "filter_relevant_task_effects() (\n    set -f" in stock_restart
+    watchdog_namespace_gate = (
+        'case "$FD_TARGET" in\n'
+        '                    "$WATCHDOG_NODE_ROOT"/*) ;;\n'
+        "                    *) continue ;;\n"
+        "                esac"
+    )
+    assert watchdog_namespace_gate in stock_restart
+    assert stock_restart.index(watchdog_namespace_gate) < stock_restart.index(
+        'if fd_watchdog_rdev "$FD"; then'
+    )
+    bounded_verify = (ROOT / "scripts/s19k_bounded_transcript_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert (
+        'RECEIPT_SCHEMA = "dcentos.s19k-bounded-work-transcript/v1"' in bounded_verify
+    )
+    assert 'PLAN_SCHEMA = "dcentos.s19k-tmp-deploy/v12"' in bounded_verify
+    no_work_verify = (ROOT / "scripts/s19k_no_work_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    no_work_tests = (ROOT / "scripts/test_s19k_no_work_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    no_work_prepare = (ROOT / "scripts/s19k_no_work_prepare.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    no_work_prepare_tests = (ROOT / "scripts/test_s19k_no_work_prepare.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    phase3_physical = (ROOT / "scripts/s19k_phase3_physical_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    phase3_physical_tests = (
+        ROOT / "scripts/test_s19k_phase3_physical_verify.py"
+    ).read_text(encoding="utf-8", errors="replace")
+    phase12_normalize = (ROOT / "scripts/s19k_phase12_normalize.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    phase12_normalize_tests = (
+        ROOT / "scripts/test_s19k_phase12_normalize.py"
+    ).read_text(encoding="utf-8", errors="replace")
+    phase12_capture = (
+        ROOT / "scripts/s19k_phase12_capture_verify.py"
+    ).read_text(encoding="utf-8", errors="replace")
+    phase12_capture_tests = (
+        ROOT / "scripts/test_s19k_phase12_capture_verify.py"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert 'PLAN_SCHEMA = "dcentos.s19k-tmp-deploy/v12"' in no_work_verify
+    assert (
+        'RECEIPT_SCHEMA = "dcentos.s19k-handoff-no-work-transcript/v1"'
+        in no_work_verify
+    )
+    assert (
+        'MANIFEST_SCHEMA = "dcentos.s19k-phase12-instrument-manifest/v2"'
+        in no_work_verify
+    )
+    assert 'BUNDLE_SCHEMA = "dcentos.s19k-phase12-evidence-bundle/v2"' in no_work_verify
+    assert (
+        'VERIFICATION_SCHEMA = "dcentos.s19k-phase12-raw-capture-verification/v2"'
+        in phase12_capture
+    )
+    assert "rates_and_gaps_computed_from_raw_blocks" in phase12_capture
+    assert "rail_composite_at_times(" in phase12_capture
+    assert "test_missing_second_rail_is_rejected" in phase12_capture_tests
+    assert "test_unmeasured_gap_between_blocks_is_rejected" in phase12_capture_tests
+    assert (
+        'CONFIG_SCHEMA = "dcentos.s19k-phase12-normalization-config/v1"'
+        in phase12_normalize
+    )
+    assert (
+        'RECEIPT_SCHEMA = "dcentos.s19k-phase12-normalization/v1"' in phase12_normalize
+    )
+    assert "host-plus-independent-instruments-required" in no_work_verify
+    assert "S19K_PHASE12_NO_WORK_OK" in no_work_verify
+    assert '"verifier_sha256"' in no_work_verify
+    assert '"verifier_bytes"' in no_work_verify
+    assert '"preparer_sha256"' in no_work_verify
+    assert '"preparer_bytes"' in no_work_verify
+    assert '"normalizer_sha256"' in no_work_verify
+    assert '"normalizer_bytes"' in no_work_verify
+    assert "normalizer.verify_normalization(" in no_work_verify
+    assert 'BUNDLE_RECEIPT_FILENAME = "phase12_bundle_complete"' in no_work_verify
+    assert "require_bundle_complete: bool = True" in no_work_verify
+    assert (
+        "embedded host verification differs from fresh semantic verification"
+        in no_work_verify
+    )
+    assert "member must have exactly one hard link" in no_work_verify
+    assert "os.read(descriptor, 1024 * 1024)" in no_work_verify
+    assert '"--output"' in no_work_verify
+    assert "os.O_EXCL" in no_work_verify
+    assert "os.fsync(directory_descriptor)" in no_work_verify
+    assert "MAX_SAMPLE_GAP_MS = 1_000" in no_work_verify
+    assert "MIN_POST_DECAY_CONFIRM_MS = 5_000" in no_work_verify
+    assert "MAX_DECAY_PERCENT_OF_BASELINE = 5" in no_work_verify
+    assert "MAX_CANONICAL_BYTES = 64 * 1024 * 1024" in no_work_verify
+    assert "MIN_SPINNING_FAN_RPM = 2_000" in no_work_verify
+    assert "MIN_SPINNING_FANS = 2" in no_work_verify
+    assert "_stable_regular_bytes_bounded" in no_work_verify
+    assert 'bytes.fromhex("55AA2136")' in no_work_verify
+    assert (
+        "test_rejects_work_frame_even_when_uart_manifest_is_rehashed" in no_work_tests
+    )
+    assert "test_rejects_work_signature_split_across_adjacent_tx_rows" in no_work_tests
+    assert (
+        "test_rejects_manual_canonical_edit_even_when_manifest_is_rehashed"
+        in no_work_tests
+    )
+    assert (
+        "test_rejects_raw_export_edit_even_when_manifest_is_rehashed" in no_work_tests
+    )
+    assert "test_rejects_manifest_bound_to_another_normalizer" in no_work_tests
+    assert "test_rejects_reset_low_only_after_gpio437_cut" in no_work_tests
+    assert "test_rejects_missing_independent_rail_decay" in no_work_tests
+    assert "test_rejects_cooling_loss_before_decay_confirmation" in no_work_tests
+    assert "test_rejects_rail_rebound_after_decay_confirmation" in no_work_tests
+    assert "test_rejects_sampling_gap_after_decay_confirmation" in no_work_tests
+    assert "test_rejects_cooling_loss_after_decay_confirmation" in no_work_tests
+    assert "test_rejects_stale_instrumentation_preflight" in no_work_tests
+    assert "test_rejects_missing_bundle_completion_receipt" in no_work_tests
+    assert "test_rejects_tampered_embedded_semantic_result" in no_work_tests
+    assert "test_rejects_bundle_member_with_external_hard_link" in no_work_tests
+    assert "test_rejects_canonical_capture_over_size_limit" in no_work_tests
+    assert "test_cli_publishes_external_result_and_success_sentinel" in no_work_tests
+    assert (
+        "evidence preparation requires Linux/WSL publication semantics"
+        in no_work_prepare
+    )
+    assert (
+        "preflight, normalization, raw, and canonical inputs must be ten distinct inodes"
+        in no_work_prepare
+    )
+    assert "host-staged-hard-link-bundle-and-directory-fsync" in no_work_prepare
+    assert 'getattr(os, "O_NOFOLLOW", 0)' in no_work_prepare
+    assert "os.link(" in no_work_prepare
+    assert "_fsync_directory(output)" in no_work_prepare
+    assert "S19K_PHASE12_BUNDLE_OK" in no_work_prepare
+    assert (
+        "test_prepares_exact_self_verifying_v2_bundle" in no_work_prepare_tests
+    )
+    assert (
+        "test_refuses_semantically_unsafe_uart_capture_before_publication"
+        in no_work_prepare_tests
+    )
+    assert "test_refuses_source_inode_alias" in no_work_prepare_tests
+    assert "test_refuses_canonical_capture_over_size_limit" in no_work_prepare_tests
+    assert "test_cli_publishes_both_required_success_sentinels" in no_work_prepare_tests
+    assert (
+        "test_refuses_manifest_clock_that_disagrees_with_normalization"
+        in no_work_prepare_tests
+    )
+    assert 'SCHEMA = "dcentos.s19k-phase3-physical-manifest/v2"' in phase3_physical
+    assert "phase12._parse_instrument" in phase3_physical
+    assert "S19K_PHASE3_PHYSICAL_OK" in phase3_physical
+    assert "test_rejects_tail_rebound" in phase3_physical_tests
+    assert "def verify_normalization(" in phase12_normalize
+    assert "S19K_PHASE12_NORMALIZATION_OK" in phase12_normalize
+    assert "test_derives_and_replays_byte_identical_outputs" in phase12_normalize_tests
+    assert (
+        "test_rejects_rehashed_but_semantically_forged_receipt"
+        in phase12_normalize_tests
+    )
+    assert (
+        "test_publishes_exact_three_file_directory_and_cli_sentinel"
+        in phase12_normalize_tests
+    )
+    runbook_convergence_tests = (
+        ROOT / "scripts/test_s19k_gauntlet_runbook_convergence.py"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert (
+        "test_current_card_has_exactly_three_pinned_deploy_commands"
+        in runbook_convergence_tests
+    )
+    assert (
+        "test_historical_bench_plan_is_non_executable_and_points_forward"
+        in runbook_convergence_tests
+    )
+    assert (
+        "test_legacy_bench_pack_is_non_executable_and_points_forward"
+        in runbook_convergence_tests
+    )
+    assert (
+        "test_all_legacy_s19k_operator_docs_are_superseded_and_non_executable"
+        in runbook_convergence_tests
+    )
+    assert "test_phase12_tool_pins_match_current_files" in runbook_convergence_tests
+    assert (
+        "test_obsolete_artifacts_never_appear_in_executable_blocks"
+        in runbook_convergence_tests
+    )
+    assert "socket" not in no_work_verify
+    assert "subprocess" not in no_work_verify
+    assert "socket" not in phase12_normalize
+    assert "subprocess" not in phase12_normalize
+    endurance_verify = (ROOT / "scripts/s19k_endurance_verify.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert 'PLAN_SCHEMA = "dcentos.s19k-tmp-deploy/v12"' in endurance_verify
+    assert 'wire[:4] != bytes.fromhex("55AA2136")' in bounded_verify
+    assert "def _crc16_itu_t" in bounded_verify
+    assert "def _crc5" in bounded_verify
+    assert "S19K_BOUNDED_TRANSCRIPT_OK" in bounded_verify
+    assert "socket" not in bounded_verify
+    assert "subprocess" not in bounded_verify
     assert "admit_s19k_restore_nand_layout" in install_rs
     assert "admit_s19k_restore_ledger_vs_live" in install_rs
     assert "admit_s19k_restore_ledger_identity" in install_rs
@@ -6589,7 +7406,11 @@ def main() -> int:
     assert "board_target_source=$BOARD_TARGET_SOURCE" in install
     assert "record_s19k_backup_board_target" in install
     assert "|| echo $BOARD_PKG_NAME" not in install
-    assert "invented from --variant" in restore
+    assert (
+        "package-sourced backup must not relabel a package target as a live board_target"
+        in restore
+    )
+    assert "exact tuple proof independently re-admitted" in restore
     assert "board_target_source=package" in restore
     assert "refuse_s19k_restore_execute_package_identity" in install_rs
     assert "record_s19k_backup_board_target" in install_rs
@@ -6604,9 +7425,9 @@ def main() -> int:
     assert "ABSENT_BRAIINS_L3" in install
     assert "--backup-only" in install
 
-    hal = (
-        ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
-    ).read_text(encoding="utf-8")
+    hal = (ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs").read_text(
+        encoding="utf-8"
+    )
     assert "s19k_board_target_is_live_alias" in hal
     assert "boot_safe_handoff_s19k_requires_commanded_value_1" in hal
     assert "am3-s19k T6 SafeOff" in hal
@@ -6614,11 +7435,14 @@ def main() -> int:
     assert "s19k_board_target_is_live_alias" in hal
     assert 'fs::write(&dir_path, "high")' in hal
     assert "GPIO437 refuse: missing /etc/dcentos/board_target" in hal
-    cfg_rs = (
-        ROOT / "dcentrald/dcentrald-hal/src/platform/config.rs"
-    ).read_text(encoding="utf-8")
+    cfg_rs = (ROOT / "dcentrald/dcentrald-hal/src/platform/config.rs").read_text(
+        encoding="utf-8"
+    )
     assert "S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES" in cfg_rs
-    assert 'pub const S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 2] = ["/dev/ttyS3", "/dev/ttyS4"];' in cfg_rs
+    assert (
+        'pub const S19K_AMLOGIC_CHAIN2_TTY_CANDIDATES: [&str; 1] = ["/dev/ttyS3"];'
+        in cfg_rs
+    )
     s19k_fn = cfg_rs.split("pub fn s19k_amlogic()", 1)[1].split("pub fn ", 1)[0]
     assert 'device: "/dev/ttyS3".to_string()' in s19k_fn
     assert 'device: "/dev/ttyS4".to_string()' not in s19k_fn
@@ -6630,9 +7454,13 @@ def main() -> int:
     assert "am3-s19k-active-low" in revert
     assert 'echo 1 > "$SYS/gpio$PWR_GPIO/value"' in revert
     assert "fw_setenv missing" in revert
-    assert revert.find("Step 1c: NAND/env tool preflight") < revert.find("nandwrite -p -s")
-    assert revert.find("missing live /etc/dcentos/board_target") < revert.find(
-        "Type 'REVERT'"
+    assert revert.find("Step 1c: NAND/env tool preflight") < revert.find(
+        "nandwrite -p -s"
+    )
+    assert (
+        0
+        <= revert.find("missing exact live platform:target identity")
+        < revert.find("Type 'REVERT'")
     )
     assert revert.find("IH_ARCH") < revert.find("Type 'REVERT'")
     assert "stock revert requires expected SHA-256" in revert
@@ -6649,7 +7477,8 @@ def main() -> int:
     assert "S19K_REVERT_SIZE_SUM_WINDOW" in install_rs
     assert "S19K_LIVE_IDENTITY_ALIASES" in install_rs
     assert "s19k_board_target_is_live_alias" in install_rs
-    assert "am3-aml-s19kpro" in revert
+    assert "am3-aml-s19k:am3-s19k" in revert
+    assert "am3-aml-s19kpro" not in revert
     assert "am3-s19k|am3-s19kpro|am3-aml-s19kpro" in restore
 
     stock_cgi = (
@@ -6759,9 +7588,9 @@ def main() -> int:
     crc = crc16_itu_t(bytes(body))
     assert crc == 0x796D, hex(crc)
     # send_work / first-frame log uses the same CCITT-FALSE / ITU-T algorithm.
-    hal_crc = (
-        ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs"
-    ).read_text(encoding="utf-8")
+    hal_crc = (ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs").read_text(
+        encoding="utf-8"
+    )
     assert "fn crc16(data: &[u8]) -> u16" in hal_crc
     assert "let mut crc: u16 = 0xFFFF" in hal_crc
     assert "crc = (crc << 1) ^ 0x1021" in hal_crc
@@ -6776,7 +7605,7 @@ def main() -> int:
     assert "else if is_bm1366 && passthrough" not in work_frame
     assert "build_s19k_braiins_mining_on_work_body" in work_frame
     assert "qualify_bm1366_braiins_fill_from_body" in share
-    assert "hunt_s19k_bm1366_fill_from_tagged_slot" in serial
+    assert "hunt_s19k_bm1366_fill_from_admitted_tx_path" in serial
     assert "S19kOutstandingFillTx" in share
     assert "S19K_FILL_TX_SLOTS: usize = 256" in share
     assert "refuse_s19k_fifo32_wrap_as_outstanding_table" in share
@@ -6785,7 +7614,8 @@ def main() -> int:
     assert "refuse_esp_midstate_as_braiins_fill_index" in share
     assert "refuse_esp_flags_redrop_after_fill_hunt" in share
     assert "share.midstate_num = 0" in share
-    assert "share.rolled_version = base_version" in share
+    assert "share.rolled_version =" in share
+    assert "s19k_braiins_midstate0_version(base_version, version_be)" in share
     assert "s19k_braiins_uart_version_bits" in share
     assert "refuse_esp_qualify_as_braiins_fill" in share
     assert "SYNTHETIC_BM1366_FILL_WORK2_BODY" in share
@@ -6807,6 +7637,7 @@ def main() -> int:
     assert "refuse_s19k_skip_bm1366_open_first_read_at_7" in share
     assert "admit_s19k_production_requires_body9_before_first_read" in share
     assert "admit_s19k_init_bm1366_requires_body9_before_flush" in share
+    assert "admit_s19k_init_bm1366_requires_fresh_switched_baud_response" in share
     assert "admit_s19k_init_bm1366_omits_esp_a4" in share
     assert "s19k_fill_job_byte_or_small_core" in share
     assert "s19k_fill_lookup_tx" in share
@@ -6818,10 +7649,14 @@ def main() -> int:
     assert "admit_s19k_uart_queue_covers_fill_slots" in share
     assert "refuse_s19k_uart_queue16_as_fill_depth" in share
     assert "admit_s19k_production_bm1366_queue_covers_fill_slots" in share
+    assert "S19K_BM1366_HOLD_QUEUE_DEPTH: usize = 4" in share
+    assert "admit_s19k_bm1366_hold_queue_uart_paced" in share
+    assert "refuse_s19k_live408_256_drop_oldest_as_hold" in share
+    assert "admit_s19k_production_bm1366_holds_before_take_dispatch" in share
     assert "admit_s19k_track1_thermal_handoff_unowned" in share
     assert "refuse_s19k_track1_handoff_as_thermal_ready" in share
     assert "admit_s19k_production_bm1366_tx_before_rx" in share
-    assert "admit_s19k_init_bm1366_requires_experimental_env" in share
+    assert "admit_s19k_init_bm1366_requires_private_owner" in share
     assert "s19k_multi_send_work_tx_required" in discover
     assert "refuse_s3_tx_as_required_send_work" in discover
     assert "admit_s19k_production_multi_send_skips_discover" in discover
@@ -6830,7 +7665,10 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "refuse_chip_heard_at_115200_as_restored_3m_work_tx" in preflight
     assert "ChipHeardAt115200 is diagnostic; refuse restored-3M work TX" in preflight
-    assert "S19kDualBaudSilence::ChipHeardAt115200 | S19kDualBaudSilence::FastUartHeardAt115200" in preflight
+    assert (
+        "S19kDualBaudSilence::ChipHeardAt115200 | S19kDualBaudSilence::FastUartHeardAt115200"
+        in preflight
+    )
     assert "admit_s19k_dual_baud_work_tx_for_path" in preflight
     assert "admit_s19k_dual_baud_work_tx_for_path" in serial
     assert "admit_s19k_production_dual_baud_admit_skips_discover" in preflight
@@ -6887,8 +7725,14 @@ def main() -> int:
     assert "admit_s19k_factory_boot_recovery_kernels_identical" in install_rs
     assert "refuse_s19k_factory_recovery_second_as_boot_second" in install_rs
     assert "refuse_s19k_factory_recovery_second_as_meson1_enc" in install_rs
-    assert "S19K_FACTORY_RECOVERY_SECOND_HEAD: [u8; 4] = [0x68, 0xCA, 0xF5, 0xA1]" in install_rs
-    assert "S19K_FACTORY_BOOT_KERNEL_HEAD: [u8; 4] = [0x30, 0x9C, 0xFC, 0x10]" in install_rs
+    assert (
+        "S19K_FACTORY_RECOVERY_SECOND_HEAD: [u8; 4] = [0x68, 0xCA, 0xF5, 0xA1]"
+        in install_rs
+    )
+    assert (
+        "S19K_FACTORY_BOOT_KERNEL_HEAD: [u8; 4] = [0x30, 0x9C, 0xFC, 0x10]"
+        in install_rs
+    )
     assert 'S19K_78_MTD3_UBI_VOL_NAME: &[u8] = b"config_data"' in install_rs
     assert "S19K_78_MTD3_VTBL_NAME_OFF: usize = 397_328" in install_rs
     assert "admit_s19k_78_mtd3_ubi_volume_name" in install_rs
@@ -6904,19 +7748,499 @@ def main() -> int:
     init_seq = (
         ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs"
     ).read_text(encoding="utf-8")
-    assert "refuse_s19k_fastuart_28_write_as_leave_115200" in init_seq
+    assert "admit_s19k_stock_fastuart_28_write_as_leave_115200" in init_seq
     assert "refuse_esp_miscctrl_default_baud_as_fastuart_28" in init_seq
     assert "ESP_BM1366_MISCCTRL_DEFAULT_BAUD_VALUE: u32 = 0x0000_7A31" in init_seq
     assert "admit_s19k_production_track1_reads_not_writes_fastuart_28" in init_seq
-    assert "send_write_reg_broadcast_bm1397plus(PUBLIC_FASTUART_REG" not in serial.split("PASSTHROUGH BM1366", 1)[1].split("} else if passthrough", 1)[0]
-    assert "s19k_multi_send_work_tx_required" in serial
+    assert "BosminerBm1366StockInitEvidenceStage" in init_seq
+    assert "BOSMINER_BM1366_STOCK_INIT_DISPATCH" in init_seq
+    assert "admit_bosminer_bm1366_stock_init_order_static" in init_seq
+    assert "refuse_bosminer_bm1366_stock_init_manifest_as_executable" in init_seq
+    assert "[0x8000_8540, 0x8000_8020, 0x8000_82AA]" in init_seq
+    assert "bosminer_bm1366_stock_reg0c_plan" in init_seq
+    assert "bosminer_bm1366_stock_finalize_plan" in init_seq
+    assert "bosminer_bm1366_stock_set_address_plan" in init_seq
+    assert "bosminer_bm1366_stock_generic_core3c_value" in init_seq
+    assert "BOSMINER_BM1366_STOCK_INIT_EXECUTION_SLOT_ORDER" in init_seq
+    assert "[0x40, 0x48, 0x28, 0x38, 0x50, 0x78, 0x30]" in init_seq
+    assert "BOSMINER_BM1366_STOCK_UART_RELAY_DESCRIPTOR_FILE_OFF" in init_seq
+    assert "AnalogMuxIoDriverAndDomainRelay" in init_seq
+    assert "BOSMINER_HASHCHAIN_START_WRAPPER_FN_VA: u64 = 0x0071_78F4" in init_seq
+    assert "BOSMINER_HASHCHAIN_START_POLL_FN_VA: u64 = 0x0071_9868" in init_seq
+    assert "BOSMINER_HASHCHAIN_START_RETRY_BUDGET: u8 = 4" in init_seq
+    assert "BOSMINER_HASHCHAIN_START_RETRY_DELAY_NS: u64 = 10_000_000_000" in init_seq
+    assert "BOSMINER_HASHCHAIN_INIT_TIMEOUT_NS: u64 = 10_000_000_000" in init_seq
+    assert "BOSMINER_BM1366_STOCK_POST_BAUD_PATH" in init_seq
+    assert "refuse_bosminer_post_baud_path_as_fresh_validation" in init_seq
+    assert "classify_s19k_post_baud_observation" in init_seq
+    assert "s19k_post_baud_work_tx_disposition" in init_seq
+    assert "admit_s19k_native_work_tx_after_post_baud" in init_seq
+    assert "FailClosedRollbackBeforeWorkTx" in init_seq
+    assert "FreshSwitchedBaudResponseAdmitted" in init_seq
+    assert "refuse_native_post_baud_pass_as_production" in init_seq
+    assert "admit_s19k_native_init_program_lacks_post_baud_response_barrier" in init_seq
+    assert "admit_s19k_production_native_transport_requires_joined_owner" in init_seq
+    assert "BOSMINER_HASHCHAIN_TERMINAL_FAILURE_CALLS" in init_seq
+    assert "BOSMINER_HASHCHAIN_START_FAILURE_POLICY" in init_seq
+    assert "BOSMINER_S19K_DEPARTURE_LIFECYCLE_CAPTURE" in init_seq
+    assert "BOSMINER_HASHCHAIN_FAN_READY_SNAPSHOT_FN_VA" in init_seq
+    assert "BOSMINER_HASHCHAIN_FAN_READY_SNAPSHOT_STATUS_BYTE_OFFSET: u16 = 0x016C" in init_seq
+    assert "BOSMINER_HASHCHAIN_FAN_PENDING_WAIT_NS: u64 = 1_000_000_000" in init_seq
+    assert "BOSMINER_HASHCHAIN_PLATFORM_ORDER" in init_seq
+    assert "FanReadinessGateOneSecondPendingCadence" in init_seq
+    assert "BOSMINER_AM3_AML_PLATFORM_CODE: u8 = 3" in init_seq
+    assert "BOSMINER_AM3_AML_FILTERED_BUILDERS" in init_seq
+    assert "BOSMINER_S19K_NOPIC_CANDIDATE_INDEX: u8 = 8" in init_seq
+    assert "Antminer S19K Pro NoPic" in init_seq
+    assert "BHB56902" in init_seq
+    assert "admit_bosminer_s19k_platform_resolution_static" in init_seq
+    assert "BOSMINER_CHAIN_DESCRIPTOR_ARC_EVIDENCE" in init_seq
+    assert "BOSMINER_CHAIN_DESCRIPTOR_ARC_LINEAGE_PINS" in init_seq
+    assert "BOSMINER_LIVE_CHAIN_PAYLOAD_TYPE_PINS" in init_seq
+    assert "RawRecordOwnsLiveHashchainManagerDispatchPairIsPrestaged" in init_seq
+    assert 'BOSMINER_LIVE_CHAIN_PAYLOAD_TYPE_NAME: &str = "HashchainManager"' in init_seq
+    assert "BOSMINER_LIVE_CHAIN_PAYLOAD_TYPE_VTABLE_VA: u64 = 0x019F_B178" in init_seq
+    assert "tuner_object_bytes: BOSMINER_TUNER_OBJECT_BYTES" in init_seq
+    assert "descriptor_arc_offset: BOSMINER_CHAIN_DESCRIPTOR_ARC_OFFSET" in init_seq
+    assert "source_owner_offset: BOSMINER_TUNER_SOURCE_OWNER_OFFSET" in init_seq
+    assert "source_arc_vec_data_offset: BOSMINER_SOURCE_ARC_VEC_DATA_OFFSET" in init_seq
+    assert "source_arc_companion_offset: BOSMINER_SOURCE_ARC_COMPANION_OFFSET" in init_seq
+    assert "descriptor_build_fn_va: BOSMINER_CHAIN_DESCRIPTOR_BUILD_FN_VA" in init_seq
+    assert "derived_vec_data_offset: BOSMINER_TUNER_DERIVED_DESCRIPTOR_VEC_DATA_OFFSET" in init_seq
+    assert "callback_fn_va: BOSMINER_TUNER_CHAIN_CALLBACK_FN_VA" in init_seq
+    assert "concrete_arc_allocation_bytes: Some(BOSMINER_LIVE_CHAIN_ARC_ALLOCATION_BYTES)" in init_seq
+    assert "concrete_arc_payload_bytes: Some(BOSMINER_LIVE_CHAIN_ARC_PAYLOAD_BYTES)" in init_seq
+    assert "concrete_arc_payload_type_name: Some(BOSMINER_LIVE_CHAIN_PAYLOAD_TYPE_NAME)" in init_seq
+    assert "admit_bosminer_chain_descriptor_arc_lineage_static" in init_seq
+    assert "BOSMINER_HASHCHAIN_LIFECYCLE_RECEIVER_EVIDENCE" in init_seq
+    assert "BOSMINER_HASHCHAIN_LIFECYCLE_RECEIVER_LINEAGE_PINS" in init_seq
+    assert (
+        "PayloadPrestageProviderCandidatesLineageResolvedRuntimeSelectionBytesAndFinalMethodRemainDynamic"
+        in init_seq
+    )
+    assert "raw_record_arc_offset: 0x0510" in init_seq
+    assert "arc_allocation_bytes: 0x0570" in init_seq
+    assert "arc_payload_bytes: 0x0560" in init_seq
+    assert 'arc_payload_type_name: "HashchainManager"' in init_seq
+    assert "item_triggered_listener_offset: 0x30" in init_seq
+    assert "item_payload_offset: 0x0060" in init_seq
+    assert 'listener_type_name: "triggered::Listener"' in init_seq
+    assert "listener_clone_fn_va: 0x00BB_D3DC" in init_seq
+    assert "listener_next_id_offset: 0x48" in init_seq
+    assert "outer_cloned_listener_offset: 0x03D0" in init_seq
+    assert "state_listener_input_offset: 0x0360" in init_seq
+    assert "state_payload_input_offset: 0x0388" in init_seq
+    assert "state_reused_listener_self_slot_offset: 0x03A0" in init_seq
+    assert "state_dispatch_self_slot_offset: 0x03B8" in init_seq
+    assert "stack_listener_inner_offset: 0x48" in init_seq
+    assert "payload_hook_trait_data_offset: 0x0230" in init_seq
+    assert "payload_hook_trait_vtable_offset: 0x0238" in init_seq
+    assert "payload_hook_method_slot: 0x18" in init_seq
+    assert "payload_hook_dispatch_va: 0x0071_A51C" in init_seq
+    assert "payload_hook_method_vas: [0x0070_539C, 0x0070_57FC]" in init_seq
+    assert "payload_hook_is_noop: true" in init_seq
+    assert "prestage_vec_source_offset: 0x10" in init_seq
+    assert "prestage_vec_clone_fn_va: 0x012D_276C" in init_seq
+    assert "prestaged_data_offset: 0x0538" in init_seq
+    assert "stack_prestaged_data_offset: 0x0B10" in init_seq
+    assert "stack_prestaged_dispatch_table_offset: 0x0B18" in init_seq
+    assert "stack_listener_inner_overwrite_va: 0x0071_A528" in init_seq
+    assert "local_object_prefix_copy_bytes: 0x01E0" in init_seq
+    assert "local_object_trait_data_offset: 0x0210" in init_seq
+    assert "local_object_dispatch_table_offset: 0x0218" in init_seq
+    assert "concrete_dispatch_data: None" in init_seq
+    assert "concrete_dispatch_table_va: None" in init_seq
+    assert "concrete_method_va: None" in init_seq
+    assert "admit_bosminer_hashchain_lifecycle_receiver_lineage_static" in init_seq
+    assert "BOSMINER_CLONED_TABLE_TWO_SLOT_SEQUENCE_EVIDENCE" in init_seq
+    assert "BOSMINER_CLONED_TABLE_TWO_SLOT_SEQUENCE_PINS" in init_seq
+    assert "admit_bosminer_cloned_table_two_slot_sequence_static" in init_seq
+    assert "refuse_bosminer_cloned_table_slot_0x28_as_terminal_dispatch" in init_seq
+    assert "refuse_bosminer_cloned_table_slot_0x50_as_same_pair" in init_seq
+    assert "refuse_bosminer_cloned_table_slot_0x20_as_cloned_p10_table" in init_seq
+    assert "slot: 0x48" in init_seq
+    assert "fail_imm: 5" in init_seq
+    assert "refused_slot_0x50_source_offset: 0x03C0" in init_seq
+    assert "distinct_pair_table_offset: 0x0228" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_PRODUCER_EVIDENCE" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_PRODUCER_LINEAGE_PINS" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_CODE3_CANDIDATE_PINS" in init_seq
+    assert "BOSMINER_PRESTAGE_VEC_BOUNDARY_PINS" in init_seq
+    assert (
+        "Code3FirstSuccessProviderCandidatesAndPrestageLineageResolvedRuntimeSelectionBytesAndFinalMethodRemainDynamic"
+        in init_seq
+    )
+    assert "NoOpRetainsPrestagedPair" in init_seq
+    assert "BOSMINER_ANTMINER_BUILDER_VTABLE_VA: u64 = 0x019A_C828" in init_seq
+    assert "BOSMINER_ANTMINER_PROVIDER_VTABLE_VA: u64 = 0x019A_C978" in init_seq
+    assert "BOSMINER_BRAIINS_FIXTURE_PROVIDER_VTABLE_VA: u64 = 0x019A_C9B8" in init_seq
+    assert "BOSMINER_ANTMINER_LIFECYCLE_HOOK_METHOD_VA: u64 = 0x0070_539C" in init_seq
+    assert "BOSMINER_BRAIINS_FIXTURE_LIFECYCLE_HOOK_METHOD_VA: u64 = 0x0070_57FC" in init_seq
+    assert "BOSMINER_ANTMINER_CANDIDATE_VALIDATE_METHOD_VA: u64 = 0x0070_A82C" in init_seq
+    assert "BOSMINER_BRAIINS_FIXTURE_CANDIDATE_VALIDATE_METHOD_VA: u64 = 0x0070_A824" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_REGISTRY_SELECT_FN_VA: u64 = 0x0079_4C48" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_REGISTRY_ENTRY_METHOD_SLOT: u8 = 0x30" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_SELECTED_PAIR_OFFSETS: [u16; 2] = [0x0450, 0x0458]" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_CHILD_METHOD_SLOT: u8 = 0x20" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_MATERIALIZE_FN_VA: u64 = 0x00B2_58B8" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_PREFIX_COPY_BYTES: u16 = 0x0660" in init_seq
+    assert (
+        "BOSMINER_PRESTAGE_REFUTED_RUNTIME_OBJECT_STATE_OFFSET: u16 = 0x2940"
+        in init_seq
+    )
+    assert (
+        "BOSMINER_PRESTAGE_REFUTED_RUNTIME_OBJECT_TAIL_OFFSETS: [u8; 2] = [0x50, 0x58]"
+        in init_seq
+    )
+    assert "BOSMINER_PRESTAGE_REFUTED_ROTATED_TAIL_OFFSET: u8 = 0x50" in init_seq
+    assert "BOSMINER_PRESTAGE_B90C_ENTRY_PREFIX_OFFSET: u8 = 0x60" in init_seq
+    assert "BOSMINER_PRESTAGE_B90C_ENTRY_VEC_OFFSET: u8 = 0x70" in init_seq
+    assert (
+        "BOSMINER_PRESTAGE_B90C_SNAPSHOT_PREFIX_OFFSET: u16 = 0x0730"
+        in init_seq
+    )
+    assert "BOSMINER_PRESTAGE_B90C_OWNED_PREFIX_OFFSET: u16 = 0x0E10" in init_seq
+    assert "BOSMINER_PRESTAGE_B879_INPUT_PREFIX_OFFSET: u8 = 0x00" in init_seq
+    assert (
+        "BOSMINER_PRESTAGE_B879_SNAPSHOT_PREFIX_OFFSET: u16 = 0x06E0"
+        in init_seq
+    )
+    assert (
+        "BOSMINER_PRESTAGE_B879_CLONE_STACK_OFFSET: u16 = 0x0BF0"
+        in init_seq
+    )
+    assert (
+        "BOSMINER_PRESTAGE_B879_CLONE_FORWARD_CAP_DATA_STACK_OFFSET: u16 = 0x0BD0"
+        in init_seq
+    )
+    assert (
+        "BOSMINER_PRESTAGE_B879_CLONE_FORWARD_LEN_STACK_OFFSET: u16 = 0x0BE0"
+        in init_seq
+    )
+    assert (
+        "BOSMINER_PRESTAGE_B879_CLONE_LATER_OVERWRITE_FN_VA: u64 = 0x00B6_00A4"
+        in init_seq
+    )
+    assert "BOSMINER_PRESTAGE_PAYLOAD_PREFIX_SOURCE_STACK_OFFSET: u16 = 0x0A20" in init_seq
+    assert (
+        "BOSMINER_PRESTAGE_PAYLOAD_VEC_STACK_OFFSETS: [u16; 3] = [0x0A30, 0x0A38, 0x0A40]"
+        in init_seq
+    )
+    assert "BOSMINER_PRESTAGE_PAYLOAD_PREFIX_STAGING_STACK_OFFSET: u16 = 0x0C10" in init_seq
+    assert "BOSMINER_PRESTAGE_PAYLOAD_PREFIX_STAGING_BYTES: u16 = 0x0190" in init_seq
+    assert "BOSMINER_PRESTAGE_PAYLOAD_PREFIX_CONSTRUCTOR_ARG_INDEX: u8 = 7" in init_seq
+    assert "BOSMINER_PRESTAGE_B90C_CLONE_REACHES_PAYLOAD_PREFIX: bool = true" in init_seq
+    assert (
+        "BOSMINER_PRESTAGE_PROVIDER_PAIR_STATE_OFFSETS: [u16; 2] = [0x04B0, 0x04B8]"
+        in init_seq
+    )
+    assert "BOSMINER_PRESTAGE_PROVIDER_METHOD_SLOT: u8 = 0x18" in init_seq
+    assert "BOSMINER_PRESTAGE_PROVIDER_PRESERVED_DATA_STATE_OFFSET: u16 = 0x0EA8" in init_seq
+    assert "BOSMINER_PRESTAGE_PROVIDER_DATA_CLONE_FN_VA: u64 = 0x0046_8B24" in init_seq
+    assert "BOSMINER_PRESTAGE_PROVIDER_PREFIX_CLONE_FN_VA: u64 = 0x0046_85AC" in init_seq
+    assert "BOSMINER_PRESTAGE_PROVIDER_VEC_OFFSET: u8 = 0x10" in init_seq
+    assert "BOSMINER_PRESTAGE_MATERIALIZER_INPUT_PREFIX_BYTES: u16 = 0x02A0" in init_seq
+    assert "BOSMINER_PRESTAGE_MATERIALIZED_PREFIX_BYTES: u16 = 0x0660" in init_seq
+    assert "BOSMINER_HASHCHAIN_MANAGER_VEC_OFFSETS: [u8; 3] = [0x10, 0x18, 0x20]" in init_seq
+    assert "BOSMINER_HASHCHAIN_MANAGER_DROP_FN_VA: u64 = 0x00B7_5924" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_LISTENER_DISPATCH_VA: u64 = 0x00B8_7AE4" in init_seq
+    assert "BOSMINER_PAYLOAD_HOOK_CANDIDATE_VALIDATE_DISPATCH_VA: u64 = 0x00B8_96F4" in init_seq
+    assert "admit_bosminer_payload_hook_producer_lineage_static" in init_seq
+    assert (
+        "refuse_bosminer_hashchain_lifecycle_receiver_as_concrete_gpio_authority"
+        in init_seq
+    )
+    assert "BOSMINER_FAN_STATUS_FIELDS" in init_seq
+    assert "required_fans_above_min_speed" in init_seq
+    assert "BOSMINER_FAN_STATUS_SERIALIZER_PINS" in init_seq
+    assert "BOSMINER_S19K_DEPARTURE_FAN_POLICY" in init_seq
+    assert "resolved_config_observations: 8" in init_seq
+    assert "min_fans: 0" in init_seq
+    assert "min_fan_rpm: 2_000" in init_seq
+    assert "power_enable_to_reset" in init_seq
+    assert "admit_bosminer_hashchain_lifecycle_static" in init_seq
+    assert "admit_bosminer_fan_status_schema_static" in init_seq
+    assert "refuse_bosminer_stock_lifecycle_as_safeoff_proof" in init_seq
+    assert "refuse_bosminer_s19k_fan_gate_as_positive_cooling_proof" in init_seq
+    assert "refuse_bosminer_telemetry_cadence_as_retry_delay" in init_seq
+    init_order_tool = ROOT / "scripts/s19k_verify_bosminer_bm1366_init_order.py"
+    init_order_source = init_order_tool.read_text(encoding="utf-8")
+    assert "EXPECTED_SHA256" in init_order_source
+    assert "native cold-init execution remains refused" in init_order_source
+    init_order_spec = importlib.util.spec_from_file_location(
+        "s19k_verify_bosminer_bm1366_init_order", init_order_tool
+    )
+    assert init_order_spec is not None and init_order_spec.loader is not None
+    init_order_mod = importlib.util.module_from_spec(init_order_spec)
+    sys.modules[init_order_spec.name] = init_order_mod
+    init_order_spec.loader.exec_module(init_order_mod)
+    held_bosminer = (
+        ROOT.parent.parent
+        / ""
+    )
+    if held_bosminer.is_file():
+        init_order_lines = init_order_mod.verify(held_bosminer)
+        assert any("slot=0x40" in line for line in init_order_lines)
+        assert any("slot=0x28" in line for line in init_order_lines)
+        assert any("reg0c=index0:0x80000000" in line for line in init_order_lines)
+        assert any("UartRelay:pairs-domain10..0" in line for line in init_order_lines)
+        assert any(
+            "EXECUTION_ORDER +0x40->+0x48->+0x28->+0x38->+0x50->+0x78->+0x30" in line
+            for line in init_order_lines
+        )
+        assert any("inactive=3x/300000000ns" in line for line in init_order_lines)
+        assert any(
+            "ASIC FastUART broadcast -> host baud switch" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "POST_BAUD_VALIDATION stock=none-dedicated" in line
+            and "DCENT=fresh-response-required" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "LIFECYCLE retry-budget=4 inter-attempt=10000000000ns init-timeout=10000000000ns"
+            in line
+            and "fan-pending-cadence=1000000000ns" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "PLATFORM_ORDER observed-PSU-enable -> exact-reset-dispatch" in line
+            and "exact-fan-ready-gate/1s-pending-recheck -> Fans-OK" in line
+            and "exact-init-dispatch/10s-timeout" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "PLATFORM_RESOLUTION runtime=am3-aml/code3" in line
+            and "builders=[Antminer@vtable0x019ac828,Braiins Fixture@vtable0x019ac880]" in line
+            and "first-success-runtime-dependent" in line
+            and "Antminer-inventory-candidate[8]=Antminer S19K Pro NoPic/BHB56902" in line
+            and "Fixture-provider-vtable0x019ac9b8" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "CHAIN_DESCRIPTOR_ARC source=owner@tuner+0x950" in line
+            and "Arc-Vec@+0x6a8/+0x6b0" in line
+            and "builder=FUN_007e9c24" in line
+            and "A+0x568-enabled/A+0x558-companion" in line
+            and "descriptor=0x38/Arc@+0x20/+0x28" in line
+            and "primary-Vec@+0x7b8/+0x7c0/+0x7c8" in line
+            and "derived-Vec@+0x7d0/+0x7d8/+0x7e0" in line
+            and "callback=+0x978/FUN_0070a168@0x00662554/x0-Vec" in line
+            and "raw+0x510/+0x518=A/+0x558" in line
+            and "live-Arc=0x570/align0x10/header0x10/payload0x560" in line
+            and "payload-type=HashchainManager/vtable0x019fb178" in line
+            and "constructor=FUN_00b5c168/prefix-copy=0x1f0" in line
+            and "lifecycle-provider-candidates=[Antminer@0x019ac978,Braiins Fixture@0x019ac9b8]" in line
+            and "hook+0x18=[FUN_0070539c,FUN_007057fc]-both-no-op" in line
+            and "runtime-winner/prestaged-dispatch-table=dynamic" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "LIFECYCLE_RECEIVER raw-record=0x570/separate-Arc@+0x510" in line
+            and "live-Arc=0x570/align0x10/payload=P=A+0x10" in line
+            and "item-lanes=triggered::Listener@+0x30/P@+0x60" in line
+            and "Listener clone=FUN_00bbd3dc" in line
+            and "Listener.inner saved@sp+0x48/consumed@0x0071a2d8" in line
+            and "prestage=FUN_012d276c(clone-P+0x10-Vec)/data=P+0x538" in line
+            and "B90c lane=entry+0x70/prefix+0x60/snapshot+0x730/owned+0xe10" in line
+            and "b879-input+0x00/snapshot+0x6e0/clone+0x10" in line
+            and "forward-cap/data@sp+0xbd0,len@sp+0xbe0" in line
+            and "manager-prefix-Vec@sp+0xa30/+0xa38/+0xa40-before-later-overwrite" in line
+            and "prefix=sp+0xa20 -> sp+0xc10/0x190 -> constructor-x7" in line
+            and "P+0x10/+0x18/+0x20" in line
+            and "pair@sp+0xb10/+0xb18" in line
+            and "provider-vtables=[0x019ac978,0x019ac9b8] slot+0x18@0x0071a51c" in line
+            and "[FUN_0070539c,FUN_007057fc](both-no-op)" in line
+            and "sp+0x48-overwrite@0x0071a528 -> local+0x210/+0x218" in line
+            and "+0x3a0 overwritten with local self@0x0071ab58" in line
+            and "prestaged-table slot+0x28@0x0071b098 then same-pair slot+0x48@0x0071b128" in line
+            and "slot+0x50=LDP-from-overwritten+0x3c0-not-cloned-pair" in line
+            and "slot+0x20=distinct-local+0x220/+0x228" in line
+            and "P lane=outer+0x50/+0x3f8/nested+0x388/+0x370" in line
+            and "P+0x1c0-dispatch-join=refuted" in line
+            and "builder-vtables=[0x019ac828,0x019ac880]/runtime-winner=dynamic" in line
+            and "P+0x10-provider-lineage=resolved/runtime-bytes+final-method=dynamic" in line
+            and "initial-payload+0x200=Vec-metadata" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "PAYLOAD_HOOK_PRODUCER registry=FUN_00794c48" in line
+            and "entry0x10/slot+0x30" in line
+            and "calls=[0x00471804,0x004c1fc8,0x004ef814]" in line
+            and "selected@parent+0x450/+0x458 -> FUN_005614c0" in line
+            and "child=parent+0xd40/capture+0x4b0/+0x4b8" in line
+            and "slot+0x20@[0x0047ab50,0x004cb318,0x004f8b64]" in line
+            and "provider-pair+0x4b0/+0x4b8 slot+0x18" in line
+            and "provider-data@state+0xea8" in line
+            and "FUN_00468b24/FUN_004685ac clone-provider-data-Vec+0x10" in line
+            and "FUN_00b258b8 input-prefix0x2a0 -> materialized-prefix0x660" in line
+            and "state+0xf10/+0x1570/+0x1be0/+0x2240" in line
+            and "runtime-object-footer-separate" in line
+            and "B90c entry+0x70/prefix+0x60" in line
+            and "snapshot+0x730/owned+0xe10" in line
+            and "FUN_00b87980 input+0x00/snapshot+0x6e0/clone+0x10" in line
+            and "sp+0xbf0 -> forwarded-to-prefix-Vec" in line
+            and "constructor-x7 -> HashchainManager-P+0x10" in line
+            and "materialized+0x4c0/+0x4c8" in line
+            and "working+0xba0/+0xba8 slot+0x18@0x00b87ae4" in line
+            and "selected+0xe20/+0xe28 slot+0x28@0x00b896f4" in line
+            and "HashchainManager-P+0x230/+0x238" in line
+            and "code3-builder-vtables=[0x019ac828,0x019ac880]" in line
+            and "provider-vtables=[0x019ac978,0x019ac9b8]" in line
+            and "validators=[FUN_0070a82c,FUN_0070a824]" in line
+            and "child-methods=[FUN_007053a0,FUN_00705800]" in line
+            and "child-results=[0x340@0x019ace50,0x300@0x019ace70]" in line
+            and "hook+0x18=[FUN_0070539c,FUN_007057fc](both-no-op)/runtime-winner=dynamic" in line
+            and "prestaged={data:P+0x538,table:clone(P+0x10).data}" in line
+            and "P+0x10-provider-lineage=resolved/runtime-table+concrete-slot-methods=dynamic" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "CLONED_TABLE_DISPATCH pair=+0x210/+0x218 slot+0x28@0x0071b098" in line
+            and "slot+0x48@0x0071b128" in line
+            and "fail-imm=4 then" in line
+            and "fail-imm=5" in line
+            and "slot+0x50=LDP-from-overwritten+0x3c0-refused" in line
+            and "slot+0x20=distinct-+0x220/+0x228-refused-as-P+0x10" in line
+            and "concrete-method=None" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "FAN_STATUS schema=num_fans_at_ok_speed:u64@0x00" in line
+            and "required_fans_above_min_speed:bool@0x11" in line
+            and "gate-watch-byte=+0x16c/unjoined" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "FAN_POLICY observed-configs=8 fixed-speed=100 min-fans=0" in line
+            and "min-rpm=2000 rpm-epsilon=600" in line
+            and "max-fans=4 start-cooldown=100" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "FAN_GATE_AUTHORITY refused=min-fans-zero/no-positive-fan-proof" in line
+            and "independent-positive-count+fresh-per-channel-RPM/tach-required" in line
+            and "tach-motion-is-not-physical-airflow-rate-proof" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "CAPTURE_OBSERVED complete-dual-cycles=8 chain3-partial=1 per-chain-success=17"
+            in line
+            and "power-enable-to-reset=2060449..2071063us" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "FAILURE_POLICY retry=wait10s->new-inner-reset" in line
+            and "terminal-wrapper=retained-error/no-BLR/no-local-reset-or-APW" in line
+            for line in init_order_lines
+        )
+        assert any("telemetry-1s-is-not-retry" in line for line in init_order_lines)
+        assert any(
+            "reset lineage is not GPIO/electrical authority" in line
+            for line in init_order_lines
+        )
+        assert any(
+            "stock lifecycle is not SafeOff proof" in line for line in init_order_lines
+        )
+        assert init_order_lines[-1].endswith(
+            "native cold-init execution remains refused"
+        )
+    apw_stock = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_apw121215f_stock.rs"
+    ).read_text(encoding="utf-8")
+    assert (
+        "S19K_APW121215F_REPORTED_VERSION_BYTES: [u8; 3] = [0x75, 0x76, 0x77]"
+        in apw_stock
+    )
+    assert "S19K_APW121215F_TRAIT_ALLOC_FN_VA" in apw_stock
+    assert "BOSMINER_PSU_SERVICE_ASYNC_STATE_MACHINE_FN_VA" in apw_stock
+    assert "S19K_STOCK_PSU_ENABLE_DISPATCH" in apw_stock
+    assert "StockPsuEnableDispatchStep::InvokePsuTraitSlot(0x20)" in apw_stock
+    assert "refuse_stock_psu_enable_dispatch_as_electrical_rail_proof" in apw_stock
+    assert (
+        "refuse_stock_psu_enable_and_hashboard_reset_as_one_static_transaction"
+        in apw_stock
+    )
+    assert "S19K_STOCK_APW_DISABLE_SEQUENCE" in apw_stock
+    assert "StockApwLifecycleStep::AwaitI2cWorkerBarrier" in apw_stock
+    assert "StockApwDisableWorkerStep::AcknowledgeWithoutApwBackendCall" in apw_stock
+    assert "S19K_STOCK_APW_DISABLE_WORKER_MESSAGE_TAG: u8 = 3" in apw_stock
+    assert "S19K_STOCK_APW_I2C_WORKER_TAG3_HANDLER_VA" in apw_stock
+    assert "StockApwLifecycleStep::WritePsuControlOutput(true)" in apw_stock
+    assert "S19K_STOCK_PSU_CONTROL_INITIAL_STATE: bool = true" in apw_stock
+    assert "S19K_STOCK_SYSFS_PIN_OUT_WRITE_FN_VA" in apw_stock
+    assert "S19K_STOCK_APW_WORD_CHECKSUM_MODE: u8 = 1" in apw_stock
+    assert "s19k_stock_apw_wire_checksum" in apw_stock
+    assert "S19K_STOCK_APW_SET_VOLTAGE_POLICY" in apw_stock
+    assert "write_to_read_delay_ms: 350" in apw_stock
+    assert "retry_count: 3" in apw_stock
+    assert "retry_delay_s: 2" in apw_stock
+    assert "classify_s19k_rail_cut" in apw_stock
+    assert "admit_s19k_terminal_safeoff_evidence" in apw_stock
+    assert "MissingIndependentRailOrCurrentDecay" in apw_stock
+    assert "pub mod s19k_apw121215f_stock;" in (
+        ROOT / "dcentrald/dcentrald-common/src/lib.rs"
+    ).read_text(encoding="utf-8")
+    apw_tool = ROOT / "scripts/s19k_verify_bosminer_apw121215f.py"
+    apw_tool_source = apw_tool.read_text(encoding="utf-8")
+    assert "EXPECTED_SHA256" in apw_tool_source
+    assert "stock disable is not VerifiedRailCut" in apw_tool_source
+    apw_spec = importlib.util.spec_from_file_location(
+        "s19k_verify_bosminer_apw121215f", apw_tool
+    )
+    assert apw_spec is not None and apw_spec.loader is not None
+    apw_mod = importlib.util.module_from_spec(apw_spec)
+    sys.modules[apw_spec.name] = apw_mod
+    apw_spec.loader.exec_module(apw_mod)
+    if held_bosminer.is_file():
+        apw_lines = apw_mod.verify(held_bosminer)
+        assert any("reported-versions=0x75,0x76,0x77" in line for line in apw_lines)
+        assert len(apw_mod.INSTRUCTION_PINS) == 114
+        assert any("compatibility-discriminator=4" in line for line in apw_lines)
+        assert any(
+            "PSU_ENABLE_DISPATCH state-machine=0x00b8be50" in line
+            and "trait-slot=+0x20" in line
+            for line in apw_lines
+        )
+        assert any(
+            "allocator=0x0090dfc0 -> vtable=0x019c8e78" in line
+            and "slot+0x20=0x0090fcc8/poll=0x0090fd70" in line
+            for line in apw_lines
+        )
+        assert any("PSU_CONTROL open-PinOut(initial=1)" in line for line in apw_lines)
+        assert any("enqueue-worker-tag=3" in line for line in apw_lines)
+        assert any("await-worker-ack" in line for line in apw_lines)
+        assert any("no-APW-backend-call" in line for line in apw_lines)
+        assert any("worker-continues" in line for line in apw_lines)
+        assert any("write-logical-1" in line for line in apw_lines)
+        assert any("mode=1 little-endian-word-additive" in line for line in apw_lines)
+        assert any("other-modes byte-additive" in line for line in apw_lines)
+        assert any("write-to-read=350ms" in line for line in apw_lines)
+        assert any("maximum-attempts=4" in line for line in apw_lines)
+        assert any(
+            "static=separate-exact-futures/no-single-recovered-transaction" in line
+            for line in apw_lines
+        )
+        assert any(
+            "controller-dispatch+logical-GPIO-write-is-not-voltage-rise" in line
+            for line in apw_lines
+        )
+        assert apw_lines[-1].endswith("stock disable is not VerifiedRailCut")
+    assert (
+        "send_write_reg_broadcast_bm1397plus(PUBLIC_FASTUART_REG"
+        not in serial.split("PASSTHROUGH BM1366", 1)[1].split(
+            "} else if passthrough", 1
+        )[0]
+    )
+    assert "s19k_work_tx_required_after_enum" in serial
     send_i = serial.find("impl SerialWorkTransport")
     assert send_i != -1
     send_win = serial[send_i : send_i + 1800]
-    assert "s19k_multi_send_work_tx_required" in send_win
+    assert "multi.tx_required.iter()" in send_win
     assert "admit_s19k_multi_send_work" in send_win
-    assert "refuse_s3_rx_as_fill_hunt" in serial
-    assert "S19k discover UART RX is observe-only; not fill-hunted" in serial
+    assert "admit_s19k_fill_hunt_on_tx_path" in serial
+    assert "did not receive work" in serial
     discover_rs = (
         ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs"
     ).read_text(encoding="utf-8")
@@ -6924,12 +8248,32 @@ def main() -> int:
     assert "admit_s19k_production_fill_hunt_skips_discover" in discover_rs
     assert "ThermalSafetyState::HandoffUnowned" in serial
     assert "thermal HandoffUnowned (not Ready)" in serial
+    assert "s19k_track1_thermal" in serial
+    assert "GPIO437 not written" in serial
+    assert "spawn_track1_temps" in serial
+    assert "hold_track1_leftover_fans_pwm100" in serial
+    assert "admit_s19k_track1_thermal_ready" in share
+    assert "admit_s19k_production_construction_serial_work" in share
+    assert "S19K_TRACK1_LEFTOVER_FAN_PWM" in share
+    board_desc_rs = (ROOT / "dcentrald/dcentrald-common/src/board_desc.rs").read_text(
+        encoding="utf-8"
+    )
+    s19k_fn = board_desc_rs.find("pub const fn am3_s19kpro()")
+    assert s19k_fn != -1
+    s19k_win = board_desc_rs[s19k_fn : s19k_fn + 900]
+    assert "WorkEngineKind::SerialWork" in s19k_win
+    assert "LifecycleLane::AmlogicNativeSerial" in s19k_win
+    assert (
+        "native BM1366 transport is absent and production construction refuses"
+        not in s19k_win
+    )
     proof_i = serial.find("let thermal_proof_present =")
     assert proof_i != -1
     proof_win = serial[proof_i : serial.find(";", proof_i) + 1]
     assert "braiins_bm1366_passthrough_handoff" not in proof_win
     assert "let tx_before_rx = is_bm1362 || is_bm1366" in serial
-    assert "DCENT_S19K_EXPERIMENTAL_INIT_BM1366" in serial
+    assert "DCENT_S19K_NATIVE_COLD_START" in serial
+    assert 'matches!(raw, Some("1"))' in serial
     assert "BM1366_SERIAL_WORK_QUEUE_DEPTH" in serial
     depth_i = serial.find("let work_queue_depth = if is_bm1362")
     assert depth_i != -1
@@ -6938,7 +8282,53 @@ def main() -> int:
     assert "BM1366_SERIAL_WORK_QUEUE_DEPTH" in depth_win
     assert "admit_s19k_production_run_skips_init_bm1366_chain" in share
     assert "admit_s19k_nopic_observation_refuses_bm1366" in share
-    assert "admit_s19k_hotstart_baud_requires_body9_before_spray" in share
+    assert "admit_s19k_native_multi_uart_route_is_fenced" in share
+    assert "admit_s19k_native_aggregate_platform_admission" in share
+    aggregate_hal = (
+        ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
+    ).read_text(encoding="utf-8")
+    assert "S19K_NATIVE_LOGICAL_CHAIN_ROUTES" in aggregate_hal
+    assert 'uart: "/dev/ttyS3"' in aggregate_hal
+    assert "logical_chain: 0" in aggregate_hal
+    assert "reset_gpio: 454" in aggregate_hal
+    aggregate_i = aggregate_hal.find("impl S19kNativeAggregateAdmission")
+    aggregate_end = aggregate_hal.find("impl S19kNativePopulationAdmission", aggregate_i)
+    assert aggregate_i != -1 and aggregate_end > aggregate_i
+    aggregate = aggregate_hal[aggregate_i:aggregate_end]
+    assert "validate_amlogic_boot_safe_handoff(AmlogicNoPicProfile::S19k)" in aggregate
+    assert "let populated_slots = read_plug_topology_checked()?" in aggregate
+    assert "populated_slots[*index] && !uart_available[*index]" in aggregate
+    assert "let routes = self.logical_chain_routes()" in aggregate
+    assert "service.psu_enable_operation_available = false" in aggregate
+    assert "service.psu_enable_operation_available = true" not in aggregate
+    assert "take_psu_enable_operation" not in aggregate
+    assert "Result<Arc<S19kNativeFanObservation>>" in aggregate
+    assert "Result<Arc<dyn FanAccess>>" not in aggregate
+    observer_i = aggregate_hal.find("impl S19kNativeFanObservation")
+    observer_end = aggregate_hal.find("pub struct S19kNativeAggregateAdmission", observer_i)
+    assert observer_i != -1 and observer_end > observer_i
+    observer = aggregate_hal[observer_i:observer_end]
+    assert "pub fn get_per_fan_rpm" in observer
+    assert "pub fn get_speed_pwm" in observer
+    assert "pub fn set_speed" not in observer
+    assert "impl FanAccess" not in observer
+    assert "set_amlogic_board_reset_checked" not in aggregate
+    mapped_i = aggregate_end
+    mapped_end = aggregate_hal.find("fn amlogic_slot_from_serial_device", mapped_i)
+    assert mapped_i != -1 and mapped_end > mapped_i
+    mapped = aggregate_hal[mapped_i:mapped_end]
+    assert "service.psu_enable_operation_available = true" in mapped
+    assert "Result<Arc<dyn FanAccess>>" in mapped
+    assert "Arc::ptr_eq(power_generation, &self.generation)" in mapped
+    assert "assert_s19k_native_all_resets_checked()" in mapped
+    assert "release_mapped_resets_checked" in mapped
+    native_shape = serial[
+        serial.find("fn admit_s19k_native_multi_uart_shape") : serial.find(
+            "mod serial_route_domains",
+            serial.find("fn admit_s19k_native_multi_uart_shape"),
+        )
+    ]
+    assert "S19K_NATIVE_LOGICAL_CHAIN_ROUTES.as_slice()" in native_shape
     assert "refuse_s19k_nopic_probe_as_track1_first_read" in share
     assert "admit_s19k_am2_hybrid_reset_is_not_bm1366" in share
     assert "refuse_s19k_am2_hybrid_open_as_track1_first_read" in share
@@ -6976,8 +8366,44 @@ def main() -> int:
     init70_i = serial.find("fn init_bm1370_chain(")
     assert init66_i != -1 and init70_i != -1 and init70_i > init66_i
     init66_win = serial[init66_i:init70_i]
+    assert "serial: &ValidatedSerialBackend" in init66_win
+    assert "native_program: &S19kBm1366NativeExecutionProgram" in init66_win
+    assert "SerialChainBackend::open(" not in init66_win
+    assert "reset_asic_baud(" not in init66_win
+    assert "Bm1366EnumerationAdmission" not in init66_win
+    assert "rambo" not in init66_win
     assert "BM1366_VERSION_MASK_VALUE" not in init66_win
     assert "send_write_reg_broadcast_bm1397plus(0xA4" not in init66_win
+    assert "s19k_bm1366_native_execution_program" in init66_win
+    assert "native_program.pre_baud_commands" in init66_win
+    assert "native_program.fast_uart_command" in init66_win
+    assert "set_baud(native_program.fast_host_baud)" in init66_win
+    assert "native BM1366 post-baud anti-staleness flush failed" in init66_win
+    assert "Bm1366NativePostBaudAdmission::from_response_window" in init66_win
+    assert "native_program.post_baud_commands" in init66_win
+    assert "native_program.final_commands" in init66_win
+    assert "terminal rollback required before per-chip mutation or work TX" in init66_win
+    assert "fn init_bm1366_chains(" in init66_win
+    assert "ValidatedS19kBm1366NativeMultiBackend" in init66_win
+    assert "serial.expected_chips_per_uart() == 77" in init66_win
+    assert "for (path, backend) in serial.iter()" in init66_win
+    assert "Self::init_bm1366_chain(backend, path, &native_program)" in init66_win
+    assert "PUBLIC_FASTUART_VALUE" not in init66_win
+    asic_switch_i = init66_win.find("native_program.fast_uart_command")
+    host_switch_i = init66_win.find("set_baud(native_program.fast_host_baud)")
+    fresh_gate_i = init66_win.find("Bm1366NativePostBaudAdmission::from_response_window")
+    per_chip_i = init66_win.find("native_program.post_baud_commands")
+    assert asic_switch_i < host_switch_i < fresh_gate_i < per_chip_i
+    pre_ladder_i = init66_win.find("native_program.pre_baud_commands")
+    assert pre_ladder_i != -1
+    assert "send_get_address_bm1397plus" not in init66_win[:pre_ladder_i]
+    assert "pub struct S19kBm1366NativeExecutionProgram" in init_seq
+    assert "fastuart_stock_3m125" in init_seq
+    assert "BOSMINER_BM1366_FASTUART_3M125" in init_seq
+    assert "post_host_baud_settle_ms: 50" in init_seq
+    assert "post_baud_tail_settle_ms: 50" in init_seq
+    assert "const BM1366_REG_A8_PER_CHIP" not in serial
+    assert "const BM1366_HASH_COUNTING_S19K" not in serial
     bm1368_i = serial.find("fn init_bm1368_chain(")
     assert bm1368_i != -1
     bm1368_win = serial[bm1368_i : bm1368_i + 4000]
@@ -7074,14 +8500,15 @@ def main() -> int:
     assert "AM2 BM1362 reset-baseline" in base_win
     assert "require_bm1366_response_body" not in base_win
     assert "BM1366_UART_RESP_BODY_LEN" not in base_win
-    am3_bb = (ROOT / "dcentrald/dcentrald/src/am3_bb_mining.rs").read_text(encoding="utf-8")
+    am3_bb = (ROOT / "dcentrald/dcentrald/src/am3_bb_mining.rs").read_text(
+        encoding="utf-8"
+    )
     bb_i = am3_bb.find("impl Am3BbChainUart")
     assert bb_i != -1
     bb_win = am3_bb[bb_i : bb_i + 2500]
     assert "am3-bb: SerialChainBackend::open" in bb_win
     assert "require_bm1366_response_body" not in bb_win
     assert "open_passthrough_bm1366" not in bb_win
-    assert "hot-start baud-wake refused: BM1366 first-read must be body 9" in serial
     assert "init_bm1366_chain first-read must be body 9" in serial
     assert "require_bm1366_response_body" in serial
     assert "fn require_bm1366_response_body" in hal_crc
@@ -7097,7 +8524,10 @@ def main() -> int:
     assert "admit_s19k_production_uses_bm1366_passthrough_open" in share
     assert "admit_s19k_production_refuses_generic_passthrough_for_bm1366" in share
     assert "refuse_s19k_generic_passthrough0_as_track1" in share
-    assert "S19k BM1366 must use Track-1 multi-tty open_passthrough_bm1366, not generic open_passthrough(0)" in serial
+    assert (
+        "S19k BM1366 must use Track-1 multi-tty open_passthrough_bm1366, not generic open_passthrough(0)"
+        in serial
+    )
     assert "Some(&resp[..9])" in serial
     assert "Some(&resp[..7])" not in serial
     assert "s.set_response_len(resp_body_len)" in serial
@@ -7105,9 +8535,14 @@ def main() -> int:
     assert "SerialChainBackend::open_passthrough(i as u8, path)" not in serial
     open_i = serial.find("SerialChainBackend::open_passthrough_bm1366(i as u8, path)")
     assert open_i != -1
-    win = serial[open_i : open_i + 1800]
+    win = serial[open_i : open_i + 2800]
     assert win.find("s.set_response_len(resp_body_len)") < win.find("send_get_address")
-    hal = (ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs").read_text(encoding="utf-8")
+    assert win.find(
+        "s19k_discover_skip_rx_when_leftover_baud_not_track1_3m"
+    ) < win.find("send_get_address")
+    hal = (ROOT / "dcentrald/dcentrald-hal/src/serial_chain.rs").read_text(
+        encoding="utf-8"
+    )
     assert "fn open_passthrough_bm1366" in hal
     assert "set_response_len(BM1366_UART_RESP_BODY_LEN)" in hal
     discover = (
@@ -7141,7 +8576,7 @@ def main() -> int:
     assert "admit_s19k_production_getaddress_tx_fail_is_framing" in discover
     tx_fail = serial.find("S19k GetAddress TX failed")
     assert tx_fail != -1
-    tx_window = serial[tx_fail:tx_fail + 240]
+    tx_window = serial[tx_fail : tx_fail + 240]
     assert "S19kPortAnswer::FramingOrEcho" in tx_window
     assert "S19kPortAnswer::Silence" not in tx_window
     assert "BM1366_VERSION_ROLL_SHIFT" in share
@@ -7153,7 +8588,7 @@ def main() -> int:
     version_bits = (0x0304 << 13) & 0x1FFFE000
     assert version_bits == 0x00608000, hex(version_bits)
     assert "admit_s19k_multi_send_work" in serial
-    assert "s19k_multi_send_work_tx_required" in serial
+    assert "s19k_work_tx_required_after_enum" in serial
     assert "s19k_multi_send_work_tx_required" in discover
     assert "refuse_s3_tx_as_required_send_work" in discover
     assert "s19k_multi_rx_start" in serial
@@ -7184,11 +8619,169 @@ def main() -> int:
     assert "admit_s19k_production_bm1366_tx_min_interval" in discover
     assert "admit_s19k_tx_pace_puts_wrap5_after_t90" in discover
     assert "admit_s19k_fill_registry_is_256" in discover
+    assert "admit_s19k_live406_hung_on_ttys3_9600" in discover
+    assert "refuse_s19k_live406_as_stall_closed" in discover
+    assert "s19k_discover_skip_rx_when_leftover_baud_not_track1_3m" in discover
+    assert "admit_s19k_production_skips_discover_rx_when_leftover_not_3m" in discover
+    assert "admit_s19k_live407_dual_port_past_t90" in discover
+    assert "admit_s19k_live407_survived_paced_wrap5" in discover
+    assert "admit_s19k_live407_zero_shares" in discover
+    assert "refuse_s19k_live407_as_share_closed" in discover
+    assert "refuse_s19k_t90_only_as_production_ready" in discover
+    assert "refuse_s19k_t90_only_as_customer_writable" in discover
+    assert "admit_s19k_live408_pool_accepted_one_share" in discover
+    assert "refuse_s19k_live408_as_t90_dual_port" in discover
+    assert "refuse_s19k_live408_as_share_and_t90" in discover
+    assert "admit_s19k_live408_died_at_wrap3" in discover
+    assert "admit_s19k_tx_pace_puts_wrap3_after_t90" in discover
+    assert "S19K_LIVE408_WRAP3_TX: u32 = 768" in discover
+    assert "S19K_LIVE407_TX_MIN_INTERVAL_MS: u32 = 80" in discover
+    assert "S19K_BM1366_TX_MIN_INTERVAL_MS: u32 = 120" in discover
+    assert "admit_s19k_live409_parked_boarddesc_management_only" in discover
+    assert "refuse_s19k_live409_as_share_and_t90" in discover
+    assert "admit_s19k_production_track1_serial_not_native" in discover
+    assert "admit_s19k_live410_share_and_t90" in discover
+    assert "refuse_s19k_live410_as_production_ready" in discover
+    assert "refuse_s19k_live410_as_multi_share_closed" in discover
+    assert "refuse_s19k_live410_as_customer_writable" in discover
+    assert "admit_s19k_live411_multi_share_and_t90" in discover
+    assert "refuse_s19k_live411_as_production_ready" in discover
+    assert "refuse_s19k_live411_as_t180_soak" in discover
+    assert "refuse_s19k_t90_multi_share_as_soak" in discover
+    assert "refuse_s19k_live411_as_customer_writable" in discover
+    assert "S19K_LIVE411_SHARE1_NONCE: u32 = 0xC15A_724A" in discover
+    assert "S19K_LIVE411_S1_LAST_RX_MS: u32 = 118_283" in discover
+    assert "admit_s19k_live412_multi_share_and_t180" in discover
+    assert "admit_s19k_live412_survived_paced_wrap5" in discover
+    assert "refuse_s19k_live412_as_production_ready" in discover
+    assert "refuse_s19k_t180_tmp_as_production_ready" in discover
+    assert "refuse_s19k_live412_as_customer_writable" in discover
+    assert "S19K_LIVE412_SHARE1_NONCE: u32 = 0x4E3E_900D" in discover
+    assert "S19K_LIVE412_S1_LAST_RX_MS: u32 = 187_186" in discover
+    assert "S19K_LIVE412_S2_LAST_RX_MS: u32 = 188_012" in discover
+    assert "admit_s19k_live414_thermal_ready_and_t180" in discover
+    assert "admit_s19k_live414_died_at_wrap7" in discover
+    assert "refuse_s19k_live414_as_t600_soak" in discover
+    assert "refuse_s19k_live414_as_production_ready" in discover
+    assert "refuse_s19k_live414_as_customer_writable" in discover
+    assert "S19K_LIVE414_SHARE1_NONCE: u32 = 0xEEAB_1C38" in discover
+    assert "S19K_LIVE414_S1_LAST_RX_MS: u32 = 228_031" in discover
+    assert "S19K_LIVE414_S2_LAST_RX_MS: u32 = 213_744" in discover
+    assert "S19K_LIVE414_WRAP7_TX: u32 = 1_792" in discover
+    assert "s19k_track1_wrap_barrier_due" in discover
+    assert "admit_s19k_production_wrap_barrier" in discover
+    assert "admit_s19k_live414_wrap7_trips_barrier" in discover
+    assert "refuse_s19k_slower_tx_as_wrap7_survival" in discover
+    assert "admit_s19k_live415_died_before_wrap1" in discover
+    assert "refuse_s19k_live415_as_t600_soak" in discover
+    assert "admit_s19k_live416_died_after_wrap2_drain_rearm" in discover
+    assert "refuse_s19k_live416_as_t600_soak" in discover
+    assert "refuse_s19k_live415_416_drain_rearm_as_wrap_survival" in discover
+    assert "S19K_LIVE415_S1_LAST_RX_MS: u32 = 26_517" in discover
+    assert "S19K_LIVE416_S1_LAST_RX_MS: u32 = 73_609" in discover
+    assert "S19K_LIVE416_SHARE1_NONCE: u32 = 0xADFE_CA91" in discover
+    assert "admit_s19k_live417_died_at_wrap6" in discover
+    assert "refuse_s19k_live417_as_t600_soak" in discover
+    assert "admit_s19k_production_rearm_skips_tx" in discover
+    assert "live417: ticket+HCN then immediate work TX" in serial
+    assert "S19K_LIVE417_S1_LAST_RX_MS: u32 = 169_044" in discover
+    assert "S19K_LIVE417_SHARE1_NONCE: u32 = 0xD081_C53B" in discover
+    assert "admit_s19k_live418_died_at_wrap6" in discover
+    assert "refuse_s19k_live418_as_t600_soak" in discover
+    assert "S19K_LIVE418_S1_LAST_RX_MS: u32 = 184_926" in discover
+    assert "S19K_LIVE418_SHARE1_NONCE: u32 = 0xD272_543F" in discover
+    assert "admit_s19k_live419_died_after_wrap1_cold_leftover" in discover
+    assert "refuse_s19k_live419_as_t600_soak" in discover
+    assert "S19K_LIVE419_S1_LAST_RX_MS: u32 = 38_374" in discover
+    assert "admit_s19k_live420_died_after_wrap4" in discover
+    assert "refuse_s19k_live420_as_t600_soak" in discover
+    assert "S19K_LIVE420_S1_LAST_RX_MS: u32 = 136_902" in discover
+    assert "admit_s19k_midrun_rearm_includes_analog_mux" in discover
+    assert "refuse_s19k_analog_mux_rearm_as_t600_soak" in discover
+    assert "admit_s19k_live414_shares_stopped_after_midrun_clean" in discover
+    assert "refuse_s19k_midrun_clean_as_chip_reload" in discover
+    assert "refuse_s19k_live412_8bd1_as_same_slot_replace" in discover
+    assert "admit_s19k_live412_8bd1_is_first_fill" in discover
+    assert "refuse_s19k_session_start_shares_as_occupied_slot_replace" in discover
+    assert "S19K_LIVE412_8BD1_TX_EST: u32 = 65" in discover
+    assert "classify_s19k_post_clean_nonce" in serial
+    assert "leftover_hit" in serial
+    assert "retired_s19k_history" in serial
+    assert "let midrun_clean = is_bm1366 && total_work > 0" in serial
+    assert "s19k_post_clean_submit_allowed" in serial
+    assert "S19k leftover/ambiguous post-clean nonce refused at submit" in serial
+    assert "unpack_s19k_braiins_ghidra_job_wire" in job
+    assert "parse_s19k_compact_hex" in job
+    assert "s19k_live412_captured_first_frame_is_8bd0_job0" in job
+    assert "b.is_ascii_whitespace()" in job
+    assert "admit_s19k_esp_bm1366_has_no_work_abort_opcode" in job
+    assert "s19k_track1_fill_job_id" in job
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP" in job
+    assert "s19k_track1_fill_job_id" in serial
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP" in serial
+    assert "s19k_experimental_post_clean_flip_enabled_from_env" in serial
+    assert "s19k_plan_post_clean_uart_replace" in serial
+    assert "post_clean_uart.chain_inactive" in serial
+    assert "s19k_compact_tx_meets_share_target" in serial
+    assert "new_tx_meets" in serial
+    assert "retired_tx_meets" in serial
+    assert "admit_s19k_jig_has_no_closed11d_job" in job
+    assert "retired_s19k_tx" in serial
+    assert "retired_tx_wire" in serial
+    assert "s19k_should_log_full_work_frame" in serial
+    assert "s19k_first_occupied_tx_hex" in serial
+    assert "refuse_s19k_fill_cursor_reset_as_t600_soak" in discover
+    assert "admit_s19k_live414_resent_full_registry_after_clean" in discover
+    assert "refuse_s19k_fill_cursor_reset_as_chip_work_replace" in discover
+    assert "S19K_LIVE414_POST_CLEAN_TX_EST: u32 = 1_228" in discover
+    assert "s19k_track1_pause_rearm_until_tx" in discover
+    assert "admit_s19k_production_pauses_rearm_one_wrap_after_clean" in discover
+    assert "refuse_s19k_hcn_pause_as_t600_soak" in discover
+    assert "refuse_s19k_hcn_pause_as_chip_work_replace" in discover
+    assert "refuse_s19k_getaddress_as_midrun_invalidate" in discover
+    assert "s19k_track1_pause_rearm_until_tx" in serial
+    assert "pause mid-run re-arm after clean" in serial
+    assert "total_tx < pause_until" in serial
+    assert "refuse_s19k_analog_mux_as_wrap7_survival" in discover
+    assert "admit_s19k_production_clean_resets_fill_cursor" in discover
+    assert "admit_s19k_live424_session_start_paused_rearm" in discover
+    assert "refuse_s19k_live424_as_leftover_hit_soak" in discover
+    assert "refuse_s19k_session_start_hcn_pause" in discover
+    assert "S19K_LIVE424_S1_LAST_RX_MS: u32 = 102_054" in discover
+    assert "S19K_LIVE424_SESSION_START_PAUSE_TX: u32 = 37" in discover
+    assert "admit_s19k_live425_leftover_hit_and_wrap7" in discover
+    assert "refuse_s19k_live425_as_t600_soak" in discover
+    assert "S19K_LIVE425_LEFTOVER_HIT: u32 = 6" in discover
+    assert "S19K_LIVE425_S1_LAST_RX_MS: u32 = 225_447" in discover
+    assert "S19K_LIVE414_LAST_SHARE_MS: u32 = 50_683" in discover
+    assert "S19K_LIVE414_MIDRUN_CLEAN_MS: u32 = 66_296" in discover
+    assert "reset_s19k_braiins_fill" in serial
+    assert "live414/417/418: mid-run clean left fill cursor running" in serial
+    assert "admit_s19k_live414_rx_died_while_tx_crossed_wrap7" in discover
+    assert "skip_tx_this_loop" in serial
+    assert "s19k_track1_wrap_barrier_due" in serial
+    assert "S19k passthrough wrap-barrier" in serial
+    assert "S19K_LIVE410_SHARE_NONCE: u32 = 0x9AEA_565C" in discover
+    assert "s19k_track1_job_id_retry_slots" in share
+    assert "admit_s19k_production_retries_track1_job_id_slots" in share
+    assert "s19k_track1_job_id_retry_slots" in serial
+    assert "live410: also try ESP 0xF8 and >>3" in serial
+    assert "S19K_LIVE410_S1_LAST_RX_MS: u32 = 116_990" in discover
+    assert "S19K_LIVE410_S2_LAST_RX_MS: u32 = 117_231" in discover
+    main_rs = (ROOT / "dcentrald/dcentrald/src/main.rs").read_text(encoding="utf-8")
+    assert "Track-1 Braiins leftover" in main_rs
+    assert "live409 parked this path" in main_rs
+    assert 'board_desc.board_target == "am3-s19k"' in main_rs
+    assert "s19k_discover_skip_rx_when_leftover_baud_not_track1_3m" in serial
+    assert "skip drain/GetAddress" in serial
     assert "BM1366_PASSTHROUGH_REARM_EVERY_S" in serial
     assert "S19k passthrough mid-run re-arm" in serial
     assert "BM1366_SERIAL_TX_MIN_INTERVAL_MS" in serial
     assert "let min_tx_interval = if is_bm1366" in serial
-    assert "const BM1366_SERIAL_TX_MIN_INTERVAL_MS: u64 = 80" in serial
+    assert "const BM1366_SERIAL_TX_MIN_INTERVAL_MS: u64 = 120" in serial
+    assert "S19k Track-1 hold" in serial
+    assert "refuse live408 drop-oldest" in serial
+    assert "S19K_BM1366_HOLD_QUEUE_DEPTH" in serial
     assert "BM1366_SERIAL_RX_FOLLOWUP_DRAIN" in serial
     assert "let rx_followup_drain = if is_bm1366" in serial
     assert "for _ in 0..rx_followup_drain" in serial
@@ -7306,8 +8899,8 @@ def main() -> int:
     assert "FastUart28SilenceAt115200" in uart_rx_src
     fu115 = uart_rx_src.find("S19kRxExpectedAfter::FastUart28At115200 => match obs")
     assert fu115 != -1
-    assert "FastUart28HeardAt115200" in uart_rx_src[fu115:fu115 + 600]
-    assert "ChipFastUartUnread" not in uart_rx_src[fu115:fu115 + 400]
+    assert "FastUart28HeardAt115200" in uart_rx_src[fu115 : fu115 + 600]
+    assert "ChipFastUartUnread" not in uart_rx_src[fu115 : fu115 + 400]
     ga_retry = serial.find("S19kRxExpectedAfter::GetAddress115200Retry")
     fu115_serial = serial.find("S19kRxExpectedAfter::FastUart28At115200")
     arm_at = serial.find("Track1HostBaudRestore::arm(&s)")
@@ -7377,11 +8970,13 @@ def main() -> int:
         i = blob.find(bytes.fromhex("2136"))
         assert i > 0
         # First 21 36 adjacency is Thumb `movs r1,#0x30; add r0,sp,#imm`, not a job prefix.
-        assert blob[i - 1 : i + 3] == bytes.fromhex("302136a8"), blob[i - 2 : i + 4].hex()
+        assert blob[i - 1 : i + 3] == bytes.fromhex("302136a8"), blob[
+            i - 2 : i + 4
+        ].hex()
 
-    uart_trans = (
-        ROOT / "dcentrald/dcentrald-asic/src/uart_trans/mod.rs"
-    ).read_text(encoding="utf-8")
+    uart_trans = (ROOT / "dcentrald/dcentrald-asic/src/uart_trans/mod.rs").read_text(
+        encoding="utf-8"
+    )
     assert "JOB_LEN_FIELD" in uart_trans
     assert "UART_TRANS_BM1362_LEN_FIELD" in uart_trans
     assert "S19k 21 36" in uart_trans
@@ -7478,11 +9073,17 @@ def main() -> int:
         ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
     ).read_text(encoding="utf-8")
     assert "admit_s19k_track1_mining_on_does_not_write_gpio437" in gpio437_rs
-    hal_aml = (
-        ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs"
-    ).read_text(encoding="utf-8")
-    assert '"CH0_PLUG"' in hal_aml and '"CH1_PLUG"' in hal_aml and '"CH2_PLUG"' in hal_aml
-    assert '"HB0_RESET"' in hal_aml and '"HB1_RESET"' in hal_aml and '"HB2_RESET"' in hal_aml
+    hal_aml = (ROOT / "dcentrald/dcentrald-hal/src/platform/amlogic/mod.rs").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        '"CH0_PLUG"' in hal_aml and '"CH1_PLUG"' in hal_aml and '"CH2_PLUG"' in hal_aml
+    )
+    assert (
+        '"HB0_RESET"' in hal_aml
+        and '"HB1_RESET"' in hal_aml
+        and '"HB2_RESET"' in hal_aml
+    )
     assert "resolve_plug_gpio_global" in hal_aml
     assert "resolve_reset_gpio_global" in hal_aml
     plug_fn = hal_aml.find("fn resolve_plug_gpio_global")
@@ -7495,9 +9096,11 @@ def main() -> int:
     assert "resolve_plug_gpio_global" in hal_aml[topo:topo_end]
     assert "GPIO_PLUG_BASE +" not in hal_aml[topo:topo_end]
     rst = hal_aml.find("fn set_board_reset(&self")
-    rst_end = hal_aml.find("let _ = fs::write(&path, value);", rst)
+    rst_end = hal_aml.find("// PSU enable for cold boot", rst)
     assert rst != -1 and rst_end != -1
-    assert "resolve_reset_gpio_global" in hal_aml[rst:rst_end]
+    assert "set_amlogic_board_reset_checked" in hal_aml[rst:rst_end]
+    assert "checked write failed" in hal_aml[rst:rst_end]
+    assert "let _ = fs::write" not in hal_aml[rst:rst_end]
     assert "GPIO_RESET_BASE +" not in hal_aml[rst:rst_end]
     t1_win = serial.find("PASSTHROUGH BM1366")
     t1_seam = serial.find("} else if passthrough {", t1_win)
@@ -7534,39 +9137,88 @@ def main() -> int:
     assert "I2C_SCL=476" in s37t and "I2C_SDA=477" in s37t
     assert "for GPIO in 453 438" in s37t
     assert "for GPIO in 476 477" in s37t
-    dis = hal_aml.find("pub fn disable_psu_checked()")
+    dis = hal_aml.find("fn disable_psu_checked_at(")
     dis_end = hal_aml.find("pub fn disable_psu()", dis)
     assert dis != -1 and dis_end != -1 and dis < dis_end
     dis_body = hal_aml[dis:dis_end]
-    assert "/sys/class/gpio/export" in dis_body
+    assert 'gpio_root.join("export")' in dis_body
     assert "still unexported after export" in dis_body
     assert 'fs::write(&dir_path, "high")' in dis_body
     assert 'fs::write(&gpio_path, "1")' in dis_body
     assert "enable_psu_gpio()?;" not in dis_body
     assert "let _ = enable_psu_gpio" not in dis_body
-    assert dis_body.find("amlogic_board_target_is_s19k") < dis_body.find(
-        "/sys/class/gpio/export"
+    assert (
+        "disable_psu_checked_for_polarity(amlogic_board_target_is_s19k()?)" in dis_body
     )
-    assert dis_body.find("/sys/class/gpio/export") < dis_body.find(
+    assert "disable_psu_checked_for_polarity(true)" in dis_body
+    assert dis_body.find('gpio_root.join("export")') < dis_body.find(
         'fs::write(&gpio_path, "1")'
     )
+    profile = hal_aml[hal_aml.find("impl AmlogicNoPicProfile") : hal_aml.find(
+        "pub struct AmlogicNoPicAdmission"
+    )]
+    assert "fn psu_is_active_low(self) -> bool" in profile
+    assert "matches!(self, Self::S19k)" in profile
+    authority = hal_aml[hal_aml.find("struct AmlogicPsuCommitAuthority") : hal_aml.find(
+        "fn amlogic_psu_enable_superseded"
+    )]
+    assert "s19k_active_low: profile.psu_is_active_low()" in authority
+    assert "disable_psu_checked_for_polarity(self.s19k_active_low)" in authority
+    assert "disable_psu_checked()" not in authority
+    assert "amlogic_board_target_is_s19k" not in authority
+    lifecycle = hal_aml[
+        hal_aml.find("impl AmlogicPowerThermalLifecycleOwner") : hal_aml.find(
+            "pub struct AmlogicPsuEnableOperation"
+        )
+    ]
+    assert (
+        "disable_psu_checked_for_polarity(self.psu_commit.s19k_active_low())"
+        in lifecycle
+    )
+    assert "disable_psu_checked()" not in lifecycle
+    power_operation = hal_aml[
+        hal_aml.find("struct AmlogicPsuGpioRollback") : hal_aml.find(
+            "impl AmlogicThermalPort"
+        )
+    ]
+    assert "AmlogicPsuGpioRollback::armed(s19k_active_low)" in power_operation
+    assert "enable_psu_gpio_for_polarity(s19k_active_low)" in power_operation
+    assert "fn enable_psu_gpio() -> Result<()>" not in hal_aml
+    assert "disable_psu_checked_for_polarity(self.s19k_active_low)" in power_operation
+    assert "disable_psu_checked()" not in power_operation
+    assert "if amlogic_board_target_is_s19k" not in power_operation
+    assert "admission.populated_slots(), admission.profile()" in hal_aml
+    assert "profile,\n            s19k_native_generation," in hal_aml
+    assert "admit_amlogic_retained_power_owner_freezes_profile_polarity" in gpio437_rs
     assert "admit_s19k_track1_arms_teardown_without_enable" in gpio437_rs
     assert "admit_s19k_track1_arms_watchdog_without_enable" in gpio437_rs
     assert "s19k_track1_mark_watchdog_liveness" in serial
-    assert "Track-1 SoC watchdog armed without a power lease" in serial
-    t1_arm = serial.find("arm_s19k_track1_teardown();")
-    t1_seam = serial.find("} else if passthrough {", t1_arm)
+    assert (
+        "Track-1 SoC watchdog/route positively admitted at terminal stock-process boundary"
+        in serial
+    )
+    t1_arm = serial.find(
+        "let watchdog_start = SafetyWatchdogOwner::start_before_energizing"
+    )
+    t1_seam = serial.find("let serial = if braiins_bm1366_passthrough_handoff", t1_arm)
     assert t1_arm != -1 and t1_seam != -1 and t1_arm < t1_seam
     t1_wd = serial[t1_arm:t1_seam]
     assert "start_before_energizing" in t1_wd
     assert "prepare_enable(" not in t1_wd
     assert "enable_psu(" not in t1_wd
-    assert "require_armed" not in t1_wd
+    assert "admit_s19k_track1_watchdog_sla(&receipt)" in t1_wd
+    assert "SerialRouteDomains::claim_s19k_track1(" in t1_wd
     assert "nopic_watchdog = Some(watchdog_owner)" in t1_wd
+    assert (
+        0
+        <= t1_wd.find("expected.require_exact_tree_at")
+        < t1_wd.find(".assume_inherited_rails();")
+        < t1_wd.find(".sigkill_and_wait(")
+    )
     assert "arm_s19k_track1_teardown" in serial
     assert "s19k_track1_maybe_planned_stop_safeoff" in serial
     assert "DCENT_S19K_TRACK1_STOP_SAFEOFF" in gpio437_rs
-    assert "admit_s19k_production_planned_stop_is_opt_in" in gpio437_rs
+    assert "admit_s19k_production_planned_stop_is_fail_closed" in gpio437_rs
     assert "GPIO437 is checked low" not in serial
     assert "power is checked low" not in serial
     assert "checked SafeOff" in serial
@@ -7581,6 +9233,523 @@ def main() -> int:
     assert "for GPIO in 454 455 456" in s37
     assert "configure_output_low_gpio" in s37
     assert "Hold hashboards in reset" in s37
+
+    # --- : post-clean share-funnel discriminator (live414/417/418
+    # cliff: correlated ticket nonces never pass the pool target after the
+    # first mid-run clean; live412 proves non-clean updates replace work) ---
+    engine = (ROOT / "dcentrald/dcentrald-common/src/serial_work_engine.rs").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "pub struct S19kCleanFunnel" in engine
+    assert "DUMPS_PER_CLEAN" in engine
+    assert "admit_s19k_production_clean_funnel_instrumented" in engine
+    assert "clean_funnel.on_clean()" in serial
+    assert "clean_funnel.take_dump_for(" in serial
+    assert "s19k_track1_alive_gpio437_field" in serial
+    assert "s19k_first_tx_hex_where" in serial
+    assert "s19k_leftover_hit_from_retired_store" in serial
+    assert "s19k_leftover_class_matches_retired_tx" in serial
+    assert "leftover_header" in serial
+    assert "nonce_silent_s" in serial
+    install_rs = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_am3_install.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "s19k_track1_tmpfs_stage_allowed" in install_rs
+    assert "s19k_track1_soak_should_stop" in install_rs
+    assert "fn s19k_track1_parse_wrap_rx" in install_rs
+    assert "fn s19k_track1_alive_line_wrap7" in install_rs
+    assert "fn admit_s19k_live432_tx_wrap_does_not_stop_wrap7_t600" in install_rs
+    assert "fn s19k_track1_production_endurance_requires_stop(" in serial
+    assert (
+        "s19k_track1_soak_decision(elapsed_s, nonce_silent_s, wrap_rx, false)" in serial
+    )
+    assert "s19k_track1_soak_should_stop(" not in serial
+    assert (
+        "s19k_production_endurance_never_grants_itself_bounded_bench_completion"
+        in serial
+    )
+    assert "S19k Track-1 RX-death stop predicate reached; revoking work" in serial
+    assert "DispatchRevocationCause::HeartbeatFailure" in serial
+    assert "S19K_TRACK1_SOAK_MAX_S: u64 = 1500" in install_rs
+    assert (
+        "fn s19k_track1_tmpfs_refuses_live426_enospc_copy_and_admits_hardlink"
+        in install_rs
+    )
+    assert (
+        "fn s19k_track1_soak_does_not_stop_at_live427_620s_without_clean" in install_rs
+    )
+    assert "S19K_TRACK1_SOAK_T600_S: u64 = 600" in install_rs
+    assert "S19K_TRACK1_SOAK_WRAP7: u64 = 7" in install_rs
+    assert "fn refuse_s19k_live431_220s_as_wrap7_t600" in install_rs
+    assert "fn admit_s19k_track1_restore_never_writes_gpio437" in install_rs
+    assert "fn s19k_track1_launch_may_kill" in install_rs
+    assert "fn admit_s19k_track1_launch_kills_owned_pid_only" in install_rs
+    assert "fn refuse_s19k_live429_sigterm_as_leftover_or_wrap" in install_rs
+    uart_job = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_uart_trans_job.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "fn refuse_s19k_stock_uart_job_id_as_slot_shift" in uart_job
+    assert "stock pack_asic_work job_id is work_id&0xff" in uart_job
+    live430_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert not any(
+        "kill $(pidof dcentrald)" in line
+        for line in live430_launch.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert 'kill "$OWNED"' in live430_launch
+    assert "dcentrald.pid" in live430_launch
+    assert "nonce_silent_s=90" in live430_launch
+    live431_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert not any(
+        "kill $(pidof dcentrald)" in line
+        for line in live431_launch.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert 'kill "$OWNED"' in live431_launch
+    assert "dcentrald.pid" in live431_launch
+    assert "nonce_silent_s=90" in live431_launch
+    assert "s1_silent_s" in live431_launch
+    assert "wrap_idx" in live431_launch
+    live431_toml = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "passthrough = true" in live431_toml
+    assert "CLEAR_FOR_FLASH" not in live431_toml
+    discover = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S19K_LIVE427_S1_LAST_RX_MS: u32 = 187_676" in discover
+    assert "fn refuse_s19k_live427_as_chain_inactive_result" in discover
+    assert "fn s19k_track1_wrap_index" in discover
+    assert "fn refuse_s19k_wrap_tx_skip_as_survival" in discover
+    assert "fn s19k_track1_soak_rx_dead" in install_rs
+    assert "S19K_TRACK1_SOAK_RX_DEAD_S: u64 = 90" in install_rs
+    assert "fn s19k_track1_tracing_ansi_enabled" in install_rs
+    assert "fn admit_s19k_production_honors_rust_log_style_never" in install_rs
+    logging_rs = (ROOT / "dcentrald/dcentrald/src/logging.rs").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "s19k_track1_tracing_ansi_enabled" in logging_rs
+    assert "with_ansi(ansi)" in logging_rs
+    assert "fn refuse_s19k_restore_plan_as_execute_grant" in install_rs
+    assert "s19k_track1_wrap_index" in serial
+    assert "wrap_idx" in serial
+    assert "fn s19k_esp_bm1366_job_slot_count" in discover
+    assert "fn refuse_s19k_esp_plus8_mod128_as_track1_fill" in discover
+    assert "fn refuse_s19k_bosminer_registry_wrap_as_chip_uart_abort" in discover
+    assert "fn s19k_leftover_hit_from_retired_store" in (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_share.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    share_rs = (ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_share.rs").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "fn insert_wire_retiring" in share_rs
+    assert "fn refuse_s19k_wrap7_same_id_drop_without_retire" in share_rs
+    assert "fn admit_s19k_production_retires_wrap_overwrite" in share_rs
+    assert "fn s19k_track1_hunt_retired_without_funnel" in share_rs
+    assert "fn s19k_track1_count_wrap_retire_leftover" in share_rs
+    assert "fn s19k_track1_refuse_wrap_retired_submit" in share_rs
+    assert "s19k_track1_hunt_retired_without_funnel" in serial
+    assert "s19k_track1_count_wrap_retire_leftover" in serial
+    assert "s19k_track1_refuse_wrap_retired_submit" in serial
+    assert "s19k_restore_wrap_retire_leftover_after_clean_snapshot" in serial
+    assert "S19k wrap-retire leftover" in serial
+    assert "s19k_track1_count_wrap_retire_leftover" in serial
+    assert "s19k_track1_refuse_wrap_retired_submit" in serial
+    assert "fn admit_s19k_install_backup_reads_gpio437_before_safeoff" in install_rs
+    assert "fn s19k_track1_note_port_rx" in discover
+    assert "fn s19k_track1_port_silent_s" in discover
+    assert "s1_silent_s" in serial
+    assert "s2_silent_s" in serial
+    assert "S19K_TRACK1_RX_CHANNEL" in serial
+    assert "mpsc::channel::<S19kSerialRxHit>(256)" not in serial
+    assert "fn admit_s19k_live430_wrap4_gpio_on_no_clean" in discover
+    assert "fn refuse_s19k_live430_as_leftover_or_sigterm" in discover
+    assert "fn admit_s19k_live431_wrap6_after_live_clean" in discover
+    assert "fn refuse_s19k_live431_as_wrap7_t600" in discover
+    braiins_job_live = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_job.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "fn s19k_leftover_hit_admits_experimental_inactive" in braiins_job_live
+    assert (
+        "fn admit_s19k_live436_wrap_retire_leftover_admits_first_clean_inactive"
+        in braiins_job_live
+    )
+    assert "S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT: u32 = 3" in braiins_job_live
+    assert "fn s19k_leftover_hit_vs_meets_replace_proven" in braiins_job_live
+    assert "fn s19k_plan_wrap4_early_leftover_safe" in braiins_job_live
+    assert "fn s19k_wrap4_early_leftover_safe_due" in braiins_job_live
+    assert "fn admit_s19k_live434_wrap4_early_clean_was_due" in braiins_job_live
+    assert (
+        "fn admit_s19k_live436_leftover3_wrap4_early_admits_inactive"
+        in braiins_job_live
+    )
+    assert (
+        "fn admit_s19k_live437_wrap4_same_tick_admits_before_header_climb"
+        in braiins_job_live
+    )
+    assert "fn admit_s19k_production_wrap4_logs_snapshot_leftover" in braiins_job_live
+    assert "let admit_hit = clean_funnel.leftover_hit" in serial
+    assert (
+        "fn admit_s19k_live437_launch_wrap4_early_is_experimental" in braiins_job_live
+    )
+    assert "Same-tick admit uses the" in braiins_job_live
+    live437_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1" in live437_launch
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE=1" in live437_launch
+    assert 'kill "$OWNED"' in live437_launch
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live437_launch
+    live437_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live437_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live437_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live437_restore
+    live438_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1" in live438_launch
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE=1" in live438_launch
+    assert "wrap-4 leftover-admitted chain-inactive" in live438_launch
+    assert 'kill "$OWNED"' in live438_launch
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live438_launch
+    live438_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live438_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live438_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live438_restore
+    live439_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1" in live439_launch
+    assert "flush_measured" in (
+        ROOT / "dcentrald/dcentrald/src/serial_mining.rs"
+    ).read_text(encoding="utf-8")
+    live439_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live439_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live439_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live439_restore
+    assert "fn admit_s19k_live435_dual_port_wrap7" in discover
+    assert "fn refuse_s19k_live435_as_wrap7_t600" in discover
+    assert "S19K_LIVE435_WRAP_RX: u32 = 8" in discover
+    assert "fn admit_s19k_live436_wrap4_death_with_wrap_retire_leftover" in discover
+    assert "fn refuse_s19k_live436_as_wrap7_t600_or_replace" in discover
+    assert "S19K_LIVE436_WRAP_RX: u32 = 4" in discover
+    assert "fn admit_s19k_live437_wrap4_snapshot_without_inactive" in discover
+    assert "fn refuse_s19k_live437_as_leftover_admit_or_t600" in discover
+    assert "S19K_LIVE437_WRAP_RX: u32 = 6" in discover
+    assert "S19K_LIVE437_WRAP4_SNAPSHOT_LEFTOVER_HIT: u32 = 4" in discover
+    assert "fn admit_s19k_live438_wrap4_same_tick_queued_cmd3" in discover
+    assert "fn refuse_s19k_live438_admit_as_replace" in discover
+    assert "S19K_LIVE438_WRAP4_ADMIT_LEFTOVER_HIT: u32 = 6" in discover
+    assert "fn admit_s19k_live439_wrap7_after_leftover_admit" in discover
+    assert "fn refuse_s19k_live439_as_replace_or_t600" in discover
+    assert "fn admit_s19k_live440_wrap7_header_only_does_not_readmit" in discover
+    assert "fn admit_s19k_live441_wrap6_death_before_wrap7_snapshot" in discover
+    assert "S19K_LIVE441_WRAP_RX: u32 = 6" in discover
+    assert "S19K_LIVE441_WRAP7_SNAP_QUEUED: u32 = 0" in discover
+    assert "fn refuse_s19k_live440_as_replace_or_t600" in discover
+    assert "S19K_LIVE440_WRAP4_ADMIT_LEFTOVER_HIT: u32 = 1" in discover
+    assert "S19K_LIVE440_WRAP7_READMIT_QUEUED: u32 = 0" in discover
+    assert "S19K_LIVE440_WRAP_RX: u32 = 7" in discover
+    assert "S19K_LIVE439_WRAP4_ADMIT_LEFTOVER_HIT: u32 = 2" in discover
+    assert "S19K_LIVE439_SECOND_CLEAN_LEFTOVER_HIT: u32 = 216" in discover
+    assert "S19K_LIVE439_WRAP_RX_ALIVE: u32 = 7" in discover
+    assert "fn s19k_wrap7_leftover_readmit_due" in braiins_job_live
+    assert "fn s19k_wrap7_leftover_snapshot_due" in braiins_job_live
+    assert "fn admit_s19k_live440_wrap7_snapshots_post_admit_store" in braiins_job_live
+    assert "fn admit_s19k_live439_wrap7_leftover_readmit" in braiins_job_live
+    assert "s19k_wrap7_leftover_snapshot_due(" in serial
+    assert "S19k wrap-7 leftover snapshot (experimental)" in serial
+    assert (
+        "fn refuse_s19k_bosminer_53050000_as_chain_inactive_template"
+        in braiins_job_live
+    )
+    assert "fn refuse_s19k_jig_chain_inactive_log_as_midrun_abort" in braiins_job_live
+    assert "s19k_track1_rx_death_parser_note" in serial
+    assert "rx_parser" in serial
+    assert "Serial RX wire observation" in (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    bosminer_bin = (
+        ROOT.parent.parent
+        / ""
+    )
+    if bosminer_bin.is_file():
+        bos = bosminer_bin.read_bytes()
+        assert bos.find(bytes.fromhex("55aa5305")) < 0
+        first_5305 = bos.find(bytes.fromhex("53050000"))
+        assert first_5305 > 4
+        assert bos[first_5305 - 4 : first_5305] == bytes.fromhex("52050000")
+    jig_bin = (
+        ROOT.parent.parent
+        / ""
+    )
+    if jig_bin.is_file():
+        jig = jig_bin.read_bytes()
+        assert b"Set chain inactive" in jig
+        assert jig.find(b"Set chain inactive") < jig.find(b"Set asic address")
+        assert jig.find(bytes.fromhex("55aa5305")) < 0
+        assert jig.find(bytes.fromhex("55aa2136")) < 0
+    assert "fn s19k_live439_planner_numbers_drive_shipped_helpers" in braiins_job_live
+    assert "leftover_hit > 0 && meets == 0" in braiins_job_live
+    assert "s19k_wrap7_leftover_readmit_due(" in serial
+    assert "wrap7_leftover_readmitted" in serial
+    assert "S19k wrap-7 leftover-readmit chain-inactive (experimental)" in serial
+    live440_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1" in live440_launch
+    assert "wrap-7 leftover-readmit" in live440_launch
+    live441_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1" in live441_launch
+    assert "wrap-7 leftover snapshot" in live441_launch
+    live441_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live441_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live441_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live441_restore
+    live440_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live440_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live440_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live440_restore
+    assert "fn s19k_post_inactive_flush_measured_not_replace" in braiins_job_live
+    assert "fn refuse_s19k_live438_post_flush_leftover0_as_replace" in braiins_job_live
+    assert "fn s19k_leftover_header_is_not_tx_leftover" in braiins_job_live
+    assert "fn refuse_s19k_live438_header_leftover_as_second_cmd3" in braiins_job_live
+    assert "s19k_leftover_header_is_not_tx_leftover" in serial
+    assert "s19k_post_inactive_flush_measured_not_replace" in serial
+    assert "flush_measured" in serial
+    assert "CLEAR_FOR_FLASH: bool = false" in install_rs
+    assert "S19K_LIVE438_WRAP4_ADMIT_LEFTOVER_HEADER: u32 = 0" in discover
+    assert "S19K_LIVE438_S1_LAST_RX_MS: u32 = 151_822" in discover
+    assert "fn admit_s19k_job_flip_is_leftover_admitted" in braiins_job_live
+    assert "fn s19k_post_inactive_replace_proven" in braiins_job_live
+    assert "s19k_post_inactive_replace_proven(" in serial
+    assert "replace_proven" in serial
+    assert (
+        "fn admit_s19k_second_clean_plans_from_pre_reset_leftover" in braiins_job_live
+    )
+    assert "snapshot_for_post_clean_plan" in serial
+    assert "on_leftover_admitted_inactive" in serial
+    assert "fn s19k_experimental_wrap4_early_clean_enabled_from_env" in braiins_job_live
+    assert "s19k_plan_wrap4_early_leftover_safe(" in serial
+    assert "s19k_track1_clean_after_rx_death_silent" in serial
+    assert "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN" in serial
+    assert "fn admit_s19k_live431_leftover_vs_meets_unproven" in braiins_job_live
+    assert "fn admit_s19k_live433_leftover_vs_meets_unproven" in braiins_job_live
+    assert (
+        "fn admit_s19k_live431_leftover_admits_experimental_inactive"
+        in braiins_job_live
+    )
+    assert "clean_funnel.leftover_hit" in serial
+    assert "leftover_header" in serial
+    assert "fn s19k_track1_leftover_handoff_gpio437_ok" in (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    init_seq_gpio = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "fn s19k_track1_refuse_work_tx_if_gpio437_not_on" in init_seq_gpio
+    assert "fn admit_s19k_production_refuses_tx_when_gpio437_off" in init_seq_gpio
+    assert "s19k_track1_refuse_work_tx_if_gpio437_not_on" in serial
+    assert "S19k leftover handoff gpio437 not ON" in serial
+    assert "fn refuse_s19k_s21_pwr_en_polarity_as_am3_s19k" in (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "fn refuse_s19k_dcent_sysupgrade_execute_while_flash_false" in install_rs
+    assert "fn s19k_track1_note_wrap_at_rx" in discover
+    assert "wrap_rx" in serial
+    assert "fn s19k_track1_alive_line_rx_dead" in install_rs
+    assert "fn admit_s19k_track1_launch_rx_dead_is_ge_90" in install_rs
+    assert "fn admit_s19k_live432_rx_died_after_first_clean_inactive" in discover
+    assert "fn classify_s19k_track1_rx_death" in discover
+    assert "fn s19k_track1_tx_wrap_after_rx_death" in discover
+    assert "fn admit_s19k_live433_wrap6_identity_death" in discover
+    assert "fn classify_s19k_held_uart_wrap6" in discover
+    assert "fn admit_s19k_wrap6_death_not_held_uart_abort" in discover
+    assert "fn admit_s19k_live434_wrap4_identity_death" in discover
+    assert "fn s19k_track1_clean_after_rx_death_ms" in discover
+    assert "fn s19k_track1_clean_after_rx_death_silent" in discover
+    assert "CleanAfterRxDeath" in discover
+    assert "fn s19k_held_uart_prefix_is_wrap6_abort" in discover
+    assert "S19K_TRACK1_WRAP6_TX" in discover
+    assert (
+        "TxWrapAfterRxDeath"
+        not in discover.split("pub enum S19kTrack1RxDeathClass", 1)[-1].split("}", 1)[0]
+    )
+    assert "fn admit_s19k_aml_mutation" in install_rs
+    assert "fn refuse_s19k_leftover_admitted_inactive_as_flash_grant" in install_rs
+    assert "fn leftover_admit_is_refused_as_flash_grant" in install_rs
+    assert "fn s19k_aml_intent_from_artifact" in install_rs
+    assert "fn admit_s19k_aml_artifact" in install_rs
+    assert "fn refuse_s19k_rescue_console_as_nandwrite_grant" in install_rs
+    assert "fn refuse_s19k_rollback_plan_as_execute_grant" in install_rs
+    assert "fn admit_s19k_recover_script_refuses_execute_before_gpio" in install_rs
+    assert "fn refuse_s19k_backup_as_nandwrite_grant" in install_rs
+    assert "enum S19kAmlMutationIntent" in install_rs
+    assert "fn s19k_track1_parse_nonce_silent_s" in install_rs
+    assert "fn admit_s19k_track1_launch_rx_dead_ignores_ansi" in install_rs
+    assert "fn s19k_hunt_retired_after_outstanding_miss" in (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_share.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "live433: outstanding miss hunts retired 21 36" in serial
+    assert "S19k leftover 21 36 via retired store" in serial
+    assert "S19k track1 RX death class" in serial
+    live433_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "nonce_silent_s=(9[0-9]" in live433_launch
+    assert "wrap_rx=" in live433_launch
+    assert 'kill "$OWNED"' in live433_launch
+    assert "RUST_LOG_STYLE=never" not in live433_launch
+    live434_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "RUST_LOG_STYLE=never" in live434_launch
+    assert "nonce_silent_s.{0,40}" in live434_launch
+    assert "wrap_rx=" in live434_launch
+    assert 'kill "$OWNED"' in live434_launch
+    live434_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live434_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live434_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live434_restore
+    live435_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "RUST_LOG_STYLE=never" in live435_launch
+    assert "nonce_silent_s.{0,40}" in live435_launch
+    assert "wrap_rx=" in live435_launch
+    assert 'kill "$OWNED"' in live435_launch
+    assert "S19k wrap-retire leftover" in live435_launch
+    live435_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live435_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live435_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live435_restore
+    assert "CLEAR_FOR_FLASH" not in (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    live432_launch = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert not any(
+        "kill $(pidof dcentrald)" in line
+        for line in live432_launch.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert 'kill "$OWNED"' in live432_launch
+    assert "nonce_silent_s=90" in live432_launch
+    assert "wrap7_and_t600" in live432_launch
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE=1" in live432_launch
+    live432_restore = (
+        ROOT.parent.parent
+        / ""
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S99bosminer start" in live432_restore
+    assert "echo 1 > /sys/class/gpio/gpio437/value" not in live432_restore
+    assert "echo 0 > /sys/class/gpio/gpio437/value" not in live432_restore
+    assert "fn refuse_s19k_rx_channel_as_wrap7_survival" in (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_share.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S19k post-clean funnel" in serial
+    assert "S19k post-clean nonce dump" in serial
+    assert "s19k_clean_funnel_armed(&clean_funnel)" in serial
+    # : VNish v1.3.3 S11board production GPIO map pinned in rust.
+    init_seq = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "S19K_AML_CHAIN_RESET_GPIOS: [u32; 3] = [454, 455, 456]" in init_seq
+    assert "S19K_AML_PWR_EN_GPIO: u32 = 437" in init_seq
+    assert "admit_s19k_aml_chain_reset_gpios" in init_seq
+
+    # --- : post-clean chain-inactive broadcast (experimental).
+    # BM1366 protocol CMD=3 chain inactive (55 AA 53 05 00 00 CRC5) is the
+    # only documented chip-side work flush; shipped env-gated as the live
+    # follow-up when leftover_hit dominates the funnel. ---
+    braiins_job = (
+        ROOT / "dcentrald/dcentrald-common/src/s19k_braiins_job.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert (
+        "S19K_BM1366_CHAIN_INACTIVE_BODY: [u8; 4] = [0x53, 0x05, 0x00, 0x00]"
+        in braiins_job
+    )
+    assert "S19K_BM1366_CHAIN_INACTIVE_WIRE: [u8; 7]" in braiins_job
+    assert "refuse_s19k_post_clean_chain_inactive_as_production" in braiins_job
+    assert "admit_s19k_production_post_clean_chain_inactive_is_env_gated" in braiins_job
+    assert "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE" in serial
+    assert "actor_send_chain_inactive_bm1366" in serial
+    assert "S19k post-clean chain-inactive broadcast queued" in serial
+    assert "if frame.as_slice() == S19K_BM1366_CHAIN_INACTIVE_BODY" in serial
+
+    # --- : FR-1.28 (251010) stock S19k Pro .bmu 3-variant TOC
+    # parser (RE only). AMLCtrl/zynq7007/CVCtrl blobs tile the container;
+    # never nandwrite a BMU. ---
+    bmu_toc = (ROOT / "dcentrald/dcentrald-common/src/s19k_stock_bmu_toc.rs").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "pub mod" not in bmu_toc
+    assert "S19K_BMU_TOC_MAGIC: u32 = 0xABAB_ABAB" in bmu_toc
+    assert "AMLCtrl_BHB56XXX" in bmu_toc
+    assert "zynq7007_BHB56XXX" in bmu_toc
+    assert "CVCtrl_BHB56XXX" in bmu_toc
+    assert "refuse_s19k_bmu_nand_write" in bmu_toc
+    assert "refuse_s19k_bmu_fr128_as_legacy_single_image" in bmu_toc
+    assert "pub mod s19k_stock_bmu_toc;" in (
+        ROOT / "dcentrald/dcentrald-common/src/lib.rs"
+    ).read_text(encoding="utf-8", errors="replace")
+
+    # --- : parser-boundary UART telemetry. A future authorized run
+    # must distinguish host-observed wire silence from bytes that reach the
+    # UART but fail to assemble into complete BM1366 responses. ---
+    assert "pub fn classify_serial_rx_interval(" in engine
+    assert "SerialRxIntervalState::WireOnlyProgress" in engine
+    assert "SerialRxIntervalState::CounterReset" in engine
+    assert "pub struct SerialRxObservation" in hal
+    assert "rx_wire_bytes: AtomicU64" in hal
+    assert "rx_framed_responses: AtomicU64" in hal
+    assert "pub fn rx_observation(&self) -> SerialRxObservation" in hal
+    assert "fn actor_rx_observations(&self)" in serial
+    assert "classify_serial_rx_interval(" in serial
+    assert '"Serial RX wire observation"' in serial
 
     print("S19K_HOST_VERIFY_OK")
     return 0

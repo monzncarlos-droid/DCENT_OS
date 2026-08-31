@@ -1,17 +1,20 @@
 //! BM1366 UART nonce → share reconstruction (ESP-Miner `BM1366_process_work`).
 //!
 //! Pure. Does **not** submit, open UART, or claim accepted shares.
-//! Job CRC5 is **not** a drop condition (S21 comparative trailer ≠ init 0x1B).
+//! Runtime frames require ESP/BM1366 full-frame remainder-zero CRC5. The
+//! payload-only `0x1B` hypothesis remains diagnostic evidence, not admission.
 //!
-//! Address interval is AML **2** (desk 11g). Do not use Bitaxe `256/N`.
+//! S19k address interval is AML **2**, but attribution dialects differ:
+//! ESP/AMTC uses nonce bits 17..24, while Braiins fill uses the recovered
+//! partition callback in `s19k_bm1366_braiins_nonce`.
 
 use crate::s19k_bm1366_uart_rx::{
     admit_fill_work_id_tx_rx_correlate, asic_index_from_nonce_be, chip_addr_from_nonce_be,
-    classify_bm1366_uart_rx, core_id_from_nonce_be, S19kUartRxKind, S19kUartRxObservation,
+    classify_bm1366_uart_rx_checked, core_id_from_nonce_be, S19kUartRxKind, S19kUartRxObservation,
     BM1366_JOB_ID_MASK, BM1366_SMALL_CORE_MASK, BM1366_UART_RESP_BODY_LEN, UART_RESP_LEN,
     UART_RESP_PREAMBLE,
 };
-
+use crate::s19k_uart_trans_job::BRAIINS_TTYS_THIRD;
 
 /// BIP320 version-roll positions 13..28 (`VERSION_ROLLING_STRATUM_BIP320_MASK`).
 /// Do not use the 12-bit mask that drops bits 13..16 (`version_be` low nibble);
@@ -20,8 +23,22 @@ pub const BM1366_VERSION_ROLL_SHIFT: u32 = 13;
 pub const BM1366_VERSION_ROLL_MASK: u32 = crate::VERSION_ROLLING_STRATUM_BIP320_MASK;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kBm1366AttributionProvenance {
+    /// ESP/AMTC `(nonce>>17)&0xff`, interval-2 decoder.
+    EspAmtcBits17Derived,
+    /// Exact Bosminer callback arithmetic and S19k 77/2 configuration; the
+    /// result also passed the independently evidenced physical ranges.
+    BraiinsDerivedInPhysicalRange,
+    /// Arithmetic output retained for observability only. Do not publish it
+    /// as a physical ASIC/core identity or reject an otherwise valid share.
+    BraiinsDerivedOutOfPhysicalRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S19kBm1366Share {
     pub job_id: u8,
+    /// ESP raw-UART dialect only. Braiins fill consumes the entire job byte
+    /// as work-id and stores zero here because no small-core field is known.
     pub small_core: u8,
     pub midstate_num: u8,
     pub nonce_be: u32,
@@ -32,6 +49,29 @@ pub struct S19kBm1366Share {
     pub chip_addr: u8,
     pub asic_index: u8,
     pub core_id: u8,
+    pub attribution_provenance: S19kBm1366AttributionProvenance,
+}
+
+impl S19kBm1366Share {
+    /// Only exposes Braiins ASIC/core identity after the recovered arithmetic
+    /// also passes S19k's independent 77-ASIC / 112-core physical ranges.
+    pub fn braiins_physical_chip_core(&self) -> Option<(u8, u8, u8)> {
+        matches!(
+            self.attribution_provenance,
+            S19kBm1366AttributionProvenance::BraiinsDerivedInPhysicalRange
+        )
+        .then_some((self.chip_addr, self.asic_index, self.core_id))
+    }
+}
+
+pub fn s19k_braiins_attribution_provenance(
+    attribution: &crate::s19k_bm1366_braiins_nonce::BraiinsBm1366Attribution,
+) -> S19kBm1366AttributionProvenance {
+    if crate::s19k_bm1366_braiins_nonce::s19k_braiins_bm1366_attribution_is_physical(attribution) {
+        S19kBm1366AttributionProvenance::BraiinsDerivedInPhysicalRange
+    } else {
+        S19kBm1366AttributionProvenance::BraiinsDerivedOutOfPhysicalRange
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +98,7 @@ pub fn parse_bm1366_uart_share(
     frame: &[u8],
     base_version: u32,
 ) -> Result<S19kBm1366Share, S19kShareError> {
-    let kind = classify_bm1366_uart_rx(frame).map_err(|_| S19kShareError::NotJobNonce)?;
+    let kind = classify_bm1366_uart_rx_checked(frame).map_err(|_| S19kShareError::NotJobNonce)?;
     let S19kUartRxKind::JobNonce { job_id, .. } = kind else {
         return Err(S19kShareError::NotJobNonce);
     };
@@ -125,7 +165,9 @@ pub fn refuse_esp_step8_as_braiins_fill_registry(step: u8, mask: u8) -> Result<(
 pub fn refuse_esp_f8_mask_as_braiins_fill_job_id(raw_job_byte: u8) -> Result<(), &'static str> {
     let masked = raw_job_byte & BM1366_JOB_ID_MASK;
     if masked != raw_job_byte {
-        return Err("ESP id&0xF8 drops low 3 bits; Braiins fill log=0 uses the raw job byte as work_id");
+        return Err(
+            "ESP id&0xF8 drops low 3 bits; Braiins fill log=0 uses the raw job byte as work_id",
+        );
     }
     Ok(())
 }
@@ -147,33 +189,37 @@ pub fn parse_bm1366_braiins_fill_share_from_body(
     )
     .map_err(|_| S19kShareError::NotJobNonce)?;
     share.job_id = work_id as u8;
-    let payload_le = u64::from_le_bytes([
-        body[0],
-        body[1],
-        body[2],
-        body[3],
-        body[4],
-        body[5],
-        body.get(6).copied().unwrap_or(0),
-        body.get(7).copied().unwrap_or(0),
-    ]);
-    let rev = crate::s19k_braiins_job::s19k_braiins_uart_nonce_arg_from_payload8(payload_le);
-    // Fill identity is only defined for engine+0x80 == 1 (bm1398_6x.rs:344).
-    share.nonce_be = crate::s19k_braiins_job::s19k_braiins_fill_nonce_word(rev);
-    share.nonce_le = share.nonce_be.swap_bytes();
+    let words = crate::s19k_bm1366_braiins_nonce::bosminer_bm1366_nonce_words(body)
+        .ok_or(S19kShareError::NotJobNonce)?;
+    share.nonce_be = words.callback_nonce_be;
+    share.nonce_le = words.payload_low32_le;
+    let attribution = crate::s19k_bm1366_braiins_nonce::decode_s19k_braiins_bm1366_attribution(
+        words.callback_nonce_be,
+    )
+    .map_err(|_| S19kShareError::NotJobNonce)?;
+    share.chip_addr = attribution.chip_address_low8;
+    share.asic_index = attribution.asic_index as u8;
+    share.core_id = attribution.core_id;
+    share.attribution_provenance = s19k_braiins_attribution_provenance(&attribution);
+    // `payload[5] >> log0` is the complete fill work-id. Its low three bits
+    // are not the ESP small-core field.
+    share.small_core = 0;
     // Fill midstates=1 ⇒ log 0 ⇒ FUN_0091c0a0 version mask is 0.
     // Do not keep ESP `version_be << 13` BIP320 bits from parse_bm1366_share_from_body.
     let version_be = u16::from_be_bytes([
         body.get(6).copied().unwrap_or(0),
         body.get(7).copied().unwrap_or(0),
     ]);
-    let masked = crate::s19k_braiins_job::s19k_braiins_uart_version_bits(
+    // live407: fill log-0 UART *width* is 0 in bosminer, but the chip still
+    // rolls body[6:7]<<13. Masking to 0 hashes 434faee1; keeping version_be
+    // hashes 00000000009b6f81 (ticket-valid). Do not use the log-0 mask here.
+    let _ = crate::s19k_braiins_job::s19k_braiins_uart_version_bits(
         version_be,
         crate::s19k_braiins_job::s19k_braiins_fill_midstate_log(),
-    )
-    .map_err(|_| S19kShareError::NotJobNonce)?;
-    share.version_bits = u32::from(masked);
-    share.rolled_version = base_version;
+    );
+    share.version_bits = u32::from(version_be);
+    share.rolled_version =
+        crate::s19k_braiins_job::s19k_braiins_midstate0_version(base_version, version_be);
     // Fill midstates=1 ⇒ only index 0. Do not keep ESP body[4] midstate_num.
     share.midstate_num = 0;
     Ok(share)
@@ -196,9 +242,7 @@ pub fn refuse_esp_flags_redrop_after_fill_hunt(src: &str) -> Result<(), &'static
     if src.contains("0u16, // fill log 0") && src.contains("resp[8]") {
         // Fill Ok tuple must not pass HAL body[8] as flags after hunt.
         if !src.contains("0x80, // fill hunt") {
-            return Err(
-                "fill hunt already required JobNonce; refuse ESP resp[8] flags redrop",
-            );
+            return Err("fill hunt already required JobNonce; refuse ESP resp[8] flags redrop");
         }
     }
     Ok(())
@@ -207,9 +251,7 @@ pub fn refuse_esp_flags_redrop_after_fill_hunt(src: &str) -> Result<(), &'static
 /// Fill midstates=1 ⇒ midstate index is 0. ESP `body[4]` is a different dialect.
 pub fn refuse_esp_midstate_as_braiins_fill_index(src: &str) -> Result<(), &'static str> {
     if src.contains("share.midstate_num") {
-        return Err(
-            "Braiins fill midstates=1; refuse ESP share.midstate_num as midstate_idx",
-        );
+        return Err("Braiins fill midstates=1; refuse ESP share.midstate_num as midstate_idx");
     }
     Ok(())
 }
@@ -244,11 +286,13 @@ pub fn qualify_bm1366_job_nonce(
         midstate_num,
         nonce_be,
         nonce_le: nonce_be.swap_bytes(),
-        version_bits: (u32::from(version_be) << BM1366_VERSION_ROLL_SHIFT) & BM1366_VERSION_ROLL_MASK,
+        version_bits: (u32::from(version_be) << BM1366_VERSION_ROLL_SHIFT)
+            & BM1366_VERSION_ROLL_MASK,
         rolled_version: reconstruct_rolled_version(base_version, version_be),
         chip_addr: chip_addr_from_nonce_be(nonce_be),
         asic_index: asic_index_from_nonce_be(nonce_be),
         core_id: core_id_from_nonce_be(nonce_be),
+        attribution_provenance: S19kBm1366AttributionProvenance::EspAmtcBits17Derived,
     })
 }
 
@@ -278,7 +322,7 @@ pub fn refuse_esp_qualify_as_braiins_fill(expected_work_id: u8) -> Result<(), &'
 
 /// Synthetic AA55 job body (9 B) with fill work_id 2 in ESP byte 5. Not live BM1366.
 pub const SYNTHETIC_BM1366_FILL_WORK2_BODY: [u8; 9] =
-    [0x11, 0x22, 0x33, 0x44, 0x00, 0x02, 0x00, 0x00, 0x80];
+    [0x11, 0x22, 0x33, 0x44, 0x00, 0x02, 0x00, 0x00, 0x8F];
 /// : constructed fill job_id. Not a live sniff.
 pub const S19K_CONSTRUCTED_FILL_JOB_ID: u8 = 0x10;
 /// Packed nVersion with bit 13 set so BIP320 strip is observable.
@@ -288,8 +332,17 @@ pub const S19K_CONSTRUCTED_FILL_MERKLE: [u8; 32] = [0x22; 32];
 pub const S19K_CONSTRUCTED_FILL_NTIME: u32 = 0x5C00_0000;
 pub const S19K_CONSTRUCTED_FILL_NBITS: u32 = 0x1D00_FFFF;
 /// Wire nonce bytes in the constructed 9-byte body.
-pub const S19K_CONSTRUCTED_FILL_BODY: [u8; 9] =
-    [0x00, 0x11, 0x22, 0x33, 0x00, S19K_CONSTRUCTED_FILL_JOB_ID, 0x00, 0x00, 0x80];
+pub const S19K_CONSTRUCTED_FILL_BODY: [u8; 9] = [
+    0x00,
+    0x11,
+    0x22,
+    0x33,
+    0x00,
+    S19K_CONSTRUCTED_FILL_JOB_ID,
+    0x00,
+    0x00,
+    0x82,
+];
 /// Constructed RX job byte with small_core ORed in. Not a live sniff.
 pub const S19K_CONSTRUCTED_FILL_SMALL_CORE: u8 = 0x02;
 pub const S19K_CONSTRUCTED_FILL_JOB_OR_CORE: u8 =
@@ -303,7 +356,7 @@ pub const S19K_CONSTRUCTED_FILL_WORK10_CORE2_BODY: [u8; 9] = [
     S19K_CONSTRUCTED_FILL_JOB_OR_CORE,
     0x00,
     0x00,
-    0x80,
+    0x9B,
 ];
 
 /// One UART nonce body plus the tty that produced it. Untagged hits
@@ -322,6 +375,28 @@ impl S19kSerialRxHit {
 
 /// Fill work_id is a `u8`. A 32-deep FIFO can drop a still-valid older slot.
 pub const S19K_FILL_TX_SLOTS: usize = 256;
+/// live408: UART TX hold (2–4), not the 256-slot outstanding table.
+/// take_dispatch only when this queue has room so job_id matches the wire.
+pub const S19K_BM1366_HOLD_QUEUE_DEPTH: usize = 4;
+/// live428/430: MULTI died while TX continued. Actor `blocking_send` on a
+/// 256-deep nonce channel stalls UART read (kernel FIFO overflow). Dual
+/// 77-chip boards can emit more than 256 ticket hits between async
+/// consumes. Deeper channel is backpressure, not wrap-7 soak proof.
+pub const S19K_TRACK1_RX_CHANNEL: usize = 2048;
+
+pub fn refuse_s19k_rx_channel_as_wrap7_survival() -> Result<(), &'static str> {
+    Err("deeper RX channel is backpressure, not wrap-7 dual-port soak proof")
+}
+
+pub fn admit_s19k_production_rx_channel(src: &str) -> Result<(), &'static str> {
+    if !src.contains("S19K_TRACK1_RX_CHANNEL") {
+        return Err("serial_mining must size nonce channel with S19K_TRACK1_RX_CHANNEL");
+    }
+    if src.contains("mpsc::channel::<S19kSerialRxHit>(256)") {
+        return Err("256-deep nonce channel can stall actor blocking_send");
+    }
+    Ok(())
+}
 
 /// Closed fill TX prefix: `55 AA 21 36` + fill job_id.
 pub fn s19k_fill_tx_prefix(job_id: u8) -> [u8; 5] {
@@ -352,7 +427,9 @@ pub fn hunt_s19k_bm1366_fill_from_tagged_outstanding(
         }
         _ => return Err("tagged RX is not JobNonce (framing/echo/short/chip)"),
     }
-    let body = body.filter(|b| !b.is_empty()).ok_or("tagged RX body empty")?;
+    let body = body
+        .filter(|b| !b.is_empty())
+        .ok_or("tagged RX body empty")?;
     if body.len() != BM1366_UART_RESP_BODY_LEN {
         return Err("BM1366 fill body must be 9");
     }
@@ -376,9 +453,17 @@ pub fn hunt_s19k_bm1366_fill_from_tagged_outstanding(
 /// : outstanding `21 36` TX indexed by sent fill job_id.
 /// Replacing a slot overwrites that job_id only. Wrap of a 32-deep FIFO
 /// cannot drop a still-valid older slot.
+///
+/// Retired stores keep a short generation stack per job_id. live443
+/// wrap-5 `clone()` replace and `insert_wire` overwrite dropped wrap-4
+/// leftover 21 36 wires, so leftover_header remapped and leftover_hit
+/// stayed 0 after leftover-admit. Merge + keep generations so wrap-4
+/// leftover TXs still leftover_hit after leftover-admit wipe.
+pub const S19K_RETIRED_TX_GENS: usize = 4;
+
 #[derive(Clone, Debug)]
 pub struct S19kOutstandingFillTx {
-    slots: Vec<Option<Vec<u8>>>,
+    slots: Vec<Vec<Vec<u8>>>,
 }
 
 impl Default for S19kOutstandingFillTx {
@@ -390,34 +475,228 @@ impl Default for S19kOutstandingFillTx {
 impl S19kOutstandingFillTx {
     pub fn new() -> Self {
         Self {
-            slots: vec![None; S19K_FILL_TX_SLOTS],
+            slots: vec![Vec::new(); S19K_FILL_TX_SLOTS],
         }
     }
 
     pub fn insert_wire(&mut self, wire: Vec<u8>) -> Result<u8, &'static str> {
         let job_id = s19k_fill_job_id_from_tx_wire(&wire)?;
-        self.slots[usize::from(job_id)] = Some(wire);
+        let slot = &mut self.slots[usize::from(job_id)];
+        slot.clear();
+        slot.push(wire);
         Ok(job_id)
     }
 
+    /// Push a retired generation without dropping older leftover 21 36.
+    pub fn push_retired_generation(&mut self, wire: Vec<u8>) -> Result<u8, &'static str> {
+        let job_id = s19k_fill_job_id_from_tx_wire(&wire)?;
+        let gens = &mut self.slots[usize::from(job_id)];
+        if gens.last().is_some_and(|prev| prev == &wire) {
+            return Ok(job_id);
+        }
+        gens.push(wire);
+        while gens.len() > S19K_RETIRED_TX_GENS {
+            gens.remove(0);
+        }
+        Ok(job_id)
+    }
+
+    /// Fail-closed wrap overwrite: the previous `21 36` at this job_id
+    /// is occupied leftover, not a 32-FIFO drop. Retire it before the
+    /// new merkle occupies the slot (wrap-7 same-id replace). Keep the
+    /// prior retired generation (live443 wrap-retire overwrite wiped
+    /// wrap-4 leftover TX so leftover_hit stayed 0).
+    pub fn insert_wire_retiring(
+        &mut self,
+        wire: Vec<u8>,
+        retired: &mut Self,
+    ) -> Result<S19kFillInsert, &'static str> {
+        let job_id = s19k_fill_job_id_from_tx_wire(&wire)?;
+        let slot = &mut self.slots[usize::from(job_id)];
+        let evicted = slot.pop();
+        slot.clear();
+        slot.push(wire);
+        let retired_prev = if let Some(old) = evicted {
+            retired.push_retired_generation(old)?;
+            true
+        } else {
+            false
+        };
+        Ok(S19kFillInsert {
+            job_id,
+            retired_prev,
+        })
+    }
+
+    /// live443 wrap-5 `retired = outstanding.clone()` wiped wrap-4 leftover
+    /// 21 36. Merge POST-admit outstanding into retired generations.
+    pub fn merge_from(&mut self, other: &Self) {
+        for gens in &other.slots {
+            for wire in gens {
+                let _ = self.push_retired_generation(wire.clone());
+            }
+        }
+    }
+
     pub fn get(&self, job_id: u8) -> Option<&[u8]> {
-        self.slots[usize::from(job_id)].as_deref()
+        self.slots[usize::from(job_id)]
+            .last()
+            .map(|wire| wire.as_slice())
+    }
+
+    pub fn wires_for(&self, job_id: u8) -> impl Iterator<Item = &[u8]> {
+        self.slots[usize::from(job_id)]
+            .iter()
+            .map(|wire| wire.as_slice())
     }
 
     pub fn clear(&mut self) {
         for slot in &mut self.slots {
-            *slot = None;
+            slot.clear();
         }
     }
 
     pub fn occupied(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+        self.slots.iter().filter(|slot| !slot.is_empty()).count()
     }
 }
 
-/// Constructed RX job byte: `work_id | (small_core & 0x07)`.
+/// Result of a fail-closed fill insert. `retired_prev` is occupied-slot
+/// leftover of the previous wrap at the same job_id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kFillInsert {
+    pub job_id: u8,
+    pub retired_prev: bool,
+}
+
+/// wrap-7 same job_id overwrite must retire the previous 21 36.
+/// wrap_idx>=7 without retiring is an occupied-slot drop, not wrap-7 RX.
+pub fn refuse_s19k_wrap7_same_id_drop_without_retire(
+    wrap_idx: u64,
+    retired_prev: bool,
+) -> Result<(), &'static str> {
+    if wrap_idx >= 7 && !retired_prev {
+        return Err(
+            "wrap-7 same job_id overwrite without retiring previous 21 36 drops occupied leftover",
+        );
+    }
+    Ok(())
+}
+
+/// First wrap of a slot needs no retire. Later wraps must retire.
+pub fn s19k_track1_wrap_overwrite_must_retire(wrap_idx: u64, slot_was_occupied: bool) -> bool {
+    wrap_idx >= 1 && slot_was_occupied
+}
+
+/// Production TX path must retire wrap overwrite into retired_s19k_tx.
+pub fn admit_s19k_production_retires_wrap_overwrite(src: &str) -> Result<(), &'static str> {
+    if !src.contains("insert_wire_retiring") {
+        return Err("BM1366 outstanding insert must retire previous 21 36 on same job_id");
+    }
+    if !src.contains("&mut retired_s19k_tx") && !src.contains("retired_s19k_tx") {
+        return Err("wrap overwrite must retire into retired_s19k_tx");
+    }
+    Ok(())
+}
+
+/// Compact uppercase hex used on leftover dump `tx_wire` / `retired_tx_wire`.
+pub fn s19k_compact_tx_hex(wire: &[u8]) -> String {
+    wire.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// First occupied slot among `slots` whose wire satisfies `pred`.
+/// live425 leftover dumps used [`s19k_first_occupied_tx_hex`] (first
+/// occupied, not the wire that actually hashed), so `LeftoverPreClean`
+/// and `retired_tx_meets=false` could appear on the same line.
+pub fn s19k_first_tx_hex_where(
+    store: &S19kOutstandingFillTx,
+    slots: &[u8],
+    mut pred: impl FnMut(&[u8]) -> bool,
+) -> Option<String> {
+    slots.iter().find_map(|&jid| {
+        store
+            .wires_for(jid)
+            .find_map(|wire| pred(wire).then(|| s19k_compact_tx_hex(wire)))
+    })
+}
+
+/// First occupied slot among the live410 retry set. Occupancy-only —
+/// not leftover proof. Leftover class/dump must use
+/// [`s19k_first_tx_hex_where`] with a compact-TX meet predicate.
+pub fn s19k_first_occupied_tx_hex(store: &S19kOutstandingFillTx, slots: &[u8]) -> String {
+    s19k_first_tx_hex_where(store, slots, |_| true).unwrap_or_default()
+}
+
+/// leftover_hit and dump `retired_tx_meets` must describe the same wire.
+pub fn s19k_leftover_class_matches_retired_tx(
+    class: crate::S19kPostCleanNonceClass,
+    retired_tx_meets: bool,
+) -> bool {
+    matches!(class, crate::S19kPostCleanNonceClass::LeftoverPreClean) == retired_tx_meets
+}
+
+/// leftover_hit is true only when a retired 21 36 wire in `store` satisfies
+/// `pred` (the same compact-TX meet the dump uses).
+pub fn s19k_leftover_hit_from_retired_store(
+    store: &S19kOutstandingFillTx,
+    slots: &[u8],
+    pred: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    s19k_first_tx_hex_where(store, slots, pred).is_some()
+}
+
+pub fn classify_s19k_post_clean_from_retired_tx_hit(
+    new_meets: bool,
+    retired_tx_hit: bool,
+) -> crate::S19kPostCleanNonceClass {
+    crate::classify_s19k_post_clean_nonce(new_meets, retired_tx_hit)
+}
+
+/// Constructed ESP-overlay hypothesis: `work_id | (small_core & 0x07)`.
+/// This is not Braiins fill semantics and must not be used for production
+/// encode/decode; fill log0 consumes the complete byte as work-id.
 pub fn s19k_fill_job_byte_or_small_core(work_id: u8, small_core: u8) -> u8 {
     work_id | (small_core & BM1366_SMALL_CORE_MASK)
+}
+
+pub fn refuse_s19k_fill_job_byte_or_small_core_as_braiins() -> Result<(), &'static str> {
+    Err("Braiins fill payload[5] is the complete work-id; ESP low3 small-core overlay is unproven")
+}
+
+/// live410: 932 ticket-256 nonces / 1 pool-8192 share. Raw fill job-id hunt
+/// hits some outstanding slot (so the nonce is counted) but the chip often
+/// hashed a different slot (core bits / <<3). Retry these after the raw miss.
+pub fn s19k_track1_job_id_retry_slots(raw_job_byte: u8) -> [u8; 3] {
+    [
+        raw_job_byte,
+        raw_job_byte & BM1366_JOB_ID_MASK,
+        raw_job_byte >> 3,
+    ]
+}
+
+pub fn admit_s19k_track1_job_id_retry_slots(raw: u8) -> Result<(), &'static str> {
+    let slots = s19k_track1_job_id_retry_slots(raw);
+    if slots[0] != raw {
+        return Err("first retry slot must be the raw fill job byte");
+    }
+    if slots[1] != (raw & BM1366_JOB_ID_MASK) {
+        return Err("second retry slot must be ESP id&0xF8");
+    }
+    if slots[2] != (raw >> 3) {
+        return Err("third retry slot must be slot<<3 inverse");
+    }
+    Ok(())
+}
+
+/// Production submit must retry live410 wrong-slot job_ids.
+pub fn admit_s19k_production_retries_track1_job_id_slots(src: &str) -> Result<(), &'static str> {
+    if !src.contains("s19k_track1_job_id_retry_slots") {
+        return Err("serial_mining must call s19k_track1_job_id_retry_slots");
+    }
+    if !src.contains("live410: also try ESP 0xF8 and >>3") {
+        return Err("serial_mining must name the live410 job-id retry");
+    }
+    Ok(())
 }
 
 /// Braiins fill log 0: `FUN_0091c0a0` work_id is `payload[5] >> 0` = raw byte.
@@ -450,9 +729,7 @@ pub fn s19k_fill_lookup_tx_esp_overlay_experimental<'a>(
 }
 
 pub fn refuse_s19k_fill_overlay_f8_as_fun_0091c0a0() -> Result<(), &'static str> {
-    Err(
-        "FUN_0091c0a0 fill work_id is payload[5]>>log; log 0 is the raw byte, not id&0xF8 overlay",
-    )
+    Err("FUN_0091c0a0 fill work_id is payload[5]>>log; log 0 is the raw byte, not id&0xF8 overlay")
 }
 
 pub fn admit_s19k_fill_lookup_uses_raw_job_byte(
@@ -495,7 +772,24 @@ pub fn hunt_s19k_bm1366_fill_from_tagged_slot(
     body: Option<&[u8]>,
     outstanding: &S19kOutstandingFillTx,
 ) -> Result<S19kBm1366Share, &'static str> {
-    crate::s19k_braiins_chain_discover::refuse_s3_rx_as_fill_hunt(path)?;
+    hunt_s19k_bm1366_fill_from_admitted_tx_path(
+        path,
+        body,
+        outstanding,
+        crate::s19k_uart_trans_job::BRAIINS_TTYS_CANDIDATES,
+    )
+}
+
+/// Fill-hunt using the runtime's evidence-derived work-TX path set. The same
+/// logical UART that received the work must own the response; ttyS3 is valid
+/// only after complete CRC-valid enumeration promoted it into that set.
+pub fn hunt_s19k_bm1366_fill_from_admitted_tx_path(
+    path: &str,
+    body: Option<&[u8]>,
+    outstanding: &S19kOutstandingFillTx,
+    work_tx_paths: &[&str],
+) -> Result<S19kBm1366Share, &'static str> {
+    crate::s19k_braiins_chain_discover::admit_s19k_fill_hunt_on_tx_path(path, work_tx_paths)?;
     let obs = crate::s19k_braiins_chain_discover::observe_s19k_tagged_rx_body(path, body, 10)?;
     match &obs {
         S19kUartRxObservation::Frames { frames, .. }
@@ -507,7 +801,9 @@ pub fn hunt_s19k_bm1366_fill_from_tagged_slot(
         }
         _ => return Err("tagged RX is not JobNonce (framing/echo/short/chip)"),
     }
-    let body = body.filter(|b| !b.is_empty()).ok_or("tagged RX body empty")?;
+    let body = body
+        .filter(|b| !b.is_empty())
+        .ok_or("tagged RX body empty")?;
     if body.len() != BM1366_UART_RESP_BODY_LEN {
         return Err("BM1366 fill body must be 9");
     }
@@ -524,6 +820,59 @@ pub fn hunt_s19k_bm1366_fill_from_tagged_slot(
     Ok(share)
 }
 
+/// live433: 199 correlate_fail never checked retired 21 36. After a
+/// mid-run clean, an outstanding miss that correlates on the retired
+/// store is leftover, not a framing miss.
+pub fn s19k_hunt_retired_after_outstanding_miss(outstanding_miss: bool, retired_hit: bool) -> bool {
+    outstanding_miss && retired_hit
+}
+
+/// Hunt retired 21 36 after an outstanding miss even when the
+/// post-clean funnel is not armed. Wrap-retire leftover (same job_id
+/// overwrite before the first pool clean) is occupied leftover.
+pub fn s19k_track1_hunt_retired_without_funnel(funnel_armed: bool) -> bool {
+    let _ = funnel_armed;
+    true
+}
+
+/// leftover_hit increments on a retired 21 36 meet even when the
+/// funnel is not yet armed. First-fill `meets` stay funnel-only so
+/// leftover-admitted inactive is not blocked by session-start shares.
+pub fn s19k_track1_count_wrap_retire_leftover(funnel_armed: bool) -> bool {
+    let _ = funnel_armed;
+    true
+}
+
+/// Submit of wrap-retired leftover is refused the same as post-clean
+/// leftover. `true` means submit is allowed.
+pub fn s19k_track1_refuse_wrap_retired_submit(retired_tx_meets: bool) -> bool {
+    !retired_tx_meets
+}
+
+/// Production nonce path must hunt `retired_s19k_tx` after the
+/// outstanding miss (live433 leftover_hit=0 with 199 correlate_fail)
+/// and count wrap-retire leftover without waiting for a pool clean.
+pub fn admit_s19k_production_hunts_retired_after_outstanding_miss(
+    src: &str,
+) -> Result<(), &'static str> {
+    if !src.contains("live433: outstanding miss hunts retired 21 36") {
+        return Err("outstanding miss must hunt retired_s19k_tx (live433 leftover_hit=0 / correlate_fail=199)");
+    }
+    if !src.contains("S19k leftover 21 36 via retired store") {
+        return Err("retired hunt must log leftover 21 36 via retired store");
+    }
+    if !src.contains("s19k_track1_hunt_retired_without_funnel") {
+        return Err("retired hunt after outstanding miss must not wait for funnel arm");
+    }
+    if !src.contains("s19k_track1_count_wrap_retire_leftover") {
+        return Err("wrap-retire leftover_hit must increment without funnel arm");
+    }
+    if !src.contains("s19k_track1_refuse_wrap_retired_submit") {
+        return Err("wrap-retired leftover submit must be refused the same as post-clean leftover");
+    }
+    Ok(())
+}
+
 /// A 32-deep FIFO is not an S19k outstanding-TX table.
 pub fn refuse_s19k_fifo32_wrap_as_outstanding_table() -> Result<(), &'static str> {
     Err(
@@ -531,7 +880,8 @@ pub fn refuse_s19k_fifo32_wrap_as_outstanding_table() -> Result<(), &'static str
     )
 }
 
-/// UART send queue must cover the 256-slot fill outstanding table.
+/// Outstanding TX table must stay 256. This is not the UART send-queue depth
+/// (live408 256-deep drop-oldest burned job_ids at ~40 Hz).
 pub fn admit_s19k_uart_queue_covers_fill_slots(depth: usize) -> Result<(), &'static str> {
     if depth < S19K_FILL_TX_SLOTS {
         return Err(
@@ -541,6 +891,18 @@ pub fn admit_s19k_uart_queue_covers_fill_slots(depth: usize) -> Result<(), &'sta
     Ok(())
 }
 
+/// UART TX hold must be 2–4 so take_dispatch is paced by the actor, not 40 Hz.
+pub fn admit_s19k_bm1366_hold_queue_uart_paced(depth: usize) -> Result<(), &'static str> {
+    if depth < 2 || depth > 4 {
+        return Err("BM1366 UART hold queue must be 2-4 so take_dispatch is UART-paced (live408)");
+    }
+    Ok(())
+}
+
+pub fn refuse_s19k_live408_256_drop_oldest_as_hold() -> Result<(), &'static str> {
+    Err("live408 256-deep drop-oldest UART queue is not a Track-1 hold")
+}
+
 pub fn refuse_s19k_uart_queue16_as_fill_depth(depth: usize) -> Result<(), &'static str> {
     if depth == 16 {
         return Err("16-deep UART queue is not the 256-slot fill outstanding table");
@@ -548,7 +910,7 @@ pub fn refuse_s19k_uart_queue16_as_fill_depth(depth: usize) -> Result<(), &'stat
     Ok(())
 }
 
-/// Production `run()` must select BM1366_SERIAL_WORK_QUEUE_DEPTH, not default 16.
+/// Production `run()` must select the 4-slot hold, not fill-256 drop-oldest.
 pub fn admit_s19k_production_bm1366_queue_covers_fill_slots(src: &str) -> Result<(), &'static str> {
     let Some(start) = src.find("let work_queue_depth = if is_bm1362") else {
         return Err("missing work_queue_depth selection");
@@ -563,10 +925,66 @@ pub fn admit_s19k_production_bm1366_queue_covers_fill_slots(src: &str) -> Result
     if win.contains("is_bm1366 {\n            DEFAULT_SERIAL_WORK_QUEUE_DEPTH") {
         return Err("BM1366 must not use DEFAULT_SERIAL_WORK_QUEUE_DEPTH 16");
     }
+    if src.contains("s19k_bm1366_share::S19K_FILL_TX_SLOTS")
+        && src.contains("const BM1366_SERIAL_WORK_QUEUE_DEPTH: usize =\n    dcentrald_common::s19k_bm1366_share::S19K_FILL_TX_SLOTS")
+    {
+        return Err("BM1366 UART queue must not be S19K_FILL_TX_SLOTS (live408 drop-oldest)");
+    }
+    if !src.contains("S19K_BM1366_HOLD_QUEUE_DEPTH") {
+        return Err("BM1366 UART queue must be S19K_BM1366_HOLD_QUEUE_DEPTH");
+    }
     Ok(())
 }
 
+/// live408: take_dispatch before UART send burned job_ids. Hold first.
+pub fn admit_s19k_production_bm1366_holds_before_take_dispatch(
+    src: &str,
+) -> Result<(), &'static str> {
+    let start = src
+        .find("_ = dispatch_timer.tick()")
+        .ok_or("missing dispatch_timer tick")?;
+    let win = src.get(start..start.saturating_add(3200)).unwrap_or("");
+    let hold = win
+        .find("S19k Track-1 hold")
+        .ok_or("dispatch_timer must hold BM1366 when UART queue is full")?;
+    let take = win
+        .find("take_dispatch()")
+        .ok_or("dispatch_timer must take_dispatch after hold")?;
+    if hold > take {
+        return Err("BM1366 must hold before take_dispatch (live408 job_id burn)");
+    }
+    if !src.contains("refuse live408 drop-oldest") {
+        return Err("BM1366 push must refuse live408 drop-oldest");
+    }
+    Ok(())
+}
+
+/// Leftover rails-up on `.88` must hold PWM 100 (home PWM 30 cooks boards).
+pub const S19K_TRACK1_LEFTOVER_FAN_PWM: u8 = 100;
+/// `.88` seated BHB56903 slots 2+3 (physical 2+3; slot 1 empty).
+pub const S19K_LIVE88_SEATED_TMP75_SLOTS: [bool; 3] = [false, true, true];
+
+/// Thermal coverage starts from the freshly bound live-hardware profile, not
+/// from logical UART count. This matters for the held `a lab unit` profile: all three
+/// boards remain physically populated even when only ttyS1+ttyS2 are admitted
+/// for work TX, and inherited rails can leave the third board hot.
+///
+/// A dynamically promoted ttyS3 still escalates to all three TMP75 pairs. That
+/// is a fail-closed response to serial evidence outside the `.88` two-board
+/// profile, not a tty-to-physical-slot mapping claim.
+pub fn s19k_track1_required_tmp75_slots(
+    profile_seated_slots: [bool; 3],
+    active_tx_paths: &[&str],
+) -> [bool; 3] {
+    if active_tx_paths.contains(&BRAIINS_TTYS_THIRD) {
+        [true, true, true]
+    } else {
+        profile_seated_slots
+    }
+}
+
 /// Track-1 must not OR the Braiins handoff into thermal_proof_present.
+/// Ready requires the Track-1 TMP75+fan owner, not the leftover flag.
 pub fn admit_s19k_track1_thermal_handoff_unowned(src: &str) -> Result<(), &'static str> {
     let Some(start) = src.find("let thermal_proof_present =") else {
         return Err("missing thermal_proof_present");
@@ -577,8 +995,14 @@ pub fn admit_s19k_track1_thermal_handoff_unowned(src: &str) -> Result<(), &'stat
     if win.contains("braiins_bm1366_passthrough_handoff") {
         return Err("thermal_proof_present must not include Braiins handoff as Ready");
     }
+    if !src.contains("s19k_track1_thermal") {
+        return Err("Track-1 must own TMP75+fans (s19k_track1_thermal) for Ready");
+    }
+    if !src.contains("GPIO437 not written") {
+        return Err("Track-1 thermal Ready must keep GPIO437 unread-for-write");
+    }
     if !src.contains("ThermalSafetyState::HandoffUnowned") {
-        return Err("Track-1 must set HandoffUnowned, not invent Ready");
+        return Err("Track-1 must keep HandoffUnowned as the no-owner fallback");
     }
     if !src.contains("thermal HandoffUnowned (not Ready)") {
         return Err("Track-1 must log HandoffUnowned is not Ready");
@@ -587,7 +1011,88 @@ pub fn admit_s19k_track1_thermal_handoff_unowned(src: &str) -> Result<(), &'stat
 }
 
 pub fn refuse_s19k_track1_handoff_as_thermal_ready() -> Result<(), &'static str> {
-    Err("Track-1 Braiins passthrough is thermal HandoffUnowned, not Ready")
+    Err("Braiins handoff flag alone is not thermal Ready")
+}
+
+pub fn refuse_s19k_track1_pwm30_as_leftover_ready() -> Result<(), &'static str> {
+    Err("PWM 30 home cap is not leftover-rails-up Ready")
+}
+
+/// Classify Track-1 leftover thermal from measured seated TMP75 + commanded PWM.
+/// Does not invent Ready from constants or the Braiins handoff flag.
+pub fn classify_s19k_track1_thermal(
+    seated_inlet_outlet_c: &[(f32, f32)],
+    fan_pwm: u8,
+    gpio437_written: bool,
+    dangerous_temp_c: u8,
+    hysteresis_c: u8,
+) -> crate::work_dispatch_safety::ThermalSafetyState {
+    use crate::work_dispatch_safety::{measured_startup_thermal_state, ThermalSafetyState};
+    if gpio437_written {
+        return ThermalSafetyState::Emergency;
+    }
+    if fan_pwm != S19K_TRACK1_LEFTOVER_FAN_PWM {
+        return ThermalSafetyState::NotReady;
+    }
+    if seated_inlet_outlet_c.len() < 2 {
+        return ThermalSafetyState::NotReady;
+    }
+    let mut hottest = f32::NEG_INFINITY;
+    for (inlet, outlet) in seated_inlet_outlet_c {
+        if !inlet.is_finite() || !outlet.is_finite() {
+            return ThermalSafetyState::NotReady;
+        }
+        hottest = hottest.max(*inlet).max(*outlet);
+    }
+    measured_startup_thermal_state(Some(hottest), dangerous_temp_c, hysteresis_c)
+}
+
+pub fn admit_s19k_track1_thermal_ready(
+    seated_inlet_outlet_c: &[(f32, f32)],
+    fan_pwm: u8,
+    gpio437_written: bool,
+    dangerous_temp_c: u8,
+    hysteresis_c: u8,
+) -> Result<crate::work_dispatch_safety::ThermalSafetyState, &'static str> {
+    use crate::work_dispatch_safety::ThermalSafetyState;
+    if gpio437_written {
+        return Err("Track-1 thermal must not write GPIO437");
+    }
+    if fan_pwm != S19K_TRACK1_LEFTOVER_FAN_PWM {
+        return Err("Track-1 leftover rails-up must hold fan PWM 100");
+    }
+    if seated_inlet_outlet_c.len() < 2 {
+        return Err("Track-1 .88 seated slots 2+3 need inlet/outlet pairs");
+    }
+    let state = classify_s19k_track1_thermal(
+        seated_inlet_outlet_c,
+        fan_pwm,
+        gpio437_written,
+        dangerous_temp_c,
+        hysteresis_c,
+    );
+    if state != ThermalSafetyState::Ready {
+        return Err("Track-1 thermal is not Ready");
+    }
+    Ok(state)
+}
+
+pub fn admit_s19k_production_construction_serial_work(
+    desc: &crate::BoardDesc,
+) -> Result<(), &'static str> {
+    if desc.board_target != "am3-s19k" {
+        return Err("production construction pin is am3-s19k");
+    }
+    if desc.work_engine != crate::WorkEngineKind::SerialWork {
+        return Err("am3-s19k production construction must be SerialWork");
+    }
+    if !desc.runtime_status.permits_mining_lane() {
+        return Err("am3-s19k production construction must permit a mining lane");
+    }
+    if desc.asic_protocol != crate::AsicProtocolIdentity::Bm1366 {
+        return Err("am3-s19k production construction must stay BM1366");
+    }
+    Ok(())
 }
 
 /// BM1366 must TX-before-RX so the 256-deep queue drains before VTIME read.
@@ -598,14 +1103,24 @@ pub fn admit_s19k_production_bm1366_tx_before_rx(src: &str) -> Result<(), &'stat
     Ok(())
 }
 
-/// Leftover init_bm1366_chain must env-gate experimental use.
-pub fn admit_s19k_init_bm1366_requires_experimental_env(src: &str) -> Result<(), &'static str> {
+/// The per-UART BM1366 initializer must accept only already-promoted custody.
+pub fn admit_s19k_init_bm1366_requires_private_owner(src: &str) -> Result<(), &'static str> {
     let Some(start) = src.find("fn init_bm1366_chain(") else {
         return Err("missing init_bm1366_chain");
     };
     let win = src.get(start..start.saturating_add(2500)).unwrap_or("");
-    if !win.contains("DCENT_S19K_EXPERIMENTAL_INIT_BM1366") {
-        return Err("leftover init_bm1366_chain must require DCENT_S19K_EXPERIMENTAL_INIT_BM1366=1");
+    for required in [
+        "serial: &ValidatedSerialBackend",
+        "native_program: &S19kBm1366NativeExecutionProgram",
+    ] {
+        if !win.contains(required) {
+            return Err("BM1366 initializer must accept only typed promoted custody");
+        }
+    }
+    for forbidden in ["ExperimentalConfig::load()", "SerialChainBackend::open("] {
+        if win.contains(forbidden) {
+            return Err("BM1366 initializer must not mint or bypass native custody");
+        }
     }
     Ok(())
 }
@@ -618,13 +1133,12 @@ pub fn refuse_constructed_fill_hal_body7_wire_as_share(
 ) -> Result<(), &'static str> {
     use crate::s19k_bm1366_uart_rx::{bm1366_fill_job_nonce_uart, s19k_hal_body7_wire_cut};
     let rx = bm1366_fill_job_nonce_uart(raw_job);
-    let cut = s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
+    let cut =
+        s19k_hal_body7_wire_cut(&rx).ok_or("constructed fill nonce shorter than body-7 cut")?;
     match hunt_s19k_bm1366_fill_from_tagged_outstanding(path, Some(cut), outstanding) {
         Ok(_) => Ok(()),
         Err(e)
-            if e.contains("framing")
-                || e.contains("not JobNonce")
-                || e.contains("must be 9") =>
+            if e.contains("framing") || e.contains("not JobNonce") || e.contains("must be 9") =>
         {
             Err("constructed fill HAL body-7 wire cut is framing, not a share or Silence")
         }
@@ -648,9 +1162,7 @@ pub fn refuse_constructed_fill_hal_body7_extract_as_share(
     match hunt_s19k_bm1366_fill_from_tagged_slot(path, Some(bodies[0].as_slice()), slots) {
         Ok(_) => Ok(()),
         Err(e)
-            if e.contains("must be 9")
-                || e.contains("framing")
-                || e.contains("not JobNonce") =>
+            if e.contains("must be 9") || e.contains("framing") || e.contains("not JobNonce") =>
         {
             Err("constructed fill HAL body-7 extract is not a share")
         }
@@ -664,9 +1176,7 @@ pub fn admit_constructed_fill_hal_body9_extract_hunts(
     raw_job: u8,
     slots: &S19kOutstandingFillTx,
 ) -> Result<S19kBm1366Share, &'static str> {
-    use crate::s19k_bm1366_uart_rx::{
-        bm1366_fill_job_nonce_uart, extract_s19k_hal_bm1366_bodies,
-    };
+    use crate::s19k_bm1366_uart_rx::{bm1366_fill_job_nonce_uart, extract_s19k_hal_bm1366_bodies};
     let rx = bm1366_fill_job_nonce_uart(raw_job);
     let bodies = extract_s19k_hal_bm1366_bodies(&rx);
     if bodies.len() != 1 || bodies[0].len() != BM1366_UART_RESP_BODY_LEN {
@@ -812,9 +1322,8 @@ pub fn admit_s19k_constructed_fill_hunts_and_headers() -> Result<[u8; 80], &'sta
 
 /// Asymmetric stratum prev. `[0x11; 32]` is invariant under both reverses.
 pub const S19K_STRATUM_PREV_ASYM: [u8; 32] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-    0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
-    0x1E, 0x1F,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
 ];
 
 /// WorkBuilder / `serial_build_header` prev: per-word byte swap of stratum.
@@ -874,9 +1383,7 @@ pub fn refuse_s19k_wire_word_reverse_as_fill_header() -> Result<(), &'static str
 }
 
 /// Production `serial_build_header` copies WorkEntry prev/merkle, not wire reverse.
-pub fn admit_s19k_production_header_uses_workentry_prev(
-    src: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_production_header_uses_workentry_prev(src: &str) -> Result<(), &'static str> {
     let Some(fn_start) = src.find("fn serial_build_header(") else {
         return Err("serial_build_header missing");
     };
@@ -896,7 +1403,9 @@ pub fn admit_s19k_production_header_uses_workentry_prev(
     Ok(())
 }
 
-pub fn refuse_constructed_fill_header_as_bip320_strip(header: &[u8; 80]) -> Result<(), &'static str> {
+pub fn refuse_constructed_fill_header_as_bip320_strip(
+    header: &[u8; 80],
+) -> Result<(), &'static str> {
     let stripped = crate::s19k_braiins_job::refuse_bip320_strip_as_braiins_fill_ver0(
         S19K_CONSTRUCTED_FILL_BASE_VERSION,
         0,
@@ -909,8 +1418,8 @@ pub fn refuse_constructed_fill_header_as_bip320_strip(header: &[u8; 80]) -> Resu
 
 /// Production BM1366 hunt must pass the 9-byte UART body, not HAL default 7.
 pub fn admit_s19k_production_hunt_uses_body9(src: &str) -> Result<(), &'static str> {
-    if !src.contains("hunt_s19k_bm1366_fill_from_tagged_slot") {
-        return Err("production hunter must call hunt_s19k_bm1366_fill_from_tagged_slot");
+    if !src.contains("hunt_s19k_bm1366_fill_from_admitted_tx_path") {
+        return Err("production hunter must call the admitted-TX-path fill parser");
     }
     if !src.contains("Some(&resp[..9])") {
         return Err("production BM1366 hunt must pass Some(&resp[..9])");
@@ -1012,12 +1521,9 @@ pub fn refuse_s19k_skip_bm1366_open_first_read_at_7(
     used_bm1366_open: bool,
     body_len: usize,
 ) -> Result<(), &'static str> {
-    if !used_bm1366_open
-        && body_len == crate::s19k_bm1366_uart_rx::BM139X_HAL_DEFAULT_RESP_BODY_LEN
+    if !used_bm1366_open && body_len == crate::s19k_bm1366_uart_rx::BM139X_HAL_DEFAULT_RESP_BODY_LEN
     {
-        return Err(
-            "skipping open_passthrough_bm1366 leaves first-read at HAL DEFAULT 7",
-        );
+        return Err("skipping open_passthrough_bm1366 leaves first-read at HAL DEFAULT 7");
     }
     Ok(())
 }
@@ -1026,8 +1532,7 @@ pub fn refuse_s19k_skip_bm1366_open_first_read_at_7(
 pub fn admit_s19k_production_requires_body9_before_first_read(
     src: &str,
 ) -> Result<(), &'static str> {
-    let Some(open) = src.find("SerialChainBackend::open_passthrough_bm1366(i as u8, path)")
-    else {
+    let Some(open) = src.find("SerialChainBackend::open_passthrough_bm1366(i as u8, path)") else {
         return Err("missing Track-1 open_passthrough_bm1366");
     };
     let win = src.get(open..open.saturating_add(1800)).unwrap_or("");
@@ -1047,27 +1552,92 @@ pub fn admit_s19k_production_requires_body9_before_first_read(
     Ok(())
 }
 
-/// `init_bm1366_chain` (experimental leftover) must require body 9 before flush.
+/// Native BM1366 cold init must consume a validated backend and require body 9
+/// before its first flush/read. Raw UART open belongs only to the exact
+/// multi-UART route promotion fence.
 pub fn admit_s19k_init_bm1366_requires_body9_before_flush(src: &str) -> Result<(), &'static str> {
     let Some(start) = src.find("fn init_bm1366_chain(") else {
         return Err("missing init_bm1366_chain");
     };
-    let rest = src.get(start..start.saturating_add(2500)).unwrap_or("");
-    let Some(open_at) = rest.find("SerialChainBackend::open(0, serial_device, 115_200)") else {
-        return Err("init_bm1366_chain must open at 115200");
-    };
-    let after_open = rest.get(open_at..).unwrap_or("");
-    let Some(req_at) = after_open.find("require_bm1366_response_body") else {
+    let after_start = src.get(start..).unwrap_or("");
+    let end = after_start
+        .get(1..)
+        .and_then(|tail| tail.find("fn init_bm1370_chain(").map(|offset| offset + 1))
+        .unwrap_or(after_start.len());
+    let rest = after_start.get(..end).unwrap_or(after_start);
+    if !rest.contains("serial: &ValidatedSerialBackend") {
+        return Err("init_bm1366_chain must consume a validated serial backend");
+    }
+    if rest.contains("SerialChainBackend::open(") || rest.contains("reset_asic_baud(") {
+        return Err("init_bm1366_chain must not reopen or hot-reset a raw UART");
+    }
+    let Some(req_at) = rest.find("require_bm1366_response_body") else {
         return Err("init_bm1366_chain must require_bm1366_response_body");
     };
-    let Some(flush_at) = after_open.find("flush_io") else {
+    let Some(flush_at) = rest.find("flush_io") else {
         return Err("init_bm1366_chain must still flush_io");
     };
     if flush_at < req_at {
         return Err("init_bm1366_chain must require body 9 before flush_io");
     }
-    if !after_open.contains("set_response_len(BM1366_UART_RESP_BODY_LEN)") {
+    if !rest.contains("set_response_len(BM1366_UART_RESP_BODY_LEN)") {
         return Err("init_bm1366_chain must set BM1366_UART_RESP_BODY_LEN, not a generic 9");
+    }
+    Ok(())
+}
+
+/// The experimental native executor must cross the exact held-stock BM1366
+/// ASIC/host baud pair and obtain a fresh admitted response before any
+/// per-chip tail. This remains an offline/runtime-shape gate, not production
+/// authority; `run()` must continue to refuse the executor separately.
+pub fn admit_s19k_init_bm1366_requires_fresh_switched_baud_response(
+    src: &str,
+) -> Result<(), &'static str> {
+    let Some(start) = src.find("fn init_bm1366_chain(") else {
+        return Err("missing init_bm1366_chain");
+    };
+    let end = src[start + 1..]
+        .find("fn init_bm1370_chain(")
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(src.len());
+    let init = &src[start..end];
+    for required in [
+        "s19k_bm1366_native_execution_program(",
+        "fn init_bm1366_chains(",
+        "ValidatedS19kBm1366NativeMultiBackend",
+        "for (path, backend) in serial.iter()",
+        "native_program.pre_baud_commands",
+        "native_program.fast_uart_command",
+        "set_baud(native_program.fast_host_baud)",
+        "native BM1366 post-baud anti-staleness flush failed",
+        "Bm1366NativePostBaudAdmission::from_response_window",
+        "native_program.post_baud_commands",
+        "native_program.final_commands",
+        "terminal rollback required before per-chip mutation or work TX",
+    ] {
+        if !init.contains(required) {
+            return Err("native BM1366 executor is missing an exact switched-baud response gate");
+        }
+    }
+    if init.contains("PUBLIC_FASTUART_VALUE") {
+        return Err("native BM1366 executor must not use the ESP 1M FastUART word");
+    }
+    let asic_switch = init
+        .find("native_program.fast_uart_command")
+        .ok_or("missing typed exact BM1366 ASIC FastUART command")?;
+    let host_switch = init
+        .find("set_baud(native_program.fast_host_baud)")
+        .ok_or("missing exact S19k host baud switch")?;
+    let fresh_gate = init
+        .find("Bm1366NativePostBaudAdmission::from_response_window")
+        .ok_or("missing fresh post-baud admission")?;
+    let per_chip = init
+        .find("native_program.post_baud_commands")
+        .ok_or("missing typed BM1366 per-chip tail")?;
+    if !(asic_switch < host_switch && host_switch < fresh_gate && fresh_gate < per_chip) {
+        return Err(
+            "native BM1366 per-chip tail is not gated after the exact switched-baud response",
+        );
     }
     Ok(())
 }
@@ -1090,7 +1660,8 @@ pub fn admit_s19k_init_bm1366_omits_esp_a4(src: &str) -> Result<(), &'static str
     Ok(())
 }
 
-/// Production `run()` must not call the leftover init_bm1366_chain.
+/// Production `run()` must use the population-scoped native initializer and
+/// must not call the leftover single-backend initializer directly.
 pub fn admit_s19k_production_run_skips_init_bm1366_chain(src: &str) -> Result<(), &'static str> {
     let Some(run_start) = src.find("pub async fn run(&mut self)") else {
         return Err("missing production run()");
@@ -1102,6 +1673,9 @@ pub fn admit_s19k_production_run_skips_init_bm1366_chain(src: &str) -> Result<()
     let run = &src[run_start..run_end];
     if run.contains("Self::init_bm1366_chain(") {
         return Err("production run() must not call init_bm1366_chain");
+    }
+    if !run.contains("Self::init_bm1366_chains(native_backends, target_freq)") {
+        return Err("production run() must call the typed population-scoped initializer");
     }
     Ok(())
 }
@@ -1126,32 +1700,101 @@ pub fn admit_s19k_nopic_observation_refuses_bm1366(src: &str) -> Result<(), &'st
     Ok(())
 }
 
-/// Hot-start baud-wake (only BM1366 leftover caller) must set body 9 before spray.
-pub fn admit_s19k_hotstart_baud_requires_body9_before_spray(
-    src: &str,
-) -> Result<(), &'static str> {
-    let Some(start) = src.find("fn reset_asic_baud(serial_device: &str)") else {
-        return Err("missing serial_mining reset_asic_baud");
-    };
-    let win = src.get(start..start.saturating_add(1800)).unwrap_or("");
-    let Some(open_at) = win.find("SerialChainBackend::open(0, serial_device, stage.baud)")
-    else {
-        return Err("reset_asic_baud must open each stage baud");
-    };
-    let after = win.get(open_at..).unwrap_or("");
-    let Some(req_at) = after.find("require_bm1366_response_body") else {
-        return Err("reset_asic_baud must require_bm1366_response_body after open");
-    };
-    let spray_at = after
-        .find("send_chain_inactive")
-        .or_else(|| after.find("Hot-start baud-wake stage"));
-    if let Some(s) = spray_at {
-        if s < req_at {
-            return Err("reset_asic_baud must require body 9 before TX spray");
+/// Native BM1366 custody must be an exact selected population, single-fence
+/// route whose pre-serial token has no caller-selected constructor.
+pub fn admit_s19k_native_multi_uart_route_is_fenced(src: &str) -> Result<(), &'static str> {
+    let production = src
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or(src);
+    for required in [
+        "ExactSerialRoute::S19kNative",
+        "struct S19kNativePreSerialAdmission {",
+        "fn promote_s19k_native_multi_execution(",
+        "admit_s19k_native_multi_uart_shape(",
+        "S19k native exact multi-UART open",
+        "ValidatedSerialBackend::new(backend, execution.clone())",
+        "ValidatedS19kBm1366NativeMultiBackend",
+        "fn issue_pre_serial(&mut self)",
+    ] {
+        if !production.contains(required) {
+            return Err("native S19k multi-UART route is missing exact fenced custody");
         }
     }
-    if !after.contains("set_response_len(BM1366_UART_RESP_BODY_LEN)") {
-        return Err("reset_asic_baud must set BM1366 body 9 after open");
+    if production.contains("pub struct S19kNativePreSerialAdmission") {
+        return Err("native S19k pre-serial authority must remain private");
+    }
+    Ok(())
+}
+
+/// Native S19k platform admission selects an ordered subset of the immutable
+/// controller-facing route from the fresh plug bitmap. The read-only aggregate
+/// must not expose APW/reset/PWM mutation; only the opaque population promotion
+/// may own those operations.
+pub fn admit_s19k_native_aggregate_platform_admission(
+    hal: &str,
+    serial: &str,
+) -> Result<(), &'static str> {
+    for required in [
+        "pub const S19K_NATIVE_LOGICAL_CHAIN_ROUTES:",
+        "pub struct S19kNativeLogicalChainRoute",
+        "uart: \"/dev/ttyS3\"",
+        "logical_chain: 0",
+        "reset_gpio: 454",
+        "pub struct S19kNativeFanObservation",
+        "pub struct S19kNativeAggregateAdmission",
+        "pub struct S19kNativePopulationAdmission",
+        "validate_amlogic_boot_safe_handoff(AmlogicNoPicProfile::S19k)",
+        "let populated_slots = read_plug_topology_checked()?",
+        "populated_slots[*index] && !uart_available[*index]",
+    ] {
+        if !hal.contains(required) {
+            return Err("native S19k aggregate platform admission is incomplete");
+        }
+    }
+    let start = hal
+        .find("impl S19kNativeAggregateAdmission")
+        .ok_or("missing native S19k aggregate admission implementation")?;
+    let end = hal[start..]
+        .find("impl S19kNativePopulationAdmission")
+        .map(|offset| start + offset)
+        .ok_or("cannot bound native S19k aggregate admission implementation")?;
+    let body = &hal[start..end];
+    if !body.contains("service.psu_enable_operation_available = false")
+        || body.contains("service.psu_enable_operation_available = true")
+        || body.contains("take_psu_enable_operation")
+        || body.contains("set_amlogic_board_reset_checked")
+        || !body.contains("Result<Arc<S19kNativeFanObservation>>")
+        || body.contains("Result<Arc<dyn FanAccess>>")
+    {
+        return Err(
+            "native S19k aggregate admission gained unproven power/reset/PWM/slot authority",
+        );
+    }
+    let observer_start = hal
+        .find("impl S19kNativeFanObservation")
+        .ok_or("missing native S19k fan observation implementation")?;
+    let observer_end = hal[observer_start..]
+        .find("pub struct S19kNativeAggregateAdmission")
+        .map(|offset| observer_start + offset)
+        .ok_or("cannot bound native S19k fan observation implementation")?;
+    let observer = &hal[observer_start..observer_end];
+    if !observer.contains("pub fn get_per_fan_rpm")
+        || !observer.contains("pub fn get_speed_pwm")
+        || observer.contains("pub fn set_speed")
+        || observer.contains("impl FanAccess")
+    {
+        return Err("native S19k fan observation capability gained PWM command authority");
+    }
+    let shape_start = serial
+        .find("fn admit_s19k_native_multi_uart_shape")
+        .ok_or("missing native S19k multi-UART shape gate")?;
+    let shape_end = serial[shape_start..]
+        .find("mod serial_route_domains")
+        .map(|offset| shape_start + offset)
+        .ok_or("cannot bound native S19k multi-UART shape gate")?;
+    if !serial[shape_start..shape_end].contains("S19K_NATIVE_LOGICAL_CHAIN_ROUTES.as_slice()") {
+        return Err("native serial route must consume the HAL logical-chain contract");
     }
     Ok(())
 }
@@ -1165,7 +1808,9 @@ pub fn admit_s19k_am2_hybrid_reset_is_not_bm1366(hybrid_src: &str) -> Result<(),
     let Some(start) = hybrid_src.find("fn reset_asic_baud(serial_device: &str)") else {
         return Err("missing AM2 hybrid reset_asic_baud");
     };
-    let win = hybrid_src.get(start..start.saturating_add(1800)).unwrap_or("");
+    let win = hybrid_src
+        .get(start..start.saturating_add(1800))
+        .unwrap_or("");
     if !win.contains("HotStartHostClass::Zynq") {
         return Err("AM2 hybrid reset_asic_baud must use Zynq hot-start class");
     }
@@ -1346,11 +1991,12 @@ pub fn refuse_s19k_init_bm1362_as_track1_first_read() -> Result<(), &'static str
 
 /// AM2 RANK-5 companion PL-UART is Zynq BM1362 dual-UART, not S19k Track-1.
 pub fn admit_s19k_am2_companion_open_is_not_bm1366(hybrid_src: &str) -> Result<(), &'static str> {
-    let Some(start) = hybrid_src.find("let companion_dev = am2_dual_chain_second_uart()")
-    else {
+    let Some(start) = hybrid_src.find("let companion_dev = am2_dual_chain_second_uart()") else {
         return Err("missing AM2 companion UART open");
     };
-    let win = hybrid_src.get(start..start.saturating_add(2500)).unwrap_or("");
+    let win = hybrid_src
+        .get(start..start.saturating_add(2500))
+        .unwrap_or("");
     if !win.contains("SerialChainBackend::open(0, &companion_dev, 115_200)") {
         return Err("AM2 companion must open companion_dev at 115200");
     }
@@ -1376,7 +2022,9 @@ pub fn admit_s19k_am2_phase3b1_relay_is_not_bm1366(hybrid_src: &str) -> Result<(
     else {
         return Err("missing Phase 3b1-relay SerialChainBackend::open");
     };
-    let win = hybrid_src.get(start..start.saturating_add(1800)).unwrap_or("");
+    let win = hybrid_src
+        .get(start..start.saturating_add(1800))
+        .unwrap_or("");
     if !win.contains("maybe_write_bm1362_uart_relay") {
         return Err("Phase 3b1-relay must write BM1362 UART relay");
     }
@@ -1401,7 +2049,9 @@ pub fn admit_s19k_am2_probe_uart_is_not_bm1366(hybrid_src: &str) -> Result<(), &
     let Some(start) = hybrid_src.find("fn probe_uart_for_chips(") else {
         return Err("missing probe_uart_for_chips");
     };
-    let win = hybrid_src.get(start..start.saturating_add(2500)).unwrap_or("");
+    let win = hybrid_src
+        .get(start..start.saturating_add(2500))
+        .unwrap_or("");
     if !win.contains("BM1362_RESP_BODY_LEN") {
         return Err("AM2 UART probe must set BM1362 response body");
     }
@@ -1429,16 +2079,21 @@ pub fn admit_s19k_am2_init_asic_open_is_not_bm1366(hybrid_src: &str) -> Result<(
     let Some(fn_at) = hybrid_src.find("fn init_asic_chain(") else {
         return Err("missing AM2 init_asic_chain");
     };
-    let head = hybrid_src.get(fn_at..fn_at.saturating_add(800)).unwrap_or("");
+    let head = hybrid_src
+        .get(fn_at..fn_at.saturating_add(800))
+        .unwrap_or("");
     if !head.contains("=== BM1362 ASIC INIT") {
         return Err("AM2 init_asic_chain must name BM1362 ASIC INIT");
     }
     let rest = hybrid_src.get(fn_at..).unwrap_or("");
-    let Some(open_at) = rest.find("let mut serial = SerialChainBackend::open(0, serial_device, 115_200)")
+    let Some(open_at) =
+        rest.find("let mut serial = SerialChainBackend::open(0, serial_device, 115_200)")
     else {
         return Err("AM2 init_asic_chain must open primary UART at 115200");
     };
-    let win = rest.get(open_at..open_at.saturating_add(1500)).unwrap_or("");
+    let win = rest
+        .get(open_at..open_at.saturating_add(1500))
+        .unwrap_or("");
     if !win.contains("am2_post_reset_settle_ms") {
         return Err("AM2 init_asic_chain primary open must settle via am2_post_reset_settle_ms");
     }
@@ -1460,11 +2115,14 @@ pub fn refuse_s19k_am2_init_asic_open_as_track1_first_read() -> Result<(), &'sta
 
 /// AM2 hybrid mining-on passthrough is BM1362 DEFAULT-7 open, not S19k Track-1.
 pub fn admit_s19k_am2_passthrough0_is_not_bm1366(hybrid_src: &str) -> Result<(), &'static str> {
-    let Some(start) = hybrid_src.find("PASSTHROUGH: skipping Phase 1-7 (bosminer owns PIC+chain init)")
+    let Some(start) =
+        hybrid_src.find("PASSTHROUGH: skipping Phase 1-7 (bosminer owns PIC+chain init)")
     else {
         return Err("missing AM2 hybrid passthrough skip");
     };
-    let win = hybrid_src.get(start..start.saturating_add(800)).unwrap_or("");
+    let win = hybrid_src
+        .get(start..start.saturating_add(800))
+        .unwrap_or("");
     if !win.contains("open_passthrough(0, &serial_device)") {
         return Err("AM2 hybrid passthrough must open_passthrough(0)");
     }
@@ -1485,8 +2143,11 @@ pub fn refuse_s19k_am2_passthrough0_as_track1_first_read() -> Result<(), &'stati
 }
 
 pub fn admit_s19k_production_uses_tagged_fill_hunt(src: &str) -> Result<(), &'static str> {
-    if !src.contains("hunt_s19k_bm1366_fill_from_tagged_slot") {
-        return Err("production hunter must call hunt_s19k_bm1366_fill_from_tagged_slot");
+    if !src.contains("hunt_s19k_bm1366_fill_from_admitted_tx_path") {
+        return Err("production hunter must call the admitted-TX-path fill parser");
+    }
+    if !src.contains("admit_s19k_fill_hunt_on_tx_path") {
+        return Err("production hunter must refuse RX paths that did not receive work");
     }
     if !src.contains("S19kOutstandingFillTx") {
         return Err("production must index outstanding fill TX by job-id slot");
@@ -1498,8 +2159,11 @@ pub fn admit_s19k_production_uses_tagged_fill_hunt(src: &str) -> Result<(), &'st
     refuse_esp_bip320_as_braiins_fill_version(src)?;
     refuse_esp_midstate_as_braiins_fill_index(src)?;
     refuse_esp_flags_redrop_after_fill_hunt(src)?;
-    if !src.contains("0u16, // fill log 0") {
-        return Err("production fill arm must pass version_bits_raw = 0 (fill log 0)");
+    if src.contains("0u16, // fill log 0: not ESP BIP320 body[6:7]") {
+        return Err("production fill arm must not zero UART version_be (live407)");
+    }
+    if !src.contains("share.version_bits as u16") {
+        return Err("production fill arm must pass UART version_be into midstate0 OR");
     }
     if !src.contains("0u8, // fill midstates=1") {
         return Err("production fill arm must pass midstate_idx = 0 (fill midstates=1)");
@@ -1516,7 +2180,7 @@ pub fn share_from_uart_frame(
     expected_job_id: u8,
     base_version: u32,
 ) -> Result<S19kBm1366Share, S19kShareError> {
-    let kind = classify_bm1366_uart_rx(frame).map_err(|_| S19kShareError::NotJobNonce)?;
+    let kind = classify_bm1366_uart_rx_checked(frame).map_err(|_| S19kShareError::NotJobNonce)?;
     qualify_bm1366_job_nonce(kind, expected_job_id, base_version)
 }
 
@@ -1530,7 +2194,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn s21_comparative_nonce_reconstructs_share_without_crc_drop() {
+    fn s21_comparative_nonce_reconstructs_after_remainder_zero_admission() {
         // Comparative BM1368 live frame decoded with **BM1366** masks.
         let frame = [
             0xAA, 0x55, 0x60, 0x96, 0x39, 0x4C, 0x02, 0x14, 0x03, 0x04, 0x8E,
@@ -1548,12 +2212,67 @@ mod tests {
         assert_eq!(0x0304u32 << 13, 0x0060_8000);
         assert_eq!(share.version_bits, 0x0304u32 << 13);
         assert_eq!(share.version_bits & 0x0000_8000, 0x0000_8000);
-        assert_eq!(share.rolled_version, reconstruct_rolled_version(base, 0x0304));
+        assert_eq!(
+            share.rolled_version,
+            reconstruct_rolled_version(base, 0x0304)
+        );
+    }
+
+    #[test]
+    fn live407_fill_parse_keeps_uart_version_be() {
+        // live407 Nonce #1 body. Fill log-0 mask would zero 0x00A0 and
+        // hash 434faee1; keeping it feeds midstate0 OR 0x20140000.
+        let body = [0x87, 0xD9, 0x6C, 0x10, 0x00, 0x00, 0x00, 0xA0, 0x94];
+        let share = parse_bm1366_braiins_fill_share_from_body(&body, 0x2000_0000).unwrap();
+        assert_eq!(share.nonce_le, 0x106C_D987);
+        assert_eq!(
+            share.attribution_provenance,
+            S19kBm1366AttributionProvenance::BraiinsDerivedInPhysicalRange
+        );
+        assert!(share.braiins_physical_chip_core().is_some());
+        assert_eq!(share.version_bits, 0x00A0);
+        assert_eq!(
+            crate::s19k_braiins_job::s19k_braiins_midstate0_version(
+                0x2000_0000,
+                share.version_bits as u16
+            ),
+            0x2014_0000
+        );
+        assert_eq!(share.rolled_version, 0x2014_0000);
+        assert_ne!(
+            crate::s19k_braiins_job::s19k_braiins_uart_version_bits(0x00A0, 0).unwrap(),
+            0x00A0
+        );
+    }
+
+    #[test]
+    fn braiins_rounding_tail_is_observable_but_not_physical_identity() {
+        let attr = crate::s19k_bm1366_braiins_nonce::decode_s19k_braiins_bm1366_attribution(
+            u32::from(u16::MAX) << 9,
+        )
+        .unwrap();
+        assert_eq!(attr.asic_index, 77);
+        assert_eq!(
+            s19k_braiins_attribution_provenance(&attr),
+            S19kBm1366AttributionProvenance::BraiinsDerivedOutOfPhysicalRange
+        );
+    }
+
+    #[test]
+    fn s21_comparative_share_follow_on_pins() {
+        let frame = [
+            0xAA, 0x55, 0x60, 0x96, 0x39, 0x4C, 0x02, 0x14, 0x03, 0x04, 0x8E,
+        ];
+        let base = 0x2000_0000u32;
+        let share = share_from_uart_frame(&frame, 0x10, base).unwrap();
         assert_eq!(
             reconstruct_rolled_version(0x2000_0000, 0x0304),
             0x2000_0000 | 0x0060_8000
         );
-        assert_eq!(share.asic_index, share.chip_addr / crate::s19k_bm1366_wire_b::S19K_AML_ADDR_INTERVAL);
+        assert_eq!(
+            share.asic_index,
+            share.chip_addr / crate::s19k_bm1366_wire_b::S19K_AML_ADDR_INTERVAL
+        );
         assert_eq!(crate::s19k_bm1366_wire_b::S19K_AML_ADDR_INTERVAL, 2);
         // Wrong family extract must not be used.
         assert_ne!(refuse_bm1368_job_id_extract(0x14), share.job_id);
@@ -1574,9 +2293,16 @@ mod tests {
         assert_eq!(from_body.nonce_le, share.nonce_le);
         let serial = include_str!("../../dcentrald/src/serial_mining.rs");
         assert!(
-            serial.contains("hunt_s19k_bm1366_fill_from_tagged_slot"),
-            "production BM1366 nonce path must hunt tagged fill against the job-id slot"
+            serial.contains("hunt_s19k_bm1366_fill_from_admitted_tx_path"),
+            "production BM1366 nonce path must bind fill RX to an admitted TX path"
         );
+        assert!(s19k_hunt_retired_after_outstanding_miss(true, true));
+        assert!(!s19k_hunt_retired_after_outstanding_miss(true, false));
+        assert!(s19k_track1_hunt_retired_without_funnel(false));
+        assert!(s19k_track1_count_wrap_retire_leftover(false));
+        assert!(s19k_track1_refuse_wrap_retired_submit(false));
+        assert!(!s19k_track1_refuse_wrap_retired_submit(true));
+        assert!(admit_s19k_production_hunts_retired_after_outstanding_miss(serial).is_ok());
         assert!(serial.contains("else if is_bm1366"));
         assert!(admit_s19k_share_job_id_in_history(true, 0x10).is_ok());
         assert!(admit_s19k_share_job_id_in_history(false, 0x10).is_err());
@@ -1585,8 +2311,8 @@ mod tests {
             "S19k BM1366 must not use ESP 0xF8 history admit"
         );
         assert!(
-            serial.contains("hunt_s19k_bm1366_fill_from_tagged_slot"),
-            "Braiins fill RX must hunt the job-id slot, not a 32-deep FIFO"
+            serial.contains("hunt_s19k_bm1366_fill_from_admitted_tx_path"),
+            "Braiins fill RX must bind the job-id slot to a path that received work"
         );
         assert!(
             admit_s19k_production_uses_tagged_fill_hunt(serial).is_ok(),
@@ -1594,7 +2320,7 @@ mod tests {
         );
         assert!(admit_s19k_production_hunt_uses_body9(serial).is_ok());
         assert!(admit_s19k_production_hunt_uses_body9(
-            "hunt_s19k_bm1366_fill_from_tagged_slot\nSome(&resp[..7])\nBM1366_UART_RESP_BODY_LEN"
+            "hunt_s19k_bm1366_fill_from_admitted_tx_path\nSome(&resp[..7])\nBM1366_UART_RESP_BODY_LEN"
         )
         .is_err());
         assert!(refuse_s19k_production_bm1366_hunt_as_hal_body7().is_err());
@@ -1615,7 +2341,12 @@ mod tests {
         .is_err());
         assert!(admit_s19k_init_bm1366_requires_body9_before_flush(serial).is_ok());
         assert!(admit_s19k_init_bm1366_requires_body9_before_flush(
-            "fn init_bm1366_chain(\nSerialChainBackend::open(0, serial_device, 115_200)\nflush_io\nrequire_bm1366_response_body"
+            "fn init_bm1366_chain(\nserial: &ValidatedSerialBackend\nflush_io\nrequire_bm1366_response_body\nfn init_bm1370_chain("
+        )
+        .is_err());
+        assert!(admit_s19k_init_bm1366_requires_fresh_switched_baud_response(serial).is_ok());
+        assert!(admit_s19k_init_bm1366_requires_fresh_switched_baud_response(
+            "fn init_bm1366_chain(\nBOSMINER_BM1366_FASTUART_REG\nset_baud(BOSMINER_BM1366_AML_HOST_BAUD)\nfor i in 0..chip_count\nfn init_bm1370_chain("
         )
         .is_err());
         assert!(admit_s19k_init_bm1366_omits_esp_a4(serial).is_ok());
@@ -1629,9 +2360,25 @@ mod tests {
             "fn begin_nopic_observation(\nAsicProtocolIdentity::Bm1366\n"
         )
         .is_err());
-        assert!(admit_s19k_hotstart_baud_requires_body9_before_spray(serial).is_ok());
-        assert!(admit_s19k_hotstart_baud_requires_body9_before_spray(
-            "fn reset_asic_baud(serial_device: &str)\nSerialChainBackend::open(0, serial_device, stage.baud)\nsend_chain_inactive"
+        assert!(admit_s19k_native_multi_uart_route_is_fenced(serial).is_ok());
+        const AML_HAL: &str = include_str!("../../dcentrald-hal/src/platform/amlogic/mod.rs");
+        assert!(admit_s19k_native_aggregate_platform_admission(AML_HAL, serial).is_ok());
+        let power_enabled = AML_HAL.replacen(
+            "service.psu_enable_operation_available = false",
+            "service.psu_enable_operation_available = true",
+            1,
+        );
+        assert!(admit_s19k_native_aggregate_platform_admission(&power_enabled, serial).is_err());
+        let remapped = AML_HAL.replacen("uart: \"/dev/ttyS3\"", "uart: \"/dev/ttyS4\"", 1);
+        assert!(admit_s19k_native_aggregate_platform_admission(&remapped, serial).is_err());
+        let pwm_elevated = AML_HAL.replacen(
+            "Result<Arc<S19kNativeFanObservation>>",
+            "Result<Arc<dyn FanAccess>>",
+            1,
+        );
+        assert!(admit_s19k_native_aggregate_platform_admission(&pwm_elevated, serial).is_err());
+        assert!(admit_s19k_native_multi_uart_route_is_fenced(
+            "ExactSerialRoute::S19kNative\nstruct S19kNativePreSerialAdmission {"
         )
         .is_err());
         assert!(refuse_s19k_nopic_probe_as_track1_first_read().is_err());
@@ -1749,7 +2496,7 @@ mod tests {
             "Braiins fill history must not mask 0xF8"
         );
         let fill_frame = [
-            0xAA, 0x55, 0x11, 0x22, 0x33, 0x44, 0x00, 0x02, 0x00, 0x00, 0x80,
+            0xAA, 0x55, 0x11, 0x22, 0x33, 0x44, 0x00, 0x02, 0x00, 0x00, 0x8F,
         ];
         let fill = parse_bm1366_braiins_fill_share_from_body(&fill_frame[2..], base).unwrap();
         assert_eq!(fill.job_id, 2);
@@ -1767,10 +2514,13 @@ mod tests {
         assert_eq!(fill.version_bits, 0);
         assert_eq!(fill.rolled_version, base);
         assert_eq!(fill.midstate_num, 0);
-        let noisy = [0x11, 0x22, 0x33, 0x44, 0x07, 0x02, 0xAB, 0xCD, 0x80];
+        let noisy = [0x11, 0x22, 0x33, 0x44, 0x07, 0x02, 0xAB, 0xCD, 0x81];
         let noisy_fill = parse_bm1366_braiins_fill_share_from_body(&noisy, base).unwrap();
-        assert_eq!(noisy_fill.version_bits, 0);
-        assert_eq!(noisy_fill.rolled_version, base);
+        assert_eq!(noisy_fill.version_bits, 0xABCD);
+        assert_eq!(
+            noisy_fill.rolled_version,
+            crate::s19k_braiins_job::s19k_braiins_midstate0_version(base, 0xABCD)
+        );
         assert_eq!(noisy_fill.job_id, 2);
         assert_eq!(noisy_fill.midstate_num, 0);
         let esp_noisy = parse_bm1366_share_from_body(&noisy, base).unwrap();
@@ -1778,18 +2528,14 @@ mod tests {
         assert_eq!(esp_noisy.midstate_num, 0x07);
         assert!(refuse_esp_midstate_as_braiins_fill_index("share.midstate_num").is_err());
         assert!(refuse_esp_midstate_as_braiins_fill_index("0u8, // fill midstates=1").is_ok());
-        assert!(refuse_esp_flags_redrop_after_fill_hunt(
-            "0u16, // fill log 0\nresp[8],"
-        )
-        .is_err());
-        assert!(refuse_esp_flags_redrop_after_fill_hunt(
-            "0u16, // fill log 0\n0x80, // fill hunt"
-        )
-        .is_ok());
-        assert!(refuse_esp_bip320_as_braiins_fill_version(
-            "(share.version_bits >> 13) as u16"
-        )
-        .is_err());
+        assert!(refuse_esp_flags_redrop_after_fill_hunt("0u16, // fill log 0\nresp[8],").is_err());
+        assert!(
+            refuse_esp_flags_redrop_after_fill_hunt("0u16, // fill log 0\n0x80, // fill hunt")
+                .is_ok()
+        );
+        assert!(
+            refuse_esp_bip320_as_braiins_fill_version("(share.version_bits >> 13) as u16").is_err()
+        );
         assert!(refuse_esp_bip320_as_braiins_fill_version("0u16, // fill log 0").is_ok());
         let esp = parse_bm1366_share_from_body(&fill_frame[2..], base).unwrap();
         assert_eq!(esp.job_id, 0);
@@ -1803,8 +2549,12 @@ mod tests {
         let q = qualify_bm1366_braiins_fill_from_body(&SYNTHETIC_BM1366_FILL_WORK2_BODY, 2, base)
             .unwrap();
         assert_eq!(q.job_id, 2);
-        assert!(qualify_bm1366_braiins_fill_from_body(&SYNTHETIC_BM1366_FILL_WORK2_BODY, 0x10, base)
-            .is_err());
+        assert!(qualify_bm1366_braiins_fill_from_body(
+            &SYNTHETIC_BM1366_FILL_WORK2_BODY,
+            0x10,
+            base
+        )
+        .is_err());
         let tx2 = s19k_fill_tx_prefix(2).to_vec();
         let tx3 = s19k_fill_tx_prefix(3).to_vec();
         let hit = hunt_s19k_bm1366_fill_from_tagged_outstanding(
@@ -1832,31 +2582,27 @@ mod tests {
             &[tx2.clone()],
         )
         .is_err());
-        assert!(hunt_s19k_bm1366_fill_from_tagged_outstanding(
-            "/dev/ttyS1",
-            None,
-            &[tx2.clone()],
-        )
-        .is_err());
+        assert!(
+            hunt_s19k_bm1366_fill_from_tagged_outstanding("/dev/ttyS1", None, &[tx2.clone()],)
+                .is_err()
+        );
         let cut7 = &SYNTHETIC_BM1366_FILL_WORK2_BODY[..7];
-        let cut7_err = hunt_s19k_bm1366_fill_from_tagged_outstanding(
-            "/dev/ttyS2",
-            Some(cut7),
-            &[tx2.clone()],
-        )
-        .expect_err("HAL body-7 must not hunt as a share");
+        let cut7_err =
+            hunt_s19k_bm1366_fill_from_tagged_outstanding("/dev/ttyS2", Some(cut7), &[tx2.clone()])
+                .expect_err("HAL body-7 must not hunt as a share");
         assert!(
             cut7_err.contains("framing") || cut7_err.contains("not JobNonce"),
             "HAL body-7 must be framing, not silence: {cut7_err}"
         );
         assert!(!cut7_err.contains("silence"));
-        assert!(refuse_constructed_fill_hal_body7_wire_as_share(
-            "/dev/ttyS1",
-            2,
-            &[tx2.clone()],
-        )
-        .is_err());
-        assert!(refuse_constructed_fill_hal_body7_wire_as_share("/dev/ttyS0", 2, &[tx2.clone()]).is_ok());
+        assert!(
+            refuse_constructed_fill_hal_body7_wire_as_share("/dev/ttyS1", 2, &[tx2.clone()],)
+                .is_err()
+        );
+        assert!(
+            refuse_constructed_fill_hal_body7_wire_as_share("/dev/ttyS0", 2, &[tx2.clone()])
+                .is_ok()
+        );
         let taut = qualify_bm1366_braiins_fill_from_body(
             &SYNTHETIC_BM1366_FILL_WORK2_BODY,
             parse_bm1366_braiins_fill_share_from_body(&SYNTHETIC_BM1366_FILL_WORK2_BODY, base)
@@ -1864,14 +2610,80 @@ mod tests {
                 .job_id,
             base,
         );
-        assert!(taut.is_ok(), "self-qualify is tautological; hunt requires TX");
+        assert!(
+            taut.is_ok(),
+            "self-qualify is tautological; hunt requires TX"
+        );
+        let mut live = S19kOutstandingFillTx::new();
+        let mut retired = S19kOutstandingFillTx::new();
+        let first = live
+            .insert_wire_retiring(tx2.clone(), &mut retired)
+            .unwrap();
+        assert!(!first.retired_prev);
+        assert!(retired.get(2).is_none());
+        let second = live
+            .insert_wire_retiring(tx2.clone(), &mut retired)
+            .unwrap();
+        assert!(second.retired_prev);
+        assert!(retired.get(2).is_some());
+        // live443: wrap-5 clone() replace dropped wrap-4 leftover TX.
+        // wrap-retire leftover must keep the prior retired generation.
+        let wrap4 = s19k_fill_tx_prefix(2).to_vec();
+        let post_admit = {
+            let mut w = s19k_fill_tx_prefix(2).to_vec();
+            w.push(0xAA);
+            w
+        };
+        let mut wrap4_store = S19kOutstandingFillTx::new();
+        wrap4_store.insert_wire(wrap4.clone()).unwrap();
+        let mut live_post = S19kOutstandingFillTx::new();
+        live_post.insert_wire(wrap4.clone()).unwrap();
+        live_post
+            .insert_wire_retiring(post_admit.clone(), &mut wrap4_store)
+            .unwrap();
+        let slots = [2u8];
+        assert!(
+            s19k_leftover_hit_from_retired_store(&wrap4_store, &slots, |w| w == wrap4.as_slice()),
+            "wrap-4 leftover 21 36 must leftover_hit after wrap-retire"
+        );
+        let replaced = live_post.clone();
+        assert!(
+            !s19k_leftover_hit_from_retired_store(&replaced, &slots, |w| w == wrap4.as_slice()),
+            "live443 wrap-5 clone() replace drops wrap-4 leftover TX"
+        );
+        wrap4_store.merge_from(&live_post);
+        assert!(
+            s19k_leftover_hit_from_retired_store(&wrap4_store, &slots, |w| w == wrap4.as_slice()),
+            "wrap-5 merge must keep wrap-4 leftover 21 36"
+        );
+        assert!(
+            s19k_leftover_hit_from_retired_store(&wrap4_store, &slots, |w| w
+                == post_admit.as_slice()),
+            "wrap-5 merge must leftover_hit POST-admit 21 36"
+        );
+        assert_eq!(S19K_RETIRED_TX_GENS, 4);
+        assert!(s19k_track1_wrap_overwrite_must_retire(1, true));
+        assert!(!s19k_track1_wrap_overwrite_must_retire(0, true));
+        assert!(refuse_s19k_wrap7_same_id_drop_without_retire(7, false).is_err());
+        assert!(refuse_s19k_wrap7_same_id_drop_without_retire(7, true).is_ok());
+        assert!(refuse_s19k_wrap7_same_id_drop_without_retire(6, false).is_ok());
+        assert!(admit_s19k_production_retires_wrap_overwrite(serial).is_ok());
         assert_eq!(S19K_FILL_TX_SLOTS, 256);
+        assert_eq!(S19K_BM1366_HOLD_QUEUE_DEPTH, 4);
         assert!(refuse_s19k_fifo32_wrap_as_outstanding_table().is_err());
         assert!(admit_s19k_uart_queue_covers_fill_slots(S19K_FILL_TX_SLOTS).is_ok());
         assert!(admit_s19k_uart_queue_covers_fill_slots(16).is_err());
+        assert!(admit_s19k_bm1366_hold_queue_uart_paced(S19K_BM1366_HOLD_QUEUE_DEPTH).is_ok());
+        assert!(admit_s19k_bm1366_hold_queue_uart_paced(S19K_FILL_TX_SLOTS).is_err());
+        assert!(refuse_s19k_live408_256_drop_oldest_as_hold().is_err());
         assert!(refuse_s19k_uart_queue16_as_fill_depth(16).is_err());
         assert!(refuse_s19k_uart_queue16_as_fill_depth(256).is_ok());
         assert!(admit_s19k_production_bm1366_queue_covers_fill_slots(serial).is_ok());
+        assert!(admit_s19k_production_bm1366_holds_before_take_dispatch(serial).is_ok());
+        assert_eq!(s19k_track1_job_id_retry_slots(0x04), [0x04, 0x00, 0x00]);
+        assert_eq!(s19k_track1_job_id_retry_slots(0x0C), [0x0C, 0x08, 0x01]);
+        assert!(admit_s19k_track1_job_id_retry_slots(0x04).is_ok());
+        assert!(admit_s19k_production_retries_track1_job_id_slots(serial).is_ok());
         assert!(admit_s19k_production_bm1366_queue_covers_fill_slots(
             "let work_queue_depth = if is_bm1362 {\nBM1362_SERIAL_WORK_QUEUE_DEPTH\n} else {\nDEFAULT_SERIAL_WORK_QUEUE_DEPTH\n}"
         )
@@ -1882,11 +2694,66 @@ mod tests {
         )
         .is_err());
         assert!(refuse_s19k_track1_handoff_as_thermal_ready().is_err());
+        assert!(refuse_s19k_track1_pwm30_as_leftover_ready().is_err());
+        assert_eq!(S19K_TRACK1_LEFTOVER_FAN_PWM, 100);
+        assert_eq!(S19K_LIVE88_SEATED_TMP75_SLOTS, [false, true, true]);
+        assert_eq!(
+            s19k_track1_required_tmp75_slots(
+                S19K_LIVE88_SEATED_TMP75_SLOTS,
+                &["/dev/ttyS1", "/dev/ttyS2"],
+            ),
+            [false, true, true]
+        );
+        assert_eq!(
+            s19k_track1_required_tmp75_slots(
+                S19K_LIVE88_SEATED_TMP75_SLOTS,
+                &["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"],
+            ),
+            [true, true, true]
+        );
+        assert_eq!(
+            s19k_track1_required_tmp75_slots([true, true, true], &["/dev/ttyS1", "/dev/ttyS2"],),
+            [true, true, true],
+            "held .78 three-board population must not be weakened by a two-UART TX plan"
+        );
+        assert!(serial.contains(
+            "let s19k_track1_required_tmp75_slots = s19k_track1_required_tmp75_slots(\n            s19k_profile_seated_tmp75_slots"
+        ));
+        assert!(serial.contains("if !s19k_track1_required_tmp75_slots[slot as usize]"));
+        let ready = admit_s19k_track1_thermal_ready(
+            &[(42.0, 48.0), (41.0, 47.0)],
+            S19K_TRACK1_LEFTOVER_FAN_PWM,
+            false,
+            80,
+            5,
+        );
+        assert_eq!(
+            ready.unwrap(),
+            crate::work_dispatch_safety::ThermalSafetyState::Ready
+        );
+        assert!(
+            admit_s19k_track1_thermal_ready(&[(42.0, 48.0), (41.0, 47.0)], 30, false, 80, 5,)
+                .is_err()
+        );
+        assert!(admit_s19k_track1_thermal_ready(
+            &[(42.0, 48.0), (41.0, 47.0)],
+            S19K_TRACK1_LEFTOVER_FAN_PWM,
+            true,
+            80,
+            5,
+        )
+        .is_err());
+        assert!(
+            admit_s19k_production_construction_serial_work(&crate::BoardDesc::am3_s19kpro())
+                .is_ok()
+        );
         assert!(admit_s19k_production_bm1366_tx_before_rx(serial).is_ok());
-        assert!(admit_s19k_production_bm1366_tx_before_rx("let tx_before_rx = is_bm1362;").is_err());
-        assert!(admit_s19k_init_bm1366_requires_experimental_env(serial).is_ok());
-        assert!(admit_s19k_init_bm1366_requires_experimental_env(
-            "fn init_bm1366_chain(\nSelf::reset_asic_baud"
+        assert!(
+            admit_s19k_production_bm1366_tx_before_rx("let tx_before_rx = is_bm1362;").is_err()
+        );
+        assert!(admit_s19k_init_bm1366_requires_private_owner(serial).is_ok());
+        assert!(admit_s19k_init_bm1366_requires_private_owner(
+            "fn init_bm1366_chain(\nserial: &SerialChainBackend"
         )
         .is_err());
         assert_eq!(
@@ -1906,7 +2773,7 @@ mod tests {
         );
         assert!(s19k_fill_job_id_from_tx_wire(&tx2).unwrap() == 2);
         assert!(s19k_fill_job_id_from_tx_wire(&[0x55, 0xAA, 0x21, 0x56, 2]).is_err());
-        let body0 = [0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x80];
+        let body0 = [0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x96];
         let mut slots = S19kOutstandingFillTx::new();
         let mut fifo: Vec<Vec<u8>> = Vec::new();
         for id in 0u8..=40 {
@@ -1920,18 +2787,12 @@ mod tests {
         assert_eq!(slots.occupied(), 41);
         assert!(slots.get(0).is_some());
         assert!(fifo.iter().all(|tx| tx.get(4) != Some(&0)));
-        assert!(hunt_s19k_bm1366_fill_from_tagged_outstanding(
-            "/dev/ttyS1",
-            Some(&body0),
-            &fifo,
-        )
-        .is_err());
-        let slot_hit = hunt_s19k_bm1366_fill_from_tagged_slot(
-            "/dev/ttyS1",
-            Some(&body0),
-            &slots,
-        )
-        .unwrap();
+        assert!(
+            hunt_s19k_bm1366_fill_from_tagged_outstanding("/dev/ttyS1", Some(&body0), &fifo,)
+                .is_err()
+        );
+        let slot_hit =
+            hunt_s19k_bm1366_fill_from_tagged_slot("/dev/ttyS1", Some(&body0), &slots).unwrap();
         assert_eq!(slot_hit.job_id, 0);
         let slot2 = hunt_s19k_bm1366_fill_from_tagged_slot(
             "/dev/ttyS1",
@@ -1947,6 +2808,7 @@ mod tests {
             ),
             S19K_CONSTRUCTED_FILL_JOB_OR_CORE
         );
+        assert!(refuse_s19k_fill_job_byte_or_small_core_as_braiins().is_err());
         let mut overlay_slots = S19kOutstandingFillTx::new();
         overlay_slots
             .insert_wire(s19k_fill_tx_prefix(S19K_CONSTRUCTED_FILL_JOB_ID).to_vec())
@@ -1978,34 +2840,25 @@ mod tests {
             identity_wins.job_id
         )
         .is_ok());
-        assert!(refuse_constructed_fill_hal_body7_extract_as_share(
-            "/dev/ttyS1",
-            2,
-            &slots,
-        )
-        .is_err());
-        assert!(refuse_constructed_fill_hal_body7_extract_as_share(
-            "/dev/ttyS0",
-            2,
-            &slots,
-        )
-        .is_ok());
-        let extracted = admit_constructed_fill_hal_body9_extract_hunts("/dev/ttyS1", 2, &slots)
-            .unwrap();
+        assert!(
+            refuse_constructed_fill_hal_body7_extract_as_share("/dev/ttyS1", 2, &slots,).is_err()
+        );
+        assert!(
+            refuse_constructed_fill_hal_body7_extract_as_share("/dev/ttyS0", 2, &slots,).is_ok()
+        );
+        let extracted =
+            admit_constructed_fill_hal_body9_extract_hunts("/dev/ttyS1", 2, &slots).unwrap();
         assert_eq!(extracted.job_id, 2);
         assert!(refuse_s19k_body7_two_frame_extract_as_shares("/dev/ttyS1", &slots).is_err());
         assert!(refuse_s19k_body7_two_frame_extract_as_shares("/dev/ttyS0", &slots).is_ok());
-        let recovered = admit_s19k_body7_then_body9_next_frame_hunts("/dev/ttyS1", 2, 3, &slots)
-            .unwrap();
+        let recovered =
+            admit_s19k_body7_then_body9_next_frame_hunts("/dev/ttyS1", 2, 3, &slots).unwrap();
         assert_eq!(recovered.job_id, 3);
         assert!(admit_s19k_body7_then_body9_next_frame_hunts("/dev/ttyS0", 2, 3, &slots).is_err());
         slots.clear();
-        assert!(hunt_s19k_bm1366_fill_from_tagged_slot(
-            "/dev/ttyS1",
-            Some(&body0),
-            &slots,
-        )
-        .is_err());
+        assert!(
+            hunt_s19k_bm1366_fill_from_tagged_slot("/dev/ttyS1", Some(&body0), &slots,).is_err()
+        );
         overlay_slots
             .insert_wire(s19k_fill_tx_prefix(S19K_CONSTRUCTED_FILL_JOB_ID).to_vec())
             .ok();
@@ -2054,11 +2907,12 @@ mod tests {
         let share_src = include_str!("s19k_bm1366_share.rs");
         assert!(admit_s19k_production_fill_lookup_is_raw(share_src).is_ok());
         assert!(refuse_s19k_fill_overlay_f8_as_fun_0091c0a0().is_err());
-        assert!(refuse_esp_f8_mask_as_braiins_fill_job_id(
-            S19K_CONSTRUCTED_FILL_JOB_OR_CORE
-        )
-        .is_err());
-        assert!(crate::s19k_braiins_job::admit_bosminer_fill_path_job_id_is_work_id_shl_log().is_ok());
+        assert!(
+            refuse_esp_f8_mask_as_braiins_fill_job_id(S19K_CONSTRUCTED_FILL_JOB_OR_CORE).is_err()
+        );
+        assert!(
+            crate::s19k_braiins_job::admit_bosminer_fill_path_job_id_is_work_id_shl_log().is_ok()
+        );
         assert_eq!(
             crate::s19k_braiins_job::s19k_braiins_uart_work_id_from_rx_job_byte(
                 S19K_CONSTRUCTED_FILL_JOB_OR_CORE,
@@ -2073,12 +2927,9 @@ mod tests {
             .unwrap();
         assert!(s19k_fill_lookup_tx(S19K_CONSTRUCTED_FILL_JOB_OR_CORE, &slots).is_err());
         assert_eq!(
-            s19k_fill_lookup_tx_esp_overlay_experimental(
-                S19K_CONSTRUCTED_FILL_JOB_OR_CORE,
-                &slots
-            )
-            .unwrap()
-            .1,
+            s19k_fill_lookup_tx_esp_overlay_experimental(S19K_CONSTRUCTED_FILL_JOB_OR_CORE, &slots)
+                .unwrap()
+                .1,
             S19K_CONSTRUCTED_FILL_JOB_ID
         );
         slots
@@ -2093,5 +2944,59 @@ mod tests {
         )
         .is_err());
         assert!(crate::s19k_bm1366_uart_rx::admit_s19k_live88_held_bm1366_job_nonce().is_ok());
+    }
+
+    #[test]
+    fn s19k_retired_tx_hex_is_empty_after_remap_clear() {
+        let mut retired = S19kOutstandingFillTx::new();
+        let tx = s19k_fill_tx_prefix(8).to_vec();
+        assert_eq!(retired.insert_wire(tx.clone()).unwrap(), 8);
+        let retry = s19k_track1_job_id_retry_slots(8);
+        assert_eq!(
+            s19k_first_occupied_tx_hex(&retired, &retry),
+            s19k_compact_tx_hex(&tx)
+        );
+        let remapped = S19kOutstandingFillTx::new();
+        assert!(s19k_first_occupied_tx_hex(&remapped, &retry).is_empty());
+        let mut two = S19kOutstandingFillTx::new();
+        let miss = s19k_fill_tx_prefix(8).to_vec();
+        let hit = s19k_fill_tx_prefix(9).to_vec();
+        assert_eq!(two.insert_wire(miss.clone()).unwrap(), 8);
+        assert_eq!(two.insert_wire(hit.clone()).unwrap(), 9);
+        let slots = [8u8, 9];
+        let chosen = s19k_first_tx_hex_where(&two, &slots, |w| w == hit.as_slice()).unwrap();
+        assert_eq!(chosen, s19k_compact_tx_hex(&hit));
+        assert_ne!(chosen, s19k_first_occupied_tx_hex(&two, &slots));
+        assert!(s19k_leftover_class_matches_retired_tx(
+            crate::S19kPostCleanNonceClass::LeftoverPreClean,
+            true
+        ));
+        assert!(!s19k_leftover_class_matches_retired_tx(
+            crate::S19kPostCleanNonceClass::LeftoverPreClean,
+            false
+        ));
+        assert!(s19k_leftover_hit_from_retired_store(&two, &slots, |w| w == hit.as_slice()));
+        assert!(!s19k_leftover_hit_from_retired_store(&two, &slots, |_| {
+            false
+        }));
+        assert_eq!(S19K_TRACK1_RX_CHANNEL, 2048);
+        assert!(refuse_s19k_rx_channel_as_wrap7_survival().is_err());
+        let serial = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcentrald/src/serial_mining.rs"
+        ));
+        assert!(admit_s19k_production_rx_channel(serial).is_ok());
+        assert_eq!(
+            classify_s19k_post_clean_from_retired_tx_hit(false, true),
+            crate::S19kPostCleanNonceClass::LeftoverPreClean
+        );
+        assert_eq!(
+            classify_s19k_post_clean_from_retired_tx_hit(true, false),
+            crate::S19kPostCleanNonceClass::NewBlockShare
+        );
+        assert!(s19k_leftover_class_matches_retired_tx(
+            classify_s19k_post_clean_from_retired_tx_hit(false, true),
+            true
+        ));
     }
 }

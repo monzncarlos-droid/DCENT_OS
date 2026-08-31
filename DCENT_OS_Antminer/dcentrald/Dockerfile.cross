@@ -12,9 +12,12 @@
 #
 # Output: target/armv7-unknown-linux-musleabihf/release/dcentrald
 
-# Rust 1.95 — the committed Cargo.lock pins icu_* 2.2.0 which requires
-# rustc >= 1.86; 1.95 matches the verified host toolchain (2026-04-14).
-FROM rust:1.95-bookworm
+# rustc 1.90.0 — canonical DCENT_OS pin (same linux/amd64 digest as
+# scripts/docker/Dockerfile.dcentrald-test and build-dcentrald.sh).
+# Mutable tags (rust:1.90-bookworm, rust:1.95-bookworm, rust:latest) are
+# quarantined; a floating tag must not build this image.
+FROM rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+RUN rustc -vV | grep -E '^release: 1\.90\.0$'
 
 ENV DEBIAN_FRONTEND=noninteractive
 

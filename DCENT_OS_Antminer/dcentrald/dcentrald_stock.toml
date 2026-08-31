@@ -16,7 +16,11 @@ hostname = "dcentral-s9-stock"
 log_level = "info"
 
 [pool]
-url = "stratum+tcp://solo.ckpool.org:3333"
+# Lottery solo (e.g. solo.ckpool.org) is NOT a first-boot default. Point this
+# at an operator-chosen pool before enabling mining.
+# Example (operator-chosen, never a shipped default):
+#   url = "stratum+tcp://solo.ckpool.org:3333"
+url = ""
 worker = ""
 password = "d=1"
 
@@ -38,7 +42,7 @@ target_temp_c = 55
 hot_temp_c = 65
 dangerous_temp_c = 75
 fan_min_pwm = 10
-fan_max_pwm = 127
+fan_max_pwm = 30  # home-quiet ceiling; industrial 127 is not a shipped default
 
 [api]
 cgminer_port = 4028
@@ -64,9 +68,10 @@ enabled = true
 active = "standard"
 
 [autotuner]
+# Ships DISABLED. measurement_window_s=6 / efficiency match crate defaults.
 enabled = false
-target_mode = "hashrate"
-measurement_window_s = 3
+target_mode = "efficiency"
+measurement_window_s = 6
 verification_window_s = 15
 error_threshold_pct = 0.5
 safety_margin_pct = 5.0

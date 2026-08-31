@@ -1,0 +1,189 @@
+{
+  "schema": "dcent.nano3.w1-attended-soak.v1",
+  "isolated_pool_receipt": {
+    "unit_id": null,
+    "nonce": null
+  },
+  "session": {
+    "id": "REPLACE_WITH_UNIQUE_SESSION_ID",
+    "disposition": "draft_does_not_authorize",
+    "operator": "REPLACE_WITH_OPERATOR_NAME",
+    "authorization_reference": "REPLACE_WITH_EXACT_OPERATOR_AUTHORIZATION_REFERENCE",
+    "approved_at_utc": "REPLACE_WITH_UTC_TIMESTAMP",
+    "expires_at_utc": "REPLACE_WITH_UTC_TIMESTAMP",
+    "exact_actions": [
+      "bounded_host_to_target_load",
+      "cgminer_pool_mutation",
+      "exact_pool_state_restore",
+      "manual_whole_unit_ac_disconnect_on_abort",
+      "read_only_ssh_http_cgminer_probes",
+      "restore_original_hashing_state",
+      "target_lan_contact"
+    ],
+    "explicit_exclusions": [
+      "fixed_fan_or_fan_spd_mutation",
+      "flash",
+      "kill_or_signal_btcminer",
+      "reboot",
+      "uart_contact",
+      "watchdog_close_probe_phase4"
+    ],
+    "consumption_marker_path": "REPLACE_WITH_ABSOLUTE_NEW_ONE_SHOT_MARKER_PATH"
+  },
+  "target": {
+    "ipv4": "REPLACE_WITH_EXACT_PRIVATE_IPV4",
+    "repeat_ipv4": "REPEAT_EXACT_PRIVATE_IPV4",
+    "btcminer_sha256": "e6c11630a187d677f55178fa1dc7f2f1a52805856c538fae70cfbf0038ca6751",
+    "expected_version_fields": {
+      "CGMiner": "REPLACE_WITH_EXACT_CGMINER_FIELD",
+      "VERSION": "REPLACE_WITH_EXACT_VERSION_FIELD",
+      "PROD": "REPLACE_WITH_EXACT_PROD_FIELD"
+    },
+    "api_port": 4028,
+    "http_port": 80,
+    "ssh_port": 22
+  },
+  "isolated_lan": {
+    "boundary_record": "REPLACE_WITH_REVIEWED_ISOLATED_LAN_RECORD",
+    "subnet_cidr": "REPLACE_WITH_EXACT_RFC1918_SUBNET_CIDR",
+    "operator_controlled": false,
+    "only_permitted_hosts_can_reach_4028": false,
+    "permitted_host_ipv4": [],
+    "single_serialized_mutation_client": true,
+    "receipt_observer_clock_domain": null
+  },
+  "attended_safety": {
+    "operator_at_bench_continuously": false,
+    "manual_ac_disconnect_within_arm_reach": false,
+    "manual_ac_is_not_independent_or_automatic": true,
+    "acknowledges_ac_removes_fan_power": true,
+    "external_post_cut_thermal_observation_required": true,
+    "post_cut_observation_seconds": null,
+    "stock_fan_remains_auto": true,
+    "phase4_excluded": true
+  },
+  "guard": {
+    "expected_btcminer_sha256": "e6c11630a187d677f55178fa1dc7f2f1a52805856c538fae70cfbf0038ca6751",
+    "required_live_comms": [
+      "API",
+      "watchdog_thread",
+      "watchpool_threa"
+    ],
+    "required_initial_fields": {
+      "guard_initial_admission": "success",
+      "pass_1_btcminer_hash_admitted": "1",
+      "pass_1_all_targets_nice_zero": "1"
+    }
+  },
+  "timeouts_seconds": {
+    "api": {
+      "connect": null,
+      "read": null,
+      "total": null
+    },
+    "http": {
+      "connect": null,
+      "read": null,
+      "total": null
+    },
+    "ssh": {
+      "connect": null,
+      "read": null,
+      "total": null
+    }
+  },
+  "probe_cadence_seconds": null,
+  "load": {
+    "payload_path": "REPLACE_WITH_ABSOLUTE_PAYLOAD_PATH",
+    "payload_bytes": null,
+    "payload_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+    "direction": "host_to_target_tmpfs",
+    "concurrency": null,
+    "duration_seconds": null,
+    "per_transfer_total_timeout_seconds": null,
+    "remote_tmpfs_path": "/tmp/dcent-w1-REPLACE_WITH_UNIQUE_SESSION_ID.payload",
+    "scp_executable": "REPLACE_WITH_ABSOLUTE_SCP_EXECUTABLE",
+    "scp_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+    "ssh_executable": "REPLACE_WITH_ABSOLUTE_SSH_EXECUTABLE",
+    "ssh_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+    "ssh_identity_file": "REPLACE_WITH_ABSOLUTE_SESSION_KEY_PATH",
+    "ssh_identity_file_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+    "known_hosts_file": "REPLACE_WITH_ABSOLUTE_PINNED_KNOWN_HOSTS_PATH",
+    "known_hosts_sha256": "REPLACE_WITH_LOWERCASE_SHA256"
+  },
+  "thermal_acceptance": {
+    "contract_status": "draft_target_capture_absent",
+    "contract_receipt_path": "REPLACE_WITH_ABSOLUTE_REVIEWED_TARGET_CAPTURE_CONTRACT",
+    "contract_receipt_sha256": "REPLACE_WITH_LOWERCASE_SHA256",
+    "engineering_basis": "REPLACE_WITH_REVIEWED_ENGINEERING_BASIS",
+    "qualified_limit_reference": "REPLACE_WITH_QUALIFICATION_RECORD_REFERENCE",
+    "stock_90c_pid_target_is_not_a_safety_limit": true,
+    "temperature_ceiling_c": null,
+    "max_rise_c_per_minute": null,
+    "telemetry_freshness_seconds": null,
+    "auto_rpm": {
+      "min": null,
+      "max": null,
+      "stock_mode_must_equal_auto": true
+    },
+    "temperature_pointers": [
+      "REPLACE_WITH_REVIEWED_MERGED_STATS_DEVS_JSON_POINTER_FOR_EACH_REQUIRED_SENSOR"
+    ],
+    "fan_rpm_pointers": [],
+    "auto_mode_pointer": "REPLACE_WITH_MERGED_STATS_DEVS_JSON_POINTER",
+    "sensor_sample_epoch_pointer": "REPLACE_WITH_MERGED_STATS_DEVS_JSON_POINTER"
+  },
+  "wall_power_acceptance": {
+    "meter_id": "REPLACE_WITH_METER_ID",
+    "engineering_basis": "REPLACE_WITH_REVIEWED_WALL_POWER_BASIS",
+    "sample_freshness_seconds": null,
+    "idle_watts": {
+      "min": null,
+      "max": null
+    },
+    "hashing_watts": {
+      "min": null,
+      "max": null
+    },
+    "hash_off_watts": {
+      "min": null,
+      "max": null
+    },
+    "sample_file": "REPLACE_WITH_ABSOLUTE_ATOMIC_SAMPLE_FILE"
+  },
+  "load_acceptance": {
+    "short_window_pointer": "/SUMMARY/0/MHS 5s",
+    "accepted_pointer": "/SUMMARY/0/Accepted",
+    "rejected_pointer": "/SUMMARY/0/Rejected",
+    "hardware_errors_pointer": "/SUMMARY/0/Hardware Errors",
+    "short_window_mhs": {
+      "min": null,
+      "max": null
+    },
+    "accepted_min_delta": null,
+    "rejected_max_delta": null,
+    "hardware_errors_max_delta": null,
+    "original_current_pool_must_remain_selected": true
+  },
+  "hash_off_proof": {
+    "proof_seconds": 120,
+    "sample_interval_seconds": null,
+    "idle_settle_seconds": null,
+    "short_window_pointer": "/SUMMARY/0/MHS 5s",
+    "accepted_pointer": "/SUMMARY/0/Accepted",
+    "short_window_mhs_max": null,
+    "lcd_is_corroboration_only": true,
+    "btcminer_and_telemetry_must_remain_alive": true,
+    "lcd_observation_file": "REPLACE_WITH_ABSOLUTE_ATOMIC_LCD_OBSERVATION_FILE"
+  },
+  "cgminer_protocol": {
+    "request_framing": "minified_json_plus_one_nul",
+    "response_framing": "one_json_object_then_nuls",
+    "response_id": 1,
+    "max_response_bytes": 2097152,
+    "dead_pool_parameter": "stratum+tcp://127.0.0.1:1,x,x",
+    "max_original_pools": 3,
+    "hash_off_total_timeout_seconds": null,
+    "restore_total_timeout_seconds": null
+  }
+}

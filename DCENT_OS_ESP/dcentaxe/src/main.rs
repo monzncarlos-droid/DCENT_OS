@@ -65,6 +65,21 @@ compile_error!(
     "temp-tmp451 cannot be combined with pins-bitaxe: the TMP451 mux select \
      line A1 is GPIO12, which the pins-bitaxe plug-sense binder already claims"
 );
+// Hammer DC02 binds ASIC reset on GPIO3. NerdQX TMP451 mux A1 is also GPIO3.
+// The GPIO binder `match` compiles every arm into every image, so a combined
+// image would move gpio3 twice (E0382). Refuse the pairing: no SKU is both.
+#[cfg(all(feature = "temp-tmp451", feature = "pins-hammer-dc"))]
+compile_error!(
+    "temp-tmp451 cannot be combined with pins-hammer-dc: NerdQX mux A1 is \
+     GPIO3, which Hammer DC02 already binds as ASIC reset"
+);
+// NerdQX mux A1 is GPIO3; NerdOCTAXE-γ mux A1 is GPIO12. Both also take GPIO2
+// as A0, so two mux arms in one image is a static gpio2 double-move.
+#[cfg(all(feature = "nerdqx", feature = "nerdoctaxe-gamma"))]
+compile_error!(
+    "nerdqx and nerdoctaxe-gamma cannot share an image: TMP451 mux A1 is \
+     GPIO3 vs GPIO12 (and both arms would move GPIO2)"
+);
 // DCENT_axe — Clean-room BitAxe mining firmware
 // Copyright (C) 2026 D-Central Technologies
 // License: GPL-3.0
@@ -1856,7 +1871,7 @@ fn main() {
         error!("Config safety validation failed: {}", e);
     }
 
-    let board_config = config.board_config();
+    let mut board_config = config.board_config();
     let asic_model = config.asic_model();
     let asic_count = if config.asic_count > 0 {
         config.asic_count
@@ -2248,6 +2263,11 @@ fn main() {
         }
         // Hammer DC02: reset is GPIO3 and no discrete buck-enable is verified.
         // GPIO 1 is its fan TACH input; GPIO46 is ST7789 panel D5.
+        //
+        // Gated off `temp-tmp451` images: that feature binds GPIO3 as NerdQX
+        // TMP451 mux A1, and a runtime match cannot make the two moves exclusive.
+        // The compile_error above refuses `pins-hammer-dc` + `temp-tmp451`.
+        #[cfg(not(feature = "temp-tmp451"))]
         (3, -1, 4, -1) => {
             GpioController::new_without_buck(peripherals.pins.gpio3, peripherals.pins.gpio4)
         }
@@ -2403,6 +2423,14 @@ fn main() {
             )
             } else {
                 match decl.select {
+                    #[cfg(feature = "nerdqx")]
+                    Tmp451SelectLines::Gpio { a0: 2, a1: 3 } => MuxSelect::new(
+                        peripherals.pins.gpio2.into(),
+                        peripherals.pins.gpio3.into(),
+                        decl.active_high,
+                    )
+                    .map_err(|e| e.to_string()),
+                    #[cfg(not(feature = "nerdqx"))]
                     Tmp451SelectLines::Gpio { a0: 2, a1: 12 } => MuxSelect::new(
                         peripherals.pins.gpio2.into(),
                         peripherals.pins.gpio12.into(),
@@ -2411,7 +2439,7 @@ fn main() {
                     .map_err(|e| e.to_string()),
                     Tmp451SelectLines::Gpio { a0, a1 } => Err(format!(
                 "board declares TMP451 mux select lines GPIO{}/GPIO{}, which this image has no \
-                 binding for (only GPIO2/GPIO12 are bound)",
+                 binding for",
                 a0, a1
             )),
                     Tmp451SelectLines::Expander { addr, a0, a1 } => Err(format!(
@@ -2451,6 +2479,10 @@ fn main() {
                         sensors,
                         expected_asics: board_config.asic_count,
                     });
+                    // NerdQX: the mux answering IS the identity check. Raise
+                    // the static clamped envelope to upstream nominal only
+                    // after a positive bring-up — never from the row alone.
+                    board_config.apply_nerdqx_tmp451_identity(true);
                 } else {
                     mining_permitted = false;
                     mining_block_reason = Some(format!(
@@ -3749,7 +3781,7 @@ fn main() {
                             .map_err(|e| format!("{}", e))
                     };
 
-                let mut process_work_fn = || -> Vec<(u8, u32, u32, u8)> {
+                let mut process_work_fn = || -> Vec<(u8, u32, u32, u32, u8)> {
                     match driver_cell.borrow_mut().read_responses(10) {
                         Ok(results) => results
                             .into_iter()
@@ -3758,15 +3790,17 @@ fn main() {
                                     job_id,
                                     nonce,
                                     rolled_version,
+                                    rolled_ntime,
                                     asic_nr,
                                     timestamp_us: _,
                                 } = r
                                 {
                                     // For BM1397: rolled_version = midstate_index (0-3)
                                     // For BM1366/68/70: rolled_version = actual rolled version from ASIC
+                                    // For ntime-rolling chains: rolled_ntime = absolute hashed ntime (0 = none)
                                     // The dispatcher's handle_nonce will convert midstate_index
                                     // to actual version for BM1397 using increment_bitmask.
-                                    Some((job_id, nonce, rolled_version, asic_nr))
+                                    Some((job_id, nonce, rolled_version, rolled_ntime, asic_nr))
                                 } else {
                                     None
                                 }

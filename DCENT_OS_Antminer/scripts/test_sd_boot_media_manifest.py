@@ -22,10 +22,10 @@ DONOR_SHA256 = "b0444ad2a5e9b9e2b021ec756a40cb1448128545a42c77bdabb4363617d03579
 
 
 class BootMediaManifestTests(unittest.TestCase):
-    def posix_shell(self) -> str:
-        shell = shutil.which("sh")
-        if shell:
-            return shell
+    def bash_shell(self) -> str:
+        # build_sd_s19pro.sh deliberately uses Bash (`pipefail` and arrays),
+        # so invoking it through `/bin/sh` tests the wrong interpreter and can
+        # fail before the donor-preservation boundary under dash.
         if os.name == "nt":
             program_files = Path(
                 os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -33,6 +33,10 @@ class BootMediaManifestTests(unittest.TestCase):
             git_bash = program_files / "Git/bin/bash.exe"
             if git_bash.is_file():
                 return str(git_bash)
+            self.skipTest("Git Bash unavailable on Windows")
+        shell = shutil.which("bash")
+        if shell:
+            return shell
         self.skipTest("POSIX shell unavailable")
 
     def run_writer(
@@ -254,7 +258,7 @@ class BootMediaManifestTests(unittest.TestCase):
         )
 
     def test_builder_rejects_bad_donor_before_clearing_workdir(self) -> None:
-        bash = self.posix_shell()
+        bash = self.bash_shell()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             donor = root / "wrong-size.img"
@@ -278,7 +282,7 @@ class BootMediaManifestTests(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(), b"preserved")
 
     def test_builder_rejects_exact_size_wrong_hash_before_clearing_workdir(self) -> None:
-        bash = self.posix_shell()
+        bash = self.bash_shell()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             donor = root / "wrong-hash.img"

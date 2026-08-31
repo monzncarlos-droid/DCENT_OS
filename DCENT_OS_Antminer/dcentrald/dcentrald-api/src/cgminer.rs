@@ -57,38 +57,37 @@ pub const DCENTOS_FIRMWARE_MARKER: &str = "DCENTOS";
 
 /// Resolve the real hardware MODEL string (e.g. "Antminer S19 Pro")
 /// from the detected `HardwareInfo`, for the pyasic/asic-rs `Type`
-/// token. Mirrors `rest::fleet_model_label`'s precedence (canonical
-/// `MinerProfile` name → hashboard type → chip-type fallback) so the
-/// CGMiner surface and the REST fleet surface agree on the model.
+/// token. Single source: `rest::fleet_model_label` (canonical
+/// `MinerProfile::name` → hashboard type → chip-type fallback).
 ///
 /// This identifies the HARDWARE only. Firmware identity stays honest
 /// as DCENT_OS via `DCENTOS_FIRMWARE_MARKER` + `CGMINER_VERSION`.
 fn hardware_model_label(hw: &crate::HardwareInfo) -> String {
-    // Canonical chip-id → model name (same table rest.rs uses).
-    let chip_id = match hw.chip_type.trim().to_ascii_uppercase().as_str() {
-        "BM1387" => Some(0x1387u16),
-        "BM1397" => Some(0x1397),
-        "BM1398" => Some(0x1398),
-        "BM1362" => Some(0x1362),
-        "BM1366" => Some(0x1366),
-        "BM1368" => Some(0x1368),
-        "BM1370" => Some(0x1370),
-        _ => None,
-    };
-    if let Some(profile) = chip_id.and_then(dcentrald_asic::drivers::MinerProfile::for_chip) {
-        return profile.name.to_string();
-    }
-    if let Some(hb_type) = hw
-        .hb_type
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return hb_type.to_string();
-    }
-    if !hw.chip_type.trim().is_empty() {
-        return format!("Antminer ({})", hw.chip_type.trim());
-    }
-    "Antminer (unknown ASIC)".to_string()
+    crate::rest::fleet_model_label(hw)
+}
+
+/// Factory-rated hashrate in GH/s from [`MinerProfile`] geometry at the
+/// profile default frequency. `None` when the chip is unknown — callers
+/// must not invent a TH/s figure.
+fn profile_total_rateideal_ghs(hw: &crate::HardwareInfo) -> Option<f64> {
+    let profile = crate::rest::chip_type_to_chip_id(&hw.chip_type)
+        .and_then(dcentrald_asic::drivers::MinerProfile::for_chip)?;
+    profile
+        .nominal_hashrate_ghs(profile.default_freq_mhz)
+        .map(f64::from)
+        .filter(|ghs| ghs.is_finite() && *ghs > 0.0)
+}
+
+/// MAC + hostname from the same read-only files `/api/status` and
+/// `/api/system/info` already use. Empty MAC when eth0 is unread; hostname
+/// falls back to `dcentos`. No LAN writes.
+fn read_cgminer_net_identity() -> (String, String) {
+    let mac = std::fs::read_to_string("/sys/class/net/eth0/address")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    (mac, crate::rest::local_hostname())
 }
 
 /// Maximum request size in bytes.
@@ -666,6 +665,7 @@ async fn handle_summary(state: &AppState) -> serde_json::Value {
             .map(|events| events.clone())
             .unwrap_or_default(),
     );
+    let (mac, hostname) = read_cgminer_net_identity();
 
     serde_json::json!({
         "STATUS": [CgMinerStatus::success_for(CgminerStatusCode::Summary, "Summary")],
@@ -677,6 +677,8 @@ async fn handle_summary(state: &AppState) -> serde_json::Value {
             miner.hashrate_ghs,
             miner.hashrate_5s_ghs,
             best_share,
+            &mac,
+            &hostname,
         )],
         "id": 1
     })
@@ -702,6 +704,8 @@ fn build_summary_object(
     hashrate_ghs: f64,
     hashrate_5s_ghs: f64,
     best_share: f64,
+    mac: &str,
+    hostname: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "Elapsed": uptime_s,
@@ -718,6 +722,13 @@ fn build_summary_object(
         "MHS 1m": hashrate_ghs * 1000.0,
         "MHS 5m": hashrate_ghs * 1000.0,
         "MHS 15m": hashrate_ghs * 1000.0,
+        // pyasic Antminer backend reads SUMMARY `GHS 5s` / `GHS av` in GH/s.
+        // Same sources as the MHS keys; GH = MH / 1000.
+        "GHS av": hashrate_ghs,
+        "GHS 5s": hashrate_5s_ghs,
+        "MAC": mac,
+        "Hostname": hostname,
+        "hostname": hostname,
         "Found Blocks": 0,
         "Getworks": 0,
         "Accepted": accepted,
@@ -772,7 +783,11 @@ fn build_summary_object(
             "Difficulty Accepted": "accepted_share_count_compat",
             "Difficulty Rejected": "rejected_share_count_compat",
             "Best Share": "max(recent_share_history[].achieved_difficulty) — best locally-proven achieved difficulty in the recent share window (0 = none yet, never the pool target)",
-            "Total MH": "hashrate_ghs × 1000 × uptime_s — APPROXIMATION from instantaneous hashrate × elapsed, NOT true cumulative work (drifts after any ramp/tune/gap or restart)"
+            "Total MH": "hashrate_ghs × 1000 × uptime_s — APPROXIMATION from instantaneous hashrate × elapsed, NOT true cumulative work (drifts after any ramp/tune/gap or restart)",
+            "GHS 5s": "miner_state.hashrate_5s_ghs (GH/s; same source as MHS 5s / 1000)",
+            "GHS av": "miner_state.hashrate_ghs (GH/s; same source as MHS av / 1000)",
+            "MAC": "/sys/class/net/eth0/address (empty when unread; no LAN write)",
+            "Hostname": "/etc/hostname via rest::local_hostname (default dcentos)"
         }
     })
 }
@@ -869,6 +884,9 @@ fn build_bmminer_stats_object(
     chains: &[CgStatsChain],
     uptime_s: u64,
     fan_rpms: &[u32],
+    total_rateideal_ghs: Option<f64>,
+    mac: &str,
+    hostname: &str,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("STATS".into(), serde_json::json!(0));
@@ -899,6 +917,16 @@ fn build_bmminer_stats_object(
     );
     obj.insert("GHS av".into(), serde_json::json!(total_rate_ghs));
     obj.insert("total_rate".into(), serde_json::json!(total_rate_ghs));
+    // pyasic `expected_hashrate` reads STATS `total_rateideal` in GH/s.
+    // Sourced from MinerProfile::nominal_hashrate_ghs(default_freq); 0.0
+    // when the chip has no profile — never a fabricated TH/s figure.
+    let rate_ideal = total_rateideal_ghs
+        .filter(|ghs| ghs.is_finite() && *ghs > 0.0)
+        .unwrap_or(0.0);
+    obj.insert("total_rateideal".into(), serde_json::json!(rate_ideal));
+    obj.insert("MAC".into(), serde_json::json!(mac));
+    obj.insert("Hostname".into(), serde_json::json!(hostname));
+    obj.insert("hostname".into(), serde_json::json!(hostname));
 
     // freq_avg = mean of per-board commanded frequency (0 when no boards).
     let freq_avg = if board_count > 0 {
@@ -953,6 +981,9 @@ fn build_bmminer_stats_object(
             "temp{N}/temp2_{N}/temp_chip{N}": "chains[N-1].temp_c (single per-chain sensor)",
             "freq_avg": "mean(chains.frequency_mhz)",
             "total_rate": "sum(chains.hashrate_ghs) GH/s",
+            "total_rateideal": "MinerProfile::nominal_hashrate_ghs(default_freq_mhz) GH/s; 0 when chip has no profile (not a measured rate)",
+            "MAC": "/sys/class/net/eth0/address (empty when unread; no LAN write)",
+            "Hostname": "/etc/hostname via rest::local_hostname (default dcentos)",
             "fan_num/fan{N}": "miner_state.fans.per_fan[].rpm (live per-fan telemetry; legacy single primary-tach RPM fallback)"
         }),
     );
@@ -997,10 +1028,19 @@ async fn handle_stats(state: &AppState) -> serde_json::Value {
     // key family), then the legacy per-chain rows.
     // P1-5 (D-14): project live per-fan RPM into the bmminer `fan_num`/`fan{N}`.
     let fan_rpms = project_fan_rpms(&miner.fans);
+    let total_rateideal_ghs = state
+        .hardware_info
+        .lock()
+        .ok()
+        .and_then(|hw| profile_total_rateideal_ghs(&hw));
+    let (mac, hostname) = read_cgminer_net_identity();
     let mut stats = vec![build_bmminer_stats_object(
         &projected,
         miner.uptime_s,
         &fan_rpms,
+        total_rateideal_ghs,
+        &mac,
+        &hostname,
     )];
     for chain in &projected {
         stats.push(build_cg_chain_stats_row(chain, miner.uptime_s));
@@ -1906,8 +1946,8 @@ mod tests {
 
     #[test]
     fn cgminer_connection_cap_is_finite_for_lan_exposure() {
-        assert!(MAX_CGMINER_CONNECTIONS > 0);
-        assert!(MAX_CGMINER_CONNECTIONS <= 64);
+        let cap = std::hint::black_box(MAX_CGMINER_CONNECTIONS);
+        assert!((1..=64).contains(&cap));
     }
 
     #[test]
@@ -2148,7 +2188,12 @@ mod tests {
         assert_eq!(summary_obj["Hardware Errors"], serde_json::json!(10));
         assert_eq!(summary_obj["MHS av"], serde_json::json!(104_250_500.0));
         assert_eq!(summary_obj["MHS 5s"], serde_json::json!(103_900_000.0));
+        assert_eq!(summary_obj["GHS av"], serde_json::json!(104_250.5));
+        assert_eq!(summary_obj["GHS 5s"], serde_json::json!(103_900.0));
         assert_eq!(summary_obj["Best Share"], serde_json::json!(60_933.43));
+        assert!(summary_obj.get("MAC").is_some());
+        assert!(summary_obj.get("Hostname").is_some());
+        assert!(summary_obj.get("hostname").is_some());
 
         let stats = handle_command_arc(&state, &command("stats")).await;
         assert_success_status(&stats, "Stats");
@@ -2162,6 +2207,12 @@ mod tests {
         assert_eq!(bmminer["temp_chip2"], serde_json::json!(64.0));
         assert_eq!(bmminer["freq_avg"], serde_json::json!(527.5));
         assert_eq!(bmminer["total_rate"], serde_json::json!(41_500.0));
+        assert_eq!(bmminer["GHS av"], serde_json::json!(41_500.0));
+        assert_eq!(bmminer["GHS 5s"], serde_json::json!("41500.00"));
+        assert_eq!(bmminer["total_rateideal"], serde_json::json!(103_950.0));
+        assert_eq!(bmminer["Type"], serde_json::json!("DCENTos"));
+        assert!(bmminer.get("MAC").is_some());
+        assert!(bmminer.get("Hostname").is_some());
         let chain_row = &stats["STATS"][1];
         assert_eq!(chain_row["ID"], serde_json::json!("CHAIN6"));
         assert_eq!(chain_row["chain_acn"], serde_json::json!(114));
@@ -2312,7 +2363,7 @@ mod tests {
             chain(6, 114, 525, 13_700, 62.5, 21_000.0, 3),
             chain(7, 110, 530, 13_750, 64.0, 20_500.0, 7),
         ];
-        let obj = build_bmminer_stats_object(&chains, 1234, &[]);
+        let obj = build_bmminer_stats_object(&chains, 1234, &[], None, "", "");
 
         assert_eq!(obj["miner_count"], serde_json::json!(2));
         assert_eq!(obj["temp_num"], serde_json::json!(2));
@@ -2337,6 +2388,8 @@ mod tests {
         assert_eq!(obj["freq_avg"], serde_json::json!(527.5));
         // total_rate = sum of per-board GH/s.
         assert_eq!(obj["total_rate"], serde_json::json!(41_500.0));
+        // Unknown profile → honest 0, not a fabricated TH/s figure.
+        assert_eq!(obj["total_rateideal"], serde_json::json!(0.0));
         // chain-alive map char ('o' = responding).
         assert_eq!(obj["chain_xtime1"], serde_json::json!("o"));
     }
@@ -2346,7 +2399,7 @@ mod tests {
     #[test]
     fn bmminer_stats_object_marks_dead_board() {
         let chains = vec![chain(6, 0, 0, 0, 0.0, 0.0, 0)];
-        let obj = build_bmminer_stats_object(&chains, 1, &[]);
+        let obj = build_bmminer_stats_object(&chains, 1, &[], None, "", "");
         assert_eq!(obj["chain_acn1"], serde_json::json!(0));
         assert_eq!(obj["chain_xtime1"], serde_json::json!("x"));
         assert_eq!(obj["total_rate"], serde_json::json!(0.0));
@@ -2355,11 +2408,12 @@ mod tests {
     // Zero boards (pre-enumeration) must not divide-by-zero on freq_avg.
     #[test]
     fn bmminer_stats_object_handles_empty_chains() {
-        let obj = build_bmminer_stats_object(&[], 0, &[]);
+        let obj = build_bmminer_stats_object(&[], 0, &[], None, "", "");
         assert_eq!(obj["miner_count"], serde_json::json!(0));
         assert_eq!(obj["freq_avg"], serde_json::json!(0.0));
         assert_eq!(obj["temp_max"], serde_json::json!(0.0));
         assert_eq!(obj["total_rate"], serde_json::json!(0.0));
+        assert_eq!(obj["total_rateideal"], serde_json::json!(0.0));
         // No per-board keys leak when there are no boards.
         assert!(obj.get("chain_acn1").is_none());
     }
@@ -2374,7 +2428,7 @@ mod tests {
         // 10 hw errors out of (40 accepted + 1 rejected + 10 errors) = 51
         // work units => 10/51*100 ≈ 19.6078 %. Matches the Prometheus gauge
         // (0.196078) × 100, by construction (shared `hw_error_percent`).
-        let obj = build_summary_object(40, 1, 10, 7_800, 104_250.5, 103_900.0, 60_933.43);
+        let obj = build_summary_object(40, 1, 10, 7_800, 104_250.5, 103_900.0, 60_933.43, "", "");
 
         let dhw = obj["Device Hardware%"]
             .as_f64()
@@ -2412,7 +2466,7 @@ mod tests {
     // — indistinguishable from a measured 0 because it IS one.
     #[test]
     fn summary_object_healthy_miner_reports_honest_zero_hardware_pct() {
-        let obj = build_summary_object(100, 0, 0, 600, 95_000.0, 95_500.0, 0.0);
+        let obj = build_summary_object(100, 0, 0, 600, 95_000.0, 95_500.0, 0.0, "", "");
         assert_eq!(obj["Device Hardware%"], serde_json::json!(0.0));
         // Still not listed as unsupported — it's a real, computed value.
         let unsupported = obj["_DCENTUnsupported"].as_array().unwrap();
@@ -2422,7 +2476,7 @@ mod tests {
     // Pre-mining (no work, uptime 0) must not divide-by-zero anywhere.
     #[test]
     fn summary_object_no_work_zero_uptime_no_divide_by_zero() {
-        let obj = build_summary_object(0, 0, 0, 0, 0.0, 0.0, 0.0);
+        let obj = build_summary_object(0, 0, 0, 0, 0.0, 0.0, 0.0, "", "");
         assert_eq!(obj["Device Hardware%"], serde_json::json!(0.0));
         assert_eq!(obj["Device Rejected%"], serde_json::json!(0.0));
         assert_eq!(obj["Utility"], serde_json::json!(0.0));
@@ -2435,7 +2489,7 @@ mod tests {
     // Utility / Best Share (all sourced) are NOT among them.
     #[test]
     fn summary_object_unsupported_list_is_exactly_the_placeholder_keys() {
-        let obj = build_summary_object(40, 1, 10, 7_800, 104_250.5, 103_900.0, 1_024.0);
+        let obj = build_summary_object(40, 1, 10, 7_800, 104_250.5, 103_900.0, 1_024.0, "", "");
         let unsupported: Vec<&str> = obj["_DCENTUnsupported"]
             .as_array()
             .unwrap()
@@ -2521,7 +2575,7 @@ mod tests {
     fn fan_num_and_best_share_are_nonzero_when_data_present() {
         // fan_num / fan{N} projected from the live per-fan RPM list.
         let chains = vec![chain(6, 114, 525, 13_700, 62.5, 21_000.0, 3)];
-        let obj = build_bmminer_stats_object(&chains, 1234, &[2940, 3720]);
+        let obj = build_bmminer_stats_object(&chains, 1234, &[2940, 3720], None, "", "");
         assert_eq!(obj["fan_num"], serde_json::json!(2));
         assert_eq!(obj["fan1"], serde_json::json!(2940));
         assert_eq!(obj["fan2"], serde_json::json!(3720));
@@ -2629,16 +2683,24 @@ mod tests {
         // hardware model string for pyasic/asic-rs `Type` classification.
         // (Exact names come from dcentrald_asic::drivers::MINER_PROFILES.)
         let s9 = hardware_model_label(&hw("BM1387"));
-        assert!(
-            s9.starts_with("Antminer"),
-            "BM1387 should map to an Antminer model, got {s9:?}"
-        );
+        assert_eq!(s9, "Antminer S9");
         let s19pro = hardware_model_label(&hw("BM1398"));
-        assert!(s19pro.starts_with("Antminer"), "got {s19pro:?}");
+        assert_eq!(s19pro, "Antminer S19 Pro");
         // Case-insensitive chip-type matching.
         assert_eq!(
             hardware_model_label(&hw("bm1387")),
             hardware_model_label(&hw("BM1387"))
+        );
+        // REST fleet_model_label is the single SSOT — BM1362 must not stay
+        // chip-typed as "Antminer (BM1362)".
+        assert_eq!(hardware_model_label(&hw("BM1362")), "Antminer S19j Pro");
+        assert_eq!(
+            crate::rest::fleet_model_label(&hw("BM1362")),
+            "Antminer S19j Pro"
+        );
+        assert_ne!(
+            crate::rest::fleet_model_label(&hw("BM1362")),
+            "Antminer (BM1362)"
         );
     }
 
@@ -2646,7 +2708,11 @@ mod tests {
     fn hardware_model_falls_back_without_claiming_competitor_firmware() {
         // Unknown chip → honest fallback, never an empty/garbage Type.
         let unknown = hardware_model_label(&hw("BM9999"));
-        assert!(unknown.contains("BM9999"), "got {unknown:?}");
+        assert_eq!(unknown, "Antminer (BM9999)");
+        assert_eq!(
+            crate::rest::fleet_model_label(&hw("BM9999")),
+            "Antminer (BM9999)"
+        );
         let empty = hardware_model_label(&hw(""));
         assert_eq!(empty, "Antminer (unknown ASIC)");
         // hb_type is used when chip-type doesn't resolve a profile.
@@ -2668,6 +2734,61 @@ mod tests {
                 "firmware version must not impersonate {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn summary_object_exposes_ghs_aliases_mac_and_hostname() {
+        let obj = build_summary_object(
+            40,
+            1,
+            10,
+            7_800,
+            104_250.5,
+            103_900.0,
+            60_933.43,
+            "aa:bb:cc:dd:ee:ff",
+            "miner-25",
+        );
+        assert_eq!(obj["GHS av"], serde_json::json!(104_250.5));
+        assert_eq!(obj["GHS 5s"], serde_json::json!(103_900.0));
+        assert_eq!(obj["MHS av"], serde_json::json!(104_250_500.0));
+        assert_eq!(obj["MHS 5s"], serde_json::json!(103_900_000.0));
+        assert_eq!(obj["MAC"], serde_json::json!("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(obj["Hostname"], serde_json::json!("miner-25"));
+        assert_eq!(obj["hostname"], serde_json::json!("miner-25"));
+    }
+
+    #[test]
+    fn bmminer_stats_object_exposes_total_rateideal_mac_and_hostname() {
+        let chains = vec![chain(6, 126, 500, 13_700, 62.5, 34_650.0, 0)];
+        let obj = build_bmminer_stats_object(
+            &chains,
+            1234,
+            &[],
+            Some(103_950.0),
+            "aa:bb:cc:dd:ee:ff",
+            "miner-25",
+        );
+        assert_eq!(obj["total_rateideal"], serde_json::json!(103_950.0));
+        assert_eq!(obj["total_rate"], serde_json::json!(34_650.0));
+        assert_eq!(obj["MAC"], serde_json::json!("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(obj["Hostname"], serde_json::json!("miner-25"));
+        assert_eq!(obj["hostname"], serde_json::json!("miner-25"));
+        assert_eq!(obj["Type"], serde_json::json!("DCENTos"));
+    }
+
+    #[test]
+    fn profile_total_rateideal_uses_miner_profile_and_refuses_unknown() {
+        let ghs = profile_total_rateideal_ghs(&hw("BM1362")).expect("BM1362 has a profile");
+        assert!(
+            (ghs - 103_950.0).abs() < 1.0,
+            "BM1362 default-freq nominal should be ~103950 GH/s, got {ghs}"
+        );
+        assert!(
+            profile_total_rateideal_ghs(&hw("BM9999")).is_none(),
+            "unknown chip must not invent a TH/s rateideal"
+        );
+        assert!(profile_total_rateideal_ghs(&hw("")).is_none());
     }
 
     // ── Item 3: multi-pool POOLS array ──

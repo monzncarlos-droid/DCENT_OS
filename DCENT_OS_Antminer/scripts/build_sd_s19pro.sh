@@ -1,11 +1,20 @@
 #!/bin/bash
 #
-# build_sd_s19pro.sh — Build DCENT_OS lab SD boot media for AM2 S17 Pro / S19 Pro
+# build_sd_s19pro.sh — Build DCENT_OS lab SD boot media for the AM2 Zynq family
+# (S19 Pro, S17 / S17 Pro, and — since the 2026-08-27 unlock armada — S17+,
+# T17, T17+; all BM1397 17-series SKUs ride the same held Braiins am2-s17
+# boot components per A2 section 3).
 # D-Central Technologies, 2026
 #
 # Creates a bootable SD card for AM2 lab bring-up and SD boot validation.
-# It does NOT imply a safe public NAND install path for either miner variant.
+# It does NOT imply a safe public NAND install path for any miner variant.
 # Uses BraiinsOS boot chain (FSBL, U-Boot, FPGA, kernel) + DCENT_OS rootfs.
+#
+# SD-TRIAL CONTRACT (17 family): zero NAND writes. On a stock unit the stock
+# NAND u-boot chain-loads the SD payload (uenvcmd, see the uEnv notes); the
+# `boot_stock` flag file on the FAT is the documented escape back to the
+# stock chain. Held boot assets are referenced by exact path + SHA256 below
+# and are NEVER regenerated.
 #
 # *** 2026-06-10 SD BOOT DEFECT FIX (squashfs-root model) ***
 # The previous revision booted the squashfs as a U-Boot ramdisk
@@ -29,7 +38,7 @@ VARIANT="s19pro"
 VERIFY_DONOR_ONLY=0
 
 usage() {
-    echo "Usage: $(basename "$0") [--variant s19pro|s17p]" >&2
+    echo "Usage: $(basename "$0") [--variant s19pro|s17p|s17plus|t17|t17plus]" >&2
     echo "       Builds experimental, management-only AM2 Zynq SD boot media." >&2
     echo "       --verify-donor-only checks the held boot image and exits." >&2
 }
@@ -76,8 +85,46 @@ case "$VARIANT" in
         CONFIG_NAME="dcentrald_s17pro_am2_baked_default.toml"
         IMAGE_NAME="dcentos-s17pro-sd.img"
         ;;
+    # 2026-08-27 Antminer 17-Series Complete Unlock Armada (agent B2): the
+    # remaining BM1397 17-family SKUs get SD-first TRIAL media on the SAME
+    # held Braiins am2-s17 boot components (A2 section 3: one image serves
+    # S17/S17 Pro/S17+/T17/T17+). Zero NAND writes: the stock NAND u-boot
+    # chain-loads the SD payload via uenvcmd (see the uEnv.txt notes), and a
+    # `boot_stock` flag file on the FAT escapes back to the stock NAND chain.
+    # Config: the am2-s17pro baked default (mining disabled, am2 safety
+    # envelope) patched with the per-model geometry below.
+    s17plus|s17+)
+        VARIANT="s17plus"
+        BOARD_TARGET="am2-s17plus"
+        ARTIFACT_TARGET="am2-s17plus-sd"
+        MODEL_LABEL="S17+"
+        CONFIG_NAME="dcentrald_s17pro_am2_baked_default.toml"
+        CONFIG_CHIP_COUNT=65
+        CONFIG_MODEL="s17+"
+        IMAGE_NAME="dcentos-s17plus-sd.img"
+        ;;
+    t17)
+        VARIANT="t17"
+        BOARD_TARGET="am2-t17"
+        ARTIFACT_TARGET="am2-t17-sd"
+        MODEL_LABEL="T17"
+        CONFIG_NAME="dcentrald_s17pro_am2_baked_default.toml"
+        CONFIG_CHIP_COUNT=30
+        CONFIG_MODEL="t17"
+        IMAGE_NAME="dcentos-t17-sd.img"
+        ;;
+    t17plus|t17+)
+        VARIANT="t17plus"
+        BOARD_TARGET="am2-t17plus"
+        ARTIFACT_TARGET="am2-t17plus-sd"
+        MODEL_LABEL="T17+"
+        CONFIG_NAME="dcentrald_s17pro_am2_baked_default.toml"
+        CONFIG_CHIP_COUNT=44
+        CONFIG_MODEL="t17+"
+        IMAGE_NAME="dcentos-t17plus-sd.img"
+        ;;
     *)
-        echo "ERROR: unsupported AM2 SD variant: $VARIANT (supported: s19pro, s17p)" >&2
+        echo "ERROR: unsupported AM2 SD variant: $VARIANT (supported: s19pro, s17p, s17plus, t17, t17plus)" >&2
         exit 2
         ;;
 esac
@@ -213,6 +260,20 @@ echo "  Installed current dcentrald binary ($(stat -c%s "$NEW_BINARY") bytes)"
     exit 1
 }
 $SUDO cp "$DCENTOS_CONFIG" "$WORKDIR/rootfs_new/etc/dcentrald.toml"
+if [ -n "${CONFIG_CHIP_COUNT:-}" ]; then
+    # Patch ONLY the per-model geometry (3x65 / 3x30 / 3x44 chips, model
+    # token) into the am2-s17pro baked default. Same mining-disabled,
+    # am2-safety-envelope config otherwise.
+    $SUDO awk -v chips="$CONFIG_CHIP_COUNT" -v model="$CONFIG_MODEL" '
+        BEGIN { in_mining = 0 }
+        /^\[/ { in_mining = ($0 ~ /^\[mining\]$/) ? 1 : 0; print; next }
+        in_mining && /^[[:space:]]*serial_chip_count[[:space:]]*=/ { print "serial_chip_count = " chips; next }
+        in_mining && /^[[:space:]]*model[[:space:]]*=/ { print "model = \"" model "\""; next }
+        { print }
+    ' "$WORKDIR/rootfs_new/etc/dcentrald.toml" > "$WORKDIR/rootfs_new/etc/dcentrald.toml.patched"
+    $SUDO mv "$WORKDIR/rootfs_new/etc/dcentrald.toml.patched" "$WORKDIR/rootfs_new/etc/dcentrald.toml"
+    echo "  Patched per-model geometry: serial_chip_count=$CONFIG_CHIP_COUNT model=$CONFIG_MODEL"
+fi
 echo "  Installed idle-first $MODEL_LABEL config"
 
 # Fix dropbear — enable password auth
@@ -326,9 +387,27 @@ bootargs=mem=228M console=ttyPS0,115200 root=/dev/mmcblk0p2 rootfstype=squashfs 
 bm_kernel_addr=0x2000000
 bm_devicetree_addr=0x3000000
 
-# (no `uenvcmd`: the resident BraiinsOS 2016.03 U-Boot runs `sd_uenvcmd`, never `uenvcmd`.
-#  The old stage-1 `go 0x4000000` chain-load was DEAD code AND self-referential — re-entering
-#  the running U-Boot, a latent boot-loop if ever executed. Removed, pass-2 M-2.)
+# STOCK-UNIT ENTRY (2026-08-27 armada, A2 section 3 boot model 2): on a STOCK
+# unit (stock NAND u-boot intact, eFuse state irrelevant) the stock ROM u-boot
+# scans the SD in its recovery path and EXECUTES a top-level `uenvcmd` — the
+# documented Braiins stock-chain-load: `load mmc 0 0x3FFFFC0 u-boot.img; go
+# 0x4000000` (BOS u-boot.img loaded 64-byte-header-aligned, jump to the
+# binary). That is what makes SD trial boot a ZERO-NAND-WRITE path on an
+# otherwise untouched stock unit. On the BOS-SPL path (this card's own
+# BOOT.BIN) the resident BraiinsOS 2016.03 u-boot runs `sd_uenvcmd` and NEVER
+# imports `uenvcmd`, so the line below is inert there — the pass-2 M-2
+# boot-loop concern applied to re-entering an ALREADY-RUNNING BOS u-boot,
+# which the sdboot path cannot do. After `go 0x4000000` the freshly entered
+# BOS u-boot runs its own sdboot -> sd_uenvcmd below: both entries converge on
+# the DCENT kernel.
+uenvcmd=load mmc 0 0x3FFFFC0 u-boot.img && go 0x4000000
+
+# ESCAPE HATCH (`boot_stock` flag file): create an empty file named
+# `boot_stock` in this FAT partition to flip the BOS u-boot to the STOCK NAND
+# boot chain (system_bm.bit stock-compat bitstream + stock mtd0 offsets) —
+# the Braiins dual-boot contract (A2 section 3 boot model 3). Removing the
+# file restores DCENT SD boot. Documented escape for ending an SD trial with
+# zero NAND mutation: power off, add boot_stock (or pull the card), power on.
 
 # FPGA bitstream load (explicit addresses, unzip before fpga loadb)
 bm_bitstream_load_addr=0x1000000

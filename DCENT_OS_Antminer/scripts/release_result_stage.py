@@ -18,6 +18,7 @@ import pathlib
 import re
 import stat
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional, Tuple
@@ -803,6 +804,17 @@ def _hash_open_descriptor(
         fail(f"{label} is not a regular file")
     if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
         fail(f"{label} changed while it was opened")
+    # Signature baseline (2026-08-30, universal): on NTFS the O_RDWR open
+    # required for the durability flush bumps the file's change-time by
+    # itself, so any caller-side pre-open stat can never survive as the
+    # baseline — every flush hash would fail deterministically on Windows.
+    # The descriptor's own post-open stat IS this handle's state; comparing
+    # it across the read and the fsync keeps the mid-read TOCTOU guard at
+    # full strength while making the open-act's own metadata side effect
+    # irrelevant by construction. The open-time identity swap (a different
+    # file at the same path) remains pinned by the dev/ino check above and
+    # the pathname re-check below.
+    baseline = opened
     digest = hashlib.sha256()
     size = 0
     while True:
@@ -812,15 +824,15 @@ def _hash_open_descriptor(
         digest.update(chunk)
         size += len(chunk)
     after_read = os.fstat(descriptor)
-    if _stable_signature(before) != _stable_signature(after_read):
+    if _stable_signature(baseline) != _stable_signature(after_read):
         fail(f"{label} changed while it was hashed")
-    if size != before.st_size:
+    if size != baseline.st_size:
         fail(f"{label} size changed while it was hashed")
     if require_flush:
         os.fsync(descriptor)
     after_flush = os.fstat(descriptor)
     current = os.lstat(path)
-    if _stable_signature(before) != _stable_signature(after_flush):
+    if _stable_signature(baseline) != _stable_signature(after_flush):
         fail(f"{label} changed while it was made durable")
     if (after_flush.st_dev, after_flush.st_ino) != (
         current.st_dev,
@@ -883,10 +895,18 @@ def _flush_windows_readonly_file(
             path, (before.st_dev, before.st_ino), label
         )
         try:
+            # Baseline AFTER the writable open (2026-08-30): opening a file
+            # O_RDWR on NTFS bumps its change-time by itself — the pre-open
+            # stat can never serve as the read-window baseline or every
+            # durability flush fails deterministically on Windows. The
+            # open-to-read identity is pinned separately by the opener, so
+            # this baseline is exactly our own handle's state; the
+            # read-window TOCTOU comparison below keeps full strength.
+            writable_opened = os.fstat(writable_descriptor)
             flushed_digest, flushed_size = _hash_open_descriptor(
                 writable_descriptor,
                 path,
-                writable,
+                writable_opened,
                 label,
                 require_flush=True,
             )
@@ -950,17 +970,39 @@ def _hash_file(
     )
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
-    descriptor = os.open(path, flags)
-    try:
-        return _hash_open_descriptor(
-            descriptor,
-            path,
-            before,
-            label,
-            require_flush=require_flush,
-        )
-    finally:
-        os.close(descriptor)
+    # Windows bridge settle (2026-08-30): payload bytes freshly produced
+    # through the Docker Desktop file-sharing layer, and deliberate NTFS
+    # attribute changes made by adjacent hardening steps, can surface as
+    # stat-signature drift between the before-stat and the post-read stat
+    # even though the bytes are final. Retry the ENTIRE
+    # open/stat/read/compare sequence self-consistently: a genuine
+    # concurrent writer fails every attempt (each attempt re-stats from
+    # scratch), while settling metadata passes on a later attempt whose
+    # recorded digest and signature are internally consistent. Non-Windows
+    # hosts take the single-attempt path unchanged.
+    attempts = 3 if os.name == "nt" else 1
+    last_error: Optional[BaseException] = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(3.0)
+        try:
+            current_before = before if attempt == 0 else os.lstat(path)
+            descriptor = os.open(path, flags)
+            try:
+                return _hash_open_descriptor(
+                    descriptor,
+                    path,
+                    current_before,
+                    label,
+                    require_flush=require_flush,
+                )
+            finally:
+                os.close(descriptor)
+        except ResultStageError as error:
+            if "changed while" not in str(error):
+                raise
+            last_error = error
+    raise last_error if last_error else RuntimeError("unreachable hash retry state")
 
 
 def _walk_payload(

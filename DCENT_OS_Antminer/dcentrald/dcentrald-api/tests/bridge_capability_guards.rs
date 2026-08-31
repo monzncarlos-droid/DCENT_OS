@@ -58,6 +58,7 @@ fn unknown_identity_state() -> Arc<AppState> {
 /// Granted identity: BM1387 (the S9 beta anchor in the public support matrix) +
 /// operator-confirmed `exact` identity confidence → `CapabilitySupportTier::Beta`
 /// + `IdentityConfidence::Exact` → all mutating runtime caps are granted
+///
 /// (PoolsRw / PowerControl / Reboot / AsicOptions / ConfigRw / Identify).
 fn granted_identity_state() -> Arc<AppState> {
     granted_identity_state_with_gate(HardwareMutationGate::new_open())

@@ -33,7 +33,9 @@ use dcentrald_hal::fan::FanController;
 use dcentrald_hal::fpga_chain::FpgaChain;
 use dcentrald_hal::gpio::GpioController;
 use dcentrald_hal::i2c::TerminalSafeOffTransition;
-use dcentrald_hal::led::{LedCommand, LedEngine, LedEngineConfig, LedPattern};
+use dcentrald_hal::led::{
+    sysfs_status_led_backend, LedCommand, LedEngine, LedEngineConfig, LedIo, LedPattern,
+};
 use dcentrald_hal::platform::{
     FanAccess, HardwareMutationBarrierReceipt, HardwareMutationCommitFenceReceipt,
 };
@@ -83,6 +85,13 @@ use crate::runtime::watchdog_feed_gate::{
 use crate::voltage_mailbox::{voltage_command_mailbox, VoltageCommandSender, VoltageTrySendError};
 use crate::work_dispatcher::{VoltageCommand, VoltageCommandReply};
 
+use dcentrald_common::mutation_disposition::{
+    admit_hardware_after_mutation_adjudication, clear_mutation_disposition,
+    current_slot_image_identity, load_and_adjudicate_mutation_disposition,
+    persist_mutation_disposition, sanitize_journal_token, MutationDispositionEntry,
+    MutationDispositionRecord, MutationEndpointClass, MutationEntryDisposition,
+    MutationQuarantineReason, MutationSessionReason,
+};
 use dcentrald_common::thermal_lockout::{
     evaluate_thermal_lockout_release, load_thermal_lockout, persist_thermal_lockout,
     prearmed_thermal_generation, remove_thermal_lockout, TerminalThermalLockout,
@@ -1060,33 +1069,74 @@ pub(crate) fn exercise_s19k_nopic_config_admission(
     config: &crate::config::DcentraldConfig,
 ) {
     use dcentrald_common::s19k_bm1366_nopic_beta::{
-        admit_s19k_am3_board_desc, admit_s19k_bm1366_nopic_skeleton, S19K_AM3_BOARD_TARGET,
-        S19K_BM1366_ASIC_NUM, S19K_BM1366_BAUD_HZ, S19K_BM1366_CHIP_ID,
-        S19K_BM1366_INC_FREQ_DELAY_MS, S19K_BM1366_MIDSTATE_NUMBER,
+        admit_s19k_am3_board_desc, admit_s19k_bm1366_nopic_skeleton,
+        admit_s19k_bm1366_stock_baud_pair, S19K_AM3_BOARD_TARGET, S19K_BM1366_ASIC_NUM,
+        S19K_BM1366_BAUD_HZ, S19K_BM1366_CHIP_ID, S19K_BM1366_FASTUART_VALUE,
+        S19K_BM1366_HOST_BAUD_HZ, S19K_BM1366_INC_FREQ_DELAY_MS, S19K_BM1366_MIDSTATE_NUMBER,
         S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV, S19K_BM1366_VOLTAGE_ADJUST_STEP,
         S19K_CTRLBOARD_LM75_ADDRS, S19K_GPIO_PWR_EN, S19K_GPIO_PWR_EN_SAFE_OFF_VALUE,
     };
     let board_target = identity.board_target().trim();
-    let _model_is_s19k = config.mining.model.as_deref().map(|m| {
-        let m = m.trim().to_ascii_lowercase();
-        m == "s19k" || m == "s19kpro" || m == "s19k-pro"
-    }).unwrap_or(false);
+    let _model_is_s19k = config
+        .mining
+        .model
+        .as_deref()
+        .map(|m| {
+            let m = m.trim().to_ascii_lowercase();
+            m == "s19k" || m == "s19kpro" || m == "s19k-pro"
+        })
+        .unwrap_or(false);
     // Identity via /etc/dcentos/board_target (authoritative) and/or typed
     // TOML [platform].board_target applied onto the snapshot before this call.
-    if board_target != S19K_AM3_BOARD_TARGET { return; }
+    if board_target != S19K_AM3_BOARD_TARGET {
+        return;
+    }
     if let Some(desc) = identity.board_desc {
         match admit_s19k_am3_board_desc(desc) {
-            Ok(()) => tracing::info!(board_target = desc.board_target, "S19k NoPic BoardDesc admission OK (management-only; no energize)"),
+            Ok(()) => tracing::info!(
+                board_target = desc.board_target,
+                "S19k NoPic BoardDesc admission OK (management-only; no energize)"
+            ),
             Err(err) => tracing::warn!(error = %err, "S19k NoPic BoardDesc admission refused"),
         }
     }
-    match admit_s19k_bm1366_nopic_skeleton(
-        "BHB56903", S19K_BM1366_CHIP_ID, S19K_BM1366_ASIC_NUM, S19K_BM1366_MIDSTATE_NUMBER, false,
-        S19K_BM1366_BAUD_HZ, S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV, S19K_BM1366_INC_FREQ_DELAY_MS,
-        S19K_BM1366_VOLTAGE_ADJUST_STEP, S19K_CTRLBOARD_LM75_ADDRS, S19K_GPIO_PWR_EN, S19K_GPIO_PWR_EN_SAFE_OFF_VALUE,
+    match admit_s19k_bm1366_stock_baud_pair(
+        S19K_BM1366_BAUD_HZ,
+        S19K_BM1366_HOST_BAUD_HZ,
+        S19K_BM1366_FASTUART_VALUE,
     ) {
-        Ok(()) => tracing::info!(board_name = "BHB56903", "S19k BM1366 NoPic skeleton admission OK for BHB56903 (management-only)"),
-        Err(err) => tracing::warn!(error = %err, "S19k BM1366 NoPic skeleton admission refused for BHB56903"),
+        Ok(()) => tracing::info!(
+            requested_chip_baud_hz = S19K_BM1366_BAUD_HZ,
+            host_baud_hz = S19K_BM1366_HOST_BAUD_HZ,
+            fast_uart_value = S19K_BM1366_FASTUART_VALUE,
+            "S19k BM1366 stock FastUART pair admission OK (management-only)"
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "S19k BM1366 stock FastUART pair admission refused");
+            return;
+        }
+    }
+    match admit_s19k_bm1366_nopic_skeleton(
+        "BHB56903",
+        S19K_BM1366_CHIP_ID,
+        S19K_BM1366_ASIC_NUM,
+        S19K_BM1366_MIDSTATE_NUMBER,
+        false,
+        S19K_BM1366_BAUD_HZ,
+        S19K_BM1366_PRE_OPEN_CORE_VOLTAGE_CV,
+        S19K_BM1366_INC_FREQ_DELAY_MS,
+        S19K_BM1366_VOLTAGE_ADJUST_STEP,
+        S19K_CTRLBOARD_LM75_ADDRS,
+        S19K_GPIO_PWR_EN,
+        S19K_GPIO_PWR_EN_SAFE_OFF_VALUE,
+    ) {
+        Ok(()) => tracing::info!(
+            board_name = "BHB56903",
+            "S19k BM1366 NoPic skeleton admission OK for BHB56903 (management-only)"
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "S19k BM1366 NoPic skeleton admission refused for BHB56903")
+        }
     }
 }
 
@@ -2395,6 +2445,151 @@ fn persist_terminal_thermal_generation(
         })?;
     }
     persist_thermal_lockout(path, lockout).map_err(anyhow::Error::new)
+}
+
+/// Durable location of the hardware mutation-disposition journal. Same
+/// persistence seam and ephemeral-deploy policy as the thermal lockout above:
+/// `/data` is the durable copy; the forced runtime-only policy redirects to
+/// tmpfs (where the journal is intentionally boot-scoped).
+pub(crate) fn terminal_mutation_disposition_path() -> std::path::PathBuf {
+    crate::runtime_policy::persistence_path(
+        std::path::Path::new("/data/dcent/dcentrald-mutation-disposition-v1"),
+        std::path::Path::new("/tmp/dcent/dcentrald-mutation-disposition-v1"),
+    )
+}
+
+/// The adjudicating/writing boot's kernel boot id as a journal-safe token.
+/// If the boot id cannot be read, a sentinel is returned; a persisted record
+/// bearing a sentinel can only ever contain non-Clean entries (see the journal
+/// builder below), so a sentinel/sentinel match can never create a false
+/// admission — non-Clean entries without receipts refuse regardless of boot
+/// identity.
+pub(crate) fn current_boot_id_token() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|raw| sanitize_journal_token(raw.trim()))
+        .unwrap_or_else(|| "boot-id-unavailable".to_string())
+}
+
+/// Project the HAL's process-local fabric-registry snapshot into durable
+/// journal entries. ONLY `Mutated` and `Quarantined` dispositions are
+/// journaled: `Clean`/`Active` entries are live-owner states whose crash
+/// disposition is owned by the supervisor session latch, and journaling them
+/// would turn every normally-closed session into an operator boundary. No
+/// SafeOff receipt is ever auto-minted here — process teardown is not
+/// rail-cut evidence.
+fn unresolved_mutation_journal_entries() -> Vec<MutationDispositionEntry> {
+    dcentrald_hal::i2c::snapshot_i2c_fabric_dispositions()
+        .into_iter()
+        .filter_map(|snapshot| {
+            use dcentrald_hal::i2c::{
+                I2cFabricDispositionState, I2cFabricEndpointClass, I2cFabricQuarantineDisposition,
+            };
+            let disposition = match snapshot.disposition {
+                I2cFabricDispositionState::Clean | I2cFabricDispositionState::Active => {
+                    return None;
+                }
+                I2cFabricDispositionState::Mutated => MutationEntryDisposition::Mutated,
+                I2cFabricDispositionState::Quarantined(reason) => {
+                    MutationEntryDisposition::Quarantined(match reason {
+                        I2cFabricQuarantineDisposition::PreparationAborted => {
+                            MutationQuarantineReason::PreparationAborted
+                        }
+                        I2cFabricQuarantineDisposition::WorkerPanicked => {
+                            MutationQuarantineReason::WorkerPanicked
+                        }
+                        I2cFabricQuarantineDisposition::UnresolvedPic16State => {
+                            MutationQuarantineReason::UnresolvedPic16State
+                        }
+                        I2cFabricQuarantineDisposition::UnexpectedLeaseDrop => {
+                            MutationQuarantineReason::UnexpectedLeaseDrop
+                        }
+                        I2cFabricQuarantineDisposition::RegistryInvariantLost => {
+                            MutationQuarantineReason::RegistryInvariantLost
+                        }
+                    })
+                }
+            };
+            Some(MutationDispositionEntry {
+                fabric_key: sanitize_journal_token(&snapshot.fabric_key),
+                allocation_id: snapshot.allocation_id,
+                endpoint_class: match snapshot.endpoint_class {
+                    I2cFabricEndpointClass::RuntimeService => MutationEndpointClass::RuntimeService,
+                    I2cFabricEndpointClass::RawLease => MutationEndpointClass::RawLease,
+                },
+                disposition,
+                safe_off_receipt: None,
+            })
+        })
+        .collect()
+}
+
+/// Capture and durably journal any Mutated/Quarantined fabric dispositions.
+///
+/// Called ONLY from controlled teardown points (typed shutdown and the two
+/// thermal terminal arms, at the same watchdog-feed-closed boundary that
+/// persists the thermal lockout) — NEVER from a panic handler or unwind path.
+/// A clean roster journals nothing, keeping a normally-closed session
+/// byte-identical to today. A persistence failure is logged as CRITICAL and
+/// cannot admit anything by itself: the supervisor session latch remains the
+/// outer fail-closed boundary.
+///
+/// Receipt is always `None`: software SafeOff is not `VerifiedRailCut`.
+/// Session reason is journaled so sysupgrade admit can distinguish
+/// expected-zero from safeoff-failed without promoting either to a rail proof.
+pub(crate) fn persist_unresolved_mutation_dispositions(path: &std::path::Path) {
+    persist_unresolved_mutation_dispositions_with_reason(
+        path,
+        MutationSessionReason::UnresolvedFabricQuarantine,
+    );
+}
+
+pub(crate) fn persist_unresolved_mutation_dispositions_with_reason(
+    path: &std::path::Path,
+    session_reason: MutationSessionReason,
+) {
+    let entries = unresolved_mutation_journal_entries();
+    if entries.is_empty() {
+        return;
+    }
+    let image_version = std::fs::read_to_string("/etc/dcentos-version").ok();
+    let platform = std::fs::read_to_string("/etc/dcentos/platform").ok();
+    let record = MutationDispositionRecord {
+        boot_id: current_boot_id_token(),
+        image_version: sanitize_journal_token(
+            image_version.as_deref().map(str::trim).unwrap_or("unknown"),
+        ),
+        platform: sanitize_journal_token(platform.as_deref().map(str::trim).unwrap_or("unknown")),
+        slot_identity: current_slot_image_identity(),
+        session_reason,
+        recorded_unix_s: current_unix_s(),
+        entries,
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(create_error) = std::fs::create_dir_all(parent) {
+            error!(
+                path = %path.display(),
+                error = %create_error,
+                "CRITICAL: mutation-disposition journal directory could not be created; the unresolved dispositions are NOT durably journaled and the supervisor session latch must remain the operator boundary"
+            );
+            return;
+        }
+    }
+    match persist_mutation_disposition(path, &record) {
+        Ok(outcome) => warn!(
+            ?record,
+            path = %path.display(),
+            bytes_written = outcome.bytes_written,
+            replaced_existing = outcome.replaced_existing,
+            "Unresolved hardware mutation dispositions durably journaled; the next startup will refuse hardware admission until an operator resolves them"
+        ),
+        Err(persist_error) => error!(
+            ?record,
+            path = %path.display(),
+            error = %persist_error,
+            "CRITICAL: mutation-disposition journal persistence failed; the unresolved dispositions are NOT durably journaled and the supervisor session latch must remain the operator boundary"
+        ),
+    }
 }
 
 /// Run crash-durable lockout publication away from the async worker and bound
@@ -4035,6 +4230,48 @@ enum AtmStepDir {
 /// - This helper never touches voltage; the autotuner lowers voltage with
 ///   frequency through its PVT envelope, so an ATM step can never raise voltage
 ///   past the 14500 mV cap.
+/// Apply a decrease-only bad-chip intent to the dispatcher freq channel.
+/// BoardReset/None are no-ops. Never sends voltage, fan, or EEPROM commands.
+fn apply_bad_chip_actuation(
+    freq_tx: &tokio::sync::mpsc::Sender<dcentrald_autotuner::FreqCommand>,
+    planned: &dcentrald_autotuner::BadChipActuation,
+) {
+    let send = |cmd| {
+        if let Err(e) = freq_tx.try_send(cmd) {
+            warn!(error = %e, "bad-chip actuation FreqCommand dropped");
+        }
+    };
+    match planned {
+        dcentrald_autotuner::BadChipActuation::None
+        | dcentrald_autotuner::BadChipActuation::Refuse { .. } => {}
+        dcentrald_autotuner::BadChipActuation::ChipCeiling {
+            chain_id,
+            chip_index,
+            max_freq_mhz,
+        } => send(dcentrald_autotuner::FreqCommand::SetChipFrequencyLimit {
+            chain_id: *chain_id,
+            chip_index: *chip_index,
+            max_freq_mhz: Some(*max_freq_mhz),
+            source: dcentrald_autotuner::FrequencyLimitSource::BadChip,
+            ack_tx: None,
+        }),
+        dcentrald_autotuner::BadChipActuation::ChainCeiling {
+            chain_id,
+            max_freq_mhz,
+        }
+        | dcentrald_autotuner::BadChipActuation::CutHash {
+            chain_id,
+            max_freq_mhz,
+            ..
+        } => send(dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
+            chain_id: *chain_id,
+            max_freq_mhz: Some(*max_freq_mhz),
+            source: dcentrald_autotuner::FrequencyLimitSource::BadChip,
+            ack_tx: None,
+        }),
+    }
+}
+
 fn atm_step_ceiling_decision(
     dir: AtmStepDir,
     current: Option<u16>,
@@ -4043,14 +4280,21 @@ fn atm_step_ceiling_decision(
     floor_mhz: u16,
     cutting_hash: bool,
     debounced: bool,
+    live_operating_mhz: Option<u16>,
 ) -> Option<u16> {
     match dir {
         AtmStepDir::Down => {
             if debounced {
                 return current;
             }
-            // From "no ceiling" the first step-down starts at nominal − one step.
-            let base = current.unwrap_or(nominal_mhz);
+            // From "no ceiling" the first step-down starts at live operating
+            // MHz (else nameplate) − one step. A stale nameplate above the
+            // live point would underclock from the wrong base.
+            let base = dcentrald_autotuner::decrease_only_step_base(
+                current,
+                live_operating_mhz,
+                nominal_mhz,
+            );
             Some(
                 base.saturating_sub(step_mhz)
                     .max(floor_mhz)
@@ -4767,6 +5011,10 @@ pub struct Daemon {
     /// ALL I2C operations (init, heartbeat, shutdown) go through this handle.
     /// Matches BraiinsOS's AsyncI2cDev pattern: 1 fd, 1 thread, mpsc channel.
     i2c_service: Option<dcentrald_hal::i2c::I2cServiceHandle>,
+    /// Sender-free readers published to the API. A new service lifetime for a
+    /// bus replaces the preceding reader; REST can clone evidence but cannot
+    /// submit any I2C operation.
+    i2c_observation_readers: Arc<std::sync::Mutex<Vec<dcentrald_hal::i2c::I2cObservationReader>>>,
     /// Read-only I2C/sysfs observations captured before any runtime fabric
     /// service exists. Runtime policy consumes these immutable values rather
     /// than issuing hidden kernel-adapter transfers through sysfs.
@@ -4953,6 +5201,7 @@ impl Daemon {
             api_hardware_mutation_gate: dcentrald_hal::platform::HardwareMutationGate::new_open(),
             heartbeat_shutdown_token: CancellationToken::new(),
             i2c_service: None,
+            i2c_observation_readers: Arc::new(std::sync::Mutex::new(Vec::new())),
             bootstrap_eeprom_fingerprints: Vec::new(),
             bootstrap_eeprom_preambles: Vec::new(),
             bootstrap_hb_type: None,
@@ -5017,6 +5266,8 @@ impl Daemon {
             accepted: 0,
             rejected: 0,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: dcentrald_api::FanState {
                 pwm: 10,
                 rpm: 0,
@@ -5177,6 +5428,8 @@ impl Daemon {
             led_status_rx: None,
             curtailment,
             power_rx,
+            fpga_status_rx: None,
+            i2c_observation_readers: self.i2c_observation_readers.clone(),
             power_calibration,
             psu_lock,
             hardware_mutation_gate,
@@ -5185,6 +5438,8 @@ impl Daemon {
             autotuner_chip_health_rx,
             autotuner_telemetry_rx,
             autotuner_command_tx: None,
+            home_night_fan_tx: None,
+            serial_live_mhz_tx: None,
             history_data: history_data.clone(),
             recent_share_history,
             local_reject_ring: Arc::new(std::sync::Mutex::new(
@@ -6021,7 +6276,10 @@ impl Daemon {
                             continue;
                         }
                         if !webhook_runtime.events.is_empty()
-                            && !webhook_runtime.events.iter().any(|configured| configured == event_name)
+                            && !webhook_runtime
+                                .events
+                                .iter()
+                                .any(|configured| event.matches_event_filter(configured))
                         {
                             tracing::debug!(
                                 event = event_name,
@@ -6132,6 +6390,8 @@ impl Daemon {
             accepted: 0,
             rejected: 0,
             chains: initial_chains,
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: dcentrald_api::FanState {
                 pwm: 10,
                 rpm: 0,
@@ -6209,6 +6469,8 @@ impl Daemon {
         // multiple concurrent readers without contention.
         let (power_tx, power_rx) =
             watch::channel(dcentrald_autotuner::LivePowerEstimate::default());
+        let (fpga_status_tx, fpga_status_rx) =
+            watch::channel(None::<dcentrald_diagnostics::troubleshoot::RuntimeOwnedFpgaTelemetry>);
         // Consolidated hardware-inventory startup line (directive: "hardware
         // inventory reporting"). One structured, operator-facing summary of the
         // hardware identity at startup — the values are otherwise scattered across
@@ -6318,6 +6580,13 @@ impl Daemon {
                     .unwrap_or_default()
                     .as_secs(),
                 message: "Autotuner waiting for mining stabilization".to_string(),
+                night_power: Some(dcentrald_autotuner::NightPowerPolicy::from_home_night_mode(
+                    self.config.mode.home.night_mode.enabled,
+                    self.config.mode.home.night_mode.start_hour,
+                    self.config.mode.home.night_mode.end_hour,
+                    self.config.mode.home.night_mode.power_reduction_pct,
+                    self.config.thermal.night_mode.timezone_offset_hours,
+                )),
             }
         } else {
             dcentrald_autotuner::AutotunerRuntimeStatus::default()
@@ -7170,6 +7439,18 @@ impl Daemon {
             }
         };
 
+        let home_night = &self.config.mode.home.night_mode;
+        let (home_night_fan_tx, home_night_fan_rx) = watch::channel(
+            dcentrald_common::night_power::NightFanWindow::new(
+                home_night.enabled,
+                home_night.start_hour,
+                home_night.end_hour,
+                home_night.max_fan_pwm,
+            )
+            .with_max_frequency(home_night.max_frequency_mhz)
+            .with_power_reduction(home_night.power_reduction_pct),
+        );
+
         let app_state = Arc::new(dcentrald_api::AppState {
             state_rx: state_rx.clone(),
             mode_rx: mode_rx.clone(),
@@ -7195,6 +7476,8 @@ impl Daemon {
             led_status_rx: self.led_status_rx.clone(),
             curtailment: curtailment.clone(),
             power_rx: power_rx.clone(),
+            fpga_status_rx: Some(fpga_status_rx),
+            i2c_observation_readers: self.i2c_observation_readers.clone(),
             power_calibration: power_calibration.clone(),
             psu_lock: psu_lock.clone(),
             hardware_mutation_gate: self.api_hardware_mutation_gate.clone(),
@@ -7203,6 +7486,8 @@ impl Daemon {
             autotuner_chip_health_rx: autotuner_chip_health_rx.clone(),
             autotuner_telemetry_rx: autotuner_telemetry_rx.clone(),
             autotuner_command_tx: Some(autotuner_command_tx.clone()),
+            home_night_fan_tx: Some(home_night_fan_tx),
+            serial_live_mhz_tx: None,
             history_data: history_data.clone(),
             recent_share_history: recent_share_history.clone(),
             local_reject_ring,
@@ -7723,6 +8008,11 @@ impl Daemon {
                                         version_bits: meta.as_ref().and_then(|meta| meta.share.version_bits.clone()),
                                         version: meta.as_ref().map(|meta| meta.share.version),
                                         protocol_meta_present: meta.is_some(),
+                                        serial_logical_path: None,
+                                        serial_attribution: None,
+                                        serial_chip_addr: None,
+                                        serial_asic_index: None,
+                                        serial_core_id: None,
                                     },
                                 );
                                 info!(
@@ -7821,6 +8111,11 @@ impl Daemon {
                                         version_bits: meta.as_ref().and_then(|meta| meta.share.version_bits.clone()),
                                         version: meta.as_ref().map(|meta| meta.share.version),
                                         protocol_meta_present: meta.is_some(),
+                                        serial_logical_path: None,
+                                        serial_attribution: None,
+                                        serial_chip_addr: None,
+                                        serial_asic_index: None,
+                                        serial_core_id: None,
                                     },
                                 );
                                 warn!(
@@ -8191,8 +8486,12 @@ impl Daemon {
         // Clone for thermal throttle loop.
         let thermal_freq_tx = freq_cmd_tx.clone();
 
-        // Create autotuner stats channels if auto-tuning is enabled
-        let (autotune_stats_tx, mut autotune_stats_rx) = if self.config.autotuner.enabled {
+        // Snapshot stream for the autotuner and/or the bad-chip supervisor.
+        // Health telemetry must not depend on frequency autotune being opted in.
+        let bad_chip_enabled = self.config.autotune.bad_chip.enabled;
+        let (autotune_stats_tx, mut autotune_stats_rx) = if self.config.autotuner.enabled
+            || bad_chip_enabled
+        {
             let (stats_tx, stats_rx) = mpsc::channel::<dcentrald_autotuner::ChipStatsSnapshot>(256);
             (Some(stats_tx), Some(stats_rx))
         } else {
@@ -8636,6 +8935,7 @@ impl Daemon {
             Some(self.config.power.circuit_capacity_watts)
         };
         dispatcher.set_circuit_capacity(circuit_capacity);
+        dispatcher.set_fpga_status_tx(fpga_status_tx);
         //  W1: install the shared local-reject ring so the
         // dispatcher can push diagnostic entries on every reject.
         dispatcher.set_local_reject_ring(dispatcher_local_reject_ring);
@@ -9207,11 +9507,13 @@ impl Daemon {
                 .ok()
                 .as_deref(),
         );
+        let spawn_autotuner =
+            self.config.autotuner.enabled && !(am2_bm1362_family && !am2_freq_autotune_opted_in);
         if am2_bm1362_family && !am2_freq_autotune_opted_in {
-            // Gate CLOSED. Drop the stats receiver so the autotuner is
-            // not spawned for this family. This is the zero-regression
-            // default for the live `a lab unit` / XIL home unit.
-            if autotune_stats_rx.is_some() {
+            // Gate CLOSED for the autotuner. Keep the snapshot receiver when
+            // the bad-chip supervisor needs it; otherwise drop so AM2 default
+            // still does not spawn TABS.
+            if self.config.autotuner.enabled {
                 info!(
                     chip_id = format_args!("0x{:04X}", effective_chip_id),
                     "am2/BM1362 frequency-only autotuner is DISABLED by default. \
@@ -9220,51 +9522,45 @@ impl Daemon {
                      TABS tuning (no live voltage write on am2 this wave)."
                 );
             }
-            autotune_stats_rx = None;
+            if !bad_chip_enabled {
+                autotune_stats_rx = None;
+            }
         }
 
-        // ---- W24-BC-1 (): bad-chip supervisor tee (DEFAULT-OFF) ----
+        // ---- W24-BC-1 / gauntlet #11: bad-chip supervisor tee (DEFAULT-OFF) ----
         //
-        // When `[autotune.bad_chip].enabled = true`, interpose a TELEMETRY-FIRST
-        // observer between the work dispatcher's `ChipStatsSnapshot` mpsc and the
-        // autotuner. The observer feeds each per-chain snapshot into
-        // `BadChipSupervisor::observe()` and LOGS the resulting `BadChipAction`s,
-        // then forwards the snapshot UNCHANGED to the autotuner so per-chip
-        // characterization is unaffected.
+        // When `[autotune.bad_chip].enabled = true`, interpose an observer between
+        // the work dispatcher's `ChipStatsSnapshot` mpsc and the autotuner. The
+        // observer feeds each per-chain snapshot into `BadChipSupervisor::observe()`
+        // and then, only when `.actuate = true` as well, applies the decrease-only
+        // `plan_bad_chip_actuation_on_chain` result via `FreqCommand` ceilings.
+        // The snapshot is forwarded UNCHANGED to the autotuner.
         //
         // SAFETY / default-off contract (load-bearing):
-        //   * The supervisor is constructed and the tee task is spawned ONLY when
-        //     `self.config.autotune.bad_chip.enabled` is true. When it is false
-        //     (the default — and the case for an absent `[autotune.bad_chip]`
-        //     block) this whole block is a no-op: `autotune_stats_rx` is passed to
-        //     the autotuner unchanged, `observe()` is NEVER called, and the channel
-        //     wiring is byte-identical to today. Zero behavior change on the proven
-        //     live `a lab unit` / `a lab unit` am2 path.
-        //   * ACTUATION IS DEFERRED. This pass is telemetry-first: NONE of the
-        //     emitted `BadChipAction`s (PerChipDownclock / BlacklistChip /
-        //     ReduceBoardProfile / BoardReset / HaltMining) are wired to a control
-        //     surface yet — they are logged only. Actuating per-chip downclock /
-        //     blacklist / bounded board-reset / halt is Wave-H work behind operator
-        //     per-action authorization, and the supervisor's math (rolling window,
-        //     per-chain healthy-chip floor) must be live-validated first. A
-        //     half-actuated default-off path is safe; an unsafe actuation is not.
+        //   * The tee is spawned ONLY when `enabled` is true. Default (absent
+        //     `[autotune.bad_chip]`) is a no-op: `autotune_stats_rx` is unchanged.
+        //   * `.actuate` is a second default-false gate. Telemetry can run without
+        //     moving frequency. Actuation is decrease-only (never raise freq,
+        //     never raise fans, never write voltage/EEPROM). BoardReset is refused.
         //   * The supervisor NEVER emits a fan-control action (enforced by the
         //     `BadChipAction` enum + the supervisor's own structural test) — the
         //     quiet-home cut-hash-before-noise cap is untouched.
-        //   * Per-chip observation only runs when the autotuner is also enabled,
-        //     because the only `ChipStatsSnapshot` stream the daemon produces is the
-        //     dispatcher mpsc feeding the autotuner. We deliberately do NOT add a
-        //     second telemetry pipeline this pass. With the autotuner disabled there
-        //     is no stream to observe and the supervisor stays dormant — still
-        //     default-off-correct.
+        //   * Observation runs whenever `[autotune.bad_chip].enabled` is true,
+        //     even if AM2 frequency autotune is default-off. The dispatcher
+        //     snapshot sender is created for either consumer.
         let bad_chip_cfg = self.config.autotune.bad_chip.clone();
         let autotune_stats_rx = if bad_chip_cfg.enabled && autotune_stats_rx.is_some() {
             let original_rx = autotune_stats_rx
                 .take()
                 .expect("checked is_some() above for the bad-chip tee");
-            // The tuner consumes a fresh receiver; we forward observed snapshots
-            // into this tee channel so the autotuner sees the identical stream.
-            let (tee_tx, tee_rx) = mpsc::channel::<dcentrald_autotuner::ChipStatsSnapshot>(256);
+            // Forward to the autotuner only when it will actually spawn.
+            // Health observation must keep running on default AM2.
+            let (forward_tx, forward_rx) = if spawn_autotuner {
+                let (tx, rx) = mpsc::channel::<dcentrald_autotuner::ChipStatsSnapshot>(256);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
 
             // Per-chain board fingerprints (platform/model/chip_count) so the
             // supervisor can key persistence + Missing detection per chain. EEPROM
@@ -9298,13 +9594,17 @@ impl Daemon {
                 .map(|c| (c.chain_id, c.chip_id))
                 .collect();
             let bad_chip_nominal_mhz = self.config.mining.frequency_mhz;
+            let bad_chip_actuate = bad_chip_cfg.actuate;
+            let bad_chip_freq_tx = freq_cmd_tx.clone();
+            let bad_chip_state_rx = state_tx.subscribe();
 
             let bad_chip_shutdown = shutdown.clone();
             info!(
                 chains = fingerprints.len(),
-                "W24-BC-1: bad-chip supervisor ENABLED (telemetry-first — actions \
-                 are LOGGED only this pass, NOT actuated; per-chip downclock / \
-                 blacklist / board-reset / halt actuation is Wave-H operator-gated)"
+                actuate = bad_chip_actuate,
+                "W24-BC-1: bad-chip supervisor ENABLED (actuate={} — decrease-only \
+                 FreqCommand ceilings; BoardReset stays refused)",
+                bad_chip_actuate
             );
 
             let mut supervisor =
@@ -9312,6 +9612,10 @@ impl Daemon {
 
             tokio::spawn(async move {
                 let mut original_rx = original_rx;
+                let mut last_chip_ceiling: std::collections::HashMap<(u8, u8), u16> =
+                    std::collections::HashMap::new();
+                let mut last_chain_ceiling: std::collections::HashMap<u8, u16> =
+                    std::collections::HashMap::new();
                 loop {
                     tokio::select! {
                         _ = bad_chip_shutdown.cancelled() => {
@@ -9324,13 +9628,18 @@ impl Daemon {
                                 return;
                             };
 
-                            // Expected nonces per chip over this window (telemetry
-                            // estimate): expected_nps(chip_id, freq, diff) ×
-                            // window_seconds. Uses the same public chip-geometry
-                            // helper the autotuner uses; an approximate nominal freq
-                            // is acceptable because actuation is deferred and the
-                            // supervisor's own min_samples confidence gate guards
-                            // against noise.
+                            // Expected nonces use live operating MHz when the
+                            // miner state has published a positive frequency,
+                            // otherwise the config nameplate. A stale 525 MHz
+                            // nameplate against a 400 MHz live point would
+                            // false-degrade every chip.
+                            let live_mhz = bad_chip_state_rx.borrow().chains.iter().find(|c| {
+                                c.id == snapshot.chain_id && c.frequency_mhz > 0
+                            }).map(|c| c.frequency_mhz);
+                            let operating_mhz = dcentrald_autotuner::resolve_health_operating_mhz(
+                                live_mhz,
+                                bad_chip_nominal_mhz,
+                            );
                             let chip_id = chain_chip_ids
                                 .get(&snapshot.chain_id)
                                 .copied()
@@ -9340,303 +9649,380 @@ impl Daemon {
                             } else {
                                 snapshot.current_difficulty
                             };
-                            let nps = dcentrald_autotuner::chip_geometry::expected_nps_for_chip(
-                                chip_id,
-                                bad_chip_nominal_mhz,
-                                diff,
-                            );
+                            let Some(nps) =
+                                dcentrald_autotuner::chip_geometry::expected_nps_for_chip(
+                                    chip_id,
+                                    operating_mhz,
+                                    diff,
+                                )
+                            else {
+                                continue;
+                            };
                             let expected_per_chip =
                                 nps * snapshot.window_duration_s.max(1.0);
 
                             let actions = supervisor.observe(&snapshot, expected_per_chip);
                             for action in &actions {
-                                match action {
-                                    dcentrald_autotuner::BadChipAction::NoOp => {}
-                                    other => {
-                                        // TELEMETRY-ONLY: logged, never actuated this
-                                        // pass. See the default-off contract above.
-                                        warn!(
-                                            chain_id = snapshot.chain_id,
-                                            action = ?other,
-                                            "W24-BC-1: bad-chip supervisor action (NOT actuated — telemetry-first)"
-                                        );
+                                if matches!(action, dcentrald_autotuner::BadChipAction::NoOp) {
+                                    continue;
+                                }
+                                let existing_chip = match action {
+                                    dcentrald_autotuner::BadChipAction::PerChipDownclock {
+                                        chip_index,
+                                        ..
+                                    }
+                                    | dcentrald_autotuner::BadChipAction::BlacklistChip {
+                                        chip_index,
+                                        ..
+                                    } => u8::try_from(*chip_index).ok().and_then(|idx| {
+                                        last_chip_ceiling.get(&(snapshot.chain_id, idx)).copied()
+                                    }),
+                                    _ => None,
+                                };
+                                let existing_chain =
+                                    last_chain_ceiling.get(&snapshot.chain_id).copied();
+                                let (chip_base, chain_base) = dcentrald_autotuner::actuation_bases(
+                                    existing_chip,
+                                    existing_chain,
+                                    Some(operating_mhz),
+                                    bad_chip_nominal_mhz,
+                                );
+                                let planned = dcentrald_autotuner::plan_bad_chip_actuation_on_chain(
+                                    action,
+                                    snapshot.chain_id,
+                                    chip_base,
+                                    chain_base,
+                                    dcentrald_autotuner::BAD_CHIP_ACTUATION_FLOOR_MHZ,
+                                );
+                                if dcentrald_autotuner::bad_chip_actuation_armed(
+                                    true,
+                                    bad_chip_actuate,
+                                ) {
+                                    apply_bad_chip_actuation(&bad_chip_freq_tx, &planned);
+                                    match &planned {
+                                        dcentrald_autotuner::BadChipActuation::ChipCeiling {
+                                            chain_id,
+                                            chip_index,
+                                            max_freq_mhz,
+                                        } => {
+                                            last_chip_ceiling
+                                                .insert((*chain_id, *chip_index), *max_freq_mhz);
+                                            supervisor.invalidate_after_downclock(
+                                                *chain_id,
+                                                Some(u16::from(*chip_index)),
+                                            );
+                                        }
+                                        dcentrald_autotuner::BadChipActuation::ChainCeiling {
+                                            chain_id,
+                                            max_freq_mhz,
+                                        }
+                                        | dcentrald_autotuner::BadChipActuation::CutHash {
+                                            chain_id,
+                                            max_freq_mhz,
+                                            ..
+                                        } => {
+                                            last_chain_ceiling.insert(*chain_id, *max_freq_mhz);
+                                            supervisor.invalidate_after_downclock(*chain_id, None);
+                                        }
+                                        _ => {}
                                     }
                                 }
+                                warn!(
+                                    chain_id = snapshot.chain_id,
+                                    action = ?action,
+                                    planned = ?planned,
+                                    actuate = bad_chip_actuate,
+                                    operating_mhz,
+                                    "W24-BC-1: bad-chip supervisor action"
+                                );
                             }
 
-                            // Forward the snapshot UNCHANGED to the autotuner. If the
-                            // autotuner's receiver is gone, exit the observer.
-                            if tee_tx.send(snapshot).await.is_err() {
-                                return;
+                            // Forward the snapshot UNCHANGED when the autotuner is
+                            // running. Health-only mode has no consumer.
+                            if let Some(tx) = &forward_tx {
+                                if tx.send(snapshot).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
                 }
             });
 
-            Some(tee_rx)
+            forward_rx
         } else {
             autotune_stats_rx
         };
 
-        if let Some(stats_rx) = autotune_stats_rx {
-            let mut autotune_config = self.config.autotuner.clone();
+        if spawn_autotuner {
+            if let Some(stats_rx) = autotune_stats_rx {
+                let mut autotune_config = self.config.autotuner.clone();
+                autotune_config.night_power =
+                    dcentrald_autotuner::NightPowerPolicy::from_home_night_mode(
+                        self.config.mode.home.night_mode.enabled,
+                        self.config.mode.home.night_mode.start_hour,
+                        self.config.mode.home.night_mode.end_hour,
+                        self.config.mode.home.night_mode.power_reduction_pct,
+                        self.config.thermal.night_mode.timezone_offset_hours,
+                    );
 
-            //  am2/BM1362 frequency-only PIN.
-            //
-            // Reached only when `am2_bm1362_family && opted-in` (the
-            // closed-gate case already dropped `autotune_stats_rx`
-            // above and never enters this block). This is the single
-            // load-bearing transform that makes this wave SAFE on the
-            // live `a lab unit` home unit:
-            //  * voltage_optimization = false  (HARD — no voltage write)
-            //  * dvfs_enabled         = false  (HARD — DVFS ⇒ voltage)
-            //  * freq band clamped to [245, 545] MHz (home-safe, no
-            //    above-nameplate exploration).
-            // Applied BEFORE the legacy dvfs/voltage gate below so the
-            // legacy gate sees already-safe values (idempotent).
-            if am2_bm1362_family {
-                // PERF-004: SKU-aware autotune ceiling.
+                //  am2/BM1362 frequency-only PIN.
                 //
-                // Default (gate unset) keeps the load-bearing Standard 545-MHz
-                // pin → byte-identical to the historical `a lab unit`/`a lab unit` behavior.
-                // ONLY when the operator opts in via the default-OFF
-                // `DCENT_AM2_SKU_AWARE_CEILING` gate do we classify the LIVE
-                // hashboard SKU (from the read-only EEPROM SKU label) and widen
-                // the ceiling to that class's value (mid-band/high-bin → 597,
-                // still PLL-lockable). An unknown/standard SKU label classifies
-                // back to `Standard`, so even with the gate on a `a lab unit`/`a lab unit`
-                // BHB42601 home unit keeps the 545 ceiling — the gate cannot
-                // auto-promote a board the EEPROM doesn't corroborate.
-                let sku_class = if am2_sku_aware_ceiling_enabled() {
-                    let label = self.bootstrap_hb_type.clone();
-                    let class = label
-                        .as_deref()
-                        .map(dcentrald_autotuner::Bm1362SkuClass::from_sku_label)
-                        .unwrap_or_default();
-                    info!(
+                // Reached only when `am2_bm1362_family && opted-in` (the
+                // closed-gate case already dropped `autotune_stats_rx`
+                // above and never enters this block). This is the single
+                // load-bearing transform that makes this wave SAFE on the
+                // live `a lab unit` home unit:
+                //  * voltage_optimization = false  (HARD — no voltage write)
+                //  * dvfs_enabled         = false  (HARD — DVFS ⇒ voltage)
+                //  * freq band clamped to [245, 545] MHz (home-safe, no
+                //    above-nameplate exploration).
+                // Applied BEFORE the legacy dvfs/voltage gate below so the
+                // legacy gate sees already-safe values (idempotent).
+                if am2_bm1362_family {
+                    // PERF-004: SKU-aware autotune ceiling.
+                    //
+                    // Default (gate unset) keeps the load-bearing Standard 545-MHz
+                    // pin → byte-identical to the historical `a lab unit`/`a lab unit` behavior.
+                    // ONLY when the operator opts in via the default-OFF
+                    // `DCENT_AM2_SKU_AWARE_CEILING` gate do we classify the LIVE
+                    // hashboard SKU (from the read-only EEPROM SKU label) and widen
+                    // the ceiling to that class's value (mid-band/high-bin → 597,
+                    // still PLL-lockable). An unknown/standard SKU label classifies
+                    // back to `Standard`, so even with the gate on a `a lab unit`/`a lab unit`
+                    // BHB42601 home unit keeps the 545 ceiling — the gate cannot
+                    // auto-promote a board the EEPROM doesn't corroborate.
+                    let sku_class = if am2_sku_aware_ceiling_enabled() {
+                        let label = self.bootstrap_hb_type.clone();
+                        let class = label
+                            .as_deref()
+                            .map(dcentrald_autotuner::Bm1362SkuClass::from_sku_label)
+                            .unwrap_or_default();
+                        info!(
                         sku_label = label.as_deref().unwrap_or("<none>"),
                         ?class,
                         ceiling_mhz = class.max_freq_mhz(),
                         "PERF-004: SKU-aware ceiling opted in (DCENT_AM2_SKU_AWARE_CEILING=1) — \
                          classified live hashboard SKU"
                     );
-                    class
-                } else {
-                    dcentrald_autotuner::Bm1362SkuClass::Standard
-                };
-                autotune_config.pin_am2_bm1362_frequency_only_for_sku(sku_class);
-                info!(
-                    chip_id = format_args!("0x{:04X}", effective_chip_id),
-                    ?sku_class,
-                    freq_band = format_args!(
-                        "{}-{} MHz",
-                        autotune_config.min_freq_mhz, autotune_config.max_freq_mhz
-                    ),
-                    voltage_optimization = autotune_config.voltage_optimization,
-                    dvfs_enabled = autotune_config.dvfs_enabled,
-                    "am2/BM1362 FREQUENCY-ONLY autotuner opted in: voltage/DVFS \
+                        class
+                    } else {
+                        dcentrald_autotuner::Bm1362SkuClass::Standard
+                    };
+                    autotune_config.pin_am2_bm1362_frequency_only_for_sku(sku_class);
+                    info!(
+                        chip_id = format_args!("0x{:04X}", effective_chip_id),
+                        ?sku_class,
+                        freq_band = format_args!(
+                            "{}-{} MHz",
+                            autotune_config.min_freq_mhz, autotune_config.max_freq_mhz
+                        ),
+                        voltage_optimization = autotune_config.voltage_optimization,
+                        dvfs_enabled = autotune_config.dvfs_enabled,
+                        "am2/BM1362 FREQUENCY-ONLY autotuner opted in: voltage/DVFS \
                      HARD-pinned off, frequency search clamped to the SKU-class \
                      band (Standard=545). Voltage co-opt is a separate later wave."
-                );
-            }
-
-            // W1.3 — Mode-aware tune target.
-            //
-            // `TuneTarget::default()` is now `Efficiency` (was `Hashrate`)
-            // so home miners optimize the J/TH bill instead of the
-            // leaderboard. Hacker mode opts back into `Hashrate` because
-            // raw-register users explicitly asked for the leaderboard.
-            // We only override when the loaded config still has the
-            // structural default — operator TOML overrides (`target_mode =
-            // "power"`, `"hashrate_target"`, or an explicit `"hashrate"` /
-            // `"efficiency"`) are preserved.
-            //
-            // Donation default = 2% (operator-locked). NOT touched here.
-            let mode_str = self.config.mode.active.as_str();
-            if matches!(
-                autotune_config.target_mode,
-                dcentrald_autotuner::config::TuneTarget::Efficiency
-            ) {
-                let mode_default = dcentrald_autotuner::config::TuneTarget::for_mode(mode_str);
-                if mode_default != autotune_config.target_mode {
-                    info!(
-                        operating_mode = %mode_str,
-                        old = ?autotune_config.target_mode,
-                        new = ?mode_default,
-                        "Autotuner target_mode adjusted by operating-mode default \
-                         (W1.3 — Heater/Mining → Efficiency, Hacker → Hashrate)"
                     );
-                    autotune_config.target_mode = mode_default;
                 }
-            }
 
-            let pic_type = self.pic_type()?;
-            // PERF-006/011: honor the default-OFF `DCENT_AM2_VOLTAGE_AUTOTUNE`
-            // gate. Gate unset ⇒ identical conservative capability set as
-            // `autotuner_capabilities_for_chip` (byte-identical behavior).
-            let autotune_capabilities =
-                dcentrald_autotuner::autotuner_capabilities_for_chip_with_voltage_autotune(
-                    self.config.mining.model_chip_id().unwrap_or(self.chip_id),
-                    match pic_type {
-                        PicType::Pic16F1704 => "pic16",
-                        PicType::DsPic33EP => "dspic",
-                        PicType::NoPic => "nopic",
-                    },
-                    std::env::var(dcentrald_autotuner::AM2_VOLTAGE_AUTOTUNE_ENV)
-                        .ok()
-                        .as_deref(),
-                );
-            if autotune_config.dvfs_enabled && !autotune_capabilities.dvfs_runtime_supported {
-                warn!(
-                    capability_profile = %autotune_capabilities.profile_key,
-                    "Autotuner DVFS requested but this family/controller path does not support live DVFS yet — disabling it for truthful behavior"
-                );
-                autotune_config.dvfs_enabled = false;
-            }
-            if autotune_config.voltage_optimization
-                && (self.config.mining.model_chip_id().unwrap_or(self.chip_id) != 0x1387
-                    || !matches!(pic_type, PicType::Pic16F1704))
-            {
-                warn!(
+                // W1.3 — Mode-aware tune target.
+                //
+                // `TuneTarget::default()` is now `Efficiency` (was `Hashrate`)
+                // so home miners optimize the J/TH bill instead of the
+                // leaderboard. Hacker mode opts back into `Hashrate` because
+                // raw-register users explicitly asked for the leaderboard.
+                // We only override when the loaded config still has the
+                // structural default — operator TOML overrides (`target_mode =
+                // "power"`, `"hashrate_target"`, or an explicit `"hashrate"` /
+                // `"efficiency"`) are preserved.
+                //
+                // Donation default = 2% (operator-locked). NOT touched here.
+                let mode_str = self.config.mode.active.as_str();
+                if matches!(
+                    autotune_config.target_mode,
+                    dcentrald_autotuner::config::TuneTarget::Efficiency
+                ) {
+                    let mode_default = dcentrald_autotuner::config::TuneTarget::for_mode(mode_str);
+                    if mode_default != autotune_config.target_mode {
+                        info!(
+                            operating_mode = %mode_str,
+                            old = ?autotune_config.target_mode,
+                            new = ?mode_default,
+                            "Autotuner target_mode adjusted by operating-mode default \
+                             (W1.3 — Heater/Mining → Efficiency, Hacker → Hashrate)"
+                        );
+                        autotune_config.target_mode = mode_default;
+                    }
+                }
+
+                let pic_type = self.pic_type()?;
+                // PERF-006/011: honor the default-OFF `DCENT_AM2_VOLTAGE_AUTOTUNE`
+                // gate. Gate unset ⇒ identical conservative capability set as
+                // `autotuner_capabilities_for_chip` (byte-identical behavior).
+                let autotune_capabilities =
+                    dcentrald_autotuner::autotuner_capabilities_for_chip_with_voltage_autotune(
+                        self.config.mining.model_chip_id().unwrap_or(self.chip_id),
+                        match pic_type {
+                            PicType::Pic16F1704 => "pic16",
+                            PicType::DsPic33EP => "dspic",
+                            PicType::NoPic => "nopic",
+                        },
+                        std::env::var(dcentrald_autotuner::AM2_VOLTAGE_AUTOTUNE_ENV)
+                            .ok()
+                            .as_deref(),
+                    );
+                if autotune_config.dvfs_enabled && !autotune_capabilities.dvfs_runtime_supported {
+                    warn!(
+                        capability_profile = %autotune_capabilities.profile_key,
+                        "Autotuner DVFS requested but this family/controller path does not support live DVFS yet — disabling it for truthful behavior"
+                    );
+                    autotune_config.dvfs_enabled = false;
+                }
+                if autotune_config.voltage_optimization
+                    && (self.config.mining.model_chip_id().unwrap_or(self.chip_id) != 0x1387
+                        || !matches!(pic_type, PicType::Pic16F1704))
+                {
+                    warn!(
                     chip_id = format_args!("0x{:04X}", self.config.mining.model_chip_id().unwrap_or(self.chip_id)),
                     ?pic_type,
                     "Autotuner runtime voltage optimization is currently limited to BM1387/PIC16 until other controller paths have a proven live-safe implementation"
                 );
-                autotune_config.voltage_optimization = false;
-            }
-            let autotune_shutdown = shutdown.clone();
-            let mut autotune_state_rx = autotune_state_rx;
-            let nominal_mhz = self.config.mining.frequency_mhz;
-            let autotuner_status_watch = autotuner_status_tx.clone();
-            let autotuner_efficiency_watch = autotuner_efficiency_tx.clone();
-            let autotuner_chip_health_watch = autotuner_chip_health_tx.clone();
-            let autotuner_telemetry_watch = autotuner_telemetry_tx.clone();
-            let autotuner_command_rx = autotuner_command_rx;
-            let chip_type = {
-                let registry =
-                    ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
-                registry
-                    .detect(self.chip_id)
-                    .map(|d| d.chip_name().to_string())
-                    .unwrap_or_else(|| format!("0x{:04X}", self.chip_id))
-            };
-
-            info!(
-                enabled = autotune_config.enabled,
-                target_mode = ?autotune_config.target_mode,
-                measurement_s = autotune_config.measurement_window_s,
-                error_threshold = format_args!("{}%", autotune_config.error_threshold_pct),
-                safety_margin = format_args!("{}%", autotune_config.safety_margin_pct),
-                freq_range = format_args!("{}-{} MHz", autotune_config.min_freq_mhz, autotune_config.max_freq_mhz),
-                "Auto-tuner enabled: TABS per-chip frequency characterization with thermal refinement."
-            );
-
-            let chain_infos_clone = chain_infos.clone();
-            let autotune_freq_tx = freq_cmd_tx.clone();
-            let autotune_power_calibration = power_calibration.clone();
-            let autotune_xadc_temp = shared_xadc_temp.clone();
-            tokio::spawn(async move {
-                let mut tuner = dcentrald_autotuner::AutoTuner::new(
-                    autotune_config,
-                    nominal_mhz,
-                    chip_type,
-                    match pic_type {
-                        PicType::Pic16F1704 => "pic16".to_string(),
-                        PicType::DsPic33EP => "dspic".to_string(),
-                        PicType::NoPic => "nopic".to_string(),
-                    },
-                    autotune_power_calibration,
-                );
-                // CE-011: register any classified BM1362 SKU so `AutoTuner::run`
-                // tightens the frequency CEILING to the SKU's PVT envelope max
-                // (ceiling-only; never raises the ceiling, never touches the
-                // floor). Empty map (the live default — Wave-K is NoPic/BM1366)
-                // => no registration => byte-identical to today's behavior.
-                for (&chain_id, &sku) in &autotuner_chain_skus {
-                    tuner.set_chain_sku(chain_id, sku);
+                    autotune_config.voltage_optimization = false;
                 }
-                tuner.set_runtime_status_watch(autotuner_status_watch);
-                tuner.set_efficiency_watch(autotuner_efficiency_watch);
-                tuner.set_chip_health_watch(autotuner_chip_health_watch);
-                tuner.set_telemetry_watch(autotuner_telemetry_watch);
-                tuner.set_accepted_work_watch(autotuner_share_efficiency_rx);
-                tuner.set_command_receiver(autotuner_command_rx);
+                let autotune_shutdown = shutdown.clone();
+                let mut autotune_state_rx = autotune_state_rx;
+                let nominal_mhz = self.config.mining.frequency_mhz;
+                let autotuner_status_watch = autotuner_status_tx.clone();
+                let autotuner_efficiency_watch = autotuner_efficiency_tx.clone();
+                let autotuner_chip_health_watch = autotuner_chip_health_tx.clone();
+                let autotuner_telemetry_watch = autotuner_telemetry_tx.clone();
+                let autotuner_command_rx = autotuner_command_rx;
+                let chip_type = {
+                    let registry =
+                        ChipRegistry::with_execution_policy(self.asic_driver_execution_policy);
+                    registry
+                        .detect(self.chip_id)
+                        .map(|d| d.chip_name().to_string())
+                        .unwrap_or_else(|| format!("0x{:04X}", self.chip_id))
+                };
 
-                // Wait for real mining readiness before starting characterization.
-                // A fixed sleep is not enough on S9 handoff paths where zero nonces or
-                // missing board-temp samples can linger briefly after startup.
-                let require_board_temp_gate = matches!(
-                    pic_type,
-                    PicType::Pic16F1704 | PicType::DsPic33EP | PicType::NoPic
+                info!(
+                    enabled = autotune_config.enabled,
+                    target_mode = ?autotune_config.target_mode,
+                    measurement_s = autotune_config.measurement_window_s,
+                    error_threshold = format_args!("{}%", autotune_config.error_threshold_pct),
+                    safety_margin = format_args!("{}%", autotune_config.safety_margin_pct),
+                    freq_range = format_args!("{}-{} MHz", autotune_config.min_freq_mhz, autotune_config.max_freq_mhz),
+                    "Auto-tuner enabled: TABS per-chip frequency characterization with thermal refinement."
                 );
-                let mut stable_hashrate_ticks = 0u8;
-                let mut readiness_tick = tokio::time::interval(std::time::Duration::from_secs(5));
-                readiness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = autotune_shutdown.cancelled() => {
-                            info!("Auto-tuner stopping before characterization started");
-                            return;
-                        }
-                        _ = readiness_tick.tick() => {
-                            let state = autotune_state_rx.borrow().clone();
-                            let now_s = board_temp_time_base_autotune.elapsed().as_secs() as u32;
-                            let fresh_board_temp_count = board_temps_autotune
-                                .iter()
-                                .zip(board_temp_seen_at_autotune.iter())
-                                .filter(|(temp_atomic, seen_at_atomic)| {
-                                    let bits = temp_atomic.load(Ordering::Acquire);
-                                    let seen_at_s = seen_at_atomic.load(Ordering::Acquire);
-                                    if bits == 0 || seen_at_s == 0 {
-                                        return false;
-                                    }
-                                    let temp_c = f32::from_bits(bits);
-                                    temp_c > 0.0
-                                        && temp_c < 150.0
-                                        && now_s.saturating_sub(seen_at_s)
-                                            <= dcentrald_autotuner::chip_stats::BOARD_TEMP_STALE_TIMEOUT_S
-                                                as u32
-                                })
-                                .count();
 
-                            let die_temp_c = f32::from_bits(autotune_xadc_temp.load(Ordering::Acquire));
-                            let has_valid_die_temp = die_temp_c > 0.0 && die_temp_c < 125.0;
-                            let has_valid_temp = if require_board_temp_gate {
-                                (fresh_board_temp_count >= chain_infos_clone.len() && !chain_infos_clone.is_empty())
-                                    || has_valid_die_temp
-                            } else {
-                                true
-                            };
+                let chain_infos_clone = chain_infos.clone();
+                let autotune_freq_tx = freq_cmd_tx.clone();
+                let autotune_power_calibration = power_calibration.clone();
+                let autotune_xadc_temp = shared_xadc_temp.clone();
+                tokio::spawn(async move {
+                    let mut tuner = dcentrald_autotuner::AutoTuner::new(
+                        autotune_config,
+                        nominal_mhz,
+                        chip_type,
+                        match pic_type {
+                            PicType::Pic16F1704 => "pic16".to_string(),
+                            PicType::DsPic33EP => "dspic".to_string(),
+                            PicType::NoPic => "nopic".to_string(),
+                        },
+                        autotune_power_calibration,
+                    );
+                    // CE-011: register any classified BM1362 SKU so `AutoTuner::run`
+                    // tightens the frequency CEILING to the SKU's PVT envelope max
+                    // (ceiling-only; never raises the ceiling, never touches the
+                    // floor). Empty map (the live default — Wave-K is NoPic/BM1366)
+                    // => no registration => byte-identical to today's behavior.
+                    for (&chain_id, &sku) in &autotuner_chain_skus {
+                        tuner.set_chain_sku(chain_id, sku);
+                    }
+                    tuner.set_runtime_status_watch(autotuner_status_watch);
+                    tuner.set_efficiency_watch(autotuner_efficiency_watch);
+                    tuner.set_chip_health_watch(autotuner_chip_health_watch);
+                    tuner.set_telemetry_watch(autotuner_telemetry_watch);
+                    tuner.set_accepted_work_watch(autotuner_share_efficiency_rx);
+                    tuner.set_command_receiver(autotuner_command_rx);
 
-                            let telemetry_ready = state.hashrate_5s_ghs > 0.0
-                                && has_valid_temp;
-
-                            if telemetry_ready {
-                                stable_hashrate_ticks = stable_hashrate_ticks.saturating_add(1);
-                            } else {
-                                stable_hashrate_ticks = 0;
+                    // Wait for real mining readiness before starting characterization.
+                    // A fixed sleep is not enough on S9 handoff paths where zero nonces or
+                    // missing board-temp samples can linger briefly after startup.
+                    let require_board_temp_gate = matches!(
+                        pic_type,
+                        PicType::Pic16F1704 | PicType::DsPic33EP | PicType::NoPic
+                    );
+                    let mut stable_hashrate_ticks = 0u8;
+                    let mut readiness_tick =
+                        tokio::time::interval(std::time::Duration::from_secs(5));
+                    readiness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            _ = autotune_shutdown.cancelled() => {
+                                info!("Auto-tuner stopping before characterization started");
+                                return;
                             }
+                            _ = readiness_tick.tick() => {
+                                let state = autotune_state_rx.borrow().clone();
+                                let now_s = board_temp_time_base_autotune.elapsed().as_secs() as u32;
+                                let fresh_board_temp_count = board_temps_autotune
+                                    .iter()
+                                    .zip(board_temp_seen_at_autotune.iter())
+                                    .filter(|(temp_atomic, seen_at_atomic)| {
+                                        let bits = temp_atomic.load(Ordering::Acquire);
+                                        let seen_at_s = seen_at_atomic.load(Ordering::Acquire);
+                                        if bits == 0 || seen_at_s == 0 {
+                                            return false;
+                                        }
+                                        let temp_c = f32::from_bits(bits);
+                                        temp_c > 0.0
+                                            && temp_c < 150.0
+                                            && now_s.saturating_sub(seen_at_s)
+                                                <= dcentrald_autotuner::chip_stats::BOARD_TEMP_STALE_TIMEOUT_S
+                                                    as u32
+                                    })
+                                    .count();
 
-                            if stable_hashrate_ticks >= 2 {
-                                break;
+                                let die_temp_c = f32::from_bits(autotune_xadc_temp.load(Ordering::Acquire));
+                                let has_valid_die_temp = die_temp_c > 0.0 && die_temp_c < 125.0;
+                                let has_valid_temp = if require_board_temp_gate {
+                                    (fresh_board_temp_count >= chain_infos_clone.len() && !chain_infos_clone.is_empty())
+                                        || has_valid_die_temp
+                                } else {
+                                    true
+                                };
+
+                                let telemetry_ready = state.hashrate_5s_ghs > 0.0
+                                    && has_valid_temp;
+
+                                if telemetry_ready {
+                                    stable_hashrate_ticks = stable_hashrate_ticks.saturating_add(1);
+                                } else {
+                                    stable_hashrate_ticks = 0;
+                                }
+
+                                if stable_hashrate_ticks >= 2 {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
 
-                info!("Auto-tuner: Mining stable, beginning per-chip characterization...");
+                    info!("Auto-tuner: Mining stable, beginning per-chip characterization...");
 
-                // Run the full auto-tuner lifecycle via channel-based architecture
-                tuner
-                    .run(
-                        &chain_infos_clone,
-                        stats_rx,
-                        autotune_freq_tx,
-                        autotune_shutdown,
-                    )
-                    .await;
-            });
+                    // Run the full auto-tuner lifecycle via channel-based architecture
+                    tuner
+                        .run(
+                            &chain_infos_clone,
+                            stats_rx,
+                            autotune_freq_tx,
+                            autotune_shutdown,
+                        )
+                        .await;
+                });
+            }
         }
 
         // ---- SoC watchdog kicker ----
@@ -10617,6 +11003,7 @@ impl Daemon {
         let thermal_led_tx = self.led_tx.clone();
         let thermal_alert_tx = alert_tx.clone();
         let thermal_night_mode = self.config.thermal.night_mode.clone();
+        let mut home_night_fan_rx = home_night_fan_rx;
         let thermal_chip_id = self.chip_id;
         let thermal_pic_type = self.pic_type()?;
         let thermal_emergency_latch = thermal_emergency_latch.clone();
@@ -10673,14 +11060,9 @@ impl Daemon {
             let validated = std::env::var("DCENT_THERMAL_SUPERVISOR_DEFAULT_ON")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let marker = self
-                .config
-                .mining
-                .model
-                .clone()
-                .unwrap_or_else(|| self.platform_identity.observed_control_board.clone());
+            let marker = self.platform_identity.board_target();
             let platform =
-                dcentrald_thermal::supervisor::SupervisorPlatform::from_board_target(&marker);
+                dcentrald_thermal::supervisor::SupervisorPlatform::from_board_target(marker);
             let on = dcentrald_thermal::supervisor::supervisor_default_enabled(platform, validated);
             if on && !thermal_supervisor_cfg.enabled {
                 info!(?platform, "THERMAL-8: thermal supervisor default-enabled for this validated platform (DCENT_THERMAL_SUPERVISOR_DEFAULT_ON=1)");
@@ -10836,7 +11218,12 @@ impl Daemon {
                 if thermal_supervisor_cfg.enabled || thermal_supervisor_default_on {
                     let mut cfg = thermal_supervisor_cfg;
                     cfg.enabled = true;
-                    Some(dcentrald_thermal::supervisor::ThermalSupervisor::new(cfg))
+                    let mut sup = dcentrald_thermal::supervisor::ThermalSupervisor::new(cfg);
+                    sup.enable_immersion(
+                        &thermal_immersion_cfg,
+                        thermal_platform_looks_air_cooled,
+                    );
+                    Some(sup)
                 } else {
                     None
                 };
@@ -11828,6 +12215,16 @@ impl Daemon {
                                 .map(|t| t.elapsed() < atm_step_min_interval)
                                 .unwrap_or(false);
 
+                            let live_operating_mhz = {
+                                let st = thermal_state_tx.borrow();
+                                st.chains
+                                    .iter()
+                                    .filter(|c| {
+                                        thermal_chain_ids.contains(&c.id) && c.frequency_mhz > 0
+                                    })
+                                    .map(|c| c.frequency_mhz)
+                                    .min()
+                            };
                             let desired_ceiling = atm_step_ceiling_decision(
                                 step_dir,
                                 atm_step_ceiling_mhz,
@@ -11836,6 +12233,7 @@ impl Daemon {
                                 ATM_STEP_FLOOR_MHZ,
                                 is_cutting_hash,
                                 debounced,
+                                live_operating_mhz,
                             );
 
                             if desired_ceiling != atm_step_ceiling_mhz {
@@ -11890,98 +12288,82 @@ impl Daemon {
                                 // noise reduction feature: it never INCREASES anything,
                                 // only caps maximums. Safety overrides (EmergencyShutdown,
                                 // FanFailure) bypass this by using separate match arms.
-                                if thermal_night_mode.enabled {
-                                    // FWSTAB-1: compare against the operator's
-                                    // LOCAL hour (UTC + configured offset), not
-                                    // raw UTC, so a 22:00 quiet window is quiet
-                                    // at 22:00 local.
-                                    let hour = {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let utc_hour = ((now / 3600) % 24) as u8;
-                                        dcentrald_common::time::local_hour_from_utc(
-                                            utc_hour,
-                                            thermal_night_mode.timezone_offset_hours,
-                                        )
-                                    };
-
-                                    let is_night = if thermal_night_mode.start_hour > thermal_night_mode.end_hour {
-                                        // Wraps midnight: e.g., 22:00 - 06:00
-                                        hour >= thermal_night_mode.start_hour || hour < thermal_night_mode.end_hour
-                                    } else {
-                                        hour >= thermal_night_mode.start_hour && hour < thermal_night_mode.end_hour
-                                    };
-
-                                    if is_night {
-                                        // Cap fan PWM during night hours
-                                        let night_max = clamp_fan_pwm(thermal_night_mode.max_fan_pwm);
-                                        if pwm > night_max {
-                                            tracing::debug!(
-                                                pwm_before = pwm,
-                                                night_max,
-                                                "Night mode: capping fan PWM {} -> {}",
-                                                pwm, night_max,
-                                            );
-                                            pwm = night_max;
-                                        }
-
-                                        // Cap frequency during night hours via freq command channel.
-                                        // The work dispatcher applies this as a ceiling — autotuner
-                                        // and thermal throttle requests above this are clamped.
-                                        let night_max_freq = thermal_night_mode.max_frequency_mhz;
-                                        if thermal_nominal_freq > night_max_freq {
-                                            for &chain_id in &thermal_chain_ids {
-                                                let _ = thermal_freq_tx.try_send(
-                                                    dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
-                                                        chain_id,
-                                                        max_freq_mhz: Some(night_max_freq),
-                                                        source: dcentrald_autotuner::FrequencyLimitSource::QuietMode,
-                                                        ack_tx: None,
-                                                    }
-                                                );
-                                            }
-                                            tracing::debug!(
-                                                night_max_freq,
-                                                "Night mode: frequency capped to {} MHz",
-                                                night_max_freq,
-                                            );
-                                        } else {
-                                            for &chain_id in &thermal_chain_ids {
-                                                let _ = thermal_freq_tx.try_send(
-                                                    dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
-                                                        chain_id,
-                                                        max_freq_mhz: None,
-                                                        source: dcentrald_autotuner::FrequencyLimitSource::QuietMode,
-                                                        ack_tx: None,
-                                                    }
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        for &chain_id in &thermal_chain_ids {
-                                            let _ = thermal_freq_tx.try_send(
-                                                dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
-                                                    chain_id,
-                                                    max_freq_mhz: None,
-                                                    source: dcentrald_autotuner::FrequencyLimitSource::QuietMode,
-                                                    ack_tx: None,
-                                                }
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    for &chain_id in &thermal_chain_ids {
-                                        let _ = thermal_freq_tx.try_send(
-                                            dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
-                                                chain_id,
-                                                max_freq_mhz: None,
-                                                source: dcentrald_autotuner::FrequencyLimitSource::QuietMode,
-                                                ack_tx: None,
-                                            }
+                                // Home `[mode.home.night_mode].max_fan_pwm` is a live
+                                // cap (most restrictive with thermal.night_mode).
+                                let hour = {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let utc_hour = ((now / 3600) % 24) as u8;
+                                    dcentrald_common::time::local_hour_from_utc(
+                                        utc_hour,
+                                        thermal_night_mode.timezone_offset_hours,
+                                    )
+                                };
+                                let thermal_window =
+                                    dcentrald_common::night_power::NightFanWindow::new(
+                                        thermal_night_mode.enabled,
+                                        thermal_night_mode.start_hour,
+                                        thermal_night_mode.end_hour,
+                                        thermal_night_mode.max_fan_pwm,
+                                    )
+                                    .with_max_frequency(thermal_night_mode.max_frequency_mhz);
+                                let home_window = *home_night_fan_rx.borrow();
+                                if let Some(night_max) =
+                                    dcentrald_common::night_power::effective_night_fan_pwm(
+                                        thermal_window,
+                                        home_window,
+                                        hour,
+                                        FAN_PWM_SAFETY_MAX,
+                                    )
+                                {
+                                    let before = pwm;
+                                    pwm = dcentrald_common::night_power::apply_night_fan_pwm(
+                                        pwm, Some(night_max),
+                                    );
+                                    if pwm < before {
+                                        tracing::debug!(
+                                            pwm_before = before,
+                                            night_max,
+                                            "Night mode: capping fan PWM {} -> {}",
+                                            before,
+                                            pwm,
                                         );
                                     }
+                                }
+
+                                // QuietMode frequency ceiling: most-restrictive of
+                                // thermal.night_mode and live home night
+                                // max_frequency_mhz. Decrease-only; daytime or
+                                // both-idle clears the QuietMode source.
+                                let night_freq_cap =
+                                    dcentrald_common::night_power::effective_night_frequency_mhz(
+                                        thermal_window,
+                                        home_window,
+                                        hour,
+                                    );
+                                let quiet_limit =
+                                    dcentrald_common::night_power::quiet_mode_frequency_limit(
+                                        thermal_nominal_freq,
+                                        night_freq_cap,
+                                    );
+                                for &chain_id in &thermal_chain_ids {
+                                    let _ = thermal_freq_tx.try_send(
+                                        dcentrald_autotuner::FreqCommand::SetFrequencyLimit {
+                                            chain_id,
+                                            max_freq_mhz: quiet_limit,
+                                            source: dcentrald_autotuner::FrequencyLimitSource::QuietMode,
+                                            ack_tx: None,
+                                        },
+                                    );
+                                }
+                                if let Some(night_max_freq) = quiet_limit {
+                                    tracing::debug!(
+                                        night_max_freq,
+                                        "Night mode: frequency capped to {} MHz",
+                                        night_max_freq,
+                                    );
                                 }
 
                                 // P1-6: FanOnly SafetyAction — home-cap effective PWM from plan.
@@ -12270,7 +12652,7 @@ impl Daemon {
                                     fan.set_speed(pwm);
                                 }
                                 // Fire webhook alert — non-blocking try_send so thermal loop is never stalled
-                                let _ = thermal_alert_tx.try_send(AlertEvent::EmergencyShutdown {
+                                let _ = thermal_alert_tx.try_send(AlertEvent::ThermalSafety {
                                     temp_c: max_board_temp,
                                     chain_id: 0, // all chains affected
                                 });
@@ -12323,6 +12705,14 @@ impl Daemon {
                                         "CRITICAL: bounded source-aware lockout persistence was not proven after watchdog-feed closure; typed closeout is already requested, the pre-launch hardware-session latch must remain unresolved, and operator clearance must not authorize a warm restart"
                                     ),
                                 }
+                                // Same watchdog-feed-closed terminal point:
+                                // journal any Mutated/Quarantined fabric
+                                // dispositions alongside the thermal marker
+                                // (small bounded write, not an unwind path).
+                                persist_unresolved_mutation_dispositions_with_reason(
+                                    &terminal_mutation_disposition_path(),
+                                    MutationSessionReason::SafeOffFailed,
+                                );
                                 warn!(
                                     ?disposition,
                                     "Emergency thermal cut attempt finished; transferred the terminal generation immediately to typed lifecycle closeout before watchdog expiry"
@@ -12500,6 +12890,14 @@ impl Daemon {
                                         "CRITICAL: bounded fan-failure lockout persistence was not proven after watchdog-feed closure; typed closeout is already requested, the pre-launch hardware-session latch must remain unresolved, and operator clearance must not authorize a warm restart"
                                     ),
                                 }
+                                // Same watchdog-feed-closed terminal point:
+                                // journal any Mutated/Quarantined fabric
+                                // dispositions alongside the thermal marker
+                                // (small bounded write, not an unwind path).
+                                persist_unresolved_mutation_dispositions_with_reason(
+                                    &terminal_mutation_disposition_path(),
+                                    MutationSessionReason::SafeOffFailed,
+                                );
                                 warn!(
                                     ?disposition,
                                     "Fan-failure cut attempt finished; transferred the terminal generation immediately to typed lifecycle closeout before watchdog expiry"
@@ -13064,6 +13462,15 @@ impl Daemon {
         // dcentrald_hal::platform::amlogic doc comment.
         let i2c_request = SerializedI2cRequest::new(i2c_transport, recover_am1_bus)?;
         let i2c_svc = ProductionSerializedI2cFactory.open_serialized_i2c(i2c_request)?;
+        {
+            let reader = i2c_svc.observation_reader();
+            let mut readers = self
+                .i2c_observation_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            readers.retain(|existing| existing.bus() != reader.bus());
+            readers.push(reader);
+        }
         self.i2c_service = Some(i2c_svc.clone());
         info!(
             use_devmem_i2c,
@@ -13336,6 +13743,79 @@ impl Daemon {
             }
         }
 
+        // Durable mutation-disposition journal adjudication (defense-in-depth
+        // UNDER the supervisor session latch; the boot/platform/fabric/
+        // allocation-bound journal named by CONTROLLER_RECOVERY_AUTHORITY.md).
+        // Any unresolved, foreign-boot, or unreadable journal REFUSES hardware
+        // admission fail-closed before watchdog, heartbeat, rail, or mining
+        // authority exists. A Resolved journal is NOT a typed SafeOff receipt:
+        // it never authorizes skipping the shell session latch and never
+        // re-enables automatic restart (restart.rs keeps returning false).
+        let mutation_disposition_path = terminal_mutation_disposition_path();
+        let mutation_adjudication = load_and_adjudicate_mutation_disposition(
+            &mutation_disposition_path,
+            &current_boot_id_token(),
+        );
+        match admit_hardware_after_mutation_adjudication(&mutation_adjudication) {
+            Ok(admission) => {
+                if let Some(resolved_record) = mutation_adjudication.resolved_record() {
+                    // A same-boot record whose every entry is Clean or carries
+                    // a typed SafeOff receipt is an accepted explicit
+                    // resolution. Removal failure stays fail-closed, mirroring
+                    // the thermal lockout removal above.
+                    let Some(clearance) = admission.into_clearance() else {
+                        self.preflight_hardware_state_unknown = true;
+                        let transition = i2c_svc.latch_terminal_safe_off();
+                        self.signal_init_heartbeat_stop();
+                        self.heartbeat_shutdown_token.cancel();
+                        error!(
+                            ?resolved_record,
+                            path = %mutation_disposition_path.display(),
+                            safety_generation = transition.generation(),
+                            "Resolved mutation-disposition journal lacked path-bound clear authority; remaining fail-closed"
+                        );
+                        anyhow::bail!(
+                            "resolved mutation-disposition journal lacked path-bound clear authority"
+                        );
+                    };
+                    if let Err(remove_error) = clear_mutation_disposition(clearance) {
+                        self.preflight_hardware_state_unknown = true;
+                        let transition = i2c_svc.latch_terminal_safe_off();
+                        self.signal_init_heartbeat_stop();
+                        self.heartbeat_shutdown_token.cancel();
+                        error!(
+                            ?resolved_record,
+                            path = %mutation_disposition_path.display(),
+                            error = %remove_error,
+                            safety_generation = transition.generation(),
+                            "Mutation-disposition resolution was accepted but durable journal removal failed; remaining fail-closed"
+                        );
+                        anyhow::bail!(
+                            "mutation-disposition journal removal was not durably proven: {remove_error}"
+                        );
+                    }
+                    info!(
+                        ?resolved_record,
+                        path = %mutation_disposition_path.display(),
+                        "Resolved mutation-disposition journal (clean or typed-SafeOff-receipted same-boot record) removed before hardware admission"
+                    );
+                }
+            }
+            Err(refusal) => {
+                self.preflight_hardware_state_unknown = true;
+                let transition = i2c_svc.latch_terminal_safe_off();
+                self.signal_init_heartbeat_stop();
+                self.heartbeat_shutdown_token.cancel();
+                error!(
+                    path = %mutation_disposition_path.display(),
+                    refusal = %refusal,
+                    safety_generation = transition.generation(),
+                    "Durable mutation-disposition journal refuses hardware admission; no heartbeat, rail enable, or mining may follow until an operator resolves or clears the journal"
+                );
+                anyhow::bail!("mutation-disposition journal refuses hardware admission: {refusal}");
+            }
+        }
+
         // A watchdog reset recreates the process-local latch. Only a finite
         // pre-energize observation below the thermal controller's own
         // dangerous-hysteresis recovery boundary may mint Ready for this fresh
@@ -13474,6 +13954,18 @@ impl Daemon {
         // register access. This bypasses sysfs and gives us reliable control
         // over board enable/reset, plug detect, and LEDs.
         info!("--- Phase 2b: GPIO Controller Init (AXI Register Access) ---");
+        let led_config = LedEngineConfig {
+            enabled: self.config.led.enabled,
+            heartbeat_on_ms: self.config.led.heartbeat_on_ms,
+            heartbeat_off_ms: self.config.led.heartbeat_off_ms,
+            locate_pattern: self.config.led.locate_pattern.clone(),
+            locate_duration_s: self.config.led.locate_duration_s,
+            flash_on_accepted_share: self.config.led.flash_on_accepted_share,
+            flash_on_rejected_share: self.config.led.flash_on_rejected_share,
+            night_mode_disable: self.config.led.night_mode_disable,
+            celebration_on_lucky_share: self.config.led.celebration_on_lucky_share,
+            chain_status_blink_codes: self.config.led.chain_status_blink_codes,
+        };
         match GpioController::new() {
             Ok(gpio) => {
                 let input_val = gpio.read_input();
@@ -13490,23 +13982,11 @@ impl Daemon {
                 gpio.set_led(dcentrald_hal::gpio::Led::Green, true);
 
                 // Spawn the LED engine task
-                let led_config = LedEngineConfig {
-                    enabled: self.config.led.enabled,
-                    heartbeat_on_ms: self.config.led.heartbeat_on_ms,
-                    heartbeat_off_ms: self.config.led.heartbeat_off_ms,
-                    locate_pattern: self.config.led.locate_pattern.clone(),
-                    locate_duration_s: self.config.led.locate_duration_s,
-                    flash_on_accepted_share: self.config.led.flash_on_accepted_share,
-                    flash_on_rejected_share: self.config.led.flash_on_rejected_share,
-                    night_mode_disable: self.config.led.night_mode_disable,
-                    celebration_on_lucky_share: self.config.led.celebration_on_lucky_share,
-                    chain_status_blink_codes: self.config.led.chain_status_blink_codes,
-                };
                 let (led_cmd_tx, led_cmd_rx) = mpsc::channel::<LedCommand>(64);
-                let led_gpio = gpio.clone();
+                let led_io: Arc<dyn LedIo> = gpio.clone();
                 let led_shutdown = self.shutdown_token.clone();
                 let (mut engine, led_status_rx) =
-                    LedEngine::new(led_gpio, led_cmd_rx, led_shutdown, led_config);
+                    LedEngine::new(led_io, led_cmd_rx, led_shutdown, led_config);
                 tokio::spawn(async move {
                     engine.run().await;
                 });
@@ -13518,6 +13998,23 @@ impl Daemon {
             }
             Err(e) => {
                 warn!(error = %e, "GPIO controller init failed — falling back to sysfs GPIO (less reliable)");
+                // VNish-parity Find-Miner: Amlogic/BB/CV have no AXI GPIO map.
+                // Daemon-owned sysfs LEDs (AML 438/453, BB 23/45, CV pair).
+                if let Some(leds) = sysfs_status_led_backend() {
+                    leds.init_leds();
+                    leds.set_led(dcentrald_hal::gpio::Led::Green, true);
+                    let (led_cmd_tx, led_cmd_rx) = mpsc::channel::<LedCommand>(64);
+                    let led_shutdown = self.shutdown_token.clone();
+                    let (mut engine, led_status_rx) =
+                        LedEngine::new(leds, led_cmd_rx, led_shutdown, led_config);
+                    tokio::spawn(async move {
+                        engine.run().await;
+                    });
+                    let _ = led_cmd_tx.try_send(LedCommand::SetPattern(LedPattern::Initializing));
+                    self.led_tx = Some(led_cmd_tx);
+                    self.led_status_rx = Some(led_status_rx);
+                    info!("LED engine started on sysfs status-LED backend (AXI GPIO absent)");
+                }
             }
         }
 
@@ -17436,6 +17933,20 @@ impl Daemon {
             );
         }
 
+        // Journal any Mutated/Quarantined I2C-fabric dispositions at this
+        // controlled teardown boundary (the durable mutation-disposition
+        // journal). A clean roster journals nothing, so a normally-closed
+        // session stays byte-identical to today. Never called from a panic
+        // handler or unwind path.
+        persist_unresolved_mutation_dispositions_with_reason(
+            &terminal_mutation_disposition_path(),
+            if software_disable_failed {
+                MutationSessionReason::SafeOffFailed
+            } else {
+                MutationSessionReason::ExpectedZeroAwaitingTypedDisposition
+            },
+        );
+
         if self.thermal_generation_prearmed {
             if thermal_emergency_active(&self.terminal_thermal_generation_latch) {
                 warn!(
@@ -18666,6 +19177,7 @@ mod sw02_perf004_wiring_tests {
             TEST_ATM_FLOOR,
             cutting_hash,
             debounced,
+            None,
         )
     }
 
@@ -18678,7 +19190,26 @@ mod sw02_perf004_wiring_tests {
             TEST_ATM_FLOOR,
             cutting_hash,
             debounced,
+            None,
         )
+    }
+
+    #[test]
+    fn atm_first_step_down_starts_from_live_operating_not_stale_nameplate() {
+        let from_live = atm_step_ceiling_decision(
+            AtmStepDir::Down,
+            None,
+            TEST_ATM_NOMINAL,
+            TEST_ATM_STEP,
+            TEST_ATM_FLOOR,
+            false,
+            false,
+            Some(400),
+        );
+        assert_eq!(from_live, Some(400 - TEST_ATM_STEP));
+        let from_nameplate = atm_down(None, false, false);
+        assert_eq!(from_nameplate, Some(TEST_ATM_NOMINAL - TEST_ATM_STEP));
+        assert_ne!(from_live, from_nameplate);
     }
 
     // -- Gate-off: a DISABLED supervisor emits NO profile-step advisories, so

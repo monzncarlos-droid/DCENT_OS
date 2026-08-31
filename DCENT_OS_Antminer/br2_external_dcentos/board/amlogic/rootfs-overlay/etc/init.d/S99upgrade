@@ -52,7 +52,11 @@ if [ -z "$RECOVERY_FLAG_OFFSET" ]; then
     HEALTH_OK=false
 fi
 RECOVERY_MTD=${DCENTOS_SYSTEM_MTD:-/dev/mtd5}
+RECOVERY_ERASESIZE_EXPECTED=${DCENTOS_RECOVERY_ERASESIZE_EXPECTED:-131072}
+RECOVERY_STAGING_ROOT=${DCENTOS_RECOVERY_STAGING_ROOT:-/data}
 DCENT_RELEASE_IMAGE_MARKER=/etc/dcentos/release-image
+MUTATION_POLICY_FILE=${DCENTOS_MUTATION_POLICY_FILE:-/etc/dcentos/mutation_policy}
+MUTATION_POLICY_HELPER=${DCENTOS_MUTATION_POLICY_HELPER:-/usr/libexec/dcentos/mutation-policy.sh}
 
 #  B2: write-ahead log file. Existence == "I owe a fw_setenv firstboot=0".
 # Lives in /data/ (persistent overlay) so it survives reboots. Removed only after
@@ -61,6 +65,9 @@ DCENT_RELEASE_IMAGE_MARKER=/etc/dcentos/release-image
 FIRSTBOOT_PENDING_FILE=${DCENTOS_FIRSTBOOT_PENDING_FILE:-/data/.firstboot-pending}
 # Live SKU marker. Override is host-test only (WAL durability harness).
 BOARD_TARGET_FILE=${DCENTOS_BOARD_TARGET_FILE:-/etc/dcentos/board_target}
+# Independent live platform marker. Neither package metadata nor board_target
+# alone is authority for raw NAND mutation.
+PLATFORM_FILE=${DCENTOS_PLATFORM_FILE:-/etc/dcentos-platform}
 
 wait_for_http() {
     LABEL="$1"
@@ -248,34 +255,63 @@ check_health() {
 }
 
 # : OTA-08 is Amlogic-overlay only. Same sealed identities as S37.
-# Missing/unknown board_target is fail-open on a shared mtd5 write.
+# Missing, unknown, alias, or mixed platform:target identity fails closed
+# before WAL replay or any recovery-flag NAND read/write/erase.
 # : `a lab unit` bootcmd ignores firstboot. Blocking 0x03 on WAL failure
 # leaves 0x02 → recover_to_stock after a healthy S19k boot. Other Amlogic
 # identities keep the WAL fail-closed gate.
 s19k_firstboot_is_wal_companion_only() {
-    [ -r "$BOARD_TARGET_FILE" ] || return 1
-    BT=$(tr -d ' \t\r\n' < "$BOARD_TARGET_FILE")
-    case "$BT" in
-        am3-s19k|am3-s19kpro|am3-aml-s19kpro) return 0 ;;
-        *) return 1 ;;
-    esac
+    require_amlogic_ota08_identity || return 1
+    [ "$AML_OTA08_IDENTITY" = "am3-aml-s19k:am3-s19k" ]
 }
 
 require_amlogic_ota08_identity() {
+    if [ ! -r "$PLATFORM_FILE" ]; then
+        echo "  *** ERROR: missing live $PLATFORM_FILE; refuse OTA-08 NAND ***"
+        return 1
+    fi
     if [ ! -r "$BOARD_TARGET_FILE" ]; then
         echo "  *** ERROR: missing live $BOARD_TARGET_FILE; refuse OTA-08 NAND ***"
         return 1
     fi
+    PLATFORM=$(tr -d ' \t\r\n' < "$PLATFORM_FILE")
     BT=$(tr -d ' \t\r\n' < "$BOARD_TARGET_FILE")
-    case "$BT" in
-        am3-s19k|am3-s19kpro|am3-aml-s19kpro) ;;
-        am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp|am3-t21) ;;
+    AML_OTA08_IDENTITY="$PLATFORM:$BT"
+    case "$AML_OTA08_IDENTITY" in
+        am3-aml-s19k:am3-s19k) ;;
+        am3-aml-s19jpro:am3-s19jpro-aml) ;;
+        am3-aml-s21:am3-s21) ;;
+        am3-aml-s21pro:am3-s21pro) ;;
         *)
-            echo "  *** ERROR: live board_target='$BT' is not an admitted Amlogic identity; refuse OTA-08 NAND ***"
+            echo "  *** ERROR: live platform:target='$AML_OTA08_IDENTITY' is not an exact admitted Amlogic identity; refuse OTA-08 NAND ***"
             return 1
             ;;
     esac
     return 0
+}
+
+require_ota_mutation_policy() {
+    POLICY_TARGET=$(tr -d ' \t\r\n' < "$BOARD_TARGET_FILE" 2>/dev/null || true)
+    case "$POLICY_TARGET" in
+        am3-s19k|am3-s19kpro|am3-aml-s19kpro)
+            if [ ! -r "$MUTATION_POLICY_HELPER" ]; then
+                echo "  *** ERROR: S19k mutation-policy helper is missing; refuse OTA/recovery mutation ***"
+                return 1
+            fi
+            . "$MUTATION_POLICY_HELPER"
+            if ! dcent_mutation_policy_has "$MUTATION_POLICY_FILE" ota-storage; then
+                echo "  *** ERROR: S19k ota-storage capability is missing or insecure; refuse OTA/recovery mutation ***"
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+    [ -e "$MUTATION_POLICY_FILE" ] || return 0
+    POLICY=$(tr -d ' \t\r\n' < "$MUTATION_POLICY_FILE" 2>/dev/null || true)
+    [ "$POLICY" = hardware-enabled ] || {
+        echo "  *** ERROR: mutation_policy='$POLICY'; refuse OTA/recovery mutation ***"
+        return 1
+    }
 }
 
 read_recovery_flag() {
@@ -292,8 +328,11 @@ read_recovery_flag() {
         echo "ERR_NO_MTD5"
         return 1
     fi
-    BYTE=$(nanddump -s "$RECOVERY_FLAG_OFFSET" -l 1 "$RECOVERY_MTD" 2>/dev/null \
-        | tail -c 1 | od -An -tx1 | tr -d ' \n')
+    # padbad keeps the requested physical offset meaningful if this block ever
+    # becomes bad. A compacting read could silently return a byte from the next
+    # good eraseblock and admit the wrong recovery state.
+    BYTE=$(nanddump --bb=padbad --omitoob -s "$RECOVERY_FLAG_OFFSET" -l 1 \
+        "$RECOVERY_MTD" 2>/dev/null | od -An -tx1 | tr -d ' \n')
     if [ -z "$BYTE" ]; then
         echo "ERR_DUMP_FAILED"
         return 1
@@ -305,24 +344,33 @@ commit_recovery_flag() {
     # OTA-08: AMLOGIC_RAW_NAND_RECOVERY_FLAG_EXCEPTION.
     #
     # This is the only target-side raw NAND write this init script is allowed to
-    # perform: one recovery-state byte in the Amlogic mtd5 recovery-flag window,
-    # after boot health has passed. It must not be copied to Zynq/CVitek/BB, and
-    # it does not update U-Boot env; firstboot remains fw_setenv-only below.
+    # perform: a read/modify/write of the complete eraseblock containing the
+    # Amlogic mtd5 recovery-state byte, after boot health has passed. Erasing a
+    # block and programming only one byte destroys every adjacent byte, even
+    # when the flag happens to be block-aligned. It must not be copied to
+    # Zynq/CVitek/BB, and it does not update U-Boot env; firstboot remains
+    # fw_setenv-only below.
     #
-    # The nandwrite is accepted only with an immediate read_recovery_flag()
-    # readback of 0x03. A mismatch fails closed so U-Boot can keep/replay the
-    # firstboot recovery path instead of treating an unverified flag as commit.
+    # Two identical padbad/omitoob snapshots are required before erase. The
+    # expected 128 KiB image changes exactly the flag byte and the complete
+    # eraseblock must compare equal after write. The single-byte readback below
+    # is retained as a second semantic check.
     # : also require a sealed Amlogic board_target and a pre-write 0x02.
     if [ -z "$RECOVERY_FLAG_OFFSET" ] || [ "$RECOVERY_FLAG_OFFSET" = "0x05300000" ]; then
         echo "  *** ERROR: recovery flag offset unset or naive 0x05300000; refuse NAND write ***"
         return 1
     fi
+    case "$RECOVERY_FLAG_OFFSET" in
+        0x*|0X*) FLAG_HEX_DIGITS=${RECOVERY_FLAG_OFFSET#??} ;;
+        *) FLAG_HEX_DIGITS= ;;
+    esac
+    case "$FLAG_HEX_DIGITS" in
+        ''|*[!0-9A-Fa-f]*)
+            echo "  *** ERROR: recovery flag offset is not canonical hexadecimal: '$RECOVERY_FLAG_OFFSET' ***"
+            return 1
+            ;;
+    esac
     if ! require_amlogic_ota08_identity; then
-        return 1
-    fi
-    if ! command -v flash_erase > /dev/null 2>&1 || ! command -v nandwrite > /dev/null 2>&1; then
-        echo "  *** ERROR: flash_erase/nandwrite missing - cannot commit recovery flag ***"
-        echo "  *** Add BR2_PACKAGE_MTD=y to defconfig and rebuild ***"
         return 1
     fi
     OLD=$(read_recovery_flag)
@@ -330,21 +378,147 @@ commit_recovery_flag() {
         echo "  *** ERROR: recovery flag pre-write = $OLD (expected 0x02); refuse OTA-08 NAND ***"
         return 1
     fi
-    sync
-    if ! flash_erase "$RECOVERY_MTD" "$RECOVERY_FLAG_OFFSET" 1 2>&1; then
-        echo "  *** ERROR: flash_erase $RECOVERY_MTD $RECOVERY_FLAG_OFFSET failed ***"
+    for TOOL in nanddump flash_erase nandwrite cp dd od cmp mktemp wc; do
+        if ! command -v "$TOOL" > /dev/null 2>&1; then
+            echo "  *** ERROR: $TOOL missing - cannot preserve/rewrite recovery eraseblock ***"
+            return 1
+        fi
+    done
+    case "$RECOVERY_ERASESIZE_EXPECTED" in
+        ''|*[!0-9]*)
+            echo "  *** ERROR: invalid recovery erasesize '$RECOVERY_ERASESIZE_EXPECTED' ***"
+            return 1
+            ;;
+    esac
+    if [ "$RECOVERY_ERASESIZE_EXPECTED" -ne 131072 ]; then
+        echo "  *** ERROR: recovery erasesize $RECOVERY_ERASESIZE_EXPECTED != sealed 131072 ***"
         return 1
     fi
-    if ! printf '\x3' | nandwrite -p -s "$RECOVERY_FLAG_OFFSET" "$RECOVERY_MTD" 2>&1; then
-        echo "  *** ERROR: nandwrite of 0x3 to $RECOVERY_MTD failed ***"
+    MTD_BASENAME=${RECOVERY_MTD##*/}
+    MTD_ERASESIZE_FILE="/sys/class/mtd/$MTD_BASENAME/erasesize"
+    if [ -r "$MTD_ERASESIZE_FILE" ]; then
+        LIVE_ERASESIZE=$(tr -d ' \t\r\n' < "$MTD_ERASESIZE_FILE")
+        case "$LIVE_ERASESIZE" in
+            ''|*[!0-9]*)
+                echo "  *** ERROR: live recovery erasesize is invalid: '$LIVE_ERASESIZE' ***"
+                return 1
+                ;;
+        esac
+        if [ "$LIVE_ERASESIZE" -ne "$RECOVERY_ERASESIZE_EXPECTED" ]; then
+            echo "  *** ERROR: live recovery erasesize $LIVE_ERASESIZE != expected $RECOVERY_ERASESIZE_EXPECTED ***"
+            return 1
+        fi
+    fi
+    FLAG_DEC=$((RECOVERY_FLAG_OFFSET))
+    ERASEBLOCK_START_DEC=$((FLAG_DEC / RECOVERY_ERASESIZE_EXPECTED * RECOVERY_ERASESIZE_EXPECTED))
+    FLAG_IN_BLOCK=$((FLAG_DEC - ERASEBLOCK_START_DEC))
+    ERASEBLOCK_START=$(printf '0x%08X' "$ERASEBLOCK_START_DEC")
+
+    if [ ! -d "$RECOVERY_STAGING_ROOT" ] || [ -L "$RECOVERY_STAGING_ROOT" ]; then
+        echo "  *** ERROR: persistent recovery staging root is unavailable or a symlink: $RECOVERY_STAGING_ROOT ***"
+        return 1
+    fi
+    FLAG_TXN=$(mktemp -d "$RECOVERY_STAGING_ROOT/.s99-recovery-flag.XXXXXX") || {
+        echo "  *** ERROR: cannot create persistent recovery-flag transaction directory ***"
+        return 1
+    }
+    chmod 0700 "$FLAG_TXN" 2>/dev/null || {
+        rmdir "$FLAG_TXN" 2>/dev/null || true
+        echo "  *** ERROR: cannot protect recovery-flag transaction directory ***"
+        return 1
+    }
+    FLAG_BEFORE="$FLAG_TXN/eraseblock.before.bin"
+    FLAG_BEFORE_2="$FLAG_TXN/eraseblock.before-duplicate.bin"
+    FLAG_EXPECTED="$FLAG_TXN/eraseblock.expected.bin"
+    FLAG_READBACK="$FLAG_TXN/eraseblock.readback.bin"
+
+    cleanup_flag_transaction() {
+        rm -f "$FLAG_BEFORE" "$FLAG_BEFORE_2" "$FLAG_EXPECTED" "$FLAG_READBACK" 2>/dev/null || true
+        rmdir "$FLAG_TXN" 2>/dev/null || true
+    }
+    retain_flag_transaction() {
+        echo "  *** RECOVERY: preserved pre-write eraseblock transaction at $FLAG_TXN ***"
+    }
+
+    if ! nanddump --bb=padbad --omitoob -s "$ERASEBLOCK_START" \
+        -l "$RECOVERY_ERASESIZE_EXPECTED" "$RECOVERY_MTD" > "$FLAG_BEFORE"; then
+        echo "  *** ERROR: first recovery eraseblock snapshot failed ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    if ! nanddump --bb=padbad --omitoob -s "$ERASEBLOCK_START" \
+        -l "$RECOVERY_ERASESIZE_EXPECTED" "$RECOVERY_MTD" > "$FLAG_BEFORE_2"; then
+        echo "  *** ERROR: duplicate recovery eraseblock snapshot failed ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    BEFORE_SIZE=$(wc -c < "$FLAG_BEFORE" | tr -d ' \t\r\n')
+    BEFORE_2_SIZE=$(wc -c < "$FLAG_BEFORE_2" | tr -d ' \t\r\n')
+    if [ "$BEFORE_SIZE" != "$RECOVERY_ERASESIZE_EXPECTED" ] || \
+       [ "$BEFORE_2_SIZE" != "$RECOVERY_ERASESIZE_EXPECTED" ] || \
+       ! cmp -s "$FLAG_BEFORE" "$FLAG_BEFORE_2"; then
+        echo "  *** ERROR: recovery eraseblock snapshots are short or unstable ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    SNAPSHOT_OLD=$(dd if="$FLAG_BEFORE" bs=1 skip="$FLAG_IN_BLOCK" count=1 2>/dev/null \
+        | od -An -tx1 | tr -d ' \n')
+    if [ "$SNAPSHOT_OLD" != "02" ]; then
+        echo "  *** ERROR: snapshotted recovery flag = 0x$SNAPSHOT_OLD (expected 0x02) ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    if ! cp "$FLAG_BEFORE" "$FLAG_EXPECTED" || \
+       ! printf '\003' | dd of="$FLAG_EXPECTED" bs=1 seek="$FLAG_IN_BLOCK" conv=notrunc 2>/dev/null; then
+        echo "  *** ERROR: cannot construct preserved recovery eraseblock image ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    EXPECTED_SIZE=$(wc -c < "$FLAG_EXPECTED" | tr -d ' \t\r\n')
+    if [ "$EXPECTED_SIZE" != "$RECOVERY_ERASESIZE_EXPECTED" ]; then
+        echo "  *** ERROR: preserved recovery eraseblock image changed size ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+
+    # Durably retain the old and intended eraseblocks before the destructive
+    # boundary. On any later failure the directory is intentionally retained.
+    if ! sync; then
+        echo "  *** ERROR: recovery eraseblock snapshots are not durable; refuse erase ***"
+        cleanup_flag_transaction
+        return 1
+    fi
+    if ! flash_erase "$RECOVERY_MTD" "$ERASEBLOCK_START" 1 2>&1; then
+        echo "  *** ERROR: flash_erase $RECOVERY_MTD $ERASEBLOCK_START failed ***"
+        retain_flag_transaction
+        return 1
+    fi
+    if ! nandwrite -p -s "$ERASEBLOCK_START" "$RECOVERY_MTD" "$FLAG_EXPECTED" 2>&1; then
+        echo "  *** ERROR: full recovery eraseblock nandwrite failed ***"
+        retain_flag_transaction
+        return 1
+    fi
+    if ! nanddump --bb=padbad --omitoob -s "$ERASEBLOCK_START" \
+        -l "$RECOVERY_ERASESIZE_EXPECTED" "$RECOVERY_MTD" > "$FLAG_READBACK"; then
+        echo "  *** ERROR: full recovery eraseblock readback failed ***"
+        retain_flag_transaction
+        return 1
+    fi
+    READBACK_SIZE=$(wc -c < "$FLAG_READBACK" | tr -d ' \t\r\n')
+    if [ "$READBACK_SIZE" != "$RECOVERY_ERASESIZE_EXPECTED" ] || \
+       ! cmp -s "$FLAG_EXPECTED" "$FLAG_READBACK"; then
+        echo "  *** ERROR: full recovery eraseblock readback mismatch ***"
+        retain_flag_transaction
         return 1
     fi
     NEW=$(read_recovery_flag)
     if [ "$NEW" != "0x03" ]; then
         echo "  *** ERROR: recovery flag readback = $NEW (expected 0x03) ***"
+        retain_flag_transaction
         return 1
     fi
-    echo "  [OK] recovery flag promoted 0x02 -> 0x03 (firmware committed)"
+    cleanup_flag_transaction
+    echo "  [OK] recovery flag promoted 0x02 -> 0x03 by verified full-eraseblock rewrite (firmware committed)"
     return 0
 }
 
@@ -449,10 +623,15 @@ replay_pending_env_clear() {
 
 case "$1" in
     start)
+        # This gate precedes WAL replay because replay can call fw_setenv.
+        # Target policy therefore blocks every env/NAND mutation, not only the
+        # later recovery-flag commit.
+        require_ota_mutation_policy || exit 1
         if [ ! -e "$RECOVERY_MTD" ]; then
             # No mtd5 — not on Amlogic NAND. Nothing to do.
             exit 0
         fi
+        require_amlogic_ota08_identity || exit 1
 
         #  B2: WAL replay runs BEFORE the recovery-flag check. If a
         # previous boot succeeded at commit_recovery_flag but failed at

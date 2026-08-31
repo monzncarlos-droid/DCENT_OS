@@ -363,6 +363,39 @@ pub fn request_has_owner_session(
     is_bearer_authorized(req, state)
 }
 
+/// Enforce the build-bound deployment policy and the resolved board safety
+/// profile before any operational REST or MCP mutation reaches a handler.
+///
+/// This is deliberately separate from owner authentication: an authenticated
+/// owner cannot turn an identity-only diagnostic image into a mining image,
+/// and a recognized build whose runtime identity becomes unsafe also closes.
+pub(crate) fn deployment_mutations_allowed(state: &SharedState) -> bool {
+    let profile_allows_mining = state
+        .config
+        .lock()
+        .map(|config| {
+            config
+                .board_profile_resolution()
+                .mining_allowed_without_lab_bypass
+        })
+        .unwrap_or(false);
+    crate::capabilities::deployment_allows_operational_mutations(
+        env!("DCENTAXE_RUNTIME_MODE"),
+        env!("DCENTAXE_INSTALL_POLICY"),
+        profile_allows_mining,
+    )
+}
+
+fn authorize_deployment_mutation(state: &SharedState) -> Result<(), AuthFailure> {
+    if deployment_mutations_allowed(state) {
+        Ok(())
+    } else {
+        Err(AuthFailure::Forbidden(
+            "Firmware deployment policy is read-only; operational mutations are disabled",
+        ))
+    }
+}
+
 pub fn authorize_rest_write(
     req: &Request<&mut EspHttpConnection>,
     state: &SharedState,
@@ -372,6 +405,7 @@ pub fn authorize_rest_write(
             "CSRF: X-Requested-With header required",
         ));
     }
+    authorize_deployment_mutation(state)?;
     if !password_is_set(state) {
         return Ok(());
     }
@@ -404,6 +438,7 @@ pub fn authorize_mcp_control(
     req: &Request<&mut EspHttpConnection>,
     state: &SharedState,
 ) -> Result<(), AuthFailure> {
+    authorize_deployment_mutation(state)?;
     // XPH-5: the fail-closed decision lives in the host-tested pure predicate
     // `ota_signature::mcp_control_authorized`; this wrapper only feeds it the
     // two booleans the esp-idf `Request` resolves to, then maps the typed

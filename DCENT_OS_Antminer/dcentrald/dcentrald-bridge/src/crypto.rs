@@ -157,8 +157,10 @@ fn base32_decode_nopad(input: &str) -> Result<Vec<u8>, SecretDecodeError> {
 
     for ch in input.chars() {
         if ch == '=' {
-            // Tolerate trailing padding even though the spec is "no pad".
-            continue;
+            // The QR contract is explicitly base32-no-pad. Ignoring '=' here
+            // would make multiple distinct strings decode to the same secret,
+            // including strings with padding injected in the middle.
+            return Err(SecretDecodeError::InvalidChar(ch));
         }
         let up = ch.to_ascii_uppercase();
         let val = ALPHABET
@@ -299,6 +301,21 @@ mod tests {
             "non-canonical trailing bits must be rejected, got {:?}",
             base32_decode_nopad(&non_canonical)
         );
+    }
+
+    #[test]
+    fn base32_no_pad_rejects_padding_anywhere() {
+        let canonical = "A".repeat(52);
+        for padded in [
+            format!("={canonical}"),
+            format!("{}={}", &canonical[..26], &canonical[26..]),
+            format!("{canonical}===="),
+        ] {
+            assert_eq!(
+                base32_decode_nopad(&padded),
+                Err(SecretDecodeError::InvalidChar('='))
+            );
+        }
     }
 
     #[test]

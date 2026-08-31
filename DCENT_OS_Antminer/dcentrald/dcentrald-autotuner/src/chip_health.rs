@@ -216,19 +216,20 @@ impl ChipHealthTracker {
                         .get(&snapshot.chain_id)
                         .copied()
                         .unwrap_or(0);
-                    let expected_nps = crate::chip_geometry::expected_nps_for_chip(
+                    if let Some(expected_nps) = crate::chip_geometry::expected_nps_for_chip(
                         chip_id,
                         data.current_freq_mhz,
                         snapshot.current_difficulty,
-                    );
-                    let expected_nonces = expected_nps * snapshot.window_duration_s;
-                    if expected_nonces > 0.0 {
-                        let ratio = (nonces as f64 / expected_nonces).min(2.0);
-                        if data.snapshot_count == 0 {
-                            data.hashrate_ratio_ema = ratio;
-                        } else {
-                            data.hashrate_ratio_ema =
-                                EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * data.hashrate_ratio_ema;
+                    ) {
+                        let expected_nonces = expected_nps * snapshot.window_duration_s;
+                        if expected_nonces > 0.0 {
+                            let ratio = (nonces as f64 / expected_nonces).min(2.0);
+                            if data.snapshot_count == 0 {
+                                data.hashrate_ratio_ema = ratio;
+                            } else {
+                                data.hashrate_ratio_ema =
+                                    EMA_ALPHA * ratio + (1.0 - EMA_ALPHA) * data.hashrate_ratio_ema;
+                            }
                         }
                     }
                 }

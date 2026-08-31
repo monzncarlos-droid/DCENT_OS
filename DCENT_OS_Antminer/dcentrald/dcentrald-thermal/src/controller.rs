@@ -10,7 +10,7 @@
 //!     v
 //!   PID Controller (5s interval)
 //!     |
-//!     +-> Fan PWM Adjust (0-100)
+//!     +-> Fan PWM Adjust (0-100, PID path slew-limited 3 PWM/tick)
 //!     +-> Frequency Throttle (reduce MHz or disable boards)
 
 use crate::immersion::{ImmersionConfig, ImmersionDecision};
@@ -22,6 +22,24 @@ const TEMP_STALE_TIMEOUT_S: u64 = 30;
 const STARTUP_TEMP_GRACE_S: u64 = 60;
 /// Braiins fan-control PWM ceiling. Mirrors dcentrald_hal::fan::PWM_MAX.
 const FAN_PWM_MAX: u8 = 100;
+/// Max PWM change per control tick on the PID path. Matches AM3-BB
+/// `AM3_BB_FAN_PID_MAX_STEP_PWM` so PID cannot jump 0→cap in one 5s tick.
+/// Safety paths (stale/sensor/fan-fail/emergency/HotThrottle) still command
+/// the profile cap immediately; they cut hash first and never blast 100%.
+const PWM_SLEW_PER_TICK: u8 = 3;
+
+/// Absolute residential hard ceiling for the dangerous / critical hash-cut
+/// threshold, in °C. Two load-bearing uses:
+///
+/// 1. [`ThermalController::new`] clamps a configured `dangerous_temp_c` down to
+///    this value (residential-safety limit).
+/// 2. The immersion temperature offset ([`crate::immersion::ImmersionConfig`]
+///    `immersion_temp_offset_c`) can NEVER push the *effective* dangerous
+///    threshold past this ceiling. Immersion raises the sub-ceiling operating
+///    band (LuxOS/BraiinsOS parity), but the hard `EmergencyShutdown` still
+///    fires at this exact absolute temperature — the offset only widens the
+///    band below it, never the ceiling itself.
+pub(crate) const ABSOLUTE_DANGEROUS_CEILING_C: u8 = 90;
 const PID_GAIN_MIN: f32 = 0.0;
 const PID_GAIN_MAX: f32 = 10.0;
 
@@ -79,6 +97,16 @@ fn safe_pwm_clamp(requested: u8, min: u8, max: u8) -> u8 {
     let high = min.max(max);
     debug_assert!(low <= high);
     requested.clamp(low, high)
+}
+
+/// Rate-limit a PWM command toward `target` by at most `max_step` per tick.
+/// Never overshoots `target`. Callers clamp `target` to the profile cap first.
+fn slew_pwm(current: u8, target: u8, max_step: u8) -> u8 {
+    if target > current {
+        current.saturating_add(max_step).min(target)
+    } else {
+        current.saturating_sub(max_step).max(target)
+    }
 }
 
 fn clamp_pid_gain(gain: f32) -> f32 {
@@ -246,6 +274,17 @@ pub struct ThermalController {
     /// (`EmergencyShutdown`) — never by blasting nonexistent fans. Set via
     /// `enable_immersion()`. See `crate::immersion`.
     immersion_active: bool,
+    /// Immersion temperature-limit offset (°C) currently in force. **0 unless
+    /// immersion is active** — [`Self::enable_immersion`] sets it to the
+    /// config's `immersion_temp_offset_c` when immersion activates and clears
+    /// it back to 0 when immersion is disabled/refused. When non-zero it RAISES
+    /// the effective target/hot/dangerous thresholds (see
+    /// [`Self::effective_thresholds`]) by this many degrees, but the shifted
+    /// dangerous threshold is HARD-CLAMPED to [`ABSOLUTE_DANGEROUS_CEILING_C`]
+    /// so the critical hash-cut still fires at the same absolute ceiling as on
+    /// air. On the default air-cooled path this is 0 and every threshold is
+    /// byte-identical to the pre-immersion controller.
+    immersion_temp_offset_c: u8,
 }
 
 /// Default number of consecutive below-threshold RPM observations required
@@ -403,13 +442,13 @@ impl ThermalController {
     pub fn new(profile: ThermalProfile) -> Self {
         // Clamp dangerous_temp_c to absolute maximum of 90C for residential safety.
         let mut profile = profile;
-        if profile.dangerous_temp_c > 90 {
+        if profile.dangerous_temp_c > ABSOLUTE_DANGEROUS_CEILING_C {
             tracing::warn!(
                 configured = profile.dangerous_temp_c,
-                clamped = 90,
+                clamped = ABSOLUTE_DANGEROUS_CEILING_C,
                 "dangerous_temp_c clamped to 90C (residential safety limit)"
             );
-            profile.dangerous_temp_c = 90;
+            profile.dangerous_temp_c = ABSOLUTE_DANGEROUS_CEILING_C;
         }
         if profile.fan_max_pwm > FAN_PWM_MAX {
             tracing::warn!(
@@ -482,6 +521,7 @@ impl ThermalController {
             last_temp_update: std::time::Instant::now(),
             tach_available: true, // default: assume tach works, caller overrides for Amlogic
             immersion_active: false, // default-OFF: byte-identical fan behavior on air-cooled units
+            immersion_temp_offset_c: 0, // default-OFF: no threshold shift on air-cooled units
         }
     }
 
@@ -551,6 +591,47 @@ impl ThermalController {
                 }
             }
         }
+    }
+
+    /// The effective `(target, hot, dangerous)` threshold ladder for this
+    /// tick, folding in the immersion temperature offset when immersion is
+    /// active (LuxOS `immersionswitch` / BraiinsOS immersion parity: raise the
+    /// temperature limits so a dielectric-fluid rig can run its boards hotter).
+    ///
+    /// When immersion is inactive OR the offset is 0 (the default air-cooled
+    /// path) this returns the raw profile thresholds unchanged — byte-identical
+    /// to the pre-immersion controller.
+    ///
+    /// **SAFETY — the hard critical cutoff is never weakened.** The offset is
+    /// added to each base threshold, then the *dangerous* (critical hash-cut)
+    /// threshold is HARD-CLAMPED to [`ABSOLUTE_DANGEROUS_CEILING_C`] (90 °C).
+    /// The offset can therefore never push the `EmergencyShutdown` point past
+    /// that absolute ceiling — it fires in immersion mode at exactly the same
+    /// temperature it does on air. `hot` is then pulled strictly below the
+    /// (clamped) `dangerous`, and `target` strictly below `hot`, so the
+    /// monotonic `target < hot < dangerous` ladder the state machine relies on
+    /// is preserved even when the offset saturates against the ceiling.
+    fn effective_thresholds(&self) -> (f32, f32, f32) {
+        let base_target = self.profile.target_temp_c as f32;
+        let base_hot = self.profile.hot_temp_c as f32;
+        let base_dangerous = self.profile.dangerous_temp_c as f32;
+
+        if !self.immersion_active || self.immersion_temp_offset_c == 0 {
+            return (base_target, base_hot, base_dangerous);
+        }
+
+        let offset = self.immersion_temp_offset_c as f32;
+        let ceiling = ABSOLUTE_DANGEROUS_CEILING_C as f32;
+        // LOAD-BEARING: clamp the shifted critical threshold to the absolute
+        // residential ceiling AFTER adding the offset. Without this `.min`, a
+        // large offset would lift the hash-cut point above 90 °C and a real
+        // over-temp would be read as "normal" — a fail-OPEN. With it, the
+        // critical cutoff still fires at 90 °C in immersion mode.
+        let dangerous = (base_dangerous + offset).min(ceiling);
+        // Keep the ladder strictly monotonic under the clamped ceiling.
+        let hot = (base_hot + offset).min(dangerous - 1.0);
+        let target = (base_target + offset).min(hot - 1.0);
+        (target, hot, dangerous)
     }
 
     /// Inner thermal control loop — the pre-immersion behavior. The public
@@ -756,10 +837,13 @@ impl ThermalController {
             );
         }
 
-        // Thermal state machine
-        let dangerous = self.profile.dangerous_temp_c as f32;
-        let hot = self.profile.hot_temp_c as f32;
-        let target = self.profile.target_temp_c as f32;
+        // Thermal state machine. `effective_thresholds()` folds in the
+        // immersion temperature offset when immersion is active (raising the
+        // limits, LuxOS/BraiinsOS parity) while HARD-CLAMPING the critical
+        // dangerous threshold to the absolute residential ceiling so the
+        // hash-cut still fires at 90 °C. On the default air-cooled path the
+        // offset is 0 and these are byte-identical to the raw profile values.
+        let (target, hot, dangerous) = self.effective_thresholds();
         let hysteresis = self.profile.hysteresis_c as f32;
 
         match self.state {
@@ -801,11 +885,16 @@ impl ThermalController {
                 }
 
                 let pid_output = self.pid.update(max_temp);
-                let pwm = safe_pwm_clamp(
+                let target = safe_pwm_clamp(
                     pid_output as u8,
                     self.profile.fan_min_pwm,
                     self.profile.fan_max_pwm,
                 );
+                // PID-only slew: walk at most PWM_SLEW_PER_TICK toward the
+                // clamped target so a saturated PID cannot jump 0→cap in one
+                // tick. Profile/home cap still owns the target; safety paths
+                // above skip this limiter and command the cap immediately.
+                let pwm = slew_pwm(self.current_pwm, target, PWM_SLEW_PER_TICK);
                 self.current_pwm = pwm;
                 ThermalAction::SetFanPwm(pwm)
             }
@@ -883,6 +972,19 @@ impl ThermalController {
     ) -> ImmersionDecision {
         let decision = config.decide(platform_looks_air_cooled);
         self.immersion_active = decision.fans_bypassed();
+        // Adopt the temperature-limit offset ONLY when immersion actually
+        // activates (fans bypassed); a `Disabled` / `RefusedAirCooled` outcome
+        // clears it back to 0 so the raw air-cooled thresholds apply. Then
+        // re-align the PID setpoint with the (possibly immersion-shifted)
+        // effective target — with the offset 0 this is exactly the base target
+        // the constructor already set, so the air-cooled path is unchanged.
+        self.immersion_temp_offset_c = if self.immersion_active {
+            config.immersion_temp_offset_c
+        } else {
+            0
+        };
+        let (effective_target, _, _) = self.effective_thresholds();
+        self.pid.setpoint = effective_target;
         match decision {
             ImmersionDecision::Disabled => {
                 // No log — this is the default air-cooled path on every unit.
@@ -1547,13 +1649,33 @@ mod tests {
         controller.profile.fan_min_pwm = 40;
         controller.profile.fan_max_pwm = 20;
 
-        let action = controller.tick(&[65.0], 1205);
-        let ThermalAction::SetFanPwm(pwm) = action else {
-            panic!("corrupted NormalMining profile should still set a bounded PWM, got {action:?}");
-        };
+        let low = 20u8;
+        let high = 40u8;
+        let mut prev = controller.current_pwm();
+        let mut entered_band = false;
+        for _ in 0..20 {
+            let action = controller.tick(&[65.0], 1205);
+            let ThermalAction::SetFanPwm(pwm) = action else {
+                panic!(
+                    "corrupted NormalMining profile should still set a bounded PWM, got {action:?}"
+                );
+            };
+            assert!(
+                pwm <= high,
+                "inverted profile bounds must never command above the ordered max, got {pwm}"
+            );
+            assert!(
+                pwm.abs_diff(prev) <= PWM_SLEW_PER_TICK,
+                "slew {prev} -> {pwm} exceeded {PWM_SLEW_PER_TICK}"
+            );
+            if (low..=high).contains(&pwm) {
+                entered_band = true;
+            }
+            prev = pwm;
+        }
         assert!(
-            (20..=40).contains(&pwm),
-            "inverted profile bounds must be ordered before clamping, got {pwm}"
+            entered_band,
+            "after enough PID slew ticks PWM must enter the ordered inverted bounds"
         );
     }
 
@@ -1949,6 +2071,17 @@ mod tests {
         ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: 0,
+        }
+    }
+
+    /// A genuine immersion rig with a temperature-limit offset (LuxOS/Braiins
+    /// immersion parity: raise the limits by `offset` °C).
+    fn immersion_on_with_offset(offset: u8) -> ImmersionConfig {
+        ImmersionConfig {
+            enabled: true,
+            acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: offset,
         }
     }
 
@@ -2152,6 +2285,7 @@ mod tests {
         let cfg = ImmersionConfig {
             enabled: true,
             acknowledge_air_cooled_override: true,
+            immersion_temp_offset_c: 0,
         };
         let decision = controller.enable_immersion(&cfg, AIR_COOLED);
         assert_eq!(decision, ImmersionDecision::ActivatedAirCooledOverride);
@@ -2193,6 +2327,196 @@ mod tests {
             }
         ));
         assert_eq!(controller.current_pwm(), 30);
+    }
+
+    // -- Immersion TEMPERATURE-LIMIT OFFSET (LuxOS/BraiinsOS parity) --
+    //
+    // When immersion is CONFIRMED-active, the controller raises its
+    // target/hot/dangerous thresholds by `immersion_temp_offset_c` (a
+    // dielectric-fluid rig safely runs hotter). Load-bearing guarantees:
+    //   4. active offset RAISES the effective thresholds (band widens).
+    //   5. the offset can NEVER lift the critical hash-cut past the 90 °C
+    //      ceiling — the hard cutoff still fires in immersion mode.
+    //   6. `effective_thresholds()` is exact: base when off, shifted+clamped on.
+    //   7. the PID setpoint tracks the (shifted) effective target.
+    //   8. NEGATIVE: an UNCONFIRMED (refused) immersion offset shifts NOTHING
+    //      and suppresses NO fans — the offset is gated on confirmation.
+
+    // 4. active offset raises the effective thresholds — the SAME board temp
+    //    that throttles / shuts down on air is treated as cooler in immersion.
+    #[test]
+    fn immersion_offset_raises_effective_thresholds() {
+        // test_profile: target=60, hot=70, dangerous=80. +8 offset → effective
+        // target=68, hot=78, dangerous=88 (all below the 90 °C ceiling).
+
+        // Air-cooled baseline: 72 °C is >= hot(70) → HotThrottle.
+        let mut air = ThermalController::new(test_profile());
+        assert!(matches!(
+            air.tick(&[72.0], 1200),
+            ThermalAction::ThrottleAndFan {
+                pwm: 30,
+                freq_reduction_pct: 10
+            }
+        ));
+
+        // Immersion +8: the SAME 72 °C is now BELOW the raised hot(78) →
+        // NormalMining, no throttle. (Fan is zeroed by immersion; the state
+        // proves the throttle threshold moved up.)
+        let mut imm = ThermalController::new(test_profile());
+        imm.enable_immersion(&immersion_on_with_offset(8), NOT_AIR_COOLED);
+        let action = imm.tick(&[72.0], 0);
+        assert!(
+            !matches!(action, ThermalAction::ThrottleAndFan { .. }),
+            "72 °C must NOT throttle under a +8 immersion offset (raised hot=78), got {action:?}"
+        );
+        assert!(matches!(imm.state(), ThermalState::NormalMining));
+        assert_eq!(imm.current_pwm(), 0, "immersion still commands no fan");
+
+        // 85 °C on AIR is a hard shutdown (>= dangerous 80); under +8 immersion
+        // it is only a HotThrottle (>= hot 78, < dangerous 88) — the shutdown
+        // point moved up with the offset.
+        let mut air_hot = ThermalController::new(test_profile());
+        assert!(matches!(
+            air_hot.tick(&[85.0], 1200),
+            ThermalAction::EmergencyShutdown
+        ));
+
+        let mut imm_hot = ThermalController::new(test_profile());
+        imm_hot.enable_immersion(&immersion_on_with_offset(8), NOT_AIR_COOLED);
+        match imm_hot.tick(&[85.0], 0) {
+            ThermalAction::ThrottleAndFan {
+                pwm,
+                freq_reduction_pct,
+            } => {
+                assert_eq!(pwm, 0, "fan still bypassed in immersion");
+                assert_eq!(freq_reduction_pct, 10);
+            }
+            other => panic!("85 °C under +8 immersion should throttle, got {other:?}"),
+        }
+        assert!(matches!(imm_hot.state(), ThermalState::HotThrottle));
+    }
+
+    // 5. SAFETY (load-bearing NEGATIVE): the immersion offset can NEVER push the
+    //    critical hash-cut past the absolute 90 °C ceiling. A huge offset still
+    //    shuts down at 90 °C. FAILS if the `.min(ceiling)` clamp is dropped
+    //    (dangerous would become 130 and 90 °C would read as "normal" —
+    //    fail-OPEN).
+    #[test]
+    fn immersion_offset_never_lifts_critical_cutoff_past_ceiling() {
+        // test_profile dangerous=80; a +50 offset would naively push the
+        // hash-cut to 130 °C. Clamped, the effective dangerous is 90 °C.
+        let mut controller = ThermalController::new(test_profile());
+        controller.enable_immersion(&immersion_on_with_offset(50), NOT_AIR_COOLED);
+        assert!(controller.immersion_active());
+
+        // 90 °C MUST still cut hash — the hard ceiling fires in immersion mode
+        // exactly as it does on air.
+        let action = controller.tick(&[90.0], 0);
+        assert!(
+            matches!(action, ThermalAction::EmergencyShutdown),
+            "90 °C must EmergencyShutdown even under a +50 immersion offset, got {action:?}"
+        );
+        assert!(matches!(
+            controller.state(),
+            ThermalState::DangerousShutdown
+        ));
+        assert_eq!(
+            controller.current_pwm(),
+            0,
+            "the hash-cut must not command a fan in immersion"
+        );
+    }
+
+    // 6. Direct: effective_thresholds folds the offset and clamps dangerous to
+    //    the ceiling; with immersion off (or offset 0) it returns the raw
+    //    profile ladder byte-identically.
+    #[test]
+    fn effective_thresholds_apply_offset_and_clamp_ceiling() {
+        // Off → raw profile ladder.
+        let off = ThermalController::new(test_profile());
+        assert_eq!(off.effective_thresholds(), (60.0, 70.0, 80.0));
+
+        // Active but offset 0 → still the raw ladder (offset 0 is a no-op).
+        let mut zero = ThermalController::new(test_profile());
+        zero.enable_immersion(&immersion_on(), NOT_AIR_COOLED);
+        assert_eq!(zero.effective_thresholds(), (60.0, 70.0, 80.0));
+
+        // Active, +8 → raised, still below the 90 °C ceiling.
+        let mut on = ThermalController::new(test_profile());
+        on.enable_immersion(&immersion_on_with_offset(8), NOT_AIR_COOLED);
+        assert_eq!(on.effective_thresholds(), (68.0, 78.0, 88.0));
+
+        // Active, +50 → dangerous saturates at the 90 °C ceiling; hot/target
+        // are pulled strictly below to preserve target < hot < dangerous.
+        let mut sat = ThermalController::new(test_profile());
+        sat.enable_immersion(&immersion_on_with_offset(50), NOT_AIR_COOLED);
+        let (t, h, d) = sat.effective_thresholds();
+        assert_eq!(d, 90.0, "dangerous clamped to the residential ceiling");
+        assert!(h < d, "hot must stay strictly below the clamped dangerous");
+        assert!(t < h, "target must stay strictly below hot");
+        assert_eq!((t, h, d), (88.0, 89.0, 90.0));
+    }
+
+    // 7. enable_immersion re-aligns the PID setpoint to the (shifted) effective
+    //    target, and turning immersion back off restores the base target.
+    #[test]
+    fn immersion_offset_realigns_pid_setpoint_and_restores() {
+        let mut controller = ThermalController::new(test_profile());
+        assert_eq!(controller.pid_state().setpoint, 60.0, "base target");
+
+        controller.enable_immersion(&immersion_on_with_offset(8), NOT_AIR_COOLED);
+        assert_eq!(
+            controller.pid_state().setpoint,
+            68.0,
+            "setpoint tracks the +8 effective target while immersion is active"
+        );
+
+        controller.enable_immersion(&ImmersionConfig::default(), NOT_AIR_COOLED);
+        assert_eq!(
+            controller.pid_state().setpoint,
+            60.0,
+            "disabling immersion restores the base target setpoint"
+        );
+    }
+
+    // 8. NEGATIVE: an immersion config with a big offset that is REFUSED
+    //    (air-cooled, no ack) must NOT shift thresholds AND must NOT suppress
+    //    fans — the offset only takes effect when immersion is actually
+    //    confirmed-active. This proves the offset is gated on confirmation, not
+    //    merely on the presence of a config value.
+    #[test]
+    fn refused_immersion_offset_does_not_shift_thresholds_or_suppress_fans() {
+        let mut controller = ThermalController::new(test_profile());
+        // Big offset, but requested on an air-cooled platform WITHOUT the ack.
+        let decision = controller.enable_immersion(&immersion_on_with_offset(50), AIR_COOLED);
+        assert_eq!(decision, ImmersionDecision::RefusedAirCooled);
+        assert!(!controller.immersion_active());
+        // Offset was NOT adopted → raw thresholds.
+        assert_eq!(controller.effective_thresholds(), (60.0, 70.0, 80.0));
+
+        // 72 °C throttles WITH a real fan ramp to the cap — fans NOT suppressed.
+        let action = controller.tick(&[72.0], 1200);
+        assert!(matches!(
+            action,
+            ThermalAction::ThrottleAndFan {
+                pwm: 30,
+                freq_reduction_pct: 10
+            }
+        ));
+        assert_eq!(
+            controller.current_pwm(),
+            30,
+            "refused immersion must keep normal fan management (fans NOT suppressed)"
+        );
+
+        // 85 °C (>= the UN-shifted dangerous 80) still shuts down at the base
+        // threshold — the refused offset never moved it.
+        let mut c2 = ThermalController::new(test_profile());
+        c2.enable_immersion(&immersion_on_with_offset(50), AIR_COOLED);
+        assert!(matches!(
+            c2.tick(&[85.0], 1200),
+            ThermalAction::EmergencyShutdown
+        ));
     }
 
     // -- SAFETY: non-finite (NaN/±Inf) temperatures must fail CLOSED --
@@ -2306,5 +2630,125 @@ mod tests {
             }
         ));
         assert!(matches!(controller.state(), ThermalState::HotThrottle));
+    }
+
+    // -- PID PWM slew (AM3-BB 3 PWM/tick; DESK_NOW rank 18) --
+
+    #[test]
+    fn slew_pwm_helper_never_overshoots_or_steps_past_max() {
+        assert_eq!(slew_pwm(0, 30, PWM_SLEW_PER_TICK), PWM_SLEW_PER_TICK);
+        assert_eq!(slew_pwm(0, 2, PWM_SLEW_PER_TICK), 2);
+        assert_eq!(slew_pwm(10, 10, PWM_SLEW_PER_TICK), 10);
+        assert_eq!(slew_pwm(30, 10, PWM_SLEW_PER_TICK), 27);
+        assert_eq!(slew_pwm(1, 0, PWM_SLEW_PER_TICK), 0);
+        assert_eq!(slew_pwm(253, 255, PWM_SLEW_PER_TICK), 255);
+        assert_eq!(slew_pwm(0, 255, 0), 0);
+    }
+
+    #[test]
+    fn pid_interval_default_stays_five_seconds() {
+        let controller = ThermalController::new(test_profile());
+        assert_eq!(
+            controller.interval_s, 5,
+            "pid_interval default must stay 5s (2s is a documented preset, not the default)"
+        );
+    }
+
+    #[test]
+    fn pid_slew_from_zero_advances_at_most_n_per_tick_and_never_exceeds_cap() {
+        use dcentrald_common::HOME_FAN_PWM_SAFETY_MAX;
+
+        let profile = test_profile();
+        let cap = profile.fan_max_pwm;
+        assert_eq!(cap, HOME_FAN_PWM_SAFETY_MAX);
+
+        let mut controller = ThermalController::new(profile);
+        // Force the PID path at PWM 0 so ColdStart cannot snap to fan_min.
+        controller.state = ThermalState::NormalMining;
+        controller.current_pwm = 0;
+        // Saturate the PID toward the cap in one update (kp only).
+        controller.set_pid_params(PID_GAIN_MAX, 0.0, 0.0);
+
+        let mut prev = 0u8;
+        for tick in 0..20 {
+            let action = controller.tick(&[65.0], 1200);
+            let ThermalAction::SetFanPwm(pwm) = action else {
+                panic!("expected SetFanPwm on the PID path, got {action:?} at tick {tick}");
+            };
+            assert!(
+                matches!(controller.state(), ThermalState::NormalMining),
+                "65 °C must stay below hot so the PID path (not HotThrottle) owns the slew"
+            );
+            assert!(
+                pwm <= cap,
+                "PID slew commanded {pwm} which exceeds the profile/home cap {cap}"
+            );
+            assert!(
+                pwm <= HOME_FAN_PWM_SAFETY_MAX,
+                "PID slew commanded {pwm} which exceeds HOME_FAN_PWM_SAFETY_MAX"
+            );
+            let delta = pwm.abs_diff(prev);
+            assert!(
+                delta <= PWM_SLEW_PER_TICK,
+                "tick {tick}: PWM slew {prev} -> {pwm} (delta {delta}) exceeds {PWM_SLEW_PER_TICK}"
+            );
+            if tick == 0 {
+                assert_eq!(
+                    pwm, PWM_SLEW_PER_TICK,
+                    "first PID tick from 0 toward a high target must be exactly the slew step, not a 0→cap jump"
+                );
+            }
+            assert_eq!(controller.current_pwm(), pwm);
+            prev = pwm;
+        }
+        assert_eq!(
+            controller.current_pwm(),
+            cap,
+            "sustained high PID target must reach the profile cap and stop there"
+        );
+    }
+
+    #[test]
+    fn pid_slew_downward_is_also_step_limited() {
+        let mut controller = ThermalController::new(test_profile());
+        controller.state = ThermalState::NormalMining;
+        controller.current_pwm = 30;
+        controller.set_pid_params(0.0, 0.0, 0.0);
+
+        let mut prev = 30u8;
+        for tick in 0..12 {
+            let action = controller.tick(&[50.0], 1200);
+            let ThermalAction::SetFanPwm(pwm) = action else {
+                panic!("expected SetFanPwm, got {action:?} at tick {tick}");
+            };
+            assert!(pwm.abs_diff(prev) <= PWM_SLEW_PER_TICK);
+            assert!(pwm <= 30);
+            prev = pwm;
+        }
+        assert_eq!(
+            controller.current_pwm(),
+            10,
+            "zeroed PID must slew down to fan_min, not jump and not drop below min once reached"
+        );
+    }
+
+    #[test]
+    fn pid_slew_never_blasts_industrial_100_on_home_cap() {
+        let mut controller = ThermalController::new(test_profile());
+        controller.state = ThermalState::NormalMining;
+        controller.current_pwm = 0;
+        controller.set_pid_params(PID_GAIN_MAX, PID_GAIN_MAX, PID_GAIN_MAX);
+
+        for _ in 0..20 {
+            let action = controller.tick(&[69.0], 1200);
+            match action {
+                ThermalAction::SetFanPwm(pwm) => {
+                    assert!(pwm <= 30, "home PID path leaked PWM {pwm}");
+                    assert!(pwm < 100, "PID path must never blast industrial 100%");
+                }
+                other => panic!("expected SetFanPwm under hot-but-safe temp, got {other:?}"),
+            }
+        }
+        assert!(controller.current_pwm() <= 30);
     }
 }

@@ -199,7 +199,9 @@ pub fn hash_on_plug_populated(mask: u32, chain: u8) -> bool {
 }
 
 pub fn hash_on_plug_count(mask: u32) -> u8 {
-    (0u8..16).filter(|c| hash_on_plug_populated(mask, *c)).count() as u8
+    (0u8..16)
+        .filter(|c| hash_on_plug_populated(mask, *c))
+        .count() as u8
 }
 
 /// `check_chain` success on T11/S9 SE is exactly three populated bits.
@@ -334,9 +336,18 @@ mod tests {
     #[test]
     fn s9se_256mib_selects_0f000000() {
         admit_s9se_fpga_mem_is_256mib_path().unwrap();
-        assert_eq!(fpga_mem_offset_from_memtotal_kb(262_144), FPGA_MEM_OFFSET_256MIB);
-        assert_eq!(fpga_mem_offset_from_memtotal_kb(524_288), FPGA_MEM_OFFSET_512MIB);
-        assert_eq!(fpga_mem_offset_from_memtotal_kb(1_048_576), FPGA_MEM_OFFSET_1GIB);
+        assert_eq!(
+            fpga_mem_offset_from_memtotal_kb(262_144),
+            FPGA_MEM_OFFSET_256MIB
+        );
+        assert_eq!(
+            fpga_mem_offset_from_memtotal_kb(524_288),
+            FPGA_MEM_OFFSET_512MIB
+        );
+        assert_eq!(
+            fpga_mem_offset_from_memtotal_kb(1_048_576),
+            FPGA_MEM_OFFSET_1GIB
+        );
         assert_eq!(refuse_s9se_fpga_io(), Err(S9SeFpgaError::FpgaIoRefused));
     }
 
@@ -357,7 +368,9 @@ mod tests {
         assert_eq!(word & IIC_REG_VALID_BIT, IIC_REG_VALID_BIT);
         assert_eq!(word & 0xFF, 0xAA);
         assert_eq!(iic_command_store_word(0xFFFF_FFFF), IIC_COMMAND_WRITE_MASK);
-        assert!(admit_hardware_version_low16(u32::from(HARDWARE_VERSION_VALUE)));
+        assert!(admit_hardware_version_low16(u32::from(
+            HARDWARE_VERSION_VALUE
+        )));
         assert_eq!(HARDWARE_VERSION.byte_offset, 0);
         assert_eq!(AXI_MMAP_BYTES, 352);
         assert_eq!(QN_WRITE_DATA_INIT, 2_155_905_039);

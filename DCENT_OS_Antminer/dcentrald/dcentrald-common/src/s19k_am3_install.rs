@@ -12,6 +12,444 @@ use crate::s19k_am3_gpio437::{
 /// FLASH is still NOT_YET. This module is architecture + safety pins.
 pub const CLEAR_FOR_FLASH: bool = false;
 
+/// Single refuse-until-cleared gate for AML persistent-install / backup /
+/// rollback / rescue. Backup and plans may admit. Execute is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kAmlMutationIntent {
+    BackupOnly,
+    RestorePlan,
+    RestoreExecute,
+    RollbackPlan,
+    RollbackExecute,
+    RescueConsole,
+    SysupgradeExecute,
+}
+
+pub fn admit_s19k_aml_mutation(intent: S19kAmlMutationIntent) -> Result<(), &'static str> {
+    match intent {
+        S19kAmlMutationIntent::BackupOnly
+        | S19kAmlMutationIntent::RestorePlan
+        | S19kAmlMutationIntent::RollbackPlan
+        | S19kAmlMutationIntent::RescueConsole => Ok(()),
+        S19kAmlMutationIntent::RestoreExecute
+        | S19kAmlMutationIntent::RollbackExecute
+        | S19kAmlMutationIntent::SysupgradeExecute => {
+            if CLEAR_FOR_FLASH {
+                Ok(())
+            } else {
+                Err("AML execute stays CLEAR_FOR_FLASH=false; refuse nandwrite/gpio437/fw_setenv")
+            }
+        }
+    }
+}
+
+/// live436 leftover-admitted Chain Inactive is UART CMD=3 on `/tmp`.
+/// It is not a NAND/GPIO437 grant. FLASH stays false.
+pub fn refuse_s19k_leftover_admitted_inactive_as_flash_grant() -> Result<(), &'static str> {
+    if CLEAR_FOR_FLASH {
+        return Err("CLEAR_FOR_FLASH must stay false during leftover-admitted UART soaks");
+    }
+    match admit_s19k_aml_mutation(S19kAmlMutationIntent::SysupgradeExecute) {
+        Err(_) => {}
+        Ok(()) => return Err("sysupgrade execute must stay refused while leftover-admit soaks"),
+    }
+    match admit_s19k_aml_mutation(S19kAmlMutationIntent::RestoreExecute) {
+        Err(_) => {}
+        Ok(()) => return Err("restore execute must stay refused while leftover-admit soaks"),
+    }
+    if !crate::s19k_braiins_job::s19k_leftover_hit_admits_experimental_inactive(
+        crate::s19k_braiins_job::S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT,
+        crate::s19k_braiins_job::S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER,
+        crate::s19k_braiins_job::S19K_LIVE436_WRAP_RETIRE_MEETS,
+    ) {
+        return Err("live436 wrap-retire leftover still admits UART inactive only");
+    }
+    Err("leftover-admitted Chain Inactive is UART CMD=3; CLEAR_FOR_FLASH stays false")
+}
+
+pub fn refuse_s19k_backup_as_nandwrite_grant() -> Result<(), &'static str> {
+    if admit_s19k_aml_mutation(S19kAmlMutationIntent::BackupOnly).is_err() {
+        return Err("backup-only must admit while FLASH is false");
+    }
+    match admit_s19k_aml_mutation(S19kAmlMutationIntent::SysupgradeExecute) {
+        Err(_) => Err("backup-only is not a nandwrite grant; CLEAR_FOR_FLASH=false"),
+        Ok(()) => Err("sysupgrade execute must stay refused while FLASH is false"),
+    }
+}
+
+/// Installer artifact names map onto the single refuse-until-cleared gate.
+pub fn s19k_aml_intent_from_artifact(name: &str) -> Option<S19kAmlMutationIntent> {
+    match name {
+        "BACKUP_LEDGER.txt" | "BACKUP-ONLY" => Some(S19kAmlMutationIntent::BackupOnly),
+        "RECOVER_TO_STOCK_PLAN.txt" => Some(S19kAmlMutationIntent::RollbackPlan),
+        "RECOVER_EXECUTE_REFUSE.txt" | "RECOVER_EXECUTE" => {
+            Some(S19kAmlMutationIntent::RollbackExecute)
+        }
+        "RESCUE_CONSOLE.txt" => Some(S19kAmlMutationIntent::RescueConsole),
+        "sysupgrade-am3-s19k.tar" => Some(S19kAmlMutationIntent::SysupgradeExecute),
+        _ => None,
+    }
+}
+
+pub fn admit_s19k_aml_artifact(name: &str) -> Result<(), &'static str> {
+    let intent = s19k_aml_intent_from_artifact(name).ok_or("unknown AML artifact")?;
+    admit_s19k_aml_mutation(intent)
+}
+
+pub fn refuse_s19k_rescue_console_as_nandwrite_grant() -> Result<(), &'static str> {
+    if admit_s19k_aml_mutation(S19kAmlMutationIntent::RescueConsole).is_err() {
+        return Err("rescue console must admit while FLASH is false");
+    }
+    match admit_s19k_aml_mutation(S19kAmlMutationIntent::SysupgradeExecute) {
+        Err(_) => Err("rescue console is not a nandwrite grant; CLEAR_FOR_FLASH=false"),
+        Ok(()) => Err("sysupgrade execute must stay refused while FLASH is false"),
+    }
+}
+
+pub fn refuse_s19k_rollback_plan_as_execute_grant() -> Result<(), &'static str> {
+    if admit_s19k_aml_artifact("RECOVER_TO_STOCK_PLAN.txt").is_err() {
+        return Err("recover-to-stock plan must admit while FLASH is false");
+    }
+    match admit_s19k_aml_artifact("RECOVER_EXECUTE_REFUSE.txt") {
+        Err(_) => Ok(()),
+        Ok(()) => Err("recover execute must stay refused while FLASH is false"),
+    }
+}
+
+/// recover_amlogic_to_stock.sh must refuse FLASH before GPIO/NAND.
+pub fn admit_s19k_recover_script_refuses_execute_before_gpio(
+    script: &str,
+) -> Result<(), &'static str> {
+    if !script.contains("CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite")
+    {
+        return Err("recover execute must refuse CLEAR_FOR_FLASH before GPIO/NAND");
+    }
+    let refuse = script
+        .find("CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite")
+        .ok_or("missing recover FLASH refuse")?;
+    let gpio = script
+        .find("gpio437 SafeOff (am3-s19k-active-low, value=1)")
+        .ok_or("missing recover gpio SafeOff")?;
+    if refuse > gpio {
+        return Err("recover FLASH refuse must precede GPIO SafeOff");
+    }
+    Ok(())
+}
+
+/// Braiins `/tmp` is a 70 MiB tmpfs. live426 died after three 23 MiB
+/// `dcentrald` copies filled it (`df` Available=0; live427 `cp` truncated
+/// to 4096 B). Hardlink the binary; refuse a new copy unless log reserve fits.
+pub const S19K_TRACK1_TMPFS_LOG_RESERVE_BYTES: u64 = 8 * 1024 * 1024;
+pub const S19K_LIVE426_TMPFS_AVAIL_BYTES: u64 = 0;
+pub const S19K_LIVE425_DCENTRALD_BYTES: u64 = 23_419_988;
+
+/// `extra_copy` is a second inode (cp). Hardlink (`ln`) is `extra_copy=false`.
+pub fn s19k_track1_tmpfs_stage_allowed(
+    avail_bytes: u64,
+    binary_bytes: u64,
+    extra_copy: bool,
+) -> bool {
+    let need = if extra_copy {
+        binary_bytes.saturating_add(S19K_TRACK1_TMPFS_LOG_RESERVE_BYTES)
+    } else {
+        S19K_TRACK1_TMPFS_LOG_RESERVE_BYTES
+    };
+    avail_bytes >= need
+}
+
+pub fn refuse_s19k_live426_enospc_as_chain_inactive_result() -> Result<(), &'static str> {
+    if s19k_track1_tmpfs_stage_allowed(
+        S19K_LIVE426_TMPFS_AVAIL_BYTES,
+        S19K_LIVE425_DCENTRALD_BYTES,
+        true,
+    ) {
+        return Err("live426 /tmp Available=0 must refuse another dcentrald copy");
+    }
+    Err("live426 ENOSPC is not a Chain Inactive leftover result")
+}
+
+/// live427: 620 s ended with 0 mid-run cleans (ckpool / Bitcoin ~10 min).
+/// Stop after the first mid-run clean has been observed for
+/// `S19K_TRACK1_SOAK_MIN_POST_CLEAN_S`, or at `S19K_TRACK1_SOAK_MAX_S`.
+pub const S19K_TRACK1_SOAK_MAX_S: u64 = 1500;
+pub const S19K_TRACK1_SOAK_MIN_POST_CLEAN_S: u64 = 180;
+pub const S19K_LIVE427_SOAK_S: u64 = 620;
+
+/// live430: MULTI died ~T+130 (wrap-4) with gpio437=0; leftover cannot
+/// be measured after one wrap of silence. Stop instead of waiting 1500 s.
+pub const S19K_TRACK1_SOAK_RX_DEAD_S: u64 = 90;
+/// live431 stopped at T+220 after 180 s post-clean while wrap-6 RX was
+/// still live (S1 last T+200.4). leftover_hit is already measured; keep
+/// going until wrap-7 and T+600, or RX death.
+pub const S19K_TRACK1_SOAK_T600_S: u64 = 600;
+pub const S19K_TRACK1_SOAK_WRAP7: u64 = 7;
+pub const S19K_LIVE431_SOAK_STOP_S: u64 = 220;
+pub const S19K_LIVE431_WRAP_AT_STOP: u64 = 6;
+
+/// A bounded Track-1 bench run can finish normally for one of two fixed
+/// evidence reasons.  These are deliberately not production endurance stop
+/// conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kTrack1BenchCompletion {
+    /// At least seven UART-RX wraps were observed and the run reached T+600.
+    T600Wrap7,
+    /// The fixed 1,500-second bench deadline was reached.
+    Max1500,
+}
+
+/// Typed Track-1 liveness decision.  `RxDead` is a safety failure in both
+/// bench and production modes; `BenchComplete` is reachable only under
+/// explicit bounded-bench authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kTrack1SoakDecision {
+    Continue,
+    RxDead,
+    BenchComplete(S19kTrack1BenchCompletion),
+}
+
+pub fn s19k_track1_soak_rx_dead(nonce_silent_s: u64) -> bool {
+    nonce_silent_s >= S19K_TRACK1_SOAK_RX_DEAD_S
+}
+
+/// live432: 5 s alive tick printed silent=88 then 93 — never `=90`.
+/// live433: tracing ANSI sits between `nonce_silent_s` and `=`, so
+/// `nonce_silent_s=204` never appears as a contiguous token.
+pub fn s19k_strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'm' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+pub fn s19k_track1_parse_nonce_silent_s(line: &str) -> Option<u64> {
+    let stripped = s19k_strip_ansi(line);
+    let idx = stripped.find("nonce_silent_s")?;
+    let after = &stripped[idx + "nonce_silent_s".len()..];
+    let eq = after.find('=')?;
+    let digits: String = after[eq + 1..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Launch must treat any `nonce_silent_s>=90` as rx_dead, including
+/// ANSI-split structured fields (live433 soak missed silent=204).
+pub fn s19k_track1_alive_line_rx_dead(line: &str) -> bool {
+    s19k_track1_parse_nonce_silent_s(line)
+        .map(s19k_track1_soak_rx_dead)
+        .unwrap_or(false)
+}
+
+pub fn admit_s19k_track1_launch_rx_dead_is_ge_90(src: &str) -> Result<(), &'static str> {
+    let active = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if active.contains("nonce_silent_s=90") && !active.contains("nonce_silent_s=(9[0-9]") {
+        return Err("exact nonce_silent_s=90 misses 5s ticks (live432 88 then 93)");
+    }
+    if !src.contains("nonce_silent_s=(9[0-9]") && !src.contains("nonce_silent_s.{0,40}") {
+        return Err("launch must grep nonce_silent_s>=90 (9x or 100+)");
+    }
+    Ok(())
+}
+
+/// live433 soak grepped contiguous `nonce_silent_s=` while tracing
+/// inserted ANSI. Next launch must disable color or allow 40 chars.
+pub fn admit_s19k_track1_launch_rx_dead_ignores_ansi(src: &str) -> Result<(), &'static str> {
+    let active = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if active.contains("RUST_LOG_STYLE=never") || active.contains("nonce_silent_s.{0,40}") {
+        return Ok(());
+    }
+    Err("launch must set RUST_LOG_STYLE=never or grep nonce_silent_s with ANSI gap (live433)")
+}
+
+/// live435: `RUST_LOG_STYLE=never` was exported but `init_logging` built
+/// a custom fmt subscriber that never called `with_ansi`, so run.log
+/// still split `nonce_silent_s` from `=`. Honor the env.
+pub fn s19k_track1_tracing_ansi_enabled(raw: Option<&str>) -> bool {
+    raw != Some("never")
+}
+
+pub fn admit_s19k_production_honors_rust_log_style_never(src: &str) -> Result<(), &'static str> {
+    if !src.contains("s19k_track1_tracing_ansi_enabled") {
+        return Err("init_logging must honor RUST_LOG_STYLE=never (live433/435 ANSI split)");
+    }
+    if !src.contains("with_ansi(") {
+        return Err("init_logging must set with_ansi from RUST_LOG_STYLE");
+    }
+    Ok(())
+}
+
+/// Legacy bounded-bench predicate retained while launch/runtime callers move
+/// to [`s19k_track1_soak_decision`].  It always supplies bounded-bench
+/// authority and therefore must not be used by the production endurance loop.
+pub fn s19k_track1_soak_should_stop(
+    elapsed_s: u64,
+    midrun_cleans: u64,
+    post_clean_elapsed_s: u64,
+    nonce_silent_s: u64,
+    wrap_rx: u64,
+) -> bool {
+    let _ = (midrun_cleans, post_clean_elapsed_s);
+    !matches!(
+        s19k_track1_soak_decision(elapsed_s, nonce_silent_s, wrap_rx, true),
+        S19kTrack1SoakDecision::Continue
+    )
+}
+
+/// Classify Track-1 liveness without conflating a healthy bounded bench
+/// completion with RX death.  Production endurance passes
+/// `bounded_bench_authority=false`, so the fixed T+600/T+1500 caps cannot
+/// terminate an otherwise healthy run.  The 90-second RX-death fence always
+/// applies and has precedence over every bench completion condition.
+pub fn s19k_track1_soak_decision(
+    elapsed_s: u64,
+    nonce_silent_s: u64,
+    wrap_rx: u64,
+    bounded_bench_authority: bool,
+) -> S19kTrack1SoakDecision {
+    if s19k_track1_soak_rx_dead(nonce_silent_s) {
+        return S19kTrack1SoakDecision::RxDead;
+    }
+    if !bounded_bench_authority {
+        return S19kTrack1SoakDecision::Continue;
+    }
+    // wrap_rx = wrap at last UART RX. live432 wrap_idx=9 after MULTI
+    // death is TX-only and must not satisfy wrap-7 + T+600.
+    if elapsed_s >= S19K_TRACK1_SOAK_T600_S && wrap_rx >= S19K_TRACK1_SOAK_WRAP7 {
+        return S19kTrack1SoakDecision::BenchComplete(S19kTrack1BenchCompletion::T600Wrap7);
+    }
+    if elapsed_s >= S19K_TRACK1_SOAK_MAX_S {
+        return S19kTrack1SoakDecision::BenchComplete(S19kTrack1BenchCompletion::Max1500);
+    }
+    S19kTrack1SoakDecision::Continue
+}
+
+pub fn s19k_track1_parse_wrap_rx(line: &str) -> Option<u64> {
+    let stripped = s19k_strip_ansi(line);
+    let idx = stripped.find("wrap_rx")?;
+    let after = &stripped[idx + "wrap_rx".len()..];
+    let eq = after.find('=')?;
+    let digits: String = after[eq + 1..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+pub fn s19k_track1_alive_line_wrap7(line: &str) -> bool {
+    s19k_track1_parse_wrap_rx(line)
+        .map(|n| n >= S19K_TRACK1_SOAK_WRAP7)
+        .unwrap_or(false)
+}
+
+/// live432 TX wrap_idx climbed to 9 after last RX wrap_rx=5. T+600 +
+/// wrap_idx=7+ is not wrap-7 dual-port RX.
+pub fn admit_s19k_live432_tx_wrap_does_not_stop_wrap7_t600() -> Result<(), &'static str> {
+    if s19k_track1_soak_should_stop(S19K_TRACK1_SOAK_T600_S, 1, 180, 50, 5) {
+        return Err("live432 wrap_rx=5 at T+600 must not stop as wrap-7");
+    }
+    if !s19k_track1_soak_should_stop(S19K_TRACK1_SOAK_T600_S, 1, 180, 50, 7) {
+        return Err("wrap_rx=7 at T+600 must stop");
+    }
+    if s19k_track1_soak_should_stop(599, 1, 180, 50, 7) {
+        return Err("wrap_rx=7 before T+600 must not stop");
+    }
+    if s19k_track1_alive_line_wrap7("wrap_idx=9 wrap_rx=5") {
+        return Err("wrap_idx=9 must not count as wrap-7 RX");
+    }
+    if !s19k_track1_alive_line_wrap7("wrap_idx=9 wrap_rx=7") {
+        return Err("wrap_rx=7 must count as wrap-7 RX");
+    }
+    Ok(())
+}
+
+pub fn refuse_s19k_live431_220s_as_wrap7_t600() -> Result<(), &'static str> {
+    Err("live431 stopped at T+220 wrap-6 after 180 s post-clean; RX was still live; not wrap-7/T+600")
+}
+
+/// Track-1 restore starts S99bosminer. It must never write GPIO437.
+pub fn admit_s19k_track1_restore_never_writes_gpio437(script: &str) -> Result<(), &'static str> {
+    let active = script
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if active.contains("echo 1 > /sys/class/gpio/gpio437/value")
+        || active.contains("echo 0 > /sys/class/gpio/gpio437/value")
+    {
+        return Err("Track-1 restore must not write GPIO437");
+    }
+    if !script.contains("S99bosminer start") {
+        return Err("Track-1 restore must start S99bosminer");
+    }
+    Ok(())
+}
+
+/// live427 MULTI died T+188 with no mid-run clean. The 5 s alive line must
+/// print GPIO437 so a rail drop is not mistaken for wrap-barrier death.
+pub fn s19k_track1_alive_gpio437_field(value: Option<u8>) -> &'static str {
+    match value {
+        Some(0) => "0",
+        Some(1) => "1",
+        _ => "unread",
+    }
+}
+
+/// live429: live428 `launch.sh` `kill $(pidof dcentrald)` sent SIGTERM at
+/// T+9s when the 1500 s window (14:50) ended. A soak may kill only the
+/// pid it wrote to `dcentrald.pid`.
+pub const S19K_LIVE429_SIGTERM_S: u64 = 9;
+
+pub fn s19k_track1_launch_may_kill(owned_pid: u32, candidate_pid: u32) -> bool {
+    owned_pid != 0 && owned_pid == candidate_pid
+}
+
+pub fn admit_s19k_track1_launch_kills_owned_pid_only(src: &str) -> Result<(), &'static str> {
+    let active = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if active.contains("kill $(pidof dcentrald)") || active.contains("kill -9 $(pidof dcentrald)") {
+        return Err("soak launch must not kill pidof dcentrald (live429 T+9 SIGTERM)");
+    }
+    if !src.contains("dcentrald.pid") {
+        return Err("soak launch must record the owned dcentrald.pid");
+    }
+    if !active.contains("kill \"$OWNED\"") && !active.contains("kill \"$owned\"") {
+        return Err("soak launch must kill only the owned pid");
+    }
+    Ok(())
+}
+
+pub fn refuse_s19k_live429_sigterm_as_leftover_or_wrap() -> Result<(), &'static str> {
+    Err("live429 SIGTERM at T+9s is a foreign launch.sh pidof kill, not leftover/wrap")
+}
+
 /// Live `/etc/dcentos/board_target` values this SKU must treat as S19k.
 /// Persistent overlay writes `am3-s19k` (sysupgrade prefix brick-rule).
 /// `am3-s19kpro` is the extra HAL/S37 SafeOff admit. `am3-aml-s19kpro` is
@@ -78,10 +516,9 @@ pub fn admit_s19k_mtd5_backup_covers_recovery(
     mtd5_len: u64,
     mtd5_base: u64,
 ) -> Result<(), &'static str> {
-    let flag = recovery_flag_local_offset(mtd5_base)
-        .ok_or("cannot compute recovery-flag local")?;
-    let env = nandrecovery_env_local_offset(mtd5_base)
-        .ok_or("cannot compute nandrecovery_env local")?;
+    let flag = recovery_flag_local_offset(mtd5_base).ok_or("cannot compute recovery-flag local")?;
+    let env =
+        nandrecovery_env_local_offset(mtd5_base).ok_or("cannot compute nandrecovery_env local")?;
     if mtd5_len <= flag {
         return Err("mtd5 backup shorter than recovery-flag local");
     }
@@ -116,8 +553,8 @@ pub fn extract_s19k_nandrecovery_env_from_mtd5_backup(
     mtd5_base: u64,
 ) -> Result<&[u8], &'static str> {
     admit_s19k_physical_mtd5_base(mtd5_base)?;
-    let local = nandrecovery_env_local_offset(mtd5_base)
-        .ok_or("cannot compute nandrecovery_env local")?;
+    let local =
+        nandrecovery_env_local_offset(mtd5_base).ok_or("cannot compute nandrecovery_env local")?;
     if (mtd5.len() as u64) < local + NANDRECOVERY_ENV_LEN {
         return Err("mtd5 backup shorter than nandrecovery_env window");
     }
@@ -137,8 +574,8 @@ pub fn extract_s19k_recovery_flag_eraseblock_from_mtd5_backup(
     mtd5_base: u64,
 ) -> Result<&[u8], &'static str> {
     admit_s19k_physical_mtd5_base(mtd5_base)?;
-    let local = recovery_flag_local_offset(mtd5_base)
-        .ok_or("cannot compute recovery-flag local")?;
+    let local =
+        recovery_flag_local_offset(mtd5_base).ok_or("cannot compute recovery-flag local")?;
     let eb = plan_s19k_recovery_flag_eraseblock(local)
         .map_err(|_| "cannot plan recovery-flag eraseblock")?;
     let start = eb.eraseblock_start as usize;
@@ -171,9 +608,9 @@ pub fn refuse_s19k_nand_env_bak_as_recover_env_import(
     source_name: &str,
 ) -> Result<(), &'static str> {
     match source_name {
-        "nand_env.bak" | "nand_env.bin" => Err(
-            "nand_env.bak/bin is /dev/nand_env; recover_env imports nandrecovery_env.bin",
-        ),
+        "nand_env.bak" | "nand_env.bin" => {
+            Err("nand_env.bak/bin is /dev/nand_env; recover_env imports nandrecovery_env.bin")
+        }
         S19K_BACKUP_NANDRECOVERY_ENV_NAME => Ok(()),
         _ => Err("unknown recover_env source name"),
     }
@@ -194,9 +631,7 @@ pub struct S19kBackupArtifactAdmit {
 }
 
 /// Recoverability-complete artifact-dir must name the sidecar.
-pub fn admit_s19k_backup_requires_nandrecovery_sidecar(
-    names: &[&str],
-) -> Result<(), &'static str> {
+pub fn admit_s19k_backup_requires_nandrecovery_sidecar(names: &[&str]) -> Result<(), &'static str> {
     if !names
         .iter()
         .any(|n| *n == S19K_BACKUP_NANDRECOVERY_ENV_NAME)
@@ -238,11 +673,8 @@ pub fn admit_s19k_backup_artifact_dir(
     }
     let recovery_flag_byte = recovery_flag_local_offset(mtd5_base)
         .and_then(|off| read_s19k_mtd5_backup_byte(mtd5, off).ok());
-    let recover_plan = format_s19k_recover_to_stock_plan(
-        mtd5_base,
-        S19K_BACKUP_NANDRECOVERY_ENV_NAME,
-        &rec_env,
-    )?;
+    let recover_plan =
+        format_s19k_recover_to_stock_plan(mtd5_base, S19K_BACKUP_NANDRECOVERY_ENV_NAME, &rec_env)?;
     let recover_refuse =
         format_s19k_recover_execute_refuse(mtd5_base, S19K_BACKUP_NANDRECOVERY_ENV_NAME);
     admit_s19k_recover_execute_refuse_names_78_nand_src(&recover_refuse)?;
@@ -466,11 +898,82 @@ pub fn admit_s19k_rootfs_window(mtd5_base: u64, planned_local: u64) -> Result<u6
         return Err("mtd5 base cannot produce nandrootfs local offset");
     };
     if computed != planned_local {
-        return Err(
-            "planned ROOTFS_OFFSET does not match nandrootfs − mtd5_base; refuse FLASH",
-        );
+        return Err("planned ROOTFS_OFFSET does not match nandrootfs − mtd5_base; refuse FLASH");
     }
     Ok(computed)
+}
+
+/// Exact factory-bad eraseblocks reported by the held `a lab unit` boot transcript,
+/// converted from global NAND addresses to mtd5-local offsets using the proven
+/// physical mtd5 base `0x0670_0000`.
+///
+/// This tuple is evidence for that captured unit only. It is not a default for
+/// another S19k Pro and it is not permission to write NAND.
+pub const S19K_78_HELD_MTD5_BAD_ERASEBLOCKS: [u64; 4] =
+    [0x0590_0000, 0x0592_0000, 0x0976_0000, 0x097A_0000];
+
+/// Map one input byte to the mtd offset at which mtd-utils `nandwrite` will
+/// program it when normal bad-block skipping is enabled.
+///
+/// The model is deliberately narrow: start and bad-block offsets must be
+/// eraseblock-aligned, the bad-block list must be strictly increasing, and the
+/// requested byte must fit in the device. It mirrors the held
+/// mtd-utils-2.2.1 `nand-utils/nandwrite.c` ordering: check/skip a target
+/// eraseblock before consuming input for that eraseblock. It does **not** model
+/// Amlogic U-Boot `nand read`, ECC/OOB, power loss, or write-failure marking.
+pub fn map_mtdutils_nandwrite_input_byte(
+    start: u64,
+    input_byte: u64,
+    erase_size: u64,
+    device_size: u64,
+    bad_eraseblocks: &[u64],
+) -> Result<u64, &'static str> {
+    if erase_size == 0 || start % erase_size != 0 {
+        return Err("nandwrite mapping requires a nonzero erase size and aligned start");
+    }
+    let mut previous = None;
+    for &bad in bad_eraseblocks {
+        if bad % erase_size != 0 || bad >= device_size {
+            return Err("bad eraseblock is unaligned or outside the MTD device");
+        }
+        if previous.is_some_and(|prior| bad <= prior) {
+            return Err("bad eraseblocks must be unique and strictly increasing");
+        }
+        previous = Some(bad);
+    }
+
+    let input_block = input_byte / erase_size;
+    let within_block = input_byte % erase_size;
+    let mut target_block = start / erase_size;
+    let mut good_blocks_seen = 0_u64;
+    let device_blocks = device_size / erase_size;
+
+    while target_block < device_blocks {
+        let target = target_block
+            .checked_mul(erase_size)
+            .ok_or("nandwrite target offset overflow")?;
+        if bad_eraseblocks.binary_search(&target).is_err() {
+            if good_blocks_seen == input_block {
+                return target
+                    .checked_add(within_block)
+                    .filter(|offset| *offset < device_size)
+                    .ok_or("mapped nandwrite byte is outside the MTD device");
+            }
+            good_blocks_seen = good_blocks_seen
+                .checked_add(1)
+                .ok_or("nandwrite input block count overflow")?;
+        }
+        target_block = target_block
+            .checked_add(1)
+            .ok_or("nandwrite target block overflow")?;
+    }
+    Err("nandwrite input does not fit after skipping bad eraseblocks")
+}
+
+/// Linux writer mapping is not proof that the stock Amlogic U-Boot reader
+/// reconstructs the same logical byte stream or fixed-length endpoint.
+pub fn refuse_s19k_linux_badblock_map_as_uboot_read_authority() -> Result<(), &'static str> {
+    Err("mtd-utils nandwrite bad-block mapping does not prove Amlogic U-Boot nand-read mapping")
 }
 
 /// Stock web rail (`a lab unit` extract): `upgrade.cgi` writes `update.bmu` and execs
@@ -539,11 +1042,11 @@ pub fn parse_s19k_uimage_header(blob: &[u8]) -> Result<S19kUimageHeader, &'stati
 }
 
 /// `a lab unit` kernel is aarch64 (`uname` 4.9.113). Xilinx ARM32 uImage is not AML.
-pub fn refuse_xilinx_arm32_uimage_as_s19k_aml(
-    hdr: &S19kUimageHeader,
-) -> Result<(), &'static str> {
+pub fn refuse_xilinx_arm32_uimage_as_s19k_aml(hdr: &S19kUimageHeader) -> Result<(), &'static str> {
     if hdr.ih_arch == UIMAGE_ARCH_ARM && hdr.ih_name.contains("xilinx") {
-        return Err("held uImage is ARM32 Linux-4.6.0-xilinx; S19k AML is aarch64, refuse mtd5 nandwrite");
+        return Err(
+            "held uImage is ARM32 Linux-4.6.0-xilinx; S19k AML is aarch64, refuse mtd5 nandwrite",
+        );
     }
     if hdr.ih_arch == UIMAGE_ARCH_ARM64 {
         return Ok(());
@@ -818,9 +1321,7 @@ fn parse_s19k_android_amlsecu_fields(
     if &page0[off..off + 8] != S19K_AMLSECU_MAGIC {
         return Err("page0 0x400 is not AMLSECU!");
     }
-    let u32le = |o: usize| {
-        u32::from_le_bytes([page0[o], page0[o + 1], page0[o + 2], page0[o + 3]])
-    };
+    let u32le = |o: usize| u32::from_le_bytes([page0[o], page0[o + 1], page0[o + 2], page0[o + 3]]);
     let mut time = [0u8; 16];
     time.copy_from_slice(&page0[off + 16..off + 32]);
     Ok((
@@ -878,17 +1379,13 @@ pub fn refuse_s19k_factory_amlsecu_as_20231108_bmu(
         kind,
         S19kAmlsecuImageKind::FactorySdBoot | S19kAmlsecuImageKind::FactorySdRecovery
     ) {
-        return Err(
-            "factory 20231115 AMLSECU stamp is not the 20231108 single-BMU datafile",
-        );
+        return Err("factory 20231115 AMLSECU stamp is not the 20231108 single-BMU datafile");
     }
     Ok(())
 }
 
 /// Factory item 9 ANDROID header. Kernel/second/page match 20231108; ramdisk is 0x686800.
-pub fn admit_s19k_factory_android_boot_header(
-    h: S19kAndroidBootHdr,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_factory_android_boot_header(h: S19kAndroidBootHdr) -> Result<(), &'static str> {
     if h.kernel_size != S19K_20231108_KERNEL_SIZE
         || h.ramdisk_size != S19K_FACTORY_BOOT_RAMDISK_SIZE
         || h.second_size != S19K_20231108_SECOND_SIZE
@@ -920,7 +1417,9 @@ pub fn admit_s19k_factory_android_second_layout(
         || kernel != S19K_20231108_KERNEL_SIZE
         || ramdisk != S19K_FACTORY_BOOT_RAMDISK_SIZE
     {
-        return Err("factory second layout requires page 2048 + kernel 0x5C0800 + ramdisk 0x686800");
+        return Err(
+            "factory second layout requires page 2048 + kernel 0x5C0800 + ramdisk 0x686800",
+        );
     }
     let want = page as usize + kernel as usize + ramdisk as usize;
     if second_off != want || second_off != S19K_FACTORY_BOOT_SECOND_OFF {
@@ -940,11 +1439,17 @@ pub fn refuse_s19k_4k_ramdisk_off_as_factory_page2048(off: usize) -> Result<(), 
 }
 
 pub fn refuse_s19k_factory_second_as_plaintext_android(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.starts_with(S19K_ANDROID_BOOT_MAGIC) || (blob.len() >= 2 && blob[0] == 0x1F && blob[1] == 0x8B)
+    if blob.starts_with(S19K_ANDROID_BOOT_MAGIC)
+        || (blob.len() >= 2 && blob[0] == 0x1F && blob[1] == 0x8B)
     {
         return Ok(());
     }
-    for n in [b"updateporc".as_slice(), b"uart_trans", b"nandrecovery", b"AMLSECU"] {
+    for n in [
+        b"updateporc".as_slice(),
+        b"uart_trans",
+        b"nandrecovery",
+        b"AMLSECU",
+    ] {
         if blob.windows(n.len()).any(|w| w == n) {
             return Ok(());
         }
@@ -974,7 +1479,13 @@ pub fn admit_s19k_factory_android_ramdisk_not_gzip(head: &[u8]) -> Result<(), &'
 }
 
 pub fn refuse_s19k_factory_android_page0_as_gpio437(page0: &[u8]) -> Result<(), &'static str> {
-    for n in [b"gpio437".as_slice(), b"PWR_CONTROL", b"recover_env", b"updateporc", b"uart_trans"] {
+    for n in [
+        b"gpio437".as_slice(),
+        b"PWR_CONTROL",
+        b"recover_env",
+        b"updateporc",
+        b"uart_trans",
+    ] {
         if page0.windows(n.len()).any(|w| w == n) {
             return Ok(());
         }
@@ -1010,16 +1521,12 @@ pub fn refuse_s19k_factory_recovery_as_boot_ramdisk(
     h: S19kAndroidBootHdr,
 ) -> Result<(), &'static str> {
     if h.ramdisk_size == 0 {
-        return Err(
-            "factory recovery ramdisk_size=0; cannot extract updateporc from this item",
-        );
+        return Err("factory recovery ramdisk_size=0; cannot extract updateporc from this item");
     }
     Ok(())
 }
 
-pub fn refuse_s19k_factory_boot_as_20231108_datafile(
-    item_len: usize,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_factory_boot_as_20231108_datafile(item_len: usize) -> Result<(), &'static str> {
     if item_len == S19K_AML_UPGRADE_ITEM9_BOOT_SIZE as usize
         && item_len != S19K_20231108_DATAFILE_SIZE as usize
     {
@@ -1103,7 +1610,10 @@ pub fn admit_s19k_20231108_single_bmu(blob: &[u8]) -> Result<S19kSingleBmuToc, &
     {
         return Err("20231108 ANDROID boot header sizes/addr mismatch");
     }
-    if !comp.windows(S19K_20231108_CMDLINE.len()).any(|w| w == S19K_20231108_CMDLINE) {
+    if !comp
+        .windows(S19K_20231108_CMDLINE.len())
+        .any(|w| w == S19K_20231108_CMDLINE)
+    {
         return Err("20231108 ANDROID cmdline is not init=/sbin/init");
     }
     Ok(toc)
@@ -1245,9 +1755,7 @@ pub fn refuse_s19k_bmu_extraction_notes_as_toc() -> Result<(), &'static str> {
 }
 
 /// A BMU is a signed container. nandwrite of the file to mtd5 is not restore.
-pub fn refuse_s19k_bmu_as_raw_nand_image(
-    kind: S19kUpgradeBlobKind,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_bmu_as_raw_nand_image(kind: S19kUpgradeBlobKind) -> Result<(), &'static str> {
     if kind == S19kUpgradeBlobKind::StockBitmainBmu {
         return Err(
             "BMU is magic 0x26 + miner.pem + opaque payload @ 0x4000; refuse nandwrite of the BMU to mtd5",
@@ -1265,7 +1773,9 @@ pub fn classify_s19k_upgrade_blob(name: &str, head: &[u8]) -> S19kUpgradeBlobKin
     {
         return S19kUpgradeBlobKind::CvitekSd2NandFactory;
     }
-    if lower.ends_with(".bmu") || lower.ends_with("update.bmu") || head.first() == Some(&S19K_BTMU_MAGIC)
+    if lower.ends_with(".bmu")
+        || lower.ends_with("update.bmu")
+        || head.first() == Some(&S19K_BTMU_MAGIC)
     {
         return S19kUpgradeBlobKind::StockBitmainBmu;
     }
@@ -1292,10 +1802,7 @@ pub fn classify_s19k_upgrade_blob(name: &str, head: &[u8]) -> S19kUpgradeBlobKin
 
 /// Factory SD burn (`erase_bootloader=1`) is a board wipe, not DCENT sysupgrade.
 pub fn refuse_aml_sdc_burn_as_dcent(ini: &str) -> Result<(), &'static str> {
-    let compact: String = ini
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
+    let compact: String = ini.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     if compact.to_ascii_lowercase().contains("erase_bootloader=1") {
         return Err(
             "aml_sdc_burn erase_bootloader=1 wipes the control board; not a DCENT sysupgrade",
@@ -1308,8 +1815,22 @@ pub fn refuse_aml_sdc_burn_as_dcent(ini: &str) -> Result<(), &'static str> {
 pub const S19K_AML_FACTORY_SD_INI_BYTES: usize = 602;
 pub const S19K_AML_FACTORY_SD_UBOOT_BYTES: usize = 818_688;
 pub const S19K_AML_FACTORY_SD_IMG_BYTES: usize = 23_134_392;
+pub const S19K_AML_FACTORY_SD_ARCHIVE_BYTES: usize = 23_470_887;
+pub const S19K_AML_FACTORY_SD_ARCHIVE_SHA256: &str =
+    "46214d02b3c246ad4f98bcbe50b83705392a23a9fa5007120cb21d033e98dcf4";
+pub const S19K_AML_FACTORY_SD_INI_SHA256: &str =
+    "23026acac61ff4144e0e70521a91f7d527fd3bb8c31d22efce980900ebf2c5f0";
+pub const S19K_AML_FACTORY_SD_UBOOT_SHA256: &str =
+    "546ca8c4540ab584792716b2871d42ee304f594880f8c907e1018f68f6ab9cbc";
 pub const S19K_AML_FACTORY_SD_IMG_SHA256: &str =
     "539da235cdf816a2cbfbf2037b056ad1b2dc5ab704efc97ed0050e6e0b313678";
+pub const S19K_AML_FACTORY_SD_TOC_SHA256: &str =
+    "efb21fd2d67e651a4ac2d4558a21099ccab250df73032b1c0acecee78cda20d8";
+pub const S19K_AML_FACTORY_SD_MEMBERS: &[&str] = &[
+    "aml_sdc_burn.ini",
+    "aml_sdc_burn.UBOOT.ENC",
+    "aml_upgrade_package_enc.img",
+];
 /// VNish S19k `aml_sdc_burn.UBOOT.ENC` is a Git LFS pointer, not factory U-Boot.
 pub const VNISH_AML_SD_UBOOT_POINTER_BYTES: usize = 131;
 /// Shared VNish `aml_upgrade_package_enc.img` across S19j+/S19j Pro/S21/T21/S19k VNish SD.
@@ -1328,24 +1849,87 @@ pub struct S19kAmlSdcBurnIni {
     pub package_is_enc_img: bool,
 }
 
-fn aml_sdc_ini_compact(ini: &str) -> String {
-    ini.chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-/// Parse `[common]` erase/reboot plus `[burn_ex] package=`.
+/// Parse the exact functional grammar of the held S19k factory INI.
+///
+/// Whole-line `;`/`#` comments are ignored. Sections, keys, and values are
+/// otherwise exact; duplicates, unknown directives, misplaced directives,
+/// and conflicting shadow values all fail closed. The outer evidence contract
+/// separately binds the complete 602-byte file hash, including comments.
 pub fn parse_s19k_aml_sdc_burn_ini(ini: &str) -> Result<S19kAmlSdcBurnIni, &'static str> {
-    let compact = aml_sdc_ini_compact(ini);
-    if !compact.contains("erase_bootloader=") {
-        return Err("aml_sdc_burn.ini missing erase_bootloader");
+    #[derive(Clone, Copy)]
+    enum Section {
+        None,
+        Common,
+        BurnEx,
+    }
+
+    let mut section = Section::None;
+    let mut common_seen = false;
+    let mut burn_ex_seen = false;
+    let mut erase_bootloader = None;
+    let mut erase_flash = None;
+    let mut reboot = None;
+    let mut package = None;
+
+    for raw in ini.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = match line {
+                "[common]" if !common_seen => {
+                    common_seen = true;
+                    Section::Common
+                }
+                "[burn_ex]" if !burn_ex_seen => {
+                    burn_ex_seen = true;
+                    Section::BurnEx
+                }
+                "[common]" | "[burn_ex]" => {
+                    return Err("aml_sdc_burn.ini contains a duplicate section");
+                }
+                _ => return Err("aml_sdc_burn.ini contains an unknown section"),
+            };
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or("aml_sdc_burn.ini directive must contain one equals sign")?;
+        let key = key.trim();
+        let value = value.trim();
+        match (section, key) {
+            (Section::Common, "erase_bootloader") if erase_bootloader.is_none() => {
+                erase_bootloader = Some(value)
+            }
+            (Section::Common, "erase_flash") if erase_flash.is_none() => erase_flash = Some(value),
+            (Section::Common, "reboot") if reboot.is_none() => reboot = Some(value),
+            (Section::BurnEx, "package") if package.is_none() => package = Some(value),
+            (Section::Common, "erase_bootloader" | "erase_flash" | "reboot")
+            | (Section::BurnEx, "package") => {
+                return Err("aml_sdc_burn.ini contains a duplicate directive");
+            }
+            (Section::None, _) => {
+                return Err("aml_sdc_burn.ini directive appears before a section");
+            }
+            _ => return Err("aml_sdc_burn.ini contains an unknown or misplaced directive"),
+        }
+    }
+    if !common_seen || !burn_ex_seen {
+        return Err("aml_sdc_burn.ini requires one [common] and one [burn_ex]");
+    }
+    if erase_bootloader != Some("1")
+        || erase_flash != Some("1")
+        || reboot != Some("1")
+        || package != Some(S19K_AML_FACTORY_SD_PACKAGE)
+    {
+        return Err("S19k stock factory INI must exact full-erase, reboot, and encrypted package");
     }
     Ok(S19kAmlSdcBurnIni {
-        erase_bootloader: compact.contains("erase_bootloader=1"),
-        erase_flash: compact.contains("erase_flash=1"),
-        reboot: compact.contains("reboot=1"),
-        package_is_enc_img: compact.contains("package=aml_upgrade_package_enc.img"),
+        erase_bootloader: true,
+        erase_flash: true,
+        reboot: true,
+        package_is_enc_img: true,
     })
 }
 
@@ -1357,6 +1941,51 @@ pub enum S19kAmlSdPackKind {
     VnishSharedLfsPointer,
     /// Other AML SD sizes (S19j 22997160, S21, …). Comparative only.
     ComparativeOtherAml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kAmlFactorySdEvidence<'a> {
+    pub kind: S19kAmlSdPackKind,
+    pub archive_bytes: usize,
+    pub archive_sha256: &'a str,
+    pub members: &'a [&'a str],
+    pub ini_bytes: usize,
+    pub ini_sha256: &'a str,
+    pub uboot_bytes: usize,
+    pub uboot_sha256: &'a str,
+    pub img_bytes: usize,
+    pub img_sha256: &'a str,
+    pub toc_sha256: &'a str,
+    pub upgrade_header: S19kAmlUpgradeHeader,
+}
+
+pub fn admit_s19k_aml_factory_sd_evidence(
+    evidence: S19kAmlFactorySdEvidence<'_>,
+) -> Result<(), &'static str> {
+    if evidence.kind != S19kAmlSdPackKind::StockS19kFactorySd {
+        return Err("factory stock-return plan requires exact StockS19kFactorySd kind");
+    }
+    if evidence.archive_bytes != S19K_AML_FACTORY_SD_ARCHIVE_BYTES
+        || evidence.archive_sha256 != S19K_AML_FACTORY_SD_ARCHIVE_SHA256
+    {
+        return Err("S19k AML factory archive size/hash mismatch");
+    }
+    if evidence.members != S19K_AML_FACTORY_SD_MEMBERS {
+        return Err("S19k AML factory archive must contain exactly three canonical members");
+    }
+    if evidence.ini_bytes != S19K_AML_FACTORY_SD_INI_BYTES
+        || evidence.ini_sha256 != S19K_AML_FACTORY_SD_INI_SHA256
+        || evidence.uboot_bytes != S19K_AML_FACTORY_SD_UBOOT_BYTES
+        || evidence.uboot_sha256 != S19K_AML_FACTORY_SD_UBOOT_SHA256
+        || evidence.img_bytes != S19K_AML_FACTORY_SD_IMG_BYTES
+        || evidence.img_sha256 != S19K_AML_FACTORY_SD_IMG_SHA256
+    {
+        return Err("S19k AML factory member size/hash mismatch");
+    }
+    if evidence.toc_sha256 != S19K_AML_FACTORY_SD_TOC_SHA256 {
+        return Err("S19k AML factory 11008-byte TOC hash mismatch");
+    }
+    admit_s19k_aml_upgrade_header(evidence.upgrade_header)
 }
 
 pub fn classify_s19k_aml_sd_pack(uboot_len: usize, img_len: usize) -> S19kAmlSdPackKind {
@@ -1382,9 +2011,7 @@ pub fn refuse_vnish_lfs_uboot_as_s19k_factory(uboot_len: usize) -> Result<(), &'
 
 pub fn refuse_vnish_shared_img_as_s19k_stock(img_len: usize) -> Result<(), &'static str> {
     if img_len == VNISH_SHARED_AML_UPGRADE_IMG_BYTES {
-        return Err(
-            "VNish shared 22991024 aml_upgrade_package_enc.img is not S19k stock 23134392",
-        );
+        return Err("VNish shared 22991024 aml_upgrade_package_enc.img is not S19k stock 23134392");
     }
     Ok(())
 }
@@ -1422,9 +2049,7 @@ pub fn refuse_s19k_xil_sd_recover_as_aml_nand(
     kind: S19kUpgradeBlobKind,
 ) -> Result<(), &'static str> {
     if kind == S19kUpgradeBlobKind::XilSdRecoverFactory {
-        return Err(
-            "sd-recover-bmu-s19k-pro is Xilinx uImage+update.bmu; refuse as am3-s19k NAND",
-        );
+        return Err("sd-recover-bmu-s19k-pro is Xilinx uImage+update.bmu; refuse as am3-s19k NAND");
     }
     Ok(())
 }
@@ -1434,43 +2059,66 @@ pub fn refuse_s19k_xil_recover_uimage_as_aml_nand(
     ih_name: &str,
 ) -> Result<(), &'static str> {
     if bytes == S19K_XIL_SD_RECOVER_UIMAGE_BYTES && ih_name.contains("xilinx") {
-        return Err(
-            "sd-recover-bmu uImage is ARM32 Linux-4.6.0-xilinx; S19k AML is aarch64",
-        );
+        return Err("sd-recover-bmu uImage is ARM32 Linux-4.6.0-xilinx; S19k AML is aarch64");
     }
     Ok(())
 }
 
 /// Plan-only. Factory SD burn is not NAND write and not updateporc.
 pub fn format_s19k_aml_factory_sd_plan(
-    kind: S19kAmlSdPackKind,
+    evidence: S19kAmlFactorySdEvidence<'_>,
     ini: S19kAmlSdcBurnIni,
 ) -> Result<String, &'static str> {
     if !ini.erase_bootloader || !ini.erase_flash || !ini.package_is_enc_img {
-        return Err("S19k AML factory SD plan requires erase_bootloader=1 erase_flash=1 package=img");
+        return Err(
+            "S19k AML factory SD plan requires erase_bootloader=1 erase_flash=1 package=img",
+        );
     }
-    let _ = refuse_s19k_aml_factory_sd_as_dcent_sysupgrade(kind);
+    admit_s19k_aml_factory_sd_evidence(evidence)?;
     Ok(format!(
         "schema=dcentos.amlogic-factory-sd/v1\n\
 kind={kind:?}\n\
+archive_bytes={archive_bytes}\n\
+archive_sha256={archive_sha}\n\
+members=aml_sdc_burn.ini,aml_sdc_burn.UBOOT.ENC,aml_upgrade_package_enc.img\n\
 ini_bytes={ini_bytes}\n\
+ini_sha256={ini_sha}\n\
 uboot_bytes={uboot}\n\
+uboot_sha256={uboot_sha}\n\
 img_bytes={img}\n\
 img_sha256={sha}\n\
+toc_sha256={toc_sha}\n\
 package={pkg}\n\
 erase_bootloader={eb}\n\
 erase_flash={ef}\n\
 reboot={rb}\n\
+classification=vendor-encrypted-amlogic-sd-full-erase\n\
+factory_toc_scope=_aml_dtb+boot+bootloader+recovery+conf-keys+platform\n\
+unit_specific_state_restore=false\n\
+destroyed_state=/config+/nvdata+/miner+device-calibration\n\
+media_preparation=evidence-bounded-dedicated-fat32+exact-three-root-members\n\
+required_preburn_backup=dcentos.s19k-aml-full-logical-rescue/v1+six-mtd-hashes+stable-badblock-counts+boot-nand-transcript+encrypted-offhost-copy\n\
+preburn_backup_is_physical_replay=false\n\
+required_unit_state_restore=config+nvdata+miner+eeprom+calibration-import-live-unproven\n\
+bench_sequence=verify-FULL_RESCUE_LEDGER.txt+validate-unit-state-restore+power-off+insert-card+power-on+do-not-interrupt+verify-stock-version\n\
+live_choreography=usb-button-completion-signal-unproven\n\
+linux_raw_restore_equivalent=false\n\
 updateporc=false\n\
 nandrecovery_env=false\n\
 nandwrite=false\n\
 execute=false\n\
 clear_for_flash=false\n\
 reason=CLEAR_FOR_FLASH\n",
+        kind = evidence.kind,
+        archive_bytes = S19K_AML_FACTORY_SD_ARCHIVE_BYTES,
+        archive_sha = S19K_AML_FACTORY_SD_ARCHIVE_SHA256,
         ini_bytes = S19K_AML_FACTORY_SD_INI_BYTES,
+        ini_sha = S19K_AML_FACTORY_SD_INI_SHA256,
         uboot = S19K_AML_FACTORY_SD_UBOOT_BYTES,
+        uboot_sha = S19K_AML_FACTORY_SD_UBOOT_SHA256,
         img = S19K_AML_FACTORY_SD_IMG_BYTES,
         sha = S19K_AML_FACTORY_SD_IMG_SHA256,
+        toc_sha = S19K_AML_FACTORY_SD_TOC_SHA256,
         pkg = S19K_AML_FACTORY_SD_PACKAGE,
         eb = ini.erase_bootloader as u8,
         ef = ini.erase_flash as u8,
@@ -1498,8 +2146,8 @@ pub const S19K_AML_UPGRADE_ITEM_ALIGN: u32 = 8;
 /// 256-byte type fields. 0x80 (32-byte types) is the wrong published stride.
 pub const S19K_AML_UPGRADE_ITEM_STRIDE: usize = 0x240;
 pub const S19K_AML_UPGRADE_HEADER_LEN: usize = 0x40;
-pub const S19K_AML_UPGRADE_TOC_BYTES: usize =
-    S19K_AML_UPGRADE_HEADER_LEN + (S19K_AML_UPGRADE_ITEM_NUM as usize) * S19K_AML_UPGRADE_ITEM_STRIDE;
+pub const S19K_AML_UPGRADE_TOC_BYTES: usize = S19K_AML_UPGRADE_HEADER_LEN
+    + (S19K_AML_UPGRADE_ITEM_NUM as usize) * S19K_AML_UPGRADE_ITEM_STRIDE;
 pub const S19K_AML_UPGRADE_ITEM2_USB_UBOOT_OFF: u64 = 109_312;
 pub const S19K_AML_UPGRADE_ITEM2_USB_UBOOT_SIZE: u64 = 769_024;
 pub const S19K_AML_UPGRADE_ITEM4_AML_DTB_OFF: u64 = 1_647_360;
@@ -1636,7 +2284,9 @@ pub fn parse_s19k_aml_upgrade_item(entry: &[u8]) -> Result<S19kAmlUpgradeItem, &
     })
 }
 
-pub fn admit_s19k_aml_upgrade_uboot_enc_item(item: &S19kAmlUpgradeItem) -> Result<(), &'static str> {
+pub fn admit_s19k_aml_upgrade_uboot_enc_item(
+    item: &S19kAmlUpgradeItem,
+) -> Result<(), &'static str> {
     if item.main != "UBOOT.ENC" || item.sub != "aml_sdc_burn" {
         return Err("item 7 is UBOOT.ENC/aml_sdc_burn");
     }
@@ -1648,7 +2298,9 @@ pub fn admit_s19k_aml_upgrade_uboot_enc_item(item: &S19kAmlUpgradeItem) -> Resul
     Ok(())
 }
 
-pub fn admit_s19k_aml_upgrade_usb_uboot_item(item: &S19kAmlUpgradeItem) -> Result<(), &'static str> {
+pub fn admit_s19k_aml_upgrade_usb_uboot_item(
+    item: &S19kAmlUpgradeItem,
+) -> Result<(), &'static str> {
     if item.main != "USB" || item.sub != "UBOOT" {
         return Err("item 2 is USB/UBOOT");
     }
@@ -1716,7 +2368,9 @@ pub fn admit_s19k_aml_upgrade_aml_dtb_item(item: &S19kAmlUpgradeItem) -> Result<
     Ok(())
 }
 
-pub fn admit_s19k_aml_upgrade_meson1_enc_item(item: &S19kAmlUpgradeItem) -> Result<(), &'static str> {
+pub fn admit_s19k_aml_upgrade_meson1_enc_item(
+    item: &S19kAmlUpgradeItem,
+) -> Result<(), &'static str> {
     if item.main != "dtb" || item.sub != "meson1_ENC" {
         return Err("item 15 is dtb/meson1_ENC");
     }
@@ -1811,7 +2465,10 @@ pub fn classify_s19k_aml_verify_hex(hex: &[u8]) -> Result<S19kAmlVerifyKind, &'s
     Err("unknown factory VERIFY sha1 hex")
 }
 
-pub fn admit_s19k_aml_verify_pair(sub: &str, hex: &[u8]) -> Result<S19kAmlVerifyKind, &'static str> {
+pub fn admit_s19k_aml_verify_pair(
+    sub: &str,
+    hex: &[u8],
+) -> Result<S19kAmlVerifyKind, &'static str> {
     let by_sub = classify_s19k_aml_verify_sub(sub)?;
     let by_hex = classify_s19k_aml_verify_hex(hex)?;
     if by_sub != by_hex {
@@ -1873,7 +2530,9 @@ pub const S19K_AML_UPGRADE_INI_PACKAGE: &[u8] = b"aml_upgrade_package.img";
 pub const S19K_AML_UPGRADE_INI_ERASE_BL: &[u8] = b"erase_bootloader    = 1";
 pub const S19K_AML_UPGRADE_ENCRYPT_REG_ASCII: &[u8] = b"Encrypt_reg:0xff800228";
 
-pub fn admit_s19k_aml_upgrade_sdc_uboot_item(item: &S19kAmlUpgradeItem) -> Result<(), &'static str> {
+pub fn admit_s19k_aml_upgrade_sdc_uboot_item(
+    item: &S19kAmlUpgradeItem,
+) -> Result<(), &'static str> {
     if item.main != "UBOOT" || item.sub != "aml_sdc_burn" {
         return Err("item 6 is UBOOT/aml_sdc_burn");
     }
@@ -1897,7 +2556,9 @@ pub fn admit_s19k_aml_upgrade_usb_ddr_item(item: &S19kAmlUpgradeItem) -> Result<
     Ok(())
 }
 
-pub fn admit_s19k_aml_upgrade_usb_ddr_enc_item(item: &S19kAmlUpgradeItem) -> Result<(), &'static str> {
+pub fn admit_s19k_aml_upgrade_usb_ddr_enc_item(
+    item: &S19kAmlUpgradeItem,
+) -> Result<(), &'static str> {
     if item.main != "USB" || item.sub != "DDR_ENC" {
         return Err("item 1 is USB/DDR_ENC");
     }
@@ -1958,7 +2619,10 @@ pub fn admit_s19k_aml_upgrade_platform_item(item: &S19kAmlUpgradeItem) -> Result
     Ok(())
 }
 
-pub fn admit_s19k_usb_ddr_enc_same_size(plain_len: usize, enc_len: usize) -> Result<(), &'static str> {
+pub fn admit_s19k_usb_ddr_enc_same_size(
+    plain_len: usize,
+    enc_len: usize,
+) -> Result<(), &'static str> {
     if plain_len != S19K_AML_UPGRADE_ITEM0_USB_DDR_SIZE as usize
         || enc_len != S19K_AML_UPGRADE_ITEM1_USB_DDR_ENC_SIZE as usize
         || plain_len != enc_len
@@ -2072,7 +2736,9 @@ pub fn refuse_s19k_bootloader_as_uboot_enc(bl: &[u8], enc: &[u8]) -> Result<(), 
 }
 
 pub fn refuse_s19k_bootloader_as_plaintext_uboot(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"S19k-Pro_BHB56XXX".len()).any(|w| w == b"S19k-Pro_BHB56XXX")
+    if blob
+        .windows(b"S19k-Pro_BHB56XXX".len())
+        .any(|w| w == b"S19k-Pro_BHB56XXX")
         || blob.windows(b"GPIOAO_3".len()).any(|w| w == b"GPIOAO_3")
     {
         return Ok(());
@@ -2107,7 +2773,10 @@ pub fn admit_s19k_sdc_uboot_prefix_bl2(pref: &[u8]) -> Result<(), &'static str> 
     if pref.len() != S19K_SDC_USB_UBOOT_PREFIX_BYTES {
         return Err("SDC UBOOT prefix is 49664 bytes");
     }
-    if !pref.windows(S19K_SDC_BL2_BUILD.len()).any(|w| w == S19K_SDC_BL2_BUILD) {
+    if !pref
+        .windows(S19K_SDC_BL2_BUILD.len())
+        .any(|w| w == S19K_SDC_BL2_BUILD)
+    {
         return Err("SDC prefix is AXG BL2 built 2020-04-14 gf27ed33");
     }
     if !pref.windows(b"BL2".len()).any(|w| w == b"BL2")
@@ -2144,13 +2813,22 @@ pub fn parse_s19k_bl2_storage_classes(pref: &[u8]) -> Result<Vec<String>, &'stat
 
 pub fn admit_s19k_bl2_storage_init(pref: &[u8]) -> Result<(), &'static str> {
     parse_s19k_bl2_storage_classes(pref)?;
-    if !pref.windows(S19K_BL2_NAND_INIT.len()).any(|w| w == S19K_BL2_NAND_INIT) {
+    if !pref
+        .windows(S19K_BL2_NAND_INIT.len())
+        .any(|w| w == S19K_BL2_NAND_INIT)
+    {
         return Err("BL2 prefix missing NAND init");
     }
-    if !pref.windows(S19K_BL2_EMMC_BOOT.len()).any(|w| w == S19K_BL2_EMMC_BOOT) {
+    if !pref
+        .windows(S19K_BL2_EMMC_BOOT.len())
+        .any(|w| w == S19K_BL2_EMMC_BOOT)
+    {
         return Err("BL2 prefix missing eMMC boot @");
     }
-    if !pref.windows(S19K_BL2_NO_STORAGE.len()).any(|w| w == S19K_BL2_NO_STORAGE) {
+    if !pref
+        .windows(S19K_BL2_NO_STORAGE.len())
+        .any(|w| w == S19K_BL2_NO_STORAGE)
+    {
         return Err("BL2 prefix missing no-storage error");
     }
     Ok(())
@@ -2215,7 +2893,11 @@ pub const S19K_BL2_READ_PAGE_ADDR: &[u8] = b"read page_addr:";
 pub const S19K_BL2_READ_PAGE_OFF: usize = 42_189;
 
 pub fn admit_s19k_bl2_scan_bbt_ecc(pref: &[u8]) -> Result<(), &'static str> {
-    for needle in [S19K_BL2_SCAN_BBT_ECC, S19K_BL2_NBBT, S19K_BL2_READ_PAGE_ADDR] {
+    for needle in [
+        S19K_BL2_SCAN_BBT_ECC,
+        S19K_BL2_NBBT,
+        S19K_BL2_READ_PAGE_ADDR,
+    ] {
         if !pref.windows(needle.len()).any(|w| w == needle) {
             return Err("BL2 prefix missing scan bbt ecc / nbbt / read page_addr");
         }
@@ -2298,8 +2980,12 @@ pub fn admit_s19k_bl2_cpu_clk_24mhz(pref: &[u8]) -> Result<(), &'static str> {
 }
 
 pub fn admit_s19k_bl2_sys_fix_pll(pref: &[u8]) -> Result<(), &'static str> {
-    if !pref.windows(S19K_BL2_SYS_PLL.len()).any(|w| w == S19K_BL2_SYS_PLL)
-        || !pref.windows(S19K_BL2_FIX_PLL.len()).any(|w| w == S19K_BL2_FIX_PLL)
+    if !pref
+        .windows(S19K_BL2_SYS_PLL.len())
+        .any(|w| w == S19K_BL2_SYS_PLL)
+        || !pref
+            .windows(S19K_BL2_FIX_PLL.len())
+            .any(|w| w == S19K_BL2_FIX_PLL)
     {
         return Err("BL2 prefix missing SYS PLL / FIX PLL");
     }
@@ -2344,7 +3030,9 @@ pub fn admit_s19k_bl2_saradc_cnt(pref: &[u8]) -> Result<(), &'static str> {
     if pref
         .windows(S19K_BL2_SARADC_ERR.len())
         .any(|w| w == S19K_BL2_SARADC_ERR)
-        && pref.windows(S19K_BL2_SARADC_CNT.len()).any(|w| w == S19K_BL2_SARADC_CNT)
+        && pref
+            .windows(S19K_BL2_SARADC_CNT.len())
+            .any(|w| w == S19K_BL2_SARADC_CNT)
     {
         return Ok(());
     }
@@ -2392,7 +3080,8 @@ pub const S19K_BL2_RANK_OFF: usize = 42_384;
 pub const S19K_BL2_DDR_TYPE_TABLE: &[u8] = b"DDR3\x00\x00DDR4\x00\x00LPDDR3\x00\x00LPDDR2";
 pub const S19K_BL2_DDR_TYPE_TABLE_OFF: usize = 42_560;
 pub const S19K_BL2_DDR_TYPES: &[&str] = &["DDR3", "DDR4", "LPDDR3", "LPDDR2"];
-pub const S19K_BL2_RANK_TABLE: &[u8] = b"Rank0 16bit\x00\x00Rank0\x00\x00Rank0+1\x00\x00Rank01 16bit";
+pub const S19K_BL2_RANK_TABLE: &[u8] =
+    b"Rank0 16bit\x00\x00Rank0\x00\x00Rank0+1\x00\x00Rank01 16bit";
 pub const S19K_BL2_RANK_TABLE_OFF: usize = 42_588;
 pub const S19K_BL2_DDR_INIT_FAIL: &[u8] = b"DDR init fail, reset...";
 pub const S19K_BL2_DDR_INIT_FAIL_OFF: usize = 42_924;
@@ -2404,12 +3093,18 @@ pub fn parse_s19k_bl2_ddr_types(pref: &[u8]) -> Result<Vec<String>, &'static str
     {
         return Err("BL2 prefix missing DDR3/DDR4/LPDDR3/LPDDR2 type table");
     }
-    Ok(S19K_BL2_DDR_TYPES.iter().map(|s| (*s).to_string()).collect())
+    Ok(S19K_BL2_DDR_TYPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect())
 }
 
 pub fn admit_s19k_bl2_ddr_table(pref: &[u8]) -> Result<(), &'static str> {
     parse_s19k_bl2_ddr_types(pref)?;
-    if !pref.windows(S19K_BL2_RANK.len()).any(|w| w == S19K_BL2_RANK) {
+    if !pref
+        .windows(S19K_BL2_RANK.len())
+        .any(|w| w == S19K_BL2_RANK)
+    {
         return Err("BL2 prefix missing rank: ");
     }
     if !pref
@@ -2528,7 +3223,9 @@ pub fn admit_s19k_bl2_dram_chl_mhz(pref: &[u8]) -> Result<(), &'static str> {
         return Ok(());
     }
     if pref.windows(S19K_BL2_CHL.len()).any(|w| w == S19K_BL2_CHL)
-        && pref.windows(S19K_BL2_CHL_MHZ.len()).any(|w| w == S19K_BL2_CHL_MHZ)
+        && pref
+            .windows(S19K_BL2_CHL_MHZ.len())
+            .any(|w| w == S19K_BL2_CHL_MHZ)
     {
         return Ok(());
     }
@@ -2558,7 +3255,9 @@ pub fn admit_s19k_bl2_ddr_reset(pref: &[u8]) -> Result<(), &'static str> {
         S19K_BL2_DEVICE_FAIL,
     ] {
         if !pref.windows(needle.len()).any(|w| w == needle) {
-            return Err("BL2 prefix missing Reset... / AddrBus / Device test after DDR init failed");
+            return Err(
+                "BL2 prefix missing Reset... / AddrBus / Device test after DDR init failed",
+            );
         }
     }
     Ok(())
@@ -2721,7 +3420,10 @@ pub fn parse_s19k_bl2_err_sha_labels(pref: &[u8]) -> Result<Vec<String>, &'stati
 
 pub fn admit_s19k_bl2_err_sha_table(pref: &[u8]) -> Result<(), &'static str> {
     parse_s19k_bl2_err_sha_labels(pref)?;
-    if pref.windows(S19K_AML_VERIFY_PREFIX.len()).any(|w| w == S19K_AML_VERIFY_PREFIX) {
+    if pref
+        .windows(S19K_AML_VERIFY_PREFIX.len())
+        .any(|w| w == S19K_AML_VERIFY_PREFIX)
+    {
         return Err("BL2 prefix must not carry AmlImagePack sha1sum VERIFY records");
     }
     Ok(())
@@ -2758,7 +3460,9 @@ pub fn admit_s19k_bl2_never_be_here_skip_usb(pref: &[u8]) -> Result<(), &'static
         .windows(S19K_BL2_NEVER_HERE.len())
         .any(|w| w == S19K_BL2_NEVER_HERE)
     {
-        return Err("BL2 prefix must still carry Never should be here! distinct from NEVER BE HERE");
+        return Err(
+            "BL2 prefix must still carry Never should be here! distinct from NEVER BE HERE",
+        );
     }
     Ok(())
 }
@@ -2817,7 +3521,9 @@ pub fn refuse_s19k_bl2_reg_dump_as_nandrecovery() -> Result<(), &'static str> {
 pub fn refuse_s19k_sdc_uboot_prefix_as_gpio437(pref: &[u8]) -> Result<(), &'static str> {
     if pref.windows(b"GPIOAO_3".len()).any(|w| w == b"GPIOAO_3")
         || pref.windows(b"gpio437".len()).any(|w| w == b"gpio437")
-        || pref.windows(b"PWR_CONTROL".len()).any(|w| w == b"PWR_CONTROL")
+        || pref
+            .windows(b"PWR_CONTROL".len())
+            .any(|w| w == b"PWR_CONTROL")
     {
         return Ok(());
     }
@@ -2843,9 +3549,7 @@ pub fn refuse_s19k_aml_verify_hex_as_other_kind(
     hex: &[u8],
 ) -> Result<(), &'static str> {
     match classify_s19k_aml_verify_hex(hex) {
-        Ok(got) if got != kind => {
-            Err("VERIFY sha1 belongs to a different factory item")
-        }
+        Ok(got) if got != kind => Err("VERIFY sha1 belongs to a different factory item"),
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
@@ -2866,7 +3570,9 @@ pub fn refuse_s19k_aml_dtb_as_plaintext_fdt(head: &[u8]) -> Result<(), &'static 
 
 pub fn refuse_s19k_aml_dtb_as_gpio437(blob: &[u8]) -> Result<(), &'static str> {
     if blob.windows(b"gpio437".len()).any(|w| w == b"gpio437")
-        || blob.windows(b"PWR_CONTROL".len()).any(|w| w == b"PWR_CONTROL")
+        || blob
+            .windows(b"PWR_CONTROL".len())
+            .any(|w| w == b"PWR_CONTROL")
     {
         return Ok(());
     }
@@ -2874,15 +3580,22 @@ pub fn refuse_s19k_aml_dtb_as_gpio437(blob: &[u8]) -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_aml_img_as_updateporc(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"updateporc".len()).any(|w| w == b"updateporc") {
+    if blob
+        .windows(b"updateporc".len())
+        .any(|w| w == b"updateporc")
+    {
         return Ok(());
     }
     Err("S19k factory AmlImagePack has 0 updateporc bytes; TOC is not updateporc.sh")
 }
 
 pub fn refuse_s19k_aml_img_as_4cc0_or_uart_trans(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"uart_trans".len()).any(|w| w == b"uart_trans")
-        || blob.windows(b"bmminer_4cc0".len()).any(|w| w == b"bmminer_4cc0")
+    if blob
+        .windows(b"uart_trans".len())
+        .any(|w| w == b"uart_trans")
+        || blob
+            .windows(b"bmminer_4cc0".len())
+            .any(|w| w == b"bmminer_4cc0")
     {
         return Ok(());
     }
@@ -2903,7 +3616,9 @@ pub fn refuse_s19k_aml_android_boot_as_nandrecovery(magic: &[u8]) -> Result<(), 
     Ok(())
 }
 
-pub fn refuse_s19k_embedded_ini_as_operator_sd_ini(embedded_reboot: bool) -> Result<(), &'static str> {
+pub fn refuse_s19k_embedded_ini_as_operator_sd_ini(
+    embedded_reboot: bool,
+) -> Result<(), &'static str> {
     if !embedded_reboot {
         return Err(
             "embedded item-8 ini is reboot=0 package=aml_upgrade_package.img; operator zip ini is reboot=1 _enc",
@@ -2923,11 +3638,25 @@ pub fn refuse_s19k_cvctrl_sd2nand_as_aml_nand(
     Ok(())
 }
 
-pub fn refuse_stock_bmu_as_dcent_sysupgrade(
-    kind: S19kUpgradeBlobKind,
-) -> Result<(), &'static str> {
+pub fn refuse_stock_bmu_as_dcent_sysupgrade(kind: S19kUpgradeBlobKind) -> Result<(), &'static str> {
     if kind == S19kUpgradeBlobKind::StockBitmainBmu {
         return Err("stock update.bmu is daemonc→updateporc.sh; not a DCENT sysupgrade");
+    }
+    Ok(())
+}
+
+/// A classified DCENT sysupgrade tarball is still not an execute grant.
+/// Classification ≠ nandwrite. FLASH stays false.
+pub fn refuse_s19k_dcent_sysupgrade_execute_while_flash_false(
+    kind: S19kUpgradeBlobKind,
+) -> Result<(), &'static str> {
+    if kind == S19kUpgradeBlobKind::DcentSysupgradeTar && !CLEAR_FOR_FLASH {
+        return Err(
+            "sysupgrade-am3-s19k.tar is a DCENT blob; execute stays CLEAR_FOR_FLASH=false; refuse nandwrite",
+        );
+    }
+    if !CLEAR_FOR_FLASH {
+        return Err("upgrade execute stays CLEAR_FOR_FLASH=false; refuse nandwrite");
     }
     Ok(())
 }
@@ -3063,7 +3792,8 @@ pub fn admit_s19k_78_daemonc_elf(blob: &[u8]) -> Result<(), &'static str> {
     }
     let off = S19K_78_DAEMONC_PORC_STR_OFF as usize;
     if blob.len() < off + S19K_STOCK_UPDATEPORC_PATH.len()
-        || &blob[off..off + S19K_STOCK_UPDATEPORC_PATH.len()] != S19K_STOCK_UPDATEPORC_PATH.as_bytes()
+        || &blob[off..off + S19K_STOCK_UPDATEPORC_PATH.len()]
+            != S19K_STOCK_UPDATEPORC_PATH.as_bytes()
     {
         return Err("held .78 daemonc missing /usr/sbin/updateporc.sh at 0xf54");
     }
@@ -3087,14 +3817,14 @@ fn blob_str_at(blob: &[u8], off: u64, s: &str) -> bool {
 /// `daemons` binds `127.0.0.1` and `atoi("22322")`.
 pub fn admit_s19k_daemonc_listen_is_localhost_22322(blob: &[u8]) -> Result<(), &'static str> {
     admit_s19k_78_daemonc_elf(blob)?;
-    if !blob_str_at(blob, S19K_STOCK_DAEMONC_HOST_STR_OFF, S19K_STOCK_DAEMONC_LISTEN_HOST) {
-        return Err("daemonc missing 127.0.0.1 at 0x1414");
-    }
     if !blob_str_at(
         blob,
-        S19K_STOCK_DAEMONC_PORT_STR_OFF,
-        "22322",
+        S19K_STOCK_DAEMONC_HOST_STR_OFF,
+        S19K_STOCK_DAEMONC_LISTEN_HOST,
     ) {
+        return Err("daemonc missing 127.0.0.1 at 0x1414");
+    }
+    if !blob_str_at(blob, S19K_STOCK_DAEMONC_PORT_STR_OFF, "22322") {
         return Err("daemonc missing 22322 at 0x1420");
     }
     if S19K_STOCK_DAEMONC_LISTEN_PORT != 22322 {
@@ -3183,22 +3913,32 @@ pub fn refuse_s19k_daemonc_as_direct_nand_writer() -> Result<(), &'static str> {
 
 /// Held `mtd2_stock_system.bin` is NAND pages (ANDROID! @ 2MiB), not porc plaintext.
 pub fn refuse_s19k_mtd2_as_updateporc_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"updateporc".len()).any(|w| w == b"updateporc") {
+    if blob
+        .windows(b"updateporc".len())
+        .any(|w| w == b"updateporc")
+    {
         return Ok(());
     }
     Err("mtd2_stock_system.bin has 0 updateporc bytes; ANDROID! at 0x200000 is not a porc script")
 }
 
 pub fn refuse_s19k_mtd2_as_fileparser_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"FileParser".len()).any(|w| w == b"FileParser") {
+    if blob
+        .windows(b"FileParser".len())
+        .any(|w| w == b"FileParser")
+    {
         return Ok(());
     }
     Err("mtd2_stock_system.bin has 0 FileParser bytes")
 }
 
 pub fn refuse_s19k_mtd2_as_uart_trans_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"uart_trans".len()).any(|w| w == b"uart_trans")
-        || blob.windows(b"bmminer_4cc0".len()).any(|w| w == b"bmminer_4cc0")
+    if blob
+        .windows(b"uart_trans".len())
+        .any(|w| w == b"uart_trans")
+        || blob
+            .windows(b"bmminer_4cc0".len())
+            .any(|w| w == b"bmminer_4cc0")
         || blob.windows(b"4cc0".len()).any(|w| w == b"4cc0")
     {
         return Ok(());
@@ -3207,7 +3947,9 @@ pub fn refuse_s19k_mtd2_as_uart_trans_source(blob: &[u8]) -> Result<(), &'static
 }
 
 pub fn refuse_s19k_mtd2_as_bitmain_pub_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"bitmain.pub".len()).any(|w| w == b"bitmain.pub")
+    if blob
+        .windows(b"bitmain.pub".len())
+        .any(|w| w == b"bitmain.pub")
         || blob.windows(b"miner.pem".len()).any(|w| w == b"miner.pem")
         || blob.windows(b"daemonc".len()).any(|w| w == b"daemonc")
     {
@@ -3294,9 +4036,7 @@ pub fn refuse_s19k_mtd2_amlsecu_as_20231108(
     Ok(())
 }
 
-pub fn refuse_s19k_mtd2_amlsecu_as_factory(
-    kind: S19kAmlsecuImageKind,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_mtd2_amlsecu_as_factory(kind: S19kAmlsecuImageKind) -> Result<(), &'static str> {
     if matches!(
         kind,
         S19kAmlsecuImageKind::Mtd2Android1 | S19kAmlsecuImageKind::Mtd2Android2
@@ -3406,9 +4146,7 @@ pub fn admit_s19k_amlsecu_kind_matches_ramdisk(
         S19K_AMLSECU_KIND_RECOVERY => {
             Err("AMLSECU kind 2 (recovery-class) requires ramdisk_size=0")
         }
-        S19K_AMLSECU_KIND_BOOT => {
-            Err("AMLSECU kind 3 (boot-class) requires ramdisk_size>0")
-        }
+        S19K_AMLSECU_KIND_BOOT => Err("AMLSECU kind 3 (boot-class) requires ramdisk_size>0"),
         _ => Err("unknown AMLSECU declared_header_len; not an admitted boot/recovery class"),
     }
 }
@@ -3440,15 +4178,11 @@ pub fn refuse_s19k_factory_recovery_as_mtd2_a1() -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_factory_boot_as_mtd2_a2() -> Result<(), &'static str> {
-    Err(
-        "factory boot kind 3 ramdisk 0x686800 + 20231115; mtd2 A2 is ramdisk 0x662000 + 20211119",
-    )
+    Err("factory boot kind 3 ramdisk 0x686800 + 20231115; mtd2 A2 is ramdisk 0x662000 + 20211119")
 }
 
 pub fn refuse_s19k_20231108_as_mtd2_a2() -> Result<(), &'static str> {
-    Err(
-        "20231108 kind 3 ramdisk 0x66A000; mtd2 A2 is ramdisk 0x662000 + 20211119",
-    )
+    Err("20231108 kind 3 ramdisk 0x66A000; mtd2 A2 is ramdisk 0x662000 + 20211119")
 }
 
 /// Factory PARTITION/recovery does not fit `a lab unit` BOS mtd3 (UBI stock_config).
@@ -3470,7 +4204,10 @@ pub fn refuse_s19k_factory_recovery_item_as_78_bos_mtd3() -> Result<(), &'static
     )
 }
 
-pub fn refuse_s19k_s30v_mtd3_name_as_78_bos(s30v_name: &str, bos_name: &str) -> Result<(), &'static str> {
+pub fn refuse_s19k_s30v_mtd3_name_as_78_bos(
+    s30v_name: &str,
+    bos_name: &str,
+) -> Result<(), &'static str> {
     if s30v_name == S19K_S30V_MTD3_NAME && bos_name == S19K_78_MTD3_NAME {
         return Err("s30v mtd3 name recovery is not BOS stock_config");
     }
@@ -3489,9 +4226,7 @@ pub fn admit_s19k_factory_recovery_second_layout() -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_factory_recovery_second_as_boot_ramdisk() -> Result<(), &'static str> {
-    Err(
-        "factory recovery 0x5C1000 is second-stage 30720 B, not factory boot ramdisk 0x686800",
-    )
+    Err("factory recovery 0x5C1000 is second-stage 30720 B, not factory boot ramdisk 0x686800")
 }
 
 pub fn admit_s19k_factory_partition_subs(subs: &[&str]) -> Result<(), &'static str> {
@@ -3527,14 +4262,14 @@ pub fn refuse_s19k_factory_conf_as_partition_config(
     sub: &str,
 ) -> Result<(), &'static str> {
     if main == "conf" && (sub == "keys" || sub == "platform") {
-        return Err("conf/keys and conf/platform are AmlImagePack conf items, not PARTITION/config");
+        return Err(
+            "conf/keys and conf/platform are AmlImagePack conf items, not PARTITION/config",
+        );
     }
     Ok(())
 }
 
-pub fn refuse_s19k_factory_partition_sub_as_restock_slot(
-    sub: &str,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_factory_partition_sub_as_restock_slot(sub: &str) -> Result<(), &'static str> {
     if S19K_FACTORY_RESTOCK_MISSING.contains(&sub) {
         return Err("factory pack has no PARTITION item for this s30v/BOS restock slot");
     }
@@ -3570,9 +4305,7 @@ pub fn admit_s19k_android_name_empty(page0: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn admit_s19k_factory_boot_recovery_kernels_identical(
-    equal: bool,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_factory_boot_recovery_kernels_identical(equal: bool) -> Result<(), &'static str> {
     if equal {
         return Ok(());
     }
@@ -3584,9 +4317,7 @@ pub fn refuse_s19k_factory_recovery_second_as_boot_second() -> Result<(), &'stat
 }
 
 pub fn refuse_s19k_factory_recovery_second_as_meson1_enc() -> Result<(), &'static str> {
-    Err(
-        "factory recovery second is 30720 B head 68caf5a1; meson1_ENC is 29728 B head 5dc75d64",
-    )
+    Err("factory recovery second is 30720 B head 68caf5a1; meson1_ENC is 29728 B head 5dc75d64")
 }
 
 /// Held `mtd3_stock_config.bin` is UBI stock_config (ubi2), not porc plaintext.
@@ -3618,7 +4349,9 @@ pub fn admit_s19k_78_mtd3_is_ubi_stock_config(blob: &[u8]) -> Result<(), &'stati
         {
             return Err("mtd3 network.conf dent is at 3283392");
         }
-    } else if !blob.windows(S19K_78_MTD3_CGMINER_CONF.len()).any(|w| w == S19K_78_MTD3_CGMINER_CONF)
+    } else if !blob
+        .windows(S19K_78_MTD3_CGMINER_CONF.len())
+        .any(|w| w == S19K_78_MTD3_CGMINER_CONF)
         || !blob
             .windows(S19K_78_MTD3_NETWORK_CONF.len())
             .any(|w| w == S19K_78_MTD3_NETWORK_CONF)
@@ -3636,21 +4369,30 @@ pub fn admit_s19k_78_mtd3_geometry(len: usize) -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_mtd3_as_updateporc_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"updateporc".len()).any(|w| w == b"updateporc") {
+    if blob
+        .windows(b"updateporc".len())
+        .any(|w| w == b"updateporc")
+    {
         return Ok(());
     }
     Err("mtd3_stock_config.bin has 0 updateporc bytes; UBI stock_config is not a porc script")
 }
 
 pub fn refuse_s19k_mtd3_as_fileparser_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"FileParser".len()).any(|w| w == b"FileParser") {
+    if blob
+        .windows(b"FileParser".len())
+        .any(|w| w == b"FileParser")
+    {
         return Ok(());
     }
     Err("mtd3_stock_config.bin has 0 FileParser bytes")
 }
 
 pub fn refuse_s19k_mtd3_as_uart_trans_source(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"uart_trans".len()).any(|w| w == b"uart_trans") {
+    if blob
+        .windows(b"uart_trans".len())
+        .any(|w| w == b"uart_trans")
+    {
         return Ok(());
     }
     Err("mtd3_stock_config.bin has 0 uart_trans bytes; not 4cc0/uart_trans.ko")
@@ -3695,7 +4437,10 @@ pub fn refuse_s19k_78_mtd3_ubi_vol_as_s30v_recovery() -> Result<(), &'static str
 }
 
 pub fn refuse_s19k_78_nand_env_as_updateporc(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"updateporc".len()).any(|w| w == b"updateporc") {
+    if blob
+        .windows(b"updateporc".len())
+        .any(|w| w == b"updateporc")
+    {
         return Ok(());
     }
     Err("nand_env.bin has 0 updateporc; nandrecovery is recover_to_stock, not updateporc.sh")
@@ -3787,7 +4532,10 @@ pub fn refuse_s19k_s97_as_promote_01_to_03() -> Result<(), &'static str> {
 /// Stock CGI must invoke daemonc and stamp `/tmp/miner_act`. Not DCENT.
 /// 20231108 BMU is not a plaintext source of `updateporc.sh`.
 pub fn refuse_s19k_20231108_bmu_as_plaintext_porc(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"updateporc".len()).any(|w| w == b"updateporc") {
+    if blob
+        .windows(b"updateporc".len())
+        .any(|w| w == b"updateporc")
+    {
         return Ok(());
     }
     Err("20231108 BMU has no plaintext updateporc; payload @ 0x4000 is ciphertext, not a script")
@@ -3836,8 +4584,7 @@ pub const HELD_FILEPARSER_BYTES: usize = 20184;
 pub const HELD_ZYNQ_FILEPARSER_BYTES: usize = 23912;
 pub const HELD_FILEPARSER_MACHINE: u16 = 40;
 pub const HELD_FILEPARSER_NOT_BTMU: &str = "Not A Btmu File!";
-pub const HELD_FILEPARSER_TYPE_MISMATCH: &str =
-    "input miner_type and bmu miner type donot match!";
+pub const HELD_FILEPARSER_TYPE_MISMATCH: &str = "input miner_type and bmu miner type donot match!";
 pub const HELD_FILEPARSER_RSA_VERIFY: &str = "RSA_verify";
 pub const HELD_FILEPARSER_SHA256_INIT: &str = "SHA256_Init";
 pub const HELD_FILEPARSER_PEM_READ: &str = "PEM_read_bio_RSA_PUBKEY";
@@ -3903,7 +4650,9 @@ pub fn refuse_s19k_zynq_mtd0_update_marker(
 ) -> Result<(), &'static str> {
     let off = offset_hex.to_ascii_lowercase();
     if target_mtd == 0 && off.contains("1b00000") {
-        return Err("refuse Zynq update marker flash_erase /dev/mtd0 0x1B00000 on S19k (bootloader)");
+        return Err(
+            "refuse Zynq update marker flash_erase /dev/mtd0 0x1B00000 on S19k (bootloader)",
+        );
     }
     Ok(())
 }
@@ -3923,10 +4672,7 @@ pub const HELD_SD_FILEPARSER_BYTES: usize = 11620;
 pub const S19K_FILEPARSER_IN_78_EXTRACT: bool = false;
 pub const S19K_FILEPARSER_IN_AWESOME_AML_NAND: bool = false;
 
-pub fn admit_held_fileparser_names_datafile(
-    blob: &[u8],
-    off: usize,
-) -> Result<(), &'static str> {
+pub fn admit_held_fileparser_names_datafile(blob: &[u8], off: usize) -> Result<(), &'static str> {
     let n = b"datafile";
     if blob.len() < off + n.len() || &blob[off..off + n.len()] != n {
         return Err("FileParser blob does not name datafile at the pinned offset");
@@ -4115,11 +4861,15 @@ pub fn admit_s19k_backup(
 
 /// Admit a staged `--artifact-dir` file list. Accepts schema names **or**
 /// the installer aliases (`nand_env.bak`, `mtd5_pre_install.bin`).
-pub fn admit_s19k_backup_filenames(names: &[&str]) -> Result<S19kBackupCompleteness, S19kBackupAdmitError> {
+pub fn admit_s19k_backup_filenames(
+    names: &[&str],
+) -> Result<S19kBackupCompleteness, S19kBackupAdmitError> {
     let completeness = S19kBackupCompleteness {
         nand_env: names.iter().any(|n| S19K_BACKUP_NAND_ENV_NAMES.contains(n)),
         mtd5_window: names.iter().any(|n| S19K_BACKUP_MTD5_NAMES.contains(n)),
-        gpio437: names.iter().any(|n| *n == S19K_BACKUP_MANIFEST.gpio437_observed),
+        gpio437: names
+            .iter()
+            .any(|n| *n == S19K_BACKUP_MANIFEST.gpio437_observed),
         fw_printenv: names.iter().any(|n| S19K_BACKUP_FWENV_NAMES.contains(n)),
     };
     if !completeness.backup_complete() {
@@ -4244,15 +4994,11 @@ pub fn record_s19k_backup_board_target<'a>(
 }
 
 /// `--execute` requires a live-observed identity. Package/`--variant` is not that.
-pub fn refuse_s19k_restore_execute_package_identity(
-    source: &str,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_restore_execute_package_identity(source: &str) -> Result<(), &'static str> {
     if source.trim() == S19K_BOARD_TARGET_SOURCE_LIVE {
         Ok(())
     } else {
-        Err(
-            "restore --execute refuses board_target_source=package (invented from --variant)",
-        )
+        Err("restore --execute refuses board_target_source=package (invented from --variant)")
     }
 }
 
@@ -4538,6 +5284,139 @@ pub fn admit_s19k_restore_execute(
     Err(S19kRestoreError::ClearForFlashNotYet)
 }
 
+/// Restore *plan* may admit a hash-complete mtd5 nanddump while FLASH is
+/// false. Restore *execute* must still be ClearForFlashNotYet. Do not treat
+/// a passing plan as a NAND grant.
+pub fn refuse_s19k_restore_plan_as_execute_grant() -> Result<(), &'static str> {
+    let tools = S19kTargetTools {
+        dd: true,
+        sha256sum: true,
+        nanddump: true,
+        nandwrite: true,
+        flash_erase: true,
+        fw_printenv: true,
+        fw_setenv: true,
+    };
+    let backup = S19kBackupCompleteness {
+        nand_env: true,
+        mtd5_window: true,
+        gpio437: true,
+        fw_printenv: true,
+    };
+    if admit_s19k_restore_preinstall_window(
+        tools,
+        backup,
+        true,
+        5,
+        1,
+        S19kStockReturnKind::Mtd2StockSystem,
+        false,
+    )
+    .is_err()
+    {
+        return Err("restore plan must admit a hash-complete mtd5 nanddump");
+    }
+    match admit_s19k_restore_execute(
+        tools,
+        backup,
+        true,
+        5,
+        1,
+        S19kStockReturnKind::Mtd2StockSystem,
+        false,
+    ) {
+        Err(S19kRestoreError::ClearForFlashNotYet) => Ok(()),
+        Ok(_) => Err("restore execute must not grant NAND while CLEAR_FOR_FLASH is false"),
+        Err(_) => Err("restore execute must fail as ClearForFlashNotYet"),
+    }
+}
+
+/// `--backup-only` snapshots gpio437.value (read) and exits before SafeOff.
+pub fn admit_s19k_install_backup_reads_gpio437_before_safeoff(
+    script: &str,
+) -> Result<(), &'static str> {
+    let snap = script
+        .find("gpio437.value=$GPIO437_VAL")
+        .ok_or("backup must log gpio437.value snapshot")?;
+    let backup = script
+        .find("[BACKUP-ONLY]")
+        .ok_or("installer must have BACKUP-ONLY")?;
+    let safeoff = script
+        .find("gpio437 SafeOff OK")
+        .ok_or("execute path must name gpio437 SafeOff OK")?;
+    if !(snap < backup && backup < safeoff) {
+        return Err("order must be gpio437 snapshot, BACKUP-ONLY exit, then SafeOff");
+    }
+    if !script.contains("FLASH not started") {
+        return Err("BACKUP-ONLY must say FLASH not started");
+    }
+    Ok(())
+}
+
+/// The executable backup lane must never materialize `/dev/nand_env` in a
+/// predictable target-side path.  Even with NAND writes disabled, a stale
+/// `/tmp` symlink would turn `dd of=/tmp/...` into an arbitrary root write.
+/// Two direct SSH streams into the private host artifact directory provide
+/// both no-clobber target behavior and a stable duplicate-read witness.
+pub fn admit_s19k_install_backup_host_streams_nand_env(script: &str) -> Result<(), &'static str> {
+    const STREAM: &str = "ssh_stream_get \"dd if=/dev/nand_env bs=64K count=1 2>/dev/null\"";
+    if script.matches(STREAM).count() != 2 {
+        return Err("installer must host-stream two independent nand_env reads");
+    }
+    if script.contains("dd if=/dev/nand_env of=")
+        || script.contains("/tmp/nand_env_pre.bin")
+        || script.contains("/tmp/dcentos_root_readback.uimage")
+        || script.contains("scp_get()")
+    {
+        return Err("installer must not use predictable target-side backup/readback files");
+    }
+    if !script.contains("duplicate host-streamed nand_env backup SHA mismatch")
+        || !script.contains("host-streamed rootfs readback failed")
+    {
+        return Err("installer must hash-admit duplicate nand_env and streamed rootfs reads");
+    }
+    Ok(())
+}
+
+/// Package validation/staging happens before the intentionally unreachable
+/// NAND writer, so it must itself be a no-clobber transaction.  A fixed
+/// `/data` leaf can be a stale symlink and `rm -rf /data/sysupgrade` can erase
+/// unrelated operator state even when `CLEAR_FOR_FLASH=false`.
+pub fn admit_s19k_install_remote_staging_is_content_bound(
+    script: &str,
+) -> Result<(), &'static str> {
+    if script.contains("/data/dcentos-sysupgrade.tar")
+        || script.contains("rm -rf /data/sysupgrade")
+        || script.contains("/data/.dcent_stage_check")
+    {
+        return Err("installer must not use or delete shared remote staging paths");
+    }
+    for required in [
+        "DCENT_REQUIRE_INSTALLABLE_PACKAGE=1",
+        "REMOTE_STAGE_DIR=\"/data/.dcentos-sysupgrade-$LOCAL_SHA\"",
+        "[ ! -e '$REMOTE_STAGE_DIR' ]",
+        "[ ! -L '$REMOTE_STAGE_DIR' ]",
+        "mkdir '$REMOTE_STAGE_DIR'",
+        "REMOTE_BUNDLE=\"$REMOTE_STAGE_DIR/bundle.tar\"",
+        "REMOTE_EXTRACT=\"$REMOTE_STAGE_DIR/extracted\"",
+        "tar xf '$REMOTE_BUNDLE' -C '$REMOTE_EXTRACT'",
+    ] {
+        if !script.contains(required) {
+            return Err("installer lacks the exact content-bound remote staging transaction");
+        }
+    }
+    let require_installable = script
+        .find("DCENT_REQUIRE_INSTALLABLE_PACKAGE=1")
+        .ok_or("installer must require installable package authority")?;
+    let scp = script
+        .find("scp_put \"$FIRMWARE\"")
+        .ok_or("installer must have a package staging boundary")?;
+    if require_installable > scp {
+        return Err("installable package authority must precede every remote stage");
+    }
+    Ok(())
+}
+
 /// Execute path: after RESTORE confirm, refuse GPIO/NAND while FLASH-false.
 pub fn admit_s19k_restore_script_execute_refuses_nandwrite(
     script: &str,
@@ -4572,6 +5451,25 @@ pub fn admit_s19k_restore_script_execute_refuses_nandwrite(
     }
     if refuse > nw {
         return Err("execute refuse must precede nandwrite");
+    }
+    Ok(())
+}
+
+/// Even the currently unreachable restore writer must keep readback inside the
+/// private transaction directory. A fixed `/tmp` leaf can be an attacker- or
+/// stale-run-controlled symlink if mutation authority is ever enabled.
+pub fn admit_s19k_restore_script_private_readback(script: &str) -> Result<(), &'static str> {
+    if script.contains("/tmp/mtd5_restore_readback.bin") {
+        return Err("restore must not write readback through a fixed /tmp leaf");
+    }
+    for required in [
+        "RESTORE_TMP=$(mktemp -d",
+        "\"$RESTORE_TMP/mtd5_restore_readback.bin\"",
+        "trap cleanup_restore_tmp EXIT",
+    ] {
+        if !script.contains(required) {
+            return Err("restore lacks private readback transaction binding");
+        }
     }
     Ok(())
 }
@@ -4623,8 +5521,36 @@ pub fn admit_s19k_restore_script_execute_requires_proc_mtd(
     Ok(())
 }
 
-/// : recovery-flag `--execute` must not flash_erase/nandwrite while FLASH-false.
-/// Order: EXECUTE env < FLASH refuse < board_target/gpio < flash_erase/nandwrite.
+/// Plan output may describe only an offline full-eraseblock candidate and
+/// complete readback; it must never teach the retired one-byte NAND recipe.
+fn admit_s19k_recovery_flag_full_block_plan_contract(script: &str) -> Result<(), &'static str> {
+    for field in [
+        "candidate_required=full-0x20000-byte-eraseblock",
+        "candidate_source=host-fixture-only",
+        "write_command=false",
+        "readback_required=full-0x20000-byte-sha256-and-byte-compare",
+    ] {
+        if script.matches(field).count() != 3 {
+            return Err("all three recovery-flag plans must require the exact full-block contract");
+        }
+    }
+    if script.contains("dry_flash_erase=")
+        || script.contains("dry_nandwrite=")
+        || script.contains("| nandwrite")
+    {
+        return Err("recovery-flag plans must not publish a retired one-byte NAND writer recipe");
+    }
+    if script.contains("byte_in_block must be 0")
+        || !script.contains("EB_OFF=$((LOCAL_DEC % ERASESIZE))")
+        || !script.contains("seek=\"$EB_OFF\"")
+    {
+        return Err("fixture-only recovery-flag plans must preserve arbitrary in-block offsets");
+    }
+    Ok(())
+}
+
+/// Recovery-flag execute is retired: env opt-in < exact live identity <
+/// unconditional FLASH refusal, with no executable GPIO/erase/write tail.
 pub fn admit_s19k_recovery_flag_script_execute_refuses_nandwrite(
     script: &str,
 ) -> Result<(), &'static str> {
@@ -4632,41 +5558,36 @@ pub fn admit_s19k_recovery_flag_script_execute_refuses_nandwrite(
     {
         return Err("recovery-flag execute must refuse CLEAR_FOR_FLASH before GPIO/NAND");
     }
-    if !script.contains("missing live /etc/dcentos/board_target") {
-        return Err("recovery-flag execute must refuse missing live board_target");
+    if !script.contains("missing exact live platform:target identity")
+        || !script.contains("am3-aml-s19k:am3-s19k")
+    {
+        return Err("recovery-flag execute must require exact live S19k platform:target");
+    }
+    if !script.contains("one_byte_execute_retired=true")
+        || !script.contains("full_eraseblock_candidate_required=true")
+    {
+        return Err("one-byte execute must be retired in favor of a full-block candidate");
+    }
+    admit_s19k_recovery_flag_full_block_plan_contract(script)?;
+    if script.contains("mode=execute-eraseblock-rewrite")
+        || script.contains("nand=erased+programmed")
+        || script.contains("\nif ! flash_erase /dev/mtd5")
+        || script.contains("\nif ! printf '\\002' | nandwrite")
+        || script.contains("SYS=/sys/class/gpio")
+    {
+        return Err("retired recovery-flag helper retains executable GPIO/NAND code");
     }
     let env_gate = script
         .find(r#"if [ "${DCENT_S19K_RECOVERY_FLAG_EXECUTE:-0}" != 1 ]"#)
         .ok_or("missing recovery-flag EXECUTE env gate")?;
+    let identity = script
+        .find("missing exact live platform:target identity")
+        .ok_or("missing recovery-flag exact identity refuse")?;
     let refuse = script
         .find("CLEAR_FOR_FLASH=false — refusing")
         .ok_or("missing recovery-flag execute refuse")?;
-    let board = script
-        .find("missing live /etc/dcentos/board_target")
-        .ok_or("missing recovery-flag board_target refuse")?;
-    let gpio = script
-        .find("gpio437 SafeOff (am3-s19k-active-low, value=1)")
-        .ok_or("missing recovery-flag gpio SafeOff")?;
-    let erase = script
-        .find(r#"flash_erase /dev/mtd5 "$EB_START_HEX" 1"#)
-        .ok_or("missing execute flash_erase")?;
-    let nw = script
-        .find(r#"nandwrite -p -s "$EB_START_HEX" /dev/mtd5"#)
-        .ok_or("missing execute nandwrite")?;
-    if refuse < env_gate {
-        return Err("execute refuse must follow EXECUTE env gate");
-    }
-    if refuse > board {
-        return Err("execute refuse must precede board_target check");
-    }
-    if refuse > gpio {
-        return Err("execute refuse must precede GPIO SafeOff");
-    }
-    if refuse > erase {
-        return Err("execute refuse must precede flash_erase");
-    }
-    if refuse > nw {
-        return Err("execute refuse must precede nandwrite");
+    if !(env_gate < identity && identity < refuse) {
+        return Err("execute order must be env opt-in < exact identity < FLASH refusal");
     }
     Ok(())
 }
@@ -4679,9 +5600,7 @@ pub const S19K_REVERT_SIZE_SUM_FLAG: u64 = 0x0530_0000;
 pub const S19K_REVERT_ADMITTED_ROOTFS_LOCAL: u64 = 0x0510_0000;
 
 /// Live SKU must exist. Missing is fail-open on Braiins / stock.
-pub fn admit_s19k_stock_revert_live_board_target(
-    live: Option<&str>,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_stock_revert_live_board_target(live: Option<&str>) -> Result<(), &'static str> {
     let live = live.map(str::trim).filter(|s| !s.is_empty());
     let Some(live) = live else {
         return Err("stock revert refuses missing live /etc/dcentos/board_target");
@@ -4694,13 +5613,9 @@ pub fn admit_s19k_stock_revert_live_board_target(
 }
 
 /// `/tmp` bench deploy is not a NAND install; refuse stock nandwrite.
-pub fn refuse_s19k_stock_revert_tmp_deploy_stamp(
-    stamp_present: bool,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_stock_revert_tmp_deploy_stamp(stamp_present: bool) -> Result<(), &'static str> {
     if stamp_present {
-        return Err(
-            "stock revert refuses /etc/dcentos/tmp_deploy leftover from /tmp bench deploy",
-        );
+        return Err("stock revert refuses /etc/dcentos/tmp_deploy leftover from /tmp bench deploy");
     }
     Ok(())
 }
@@ -4709,9 +5624,7 @@ pub fn refuse_s19k_stock_revert_tmp_deploy_stamp(
 /// physical-base local `0x05100000`.
 pub fn admit_s19k_stock_revert_rootfs_offset(offset: u64) -> Result<u64, &'static str> {
     if offset == S19K_REVERT_SIZE_SUM_WINDOW || offset == S19K_REVERT_SIZE_SUM_FLAG {
-        return Err(
-            "0x05700000/0x05300000 is size-sum pairing; refuse as revert nandwrite base",
-        );
+        return Err("0x05700000/0x05300000 is size-sum pairing; refuse as revert nandwrite base");
     }
     if offset == S19K_78_MTD5_SIZE_SUM {
         return Err("0x06100000 is size-sum without hole; refuse as revert base");
@@ -4746,8 +5659,8 @@ pub fn admit_s19k_stock_revert_uimage(
     if hdr.ih_arch != UIMAGE_ARCH_ARM64 {
         return Err("S19k AML revert uImage must be IH_ARCH_ARM64 (22)");
     }
-    if u64::from(hdr.ih_size) + 64 > file_len {
-        return Err("uImage ih_size + 64 exceeds file length");
+    if u64::from(hdr.ih_size) + 64 != file_len {
+        return Err("uImage file length must exactly equal ih_size + 64");
     }
     Ok(hdr)
 }
@@ -4787,7 +5700,7 @@ pub fn admit_s19k_stock_image_revert(
 }
 
 /// `a lab unit` local flag is `0x04D00000` on physical mtd5 `0x06700000`. Size-sum yields
-/// `0x04D00000` — that must not be used on a `a lab unit` mtd5 base.
+/// `0x05300000` — that must not be used on a `a lab unit` mtd5 base.
 pub fn admit_s19k_recovery_flag_offset(
     mtd5_base: u64,
     claimed_local: u64,
@@ -4902,25 +5815,16 @@ pub fn plan_s19k_recovery_flag_eraseblock(
 
 /// Raw one-byte poke cannot update NAND; only an eraseblock rewrite can.
 pub fn refuse_s19k_recovery_flag_raw_byte_poke() -> Result<(), &'static str> {
-    Err(
-        "am3-s19k recovery flag needs a 128 KiB eraseblock rewrite; refuse raw one-byte nandwrite",
-    )
+    Err("am3-s19k recovery flag needs a 128 KiB eraseblock rewrite; refuse raw one-byte nandwrite")
 }
 
-/// S99upgrade-style `printf | nandwrite -p -s` after erase is only valid
-/// when the flag byte sits at the start of the eraseblock (`a lab unit` is 0).
-pub fn admit_s19k_recovery_flag_aligned_one_byte_after_erase(
-    byte_in_block: u32,
-) -> Result<(), &'static str> {
-    if byte_in_block != 0 {
-        return Err(
-            "unaligned recovery-flag byte needs a full 128 KiB rewrite; refuse one-byte nandwrite",
-        );
-    }
-    Ok(())
+/// An erase followed by a one-byte NAND program is retired even when the byte
+/// is block-aligned. S99 and host fixtures preserve the complete eraseblock.
+pub fn refuse_s19k_recovery_flag_one_byte_after_erase() -> Result<(), &'static str> {
+    Err("recovery-flag update requires a full 128 KiB candidate and readback; refuse one-byte nandwrite")
 }
 
-/// Host-testable 128 KiB rewrite. Does not flash. Live execute stays env-gated.
+/// Host-testable 128 KiB rewrite. Does not flash; live execute is refused.
 pub fn rewrite_s19k_recovery_flag_eraseblock(
     block: &[u8],
     byte_in_block: u32,
@@ -5003,9 +5907,8 @@ pub fn admit_s19k_install_commit_plan(plan: &str) -> Result<(), &'static str> {
 }
 
 /// : flag helper plans 0x01 InstallArm and rewrites a host fixture.
-pub fn admit_s19k_recovery_flag_script_plans_install_arm(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_recovery_flag_script_plans_install_arm(script: &str) -> Result<(), &'static str> {
+    admit_s19k_recovery_flag_full_block_plan_contract(script)?;
     if !script.contains("schema=dcentos.amlogic-install-commit/v1") {
         return Err("flag helper must emit rust install-commit schema");
     }
@@ -5034,17 +5937,14 @@ pub fn admit_s19k_recovery_flag_script_plans_install_arm(
     let exec_refuse = script
         .find("recovery flag 0x01 execute is FLASH NOT_YET")
         .ok_or("missing 0x01 execute refuse")?;
-    let erase = script
-        .find(r#"flash_erase /dev/mtd5 "$EB_START_HEX" 1"#)
-        .ok_or("missing 0x02 execute flash_erase")?;
     if poke < helper {
         return Err("0x01 poke must live in shared fixture helper");
     }
     if helper > plan {
         return Err("shared fixture helper must precede InstallArm plan");
     }
-    if exec_refuse > erase {
-        return Err("0x01 execute refuse must precede NAND flash_erase");
+    if exec_refuse > plan {
+        return Err("0x01 execute refusal must precede the non-executable plan");
     }
     if script.contains("recovery flag 0x01 is FLASH NOT_YET here (use INSTALL_COMMIT_PLAN)") {
         return Err("flag helper must plan 0x01 instead of bouncing to installer");
@@ -5104,6 +6004,7 @@ pub fn admit_s19k_successful_flag_plan(plan: &str) -> Result<(), &'static str> {
 pub fn admit_s19k_recovery_flag_script_plans_successful_keep_bos(
     script: &str,
 ) -> Result<(), &'static str> {
+    admit_s19k_recovery_flag_full_block_plan_contract(script)?;
     if !script.contains("schema=dcentos.amlogic-successful-flag/v1") {
         return Err("flag helper must emit rust successful-flag schema");
     }
@@ -5134,17 +6035,14 @@ pub fn admit_s19k_recovery_flag_script_plans_successful_keep_bos(
     let exec_refuse = script
         .find("recovery flag 0x03 execute is FLASH NOT_YET")
         .ok_or("missing 0x03 execute refuse")?;
-    let erase = script
-        .find(r#"flash_erase /dev/mtd5 "$EB_START_HEX" 1"#)
-        .ok_or("missing 0x02 execute flash_erase")?;
     if poke < helper {
         return Err("0x03 poke must live in shared fixture helper");
     }
     if helper > plan {
         return Err("shared fixture helper must precede SuccessfulKeepBos plan");
     }
-    if exec_refuse > erase {
-        return Err("0x03 execute refuse must precede NAND flash_erase");
+    if exec_refuse > plan {
+        return Err("0x03 execute refusal must precede the non-executable plan");
     }
     Ok(())
 }
@@ -5163,22 +6061,14 @@ pub fn admit_s19k_recovery_flag_script_shares_fixture_rewrite(
     let helper = script
         .find("rewrite_recovery_flag_fixture()")
         .ok_or("missing shared fixture helper")?;
-    for (name, poke) in [
-        ("0x01", "printf '\\001'"),
-        ("0x02", "printf '\\002'"),
-        ("0x03", "printf '\\003'"),
-    ] {
+    for poke in ["printf '\\001'", "printf '\\002'", "printf '\\003'"] {
         let at = script.find(poke).ok_or("missing shared fixture poke")?;
         if at < helper {
             return Err("fixture poke must live in shared helper");
         }
         let n = script.matches(poke).count();
-        if name == "0x02" {
-            if !(1..=2).contains(&n) {
-                return Err("0x02 poke is helper plus optional execute nandwrite");
-            }
-        } else if n != 1 {
-            return Err("0x01/0x03 fixture poke must exist once in the shared helper");
+        if n != 1 {
+            return Err("each fixture poke must exist once in the shared helper");
         }
     }
     if script.matches("rewrite_recovery_flag_fixture").count() < 4 {
@@ -5236,8 +6126,11 @@ pub fn admit_s19k_s99_identity_wal_does_not_block_03(script: &str) -> Result<(),
     if !script.contains("s19k_firstboot_is_wal_companion_only") {
         return Err("S99 must classify S19k firstboot as WAL companion only");
     }
-    if !script.contains("am3-s19k|am3-s19kpro|am3-aml-s19kpro") {
-        return Err("S19k WAL companion must name live S19k identities");
+    if !script.contains("am3-aml-s19k:am3-s19k") {
+        return Err("S19k WAL companion must require the exact live platform:target pair");
+    }
+    if !script.contains("require_amlogic_ota08_identity || return 1") {
+        return Err("S19k WAL companion must pass the shared exact live identity gate");
     }
     if !script.contains("proceeding to 0x02->0x03") {
         return Err("S19k WAL failure must proceed to 0x02->0x03");
@@ -5270,9 +6163,7 @@ pub fn admit_s21_s97_identical_to_78(s21: &str, s78: &str) -> Result<(), &'stati
 }
 
 pub fn refuse_s21_androidboot_firstboot_as_uboot_firstboot() -> Result<(), &'static str> {
-    Err(
-        "S21 dmesg androidboot.firstboot=1 is kernel cmdline, not fw_setenv firstboot / bootcmd",
-    )
+    Err("S21 dmesg androidboot.firstboot=1 is kernel cmdline, not fw_setenv firstboot / bootcmd")
 }
 
 pub fn refuse_s21_held_s97_as_firstboot_bootcmd() -> Result<(), &'static str> {
@@ -5283,8 +6174,8 @@ pub fn refuse_s21_held_s97_as_firstboot_bootcmd() -> Result<(), &'static str> {
 
 /// DCENT `S99upgrade::commit_recovery_flag` promotes `0x02 → 0x03`.
 pub fn admit_s19k_s99_promotes_02_to_03(script: &str) -> Result<(), &'static str> {
-    if !script.contains("printf '\\x3'") {
-        return Err("S99 must printf 0x03");
+    if !script.contains("printf '\\003'") {
+        return Err("S99 must patch the preserved eraseblock with 0x03");
     }
     if !script.contains("expected 0x03") {
         return Err("S99 must readback 0x03");
@@ -5295,44 +6186,62 @@ pub fn admit_s19k_s99_promotes_02_to_03(script: &str) -> Result<(), &'static str
     if !script.contains("0x05300000") {
         return Err("S99 must refuse naive 0x05300000");
     }
-    if !script.contains("flash_erase") || !script.contains("nandwrite -p -s") {
-        return Err("S99 must erase+nandwrite the flag eraseblock");
+    if !script.contains("--bb=padbad --omitoob")
+        || !script.contains("eraseblock.before-duplicate.bin")
+        || !script.contains("cmp -s \"$FLAG_BEFORE\" \"$FLAG_BEFORE_2\"")
+    {
+        return Err("S99 must duplicate-read a physical-offset-preserving eraseblock snapshot");
+    }
+    if !script.contains("flash_erase \"$RECOVERY_MTD\" \"$ERASEBLOCK_START\" 1")
+        || !script
+            .contains("nandwrite -p -s \"$ERASEBLOCK_START\" \"$RECOVERY_MTD\" \"$FLAG_EXPECTED\"")
+    {
+        return Err("S99 must erase+nandwrite the complete preserved flag eraseblock");
+    }
+    if !script.contains("cmp -s \"$FLAG_EXPECTED\" \"$FLAG_READBACK\"") {
+        return Err("S99 must compare the complete eraseblock readback");
     }
     Ok(())
 }
 
-/// Sealed Amlogic overlay identities that may run the OTA-08 flag write.
-/// Same set as S37 GPIO437 (S19k SafeOff=1 plus S21-class SafeOff=0).
+/// Exact live Amlogic platform:target pairs that may run the OTA-08 flag write.
+/// T21 is deliberately excluded: its controller-specific flash geometry and
+/// recovery-flag contract have not been reconstructed.
 pub const S99_AMLOGIC_OTA08_IDENTITIES: &[&str] = &[
-    "am3-s19k",
-    "am3-s19kpro",
-    "am3-aml-s19kpro",
-    "am3-s19jpro-aml",
-    "am3-s21",
-    "am3-s21pro",
-    "am3-s21xp",
-    "am3-t21",
+    "am3-aml-s19k:am3-s19k",
+    "am3-aml-s19jpro:am3-s19jpro-aml",
+    "am3-aml-s21:am3-s21",
+    "am3-aml-s21pro:am3-s21pro",
 ];
 
 /// : OTA-08 stays, but identity + pre/post readback must fail closed.
-pub fn admit_s19k_s99_ota08_identity_and_readback(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_s99_ota08_identity_and_readback(script: &str) -> Result<(), &'static str> {
     admit_s19k_s99_promotes_02_to_03(script)?;
     if !script.contains("AMLOGIC_RAW_NAND_RECOVERY_FLAG_EXCEPTION") {
         return Err("OTA-08 exception must stay named");
     }
     if !script.contains("require_amlogic_ota08_identity") {
-        return Err("S99 OTA-08 must require a sealed Amlogic board_target");
+        return Err("S99 OTA-08 must require a sealed Amlogic platform:target pair");
+    }
+    if !script.contains("missing live $PLATFORM_FILE") {
+        return Err("S99 OTA-08 must refuse missing live platform");
     }
     if !script.contains("missing live $BOARD_TARGET_FILE") {
         return Err("S99 OTA-08 must refuse missing live board_target");
     }
-    if !script.contains("am3-s19k|am3-s19kpro|am3-aml-s19kpro") {
-        return Err("S99 OTA-08 must admit am3-s19k aliases");
+    if !script.contains("am3-aml-s19k:am3-s19k") {
+        return Err("S99 OTA-08 must admit only the canonical S19k platform:target pair");
     }
-    if !script.contains("am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp|am3-t21") {
-        return Err("S99 OTA-08 must admit shared Amlogic overlay identities");
+    for pair in S99_AMLOGIC_OTA08_IDENTITIES {
+        if !script.contains(pair) {
+            return Err("S99 OTA-08 is missing an exact shared Amlogic platform:target pair");
+        }
+    }
+    if script.contains("am3-aml-s21xp:am3-s21xp") {
+        return Err("S99 OTA-08 must not admit S21 XP without exact recovery geometry");
+    }
+    if script.contains("am3-aml-t21:am3-t21") {
+        return Err("S99 OTA-08 must not admit T21 without exact recovery geometry");
     }
     if !script.contains("OLD=$(read_recovery_flag)") {
         return Err("S99 OTA-08 must pre-read the flag before erase");
@@ -5353,7 +6262,7 @@ pub fn admit_s19k_s99_ota08_identity_and_readback(
         .find("flash_erase \"$RECOVERY_MTD\"")
         .ok_or("missing OTA-08 flash_erase")?;
     let nw = script
-        .find("nandwrite -p -s \"$RECOVERY_FLAG_OFFSET\"")
+        .find("nandwrite -p -s \"$ERASEBLOCK_START\"")
         .ok_or("missing OTA-08 nandwrite")?;
     let new = script
         .find("NEW=$(read_recovery_flag)")
@@ -5377,9 +6286,7 @@ pub fn admit_s19k_s99_leftover_01_is_error(script: &str) -> Result<(), &'static 
     if script.contains("[WARN] recovery flag = 0x01") {
         return Err("leftover 0x01 must not be WARN");
     }
-    if !script.contains(
-        "ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace",
-    ) {
+    if !script.contains("ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace") {
         return Err("leftover 0x01 must be ERROR");
     }
     if script.contains("0x01 -> 0x03") {
@@ -5412,9 +6319,7 @@ pub fn admit_s19k_s99_leftover_01_is_error(script: &str) -> Result<(), &'static 
 
 /// : unread (`ERR_*`) and unexpected flag values are ERROR, not WARN.
 /// They must not promote to 0x03. Start already exits 0 when mtd5 is absent.
-pub fn admit_s19k_s99_unread_or_unexpected_flag_is_error(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_s99_unread_or_unexpected_flag_is_error(script: &str) -> Result<(), &'static str> {
     if script.contains("[WARN] could not read recovery flag") {
         return Err("unread flag must not be WARN");
     }
@@ -5500,6 +6405,10 @@ bootcmd_reads_firstboot=false\n\
 bootm_mtd2=false\n\
 mix_flag_02=false\n\
 uimage_write_is_not_recover_to_stock=true\n\
+legacy_uimage_classifier_only=true\n\
+uimage_crc_verified=false\n\
+stock_payload_identity_verified=false\n\
+vendor_factory_sd_is_only_evidence_bound_stock_route=true\n\
 stock_return=recover_env_nandrecovery\n\
 recover_env_source=nandrecovery_env.bin\n\
 recover_env_ram=0x01060000\n\
@@ -5525,6 +6434,10 @@ pub fn admit_s19k_stock_image_revert_plan(plan: &str) -> Result<(), &'static str
         "bootcmd_reads_firstboot=false",
         "bootm_mtd2=false",
         "mix_flag_02=false",
+        "legacy_uimage_classifier_only=true",
+        "uimage_crc_verified=false",
+        "stock_payload_identity_verified=false",
+        "vendor_factory_sd_is_only_evidence_bound_stock_route=true",
         "stock_return=recover_env_nandrecovery",
         "recover_env_source=nandrecovery_env.bin",
         "recover_env_ram=0x01060000",
@@ -5546,9 +6459,7 @@ pub fn admit_s19k_stock_image_revert_plan(plan: &str) -> Result<(), &'static str
 }
 
 /// S19k revert helper must refuse firstboot-only and name recover_env.
-pub fn admit_s19k_revert_script_refuses_firstboot_only(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_revert_script_refuses_firstboot_only(script: &str) -> Result<(), &'static str> {
     if script.contains("\nfw_setenv firstboot 1\n") {
         return Err("revert must not execute fw_setenv firstboot 1");
     }
@@ -5576,10 +6487,41 @@ pub fn admit_s19k_revert_script_refuses_firstboot_only(
     Ok(())
 }
 
+/// The evidence-only classifier runs before `CLEAR_FOR_FLASH=false`; it must
+/// not delete a shared `/tmp` directory or overwrite a fixed plan symlink.
+pub fn admit_s19k_revert_script_private_transaction(script: &str) -> Result<(), &'static str> {
+    for forbidden in [
+        "/tmp/stock_extract",
+        "/tmp/REVERT_COMMIT_PLAN.txt",
+        "/tmp/stock_firmware_am3_aml_s19k",
+    ] {
+        if script.contains(forbidden) {
+            return Err("stock-revert classifier must not use shared fixed /tmp paths");
+        }
+    }
+    for required in [
+        "REVERT_TMP=$(mktemp -d",
+        "REVERT_PLAN=\"$REVERT_TMP/REVERT_COMMIT_PLAN.txt\"",
+        "PRIVATE_FW=\"$REVERT_TMP/stock-candidate.tar.gz\"",
+        "trap cleanup_revert_tmp EXIT",
+        "cat \"$REVERT_PLAN\"",
+        "MAX_ARCHIVE_BYTES=67108864",
+        "(ulimit -f 2048 && tar -tzf \"$PRIVATE_FW\" > \"$TOC\")",
+        "(ulimit -f 81920 && tar -xOzf \"$PRIVATE_FW\" -- \"$UIMAGE_MEMBER\"",
+        "/*|-*|*/-*|..|../*|*/..|*/../*)",
+        "firmware archive must contain exactly one uImage-like candidate",
+        "POST_EXTRACT_SHA256=$(sha256sum \"$PRIVATE_FW\"",
+        "does not exactly equal 64+ih_size",
+    ] {
+        if !script.contains(required) {
+            return Err("stock-revert classifier lacks a private transaction boundary");
+        }
+    }
+    Ok(())
+}
+
 /// : `--dry-run` writes the commit plan before GPIO/nandwrite.
-pub fn admit_s19k_revert_script_dry_run_before_nandwrite(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_revert_script_dry_run_before_nandwrite(script: &str) -> Result<(), &'static str> {
     if !script.contains("--dry-run") {
         return Err("revert must accept --dry-run");
     }
@@ -5592,13 +6534,11 @@ pub fn admit_s19k_revert_script_dry_run_before_nandwrite(
     if !script.contains("nandwrite=false") {
         return Err("dry-run plan must set nandwrite=false");
     }
-    let dry = script
-        .find("[DRY RUN]")
-        .ok_or("missing DRY RUN marker")?;
-    let nw = script
-        .find("nandwrite -p -s")
-        .ok_or("missing nandwrite")?;
-    let gpio = script.find("gpio437 SafeOff").ok_or("missing gpio SafeOff")?;
+    let dry = script.find("[DRY RUN]").ok_or("missing DRY RUN marker")?;
+    let nw = script.find("nandwrite -p -s").ok_or("missing nandwrite")?;
+    let gpio = script
+        .find("gpio437 SafeOff")
+        .ok_or("missing gpio SafeOff")?;
     if dry > nw {
         return Err("dry-run block must precede nandwrite");
     }
@@ -5619,12 +6559,16 @@ pub fn refuse_s19k_revert_nandwrite_without_recover_commit() -> Result<(), &'sta
 pub fn admit_s19k_revert_script_execute_refuses_nandwrite(
     script: &str,
 ) -> Result<(), &'static str> {
-    if !script.contains("CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/nandwrite/fw_setenv")
-    {
+    if !script.contains("CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/nandwrite/fw_setenv") {
         return Err("execute must refuse CLEAR_FOR_FLASH before GPIO/NAND");
     }
     if !script.contains("write_revert_commit_plan false false") {
         return Err("execute refuse must write plan nandwrite=false");
+    }
+    if !script.contains("missing exact live platform:target identity")
+        || !script.contains("am3-aml-s19k:am3-s19k")
+    {
+        return Err("revert must require exact live S19k platform:target before NAND");
     }
     let confirm = script
         .find("Type 'REVERT'")
@@ -5632,10 +6576,10 @@ pub fn admit_s19k_revert_script_execute_refuses_nandwrite(
     let refuse = script
         .find("CLEAR_FOR_FLASH=false — refusing")
         .ok_or("missing execute refuse")?;
-    let nw = script
-        .find("nandwrite -p -s")
-        .ok_or("missing nandwrite")?;
-    let gpio = script.find("gpio437 SafeOff").ok_or("missing gpio SafeOff")?;
+    let nw = script.find("nandwrite -p -s").ok_or("missing nandwrite")?;
+    let gpio = script
+        .find("gpio437 SafeOff")
+        .ok_or("missing gpio SafeOff")?;
     if refuse < confirm {
         return Err("execute refuse must follow REVERT confirm");
     }
@@ -5707,7 +6651,7 @@ pub fn admit_s19k_install_script_writes_install_commit_geometry(
         .find("write_install_commit_plan \"dry_run=true\"")
         .ok_or("missing dry-run commit-plan write")?;
     let flash = script
-        .find("CLEAR_FOR_FLASH=false — refusing flash_erase/nandwrite/fw_setenv")
+        .find("CLEAR_FOR_FLASH=false - refusing flash_erase/nandwrite/fw_setenv")
         .ok_or("missing FLASH refuse")?;
     let flash_slice = &script[flash..];
     if !flash_slice.contains("write_install_commit_plan") {
@@ -5778,9 +6722,7 @@ pub fn admit_s19k_install_script_writes_recover_to_stock_plan(
 }
 
 /// : installer must run recover --dry-run and refuse backup if it fails.
-pub fn admit_s19k_install_script_runs_recover_dry_run(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_install_script_runs_recover_dry_run(script: &str) -> Result<(), &'static str> {
     if !script.contains("recover_amlogic_to_stock.sh") {
         return Err("installer must name recover-to-stock runner");
     }
@@ -5824,9 +6766,7 @@ pub fn admit_s19k_install_script_runs_recover_dry_run(
 }
 
 /// : installer must slice the flag eraseblock and walk 0x01 fixture.
-pub fn admit_s19k_install_script_runs_flag_01_fixture(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_install_script_runs_flag_01_fixture(script: &str) -> Result<(), &'static str> {
     if !script.contains("dcent_am3_extract_recovery_flag_eraseblock") {
         return Err("installer must slice recovery_flag_eb.bin from mtd5");
     }
@@ -5897,9 +6837,7 @@ pub fn admit_s19k_walked_flag_01_fixture(blob: &[u8]) -> Result<(), &'static str
 }
 
 /// : installer must refuse backup if walked 0x01 bytes are wrong.
-pub fn admit_s19k_install_script_admits_flag_01_bytes(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_install_script_admits_flag_01_bytes(script: &str) -> Result<(), &'static str> {
     admit_s19k_install_script_runs_flag_01_fixture(script)?;
     if !script.contains("0x01 fixture-out length") {
         return Err("installer must refuse wrong 0x01 fixture length");
@@ -5935,9 +6873,7 @@ pub fn admit_s19k_install_script_admits_flag_01_bytes(
 }
 
 /// Geometry helper must slice the 128 KiB flag eraseblock.
-pub fn admit_s19k_geometry_extracts_flag_eraseblock(
-    geometry: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_geometry_extracts_flag_eraseblock(geometry: &str) -> Result<(), &'static str> {
     if !geometry.contains("dcent_am3_extract_recovery_flag_eraseblock()") {
         return Err("geometry must define flag eraseblock extract");
     }
@@ -5951,8 +6887,7 @@ pub fn admit_s19k_geometry_extracts_flag_eraseblock(
 pub fn admit_s19k_lab_rootfs_script_execute_refuses_nandwrite(
     script: &str,
 ) -> Result<(), &'static str> {
-    if !script.contains("CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite")
-    {
+    if !script.contains("CLEAR_FOR_FLASH=false - refusing gpio437 SafeOff/flash_erase/nandwrite") {
         return Err("lab rootfs must refuse CLEAR_FOR_FLASH before GPIO/NAND");
     }
     if !script.contains("refuse_clear_for_flash_nand") {
@@ -5961,8 +6896,12 @@ pub fn admit_s19k_lab_rootfs_script_execute_refuses_nandwrite(
     if !script.contains("--lab-only is not a FLASH override") {
         return Err("lab flags must not override CLEAR_FOR_FLASH");
     }
-    let write_case = script.find("    write)").ok_or("missing write subcommand")?;
-    let restore_case = script.find("    restore)").ok_or("missing restore subcommand")?;
+    let write_case = script
+        .find("    write)")
+        .ok_or("missing write subcommand")?;
+    let restore_case = script
+        .find("    restore)")
+        .ok_or("missing restore subcommand")?;
     if restore_case <= write_case {
         return Err("restore case must follow write case");
     }
@@ -6029,8 +6968,7 @@ pub fn admit_s19k_install_rootfs_window_only(
     mtd5_len: u64,
 ) -> Result<S19kInstallPayloadPlan, &'static str> {
     admit_s19k_physical_mtd5_base(mtd5_base)?;
-    let rootfs_local =
-        rootfs_local_offset(mtd5_base).ok_or("cannot compute rootfs local")?;
+    let rootfs_local = rootfs_local_offset(mtd5_base).ok_or("cannot compute rootfs local")?;
     if mtd5_base == S19K_78_MTD5_BASE && rootfs_local != S19K_INSTALL_ROOTFS_LOCAL {
         return Err(".78 rootfs local must stay 0x05100000");
     }
@@ -6041,10 +6979,10 @@ pub fn admit_s19k_install_rootfs_window_only(
     {
         return Err("root window exceeds mtd5 length");
     }
-    let nandrecovery_env_local = nandrecovery_env_local_offset(mtd5_base)
-        .ok_or("cannot compute nandrecovery_env local")?;
-    let recovery_flag_local = recovery_flag_local_offset(mtd5_base)
-        .ok_or("cannot compute recovery-flag local")?;
+    let nandrecovery_env_local =
+        nandrecovery_env_local_offset(mtd5_base).ok_or("cannot compute nandrecovery_env local")?;
+    let recovery_flag_local =
+        recovery_flag_local_offset(mtd5_base).ok_or("cannot compute recovery-flag local")?;
     let root_end = rootfs_local + S19K_INSTALL_ROOTFS_WINDOW;
     if ranges_overlap(
         rootfs_local,
@@ -6064,14 +7002,8 @@ pub fn admit_s19k_install_rootfs_window_only(
     }
     Ok(S19kInstallPayloadPlan {
         mtd5_base,
-        uboot_local: s19k_global_to_mtd5_local(
-            crate::s19k_nand_env::S19K_78_NANDUBOOT,
-            mtd5_base,
-        ),
-        fdt_local: s19k_global_to_mtd5_local(
-            crate::s19k_nand_env::S19K_78_NANDFDT,
-            mtd5_base,
-        ),
+        uboot_local: s19k_global_to_mtd5_local(crate::s19k_nand_env::S19K_78_NANDUBOOT, mtd5_base),
+        fdt_local: s19k_global_to_mtd5_local(crate::s19k_nand_env::S19K_78_NANDFDT, mtd5_base),
         kernel_local: s19k_global_to_mtd5_local(
             crate::s19k_nand_env::S19K_78_NANDKERNEL,
             mtd5_base,
@@ -6114,13 +7046,30 @@ clear_for_flash=false\n",
 }
 
 /// Installer nandwrite must target `root`, never package `kernel`.
-pub fn admit_s19k_install_script_nandwrites_root_only(
-    script: &str,
-) -> Result<(), &'static str> {
-    if !script.contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/root'") {
-        return Err("installer must nandwrite root at ROOTFS_OFFSET");
+pub fn admit_s19k_install_script_nandwrites_root_only(script: &str) -> Result<(), &'static str> {
+    let open_fd = script
+        .find("exec 3< '$REMOTE_PREFIX/root'")
+        .ok_or("installer must bind the admitted root inode before erase")?;
+    let hash_fd = script
+        .find("sha256sum /proc/self/fd/3")
+        .ok_or("installer must hash the bound root inode")?;
+    let erase = script
+        .find("flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT || exit 1")
+        .ok_or("installer must fail closed on root-window erase")?;
+    let write = script
+        .find("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD /proc/self/fd/3 || exit 1")
+        .ok_or("installer must nandwrite the bound root inode at ROOTFS_OFFSET")?;
+    if !(open_fd < hash_fd && hash_fd < erase && erase < write) {
+        return Err("installer root inode hash/erase/write ordering is unsafe");
     }
-    if script.contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/kernel'") {
+    if !script.contains("cat /sys/class/mtd/mtd5/bad_blocks")
+        || !script.contains("cat /sys/class/gpio/gpio437/value")
+    {
+        return Err("installer must recheck zero bad blocks and GPIO437 SafeOff in writer shell");
+    }
+    if script.contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/root'")
+        || script.contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/kernel'")
+    {
         return Err("installer must not nandwrite package kernel");
     }
     if !script.contains("INSTALL_PAYLOAD_PLAN.txt") {
@@ -6158,10 +7107,10 @@ pub fn format_s19k_recover_to_stock_plan(
     if !env.crc_ok {
         return Err("nandrecovery_env CRC32 mismatch");
     }
-    let flag_local = recovery_flag_local_offset(mtd5_base)
-        .ok_or("cannot compute recovery-flag local")?;
-    let env_local = nandrecovery_env_local_offset(mtd5_base)
-        .ok_or("cannot compute nandrecovery_env local")?;
+    let flag_local =
+        recovery_flag_local_offset(mtd5_base).ok_or("cannot compute recovery-flag local")?;
+    let env_local =
+        nandrecovery_env_local_offset(mtd5_base).ok_or("cannot compute nandrecovery_env local")?;
     if classify_s19k_recovery_flag_intent(RECOVERY_FLAG_FIRST_BOOT)
         != Ok(S19kRecoveryFlagIntent::UbootStockRevert)
     {
@@ -6232,9 +7181,7 @@ fail=nand_erase_or_env_import_without_admit\n",
 }
 
 /// Refuse ledger must name the `a lab unit` `recover_env` RAM import.
-pub fn admit_s19k_recover_execute_refuse_names_78_ram(
-    ledger: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_recover_execute_refuse_names_78_ram(ledger: &str) -> Result<(), &'static str> {
     crate::s19k_nand_env::admit_s19k_78_recover_env_ram()?;
     if !ledger.contains("recover_env_ram=0x01060000") {
         return Err("refuse ledger missing recover_env_ram=0x01060000");
@@ -6277,10 +7224,10 @@ pub fn format_s19k_recover_walk_ledger(
     source_name: &str,
 ) -> Result<String, &'static str> {
     refuse_s19k_nand_env_bak_as_recover_env_import(source_name)?;
-    let flag_local = recovery_flag_local_offset(mtd5_base)
-        .ok_or("cannot compute recovery-flag local")?;
-    let env_local = nandrecovery_env_local_offset(mtd5_base)
-        .ok_or("cannot compute nandrecovery_env local")?;
+    let flag_local =
+        recovery_flag_local_offset(mtd5_base).ok_or("cannot compute recovery-flag local")?;
+    let env_local =
+        nandrecovery_env_local_offset(mtd5_base).ok_or("cannot compute nandrecovery_env local")?;
     Ok(format!(
         "schema={schema}\n\
 plan_schema=dcentos.amlogic-recover-to-stock/v1\n\
@@ -6336,12 +7283,11 @@ pub fn walk_s19k_recover_to_stock_artifact(
         return Err("nand_env.bak is not recover_env");
     }
     let env = admit_s19k_nandrecovery_env_slice(env_blob)?;
-    format_s19k_recover_walk_ledger(S19K_78_MTD5_BASE, source_name)
-        .and_then(|walk| {
-            admit_s19k_recover_walk_ledger(&walk)?;
-            let _ = env;
-            Ok(walk)
-        })
+    format_s19k_recover_walk_ledger(S19K_78_MTD5_BASE, source_name).and_then(|walk| {
+        admit_s19k_recover_walk_ledger(&walk)?;
+        let _ = env;
+        Ok(walk)
+    })
 }
 
 /// Walk ledger must name the three U-Boot steps and stay FLASH-false.
@@ -6392,9 +7338,7 @@ pub fn admit_s19k_recover_walk_ledger(ledger: &str) -> Result<(), &'static str> 
 }
 
 /// : runner must CRC-admit the sidecar and walk the rust plan.
-pub fn admit_s19k_recover_script_dry_run_walks_plan(
-    script: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_recover_script_dry_run_walks_plan(script: &str) -> Result<(), &'static str> {
     if !script.contains("--dry-run") {
         return Err("recover runner must accept --dry-run");
     }
@@ -6416,8 +7360,26 @@ pub fn admit_s19k_recover_script_dry_run_walks_plan(
     if !script.contains("RECOVER_WALK.txt") {
         return Err("recover runner must write RECOVER_WALK.txt");
     }
-    if !script.contains("[DRY RUN] walking RECOVER_TO_STOCK_PLAN before GPIO/nandwrite/fw_setenv/env import")
+    if !script.contains("BACKUP_LEDGER.txt") || !script.contains("field_get_exact") {
+        return Err("recover runner must parse exact-one plan and backup-ledger authority fields");
+    }
+    if !script.contains("nandrecovery_env_sha256")
+        || !script.contains("nandrecovery_env_sha256_ok=true")
+        || !script.contains("nandrecovery_env.bin sha256 does not match BACKUP_LEDGER")
     {
+        return Err("recover runner must bind nandrecovery_env.bin to BACKUP_LEDGER sha256");
+    }
+    if !script.contains("0x04D00000") || !script.contains("0x04900000") {
+        return Err("recover runner must seal .78 flag and nandrecovery offsets");
+    }
+    if !script.contains(".RECOVER_WALK.txt.tmp.XXXXXX")
+        || !script.contains(".RECOVER_EXECUTE_REFUSE.txt.tmp.XXXXXX")
+    {
+        return Err("recover runner must publish derived evidence atomically");
+    }
+    if !script.contains(
+        "[DRY RUN] walking RECOVER_TO_STOCK_PLAN before GPIO/nandwrite/fw_setenv/env import",
+    ) {
         return Err("recover runner dry-run must walk the plan before GPIO/NAND");
     }
     admit_s19k_recover_walk_ledger(script)?;
@@ -6434,7 +7396,8 @@ pub fn admit_s19k_recover_script_dry_run_walks_plan(
 }
 
 /// : recover `--execute` order matches restore/flag FLASH contract.
-/// EXECUTE < FLASH < board_target < GPIO437 SafeOff=1 < /proc/mtd < nandwrite.
+/// EXECUTE < FLASH < exact live platform:target < GPIO437 SafeOff=1 <
+/// /proc/mtd < nandwrite.
 pub fn admit_s19k_recover_script_execute_refuses_nandwrite(
     script: &str,
 ) -> Result<(), &'static str> {
@@ -6442,8 +7405,10 @@ pub fn admit_s19k_recover_script_execute_refuses_nandwrite(
     {
         return Err("recover execute must refuse CLEAR_FOR_FLASH before GPIO/NAND");
     }
-    if !script.contains("missing live /etc/dcentos/board_target") {
-        return Err("recover execute must refuse missing live board_target");
+    if !script.contains("missing live canonical platform/board_target pair")
+        || !script.contains("am3-aml-s19k:am3-s19k")
+    {
+        return Err("recover execute must refuse without exact live S19k platform:target");
     }
     if !script.contains("missing live /proc/mtd; refuse geometry-blind recover-to-stock") {
         return Err("recover execute must refuse missing live /proc/mtd");
@@ -6460,9 +7425,9 @@ pub fn admit_s19k_recover_script_execute_refuses_nandwrite(
     let refuse = script
         .find("CLEAR_FOR_FLASH=false — refusing")
         .ok_or("missing recover execute refuse")?;
-    let board = script
-        .find("missing live /etc/dcentos/board_target")
-        .ok_or("missing recover board_target refuse")?;
+    let identity = script
+        .find("require_exact_live_s19k_identity /etc/dcentos || exit 1")
+        .ok_or("missing recover exact live identity invocation")?;
     let gpio = script
         .find("gpio437 SafeOff (am3-s19k-active-low, value=1)")
         .ok_or("missing recover gpio SafeOff")?;
@@ -6475,8 +7440,8 @@ pub fn admit_s19k_recover_script_execute_refuses_nandwrite(
     if refuse < confirm {
         return Err("execute refuse must follow RECOVER confirm");
     }
-    if refuse > board {
-        return Err("execute refuse must precede board_target check");
+    if refuse > identity {
+        return Err("execute refuse must precede exact live identity check");
     }
     if refuse > gpio {
         return Err("execute refuse must precede GPIO SafeOff");
@@ -6487,8 +7452,8 @@ pub fn admit_s19k_recover_script_execute_refuses_nandwrite(
     if refuse > nw {
         return Err("execute refuse must precede nandwrite");
     }
-    if board > gpio {
-        return Err("board_target must precede GPIO SafeOff");
+    if identity > gpio {
+        return Err("exact live identity must precede GPIO SafeOff");
     }
     if gpio > proc {
         return Err("GPIO SafeOff must precede /proc/mtd require");
@@ -6611,13 +7576,8 @@ pub fn format_s19k_backup_ledger_with_hashes(
     if nandrecovery_env_sha256.eq_ignore_ascii_case(nand_env_sha256) {
         return Err("nandrecovery_env_sha256 must not equal nand_env_sha256");
     }
-    let base = format_s19k_backup_ledger(
-        board_target,
-        gpio437_value,
-        tools,
-        nand_env_len,
-        mtd5_len,
-    );
+    let base =
+        format_s19k_backup_ledger(board_target, gpio437_value, tools, nand_env_len, mtd5_len);
     Ok(format!(
         "{base}nand_env_sha256={nand_env_sha256}\nmtd5_sha256={mtd5_sha256}\nnandrecovery_env_sha256={nandrecovery_env_sha256}\n"
     ))
@@ -6728,7 +7688,9 @@ pub enum S19kStockReturnError {
 /// Does not write NAND. FLASH still requires [`admit_s19k_flash`].
 /// Restore/pre-install nanddump is 6-part only. 7-part and unknown maps refuse
 /// independently of [`CLEAR_FOR_FLASH`].
-pub fn admit_s19k_restore_nand_layout(mtd_names: &[&str]) -> Result<S19kStockReturnKind, S19kRestoreError> {
+pub fn admit_s19k_restore_nand_layout(
+    mtd_names: &[&str],
+) -> Result<S19kStockReturnKind, S19kRestoreError> {
     match classify_s19k_nand_layout(mtd_names) {
         Ok(S19kStockReturnKind::Mtd2StockSystem) => Ok(S19kStockReturnKind::Mtd2StockSystem),
         Ok(S19kStockReturnKind::Stock7Blocked) => Err(S19kRestoreError::Stock7LayoutBlocked),
@@ -6799,12 +7761,123 @@ mod tests {
         "../../../br2_external_dcentos/board/amlogic/rootfs-overlay/lib/functions/system.sh"
     );
 
+    fn exact_factory_sd_header() -> S19kAmlUpgradeHeader {
+        S19kAmlUpgradeHeader {
+            crc: S19K_AML_UPGRADE_CRC,
+            version: S19K_AML_UPGRADE_VERSION,
+            magic: S19K_AML_UPGRADE_MAGIC,
+            image_sz: S19K_AML_FACTORY_SD_IMG_BYTES as u64,
+            item_align: S19K_AML_UPGRADE_ITEM_ALIGN,
+            item_num: S19K_AML_UPGRADE_ITEM_NUM,
+        }
+    }
+
+    fn exact_factory_sd_evidence(kind: S19kAmlSdPackKind) -> S19kAmlFactorySdEvidence<'static> {
+        S19kAmlFactorySdEvidence {
+            kind,
+            archive_bytes: S19K_AML_FACTORY_SD_ARCHIVE_BYTES,
+            archive_sha256: S19K_AML_FACTORY_SD_ARCHIVE_SHA256,
+            members: S19K_AML_FACTORY_SD_MEMBERS,
+            ini_bytes: S19K_AML_FACTORY_SD_INI_BYTES,
+            ini_sha256: S19K_AML_FACTORY_SD_INI_SHA256,
+            uboot_bytes: S19K_AML_FACTORY_SD_UBOOT_BYTES,
+            uboot_sha256: S19K_AML_FACTORY_SD_UBOOT_SHA256,
+            img_bytes: S19K_AML_FACTORY_SD_IMG_BYTES,
+            img_sha256: S19K_AML_FACTORY_SD_IMG_SHA256,
+            toc_sha256: S19K_AML_FACTORY_SD_TOC_SHA256,
+            upgrade_header: exact_factory_sd_header(),
+        }
+    }
+
+    #[test]
+    fn s19k_dcent_sysupgrade_tar_still_refuses_execute() {
+        assert_eq!(
+            classify_s19k_upgrade_blob("sysupgrade-am3-s19k.tar", b""),
+            S19kUpgradeBlobKind::DcentSysupgradeTar
+        );
+        assert!(refuse_s19k_dcent_sysupgrade_execute_while_flash_false(
+            S19kUpgradeBlobKind::DcentSysupgradeTar
+        )
+        .is_err());
+        assert!(!CLEAR_FOR_FLASH);
+        assert!(refuse_s19k_leftover_admitted_inactive_as_flash_grant().is_err());
+        assert_eq!(
+            s19k_aml_intent_from_artifact("BACKUP_LEDGER.txt"),
+            Some(S19kAmlMutationIntent::BackupOnly)
+        );
+        assert_eq!(
+            s19k_aml_intent_from_artifact("RECOVER_TO_STOCK_PLAN.txt"),
+            Some(S19kAmlMutationIntent::RollbackPlan)
+        );
+        assert_eq!(
+            s19k_aml_intent_from_artifact("RECOVER_EXECUTE_REFUSE.txt"),
+            Some(S19kAmlMutationIntent::RollbackExecute)
+        );
+        assert_eq!(
+            s19k_aml_intent_from_artifact("RESCUE_CONSOLE.txt"),
+            Some(S19kAmlMutationIntent::RescueConsole)
+        );
+        assert_eq!(
+            s19k_aml_intent_from_artifact("sysupgrade-am3-s19k.tar"),
+            Some(S19kAmlMutationIntent::SysupgradeExecute)
+        );
+        assert_eq!(admit_s19k_aml_artifact("BACKUP_LEDGER.txt"), Ok(()));
+        assert_eq!(admit_s19k_aml_artifact("RECOVER_TO_STOCK_PLAN.txt"), Ok(()));
+        assert_eq!(admit_s19k_aml_artifact("RESCUE_CONSOLE.txt"), Ok(()));
+        assert!(admit_s19k_aml_artifact("RECOVER_EXECUTE_REFUSE.txt").is_err());
+        assert!(admit_s19k_aml_artifact("sysupgrade-am3-s19k.tar").is_err());
+        assert!(refuse_s19k_rescue_console_as_nandwrite_grant().is_err());
+        assert_eq!(refuse_s19k_rollback_plan_as_execute_grant(), Ok(()));
+        assert_eq!(
+            admit_s19k_recover_script_refuses_execute_before_gpio(RECOVER),
+            Ok(())
+        );
+        assert!(INSTALL_SCRIPT.contains("RECOVER_EXECUTE_REFUSE.txt"));
+        assert!(INSTALL_SCRIPT.contains("execute=refused"));
+    }
+
+    #[test]
+    fn leftover_admit_is_refused_as_flash_grant() {
+        assert!(!CLEAR_FOR_FLASH);
+        let grant = refuse_s19k_leftover_admitted_inactive_as_flash_grant();
+        eprintln!("leftover_admit_flash_grant={grant:?}");
+        assert!(grant.is_err());
+        assert!(grant
+            .unwrap_err()
+            .contains("leftover-admitted Chain Inactive is UART CMD=3"));
+        assert!(admit_s19k_aml_mutation(S19kAmlMutationIntent::SysupgradeExecute).is_err());
+        assert!(admit_s19k_aml_mutation(S19kAmlMutationIntent::RestoreExecute).is_err());
+    }
+
     #[test]
     fn flash_stays_not_yet_and_stock_is_separate() {
         assert!(!CLEAR_FOR_FLASH);
+        assert_eq!(
+            admit_s19k_aml_mutation(S19kAmlMutationIntent::BackupOnly),
+            Ok(())
+        );
+        assert_eq!(
+            admit_s19k_aml_mutation(S19kAmlMutationIntent::RestorePlan),
+            Ok(())
+        );
+        assert_eq!(
+            admit_s19k_aml_mutation(S19kAmlMutationIntent::RollbackPlan),
+            Ok(())
+        );
+        assert_eq!(
+            admit_s19k_aml_mutation(S19kAmlMutationIntent::RescueConsole),
+            Ok(())
+        );
+        assert!(admit_s19k_aml_mutation(S19kAmlMutationIntent::RestoreExecute).is_err());
+        assert!(admit_s19k_aml_mutation(S19kAmlMutationIntent::RollbackExecute).is_err());
+        assert!(admit_s19k_aml_mutation(S19kAmlMutationIntent::SysupgradeExecute).is_err());
+        assert!(refuse_s19k_backup_as_nandwrite_grant().is_err());
         assert_eq!(rootfs_local_offset(S19K_78_MTD5_BASE), Some(0x0510_0000));
         assert_eq!(rootfs_local_offset(0x0670_0000), Some(0x0510_0000));
-        assert_eq!(admit_s19k_rootfs_window(S19K_78_MTD5_BASE, 0x0510_0000), Ok(0x0510_0000));
+        assert_eq!(
+            admit_s19k_rootfs_window(S19K_78_MTD5_BASE, 0x0510_0000),
+            Ok(0x0510_0000)
+        );
         assert!(admit_s19k_rootfs_window(S19K_78_MTD5_BASE, 0x0570_0000).is_err());
         assert!(admit_s19k_physical_mtd5_base(S19K_78_MTD5_SIZE_SUM).is_err());
         let proc_mtd = "\
@@ -6823,8 +7896,12 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(geo.mtd5_base, 0x0670_0000);
         assert_eq!(geo.rootfs_local, 0x0510_0000);
         assert_eq!(geo.recovery_flag_local, 0x04D0_0000);
-        assert!(admit_s19k_planned_locals_match_computed(proc_mtd, 0x0510_0000, 0x04D0_0000).is_ok());
-        assert!(admit_s19k_planned_locals_match_computed(proc_mtd, 0x0570_0000, 0x04D0_0000).is_err());
+        assert!(
+            admit_s19k_planned_locals_match_computed(proc_mtd, 0x0510_0000, 0x04D0_0000).is_ok()
+        );
+        assert!(
+            admit_s19k_planned_locals_match_computed(proc_mtd, 0x0570_0000, 0x04D0_0000).is_err()
+        );
         assert_eq!(OFFSET_FROM_END_MTD0_TO_MTD1, 0x60_0000);
         assert_eq!(
             admit_s19k_flash(S19kInstallCarrier::BraiinsRootSsh, 1, 5),
@@ -6866,9 +7943,8 @@ mtd5: 09900000 00020000 \"system\"
             refuse < erase,
             "installer must refuse FLASH before flash_erase"
         );
-        assert!(INSTALL_SCRIPT.contains(
-            "ERROR: CLEAR_FOR_FLASH=false — refusing flash_erase/nandwrite/fw_setenv"
-        ));
+        assert!(INSTALL_SCRIPT
+            .contains("ERROR: CLEAR_FOR_FLASH=false - refusing flash_erase/nandwrite/fw_setenv"));
         assert!(
             INSTALL_SCRIPT.contains("recover_execute=refused reason=CLEAR_FOR_FLASH"),
             "installer must print recover-execute refuse beside CLEAR_FOR_FLASH"
@@ -6903,10 +7979,7 @@ mtd5: 09900000 00020000 \"system\"
         assert!(l3.backup_ok());
         assert!(!l3.env_flip_ok());
         assert!(!l3.flash_tools_ok());
-        assert_eq!(
-            admit_s19k_backup(l3, NAND_ENV_BACKUP_LEN, 1),
-            Ok(())
-        );
+        assert_eq!(admit_s19k_backup(l3, NAND_ENV_BACKUP_LEN, 1), Ok(()));
         assert_eq!(
             admit_s19k_backup(l3, 1, 1),
             Err(S19kBackupAdmitError::NandEnvSizeWrong)
@@ -6938,22 +8011,26 @@ mtd5: 09900000 00020000 \"system\"
         );
         assert_eq!(
             classify_s19k_nand_layout(&[
-                "bootloader", "tpl", "stock_system", "reserved", "overlay", "system", "recovery"
+                "bootloader",
+                "tpl",
+                "stock_system",
+                "reserved",
+                "overlay",
+                "system",
+                "recovery"
             ]),
             Ok(S19kStockReturnKind::Stock7Blocked)
         );
         assert!(classify_s19k_nand_layout(&["bootloader"]).is_err());
-        assert!(
-            admit_s19k_backup_filenames(&[
-                "nand_env.bak",
-                "mtd5_pre_install.bin",
-                "gpio437.value",
-                "fw_env_pre.txt",
-                "BACKUP_LEDGER.txt",
-            ])
-            .unwrap()
-            .backup_complete()
-        );
+        assert!(admit_s19k_backup_filenames(&[
+            "nand_env.bak",
+            "mtd5_pre_install.bin",
+            "gpio437.value",
+            "fw_env_pre.txt",
+            "BACKUP_LEDGER.txt",
+        ])
+        .unwrap()
+        .backup_complete());
         assert_eq!(
             admit_s19k_backup_filenames(&["nand_env.bin"]),
             Err(S19kBackupAdmitError::MissingArtifact)
@@ -6998,12 +8075,10 @@ mtd5: 09900000 00020000 \"system\"
             "{hashed}board_target=am3-s19k\nmtd5_len={}\nproc_mtd={proc_mtd}\ncomputed_mtd5_base=0x06700000\n",
             S19K_78_MTD5_LEN
         );
-        assert!(admit_s19k_restore_ledger_vs_live(
-            &restore_ok,
-            S19K_78_MTD5_LEN,
-            Some(proc_mtd)
-        )
-        .is_ok());
+        assert!(
+            admit_s19k_restore_ledger_vs_live(&restore_ok, S19K_78_MTD5_LEN, Some(proc_mtd))
+                .is_ok()
+        );
         let restore_tiny = format!(
             "{hashed}board_target=am3-s19k\nmtd5_len=4096\nproc_mtd={proc_mtd}\ncomputed_mtd5_base=0x06700000\n"
         );
@@ -7015,33 +8090,28 @@ mtd5: 09900000 00020000 \"system\"
             "{hashed}board_target=am3-s19k\nmtd5_len={}\nproc_mtd={proc_mtd}\ncomputed_mtd5_base=unknown\n",
             S19K_78_MTD5_LEN
         );
-        assert!(admit_s19k_restore_ledger_vs_live(
-            &restore_unknown,
-            S19K_78_MTD5_LEN,
-            None
-        )
-        .is_err());
+        assert!(
+            admit_s19k_restore_ledger_vs_live(&restore_unknown, S19K_78_MTD5_LEN, None).is_err()
+        );
         assert!(admit_s19k_restore_ledger_identity("").is_err());
         assert!(admit_s19k_restore_ledger_identity("am3-s21").is_err());
         assert!(admit_s19k_restore_live_board_target(None, "am3-s19k").is_err());
         assert!(admit_s19k_restore_live_board_target(Some(""), "am3-s19k").is_err());
         assert!(admit_s19k_restore_live_board_target(Some("am3-s19k"), "am3-s19k").is_ok());
-        assert!(admit_s19k_restore_live_board_target(
-            Some("am3-aml-s19kpro"),
-            "am3-aml-s19kpro"
-        )
-        .is_ok());
+        assert!(
+            admit_s19k_restore_live_board_target(Some("am3-aml-s19kpro"), "am3-aml-s19kpro")
+                .is_ok()
+        );
         assert!(admit_s19k_restore_live_board_target(Some("am3-s21"), "am3-s19k").is_err());
         assert!(RESTORE.contains("am3-s19k|am3-s19kpro|am3-aml-s19kpro"));
         assert!(refuse_s19k_restore_tmp_deploy_stamp(true).is_err());
         assert!(refuse_s19k_restore_tmp_deploy_stamp(false).is_ok());
         assert!(RESTORE.contains("tmp_deploy leftover"));
-        assert!(RESTORE.contains("missing live /etc/dcentos/board_target"));
+        assert!(RESTORE.contains("missing live canonical platform/board_target pair"));
+        assert!(RESTORE.contains("am3-aml-s19k:am3-s19k"));
         assert!(admit_s19k_restore_mtd5_len(4096, 1).is_err());
         assert!(admit_s19k_restore_ledger_vs_live(&hashed, 4096, None).is_err());
-        let wrong_len = format!(
-            "{hashed}board_target=am3-s19k\nmtd5_len=99\n"
-        );
+        let wrong_len = format!("{hashed}board_target=am3-s19k\nmtd5_len=99\n");
         assert!(admit_s19k_restore_ledger_vs_live(&wrong_len, 4096, None).is_err());
         assert!(RESTORE.contains("mtd5_len"));
         assert!(RESTORE.contains("admit ledger board_target"));
@@ -7069,7 +8139,9 @@ mtd5: 09900000 00020000 \"system\"
             NANDRECOVERY_ENV_GLOBAL,
             crate::s19k_nand_env::S19K_78_NANDRECOVERY_ENV
         );
-        assert!(admit_s19k_mtd5_backup_covers_recovery(S19K_78_MTD5_LEN, S19K_78_MTD5_BASE).is_ok());
+        assert!(
+            admit_s19k_mtd5_backup_covers_recovery(S19K_78_MTD5_LEN, S19K_78_MTD5_BASE).is_ok()
+        );
         assert!(admit_s19k_mtd5_backup_covers_recovery(0x04D0_0000, S19K_78_MTD5_BASE).is_err());
         let mut tiny = [0u8; 8];
         tiny[3] = RECOVERY_FLAG_FIRST_BOOT;
@@ -7081,10 +8153,10 @@ mtd5: 09900000 00020000 \"system\"
         );
         assert!(refuse_s19k_nand_env_bak_as_recover_env_import("nand_env.bak").is_err());
         assert!(refuse_s19k_nand_env_bak_as_recover_env_import("nand_env.bin").is_err());
-        assert!(refuse_s19k_nand_env_bak_as_recover_env_import(
-            S19K_BACKUP_NANDRECOVERY_ENV_NAME
-        )
-        .is_ok());
+        assert!(
+            refuse_s19k_nand_env_bak_as_recover_env_import(S19K_BACKUP_NANDRECOVERY_ENV_NAME)
+                .is_ok()
+        );
         let mut body = b"recover=1\0\0".to_vec();
         body.resize(crate::s19k_nand_env::S19K_NAND_ENV_LEN - 4, 0);
         let crc = crate::s19k_nand_env::crc32_iso_hdlc(&body);
@@ -7100,11 +8172,11 @@ mtd5: 09900000 00020000 \"system\"
         let admitted = admit_s19k_nandrecovery_env_slice(sliced).unwrap();
         assert!(admitted.crc_ok);
         assert_eq!(admitted.vars.get("recover").map(String::as_str), Some("1"));
-        assert!(extract_s19k_nandrecovery_env_from_mtd5_backup(&mtd5[..8], S19K_78_MTD5_BASE)
-            .is_err());
         assert!(
-            extract_s19k_nandrecovery_env_from_mtd5_backup(&mtd5, S19K_78_MTD5_SIZE_SUM)
-                .is_err()
+            extract_s19k_nandrecovery_env_from_mtd5_backup(&mtd5[..8], S19K_78_MTD5_BASE).is_err()
+        );
+        assert!(
+            extract_s19k_nandrecovery_env_from_mtd5_backup(&mtd5, S19K_78_MTD5_SIZE_SUM).is_err()
         );
         assert!(formatted.contains("nandrecovery_env=nandrecovery_env.bin"));
         assert!(INSTALL_SCRIPT.contains("nandrecovery_env.bin"));
@@ -7132,7 +8204,9 @@ mtd5: 09900000 00020000 \"system\"
         assert!(INSTALL_SCRIPT.contains("--backup-only"));
         assert!(INSTALL_SCRIPT.contains("ABSENT_BRAIINS_L3"));
         assert!(REVERT.contains("fw_setenv missing"));
-        let revert_tools = REVERT.find("Step 1c: NAND/env tool preflight").expect("preflight");
+        let revert_tools = REVERT
+            .find("Step 1c: NAND/env tool preflight")
+            .expect("preflight");
         let revert_write = REVERT.find("nandwrite -p -s").expect("nandwrite");
         assert!(revert_tools < revert_write);
         assert!(
@@ -7140,6 +8214,58 @@ mtd5: 09900000 00020000 \"system\"
             "lab rootfs must not default SafeOff=0 on unknown identity"
         );
         assert!(admit_s19k_lab_rootfs_script_execute_refuses_nandwrite(LAB_ROOTFS).is_ok());
+    }
+
+    #[test]
+    fn held_78_bad_blocks_shift_linux_nandwrite_but_do_not_prove_uboot_read() {
+        const ERASE: u64 = 0x0002_0000;
+        const ROOT: u64 = 0x0510_0000;
+
+        // The first 8 MiB of input precede the two adjacent bad eraseblocks.
+        assert_eq!(
+            map_mtdutils_nandwrite_input_byte(
+                ROOT,
+                0x007F_FFFF,
+                ERASE,
+                S19K_78_MTD5_LEN,
+                &S19K_78_HELD_MTD5_BAD_ERASEBLOCKS,
+            ),
+            Ok(0x058F_FFFF)
+        );
+        // nandwrite skips both 128-KiB blocks before consuming the next byte.
+        assert_eq!(
+            map_mtdutils_nandwrite_input_byte(
+                ROOT,
+                0x0080_0000,
+                ERASE,
+                S19K_78_MTD5_LEN,
+                &S19K_78_HELD_MTD5_BAD_ERASEBLOCKS,
+            ),
+            Ok(0x0594_0000)
+        );
+        // A full 40-MiB logical root payload therefore occupies through
+        // local 0x0793_FFFF on this captured topology, not 0x078F_FFFF.
+        assert_eq!(
+            map_mtdutils_nandwrite_input_byte(
+                ROOT,
+                S19K_INSTALL_ROOTFS_WINDOW - 1,
+                ERASE,
+                S19K_78_MTD5_LEN,
+                &S19K_78_HELD_MTD5_BAD_ERASEBLOCKS,
+            ),
+            Ok(0x0793_FFFF)
+        );
+        assert!(refuse_s19k_linux_badblock_map_as_uboot_read_authority().is_err());
+
+        assert!(map_mtdutils_nandwrite_input_byte(ROOT + 1, 0, ERASE, 0x1000_0000, &[]).is_err());
+        assert!(map_mtdutils_nandwrite_input_byte(
+            ROOT,
+            0,
+            ERASE,
+            0x1000_0000,
+            &[0x0592_0000, 0x0590_0000],
+        )
+        .is_err());
     }
 
     fn crc_env_blob(pairs: &[(&str, &str)]) -> Vec<u8> {
@@ -7185,39 +8311,29 @@ mtd5: 09900000 00020000 \"system\"
             "gpio437.value",
             S19K_BACKUP_NANDRECOVERY_ENV_NAME,
         ];
-        let admitted = admit_s19k_backup_artifact_dir(
-            &names,
-            &env,
-            &env,
-            &mtd5,
-            S19K_78_MTD5_BASE,
-        )
-        .unwrap();
+        let admitted =
+            admit_s19k_backup_artifact_dir(&names, &env, &env, &mtd5, S19K_78_MTD5_BASE).unwrap();
         assert!(admitted.nand_env_crc_ok);
         assert!(admitted.nandrecovery_env_crc_ok);
         assert!(admitted.recovery_flag_byte.is_none());
         assert!(admitted.recover_plan.contains("intent=UbootStockRevert"));
-        assert!(admitted.recover_plan.contains("recover_env_source=nandrecovery_env.bin"));
+        assert!(admitted
+            .recover_plan
+            .contains("recover_env_source=nandrecovery_env.bin"));
         assert!(admitted.recover_plan.contains("clear_for_flash=false"));
-        assert!(admit_s19k_recover_execute_refuse_names_78_nand_src(&admitted.recover_refuse).is_ok());
+        assert!(
+            admit_s19k_recover_execute_refuse_names_78_nand_src(&admitted.recover_refuse).is_ok()
+        );
         let mut other = crc_env_blob(&[("bootcmd", "other")]);
-        assert!(admit_s19k_backup_artifact_dir(
-            &names,
-            &env,
-            &other,
-            &mtd5,
-            S19K_78_MTD5_BASE,
-        )
-        .is_err());
+        assert!(
+            admit_s19k_backup_artifact_dir(&names, &env, &other, &mtd5, S19K_78_MTD5_BASE,)
+                .is_err()
+        );
         other[4] ^= 0xFF;
-        assert!(admit_s19k_backup_artifact_dir(
-            &names,
-            &other,
-            &env,
-            &mtd5,
-            S19K_78_MTD5_BASE,
-        )
-        .is_err());
+        assert!(
+            admit_s19k_backup_artifact_dir(&names, &other, &env, &mtd5, S19K_78_MTD5_BASE,)
+                .is_err()
+        );
         assert!(admit_s19k_backup_artifact_dir(
             &["nand_env.bak", "mtd5_pre_install.bin", "gpio437.value"],
             &env,
@@ -7231,16 +8347,19 @@ mtd5: 09900000 00020000 \"system\"
         assert!(admit_s19k_restore_sidecar_crc("nand_env.bin", &env).is_err());
         let mut corrupt = env.clone();
         corrupt[4] ^= 0xFF;
-        assert!(admit_s19k_restore_sidecar_crc(S19K_BACKUP_NANDRECOVERY_ENV_NAME, &corrupt).is_err());
-        let crc_plan = format_s19k_restore_crc_admit(S19K_BACKUP_NANDRECOVERY_ENV_NAME, true, true)
-            .unwrap();
+        assert!(
+            admit_s19k_restore_sidecar_crc(S19K_BACKUP_NANDRECOVERY_ENV_NAME, &corrupt).is_err()
+        );
+        let crc_plan =
+            format_s19k_restore_crc_admit(S19K_BACKUP_NANDRECOVERY_ENV_NAME, true, true).unwrap();
         assert!(crc_plan.contains("schema=dcentos.amlogic-restore-crc/v1"));
         assert!(crc_plan.contains("recover_env_source=nandrecovery_env.bin"));
         assert!(crc_plan.contains("nandrecovery_env_crc_ok=true"));
         assert!(crc_plan.contains("nand_env_crc_ok=true"));
         assert!(format_s19k_restore_crc_admit("nand_env.bak", true, true).is_err());
-        assert!(format_s19k_restore_crc_admit(S19K_BACKUP_NANDRECOVERY_ENV_NAME, false, true)
-            .is_err());
+        assert!(
+            format_s19k_restore_crc_admit(S19K_BACKUP_NANDRECOVERY_ENV_NAME, false, true).is_err()
+        );
         assert!(admit_s19k_restore_script_crc_admits_sidecar(RESTORE).is_ok());
         assert!(admit_s19k_restore_script_sidecar_matches_mtd5_slice(RESTORE).is_ok());
         assert!(admit_s19k_restore_script_sidecar_sha256(RESTORE).is_ok());
@@ -7259,28 +8378,33 @@ mtd5: 09900000 00020000 \"system\"
 
     #[test]
     fn wave227_install_rootfs_window_only() {
-        let plan = admit_s19k_install_rootfs_window_only(S19K_78_MTD5_BASE, S19K_78_MTD5_LEN)
-            .unwrap();
+        let plan =
+            admit_s19k_install_rootfs_window_only(S19K_78_MTD5_BASE, S19K_78_MTD5_LEN).unwrap();
         assert_eq!(plan.rootfs_local, 0x0510_0000);
         assert_eq!(plan.rootfs_window, 0x0280_0000);
         assert_eq!(plan.nandrecovery_env_local, 0x0490_0000);
         assert_eq!(plan.recovery_flag_local, 0x04D0_0000);
         assert_eq!(plan.kernel_local, Some(0x0110_0000));
-        assert!(plan.kernel_local.unwrap() + crate::s19k_nand_env::S19K_78_NANDKERNEL_LEN
-            <= plan.rootfs_local);
+        assert!(
+            plan.kernel_local.unwrap() + crate::s19k_nand_env::S19K_78_NANDKERNEL_LEN
+                <= plan.rootfs_local
+        );
         let text = format_s19k_install_payload_plan(&plan);
         assert!(text.contains("nandwrite_target=root"));
         assert!(text.contains("package_kernel_nandwrite=false"));
         assert!(text.contains("clear_for_flash=false"));
         assert!(refuse_s19k_package_kernel_as_rootfs_nandwrite().is_err());
         assert!(admit_s19k_install_rootfs_window_only(S19K_78_MTD5_BASE, 0x0510_0000).is_err());
-        assert!(admit_s19k_install_rootfs_window_only(S19K_78_MTD5_SIZE_SUM, S19K_78_MTD5_LEN)
-            .is_err());
+        assert!(
+            admit_s19k_install_rootfs_window_only(S19K_78_MTD5_SIZE_SUM, S19K_78_MTD5_LEN).is_err()
+        );
         assert!(admit_s19k_install_script_nandwrites_root_only(INSTALL_SCRIPT).is_ok());
-        assert!(INSTALL_SCRIPT.contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/root'"));
-        assert!(!INSTALL_SCRIPT.contains(
-            "nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/kernel'"
-        ));
+        assert!(INSTALL_SCRIPT
+            .contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD /proc/self/fd/3 || exit 1"));
+        assert!(INSTALL_SCRIPT.contains("exec 3< '$REMOTE_PREFIX/root'"));
+        assert!(INSTALL_SCRIPT.contains("sha256sum /proc/self/fd/3"));
+        assert!(!INSTALL_SCRIPT
+            .contains("nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD '$REMOTE_PREFIX/kernel'"));
         assert!(INSTALL_SCRIPT.contains("INSTALL_PAYLOAD_PLAN.txt"));
         assert!(INSTALL_SCRIPT.contains("package_kernel_nandwrite=false"));
     }
@@ -7317,9 +8441,16 @@ mtd5: 09900000 00020000 \"system\"
         let safe = INSTALL_SCRIPT
             .find("Step 7b/10: GPIO437 PWR_EN SafeOff")
             .unwrap();
+        let refusal = INSTALL_SCRIPT
+            .find("CLEAR_FOR_FLASH=false")
+            .expect("immutable flash refusal");
         let flash = INSTALL_SCRIPT
-            .find("ssh_run \"flash_erase $ROOTFS_MTD")
+            .find("    flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT")
             .unwrap();
+        assert!(
+            refusal < safe,
+            "flash refusal must precede the unreachable writer"
+        );
         assert!(safe < flash);
         assert!(S37.contains("am3-s19k|am3-s19kpro|am3-aml-s19kpro)"));
         assert!(S37.contains("set_gpio_value_checked \"$PWR_GPIO\" 1"));
@@ -7341,10 +8472,11 @@ mtd5: 09900000 00020000 \"system\"
         assert!(REVERT.contains("am3-s19k-active-low"));
         assert!(REVERT.contains("echo 1 > \"$SYS/gpio$PWR_GPIO/value\""));
         assert!(
-            REVERT.find("missing live /etc/dcentos/board_target")
+            REVERT.find("missing exact live platform:target identity")
                 < REVERT.find("Type 'REVERT'"),
             "identity gate must run before the REVERT prompt"
         );
+        assert!(REVERT.contains("am3-aml-s19k:am3-s19k"));
         assert!(REVERT.contains("tmp_deploy leftover"));
         assert!(REVERT.contains("0x05700000/0x05300000"));
         assert!(REVERT.contains("admitted local 0x05100000"));
@@ -7379,6 +8511,7 @@ mtd5: 09900000 00020000 \"system\"
         arm64[12..16].copy_from_slice(&16u32.to_be_bytes());
         arm64[29] = UIMAGE_ARCH_ARM64;
         assert!(admit_s19k_stock_revert_uimage(&arm64, 80).is_ok());
+        assert!(admit_s19k_stock_revert_uimage(&arm64, 81).is_err());
         let mut arm32 = arm64;
         arm32[29] = UIMAGE_ARCH_ARM;
         arm32[32..39].copy_from_slice(b"xilinx!");
@@ -7412,33 +8545,15 @@ mtd5: 09900000 00020000 \"system\"
             Err(S19kRestoreError::EnvToolsMissing)
         );
         assert_eq!(
-            admit_s19k_stock_image_revert(
-                restore_tools,
-                5,
-                None,
-                false,
-                0x0510_0000,
-            ),
+            admit_s19k_stock_image_revert(restore_tools, 5, None, false, 0x0510_0000,),
             Err(S19kRestoreError::MissingLiveBoardTarget)
         );
         assert_eq!(
-            admit_s19k_stock_image_revert(
-                restore_tools,
-                5,
-                Some("am3-s19k"),
-                true,
-                0x0510_0000,
-            ),
+            admit_s19k_stock_image_revert(restore_tools, 5, Some("am3-s19k"), true, 0x0510_0000,),
             Err(S19kRestoreError::TmpDeployStamp)
         );
         assert_eq!(
-            admit_s19k_stock_image_revert(
-                restore_tools,
-                5,
-                Some("am3-s19k"),
-                false,
-                0x0570_0000,
-            ),
+            admit_s19k_stock_image_revert(restore_tools, 5, Some("am3-s19k"), false, 0x0570_0000,),
             Err(S19kRestoreError::WindowOffsetForbidden)
         );
         let revert_ok_tools = S19kTargetTools {
@@ -7451,13 +8566,7 @@ mtd5: 09900000 00020000 \"system\"
             fw_setenv: true,
         };
         assert_eq!(
-            admit_s19k_stock_image_revert(
-                revert_ok_tools,
-                5,
-                Some("am3-s19k"),
-                false,
-                0x0510_0000,
-            ),
+            admit_s19k_stock_image_revert(revert_ok_tools, 5, Some("am3-s19k"), false, 0x0510_0000,),
             Ok(S19kRestoreKind::StockImageThenEnvFlip)
         );
         let complete = S19kBackupCompleteness {
@@ -7529,6 +8638,12 @@ mtd5: 09900000 00020000 \"system\"
         );
         assert!(admit_s19k_restore_script_execute_refuses_nandwrite(RESTORE).is_ok());
         assert!(admit_s19k_restore_script_execute_requires_proc_mtd(RESTORE).is_ok());
+        assert!(admit_s19k_restore_script_private_readback(RESTORE).is_ok());
+        let fixed_restore_readback = RESTORE.replace(
+            "\"$RESTORE_TMP/mtd5_restore_readback.bin\"",
+            "/tmp/mtd5_restore_readback.bin",
+        );
+        assert!(admit_s19k_restore_script_private_readback(&fixed_restore_readback).is_err());
         assert!(admit_s19k_restore_execute_live_proc_mtd(None).is_err());
         assert!(admit_s19k_restore_execute_live_proc_mtd(Some("")).is_err());
         assert!(admit_s19k_restore_execute_live_proc_mtd(Some(
@@ -7551,15 +8666,22 @@ mtd5: 09900000 00020000 \"system\"
         assert!(!RESTORE.contains("recover_env_source=nand_env.bak"));
         assert!(RESTORE.contains("nandwrite -p \"$ROOTFS_MTD\""));
         assert!(!RESTORE.contains("nandwrite -p -s"));
-        assert!(RESTORE.contains("0x05700000"));
+        assert!(RESTORE.contains("current 0x05100000"));
+        assert!(RESTORE.contains("stale 0x05700000 is size-sum geometry"));
         assert!(RESTORE.contains("refuse window-offset"));
         let restore_safe = RESTORE.find("gpio437 SafeOff").expect("restore SafeOff");
-        let restore_write = RESTORE.find("nandwrite -p \"$ROOTFS_MTD\"").expect("restore write");
+        let restore_write = RESTORE
+            .find("nandwrite -p \"$ROOTFS_MTD\"")
+            .expect("restore write");
         assert!(restore_safe < restore_write);
         assert!(RESTORE.contains("fw_setenv not required"));
         assert!(RESTORE.contains("clear_for_flash=false"));
         assert!(RESTORE.contains("--verify-only"));
-        assert!(RESTORE.contains("7-part map blocked"));
+        assert!(RESTORE.contains("dcent_am3_require_exact_s19k_mtd_map_file \"$PROC_TMP\""));
+        assert!(RESTORE.contains("dcent_am3_require_exact_s19k_mtd_map_file /proc/mtd"));
+        assert!(RESTORE.contains("backup ledger geometry is not exact S19k .78"));
+        assert!(RESTORE.contains("live geometry is not exact S19k .78; refuse restore"));
+        assert!(!RESTORE.contains("7-part map blocked"));
         assert!(RESTORE.contains("admit ledger board_target="));
         assert!(RESTORE.contains("refuse geometry-blind restore"));
         assert!(RESTORE.contains("covers_recovery=true"));
@@ -7568,17 +8690,27 @@ mtd5: 09900000 00020000 \"system\"
         assert!(INSTALL_SCRIPT.contains("board_target_source=$BOARD_TARGET_SOURCE"));
         assert!(INSTALL_SCRIPT.contains("record_s19k_backup_board_target"));
         assert!(!INSTALL_SCRIPT.contains("|| echo $BOARD_PKG_NAME"));
-        assert!(RESTORE.contains("invented from --variant"));
+        assert!(
+            RESTORE.contains("identity proof variant '$IDENTITY_PROOF_VARIANT' is not exact S19k")
+        );
+        assert!(RESTORE.contains(
+            "package-sourced backup must not relabel a package target as a live board_target"
+        ));
+        assert!(RESTORE.contains("exact tuple proof independently re-admitted"));
         assert!(RESTORE.contains("board_target_source=package"));
         assert_eq!(
-            admit_s19k_restore_nand_layout(&["bootloader", "tpl", "stock_system", "stock_config", "overlay", "system"]),
+            admit_s19k_restore_nand_layout(&[
+                "bootloader",
+                "tpl",
+                "stock_system",
+                "stock_config",
+                "overlay",
+                "system"
+            ]),
             Ok(S19kStockReturnKind::Mtd2StockSystem)
         );
         assert_eq!(S19K_NAND_MAP[3].name, "stock_config");
-        assert_eq!(
-            crate::s19k_nand_env::S19K_78_NANDROOTFS,
-            NANDROOTFS_GLOBAL
-        );
+        assert_eq!(crate::s19k_nand_env::S19K_78_NANDROOTFS, NANDROOTFS_GLOBAL);
         assert_eq!(
             crate::s19k_nand_env::S19K_78_NANDRECOVERY_FLAG,
             RECOVERY_FLAG_GLOBAL
@@ -7602,10 +8734,10 @@ mtd5: 09900000 00020000 \"system\"
         arm64[29] = UIMAGE_ARCH_ARM64;
         arm64[32..64].fill(0);
         arm64[32..40].copy_from_slice(b"linux-a6");
-        assert!(refuse_xilinx_arm32_uimage_as_s19k_aml(
-            &parse_s19k_uimage_header(&arm64).unwrap()
-        )
-        .is_ok());
+        assert!(
+            refuse_xilinx_arm32_uimage_as_s19k_aml(&parse_s19k_uimage_header(&arm64).unwrap())
+                .is_ok()
+        );
         assert_eq!(
             admit_s19k_restore_nand_layout(&["a", "b", "c", "d", "e", "f", "g"]),
             Err(S19kRestoreError::Stock7LayoutBlocked)
@@ -7667,8 +8799,7 @@ mtd5: 09900000 00020000 \"system\"
         assert!(plan.contains("eraseblock_start=0x04D00000"));
         assert!(plan.contains("byte_in_block=0x0"));
         assert!(plan.contains("rewriter=eraseblock_rewrite"));
-        assert!(admit_s19k_recovery_flag_aligned_one_byte_after_erase(0).is_ok());
-        assert!(admit_s19k_recovery_flag_aligned_one_byte_after_erase(1).is_err());
+        assert!(refuse_s19k_recovery_flag_one_byte_after_erase().is_err());
         let eb = plan_s19k_recovery_flag_eraseblock(0x04D0_0000).unwrap();
         assert_eq!(eb.eraseblock_index, 616);
         assert_eq!(eb.eraseblock_start, 0x04D0_0000);
@@ -7676,8 +8807,8 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_recovery_flag_raw_byte_poke().is_err());
         let mut blk = vec![0u8; ROOTFS_ERASESIZE as usize];
         blk[0] = 0x00;
-        let rewritten = rewrite_s19k_recovery_flag_eraseblock(&blk, 0, RECOVERY_FLAG_FIRST_BOOT)
-            .unwrap();
+        let rewritten =
+            rewrite_s19k_recovery_flag_eraseblock(&blk, 0, RECOVERY_FLAG_FIRST_BOOT).unwrap();
         assert_eq!(rewritten.len(), ROOTFS_ERASESIZE as usize);
         assert_eq!(rewritten[0], 0x02);
         assert!(rewritten[1..].iter().all(|&b| b == 0));
@@ -7685,7 +8816,9 @@ mtd5: 09900000 00020000 \"system\"
             rewrite_s19k_recovery_flag_eraseblock(&blk, 0, RECOVERY_FLAG_INSTALLED).unwrap();
         assert_eq!(rewritten01[0], 0x01);
         assert!(rewrite_s19k_recovery_flag_eraseblock(&[0u8; 16], 0, 0x02).is_err());
-        assert!(format_s19k_recovery_flag_write_plan(0x01, S19K_78_MTD5_BASE, 0x04D0_0000, 5).is_err());
+        assert!(
+            format_s19k_recovery_flag_write_plan(0x01, S19K_78_MTD5_BASE, 0x04D0_0000, 5).is_err()
+        );
         assert_eq!(
             classify_s19k_recovery_flag_intent(RECOVERY_FLAG_INSTALLED),
             Ok(S19kRecoveryFlagIntent::InstallArm)
@@ -7749,15 +8882,16 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_s99_leftover_02_as_mtd2_boot().is_err());
         assert!(admit_s19k_s99_promotes_02_to_03("flash_erase only").is_err());
         assert!(admit_s19k_s99_ota08_identity_and_readback(S99).is_ok());
-        assert!(admit_s19k_s99_ota08_identity_and_readback("printf '\\x3' expected 0x03 0x02 -> 0x03 0x05300000 flash_erase nandwrite -p -s").is_err());
+        assert!(admit_s19k_s99_ota08_identity_and_readback(
+            "printf '\\x3' expected 0x03 0x02 -> 0x03 0x05300000 flash_erase nandwrite -p -s"
+        )
+        .is_err());
         assert!(admit_s19k_s99_leftover_01_is_error(S99).is_ok());
         assert!(admit_s19k_s99_leftover_01_is_error(
             "            0x01)\n                echo \"  [WARN] recovery flag = 0x01\"\n                exit 0\n                ;;\n            ERR_*)\n"
         )
         .is_err());
-        assert!(S99.contains(
-            "ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace"
-        ));
+        assert!(S99.contains("ERROR: recovery flag = 0x01 (INSTALLED) leftover in userspace"));
         assert!(!S99.contains("[WARN] recovery flag = 0x01"));
         assert!(admit_s19k_s99_unread_or_unexpected_flag_is_error(S99).is_ok());
         assert!(admit_s19k_s99_unread_or_unexpected_flag_is_error(
@@ -7768,12 +8902,14 @@ mtd5: 09900000 00020000 \"system\"
         assert!(S99.contains("ERROR: unexpected recovery flag value: $FLAG; refuse OTA-08"));
         assert!(!S99.contains("[WARN] could not read recovery flag"));
         assert!(!S99.contains("[WARN] unexpected recovery flag value:"));
-        assert!(S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-s19k"));
-        assert!(S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-s21"));
+        assert!(S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-aml-s19k:am3-s19k"));
+        assert!(S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-aml-s21:am3-s21"));
+        assert!(!S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-aml-s21xp:am3-s21xp"));
+        assert!(!S99_AMLOGIC_OTA08_IDENTITIES.contains(&"am3-aml-t21:am3-t21"));
         for alias in S19K_LIVE_IDENTITY_ALIASES {
             assert!(
-                S99_AMLOGIC_OTA08_IDENTITIES.contains(alias),
-                "S19k live alias {alias} must remain in OTA-08 identity set"
+                !S99_AMLOGIC_OTA08_IDENTITIES.contains(alias),
+                "bare S19k alias {alias} must not be OTA-08 mutation authority"
             );
         }
         assert!(refuse_s19k_flag_03_as_recover_to_stock().is_err());
@@ -7793,9 +8929,8 @@ mtd5: 09900000 00020000 \"system\"
         assert!(admit_s19k_install_script_runs_recover_dry_run(INSTALL_SCRIPT).is_ok());
         assert!(admit_s19k_geometry_extracts_flag_eraseblock(GEOMETRY).is_ok());
         assert!(admit_s19k_install_script_runs_flag_01_fixture(INSTALL_SCRIPT).is_ok());
-        assert!(INSTALL_SCRIPT.contains(
-            "sh \"$FLAG_HELPER\" --value 0x01 --mtd5-base \"$COMPUTED_MTD5_BASE\""
-        ));
+        assert!(INSTALL_SCRIPT
+            .contains("sh \"$FLAG_HELPER\" --value 0x01 --mtd5-base \"$COMPUTED_MTD5_BASE\""));
         assert!(INSTALL_SCRIPT.contains("recovery_flag_eb.bin"));
         assert!(INSTALL_SCRIPT.contains("recovery_flag_eb.0x01.bin"));
         assert!(INSTALL_SCRIPT.contains("INSTALL_COMMIT_WALK.txt"));
@@ -7803,18 +8938,13 @@ mtd5: 09900000 00020000 \"system\"
         let flag_walk = INSTALL_SCRIPT
             .find("sh \"$FLAG_HELPER\" --value 0x01")
             .expect("0x01 fixture invoke");
-        let backup_only = INSTALL_SCRIPT
-            .find("[BACKUP-ONLY]")
-            .expect("backup-only");
+        let backup_only = INSTALL_SCRIPT.find("[BACKUP-ONLY]").expect("backup-only");
         assert!(flag_walk < backup_only);
         assert!(!INSTALL_SCRIPT[flag_walk..backup_only].contains("--execute"));
         let mut mtd5 = vec![0u8; 0x04D0_0000 + ROOTFS_ERASESIZE as usize];
         mtd5[0x04D0_0000] = 0x00;
-        let blk = extract_s19k_recovery_flag_eraseblock_from_mtd5_backup(
-            &mtd5,
-            S19K_78_MTD5_BASE,
-        )
-        .expect("slice flag eraseblock");
+        let blk = extract_s19k_recovery_flag_eraseblock_from_mtd5_backup(&mtd5, S19K_78_MTD5_BASE)
+            .expect("slice flag eraseblock");
         assert_eq!(blk.len(), ROOTFS_ERASESIZE as usize);
         assert_eq!(blk[0], 0x00);
         let rewritten =
@@ -7831,15 +8961,19 @@ mtd5: 09900000 00020000 \"system\"
             "dcent_am3_extract_recovery_flag_eraseblock\ns19k_write_recovery_flag.sh\n--value 0x01\n--fixture-in\n--fixture-out\n--verify-only\nrecovery-flag 0x01 fixture walk failed; refusing successful backup\nINSTALL_COMMIT_WALK.txt\nfixture_value=0x01\nmtd5_pre_install.bin\nsh \"$FLAG_HELPER\" --value 0x01\n[BACKUP-ONLY]\n"
         )
         .is_err());
-        assert!(INSTALL_SCRIPT.contains(
-            "sh \"$RECOVER_RUNNER\" --artifact-dir \"$ARTIFACT_DIR\" --dry-run"
-        ));
-        assert!(INSTALL_SCRIPT.contains(
-            "recover-to-stock --dry-run failed; refusing successful backup"
-        ));
+        assert!(INSTALL_SCRIPT
+            .contains("sh \"$RECOVER_RUNNER\" --artifact-dir \"$ARTIFACT_DIR\" --dry-run"));
+        assert!(INSTALL_SCRIPT
+            .contains("recover-to-stock --dry-run failed; refusing successful backup"));
         assert!(INSTALL_SCRIPT.contains("RECOVER_WALK.txt"));
         assert!(refuse_s19k_firstboot_only_as_revert_commit().is_err());
         assert!(admit_s19k_revert_script_refuses_firstboot_only(REVERT).is_ok());
+        assert!(admit_s19k_revert_script_private_transaction(REVERT).is_ok());
+        let fixed_revert_extract = REVERT.replace(
+            "${TMPDIR:-/tmp}/dcent-s19k-stock-revert.XXXXXX",
+            "/tmp/stock_extract",
+        );
+        assert!(admit_s19k_revert_script_private_transaction(&fixed_revert_extract).is_err());
         let revert_plan = format_s19k_stock_image_revert_plan();
         assert!(admit_s19k_stock_image_revert_plan(&revert_plan).is_ok());
         assert!(revert_plan.contains("stock_return=recover_env_nandrecovery"));
@@ -7884,20 +9018,17 @@ mtd5: 09900000 00020000 \"system\"
         assert!(rec.contains("bootm_mtd2=false"));
         assert!(!rec.contains("bootm "));
         assert!(rec.contains("clear_for_flash=false"));
-        assert!(format_s19k_recover_to_stock_plan(
-            S19K_78_MTD5_BASE,
-            "nand_env.bak",
-            &rec_env
-        )
-        .is_err());
-        let rec2 = plan_s19k_recover_to_stock(
-            &mtd5,
-            S19K_78_MTD5_BASE,
-            S19K_BACKUP_NANDRECOVERY_ENV_NAME,
-        )
-        .unwrap();
+        assert!(
+            format_s19k_recover_to_stock_plan(S19K_78_MTD5_BASE, "nand_env.bak", &rec_env).is_err()
+        );
+        let rec2 =
+            plan_s19k_recover_to_stock(&mtd5, S19K_78_MTD5_BASE, S19K_BACKUP_NANDRECOVERY_ENV_NAME)
+                .unwrap();
         assert!(rec2.contains("env_crc_ok=true"));
-        assert_eq!(S19K_RECOVER_TO_STOCK_STEPS[1], S19kRecoverToStockStep::EraseNvdata);
+        assert_eq!(
+            S19K_RECOVER_TO_STOCK_STEPS[1],
+            S19kRecoverToStockStep::EraseNvdata
+        );
         let geo = format_s19k_backup_geometry_lines(
             "mtd5: 09900000 \"system\"",
             Some(S19K_78_MTD5_BASE),
@@ -7954,7 +9085,8 @@ mtd5: 09900000 00020000 \"system\"
             admit_s19k_recover_execute("nandrecovery_env.bin", true, 0x02, tools_bad),
             Err(S19kRecoverExecuteError::ToolsMissing)
         );
-        let exec_ledger = format_s19k_recover_execute_refuse(S19K_78_MTD5_BASE, "nandrecovery_env.bin");
+        let exec_ledger =
+            format_s19k_recover_execute_refuse(S19K_78_MTD5_BASE, "nandrecovery_env.bin");
         assert!(exec_ledger.contains("execute=refused"));
         assert!(exec_ledger.contains("reason=CLEAR_FOR_FLASH"));
         assert!(exec_ledger.contains("nand_erase_part=nvdata"));
@@ -7962,11 +9094,9 @@ mtd5: 09900000 00020000 \"system\"
         assert!(exec_ledger.contains("fail=nand_erase_or_env_import_without_admit"));
         assert!(admit_s19k_recover_execute_refuse_names_78_ram(&exec_ledger).is_ok());
         assert!(admit_s19k_recover_execute_refuse_names_78_nand_src(&exec_ledger).is_ok());
-        let walk = format_s19k_recover_walk_ledger(
-            S19K_78_MTD5_BASE,
-            S19K_BACKUP_NANDRECOVERY_ENV_NAME,
-        )
-        .unwrap();
+        let walk =
+            format_s19k_recover_walk_ledger(S19K_78_MTD5_BASE, S19K_BACKUP_NANDRECOVERY_ENV_NAME)
+                .unwrap();
         assert!(admit_s19k_recover_walk_ledger(&walk).is_ok());
         assert!(walk.contains("schema=dcentos.amlogic-recover-walk/v1"));
         assert!(walk.contains("dry_step0="));
@@ -7997,12 +9127,7 @@ mtd5: 09900000 00020000 \"system\"
         )
         .unwrap();
         assert!(admit_s19k_recover_walk_ledger(&walked).is_ok());
-        assert!(walk_s19k_recover_to_stock_artifact(
-            &rec_plan,
-            "nand_env.bak",
-            &fixture
-        )
-        .is_err());
+        assert!(walk_s19k_recover_to_stock_artifact(&rec_plan, "nand_env.bak", &fixture).is_err());
         let mut bad = rec_plan.clone();
         bad = bad.replace(
             "recover_env_source=nandrecovery_env.bin",
@@ -8035,8 +9160,16 @@ mtd5: 09900000 00020000 \"system\"
         assert!(FLAG_SH.contains("dcent_am3_mtd5_base_from_proc_mtd"));
         assert!(FLAG_SH.contains("rewriter=eraseblock_rewrite"));
         assert!(FLAG_SH.contains("--fixture-in"));
-        assert!(FLAG_SH.contains("byte_in_block must be 0"));
-        assert!(FLAG_SH.contains("dry_flash_erase="));
+        assert!(!FLAG_SH.contains("byte_in_block must be 0"));
+        assert!(FLAG_SH.contains("EB_OFF=$((LOCAL_DEC % ERASESIZE))"));
+        assert!(FLAG_SH.contains("seek=\"$EB_OFF\""));
+        assert!(FLAG_SH.contains("candidate_required=full-0x20000-byte-eraseblock"));
+        assert!(FLAG_SH.contains("candidate_source=host-fixture-only"));
+        assert!(FLAG_SH.contains("write_command=false"));
+        assert!(FLAG_SH.contains("readback_required=full-0x20000-byte-sha256-and-byte-compare"));
+        assert!(!FLAG_SH.contains("dry_flash_erase="));
+        assert!(!FLAG_SH.contains("dry_nandwrite="));
+        assert!(!FLAG_SH.contains("| nandwrite"));
         assert!(admit_s19k_recovery_flag_script_execute_refuses_nandwrite(FLAG_SH).is_ok());
         assert!(admit_s19k_recovery_flag_script_plans_install_arm(FLAG_SH).is_ok());
         assert!(admit_s19k_recovery_flag_script_plans_successful_keep_bos(FLAG_SH).is_ok());
@@ -8050,21 +9183,40 @@ mtd5: 09900000 00020000 \"system\"
         assert!(FLAG_SH.contains("uboot_action=FirstBosThenSetFlag2"));
         assert!(FLAG_SH.contains("printf '\\001'"));
         assert!(FLAG_SH.contains("recovery flag 0x01 execute is FLASH NOT_YET"));
-        assert!(!FLAG_SH.contains(
-            "recovery flag 0x01 is FLASH NOT_YET here (use INSTALL_COMMIT_PLAN)"
-        ));
+        assert!(
+            !FLAG_SH.contains("recovery flag 0x01 is FLASH NOT_YET here (use INSTALL_COMMIT_PLAN)")
+        );
         assert!(FLAG_SH.contains("nandwrite=false"));
         assert!(FLAG_SH.contains("gpio_write=false"));
+        let weakened_block = FLAG_SH.replacen(
+            "candidate_required=full-0x20000-byte-eraseblock",
+            "candidate_required=one-byte",
+            1,
+        );
+        assert!(
+            admit_s19k_recovery_flag_script_execute_refuses_nandwrite(&weakened_block).is_err()
+        );
+        let injected_writer =
+            format!("{FLAG_SH}\ndry_nandwrite=printf-byte-pipe-nandwrite\n| nandwrite\n");
+        assert!(
+            admit_s19k_recovery_flag_script_execute_refuses_nandwrite(&injected_writer).is_err()
+        );
         assert!(!CLEAR_FOR_FLASH);
         assert_eq!(
             classify_s19k_upgrade_blob("update.bmu", b""),
             S19kUpgradeBlobKind::StockBitmainBmu
         );
-        assert!(refuse_stock_bmu_as_dcent_sysupgrade(S19kUpgradeBlobKind::StockBitmainBmu).is_err());
-        assert!(refuse_stock_bmu_as_dcent_sysupgrade(
+        assert!(
+            refuse_stock_bmu_as_dcent_sysupgrade(S19kUpgradeBlobKind::StockBitmainBmu).is_err()
+        );
+        assert!(refuse_s19k_dcent_sysupgrade_execute_while_flash_false(
             S19kUpgradeBlobKind::DcentSysupgradeTar
         )
-        .is_ok());
+        .is_err());
+        assert!(!CLEAR_FOR_FLASH);
+        assert!(
+            refuse_stock_bmu_as_dcent_sysupgrade(S19kUpgradeBlobKind::DcentSysupgradeTar).is_ok()
+        );
         assert_eq!(
             classify_s19k_upgrade_blob("sysupgrade-am3-s19k.tar", b""),
             S19kUpgradeBlobKind::DcentSysupgradeTar
@@ -8081,14 +9233,13 @@ mtd5: 09900000 00020000 \"system\"
             classify_s19k_upgrade_blob("boot.emmc", b""),
             S19kUpgradeBlobKind::CvitekSd2NandFactory
         );
-        assert!(refuse_s19k_cvctrl_sd2nand_as_aml_nand(
-            S19kUpgradeBlobKind::CvitekSd2NandFactory
-        )
-        .is_err());
-        assert!(refuse_s19k_cvctrl_sd2nand_as_aml_nand(
-            S19kUpgradeBlobKind::DcentSysupgradeTar
-        )
-        .is_ok());
+        assert!(
+            refuse_s19k_cvctrl_sd2nand_as_aml_nand(S19kUpgradeBlobKind::CvitekSd2NandFactory)
+                .is_err()
+        );
+        assert!(
+            refuse_s19k_cvctrl_sd2nand_as_aml_nand(S19kUpgradeBlobKind::DcentSysupgradeTar).is_ok()
+        );
         let mut bmu_head = [0u8; 64];
         bmu_head[0] = S19K_BTMU_MAGIC;
         bmu_head[2..10].copy_from_slice(&S19K_STOCK_20231108_MINER_TYPE_HASH.to_le_bytes());
@@ -8121,10 +9272,10 @@ mtd5: 09900000 00020000 \"system\"
             classify_s19k_bmu_payload_head(&[0x1F, 0x8B, 0x08, 0x00]),
             S19kBmuPayloadKind::Gzip
         );
-        assert!(refuse_s19k_bmu_payload_as_rootfs_uimage(
-            S19kBmuPayloadKind::HighEntropyOpaque
-        )
-        .is_err());
+        assert!(
+            refuse_s19k_bmu_payload_as_rootfs_uimage(S19kBmuPayloadKind::HighEntropyOpaque)
+                .is_err()
+        );
         assert!(refuse_s19k_bmu_payload_as_rootfs_uimage(S19kBmuPayloadKind::Uimage).is_err());
         assert_eq!(S19K_BMU_PEM_SIG_OFF, 0x418);
         let mut sig_blob = vec![0u8; S19K_BMU_PEM_SIG_OFF + 4];
@@ -8163,11 +9314,16 @@ mtd5: 09900000 00020000 \"system\"
         .unwrap();
         assert!(stock_ini.erase_bootloader && stock_ini.erase_flash && stock_ini.reboot);
         assert!(stock_ini.package_is_enc_img);
-        let vnish_ini = parse_s19k_aml_sdc_burn_ini(
-            "[common]\nerase_bootloader=1\nerase_flash=1\nreboot=0\npackage=aml_upgrade_package_enc.img\n",
-        )
-        .unwrap();
-        assert!(vnish_ini.erase_bootloader && !vnish_ini.reboot);
+        for malformed in [
+            "[common]\nerase_bootloader=1\nerase_bootloader=0\nerase_flash=1\nreboot=1\n[burn_ex]\npackage=aml_upgrade_package_enc.img\n",
+            "[common]\nerase_bootloader=0\nerase_flash=1\nreboot=1\n[burn_ex]\npackage=aml_upgrade_package_enc.img\nerase_bootloader=1\n",
+            "[common]\nerase_bootloader=1\nerase_flash=1\nreboot=0\n[burn_ex]\npackage=aml_upgrade_package_enc.img\n",
+            "[common]\nerase_bootloader=1\nerase_flash=1\nreboot=1\npackage=aml_upgrade_package_enc.img\n[burn_ex]\n",
+            "[common]\nerase_bootloader=1\nerase_flash=1\nreboot=1\nunknown=1\n[burn_ex]\npackage=aml_upgrade_package_enc.img\n",
+            "[common]\nerase_bootloader=1\nerase_flash=1\nreboot=1\n[common]\n[burn_ex]\npackage=aml_upgrade_package_enc.img\n",
+        ] {
+            assert!(parse_s19k_aml_sdc_burn_ini(malformed).is_err());
+        }
         assert_eq!(
             classify_s19k_aml_sd_pack(
                 S19K_AML_FACTORY_SD_UBOOT_BYTES,
@@ -8194,10 +9350,9 @@ mtd5: 09900000 00020000 \"system\"
             S19kAmlSdPackKind::StockS19kFactorySd
         )
         .is_err());
-        assert!(refuse_s19k_aml_factory_sd_as_nandrecovery_env(
-            "aml_upgrade_package_enc.img"
-        )
-        .is_err());
+        assert!(
+            refuse_s19k_aml_factory_sd_as_nandrecovery_env("aml_upgrade_package_enc.img").is_err()
+        );
         assert!(refuse_s19k_aml_factory_sd_as_nandrecovery_env(
             "AML-19k-Pro-202311151447-sd-card.zip"
         )
@@ -8211,17 +9366,17 @@ mtd5: 09900000 00020000 \"system\"
             classify_s19k_upgrade_blob("sd-recover-bmu-s19k-pro-202311151452-release.zip", b""),
             S19kUpgradeBlobKind::XilSdRecoverFactory
         );
-        assert!(refuse_s19k_xil_sd_recover_as_aml_nand(
-            S19kUpgradeBlobKind::XilSdRecoverFactory
-        )
-        .is_err());
+        assert!(
+            refuse_s19k_xil_sd_recover_as_aml_nand(S19kUpgradeBlobKind::XilSdRecoverFactory)
+                .is_err()
+        );
         assert!(refuse_s19k_xil_recover_uimage_as_aml_nand(
             S19K_XIL_SD_RECOVER_UIMAGE_BYTES,
             S19K_XIL_SD_RECOVER_UIMAGE_NAME
         )
         .is_err());
-        let plan = format_s19k_aml_factory_sd_plan(S19kAmlSdPackKind::StockS19kFactorySd, stock_ini)
-            .unwrap();
+        let evidence = exact_factory_sd_evidence(S19kAmlSdPackKind::StockS19kFactorySd);
+        let plan = format_s19k_aml_factory_sd_plan(evidence, stock_ini).unwrap();
         assert!(plan.contains("schema=dcentos.amlogic-factory-sd/v1"));
         assert!(plan.contains("execute=false"));
         assert!(plan.contains("clear_for_flash=false"));
@@ -8229,6 +9384,37 @@ mtd5: 09900000 00020000 \"system\"
         assert!(plan.contains("nandrecovery_env=false"));
         assert!(plan.contains("nandwrite=false"));
         assert!(plan.contains("img_bytes=23134392"));
+        assert!(plan.contains(S19K_AML_FACTORY_SD_ARCHIVE_SHA256));
+        assert!(plan.contains(S19K_AML_FACTORY_SD_INI_SHA256));
+        assert!(plan.contains(S19K_AML_FACTORY_SD_UBOOT_SHA256));
+        assert!(plan.contains(S19K_AML_FACTORY_SD_TOC_SHA256));
+        assert!(plan.contains("linux_raw_restore_equivalent=false"));
+        assert!(plan.contains("required_preburn_backup=dcentos.s19k-aml-full-logical-rescue/v1"));
+        assert!(plan.contains("stable-badblock-counts+boot-nand-transcript"));
+        assert!(plan.contains("preburn_backup_is_physical_replay=false"));
+        assert!(plan.contains("required_unit_state_restore="));
+        assert!(!plan.contains("empty-badmap"));
+        assert!(plan.contains("bench_sequence=verify-FULL_RESCUE_LEDGER.txt"));
+        let mut wrong_hash = evidence;
+        wrong_hash.img_sha256 = "039da235cdf816a2cbfbf2037b056ad1b2dc5ab704efc97ed0050e6e0b313678";
+        assert!(format_s19k_aml_factory_sd_plan(wrong_hash, stock_ini).is_err());
+        let mut wrong_outer = evidence;
+        wrong_outer.archive_sha256 =
+            "06214d02b3c246ad4f98bcbe50b83705392a23a9fa5007120cb21d033e98dcf4";
+        assert!(format_s19k_aml_factory_sd_plan(wrong_outer, stock_ini).is_err());
+        let mut wrong_toc = evidence;
+        wrong_toc.toc_sha256 = "0fb21fd2d67e651a4ac2d4558a21099ccab250df73032b1c0acecee78cda20d8";
+        assert!(format_s19k_aml_factory_sd_plan(wrong_toc, stock_ini).is_err());
+        assert!(format_s19k_aml_factory_sd_plan(
+            exact_factory_sd_evidence(S19kAmlSdPackKind::VnishSharedLfsPointer),
+            stock_ini
+        )
+        .is_err());
+        assert!(format_s19k_aml_factory_sd_plan(
+            exact_factory_sd_evidence(S19kAmlSdPackKind::ComparativeOtherAml),
+            stock_ini
+        )
+        .is_err());
         assert!(admit_s19k_aml_factory_sd_execute().is_err());
         assert!(!CLEAR_FOR_FLASH);
         assert_eq!(
@@ -8305,8 +9491,10 @@ mtd5: 09900000 00020000 \"system\"
         .is_ok());
         let mut uboot_enc = vec![0u8; S19K_AML_UPGRADE_ITEM_STRIDE];
         uboot_enc[0..4].copy_from_slice(&3u32.to_le_bytes());
-        uboot_enc[0x10..0x18].copy_from_slice(&S19K_AML_UPGRADE_ITEM3_USB_UBOOT_ENC_OFF.to_le_bytes());
-        uboot_enc[0x18..0x20].copy_from_slice(&S19K_AML_UPGRADE_ITEM3_USB_UBOOT_ENC_SIZE.to_le_bytes());
+        uboot_enc[0x10..0x18]
+            .copy_from_slice(&S19K_AML_UPGRADE_ITEM3_USB_UBOOT_ENC_OFF.to_le_bytes());
+        uboot_enc[0x18..0x20]
+            .copy_from_slice(&S19K_AML_UPGRADE_ITEM3_USB_UBOOT_ENC_SIZE.to_le_bytes());
         uboot_enc[0x20..0x23].copy_from_slice(b"USB");
         uboot_enc[0x120..0x129].copy_from_slice(b"UBOOT_ENC");
         assert!(admit_s19k_aml_upgrade_usb_uboot_enc_item(
@@ -8319,7 +9507,10 @@ mtd5: 09900000 00020000 \"system\"
         ini_item[0x18..0x20].copy_from_slice(&S19K_AML_UPGRADE_ITEM8_INI_SIZE.to_le_bytes());
         ini_item[0x20..0x23].copy_from_slice(b"ini");
         ini_item[0x120..0x12C].copy_from_slice(b"aml_sdc_burn");
-        assert!(admit_s19k_aml_upgrade_ini_item(&parse_s19k_aml_upgrade_item(&ini_item).unwrap()).is_ok());
+        assert!(
+            admit_s19k_aml_upgrade_ini_item(&parse_s19k_aml_upgrade_item(&ini_item).unwrap())
+                .is_ok()
+        );
         let mut keys_item = vec![0u8; S19K_AML_UPGRADE_ITEM_STRIDE];
         keys_item[0..4].copy_from_slice(&13u32.to_le_bytes());
         keys_item[0x10..0x18].copy_from_slice(&S19K_AML_UPGRADE_ITEM13_KEYS_OFF.to_le_bytes());
@@ -8357,7 +9548,8 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_encrypt_reg_as_otp_decrypt_key().is_err());
         assert_eq!(S19K_AML_UPGRADE_ENCRYPT_REG, 0xFF80_0228);
         let mut ini = vec![b'.'; S19K_AML_UPGRADE_ITEM8_INI_SIZE as usize];
-        ini[10..10 + S19K_AML_UPGRADE_INI_PACKAGE.len()].copy_from_slice(S19K_AML_UPGRADE_INI_PACKAGE);
+        ini[10..10 + S19K_AML_UPGRADE_INI_PACKAGE.len()]
+            .copy_from_slice(S19K_AML_UPGRADE_INI_PACKAGE);
         ini[80..80 + S19K_AML_UPGRADE_INI_ERASE_BL.len()]
             .copy_from_slice(S19K_AML_UPGRADE_INI_ERASE_BL);
         assert!(admit_s19k_factory_ini_payload(&ini).is_ok());
@@ -8508,12 +9700,10 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_bl2_storage_as_78_mtd(S19K_BL2_STORAGE_CLASSES).is_err());
         assert!(refuse_s19k_bl2_storage_as_s30v_nand(S19K_BL2_STORAGE_CLASSES).is_err());
         assert!(refuse_s19k_bl2_emmc_boot_as_s19k_nand_map().is_err());
-        sdc[500..500 + S19K_BL2_RPMB_COUNTER_ERR.len()]
-            .copy_from_slice(S19K_BL2_RPMB_COUNTER_ERR);
+        sdc[500..500 + S19K_BL2_RPMB_COUNTER_ERR.len()].copy_from_slice(S19K_BL2_RPMB_COUNTER_ERR);
         sdc[540..540 + S19K_BL2_RPMB_COUNTER.len()].copy_from_slice(S19K_BL2_RPMB_COUNTER);
         sdc[580..580 + S19K_BL2_RPMB_SET_KEY.len()].copy_from_slice(S19K_BL2_RPMB_SET_KEY);
-        sdc[620..620 + S19K_BL2_RPMB_CANNOT_READ.len()]
-            .copy_from_slice(S19K_BL2_RPMB_CANNOT_READ);
+        sdc[620..620 + S19K_BL2_RPMB_CANNOT_READ.len()].copy_from_slice(S19K_BL2_RPMB_CANNOT_READ);
         assert!(admit_s19k_bl2_rpmb_emmc_errors(&sdc).is_ok());
         assert!(refuse_s19k_bl2_rpmb_as_nandrecovery().is_err());
         assert!(refuse_s19k_bl2_rpmb_as_78_nand().is_err());
@@ -8608,8 +9798,7 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(S19K_BL2_BIST_PASS_OFF, 43_007);
         assert_eq!(S19K_BL2_BIST_FAIL_OFF, 43_016);
         assert_eq!(S19K_BL2_DDR_INIT_FAILED_OFF, 43_025);
-        sdc[S19K_BL2_CHL_OFF..S19K_BL2_CHL_OFF + S19K_BL2_CHL.len()]
-            .copy_from_slice(S19K_BL2_CHL);
+        sdc[S19K_BL2_CHL_OFF..S19K_BL2_CHL_OFF + S19K_BL2_CHL.len()].copy_from_slice(S19K_BL2_CHL);
         sdc[S19K_BL2_CHL_MHZ_OFF..S19K_BL2_CHL_MHZ_OFF + S19K_BL2_CHL_MHZ.len()]
             .copy_from_slice(S19K_BL2_CHL_MHZ);
         assert!(admit_s19k_bl2_dram_chl_mhz(&sdc).is_ok());
@@ -8631,8 +9820,7 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(S19K_BL2_DEVICE_FAIL_OFF, 43_098);
         sdc[S19K_BL2_SDIO_DEBUG_OFF..S19K_BL2_SDIO_DEBUG_OFF + S19K_BL2_SDIO_DEBUG.len()]
             .copy_from_slice(S19K_BL2_SDIO_DEBUG);
-        sdc[S19K_BL2_NO_SDIO_DEBUG_OFF
-            ..S19K_BL2_NO_SDIO_DEBUG_OFF + S19K_BL2_NO_SDIO_DEBUG.len()]
+        sdc[S19K_BL2_NO_SDIO_DEBUG_OFF..S19K_BL2_NO_SDIO_DEBUG_OFF + S19K_BL2_NO_SDIO_DEBUG.len()]
             .copy_from_slice(S19K_BL2_NO_SDIO_DEBUG);
         sdc[S19K_BL2_CUSTOMER_ID_OFF..S19K_BL2_CUSTOMER_ID_OFF + S19K_BL2_CUSTOMER_ID.len()]
             .copy_from_slice(S19K_BL2_CUSTOMER_ID);
@@ -8683,8 +9871,7 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(S19K_BL2_FIP_TMP_HDR_OFF, 43_381);
         assert_eq!(S19K_BL2_BL31_OFF, 43_393);
         assert_eq!(S19K_BL2_NEVER_HERE_OFF, 43_406);
-        sdc[S19K_BL2_ERR_SHA_TABLE_OFF
-            ..S19K_BL2_ERR_SHA_TABLE_OFF + S19K_BL2_ERR_SHA_TABLE.len()]
+        sdc[S19K_BL2_ERR_SHA_TABLE_OFF..S19K_BL2_ERR_SHA_TABLE_OFF + S19K_BL2_ERR_SHA_TABLE.len()]
             .copy_from_slice(S19K_BL2_ERR_SHA_TABLE);
         let sha_labels = parse_s19k_bl2_err_sha_labels(&sdc).unwrap();
         assert_eq!(
@@ -8696,8 +9883,7 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_bl2_err_sha_as_decrypt_key().is_err());
         assert_eq!(S19K_BL2_ERR_SHA_TABLE_OFF, 43_464);
         assert_eq!(S19K_BL2_ERR_SHA_TABLE.len(), 50);
-        sdc[S19K_BL2_NEVER_BE_HERE_OFF
-            ..S19K_BL2_NEVER_BE_HERE_OFF + S19K_BL2_NEVER_BE_HERE.len()]
+        sdc[S19K_BL2_NEVER_BE_HERE_OFF..S19K_BL2_NEVER_BE_HERE_OFF + S19K_BL2_NEVER_BE_HERE.len()]
             .copy_from_slice(S19K_BL2_NEVER_BE_HERE);
         sdc[S19K_BL2_USB_LABEL_OFF..S19K_BL2_USB_LABEL_OFF + S19K_BL2_USB_LABEL.len()]
             .copy_from_slice(S19K_BL2_USB_LABEL);
@@ -8794,7 +9980,9 @@ mtd5: 09900000 00020000 \"system\"
         high.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_USERSECURETASK);
         assert!(crate::s19k_aml_dtb::admit_s19k_usb_uboot_ec_user_high_secure(&high).is_ok());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_ec_user_high_secure_as_hash_uart().is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_usb_ec_user_high_secure_as_nandrecovery().is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_usb_ec_user_high_secure_as_nandrecovery().is_err()
+        );
         let mut adc = crate::s19k_aml_dtb::S19K_USB_UBOOT_TIMERFORADC.to_vec();
         adc.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_EMPTY_EFUSE);
         assert!(crate::s19k_aml_dtb::admit_s19k_usb_uboot_ec_timer_efuse(&adc).is_ok());
@@ -8874,7 +10062,9 @@ mtd5: 09900000 00020000 \"system\"
         assert!(crate::s19k_aml_dtb::admit_s19k_usb_uboot_a53_ao_untrimmed(&untrim).is_ok());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_a53_ao_untrimmed_as_hash_uart().is_err());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_a53_ao_untrimmed_as_nandrecovery().is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_calib_err_as_hash_thermal().is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_calib_err_as_hash_thermal().is_err()
+        );
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_untrimmed_as_hash_thermal().is_err());
         let mut ee = crate::s19k_aml_dtb::S19K_USB_UBOOT_JTAG_TO_EE.to_vec();
         ee.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_INCORRECT_PASSWORD);
@@ -8884,7 +10074,9 @@ mtd5: 09900000 00020000 \"system\"
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_ee_pw_axg_as_hash_uart().is_err());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_ee_pw_axg_as_nandrecovery().is_err());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_incorrect_password_as_miner_auth().is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_cal_data_as_hash_thermal().is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_cal_data_as_hash_thermal().is_err()
+        );
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_axg_ver_as_miner_identity().is_err());
         let mut inv = crate::s19k_aml_dtb::S19K_USB_UBOOT_INVALID_INPUT.to_vec();
         inv.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_PLEASE_TRY_AGAIN);
@@ -8892,10 +10084,14 @@ mtd5: 09900000 00020000 \"system\"
         inv.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR);
         assert!(crate::s19k_aml_dtb::admit_s19k_usb_uboot_invalid_try_thermal0(&inv).is_ok());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_invalid_try_thermal0_as_hash_uart().is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_usb_invalid_try_thermal0_as_nandrecovery().is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_usb_invalid_try_thermal0_as_nandrecovery().is_err()
+        );
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_invalid_input_as_miner_auth().is_err());
         assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_axg_thermal0_as_hash_thermal().is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_init_err_as_hash_thermal().is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_usb_bl30_thermal_init_err_as_hash_thermal().is_err()
+        );
         let mut scpi = crate::s19k_aml_dtb::S19K_USB_UBOOT_OTP_BLOCK11.to_vec();
         scpi.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_SCPI_CSS);
         scpi.extend_from_slice(crate::s19k_aml_dtb::S19K_USB_UBOOT_DDR_SUSPEND);
@@ -8916,7 +10112,10 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(crate::s19k_aml_dtb::S19K_USB_UBOOT_SCPI_CSS_OFF, 45_328);
         assert_eq!(crate::s19k_aml_dtb::S19K_USB_UBOOT_DDR_SUSPEND_OFF, 45_483);
         assert_eq!(crate::s19k_aml_dtb::S19K_USB_UBOOT_GCM_TAG_OFF, 45_797);
-        assert_eq!(crate::s19k_aml_dtb::S19K_USB_UBOOT_BL30_AXG_STAMP_OFF, 46_256);
+        assert_eq!(
+            crate::s19k_aml_dtb::S19K_USB_UBOOT_BL30_AXG_STAMP_OFF,
+            46_256
+        );
         sdc.extend_from_slice(usb_tail);
         assert!(admit_s19k_sdc_usb_uboot_suffix(&sdc, usb_tail).is_ok());
         assert!(refuse_s19k_sdc_usb_uboot_as_same_image(818_688, 769_024).is_err());
@@ -8930,14 +10129,20 @@ mtd5: 09900000 00020000 \"system\"
         boot_item[0x18..0x20].copy_from_slice(&S19K_AML_UPGRADE_ITEM9_BOOT_SIZE.to_le_bytes());
         boot_item[0x20..0x29].copy_from_slice(b"PARTITION");
         boot_item[0x120..0x124].copy_from_slice(b"boot");
-        assert!(admit_s19k_aml_upgrade_boot_item(&parse_s19k_aml_upgrade_item(&boot_item).unwrap()).is_ok());
+        assert!(admit_s19k_aml_upgrade_boot_item(
+            &parse_s19k_aml_upgrade_item(&boot_item).unwrap()
+        )
+        .is_ok());
         let mut rec_item = vec![0u8; S19K_AML_UPGRADE_ITEM_STRIDE];
         rec_item[0..4].copy_from_slice(&17u32.to_le_bytes());
         rec_item[0x10..0x18].copy_from_slice(&S19K_AML_UPGRADE_ITEM17_RECOVERY_OFF.to_le_bytes());
         rec_item[0x18..0x20].copy_from_slice(&S19K_AML_UPGRADE_ITEM17_RECOVERY_SIZE.to_le_bytes());
         rec_item[0x20..0x29].copy_from_slice(b"PARTITION");
         rec_item[0x120..0x128].copy_from_slice(b"recovery");
-        assert!(admit_s19k_aml_upgrade_recovery_item(&parse_s19k_aml_upgrade_item(&rec_item).unwrap()).is_ok());
+        assert!(admit_s19k_aml_upgrade_recovery_item(
+            &parse_s19k_aml_upgrade_item(&rec_item).unwrap()
+        )
+        .is_ok());
         assert!(refuse_s19k_factory_boot_as_20231108_datafile(
             S19K_AML_UPGRADE_ITEM9_BOOT_SIZE as usize
         )
@@ -9001,9 +10206,13 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(HELD_CVITEK_FILEPARSER_DATAFILE_OFF, 15460);
         let mut fp = vec![0u8; HELD_CVITEK_FILEPARSER_DATAFILE_OFF + 8];
         fp[HELD_CVITEK_FILEPARSER_DATAFILE_OFF..].copy_from_slice(b"datafile");
-        assert!(admit_held_fileparser_names_datafile(&fp, HELD_CVITEK_FILEPARSER_DATAFILE_OFF).is_ok());
+        assert!(
+            admit_held_fileparser_names_datafile(&fp, HELD_CVITEK_FILEPARSER_DATAFILE_OFF).is_ok()
+        );
         fp[0..7].copy_from_slice(b"ANDROID");
-        assert!(admit_held_fileparser_names_datafile(&fp, HELD_CVITEK_FILEPARSER_DATAFILE_OFF).is_err());
+        assert!(
+            admit_held_fileparser_names_datafile(&fp, HELD_CVITEK_FILEPARSER_DATAFILE_OFF).is_err()
+        );
         let mut packed = hdr.clone();
         packed.extend_from_slice(&boot);
         packed.resize(
@@ -9036,8 +10245,13 @@ mtd5: 09900000 00020000 \"system\"
             classify_s19k_amlsecu_time(&time).unwrap(),
             S19kAmlsecuImageKind::FactorySdBoot
         );
-        assert!(refuse_s19k_factory_amlsecu_as_20231108_bmu(S19kAmlsecuImageKind::FactorySdBoot).is_err());
-        assert!(refuse_s19k_factory_amlsecu_as_20231108_bmu(S19kAmlsecuImageKind::Bmu20231108).is_ok());
+        assert!(
+            refuse_s19k_factory_amlsecu_as_20231108_bmu(S19kAmlsecuImageKind::FactorySdBoot)
+                .is_err()
+        );
+        assert!(
+            refuse_s19k_factory_amlsecu_as_20231108_bmu(S19kAmlsecuImageKind::Bmu20231108).is_ok()
+        );
         page0[0x410..0x420].copy_from_slice(S19K_FACTORY_AMLSECU_RECOVERY_TIME);
         let (_, rtime) = parse_s19k_android_amlsecu_stamp_raw(&page0).unwrap();
         assert_eq!(
@@ -9068,7 +10282,10 @@ mtd5: 09900000 00020000 \"system\"
             S19K_FACTORY_BOOT_SECOND_OFF,
         )
         .is_ok());
-        assert!(refuse_s19k_4k_ramdisk_off_as_factory_page2048(S19K_FACTORY_ANDROID_RAMDISK_OFF).is_err());
+        assert!(
+            refuse_s19k_4k_ramdisk_off_as_factory_page2048(S19K_FACTORY_ANDROID_RAMDISK_OFF)
+                .is_err()
+        );
         assert_eq!(S19K_FACTORY_BOOT_RAMDISK_OFF, 0x5C1000);
         assert_eq!(S19K_FACTORY_BOOT_SECOND_OFF, 12_875_776);
         let mut second = vec![0u8; S19K_20231108_SECOND_SIZE as usize];
@@ -9104,12 +10321,14 @@ mtd5: 09900000 00020000 \"system\"
         assert!(admit_s19k_uart_rescue_console("/dev/ttyS0", 3_000_000).is_err());
         assert_eq!(S19K_78_CONSOLE_MMIO, 0xFF80_3000);
         assert!(REVERT.contains("27051956"));
-        assert!(REVERT.contains("No rootfs uImage found"));
+        assert!(REVERT.contains("must contain exactly one uImage-like candidate"));
         assert_eq!(S19K_STOCK_UPDATEPORC_PATH, "/usr/sbin/updateporc.sh");
         assert_eq!(S19K_STOCK_MINER_ACT_SUCCESS, 2);
         assert_eq!(S19K_STOCK_MINER_ACT_CLEAR, 3);
-        let upgrade_cgi = "file=$folder/update.bmu\n/usr/sbin/daemonc $file\necho 2 > /tmp/miner_act\n";
-        let clear_cgi = "file=$folder/update.bmu\n/usr/sbin/daemonc $file\necho 3 > /tmp/miner_act\n";
+        let upgrade_cgi =
+            "file=$folder/update.bmu\n/usr/sbin/daemonc $file\necho 2 > /tmp/miner_act\n";
+        let clear_cgi =
+            "file=$folder/update.bmu\n/usr/sbin/daemonc $file\necho 3 > /tmp/miner_act\n";
         assert!(admit_s19k_stock_upgrade_cgi(upgrade_cgi, 2).is_ok());
         assert!(admit_s19k_stock_upgrade_cgi(clear_cgi, 3).is_ok());
         assert!(admit_s19k_stock_upgrade_cgi(upgrade_cgi, 3).is_err());
@@ -9131,32 +10350,25 @@ mtd5: 09900000 00020000 \"system\"
         daemonc[S19K_STOCK_DAEMONC_PORT_STR_OFF as usize
             ..S19K_STOCK_DAEMONC_PORT_STR_OFF as usize + 5]
             .copy_from_slice(b"22322");
-        daemonc[S19K_STOCK_DAEMONC_ARGV0_OFF as usize
-            ..S19K_STOCK_DAEMONC_ARGV0_OFF as usize + 7]
+        daemonc[S19K_STOCK_DAEMONC_ARGV0_OFF as usize..S19K_STOCK_DAEMONC_ARGV0_OFF as usize + 7]
             .copy_from_slice(b"daemonc");
-        daemonc[S19K_STOCK_DAEMONS_ARGV0_OFF as usize
-            ..S19K_STOCK_DAEMONS_ARGV0_OFF as usize + 7]
+        daemonc[S19K_STOCK_DAEMONS_ARGV0_OFF as usize..S19K_STOCK_DAEMONS_ARGV0_OFF as usize + 7]
             .copy_from_slice(b"daemons");
         daemonc[S19K_78_DAEMONC_MOVW_DAEMONC_OFF as usize
             ..S19K_78_DAEMONC_MOVW_DAEMONC_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_MOVW_DAEMONC_INSN.to_le_bytes());
-        daemonc[S19K_78_DAEMONC_LDR_ARGV1_OFF as usize
-            ..S19K_78_DAEMONC_LDR_ARGV1_OFF as usize + 4]
+        daemonc[S19K_78_DAEMONC_LDR_ARGV1_OFF as usize..S19K_78_DAEMONC_LDR_ARGV1_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_LDR_ARGV1_INSN.to_le_bytes());
         daemonc[S19K_78_DAEMONC_MOVW_DAEMONS_OFF as usize
             ..S19K_78_DAEMONC_MOVW_DAEMONS_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_MOVW_DAEMONS_INSN.to_le_bytes());
-        daemonc[S19K_78_DAEMONC_MOVW_HOST_OFF as usize
-            ..S19K_78_DAEMONC_MOVW_HOST_OFF as usize + 4]
+        daemonc[S19K_78_DAEMONC_MOVW_HOST_OFF as usize..S19K_78_DAEMONC_MOVW_HOST_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_MOVW_HOST_INSN.to_le_bytes());
-        daemonc[S19K_78_DAEMONC_MOVW_PORT_OFF as usize
-            ..S19K_78_DAEMONC_MOVW_PORT_OFF as usize + 4]
+        daemonc[S19K_78_DAEMONC_MOVW_PORT_OFF as usize..S19K_78_DAEMONC_MOVW_PORT_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_MOVW_PORT_INSN.to_le_bytes());
-        daemonc[S19K_78_DAEMONC_MOVW_PORC_OFF as usize
-            ..S19K_78_DAEMONC_MOVW_PORC_OFF as usize + 4]
+        daemonc[S19K_78_DAEMONC_MOVW_PORC_OFF as usize..S19K_78_DAEMONC_MOVW_PORC_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_MOVW_PORC_INSN.to_le_bytes());
-        daemonc[S19K_78_DAEMONC_CMP_C8_OFF as usize
-            ..S19K_78_DAEMONC_CMP_C8_OFF as usize + 4]
+        daemonc[S19K_78_DAEMONC_CMP_C8_OFF as usize..S19K_78_DAEMONC_CMP_C8_OFF as usize + 4]
             .copy_from_slice(&S19K_78_DAEMONC_CMP_C8_INSN.to_le_bytes());
         assert!(admit_s19k_daemonc_listen_is_localhost_22322(&daemonc).is_ok());
         assert!(admit_s19k_daemonc_argv0_roles(&daemonc).is_ok());
@@ -9172,8 +10384,7 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(S19K_STOCK_DAEMONC_HTTP_OK, 200);
         assert_eq!(S19K_78_DAEMONC_CMP_C8_INSN, 0xE350_00C8);
         let mut mtd2 = vec![0u8; S19K_78_MTD2_ANDROID_OFF + 8];
-        mtd2[S19K_78_MTD2_ANDROID_OFF..S19K_78_MTD2_ANDROID_OFF + 8]
-            .copy_from_slice(b"ANDROID!");
+        mtd2[S19K_78_MTD2_ANDROID_OFF..S19K_78_MTD2_ANDROID_OFF + 8].copy_from_slice(b"ANDROID!");
         assert!(refuse_s19k_mtd2_as_updateporc_source(&mtd2).is_err());
         assert!(refuse_s19k_mtd2_as_fileparser_source(&mtd2).is_err());
         assert!(refuse_s19k_mtd2_as_uart_trans_source(&mtd2).is_err());
@@ -9317,14 +10528,14 @@ mtd5: 09900000 00020000 \"system\"
         assert!(admit_s19k_78_mtd2_geometry(S19K_78_MTD2_BYTES).is_ok());
         assert!(admit_s19k_78_mtd2_geometry(S19K_78_MTD3_BYTES).is_err());
         assert!(refuse_s19k_mtd2_ramdisk_as_factory_boot(S19K_FACTORY_BOOT_RAMDISK_SIZE).is_err());
-        assert!(refuse_s19k_mtd2_ramdisk_as_factory_boot(S19K_78_MTD2_ANDROID2_RAMDISK_SIZE).is_ok());
+        assert!(
+            refuse_s19k_mtd2_ramdisk_as_factory_boot(S19K_78_MTD2_ANDROID2_RAMDISK_SIZE).is_ok()
+        );
         assert!(refuse_s19k_mtd2_ramdisk_as_20231108(S19K_20231108_RAMDISK_SIZE).is_err());
         assert!(refuse_s19k_mtd2_ramdisk_as_20231108(S19K_78_MTD2_ANDROID2_RAMDISK_SIZE).is_ok());
         let mut pair = vec![0u8; S19K_78_MTD2_ANDROID2_OFF + 24];
-        pair[S19K_78_MTD2_ANDROID_OFF..S19K_78_MTD2_ANDROID_OFF + 8]
-            .copy_from_slice(b"ANDROID!");
-        pair[S19K_78_MTD2_ANDROID2_OFF..S19K_78_MTD2_ANDROID2_OFF + 8]
-            .copy_from_slice(b"ANDROID!");
+        pair[S19K_78_MTD2_ANDROID_OFF..S19K_78_MTD2_ANDROID_OFF + 8].copy_from_slice(b"ANDROID!");
+        pair[S19K_78_MTD2_ANDROID2_OFF..S19K_78_MTD2_ANDROID2_OFF + 8].copy_from_slice(b"ANDROID!");
         pair[S19K_78_MTD2_ANDROID2_OFF + 8..S19K_78_MTD2_ANDROID2_OFF + 12]
             .copy_from_slice(&S19K_78_MTD2_KERNEL_SIZE.to_le_bytes());
         pair[S19K_78_MTD2_ANDROID2_OFF + 16..S19K_78_MTD2_ANDROID2_OFF + 20]
@@ -9333,7 +10544,10 @@ mtd5: 09900000 00020000 \"system\"
         pair[S19K_78_MTD2_ANDROID2_OFF + 16..S19K_78_MTD2_ANDROID2_OFF + 20]
             .copy_from_slice(&S19K_FACTORY_BOOT_RAMDISK_SIZE.to_le_bytes());
         assert!(admit_s19k_78_mtd2_android_pair(&pair).is_err());
-        assert_eq!(S19K_78_MTD3_BYTES / S19K_78_MTD3_PEB, S19K_78_MTD3_PEB_COUNT);
+        assert_eq!(
+            S19K_78_MTD3_BYTES / S19K_78_MTD3_PEB,
+            S19K_78_MTD3_PEB_COUNT
+        );
         assert!(refuse_s19k_daemonc_as_direct_nand_writer().is_err());
         assert!(refuse_s19k_stock_web_rail_as_unsigned().is_err());
         assert_eq!(
@@ -9350,7 +10564,10 @@ mtd5: 09900000 00020000 \"system\"
             S19K_78_MTD2_ANDROID2_RAMDISK_SIZE,
             S19K_FACTORY_BOOT_RAMDISK_SIZE
         );
-        assert_ne!(S19K_78_MTD2_ANDROID2_RAMDISK_SIZE, S19K_20231108_RAMDISK_SIZE);
+        assert_ne!(
+            S19K_78_MTD2_ANDROID2_RAMDISK_SIZE,
+            S19K_20231108_RAMDISK_SIZE
+        );
         assert!(!S19K_AML_UPDATEPORC_IN_HELD_CORPUS);
         let empty = vec![0u8; 32];
         assert!(refuse_s19k_mtd2_as_fileparser_source(&empty).is_err());
@@ -9442,11 +10659,9 @@ mtd5: 09900000 00020000 \"system\"
             classify_s19k_amlsecu_time(S19K_20231108_AMLSECU_STAMP_TIME).unwrap(),
             S19kAmlsecuImageKind::Bmu20231108
         );
-        assert!(admit_s19k_amlsecu_kind_matches_ramdisk(
-            S19K_FACTORY_RECOVERY_AMLSECU_KIND,
-            0
-        )
-        .is_ok());
+        assert!(
+            admit_s19k_amlsecu_kind_matches_ramdisk(S19K_FACTORY_RECOVERY_AMLSECU_KIND, 0).is_ok()
+        );
         assert!(admit_s19k_amlsecu_kind_matches_ramdisk(
             S19K_FACTORY_BOOT_AMLSECU_KIND,
             S19K_FACTORY_BOOT_RAMDISK_SIZE
@@ -9457,11 +10672,7 @@ mtd5: 09900000 00020000 \"system\"
             S19K_20231108_RAMDISK_SIZE
         )
         .is_ok());
-        assert!(admit_s19k_amlsecu_kind_matches_ramdisk(
-            S19K_78_MTD2_AMLSECU_A1_KIND,
-            0
-        )
-        .is_ok());
+        assert!(admit_s19k_amlsecu_kind_matches_ramdisk(S19K_78_MTD2_AMLSECU_A1_KIND, 0).is_ok());
         assert!(admit_s19k_amlsecu_kind_matches_ramdisk(
             S19K_78_MTD2_AMLSECU_A2_KIND,
             S19K_78_MTD2_ANDROID2_RAMDISK_SIZE
@@ -9546,14 +10757,15 @@ mtd5: 09900000 00020000 \"system\"
         assert!(refuse_s19k_factory_recovery_item_as_78_bos_mtd3().is_err());
         assert_eq!(S19K_78_MTD3_NAME, "stock_config");
         assert_eq!(S19K_S30V_MTD3_NAME, "recovery");
-        assert!(refuse_s19k_s30v_mtd3_name_as_78_bos(
-            S19K_S30V_MTD3_NAME,
-            S19K_78_MTD3_NAME
-        )
-        .is_err());
+        assert!(
+            refuse_s19k_s30v_mtd3_name_as_78_bos(S19K_S30V_MTD3_NAME, S19K_78_MTD3_NAME).is_err()
+        );
         assert!(refuse_s19k_s30v_mtd3_name_as_78_bos("stock_config", "stock_config").is_ok());
         assert!(admit_s19k_factory_recovery_second_layout().is_ok());
-        assert_eq!(S19K_FACTORY_RECOVERY_SECOND_OFF, S19K_FACTORY_BOOT_RAMDISK_OFF);
+        assert_eq!(
+            S19K_FACTORY_RECOVERY_SECOND_OFF,
+            S19K_FACTORY_BOOT_RAMDISK_OFF
+        );
         assert_eq!(S19K_FACTORY_RECOVERY_SECOND_OFF, 0x5C_1000);
         assert_eq!(S19K_20231108_SECOND_SIZE, 30_720);
         assert_ne!(
@@ -9693,11 +10905,20 @@ mtd5: 09900000 00020000 \"system\"
             "#!/bin/sh\n/usr/sbin/daemonc $file\necho 2 > /tmp/miner_act\n"
         )
         .is_err());
-        assert!(refuse_s19k_upgrade_cgi_as_updateporc_script("/usr/sbin/updateporc.sh update.bmu").is_ok());
+        assert!(
+            refuse_s19k_upgrade_cgi_as_updateporc_script("/usr/sbin/updateporc.sh update.bmu")
+                .is_ok()
+        );
         assert!(!S19K_AML_UPDATEPORC_IN_HELD_CORPUS);
         assert_eq!(S19K_78_MTD3_UPDATEPORC_HITS, 0);
-        assert_eq!(S19K_78_MTD3_VTBL_PEB4_OFF, 4 * S19K_78_MTD3_PEB + S19K_78_MTD3_DATA_OFF as usize);
-        assert_eq!(S19K_78_MTD3_VTBL_PEB4_NAME_OFF, S19K_78_MTD3_VTBL_PEB4_OFF + 16);
+        assert_eq!(
+            S19K_78_MTD3_VTBL_PEB4_OFF,
+            4 * S19K_78_MTD3_PEB + S19K_78_MTD3_DATA_OFF as usize
+        );
+        assert_eq!(
+            S19K_78_MTD3_VTBL_PEB4_NAME_OFF,
+            S19K_78_MTD3_VTBL_PEB4_OFF + 16
+        );
         assert_eq!(S19K_78_MTD3_UBI_BANG_PEB4_OFF, 4 * S19K_78_MTD3_PEB + 2048);
         let mut vtbl4 = vec![0u8; S19K_78_MTD3_VTBL_PEB4_NAME_OFF + 16];
         vtbl4[S19K_78_MTD3_VTBL_PEB4_NAME_OFF..S19K_78_MTD3_VTBL_PEB4_NAME_OFF + 11]
@@ -9741,7 +10962,10 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(S19K_FACTORY_BOOT_KERNEL_HEAD, [0x30, 0x9C, 0xFC, 0x10]);
         assert_eq!(S19K_FACTORY_RECOVERY_SECOND_HEAD, [0x68, 0xCA, 0xF5, 0xA1]);
         assert_eq!(S19K_FACTORY_MESON1_ENC_HEAD, [0x5D, 0xC7, 0x5D, 0x64]);
-        assert_ne!(S19K_FACTORY_RECOVERY_SECOND_HEAD, S19K_FACTORY_BOOT_SECOND_HEAD);
+        assert_ne!(
+            S19K_FACTORY_RECOVERY_SECOND_HEAD,
+            S19K_FACTORY_BOOT_SECOND_HEAD
+        );
         assert_ne!(
             S19K_20231108_SECOND_SIZE as u64,
             S19K_AML_UPGRADE_ITEM4_AML_DTB_SIZE
@@ -9755,7 +10979,9 @@ mtd5: 09900000 00020000 \"system\"
         assert!(admit_s19k_factory_boot_recovery_kernels_identical(false).is_err());
         assert!(refuse_s19k_factory_recovery_second_as_boot_second().is_err());
         assert!(refuse_s19k_factory_recovery_second_as_meson1_enc().is_err());
-        assert!(admit_s19k_factory_android_second_head(&S19K_FACTORY_RECOVERY_SECOND_HEAD).is_err());
+        assert!(
+            admit_s19k_factory_android_second_head(&S19K_FACTORY_RECOVERY_SECOND_HEAD).is_err()
+        );
         let mut boot_second = S19K_FACTORY_BOOT_SECOND_HEAD.to_vec();
         boot_second.resize(S19K_20231108_SECOND_SIZE as usize, 0);
         assert!(admit_s19k_factory_android_second_head(&boot_second).is_ok());
@@ -9817,6 +11043,268 @@ mtd5: 09900000 00020000 \"system\"
         assert_eq!(
             crate::s19k_nand_env::S21_HELD_PROC_MTD_SIZES,
             crate::s19k_nand_env::S19K_78_PROC_MTD_SIZES
+        );
+    }
+
+    #[test]
+    fn s19k_track1_tmpfs_refuses_live426_enospc_copy_and_admits_hardlink() {
+        assert!(!s19k_track1_tmpfs_stage_allowed(
+            S19K_LIVE426_TMPFS_AVAIL_BYTES,
+            S19K_LIVE425_DCENTRALD_BYTES,
+            true,
+        ));
+        assert!(!s19k_track1_tmpfs_stage_allowed(
+            20 * 1024 * 1024,
+            S19K_LIVE425_DCENTRALD_BYTES,
+            true,
+        ));
+        assert!(s19k_track1_tmpfs_stage_allowed(
+            20 * 1024 * 1024,
+            S19K_LIVE425_DCENTRALD_BYTES,
+            false,
+        ));
+        assert!(s19k_track1_tmpfs_stage_allowed(
+            45 * 1024 * 1024,
+            S19K_LIVE425_DCENTRALD_BYTES,
+            false,
+        ));
+        assert!(refuse_s19k_live426_enospc_as_chain_inactive_result().is_err());
+    }
+
+    #[test]
+    fn s19k_track1_soak_does_not_stop_at_live427_620s_without_clean() {
+        assert!(!s19k_track1_soak_should_stop(
+            S19K_LIVE427_SOAK_S,
+            0,
+            0,
+            0,
+            6
+        ));
+        assert!(!s19k_track1_soak_should_stop(300, 1, 60, 0, 1));
+        assert!(!s19k_track1_soak_should_stop(
+            S19K_LIVE431_SOAK_STOP_S,
+            1,
+            S19K_TRACK1_SOAK_MIN_POST_CLEAN_S,
+            0,
+            S19K_LIVE431_WRAP_AT_STOP
+        ));
+        assert!(refuse_s19k_live431_220s_as_wrap7_t600().is_err());
+        assert!(s19k_track1_soak_should_stop(
+            S19K_TRACK1_SOAK_T600_S,
+            1,
+            S19K_TRACK1_SOAK_MIN_POST_CLEAN_S,
+            0,
+            S19K_TRACK1_SOAK_WRAP7
+        ));
+        assert!(s19k_track1_soak_should_stop(
+            S19K_TRACK1_SOAK_MAX_S,
+            0,
+            0,
+            0,
+            0
+        ));
+        assert!(!s19k_track1_soak_rx_dead(89));
+        assert!(s19k_track1_soak_rx_dead(S19K_TRACK1_SOAK_RX_DEAD_S));
+        assert!(s19k_track1_soak_should_stop(
+            200,
+            0,
+            0,
+            S19K_TRACK1_SOAK_RX_DEAD_S,
+            4
+        ));
+        assert!(!s19k_track1_alive_line_rx_dead(
+            "nonce_silent_s=88 wrap_idx=5"
+        ));
+        assert!(s19k_track1_alive_line_rx_dead(
+            "nonce_silent_s=93 wrap_idx=5"
+        ));
+        assert!(s19k_track1_alive_line_rx_dead("nonce_silent_s=119"));
+        assert!(!s19k_track1_alive_line_rx_dead("nonce_silent_s=9"));
+        assert!(admit_s19k_live432_tx_wrap_does_not_stop_wrap7_t600().is_ok());
+        assert!(!s19k_track1_alive_line_wrap7("wrap_idx=9 wrap_rx=5"));
+        assert!(s19k_track1_alive_line_wrap7("wrap_idx=9 wrap_rx=7"));
+        let ansi_wrap = "wrap_rx\u{1b}[3m\u{1b}[0m\u{1b}[2m=\u{1b}[0m7";
+        assert_eq!(s19k_track1_parse_wrap_rx(ansi_wrap), Some(7));
+        assert!(s19k_track1_alive_line_wrap7(ansi_wrap));
+        let ansi = "nonce_silent_s\u{1b}[3m\u{1b}[0m\u{1b}[2m=\u{1b}[0m204";
+        assert_eq!(s19k_track1_parse_nonce_silent_s(ansi), Some(204));
+        assert!(s19k_track1_alive_line_rx_dead(ansi));
+        assert!(!s19k_track1_alive_line_rx_dead(
+            "nonce_silent_s\u{1b}[3m\u{1b}[0m\u{1b}[2m=\u{1b}[0m88"
+        ));
+        assert_eq!(s19k_track1_alive_gpio437_field(Some(0)), "0");
+        assert_eq!(s19k_track1_alive_gpio437_field(Some(1)), "1");
+        assert_eq!(s19k_track1_alive_gpio437_field(None), "unread");
+    }
+
+    #[test]
+    fn s19k_track1_typed_soak_decision_separates_endurance_from_bench_completion() {
+        use S19kTrack1BenchCompletion::{Max1500, T600Wrap7};
+        use S19kTrack1SoakDecision::{BenchComplete, Continue, RxDead};
+
+        assert_eq!(
+            s19k_track1_soak_decision(599, 0, S19K_TRACK1_SOAK_WRAP7, true),
+            Continue
+        );
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_T600_S, 0, S19K_TRACK1_SOAK_WRAP7 - 1, true,),
+            Continue
+        );
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_T600_S, 0, S19K_TRACK1_SOAK_WRAP7, true,),
+            BenchComplete(T600Wrap7)
+        );
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_MAX_S, 0, 0, true),
+            BenchComplete(Max1500)
+        );
+
+        // A healthy production/endurance run has no time-based stop.
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_T600_S, 0, S19K_TRACK1_SOAK_WRAP7, false,),
+            Continue
+        );
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_MAX_S, 0, 0, false),
+            Continue
+        );
+
+        // RX death remains terminal in both modes and wins at simultaneous
+        // bench thresholds.
+        assert_eq!(
+            s19k_track1_soak_decision(
+                S19K_TRACK1_SOAK_T600_S,
+                S19K_TRACK1_SOAK_RX_DEAD_S,
+                S19K_TRACK1_SOAK_WRAP7,
+                true,
+            ),
+            RxDead
+        );
+        assert_eq!(
+            s19k_track1_soak_decision(S19K_TRACK1_SOAK_MAX_S, S19K_TRACK1_SOAK_RX_DEAD_S, 0, false,),
+            RxDead
+        );
+    }
+
+    #[test]
+    fn s19k_track1_launch_kills_only_owned_pid() {
+        assert!(s19k_track1_launch_may_kill(3667, 3667));
+        assert!(!s19k_track1_launch_may_kill(3058, 3667));
+        assert!(!s19k_track1_launch_may_kill(0, 3667));
+        assert!(refuse_s19k_live429_sigterm_as_leftover_or_wrap().is_err());
+        const LIVE428: &str = include_str!(
+            "../../../../../"
+        );
+        assert!(admit_s19k_track1_launch_kills_owned_pid_only(LIVE428).is_err());
+        const LIVE430: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE430),
+            Ok(())
+        );
+        assert_eq!(S19K_LIVE429_SIGTERM_S, 9);
+        assert!(LIVE430.contains("nonce_silent_s=90"));
+        const LIVE431: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE431),
+            Ok(())
+        );
+        assert!(LIVE431.contains("nonce_silent_s=90"));
+        assert!(LIVE431.contains("s1_silent_s"));
+        const LIVE432: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE432),
+            Ok(())
+        );
+        assert!(LIVE432.contains("nonce_silent_s=90"));
+        assert!(admit_s19k_track1_launch_rx_dead_is_ge_90(LIVE432).is_err());
+        assert!(LIVE432.contains("wrap7_and_t600"));
+        assert!(LIVE432.contains("DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE=1"));
+        const LIVE433: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE433),
+            Ok(())
+        );
+        assert_eq!(admit_s19k_track1_launch_rx_dead_is_ge_90(LIVE433), Ok(()));
+        assert!(LIVE433.contains("wrap_rx="));
+        assert!(admit_s19k_track1_launch_rx_dead_ignores_ansi(LIVE433).is_err());
+        const LIVE434: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE434),
+            Ok(())
+        );
+        assert_eq!(admit_s19k_track1_launch_rx_dead_is_ge_90(LIVE434), Ok(()));
+        assert_eq!(
+            admit_s19k_track1_launch_rx_dead_ignores_ansi(LIVE434),
+            Ok(())
+        );
+        assert!(LIVE434.contains("RUST_LOG_STYLE=never"));
+        assert!(LIVE434.contains("wrap_rx="));
+        const LIVE435: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_launch_kills_owned_pid_only(LIVE435),
+            Ok(())
+        );
+        assert_eq!(admit_s19k_track1_launch_rx_dead_is_ge_90(LIVE435), Ok(()));
+        assert_eq!(
+            admit_s19k_track1_launch_rx_dead_ignores_ansi(LIVE435),
+            Ok(())
+        );
+        assert!(LIVE435.contains("RUST_LOG_STYLE=never"));
+        assert!(LIVE435.contains("S19k wrap-retire leftover"));
+        assert!(!s19k_track1_tracing_ansi_enabled(Some("never")));
+        assert!(s19k_track1_tracing_ansi_enabled(None));
+        const LOGGING: &str = include_str!("../../dcentrald/src/logging.rs");
+        assert_eq!(
+            admit_s19k_production_honors_rust_log_style_never(LOGGING),
+            Ok(())
+        );
+        const RESTORE432: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_track1_restore_never_writes_gpio437(RESTORE432),
+            Ok(())
+        );
+        assert_eq!(refuse_s19k_restore_plan_as_execute_grant(), Ok(()));
+        const INSTALL: &str = include_str!("../../../scripts/install_amlogic_persistent.sh");
+        assert_eq!(
+            admit_s19k_install_backup_reads_gpio437_before_safeoff(INSTALL),
+            Ok(())
+        );
+        assert_eq!(
+            admit_s19k_install_backup_host_streams_nand_env(INSTALL),
+            Ok(())
+        );
+        assert!(
+            admit_s19k_install_backup_host_streams_nand_env(&INSTALL.replacen(
+                "dd if=/dev/nand_env bs=64K count=1",
+                "dd if=/dev/nand_env of=/tmp/nand_env_pre.bin bs=64K count=1",
+                1
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            admit_s19k_install_remote_staging_is_content_bound(INSTALL),
+            Ok(())
+        );
+        assert!(
+            admit_s19k_install_remote_staging_is_content_bound(&INSTALL.replace(
+                "REMOTE_STAGE_DIR=\"/data/.dcentos-sysupgrade-$LOCAL_SHA\"",
+                "REMOTE_STAGE_DIR=\"/data/sysupgrade\"",
+            ))
+            .is_err()
         );
     }
 }

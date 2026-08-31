@@ -35,7 +35,9 @@
 //!   `crate::hashboard_topology::classify_preamble_family`, which covers
 //!   all three families with the same hint-only semantics. Note also that
 //!   a SKU never maps to a format: BHB56801 was held as BOTH format 4 and
-//!   format 5 pages.
+//!   format 5 pages. Enabling a behavioral `[0x01,0x41]` routing arm here
+//!   stays HARDWARE-GATED (one read of a real A3HB page, operator-authorized);
+//!   ePIC-fixture evidence alone must not turn it on.
 //!
 //! So [`classify_by_eeprom_preamble`] returns a **canonical stand-in for
 //! the family**, exactly as the `0x04 0x11` arm has always documented
@@ -531,7 +533,9 @@ pub fn classify_by_eeprom_preamble(preamble: [u8; 2]) -> Option<Hashboard> {
     // callers needing A3HB awareness use
     // `crate::hashboard_topology::classify_preamble_family`, which returns
     // `PreambleFamily::A3hbFormat1` with the same hint-only (never
-    // identity) semantics.
+    // identity) semantics. A behavioral routing arm for [0x01,0x41] stays
+    // HARDWARE-GATED: it needs one read of a real A3HB page before it may
+    // route anything — do not enable it on fixture bytes alone.
     None
 }
 

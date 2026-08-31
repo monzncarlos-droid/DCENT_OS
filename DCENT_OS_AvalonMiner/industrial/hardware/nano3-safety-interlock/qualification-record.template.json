@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "record_type": "dcent-nano3-interlock-production-qualification",
+  "qualification_status": "TEMPLATE_NOT_QUALIFIED",
+  "record_id": "TBD_AFTER_SIGNED_LIVE_QUALIFICATION",
+  "record_created_utc": null,
+  "authority": {
+    "production_arm_allowed": false,
+    "native_takeover_allowed": false,
+    "unattended_operation_allowed": false,
+    "hardware_contact_allowed": false,
+    "energization_allowed": false
+  },
+  "source_artifacts": [
+    {
+      "path": "README.md",
+      "sha256": "8b6709c638a419daf589631e8b0638be31c2ee019749c6380a6673ae74842162"
+    },
+    {
+      "path": "WIRING.md",
+      "sha256": "01f118a5d995435e6904676fec47b37d4abbf842d844f9540c01fe62405466a7"
+    },
+    {
+      "path": "USB_C_POWER_CHAIN_QUALIFICATION.md",
+      "sha256": "e06d57f94b7e9ab8a6825a944821c201f63e19591561bca3c9aefe227891d575"
+    },
+    {
+      "path": "bom.csv",
+      "sha256": "fa9de12bd88fae17084fe6e7f7dd9eb2d4d32d40a031496139ae5ec4e372eee3"
+    },
+    {
+      "path": "fault-injection-matrix.csv",
+      "sha256": "ac7a2c53155e8cffa30f96907a7cca4192ded8be1d3b990f042dbb14342446c7"
+    },
+    {
+      "path": "interlock-contract.json",
+      "sha256": "aecb46a123f231e4ebfb09e5a95ec18e78aca2d32778c6bdbc96ab2bd9513bac"
+    }
+  ],
+  "target": {
+    "model": "Canaan Avalon Nano 3",
+    "asset_id": "TBD_EXACT_PHYSICAL_UNIT",
+    "hardware_revision": "TBD_PHYSICAL_INSPECTION",
+    "firmware_build_sha256": "TBD_EXACT_NATIVE_BUILD"
+  },
+  "power_chain": {
+    "candidate_lane": "TBD_EXACTLY_ONE_CONTROLLED_LANE",
+    "fixture_asset_id": "TBD_ENGINEERING_SELECTION_AND_BUILD",
+    "charger_asset_id": "TBD_PHYSICAL_SPECIMEN",
+    "charger_model": "TBD_EXACT_CANDIDATE_LANE",
+    "cable_asset_id": "TBD_PHYSICAL_SPECIMEN_OR_CAPTIVE_LEAD",
+    "cable_model": "TBD_EXACT_CANDIDATE_LANE",
+    "substitution_requalification_acknowledged": false
+  },
+  "numeric_envelope": {
+    "minimum_fan_rpm": null,
+    "maximum_inlet_temperature_c": null,
+    "maximum_outlet_temperature_c": null,
+    "th1_trip_temperature_c": null,
+    "th2_trip_temperature_c": null,
+    "reset_temperature_c": null,
+    "maximum_channel_disagreement_c": null,
+    "heartbeat_timeout_ms": null,
+    "startup_window_ms": null,
+    "maximum_safe_cutoff_ms": null,
+    "worst_case_contactor_release_ms": null,
+    "worst_case_hash_stop_ms": null,
+    "worst_case_rail_collapse_ms": null,
+    "worst_case_watchdog_expiry_to_cut_ms": null,
+    "maximum_post_cut_temperature_rise_c": null,
+    "worst_case_post_cut_temperature_rise_c": null,
+    "maximum_post_cut_peak_temperature_c": null,
+    "worst_case_post_cut_peak_temperature_c": null,
+    "uncertainty_included": false,
+    "numeric_cooling_and_heartbeat_envelope_complete": false,
+    "numeric_cutoff_and_coast_down_envelope_complete": false
+  },
+  "power_chain_qualification": {
+    "specimen_authenticity_nameplate_listing_match_passed": false,
+    "pd_capture_passed": false,
+    "stable_required_pdo_rdo_passed": false,
+    "e_marker_or_captive_lead_identity_passed": false,
+    "cold_trials_per_used_orientation": null,
+    "warm_rearm_trials": null,
+    "thermal_equilibrium_slope_c_per_hour": null,
+    "thermal_equilibrium_hold_hours": null,
+    "sustained_total_hours": null,
+    "post_equilibrium_hours": null,
+    "sustained_thermal_passed": false,
+    "analyzer_removed_repeat_passed": false,
+    "cutoff_correlation_passed": false,
+    "post_test_inspection_passed": false
+  },
+  "fault_results": [
+    {"id": "PWR-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-07", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-08", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-09", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-10", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-11", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-12", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-13", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-14", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-15", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-16", "result": "PENDING", "evidence_ids": []},
+    {"id": "PWR-17", "result": "PENDING", "evidence_ids": []},
+    {"id": "EST-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "EST-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "EST-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "HB-07", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-07", "result": "PENDING", "evidence_ids": []},
+    {"id": "TH-08", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "FAN-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "CTL-07", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-03", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-04", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-05", "result": "PENDING", "evidence_ids": []},
+    {"id": "BOOT-06", "result": "PENDING", "evidence_ids": []},
+    {"id": "RST-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "EDM-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "EDM-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "DIAG-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "CUT-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "CUT-02", "result": "PENDING", "evidence_ids": []},
+    {"id": "SOAK-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "EMI-01", "result": "PENDING", "evidence_ids": []},
+    {"id": "MIS-01", "result": "PENDING", "evidence_ids": []}
+  ],
+  "required_evidence_roles": [
+    "input-current-trace",
+    "usb-pd-negotiation-capture",
+    "usb-thermal-trace",
+    "adapter-output-trace",
+    "asic-rail-collapse-trace",
+    "hash-cessation-trace",
+    "calibrated-th1-th2-traces",
+    "fan-frequency-trace",
+    "physical-heartbeat-trace",
+    "k1-k2-coil-edm-traces",
+    "post-cut-passive-coast-down-trace",
+    "completed-fault-matrix",
+    "cold-warm-hot-soak-results",
+    "calibration-records",
+    "electrical-safety-review",
+    "functional-safety-review"
+  ],
+  "evidence_artifacts": [],
+  "reviews": {
+    "electrical_safety": {
+      "verdict": "PENDING",
+      "reviewer_id": "TBD_INDEPENDENT_REVIEWER",
+      "review_artifact_id": "TBD_HASHED_REVIEW_ARTIFACT"
+    },
+    "functional_safety": {
+      "verdict": "PENDING",
+      "reviewer_id": "TBD_INDEPENDENT_REVIEWER",
+      "review_artifact_id": "TBD_HASHED_REVIEW_ARTIFACT"
+    }
+  },
+  "qualification_record_compiler_implemented": false,
+  "scope_statement": "Template only. No measurements, component approvals, safety claim, contact, energization, native takeover, unattended operation, or release authority."
+}

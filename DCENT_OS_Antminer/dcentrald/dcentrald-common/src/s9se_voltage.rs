@@ -34,7 +34,10 @@ pub enum S9SeVoltageError {
     VoltageOutOfMap,
 }
 
-pub fn power_iic_from_voltage_on_map(voltage: f64, map: S9SeIicMap) -> Result<u8, S9SeVoltageError> {
+pub fn power_iic_from_voltage_on_map(
+    voltage: f64,
+    map: S9SeIicMap,
+) -> Result<u8, S9SeVoltageError> {
     let (a, b, c, d) = match map {
         S9SeIicMap::PrimaryCeBBgm => (POWER_IIC_A, POWER_IIC_B, POWER_IIC_C, POWER_IIC_D),
         S9SeIicMap::Alternate => (POWER_IIC_A2, POWER_IIC_B2, POWER_IIC_C2, POWER_IIC_D2),
@@ -155,10 +158,7 @@ mod tests {
             voltage_climb_kind(9.0, 9.6),
             S9SeVoltageClimbKind::ImmediateRaise
         );
-        assert_eq!(
-            voltage_climb_kind(9.6, 9.0),
-            S9SeVoltageClimbKind::RampDown
-        );
+        assert_eq!(voltage_climb_kind(9.6, 9.0), S9SeVoltageClimbKind::RampDown);
         assert_eq!(iic_ramp_step(10, 50), 16);
         assert_eq!(iic_ramp_step(10, 28), 8);
         assert_eq!(iic_ramp_step(10, 14), 2);

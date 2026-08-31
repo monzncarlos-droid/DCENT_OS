@@ -1,0 +1,229 @@
+{
+  "schema_version": 2,
+  "fixture_id": "dcent-nano3-independent-interlock",
+  "document_status": "desk-specification",
+  "safety_claim": "none",
+  "target": "Canaan Avalon Nano 3",
+  "cutoff_boundary": "mains input upstream of the exact qualified external USB-C charger",
+  "cutoff_class": "whole-device containment",
+  "post_cut_active_cooling_retained": false,
+  "production_cut_acceptance_rule": "qualify worst-case hot-soak passive coast-down below component limits, or replace this boundary with an independently proven hash-domain cut that leaves control and cooling powered",
+  "rail_cut_verified": false,
+  "hash_stop_verified": false,
+  "live_validation_required": true,
+  "stock_physical_heartbeat_verified": false,
+  "native_takeover_allowed": false,
+  "source_evidence": [
+    "",
+    "",
+    ""
+  ],
+  "power_path": {
+    "topology": "K1 and K2 normally-open main contacts in series",
+    "protective_earth_switched": false,
+    "control_supply_position": "upstream of K1 and K2",
+    "k1_k2_separate_safety_outputs_required": true,
+    "mechanically_linked_feedback_required": true,
+    "edm_evaluation": {
+      "state_dependent_feedback_required": true,
+      "open_pole_proof_required_before_arm": true,
+      "energized_transition_proof_required_after_pickup": true,
+      "open_transition_proof_required_after_trip": true,
+      "continuous_mirror_contact_series_permit_forbidden": true,
+      "feedback_discrepancy_latches_fault": true,
+      "feedback_transition_timeout_ms": "TBD_K1_K2_SR1_SELECTION_AND_LIVE_VALIDATION"
+    },
+    "selection_inputs": [
+      "adapter nameplate voltage and current",
+      "measured adapter inrush",
+      "deployment voltage and frequency",
+      "manufacturer utilization category and derating",
+      "regional electrical code"
+    ],
+    "exact_components": "TBD_ENGINEERING_SELECTION"
+  },
+  "usb_power_interface": {
+    "architecture": "USB-C Power Delivery from an external charger",
+    "interlock_position": "AC input upstream of the USB-C charger",
+    "approved_charger_model": "TBD_PD_ANALYZER_AND_THERMAL_VALIDATION",
+    "required_negotiated_profile": "TBD_LIVE_MEASUREMENT",
+    "approved_cable_model": "TBD_E_MARKER_AND_THERMAL_VALIDATION",
+    "candidate_charger_model": "Plugable PS-EPR-140C1 North American direct-plug variant",
+    "candidate_charger_input_nameplate": "TBD_PHYSICAL_TRANSCRIPTION_AND_LISTING_MATCH",
+    "candidate_charger_advertised_pdos": [
+      "5V@3A",
+      "9V@3A",
+      "15V@3A",
+      "20V@5A",
+      "28V@5A_EPR"
+    ],
+    "candidate_cable_model": "Plugable USB4-240W-1M passive 1 m",
+    "candidate_cable_e_marker_identity": "TBD_PHYSICAL_CAPTURE_AND_USB_IF_RECORD_MATCH",
+    "canaan_documented_nano3_input": "28V",
+    "canaan_documented_maximum_power_w": 140,
+    "canaan_documented_required_max_profile": "28V@5A",
+    "canaan_stated_typical_load_in_140w_adapter_test_w": 127,
+    "lower_power_modes_require_separate_capture": true,
+    "candidate_pair_approved": false,
+    "candidate_charger_class": "140 W USB PD 3.1",
+    "candidate_cable_class": "vendor-advertised 240 W USB-C; e-marker identity and USB-IF certification unverified",
+    "third_party_reports_are_qualification_evidence": false,
+    "first_party_reference_candidate": {
+      "candidate_id": "canaan-tp14a1-captive-usb-c",
+      "manufacturer_claim": "Canaan bundled original adapter",
+      "model": "TP14A1",
+      "topology": "external PD 3.1 charger with captive USB-C output cable and detachable regional AC cord",
+      "input_nameplate_from_independent_teardown": "100-240Vac 50/60Hz 1.8A max",
+      "output_pdos_from_label_and_analyzer_record": [
+        "5V@3A",
+        "9V@3A",
+        "12V@3A",
+        "15V@3A",
+        "20V@5A",
+        "28V@5A_EPR"
+      ],
+      "captive_usb_c_cable": true,
+      "reported_captive_cable_length_m": 1.21,
+      "reported_full_mode_observation": "27.24V@4.69A=127.68W",
+      "physical_specimen_authenticity_and_nameplate_match_required": true,
+      "candidate_approved": false
+    },
+    "marketplace_listing_metadata": {
+      "listing_identity_proven": false,
+      "reported_fields": {
+        "connector_type": "Molex",
+        "compatible_devices": "Laptops",
+        "input_voltage": "240V",
+        "output_voltage": "12Vdc",
+        "output_current": "11.67A",
+        "main_power_connector": "2 pin",
+        "power_plug": "Type B 3 pin North American",
+        "wired_charging_connector": "USB Type-C"
+      },
+      "electrical_identity_acceptance": "REJECTED_UNTIL_PHYSICAL_NAMEPLATE_AND_PD_CAPTURE",
+      "reason": "generic marketplace taxonomy conflicts internally and does not describe the Nano 3 28V/5A EPR contract"
+    },
+    "connector_temperature_limit_c": "TBD_COMPONENT_RATING_AND_LIVE_VALIDATION",
+    "substitution_without_requalification_allowed": false
+  },
+  "required_healthy_inputs": [
+    "dual-channel E-stop closed",
+    "TH1 valid and below hard trip",
+    "TH2 valid and below hard trip",
+    "fan frequency valid after startup grace",
+    "dynamic heartbeat valid after startup grace",
+    "hardware supervisor watchdog valid",
+    "K1 and K2 EDM feedback consistent",
+    "manual reset latch armed"
+  ],
+  "heartbeat": {
+    "transport": "isolated dry-contact or open-collector dynamic input",
+    "nominal_frequency_hz": 2.0,
+    "valid_duty_cycle_percent": {
+      "minimum": 20,
+      "maximum": 80
+    },
+    "valid_cycles_before_run": 6,
+    "commissioning_timeout_seconds": 1.5,
+    "production_timeout_rule": "must not exceed measured safe cutoff budget",
+    "rising_and_falling_edges_required": true,
+    "stuck_high_is_fault": true,
+    "stuck_low_is_fault": true,
+    "generation_contract": "toggle only after a complete fresh thermal/fan/controller custody iteration",
+    "forbidden_sources": [
+      "network reachability",
+      "TCP accept",
+      "miner API response",
+      "pool connection",
+      "accepted shares",
+      "hashrate",
+      "nano3-health-snapshot collector",
+      "free-running timer not coupled to custody loop"
+    ]
+  },
+  "temperature": {
+    "channel_count": 2,
+    "independent_hardware_limits": true,
+    "open_short_detection_required": true,
+    "trip_temperature_c": "TBD_LIVE_VALIDATION",
+    "reset_temperature_c": "TBD_LIVE_VALIDATION",
+    "maximum_channel_disagreement_c": "TBD_LIVE_VALIDATION",
+    "sensor_locations": [
+      "mapped hottest accessible heatsink location",
+      "independent exhaust or secondary heatsink location"
+    ]
+  },
+  "fan": {
+    "preferred_sensor": "independent optical or Hall pickup",
+    "stock_tach_tap_allowed": "only after voltage, polarity, pull-up and pulses/revolution are measured",
+    "minimum_rpm": "TBD_LIVE_VALIDATION",
+    "startup_grace_seconds": "TBD_LIVE_VALIDATION",
+    "missing_stuck_underfrequency_trip_required": true
+  },
+  "state_machine": {
+    "initial_state": "SAFE_OFF",
+    "states": [
+      "SAFE_OFF",
+      "SELF_TEST",
+      "START_WINDOW",
+      "RUN",
+      "TRIPPED_LATCHED",
+      "EDM_FAULT"
+    ],
+    "automatic_restart": false,
+    "manual_reset_required_after_trip": true,
+    "manual_reset_is_edge_not_maintained_enable": true,
+    "trip_or_power_loss_clears_internal_run_latch": true,
+    "reset_held_through_fault_cannot_rearm": true,
+    "production_bypass_allowed": false
+  },
+  "startup_bypass": {
+    "purpose": "permit bounded boot before a Nano-generated heartbeat and stock-fan tach exist",
+    "hard_temperature_bypassed": false,
+    "estop_bypassed": false,
+    "edm_bypassed": false,
+    "implementation": "two independent non-retriggerable hardware timers, one per safety channel",
+    "single_timer_stuck_closed_must_trip": true,
+    "retrigger_while_contactors_closed_allowed": false,
+    "duration_seconds": "TBD_COLD_WARM_BOOT_AND_THERMAL_VALIDATION"
+  },
+  "timing": {
+    "maximum_safe_cutoff_seconds": "TBD_LIVE_VALIDATION",
+    "temperature_trip_seconds": "TBD_COMPONENT_AND_LIVE_VALIDATION",
+    "fan_trip_seconds": "TBD_COMPONENT_AND_LIVE_VALIDATION",
+    "contactor_release_seconds": "TBD_COMPONENT_AND_LIVE_VALIDATION",
+    "startup_window_seconds": "TBD_COLD_WARM_BOOT_VALIDATION",
+    "maximum_post_cut_temperature_rise_c": "TBD_HOT_SOAK_COAST_DOWN_VALIDATION",
+    "maximum_post_cut_peak_temperature_c": "TBD_HOT_SOAK_COAST_DOWN_VALIDATION"
+  },
+  "release_evidence_required": [
+    "input-current trace",
+    "USB PD negotiation capture and approved charger/cable identities",
+    "charger cable and both USB-C connector temperature traces",
+    "adapter-output trace",
+    "candidate ASIC-rail trace and defined off threshold",
+    "hash cessation trace",
+    "TH1 and TH2 calibrated temperature traces",
+    "fan frequency trace",
+    "heartbeat trace",
+    "K1 and K2 coil and EDM traces",
+    "worst-case post-cut passive thermal coast-down trace",
+    "completed fault-injection matrix",
+    "cold warm hot-soak results",
+    "electrical and functional-safety review"
+  ],
+  "compiled_production_qualification": {
+    "record_id": "TBD_AFTER_SIGNED_LIVE_QUALIFICATION",
+    "record_sha256": "TBD_AFTER_SIGNED_LIVE_QUALIFICATION",
+    "exact_fixture_asset_id": "TBD_ENGINEERING_SELECTION_AND_LIVE_QUALIFICATION",
+    "exact_charger_asset_id": "TBD_PHYSICAL_NAMEPLATE_AND_LIVE_QUALIFICATION",
+    "exact_cable_asset_id": "TBD_E_MARKER_AND_LIVE_QUALIFICATION",
+    "qualified_minimum_fan_rpm": "TBD_LIVE_VALIDATION",
+    "qualified_maximum_inlet_temperature_c": "TBD_LIVE_VALIDATION",
+    "qualified_maximum_outlet_temperature_c": "TBD_LIVE_VALIDATION",
+    "qualified_heartbeat_timeout_ms": "TBD_LIVE_VALIDATION_WITHIN_1500_MS_COMMISSIONING_BOUND",
+    "numeric_cooling_and_heartbeat_envelope_complete": false,
+    "numeric_cutoff_and_coast_down_envelope_complete": false,
+    "native_build_pin_present": false
+  }
+}

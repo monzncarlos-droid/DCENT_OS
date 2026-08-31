@@ -290,7 +290,7 @@ s9_export_validation_selftest() {
     (cd "$wrong_board_case" && tar cf wrong-board.tar sysupgrade-am1-s9)
     s9_expect_package_rejection \
         "$wrong_board_case/wrong-board.tar" \
-        "MANIFEST.json board does not match am1-s9" \
+        "MANIFEST.json package authority is inconsistent with am1-s9" \
         "$wrong_board_case/rejection.out" || {
         rm -rf "$tmpdir"
         return 1
@@ -748,10 +748,18 @@ MANIFEST_JSON='scripts/lib/sysupgrade_manifest_json.py'
 AM2_POST_IMAGE='br2_external_dcentos/board/zynq/am2-s19jpro/post-image.sh'
 AM3_S19K_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh'
 AM3_S21_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21/post-image.sh'
+AM3_S19XP_MUTATION_POLICY='br2_external_dcentos/board/amlogic/am3-s19xp/rootfs-overlay/etc/dcentos/mutation_policy'
+AM3_S19JXP_MUTATION_POLICY='br2_external_dcentos/board/amlogic/am3-s19jxp/rootfs-overlay/etc/dcentos/mutation_policy'
 AM3_S21PRO_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21pro/post-image.sh'
 AM3_S21XP_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s21xp/post-image.sh'
+AM3_S21XP_MUTATION_POLICY='br2_external_dcentos/board/amlogic/am3-s21xp/rootfs-overlay/etc/dcentos/mutation_policy'
 AM3_T21_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-t21/post-image.sh'
+AM3_T21_POST_BUILD='br2_external_dcentos/board/amlogic/am3-t21/post-build.sh'
+AM3_T21_MUTATION_POLICY='br2_external_dcentos/board/amlogic/am3-t21/rootfs-overlay/etc/dcentos/mutation_policy'
+AMLOGIC_S46POST_INSTALL='br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S46post-install'
 AM3_S19JPRO_AML_POST_IMAGE='br2_external_dcentos/board/amlogic/am3-s19jpro-aml/post-image.sh'
+AMLOGIC_S37BOARD_SETUP='br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S37board_setup'
+AMLOGIC_S82DCENTRALD='br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S82dcentrald'
 AMLOGIC_S99UPGRADE='br2_external_dcentos/board/amlogic/rootfs-overlay/etc/init.d/S99upgrade'
 AM3_GEOMETRY='scripts/lib/am3_geometry.sh'
 SYSUPGRADE_COMMON='scripts/lib/sysupgrade_package_common.sh'
@@ -830,7 +838,7 @@ require_pattern "$PRE_FLASH" 'assert_payload_fits_window "$board root" "$root_si
 require_pattern "$PRE_FLASH" 'am1-s9|am2-s19j|am2-s19jpro|am2-s19pro|am2-s17p)' 'package-only validator covers all admitted Zynq board identities'
 require_pattern "$PRE_FLASH" 'validate_package_only "$TARBALL" "am1-s9"' 'am1-s9 live pre-flash validates the package before declaring backup-floor success (CE-352)'
 require_pattern "$BUILD_DOCKER" 'BOARD_PKG_NAME="am1-s9"' 'S9 build target retains exact am1-s9 package identity'
-require_exact_line "$BUILD_DOCKER" '            s9|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro)' 'build_in_docker package-validates exactly S9 and the install-authorized Amlogic/AM2 tarballs in this branch'
+require_exact_line "$BUILD_DOCKER" '            s9|am3-s19kpro|am3-s19xp|am3-s19jxp|am3-s19jproplus|am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml|am3-t21|am2-s19jpro|am2-s19pro)' 'build_in_docker structurally validates active packages plus explicitly non-installable S21 XP/T21 recipes'
 require_exact_line "$BUILD_DOCKER" '            am3-bb|am3-bb-s19jpro)' 'build_in_docker keeps BB targets on their distinct SD-card validation branch'
 require_pattern "$BUILD_DOCKER" 'SD-card payload validation:' 'BB export validation remains SD-card-specific, not sysupgrade package validation'
 require_pattern "$BUILD_DOCKER" 'Package-only non-installable validation:' 'build_in_docker gives am2-s17pro a distinct non-installable validation lane'
@@ -984,7 +992,7 @@ require_pattern 'br2_external_dcentos/board/amlogic/am3-s21/post-build.sh' 'dcen
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s21/post-build.sh' 'usr/sbin/lib/am3_geometry.sh' 'am3-s21 post-build ships AM3 geometry helper for revert'
 require_pattern 'br2_external_dcentos/board/beaglebone/am3-bb/post-build.sh' 'dcent_require_dcentrald_version_match' 'am3-bb post-build gates staged dcentrald version'
 require_pattern "$AM2_POST_IMAGE" '"version": "${PACKAGE_VERSION}"' 'am2 post-image writes a non-null manifest version'
-require_pattern "$AM3_S19K_POST_IMAGE" '"version": "${PACKAGE_VERSION}"' 'am3-s19k post-image writes a non-null manifest version'
+require_pattern "$AM3_S19K_POST_IMAGE" 'PACKAGE_VERSION=$(infer_package_version || true)' 'am3-s19k post-image resolves a non-null manifest version before the shared writer'
 require_pattern "$AM3_S21_POST_IMAGE" '"version": "${PACKAGE_VERSION}"' 'am3-s21 post-image writes a non-null manifest version'
 require_pattern "$AM2_POST_IMAGE" 'dcent_write_sysupgrade_manifest' 'am2 post-image uses shared AM2/AM3 manifest writer'
 require_pattern "$AM3_S19K_POST_IMAGE" 'dcent_write_sysupgrade_manifest' 'am3-s19k post-image uses shared AM2/AM3 manifest writer'
@@ -997,16 +1005,47 @@ require_pattern "$PACKAGE" 'Release-root signing requires --verify-pubkey or DCE
 require_pattern "$PACKAGE" 'unsigned package generation' 'standalone packager gates unsigned package generation'
 require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s19k metadata disables target-side sysupgrade'
 require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s21 metadata disables target-side sysupgrade'
-require_pattern "$AM3_S19K_POST_IMAGE" 'host_driven_rootfs_window_lab' 'am3-s19k metadata marks host-driven lab install'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab' 'am3-s19k metadata admits only the host-driven guarded rootfs window'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_PACKAGE_INSTALLABLE=true' 'am3-s19k package is structurally installable after its release prerequisites pass'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip>' 'am3-s19k metadata emits the guarded host install command'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="$DCENT_TOOLBOX_INSTALL_COMMAND"' 'am3-s19k update remains the same guarded host transaction'
+require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_S19K_EXPECTED_RELEASE_KEY_SHA256' 'am3-s19k build requires an externally pinned release key'
+require_pattern "$AM3_S19K_POST_IMAGE" 's19k_persistent_image_verify.py' 'am3-s19k build runs the dependency-bound image contract verifier'
+require_pattern "$AM3_S19K_POST_IMAGE" 'CLEAR_FOR_FLASH=false' 'am3-s19k packaged writer remains disabled'
+reject_pattern "$AM3_S19K_POST_IMAGE" 'dcent ota update-fleet <ip>' 'am3-s19k build artifacts do not advertise fleet OTA'
 require_pattern "$AM3_S21_POST_IMAGE" 'host_driven_rootfs_window_lab' 'am3-s21 metadata marks host-driven lab install'
 # 2026-08-15: every manifest-bearing Amlogic package advertises the fleet OTA
 # update command for the same guarded rootfs-window rail (the packaging-side
 # update contract selftest above enforces the safety shape of this string).
 require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>"' 'am3-s21 metadata advertises the fleet OTA update command'
 require_pattern "$AM3_S21PRO_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21pro.tar --artifact-dir <restore_verified_dir>"' 'am3-s21pro metadata advertises the fleet OTA update command'
-require_pattern "$AM3_S21XP_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>"' 'am3-s21xp metadata advertises the fleet OTA update command'
-require_pattern "$AM3_T21_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"' 'am3-t21 metadata advertises the fleet OTA update command'
-require_pattern "$AM3_S19K_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19kpro.tar --artifact-dir <restore_verified_dir>"' 'am3-s19kpro metadata advertises the fleet OTA update command'
+require_pattern "$AM3_S21_POST_IMAGE" 'am3-s19xp)' 'shared A113D packager has an exact S19 XP package-only branch'
+require_pattern "$AM3_S21_POST_IMAGE" 'am3-s19jxp)' 'shared A113D packager has an exact S19j XP package-only branch'
+require_pattern "$AM3_S21_POST_IMAGE" 'PACKAGE_STORAGE_AUTHORIZED=0' 'X19 AML package branches deny storage geometry'
+require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_TOOLBOX_INSTALL_MODE=package_only_denied' 'shared A113D metadata can deny X19 AML installation'
+require_pattern "$AM3_S21_POST_IMAGE" 'DCENT_PACKAGE_INSTALLABLE=false' 'shared A113D package-only branches are explicitly non-installable'
+require_exact_line "$AM3_S19XP_MUTATION_POLICY" 'management-only' 'am3-s19xp rootfs carries an immutable management-only mutation policy'
+require_exact_line "$AM3_S19JXP_MUTATION_POLICY" 'management-only' 'am3-s19jxp rootfs carries an immutable management-only mutation policy'
+require_pattern "$AM3_S21XP_POST_IMAGE" 'DCENT_TOOLBOX_INSTALL_MODE=package_only_denied' 'am3-s21xp metadata denies installation while its platform/storage contracts remain unproven'
+require_pattern "$AM3_S21XP_POST_IMAGE" 'DCENT_PACKAGE_INSTALLABLE=false' 'am3-s21xp package-validation artifact is explicitly non-installable'
+require_pattern "$AM3_S21XP_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND=""' 'am3-s21xp metadata emits no fleet OTA command'
+require_exact_line "$AM3_S21XP_MUTATION_POLICY" 'management-only' 'am3-s21xp rootfs carries an immutable management-only mutation policy'
+require_pattern "$AM3_T21_POST_IMAGE" 'DCENT_TOOLBOX_INSTALL_MODE=package_only_denied' 'am3-t21 metadata denies installation while storage geometry remains unproven'
+require_pattern "$AM3_T21_POST_IMAGE" 'DCENT_PACKAGE_INSTALLABLE=false' 'am3-t21 package-validation artifact is explicitly non-installable'
+require_pattern "$AM3_T21_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND=""' 'am3-t21 metadata emits no fleet OTA command'
+require_exact_line "$AM3_T21_MUTATION_POLICY" 'management-only' 'am3-t21 rootfs carries an immutable management-only mutation policy'
+require_ordered_patterns "$AMLOGIC_S37BOARD_SETUP" 'require_mutation_authority || return 1' 'force_psu_safe_low' 'am3 shared board init checks target policy before the first PSU GPIO write'
+require_ordered_patterns "$AMLOGIC_S46POST_INSTALL" 'require_post_install_authority || return 1' '. /lib/functions/dcentos-defaults.sh' 'am3 post-install hook checks target policy before loading generic NAND geometry'
+require_ordered_patterns "$AMLOGIC_S46POST_INSTALL" 'require_post_install_authority || return 1' 'nanddump -q' 'am3 post-install hook checks target policy before reading or erasing NAND'
+require_pattern "$AMLOGIC_S82DCENTRALD" 'require_runtime_authority || exit 1' 'am3 daemon lifecycle refuses management-only targets before launch or safety actions'
+reject_pattern "$AMLOGIC_S99UPGRADE" 'am3-s19jpro-aml|am3-s21|am3-s21pro|am3-s21xp' 'am3-s21xp is excluded from the raw-NAND OTA-08 identity gate'
+reject_pattern "$AMLOGIC_S99UPGRADE" 'am3-s19jpro-aml|am3-s21|am3-s21pro|am3-t21' 'am3-t21 is excluded from the raw-NAND OTA-08 identity gate'
+require_ordered_patterns "$AMLOGIC_S99UPGRADE" 'require_ota_mutation_policy || exit 1' 'replay_pending_env_clear' 'am3 OTA policy gate precedes WAL replay and fw_setenv mutation'
+reject_pattern "$AM3_T21_POST_BUILD" 'cp "$REVERT_T21_SRC"' 'am3-t21 rootfs does not stage an unproven revert helper'
+reject_pattern "$AM3_T21_POST_IMAGE" 'scripts/lib/am3_geometry.sh' 'am3-t21 package recipe does not import S19K/S21 flash geometry'
+reject_pattern 'br2_external_dcentos/board/amlogic/am3-s21xp/post-build.sh' 'cp "$REVERT_S21_SRC"' 'am3-s21xp rootfs does not stage an inherited base-S21 revert helper'
+reject_pattern "$AM3_S21XP_POST_IMAGE" 'scripts/lib/am3_geometry.sh' 'am3-s21xp package recipe does not import shared AM3 flash geometry'
+require_pattern "$AM3_S19K_POST_IMAGE" 'structurally installable for the host extractor, but it grants no writer' 'am3-s19k unsigned A/B package distinguishes structural installability from mutation authority'
 require_pattern "$AM3_S19JPRO_AML_POST_IMAGE" 'DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s19jpro-aml.tar --artifact-dir <restore_verified_dir>"' 'am3-s19jpro-aml metadata advertises the fleet OTA update command'
 require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_OFFSET_HEX="${DCENT_AM3_ROOTFS_OFFSET_HEX:-0x05100000}"' 'am3 geometry centralizes rootfs offset'
 require_pattern "$AM3_GEOMETRY" 'DCENT_AM3_ROOTFS_WINDOW_HEX="${DCENT_AM3_ROOTFS_WINDOW_HEX:-0x02800000}"' 'am3 geometry centralizes rootfs window'
@@ -1014,12 +1053,20 @@ require_pattern "$AM3_S21_REVERT" 'ROOTFS_OFFSET="$DCENT_AM3_ROOTFS_OFFSET_HEX"'
 require_pattern "$RESTORE_ROUTE" '.arg(&post_dwell_fp.sha256)' 'restore route passes post-dwell SHA into revert helper'
 require_pattern "$S9_REVERT" 'S9 stock restore is disabled' 'S9 stock restore is an explicit containment boundary'
 reject_executable_pattern "$S9_REVERT" 'EXPECTED_SHA256=' 'contained S9 helper does not inspect an image'
-for revert_script in "$S17_REVERT" "$AM3_S19K_REVERT" "$AM3_S21_REVERT"; do
+for revert_script in "$S17_REVERT" "$AM3_S21_REVERT"; do
     require_pattern "$revert_script" 'EXPECTED_SHA256=' "stock revert helper $(basename "$revert_script") accepts expected SHA"
     require_pattern "$revert_script" 'Firmware SHA-256 verified at extraction time.' "stock revert helper $(basename "$revert_script") verifies SHA before extract"
     require_pattern "$revert_script" 'MAX_EXTRACTED_KB' "stock revert helper $(basename "$revert_script") caps extracted size"
     require_pattern "$revert_script" 'firmware archive contains hard-linked files' "stock revert helper $(basename "$revert_script") rejects hard-linked files"
 done
+require_pattern "$AM3_S19K_REVERT" 'EXPECTED_SHA256=' 'S19k evidence classifier accepts an exact expected archive SHA'
+require_pattern "$AM3_S19K_REVERT" 'Firmware SHA-256 verified on private immutable-for-this-process snapshot.' 'S19k evidence classifier snapshots and authenticates the archive before inspection'
+require_pattern "$AM3_S19K_REVERT" '(ulimit -f 2048 && tar -tzf "$PRIVATE_FW" > "$TOC")' 'S19k evidence classifier bounds the archive TOC'
+require_pattern "$AM3_S19K_REVERT" 'firmware archive must contain exactly one uImage-like candidate' 'S19k evidence classifier rejects ambiguous payload candidates'
+require_pattern "$AM3_S19K_REVERT" '(ulimit -f 81920 && tar -xOzf "$PRIVATE_FW" -- "$UIMAGE_MEMBER" > "$UIMAGE_REAL")' 'S19k evidence classifier streams one option-delimited candidate into a bounded private file'
+require_pattern "$AM3_S19K_REVERT" 'avoids materializing' 'S19k evidence classifier never materializes archive paths, links, devices, or sibling files'
+require_pattern "$AM3_S19K_REVERT" 'private firmware snapshot changed during classification' 'S19k evidence classifier rehashes its private archive after streaming'
+require_pattern "$AM3_S19K_REVERT" 'classifier limits: CRC and stock payload identity are unverified; NAND mutation remains refused' 'S19k evidence classifier states its missing proof and mutation refusal'
 
 # NAND-safety for the AMLOGIC reverts. Amlogic (A113D) writes the stock rootfs
 # into a uImage window with `nandwrite -p` PAGE writes and must NEVER call
@@ -1030,9 +1077,11 @@ done
 # guard is comment-aware so the scripts that DOCUMENT the ban don't self-trip.
 AM3_S19JPRO_REVERT='scripts/revert_to_stock_am3_aml_s19jpro.sh'
 AM3_T21_REVERT='scripts/revert_to_stock_am3_aml_t21.sh'
-for aml_revert in "$AM3_S19K_REVERT" "$AM3_S21_REVERT" "$AM3_S19JPRO_REVERT" "$AM3_T21_REVERT"; do
+for aml_revert in "$AM3_S19K_REVERT" "$AM3_S21_REVERT" "$AM3_S19JPRO_REVERT"; do
     reject_executable_pattern "$aml_revert" 'flash_erase' "amlogic revert helper $(basename "$aml_revert") never flash_erases a partition (nandwrite page-writes only; brick op)"
 done
+require_pattern "$AM3_T21_REVERT" 'T21 stock revert is unavailable' 'T21 compatibility revert entrypoint always refuses while storage geometry is unproven'
+reject_executable_pattern "$AM3_T21_REVERT" 'nandwrite|nanddump|flash_erase|fw_setenv|revert_ssh_preflight|ssh|scp' 'T21 compatibility revert entrypoint contains no transport or storage writer'
 require_pattern "$S17_REVERT" 'command -v fw_printenv' 'S17 stock revert requires fw_printenv before destructive work'
 require_pattern "$S17_REVERT" 'command -v fw_setenv' 'S17 stock revert requires fw_setenv before destructive work'
 require_pattern "$S17_REVERT" "Refusing to infer active slot" 'S17 stock revert fails closed on unknown bootslot'
@@ -1224,7 +1273,8 @@ for forbidden_writer in fw_setenv fw_printenv flash_erase nandwrite nanddump ubi
 done
 # --- end legacy SD-to-NAND containment --------------------------------------
 require_pattern "$AM3_S19K_POST_IMAGE" 'rootfs uImage exceeds Amlogic rootfs window' 'am3-s19k post-image fails if rootfs exceeds rootfs window'
-require_pattern "$AM3_S21_POST_IMAGE" 'rootfs uImage exceeds Amlogic rootfs window' 'am3-s21 post-image fails if rootfs exceeds rootfs window'
+require_pattern "$AM3_S21_POST_IMAGE" 'PACKAGE_SIZE_LABEL="Amlogic rootfs window"' 'am3-s21 admitted targets label the guarded rootfs window'
+require_pattern "$AM3_S21_POST_IMAGE" 'rootfs uImage exceeds ${PACKAGE_SIZE_LABEL}' 'am3-s21 shared packager fails against the selected authorized or package-only ceiling'
 reject_pattern "$AM2_POST_IMAGE" '"version": null' 'am2 post-image does not emit null manifest version'
 reject_pattern "$AM3_S19K_POST_IMAGE" '"version": null' 'am3-s19k post-image does not emit null manifest version'
 reject_pattern "$AM3_S21_POST_IMAGE" '"version": null' 'am3-s21 post-image does not emit null manifest version'
@@ -1306,10 +1356,10 @@ reject_pattern "$ZYNQ_S99UPGRADE" '[[ ' 'zynq S99upgrade has no bash [[ ]] test'
 # loudly (blocked marker -> U-Boot reverts to the known-good slot) if all
 # attempts fail. NEVER raw nandwrite mtd4 (load-bearing
 # ).
-require_pattern "$ZYNQ_S99UPGRADE" 'fw_setenv --script -' 'zynq S99upgrade clears upgrade_stage via a single atomic fw_setenv --script transaction'
+require_pattern "$ZYNQ_S99UPGRADE" 'fw_setenv -c "$FW_ENV_CONFIG" --script -' 'zynq S99upgrade clears upgrade_stage via a single atomic fw_setenv --script transaction'
 require_pattern "$ZYNQ_S99UPGRADE" 'FW_COMMIT_RETRIES' 'zynq S99upgrade retries the upgrade_stage clear (weak-ECC mtd4 resilience)'
 require_pattern "$ZYNQ_S99UPGRADE" 'DCENTOS_FW_COMMIT_RETRIES' 'zynq S99upgrade retry count is tunable with a safe default'
-require_pattern "$ZYNQ_S99UPGRADE" 'STILL_PRESENT' 'zynq S99upgrade verifies upgrade_stage is actually gone after each attempt'
+require_pattern "$ZYNQ_S99UPGRADE" 'exact old environment still present' 'zynq S99upgrade verifies upgrade_stage is actually gone after each attempt'
 require_pattern "$ZYNQ_S99UPGRADE" 'could NOT be cleared after' 'zynq S99upgrade fails loudly when every clear attempt fails'
 # The clear must remain fw_setenv-only — never a raw NAND write on weak mtd4.
 # (Match an actual command targeting the device, not the word in prose/warnings:
@@ -1318,10 +1368,24 @@ reject_pattern "$ZYNQ_S99UPGRADE" 'nandwrite /dev/mtd' 'zynq S99upgrade never ra
 reject_pattern "$ZYNQ_S99UPGRADE" 'flash_erase /dev/mtd' 'zynq S99upgrade never flash_erases mtd4'
 # A blocked (unconfirmed) clear must NOT advertise a committed slot to S99verify.
 require_pattern "$ZYNQ_S99UPGRADE" 'echo "blocked" > "$UPGRADE_COMMIT_MARKER"' 'zynq S99upgrade marks the slot blocked when the clear is unconfirmed (fail-safe)'
-# fw_env.config geometry must stay the CRC-verified redundant pair.
+# fw_env.config geometry must stay the CRC-verified redundant pair. The
+# installed file is the exact 72-byte parser input (two single-space records,
+# no comment header): sysupgrade-uboot-env-admission.sh admits ONLY that
+# byte-exact content before any fw_setenv mutation, so this documentation
+# lives in tests, not in the parser input. Geometry was verified against a
+# real mtd4 dump (2026-06-05, output/nand-backup-135-20260605, 524288 B):
+# copy A @ 0x00000, copy B @ 0x20000, ENV_SIZE 0x20000 (CRC32 over
+# data[5:0x20000] matches BOTH copies). Do NOT "fix" this by shrinking
+# ENV_SIZE or by raw nandwrite (load-bearing
+# ).
 ZYNQ_FW_ENV='br2_external_dcentos/board/zynq/rootfs-overlay/etc/fw_env.config'
-require_pattern "$ZYNQ_FW_ENV" '/dev/mtd4   0x00000   0x20000   0x20000   1' 'zynq fw_env.config copy A geometry (CRC-verified)'
-require_pattern "$ZYNQ_FW_ENV" '/dev/mtd4   0x20000   0x20000   0x20000   1' 'zynq fw_env.config copy B geometry (CRC-verified)'
+require_exact_line "$ZYNQ_FW_ENV" '/dev/mtd4 0x00000 0x20000 0x20000 1' 'zynq fw_env.config copy A geometry (CRC-verified, admission byte-exact)'
+require_exact_line "$ZYNQ_FW_ENV" '/dev/mtd4 0x20000 0x20000 0x20000 1' 'zynq fw_env.config copy B geometry (CRC-verified, admission byte-exact)'
+if [ "$(wc -c <"$ZYNQ_FW_ENV" | tr -d '[:space:]')" = 72 ]; then
+    pass 'zynq fw_env.config is the exact 72-byte two-record parser input'
+else
+    fail 'zynq fw_env.config must be the exact 72-byte two-record parser input (no comments)'
+fi
 # --- end zynq upgrade_stage-clear reliability coverage -----------------------
 
 # --- CV1835 brick-vector retirement -----------------------------------------

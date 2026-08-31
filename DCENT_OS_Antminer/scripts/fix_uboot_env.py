@@ -5,7 +5,7 @@ so DCENTos survives power cycles on firmware2 slot.
 
 Usage: python3 fix_uboot_env.py
   Reads /tmp/uboot_env.bin, patches it, writes /tmp/uboot_env_patched.bin
-  Then run: flash_erase /dev/mtd4 0 0 && nandwrite -p /dev/mtd4 /tmp/uboot_env_patched.bin
+  Then apply with fw_setenv --script (NEVER flash_erase/nandwrite /dev/mtd4).
 """
 import struct, sys
 
@@ -118,4 +118,4 @@ with open("/tmp/uboot_env_patched.bin", "wb") as f:
     f.write(new_data)
 
 print("\nPatched env: /tmp/uboot_env_patched.bin (%d bytes)" % len(new_data))
-print("Flash with: flash_erase /dev/mtd4 0 0 && nandwrite -p /dev/mtd4 /tmp/uboot_env_patched.bin")
+print("Apply with: fw_setenv --script  (NEVER flash_erase/nandwrite /dev/mtd4)")

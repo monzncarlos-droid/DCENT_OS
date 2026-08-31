@@ -25,6 +25,9 @@ DROPBEAR_ARGS=""
 mkdir -p /etc/dropbear 2>/dev/null || true
 
 am3_bb_rescue_enabled() {
+    # RELEASE images must not keep the lab rescue SSH bypass even if the
+    # overlay marker accidentally survived post-build strip.
+    [ -f /etc/dcentos/release-image ] && return 1
     [ -f "$RESCUE_SSH_MARKER" ] || return 1
     [ -r "$BOARD_TARGET_FILE" ] || return 1
     [ "$(cat "$BOARD_TARGET_FILE" 2>/dev/null)" = "am3-bb-s19jpro" ] || return 1

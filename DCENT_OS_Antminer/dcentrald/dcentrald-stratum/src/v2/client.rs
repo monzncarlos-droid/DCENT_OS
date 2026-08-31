@@ -4,6 +4,15 @@
 //! mining channel, and processes jobs/shares. Ported from the proven DCENT_axe
 //! (ESP32) blocking client to async tokio.
 //!
+//! # Honesty (DESK_NOW rank 12)
+//!
+//! **Opt-in only.** `protocol = "sv2"` / `"v2"` (or Auto with `sv2_url`)
+//! selects this client. Host mock-pool harnesses pin handshake/channel/job
+//! plumbing. **Live accepted shares are BENCH_HOLD.** This is not a
+//! production SV2 mining path and **not Braiins-parity** (no live JD mining
+//! injection; JD `probe_once` is a supervisor probe). V2Only does not fail
+//! over to V1 backups — see [`crate::router::validate_v2_only_contract`].
+//!
 //! # Interface
 //! Matches the V1 client's channel interface exactly:
 //! - `job_tx`: Sends new `JobTemplate` when NewMiningJob + SetNewPrevHash arrive
@@ -185,6 +194,10 @@ struct ActiveCustomJob {
 ///
 /// ## Channel Interface
 /// Matches `StratumV1Client` exactly — drop-in replacement at the daemon level.
+///
+/// ## Honesty
+/// Opt-in. Live accepted shares **BENCH_HOLD**. Not Braiins-parity. Job
+/// Declaration `probe_once` is a connectivity probe, not work injection.
 pub struct StratumV2Client {
     config: StratumConfig,
 
@@ -548,6 +561,11 @@ impl StratumV2Client {
             .set_nodelay(true)
             .map_err(|e| format!("set_nodelay failed: {}", e))?;
 
+        let peer_is_loopback = stream
+            .peer_addr()
+            .map(|address| address.ip().is_loopback())
+            .unwrap_or(false);
+
         info!("SV2: TCP connected to {}", addr);
 
         let (mut reader, mut writer) = tokio::io::split(stream);
@@ -583,25 +601,21 @@ impl StratumV2Client {
         // Pin the pool authority key from the SV2 URL (SV2 spec §4.1: the
         // base58check authority key travels in the URL path). When present,
         // the Noise session verifies the server certificate against it and
-        // aborts on mismatch — closing the MITM hole. When absent the client
-        // proceeds in TOFU mode (NoiseSession logs the exposure at WARN).
-        match super::auth::parse_authority_key_from_sv2_url(&pool.url) {
-            Ok(key) => {
+        // aborts on mismatch. TOFU is restricted to an actual loopback peer
+        // for local mock/integration tests.
+        match super::auth::admit_authority_key_for_peer(&pool.url, peer_is_loopback) {
+            Ok(Some(key)) => {
                 info!(
                     "SV2: pinned pool authority key from URL — server certificate will be verified (BIP340)"
                 );
                 channel.noise_session_mut().pool_authority_key = Some(*key.as_bytes());
             }
-            Err(super::auth::AuthorityKeyError::NotPresent) => {
-                warn!(
-                    "SV2: no authority key in pool URL — operating in TOFU mode (active MITM possible). Append the pool's base58check authority key to the SV2 URL to enable verification."
-                );
+            Ok(None) => {
+                warn!("SV2: loopback peer has no authority key — local test session is using TOFU");
             }
             Err(e) => {
-                // A present-but-malformed key is a hard configuration error:
-                // refuse rather than silently downgrade to TOFU.
                 return Err(format!(
-                    "SV2: pool URL carries an invalid authority key ({}). Refusing to connect — fix the SV2 URL or remove the key for explicit TOFU.",
+                    "SV2: authority-key admission failed ({}). Refusing to connect; remote sessions require an exact pinned key.",
                     e
                 ));
             }

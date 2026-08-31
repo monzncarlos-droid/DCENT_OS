@@ -456,6 +456,7 @@ impl AsicDriver for Kf1950 {
                         job_id: parsed.counter,
                         nonce: parsed.nonce,
                         rolled_version: 0, // version rolling not supported
+                        rolled_ntime: 0,   // ntime rolling not supported
                         asic_nr: parsed.chip_addr,
                         timestamp_us: crate::common::now_us(),
                     });

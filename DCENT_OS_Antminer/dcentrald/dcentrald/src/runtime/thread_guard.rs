@@ -1327,9 +1327,12 @@ mod tests {
         let serial = include_str!("../serial_mining.rs");
         let hybrid = include_str!("../s19j_hybrid_mining.rs");
         let serial_production = serial
+            .split_once("pub async fn run(&mut self) -> Result<()>")
+            .expect("serial mining runtime entry")
+            .1
             .split("#[cfg(test)]\nmod tests {")
             .next()
-            .expect("serial mining production section");
+            .expect("serial mining production runtime section");
         let hybrid_production = hybrid
             .split("#[cfg(test)]\nmod tests {")
             .next()
@@ -1398,9 +1401,12 @@ mod tests {
             .find("runtime_threads.stop_and_join(Duration::from_secs(3))")
             .expect("stock heartbeat must use bounded join");
         let stock_disable = stock_shutdown
-            .find("run_safety.teardown(\"normal-shutdown\")")
+            .find("let voltage_evidence = run_safety.teardown(")
             .expect("stock voltage teardown must be explicit");
         assert!(stock_join < stock_disable);
+        let stock_disable_body = &stock_shutdown[stock_disable..];
+        assert!(stock_disable_body.contains("stock-dispatch-io-failure"));
+        assert!(stock_disable_body.contains("normal-shutdown"));
 
         let stock_drop = stock
             .split("impl Drop for StockRunSafetyGuard")
@@ -1425,7 +1431,7 @@ mod tests {
         // count (4) and the source (5) had already drifted apart before
         // `passthrough-dma-layout-refused` was added. Adding a teardown path
         // means adding its reason here; the count is the backstop, not the check.
-        assert_eq!(energized_stock_body.matches("return Err").count(), 6);
+        assert_eq!(energized_stock_body.matches("return Err").count(), 7);
         for reason in [
             "no-pics-initialized",
             "cold-chain-refusal",
@@ -1433,6 +1439,7 @@ mod tests {
             "heartbeat-spawn-failed",
             "work-dispatch-admission-refused",
             "passthrough-dma-layout-refused",
+            "full-init-dhash-refused",
         ] {
             assert!(
                 energized_stock_body.contains(reason),

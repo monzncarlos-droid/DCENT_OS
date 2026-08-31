@@ -172,21 +172,32 @@ pub fn coinbase_nonce2_word(padding_len: usize, nonce2_offset: u16, nonce2_bytes
 }
 
 fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
-    data.get(offset..offset + 2)?.try_into().ok().map(u16::from_le_bytes)
+    data.get(offset..offset + 2)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
-    data.get(offset..offset + 4)?.try_into().ok().map(u32::from_le_bytes)
+    data.get(offset..offset + 4)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
 }
 
 fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
-    data.get(offset..offset + 8)?.try_into().ok().map(u64::from_le_bytes)
+    data.get(offset..offset + 8)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
 }
 
 /// Decode one stock `parse_job_to_soc` packet. Not a work-TX permit.
 pub fn decode_s9se_job(data: &[u8]) -> Result<S9SeJobPacket, S9SeJobError> {
     if data.len() < JOB_HEADER_LEN + JOB_CRC_LEN {
-        return Err(S9SeJobError::TooShort { observed: data.len() });
+        return Err(S9SeJobError::TooShort {
+            observed: data.len(),
+        });
     }
     let typ = data[0];
     if typ != JOB_TYPE {
@@ -208,9 +219,8 @@ pub fn decode_s9se_job(data: &[u8]) -> Result<S9SeJobPacket, S9SeJobError> {
     let merkle_count = read_u16_le(data, 0x42).ok_or(S9SeJobError::TooShort {
         observed: data.len(),
     })?;
-    let payload_end = JOB_HEADER_LEN
-        + usize::from(coinbase_len)
-        + usize::from(merkle_count) * MERKLE_BRANCH_LEN;
+    let payload_end =
+        JOB_HEADER_LEN + usize::from(coinbase_len) + usize::from(merkle_count) * MERKLE_BRANCH_LEN;
     let required = payload_end + JOB_CRC_LEN;
     if required != data.len() {
         return Err(S9SeJobError::LengthMismatch {
@@ -225,11 +235,12 @@ pub fn decode_s9se_job(data: &[u8]) -> Result<S9SeJobPacket, S9SeJobError> {
     if expected != observed {
         return Err(S9SeJobError::BadCrc { expected, observed });
     }
-    let previous_hash: [u8; 32] = data[0x14..0x34]
-        .try_into()
-        .map_err(|_| S9SeJobError::TooShort {
-            observed: data.len(),
-        })?;
+    let previous_hash: [u8; 32] =
+        data[0x14..0x34]
+            .try_into()
+            .map_err(|_| S9SeJobError::TooShort {
+                observed: data.len(),
+            })?;
     Ok(S9SeJobPacket {
         flags: data[0x09],
         asic_diff: data[0x0a],
@@ -249,7 +260,11 @@ pub fn decode_s9se_job(data: &[u8]) -> Result<S9SeJobPacket, S9SeJobError> {
 }
 
 /// Pack a minimal header+payload+CRC job. Desk fixture only.
-pub fn pack_s9se_job(job: &S9SeJobPacket, coinbase: &[u8], merkles: &[u8]) -> Result<Vec<u8>, S9SeJobError> {
+pub fn pack_s9se_job(
+    job: &S9SeJobPacket,
+    coinbase: &[u8],
+    merkles: &[u8],
+) -> Result<Vec<u8>, S9SeJobError> {
     if coinbase.len() != usize::from(job.coinbase_len) {
         return Err(S9SeJobError::LengthMismatch {
             declared: usize::from(job.coinbase_len),
@@ -345,7 +360,10 @@ mod tests {
         let mut crc_bad = bytes;
         let last = crc_bad.len() - 1;
         crc_bad[last] ^= 0xff;
-        assert!(matches!(decode_s9se_job(&crc_bad), Err(S9SeJobError::BadCrc { .. })));
+        assert!(matches!(
+            decode_s9se_job(&crc_bad),
+            Err(S9SeJobError::BadCrc { .. })
+        ));
     }
 
     #[test]
@@ -357,10 +375,7 @@ mod tests {
         assert_eq!(padded.len(), 64);
         assert_eq!(padded[3], 0x80);
         assert_eq!(dhash_stop_word(0xFFFF_FFFF), 0xFFFF_FFBF);
-        assert_eq!(
-            dhash_start_word(0, 2) & DHASH_VERSION_MASK,
-            0x200
-        );
+        assert_eq!(dhash_start_word(0, 2) & DHASH_VERSION_MASK, 0x200);
         assert_eq!(dhash_start_word(0, 2) & DHASH_START_OR, DHASH_START_OR);
         assert_eq!(dhash_soc_init_word(0xFFFF_FFFF), 0xFFFF_F1DF);
         assert_eq!(dhash_start_no_ab_word(0), DHASH_NO_AB_OR);

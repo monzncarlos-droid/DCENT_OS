@@ -75,21 +75,92 @@ pub fn ticket_mask_esp_miner_pow2_floor(difficulty: u32) -> u32 {
 }
 
 /// Protocol map: which encode policy production ChipDrivers use offline.
+///
+/// Unknown chip IDs return `None`. Prefer [`compute_ticket_mask_policy`] when
+/// the caller must refuse silent encoding.
 #[inline]
-pub fn ticket_mask_encoding_for_chip_id(chip_id: u16) -> TicketMaskEncoding {
+pub fn try_ticket_mask_encoding_for_chip_id(chip_id: u16) -> Option<TicketMaskEncoding> {
     match chip_id {
         // Bit-reversed family (jig / Braiins / BM1397 pure / BM1391 set_TM).
-        0x1387 | 0x1391 | 0x1393 | 0x1397 | 0x1398 => TicketMaskEncoding::BitReversed,
+        0x1387 | 0x1391 | 0x1393 | 0x1397 | 0x1398 => Some(TicketMaskEncoding::BitReversed),
         // BM136x industrial plain (fixture 0x7F @ diff 128).
-        0x1362 | 0x1366 | 0x1368 | 0x1370 | 0x1373 => TicketMaskEncoding::PlainDiffMinusOne,
+        0x1362 | 0x1366 | 0x1368 | 0x1370 | 0x1373 => Some(TicketMaskEncoding::PlainDiffMinusOne),
         // BM1489: plain (wave-8 unconfirmed vs BM1485 bit-reversed predecessor).
-        0x1489 => TicketMaskEncoding::PlainDiffMinusOne,
-        // Unknown: fail-closed plain (never invent bit-reverse without evidence).
-        _ => TicketMaskEncoding::PlainDiffMinusOne,
+        0x1489 => Some(TicketMaskEncoding::PlainDiffMinusOne),
+        _ => None,
     }
 }
 
+/// Protocol map with a fail-closed unknown default of plain `(diff-1)`.
+///
+/// Unknown chips must not invent bit-reversal. Callers that must refuse
+/// unknown IDs entirely should use [`compute_ticket_mask_policy`].
+#[inline]
+pub fn ticket_mask_encoding_for_chip_id(chip_id: u16) -> TicketMaskEncoding {
+    try_ticket_mask_encoding_for_chip_id(chip_id).unwrap_or(TicketMaskEncoding::PlainDiffMinusOne)
+}
+
+/// Ticket-mask register for a known encoding family. BM1387 uses 0x18; BM1397+ uses 0x14.
+#[inline]
+pub fn ticket_mask_register_for_chip_id(chip_id: u16) -> Option<u8> {
+    match try_ticket_mask_encoding_for_chip_id(chip_id) {
+        None => None,
+        Some(_) if chip_id == 0x1387 => Some(TICKET_MASK_REG_BM1387),
+        Some(_) => Some(TICKET_MASK_REG_BM1397PLUS),
+    }
+}
+
+/// Computed ticket-mask policy. Does **not** write hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketMaskPolicy {
+    pub chip_id: u16,
+    pub encoding: TicketMaskEncoding,
+    pub register: u8,
+    pub mask: u32,
+}
+
+/// Unknown-chip refuse for [`compute_ticket_mask_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketMaskPolicyError {
+    UnknownChip { chip_id: u16 },
+}
+
+impl std::fmt::Display for TicketMaskPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownChip { chip_id } => write!(
+                f,
+                "unknown chip ID 0x{chip_id:04X}: refuse silent ticket-mask encoding"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TicketMaskPolicyError {}
+
+/// Compute ticket-mask value + register for a known chip. Never writes hardware.
+#[inline]
+pub fn compute_ticket_mask_policy(
+    chip_id: u16,
+    difficulty: u32,
+) -> Result<TicketMaskPolicy, TicketMaskPolicyError> {
+    let encoding = try_ticket_mask_encoding_for_chip_id(chip_id)
+        .ok_or(TicketMaskPolicyError::UnknownChip { chip_id })?;
+    let register = ticket_mask_register_for_chip_id(chip_id)
+        .ok_or(TicketMaskPolicyError::UnknownChip { chip_id })?;
+    Ok(TicketMaskPolicy {
+        chip_id,
+        encoding,
+        register,
+        mask: ticket_mask_from_difficulty(encoding, difficulty),
+    })
+}
+
 /// Resolve ticket-mask value for a chip id + difficulty (production pure).
+///
+/// Unknown chips still encode plain `(diff-1)` here so existing ChipDriver
+/// thin-wraps stay byte-stable. New callers that must refuse unknown IDs
+/// should use [`compute_ticket_mask_policy`].
 #[inline]
 pub fn resolve_ticket_mask(chip_id: u16, difficulty: u32) -> u32 {
     ticket_mask_from_difficulty(ticket_mask_encoding_for_chip_id(chip_id), difficulty)
@@ -262,5 +333,42 @@ mod tests {
         // Reg SSOT pin.
         assert_eq!(TICKET_MASK_REG_BM1397PLUS, 0x14);
         assert_eq!(TICKET_MASK_REG_BM1387, 0x18);
+    }
+
+    #[test]
+    fn compute_ticket_mask_policy_is_math_only_and_refuses_unknown() {
+        let s9 = compute_ticket_mask_policy(0x1387, 256).expect("BM1387");
+        assert_eq!(s9.encoding, TicketMaskEncoding::BitReversed);
+        assert_eq!(s9.register, TICKET_MASK_REG_BM1387);
+        assert_eq!(s9.mask, 0x0000_00FF);
+
+        let s17 = compute_ticket_mask_policy(0x1397, 64).expect("BM1397");
+        assert_eq!(s17.encoding, TicketMaskEncoding::BitReversed);
+        assert_eq!(s17.register, TICKET_MASK_REG_BM1397PLUS);
+        assert_eq!(s17.mask, 0x0000_00FC);
+
+        let s21 = compute_ticket_mask_policy(0x1368, 128).expect("BM1368");
+        assert_eq!(s21.encoding, TicketMaskEncoding::PlainDiffMinusOne);
+        assert_eq!(s21.register, TICKET_MASK_REG_BM1397PLUS);
+        assert_eq!(s21.mask, 0x0000_007F);
+
+        assert_eq!(
+            compute_ticket_mask_policy(0xFFFF, 256),
+            Err(TicketMaskPolicyError::UnknownChip { chip_id: 0xFFFF })
+        );
+        assert_eq!(try_ticket_mask_encoding_for_chip_id(0x1390), None);
+        assert_eq!(ticket_mask_register_for_chip_id(0xABCD), None);
+
+        let src = include_str!("ticket_mask.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("ticket_mask production boundary");
+        for banned in ["write_reg", "set_ticket_mask", "I2cBus", "FpgaChain"] {
+            assert!(
+                !production.contains(banned),
+                "ticket-mask policy must not write hardware ({banned})"
+            );
+        }
     }
 }

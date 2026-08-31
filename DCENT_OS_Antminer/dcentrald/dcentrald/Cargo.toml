@@ -80,6 +80,8 @@ sim-hal = [
     "dcentrald-asic/sim-hal",
     "dcentrald-stratum/mock-pool",
 ]
+# MQTT TLS passthrough. DEFAULT-OFF — see dcentrald-api `mqtt-tls`.
+mqtt-tls = ["dcentrald-api/mqtt-tls"]
 
 # W4.7 lint inheritance + grandfather override (DCENT_DevOps + DCENT_QA, 2026-05-07).
 # This crate has ~148 grandfathered unwrap/expect/panic occurrences in src/

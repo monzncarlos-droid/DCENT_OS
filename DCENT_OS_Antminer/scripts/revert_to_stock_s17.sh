@@ -1,12 +1,20 @@
 #!/bin/sh
 #
-# revert_to_stock_s17.sh — Revert an S17 (am2-s17 control board, BM1397+)
+# revert_to_stock_s17.sh — Revert a BM1397 17-series unit (am2 control board)
 # from DCENTos back to stock Bitmain firmware.  W16 closure
 # script — created alongside revert_to_stock_s9.sh / _am335x_bb.sh /
 # _am3_aml_s21.sh / _am3_aml_s19k.sh so the
 # `dcentrald-api::routes::restore_to_stock::PROFILE_TABLE` entry for
 # `zynq-am2-bm1397` can point at /usr/sbin/revert_to_stock_s17.sh on
 # the running miner.
+#
+# 2026-08-27 Antminer 17-Series Complete Unlock Armada (agent B2): family
+# extension. DCENT_S17_REVERT_MODEL selects the chassis being reverted:
+#   s17 (default) | s17plus | t17 | t17plus
+# The exact-target check is per-model (a T17+ board_target with model=s17 is
+# refused), and every non-S17 model REQUIRES an operator-supplied stock
+# tarball + SHA-256 (argv) — this desk holds no verified per-model download
+# URL for S17+/T17/T17+, so those reverts are LAB-GATED and never download.
 #
 # This script writes a stock Bitmain S17 firmware image to the inactive
 # NAND slot and updates U-Boot environment to boot it on next reboot.
@@ -54,6 +62,15 @@ MTD_FIRMWARE_A="/dev/mtd7"
 MTD_FIRMWARE_B="/dev/mtd8"
 MAX_EXTRACTED_KB="${DCENT_STOCK_REVERT_MAX_EXTRACTED_KB:-262144}"
 
+S17_REVERT_MODEL="${DCENT_S17_REVERT_MODEL:-s17}"
+case "$S17_REVERT_MODEL" in
+    s17|s17plus|t17|t17plus) ;;
+    *)
+        echo "ERROR: DCENT_S17_REVERT_MODEL must be one of s17|s17plus|t17|t17plus (got: $S17_REVERT_MODEL)." >&2
+        exit 1
+        ;;
+esac
+
 normalize_target_signal() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]'
 }
@@ -66,19 +83,39 @@ require_exact_s17_target() {
     IDENTITY_NORM=$(normalize_target_signal "$IDENTITY")
     BOARD_NORM=$(normalize_target_signal "$BOARD_TARGET")
 
+    # Per-model exact-target matrix. The device-tree model string of the
+    # 17 family is shared ("Antminer S17 Miner Control Board" class), so the
+    # load-bearing signal is /etc/dcentos/board_target; s19/t19 tokens are
+    # always refused, and a t17 board on an s17-model revert (etc.) is a
+    # cross-model mismatch = refuse.
     case "$IDENTITY_NORM" in
-        *s19*|*t19*|*t17*)
-            echo "ERROR: $IDENTITY is not an S17 stock-revert target." >&2
+        *s19*|*t19*)
+            echo "ERROR: $IDENTITY is not a 17-series stock-revert target." >&2
             exit 1
             ;;
     esac
-    case "$BOARD_NORM" in
-        am2s17|am2s17p|am2s17pro|am2s17plus)
-            echo "Exact S17 board target verified: $BOARD_TARGET"
+    case "$S17_REVERT_MODEL:$BOARD_NORM" in
+        s17:am2s17|s17:am2s17p|s17:am2s17pro|s17:am2s17plus)
+            echo "Exact S17 board target verified for model s17: $BOARD_TARGET"
+            ;;
+        s17plus:am2s17plus)
+            echo "Exact S17+ board target verified for model s17plus: $BOARD_TARGET"
+            ;;
+        t17:am2t17)
+            echo "Exact T17 board target verified for model t17: $BOARD_TARGET"
+            ;;
+        t17plus:am2t17plus)
+            echo "Exact T17+ board target verified for model t17plus: $BOARD_TARGET"
+            ;;
+        *:*t17*)
+            echo "ERROR: t17-class board target with DCENT_S17_REVERT_MODEL=$S17_REVERT_MODEL is a cross-model mismatch." >&2
+            echo "       Observed board_target: ${BOARD_TARGET:-missing}" >&2
+            exit 1
             ;;
         *)
-            echo "ERROR: /etc/dcentos/board_target must be am2-s17/am2-s17p before destructive S17 revert." >&2
+            echo "ERROR: /etc/dcentos/board_target does not match DCENT_S17_REVERT_MODEL=$S17_REVERT_MODEL before destructive revert." >&2
             echo "       Observed: ${BOARD_TARGET:-missing}" >&2
+            echo "       Expected: s17->am2-s17* | s17plus->am2-s17plus | t17->am2-t17 | t17plus->am2-t17plus" >&2
             exit 1
             ;;
     esac
@@ -147,6 +184,12 @@ echo ""
 # Get firmware image
 FW_IMAGE="${1:-}"
 EXPECTED_SHA256=$(printf '%s' "${2:-}" | tr 'A-F' 'a-f')
+if [ -z "$FW_IMAGE" ] && [ "$S17_REVERT_MODEL" != "s17" ]; then
+    echo "ERROR: model $S17_REVERT_MODEL requires an operator-supplied stock tarball + SHA-256." >&2
+    echo "       Usage: $0 /path/to/Antminer-${S17_REVERT_MODEL}-stock.tar.gz <sha256>" >&2
+    echo "       (No verified per-model download URL is held on desk; lab-gated.)" >&2
+    exit 1
+fi
 if [ -z "$FW_IMAGE" ]; then
     echo "No firmware image specified. Downloading official Bitmain S17 firmware..."
     mkdir -p "$DOWNLOAD_DIR"

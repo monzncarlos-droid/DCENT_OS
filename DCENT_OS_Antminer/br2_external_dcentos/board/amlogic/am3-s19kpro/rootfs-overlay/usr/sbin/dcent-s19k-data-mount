@@ -1,0 +1,272 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 D-Central Technologies <dev@d-central.tech>
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Fail-closed owner for the S19k persistent /data mount.
+#
+# This helper may attach the already-existing, exactly admitted mtd4 UBI
+# container and mount its one existing `overlay` volume.  It never formats an
+# MTD, creates/removes a UBI volume, erases NAND, or writes a payload.  Unknown
+# media, ambiguous attachments, unexpected volumes, and weak mount options are
+# terminal refusals.
+
+set -u
+
+EXPECTED_PROC_MTD='mtd4: 02000000 00020000 "overlay"'
+EXPECTED_PROC_MTD_MAP='mtd0: 00200000 00020000 "bootloader"
+mtd1: 00800000 00020000 "tpl"
+mtd2: 03200000 00020000 "stock_system"
+mtd3: 00500000 00020000 "stock_config"
+mtd4: 02000000 00020000 "overlay"
+mtd5: 09900000 00020000 "system"'
+EXPECTED_MTD_INDEX=4
+EXPECTED_MTD_NAME=overlay
+EXPECTED_MTD_SIZE=33554432
+EXPECTED_MTD_ERASESIZE=131072
+EXPECTED_VOLUME_ID=0
+EXPECTED_VOLUME_NAME=overlay
+EXPECTED_VOLUME_TYPE=dynamic
+EXPECTED_BOARD_TARGET=am3-s19k
+EXPECTED_PLATFORM=am3-aml-s19k
+EXPECTED_RELEASE_MARKER='# DCENT_OS PRODUCTION/RELEASE image marker.
+# Presence => dashboard/API require a password; the freedom-first
+# passwordless opt-out is DISABLED and root SSH password login is
+# locked. Built with DCENT_RELEASE_IMAGE=1. Do not hand-create.
+release_image=1'
+
+if [ "${DCENT_S19K_DATA_TEST_MODE:-0}" = 1 ]; then
+    PROC_MTD=${DCENT_S19K_PROC_MTD:?test PROC_MTD is required}
+    MTD_SYSFS=${DCENT_S19K_MTD_SYSFS:?test MTD sysfs is required}
+    UBI_SYSFS=${DCENT_S19K_UBI_SYSFS:?test UBI sysfs is required}
+    SYS_DEV_CHAR=${DCENT_S19K_SYS_DEV_CHAR:-}
+    DEV_ROOT=${DCENT_S19K_DEV_ROOT:?test dev root is required}
+    MOUNTINFO=${DCENT_S19K_MOUNTINFO:?test mountinfo is required}
+    DATA_DIR=${DCENT_S19K_DATA_DIR:?test data dir is required}
+    RELEASE_MARKER=${DCENT_S19K_RELEASE_MARKER:?test release marker is required}
+    BOARD_TARGET_FILE=${DCENT_S19K_BOARD_TARGET_FILE:?test board target is required}
+    PLATFORM_FILE=${DCENT_S19K_PLATFORM_FILE:?test platform is required}
+    UBIATTACH_BIN=${DCENT_S19K_UBIATTACH_BIN:-/usr/sbin/ubiattach}
+    MOUNT_BIN=${DCENT_S19K_MOUNT_BIN:-/bin/mount}
+else
+    PROC_MTD=/proc/mtd
+    MTD_SYSFS=/sys/class/mtd
+    UBI_SYSFS=/sys/class/ubi
+    SYS_DEV_CHAR=/sys/dev/char
+    DEV_ROOT=/dev
+    MOUNTINFO=/proc/self/mountinfo
+    DATA_DIR=/data
+    RELEASE_MARKER=/etc/dcentos/release-image
+    BOARD_TARGET_FILE=/etc/dcentos/board_target
+    PLATFORM_FILE=/etc/dcentos/platform
+    UBIATTACH_BIN=/usr/sbin/ubiattach
+    MOUNT_BIN=/bin/mount
+fi
+
+fail() {
+    echo "S19k persistent data: BLOCKED: $*" >&2
+    return 1
+}
+
+require_single_line_file() {
+    _dcent_path=$1
+    _dcent_expected=$2
+    _dcent_label=$3
+    [ -f "$_dcent_path" ] && [ ! -L "$_dcent_path" ] ||
+        fail "$_dcent_label is missing or indirect" || return 1
+    [ "$(stat -c '%h' "$_dcent_path" 2>/dev/null)" = 1 ] ||
+        fail "$_dcent_label is not single-link" || return 1
+    [ "$(wc -l < "$_dcent_path" 2>/dev/null)" = 1 ] ||
+        fail "$_dcent_label is not exactly one line" || return 1
+    [ "$(cat "$_dcent_path" 2>/dev/null)" = "$_dcent_expected" ] ||
+        fail "$_dcent_label is not exact" || return 1
+}
+
+require_release_identity() {
+    [ -f "$RELEASE_MARKER" ] && [ ! -L "$RELEASE_MARKER" ] ||
+        fail "release-image marker is missing or indirect" || return 1
+    [ "$(stat -c '%h' "$RELEASE_MARKER" 2>/dev/null)" = 1 ] ||
+        fail "release-image marker is not single-link" || return 1
+    [ "$(wc -l < "$RELEASE_MARKER" 2>/dev/null)" = 5 ] ||
+        fail "release-image marker line count is not exact" || return 1
+    [ "$(cat "$RELEASE_MARKER" 2>/dev/null)" = "$EXPECTED_RELEASE_MARKER" ] ||
+        fail "release-image marker is not canonical release posture" || return 1
+    require_single_line_file "$BOARD_TARGET_FILE" "$EXPECTED_BOARD_TARGET" board_target || return 1
+    require_single_line_file "$PLATFORM_FILE" "$EXPECTED_PLATFORM" platform || return 1
+}
+
+require_exact_mtd4() {
+    [ -f "$PROC_MTD" ] && [ ! -L "$PROC_MTD" ] ||
+        fail "/proc/mtd evidence is missing or indirect" || return 1
+    _dcent_count=$(awk '$1 == "mtd4:" { count += 1 } END { print count + 0 }' "$PROC_MTD") ||
+        fail "cannot parse /proc/mtd" || return 1
+    [ "$_dcent_count" = 1 ] || fail "mtd4 record count is not exactly one" || return 1
+    _dcent_record=$(awk '$1 == "mtd4:" { print }' "$PROC_MTD") ||
+        fail "cannot read mtd4 record" || return 1
+    [ "$_dcent_record" = "$EXPECTED_PROC_MTD" ] ||
+        fail "mtd4 is not exact 32 MiB/128 KiB overlay geometry" || return 1
+    _dcent_map=$(awk '$1 ~ /^mtd[0-9]+:$/ { print }' "$PROC_MTD") ||
+        fail "cannot read complete MTD map" || return 1
+    [ "$_dcent_map" = "$EXPECTED_PROC_MTD_MAP" ] ||
+        fail "complete six-MTD S19k map is not exact" || return 1
+
+    _dcent_mtd="$MTD_SYSFS/mtd4"
+    [ -d "$_dcent_mtd" ] || fail "mtd4 sysfs identity is missing" || return 1
+    require_single_line_file "$_dcent_mtd/name" "$EXPECTED_MTD_NAME" "mtd4 name" || return 1
+    require_single_line_file "$_dcent_mtd/size" "$EXPECTED_MTD_SIZE" "mtd4 size" || return 1
+    require_single_line_file "$_dcent_mtd/erasesize" "$EXPECTED_MTD_ERASESIZE" "mtd4 erasesize" || return 1
+}
+
+attached_ubi_for_mtd4() {
+    _dcent_found=
+    _dcent_count=0
+    for _dcent_entry in "$UBI_SYSFS"/ubi*; do
+        [ -f "$_dcent_entry/mtd_num" ] || continue
+        _dcent_mtd_num=$(cat "$_dcent_entry/mtd_num" 2>/dev/null) || return 1
+        [ "$_dcent_mtd_num" = "$EXPECTED_MTD_INDEX" ] || continue
+        _dcent_count=$((_dcent_count + 1))
+        _dcent_found=${_dcent_entry##*/}
+    done
+    [ "$_dcent_count" -eq 1 ] || return 1
+    printf '%s\n' "$_dcent_found"
+}
+
+discover_or_attach_ubi() {
+    _dcent_ubi=$(attached_ubi_for_mtd4 2>/dev/null || true)
+    if [ -z "$_dcent_ubi" ]; then
+        _dcent_pre_count=0
+        for _dcent_entry in "$UBI_SYSFS"/ubi*; do
+            [ -f "$_dcent_entry/mtd_num" ] || continue
+            [ "$(cat "$_dcent_entry/mtd_num" 2>/dev/null)" = "$EXPECTED_MTD_INDEX" ] || continue
+            _dcent_pre_count=$((_dcent_pre_count + 1))
+        done
+        [ "$_dcent_pre_count" -eq 0 ] ||
+            fail "mtd4 has ambiguous UBI attachments" || return 1
+        [ -x "$UBIATTACH_BIN" ] || fail "ubiattach is unavailable" || return 1
+        "$UBIATTACH_BIN" -m "$EXPECTED_MTD_INDEX" >/dev/null 2>&1 ||
+            fail "exact mtd4 UBI attach failed" || return 1
+        _dcent_tries=0
+        while [ "$_dcent_tries" -lt 5 ]; do
+            _dcent_ubi=$(attached_ubi_for_mtd4 2>/dev/null || true)
+            [ -n "$_dcent_ubi" ] && break
+            _dcent_tries=$((_dcent_tries + 1))
+            sleep 1
+        done
+    fi
+    [ -n "$_dcent_ubi" ] || fail "mtd4 has no single exact UBI attachment" || return 1
+    printf '%s\n' "$_dcent_ubi"
+}
+
+require_exact_overlay_volume() {
+    _dcent_ubi=$1
+    _dcent_expected="${_dcent_ubi}_${EXPECTED_VOLUME_ID}"
+    _dcent_found=
+    _dcent_count=0
+    for _dcent_entry in "$UBI_SYSFS"/"${_dcent_ubi}"_*; do
+        [ -f "$_dcent_entry/name" ] || continue
+        _dcent_count=$((_dcent_count + 1))
+        _dcent_found=${_dcent_entry##*/}
+    done
+    [ "$_dcent_count" -eq 1 ] || fail "attached mtd4 does not expose exactly one UBI volume" || return 1
+    [ "$_dcent_found" = "$_dcent_expected" ] || fail "mtd4 UBI volume id is not exactly zero" || return 1
+    require_single_line_file "$UBI_SYSFS/$_dcent_found/name" "$EXPECTED_VOLUME_NAME" "UBI volume name" || return 1
+    require_single_line_file "$UBI_SYSFS/$_dcent_found/type" "$EXPECTED_VOLUME_TYPE" "UBI volume type" || return 1
+    _dcent_node="$DEV_ROOT/$_dcent_found"
+    [ ! -L "$_dcent_node" ] || fail "UBI volume device is indirect" || return 1
+    if [ "${DCENT_S19K_DATA_TEST_MODE:-0}" = 1 ]; then
+        [ -f "$_dcent_node" ] || fail "test UBI volume device is missing" || return 1
+    else
+        [ -c "$_dcent_node" ] || fail "UBI volume device is not a character device" || return 1
+        _dcent_sys_dev=$(cat "$UBI_SYSFS/$_dcent_found/dev" 2>/dev/null) ||
+            fail "UBI volume device number is missing" || return 1
+        [ -e "$SYS_DEV_CHAR/$_dcent_sys_dev" ] ||
+            fail "UBI volume sysfs device link is missing" || return 1
+        _dcent_hex=$(stat -c '%t:%T' "$_dcent_node" 2>/dev/null) ||
+            fail "cannot inspect UBI volume device number" || return 1
+        _dcent_major=${_dcent_hex%%:*}
+        _dcent_minor=${_dcent_hex#*:}
+        _dcent_node_dev=$(printf '%d:%d' "0x$_dcent_major" "0x$_dcent_minor") ||
+            fail "cannot normalize UBI volume device number" || return 1
+        [ "$_dcent_node_dev" = "$_dcent_sys_dev" ] ||
+            fail "UBI volume device/sysfs identity mismatch" || return 1
+    fi
+    printf '%s\n' "$_dcent_node"
+}
+
+mount_record() {
+    awk -v target="$DATA_DIR" '
+        $5 == target {
+            separator = 0
+            for (i = 7; i <= NF; i += 1) {
+                if ($i == "-") { separator = i; break }
+            }
+            if (separator == 0 || separator + 3 > NF) { exit 2 }
+            print $6 "|" $(separator + 1) "|" $(separator + 2) "|" $(separator + 3)
+        }
+    ' "$MOUNTINFO"
+}
+
+has_mount_option() {
+    case ",$1," in
+        *",$2,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_exact_mount() {
+    _dcent_node=$1
+    [ -f "$MOUNTINFO" ] && [ ! -L "$MOUNTINFO" ] ||
+        fail "mountinfo evidence is missing or indirect" || return 1
+    _dcent_records=$(mount_record) || fail "cannot parse mountinfo" || return 1
+    _dcent_count=$(printf '%s\n' "$_dcent_records" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$_dcent_count" -eq 1 ] || fail "/data mount record count is not exactly one" || return 1
+    IFS='|' read -r _dcent_opts _dcent_fstype _dcent_source _dcent_superopts <<EOF
+$_dcent_records
+EOF
+    [ "$_dcent_fstype" = ubifs ] || fail "/data filesystem is not UBIFS" || return 1
+    [ "$_dcent_source" = "$_dcent_node" ] || fail "/data source is not the admitted UBI volume" || return 1
+    for _dcent_option in rw nosuid nodev noexec; do
+        has_mount_option "$_dcent_opts" "$_dcent_option" ||
+            fail "/data mount lacks $_dcent_option" || return 1
+    done
+    has_mount_option "$_dcent_superopts" rw || fail "/data superblock is not writable" || return 1
+}
+
+verify_mount() {
+    require_release_identity || return 1
+    require_exact_mtd4 || return 1
+    _dcent_ubi=$(attached_ubi_for_mtd4 2>/dev/null || true)
+    [ -n "$_dcent_ubi" ] || fail "mtd4 is not attached as one exact UBI device" || return 1
+    _dcent_node=$(require_exact_overlay_volume "$_dcent_ubi") || return 1
+    require_exact_mount "$_dcent_node" || return 1
+    echo "S19k persistent data: VERIFIED mtd4 -> ${_dcent_ubi}_0 -> /data (rw,nosuid,nodev,noexec)"
+}
+
+start_mount() {
+    require_release_identity || return 1
+    require_exact_mtd4 || return 1
+    [ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ] ||
+        fail "/data mountpoint is missing or indirect" || return 1
+
+    _dcent_existing=$(mount_record 2>/dev/null || true)
+    if [ -n "$_dcent_existing" ]; then
+        verify_mount
+        return $?
+    fi
+
+    _dcent_ubi=$(discover_or_attach_ubi) || return 1
+    _dcent_node=$(require_exact_overlay_volume "$_dcent_ubi") || return 1
+    [ -x "$MOUNT_BIN" ] || fail "mount utility is unavailable" || return 1
+    "$MOUNT_BIN" -t ubifs -o rw,nosuid,nodev,noexec "$_dcent_node" "$DATA_DIR" >/dev/null 2>&1 ||
+        fail "exact overlay volume mount failed" || return 1
+    verify_mount
+}
+
+case "${1:-}" in
+    start) start_mount ;;
+    verify|status) verify_mount ;;
+    stop) : ;;
+    *)
+        echo "Usage: $0 {start|verify|status|stop}" >&2
+        exit 2
+        ;;
+esac

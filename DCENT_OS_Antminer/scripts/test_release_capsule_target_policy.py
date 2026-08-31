@@ -35,6 +35,17 @@ class ReleaseCapsuleTargetPolicyTests(unittest.TestCase):
                 publication_admitted=False,
             ),
         )
+        self.assertEqual(
+            policy.policy_for("am3-s19kpro"),
+            policy.ReleaseCapsuleTargetPolicy(
+                target="am3-s19kpro",
+                cargo_variant="amlogic",
+                primary_artifact="dcentos-sysupgrade-am3-s19kpro.tar",
+                package_board="am3-s19kpro",
+                release_stem="DCENTOS_AML3_S19kPro",
+                publication_admitted=False,
+            ),
+        )
 
     def test_admission_is_coherent_with_source_closure_policies(self) -> None:
         for target, record in policy.POLICIES.items():
@@ -66,11 +77,19 @@ class ReleaseCapsuleTargetPolicyTests(unittest.TestCase):
         )
         with self.assertRaises(policy.TargetPolicyError):
             policy.policy_for("am2-s19jpro", require_publication=True)
+        with self.assertRaises(policy.TargetPolicyError):
+            policy.policy_for("am3-s19kpro", require_publication=True)
+
+    def test_s19k_does_not_silently_enter_frozen_portable_v2(self) -> None:
+        self.assertNotIn("am3-s19kpro", policy.PORTABLE_EVIDENCE_V2_POLICIES)
+        with self.assertRaises(policy.TargetPolicyError):
+            policy.portable_v2_policy_for("am3-s19kpro")
 
     def test_release_names_are_target_bound_and_calendar_valid(self) -> None:
         for target, expected in (
             ("s9", "DCENTOS_XIL1_S9_beta20260712"),
             ("am2-s19jpro", "DCENTOS_XIL3_S19jPro_beta20260712"),
+            ("am3-s19kpro", "DCENTOS_AML3_S19kPro_beta20260712"),
         ):
             record = policy.policy_for(target)
             self.assertEqual(policy.validate_output_name(record, expected), expected)

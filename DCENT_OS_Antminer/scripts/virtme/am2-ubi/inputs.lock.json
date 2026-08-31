@@ -1,0 +1,117 @@
+{
+  "schema": "dcentos-offline-ubi-input-lock-v1",
+  "scope": "offline-test-only",
+  "kernel": {
+    "release": "5.15.0-181-generic",
+    "vermagic": "5.15.0-181-generic SMP mod_unload modversions",
+    "vmlinuz_size": 11725032,
+    "vmlinuz_sha256": "6d08ef6d2f4c8e609cb91a512e7f37e85e9077561667da10de8f44e2eec6d85d",
+    "base_config_sha256": "df2dafef4d03a347b5b412b3c68fd97b16a672c9d40b28ab5ebb188e0c5bb490",
+    "effective_config_sha256": "c3d398ee78db28a49c49799a482b47148b2820f2fa59206f716d80eb41f67a1d",
+    "config_delta": {
+      "symbol": "CONFIG_MTD_UBI_FASTMAP",
+      "base": "y",
+      "effective": "n"
+    },
+    "expected_module_srcversions": {
+      "ubi": "B5A82C1E9EB35972CF1286F",
+      "ubifs": "757121DF1CE085230C34B8A"
+    },
+    "expected_module_parameters": {
+      "ubi": ["block", "mtd"],
+      "ubifs": []
+    }
+  },
+  "packages": [
+    {
+      "role": "linux-source-deb",
+      "package": "linux-source-5.15.0",
+      "filename": "linux-source-5.15.0_5.15.0-181.191_all.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "all",
+      "sha256": "da5f7d79f7eccecd689ba72241bdaba285707ebef6363ddd546b20fa84ccde35",
+      "required_for_build": true
+    },
+    {
+      "role": "linux-headers-common-deb",
+      "package": "linux-headers-5.15.0-181",
+      "filename": "linux-headers-5.15.0-181_5.15.0-181.191_all.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "all",
+      "sha256": "e79663e48ff1fd96dd9f1ba200d12ace01a0ec4b201068af3294ba3e160fa2ae",
+      "required_for_build": true
+    },
+    {
+      "role": "linux-headers-generic-deb",
+      "package": "linux-headers-5.15.0-181-generic",
+      "filename": "linux-headers-5.15.0-181-generic_5.15.0-181.191_amd64.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "amd64",
+      "sha256": "f7b23c5b3b256442fa880a3e402826c87ed9eac4777664ca12c325ff9d4dec5d",
+      "required_for_build": true
+    },
+    {
+      "role": "linux-image-deb",
+      "package": "linux-image-5.15.0-181-generic",
+      "filename": "linux-image-5.15.0-181-generic_5.15.0-181.191_amd64.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "amd64",
+      "sha256": "79a3ed7e3a7e7e803f13646c6092d2a10837087b68a2b3ad6fc3f4460f9533b7",
+      "required_for_build": false
+    },
+    {
+      "role": "linux-modules-deb",
+      "package": "linux-modules-5.15.0-181-generic",
+      "filename": "linux-modules-5.15.0-181-generic_5.15.0-181.191_amd64.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "amd64",
+      "sha256": "97a5fde0e4a061dd6e470ddbe5fc4230b770d4d03a55b15efd3c4fff67d687a9",
+      "required_for_build": false
+    },
+    {
+      "role": "linux-modules-extra-deb",
+      "package": "linux-modules-extra-5.15.0-181-generic",
+      "filename": "linux-modules-extra-5.15.0-181-generic_5.15.0-181.191_amd64.deb",
+      "version": "5.15.0-181.191",
+      "architecture": "amd64",
+      "sha256": "74785b62691c488ee90de2902955be053c378a34bbbbc46b220e317efdffe63f",
+      "required_for_build": false
+    },
+    {
+      "role": "mtd-utils-deb",
+      "package": "mtd-utils",
+      "filename": "mtd-utils_1%3a2.1.4-1_amd64.deb",
+      "version": "1:2.1.4-1",
+      "architecture": "amd64",
+      "sha256": "c57c0ef8980d84f781161f22300220dcb85431b4478ce2c9db20a882c92ae38c",
+      "required_for_build": false
+    },
+    {
+      "role": "qemu-system-x86-deb",
+      "package": "qemu-system-x86",
+      "filename": "qemu-system-x86_1%3a6.2+dfsg-2ubuntu6.30_amd64.deb",
+      "version": "1:6.2+dfsg-2ubuntu6.30",
+      "architecture": "amd64",
+      "sha256": "2ef566b481ec7bf1bb010572c9e0f6b8f403e44ddc57a5a5be94727afc6a891f",
+      "required_for_build": false
+    }
+  ],
+  "embedded_artifacts": [
+    {
+      "role": "linux-source-tarball",
+      "path_in_package": "usr/src/linux-source-5.15.0/linux-source-5.15.0.tar.bz2",
+      "sha256": "56b3c4b3af09a63ef13edd8505857fa89d48b005406f4260d82b505c05a8995d"
+    }
+  ],
+  "toolchain": {
+    "architecture": "x86_64-linux-gnu",
+    "gcc": "11.4.0",
+    "binutils": "2.38",
+    "make": "4.3"
+  },
+  "non_claims": [
+    "This lock does not authorize product installation.",
+    "This lock does not prove behavior on physical NAND.",
+    "virtme-ng 1.41 was locally observed but is not admitted because its distribution artifact is not pinned here."
+  ]
+}

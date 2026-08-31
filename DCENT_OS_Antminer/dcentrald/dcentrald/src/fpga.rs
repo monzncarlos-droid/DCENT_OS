@@ -4,13 +4,9 @@
 //! management, multi-chain orchestration, interrupt-driven I/O, and the
 //! complete register interface for the Braiins s9io v1.0.2 FPGA bitstream.
 //!
-//! This module is the single point of contact between dcentrald's async
-//! mining pipeline and the FPGA hardware. It owns all UIO mappings and
-//! provides safe, structured access to:
-//!   - Chain controllers (3 chains on S9: chain 6/7/8)
-//!   - Fan PWM controller
-//!   - GPIO (plug detect, board enable, LEDs)
-//!   - Glitch monitor
+//! Live S9 UIO census, baud helpers, and PL surface reports. Hardware
+//! ownership is name-based `dcentrald_hal::platform::zynq::ZynqPlatform`
+//! discovery — not positional `FAN_UIO=0` / `S9_UIO_BASES=[1,5,9]`.
 //!
 //! # Architecture
 //!
@@ -48,13 +44,10 @@ use std::fmt;
 use std::fs;
 use std::os::fd::RawFd;
 
-use dcentrald_hal::fan::FanController;
 use dcentrald_hal::fpga_chain::{self, FpgaChain};
-use dcentrald_hal::gpio::GpioController;
-use dcentrald_hal::uio::UioDevice;
-use dcentrald_hal::HalError;
+use dcentrald_hal::pl_surface::{parse_uio_sysfs_hex, PlSurfaceReport};
 
-use tracing::{debug, info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // S9 hardware constants (verified from live probe)
@@ -66,14 +59,16 @@ pub const S9_CHAIN_COUNT: usize = 3;
 /// Chain IDs matching physical connector labels (J6, J7, J8).
 pub const S9_CHAIN_IDS: [u8; S9_CHAIN_COUNT] = [6, 7, 8];
 
-/// UIO device base numbers for each chain (4 consecutive UIO devices per chain).
-/// Verified from live S9: uio1-4 = chain6, uio5-8 = chain7, uio9-12 = chain8.
+/// Live S9 UIO census pin (uio1/5/9 = chain6/7/8). **Not a discovery
+/// fallback.** Name-based `ZynqPlatform` admission is required; positional
+/// mapping of unnamed devices is forbidden (DESK_NOW 2026-08-19).
 pub const S9_UIO_BASES: [u8; S9_CHAIN_COUNT] = [1, 5, 9];
 
-/// UIO device number for the fan controller.
+/// Live S9 census: uio0 is `fan-control`. **Not** a constructor argument.
+/// AM2 fan-control is a different UIO (`fan-control` by name, typically 16).
 pub const FAN_UIO: u8 = 0;
 
-/// UIO device number for the glitch monitor.
+/// Live S9 census: uio13 is `miner-glitch-monitor`. Not a discovery fallback.
 pub const GLITCH_MONITOR_UIO: u8 = 13;
 
 /// **S9 (am1) bitstream** FPGA fabric clock frequency in Hz.
@@ -122,7 +117,10 @@ impl FpgaVersion {
         }
     }
 
-    /// Check if this is an S9 bitstream.
+    /// Check if this VERSION word *looks* like an S9 bitstream.
+    ///
+    /// **Not a fabric-class gate.** `0x00901002` is also live AM2 CTRL at +0x00.
+    /// Discriminator is BUILD_ID (`dcentrald_hal::pl_surface::admit_fabric_class`).
     pub fn is_s9(&self) -> bool {
         self.model == 0x09 || self.raw == 0x00901002
     }
@@ -138,391 +136,11 @@ impl fmt::Display for FpgaVersion {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Chain state tracking
-// ---------------------------------------------------------------------------
-
-/// State of a single hash chain in the FPGA.
-#[derive(Debug, Clone)]
-pub struct ChainState {
-    /// Chain ID (6, 7, or 8 on S9).
-    pub chain_id: u8,
-    /// Whether this chain is enabled in the FPGA CTRL_REG.
-    pub enabled: bool,
-    /// Current BAUD_REG divisor value.
-    pub baud_divisor: u32,
-    /// Actual baud rate in bps.
-    pub baud_rate: u32,
-    /// CRC error count from the FPGA.
-    pub crc_errors: u32,
-    /// FPGA version info.
-    pub version: FpgaVersion,
-    /// Build ID (unix timestamp of bitstream build).
-    pub build_id: u32,
-    /// Whether a hash board is plugged into this connector.
-    pub board_present: bool,
-    /// Whether the board power enable is asserted.
-    pub board_enabled: bool,
-}
-
-// ---------------------------------------------------------------------------
-// FPGA subsystem manager
-// ---------------------------------------------------------------------------
-
-/// Top-level FPGA subsystem that manages all hardware interfaces.
-///
-/// Owns all UIO device mappings and provides structured access to the
-/// FPGA chain controllers, fan PWM, GPIO, and glitch monitor.
-///
-/// This is the central hardware manager for the mining daemon. It is
-/// created once during daemon initialization and provides chain handles
-/// for the work dispatcher to use during mining.
-pub struct FpgaSubsystem {
-    /// FPGA chain controllers (one per hash board connector).
-    chains: Vec<FpgaChain>,
-    /// Chain IDs in the same order as `chains`.
-    chain_ids: Vec<u8>,
-    /// Fan controller (single PWM for all fans on S9).
-    fan: FanController,
-    /// GPIO controller for plug detect, board enable, LEDs.
-    gpio: Option<GpioController>,
-    /// Glitch monitor UIO device.
-    glitch_monitor: Option<UioDevice>,
-}
-
-impl FpgaSubsystem {
-    /// Initialize the FPGA subsystem by opening all UIO devices.
-    ///
-    /// This is the first step in hardware initialization. It opens and
-    /// mmaps all 14 UIO devices, verifies the FPGA is responding by
-    /// reading version registers, and sets up the fan controller.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any UIO device cannot be opened. This typically
-    /// means the FPGA bitstream is not loaded or the device tree is wrong.
-    pub fn init() -> Result<Self, HalError> {
-        info!("Initializing FPGA subsystem");
-
-        // Open fan controller
-        let fan = FanController::open(FAN_UIO)?;
-        info!(
-            uio = FAN_UIO,
-            pwm = fan.get_speed_pwm(),
-            rpm = fan.get_rpm(),
-            "Fan controller opened"
-        );
-
-        // Open all chain controllers
-        let mut chains = Vec::with_capacity(S9_CHAIN_COUNT);
-        let mut chain_ids = Vec::with_capacity(S9_CHAIN_COUNT);
-
-        for i in 0..S9_CHAIN_COUNT {
-            let chain_id = S9_CHAIN_IDS[i];
-            let uio_base = S9_UIO_BASES[i];
-
-            match FpgaChain::open(chain_id, uio_base) {
-                Ok(chain) => {
-                    let version = FpgaVersion::from_raw(chain.read_version());
-                    let build_id = chain.read_build_id();
-                    info!(
-                        chain_id,
-                        version = %version,
-                        build_id = format_args!("0x{:08X}", build_id),
-                        "Chain controller opened"
-                    );
-                    chains.push(chain);
-                    chain_ids.push(chain_id);
-                }
-                Err(e) => {
-                    warn!(
-                        chain_id,
-                        uio_base,
-                        error = %e,
-                        "Failed to open chain controller (board may not be present)"
-                    );
-                }
-            }
-        }
-
-        if chains.is_empty() {
-            return Err(HalError::Platform(
-                "no FPGA chain controllers could be opened".into(),
-            ));
-        }
-
-        // Open GPIO controller
-        let gpio = match GpioController::new() {
-            Ok(gpio) => {
-                let plugs = gpio.read_plug_detect();
-                info!(
-                    j6 = plugs[0],
-                    j7 = plugs[1],
-                    j8 = plugs[2],
-                    "GPIO controller opened, plug detect: J6={}, J7={}, J8={}",
-                    plugs[0],
-                    plugs[1],
-                    plugs[2]
-                );
-                Some(gpio)
-            }
-            Err(e) => {
-                warn!(error = %e, "GPIO controller unavailable (need /dev/mem access)");
-                None
-            }
-        };
-
-        // Open glitch monitor (optional, non-critical)
-        let glitch_monitor = match UioDevice::open(GLITCH_MONITOR_UIO) {
-            Ok(dev) => {
-                debug!("Glitch monitor opened");
-                Some(dev)
-            }
-            Err(_) => {
-                debug!("Glitch monitor not available");
-                None
-            }
-        };
-
-        // Reset all FPGA IP cores to known-good state (matches bosminer's Common::init()).
-        // Uses reset_ip_core() (read-modify-write) to preserve MIDSTATE_CNT — see
-        // B1 regression note at
-        // Writing 0 to CTRL_REG (the old set_enabled(false) path) zeros MIDSTATE_CNT and
-        // permanently breaks the UART state machine on hot-start (bosminer recently exited
-        // with CTRL=0x0C already set). and the
-        // S9 A/B test on 2026-03-12. The chip driver's reconfigure() later writes the
-        // chip-family-specific CTRL value (BM1387 wants MIDSTATE_CNT=2 → 0x0C).
-        for chain in &chains {
-            chain.reset_ip_core();
-        }
-        info!(
-            chains = chains.len(),
-            "FPGA subsystem initialized: {} chain(s) ready (IP cores reset)",
-            chains.len()
-        );
-
-        Ok(Self {
-            chains,
-            chain_ids,
-            fan,
-            gpio,
-            glitch_monitor,
-        })
-    }
-
-    /// Get the number of chain controllers that were successfully opened.
-    pub fn chain_count(&self) -> usize {
-        self.chains.len()
-    }
-
-    /// Get the chain IDs that are available.
-    pub fn chain_ids(&self) -> &[u8] {
-        &self.chain_ids
-    }
-
-    /// Take ownership of the FPGA chains (moved to the work dispatcher).
-    ///
-    /// This transfers the chain controllers out of the subsystem. After
-    /// calling this, the subsystem no longer has access to the chains.
-    /// The work dispatcher becomes the sole owner of FPGA chain I/O.
-    pub fn take_chains(
-        self,
-    ) -> (
-        Vec<FpgaChain>,
-        Vec<u8>,
-        FanController,
-        Option<GpioController>,
-    ) {
-        (self.chains, self.chain_ids, self.fan, self.gpio)
-    }
-
-    /// Get a reference to a specific chain by chain ID.
-    pub fn chain(&self, chain_id: u8) -> Option<&FpgaChain> {
-        self.chain_ids
-            .iter()
-            .position(|&id| id == chain_id)
-            .map(|idx| &self.chains[idx])
-    }
-
-    /// Get a mutable reference to a specific chain by chain ID.
-    pub fn chain_mut(&mut self, chain_id: u8) -> Option<&mut FpgaChain> {
-        self.chain_ids
-            .iter()
-            .position(|&id| id == chain_id)
-            .and_then(move |idx| self.chains.get_mut(idx))
-    }
-
-    /// Get a reference to the fan controller.
-    pub fn fan(&self) -> &FanController {
-        &self.fan
-    }
-
-    /// Get a reference to the GPIO controller, if available.
-    pub fn gpio(&self) -> Option<&GpioController> {
-        self.gpio.as_ref()
-    }
-
-    /// Read the state of all chains.
-    pub fn read_chain_states(&self) -> Vec<ChainState> {
-        let plug_detect = self
-            .gpio
-            .as_ref()
-            .map(|g| g.read_plug_detect())
-            .unwrap_or([false; 3]);
-
-        self.chains
-            .iter()
-            .enumerate()
-            .map(|(idx, chain)| {
-                let ctrl = chain.common.read_reg(fpga_chain::REG_CTRL);
-                let baud_div = chain.common.read_reg(fpga_chain::REG_BAUD);
-
-                ChainState {
-                    chain_id: self.chain_ids[idx],
-                    enabled: ctrl & fpga_chain::CTRL_ENABLE != 0,
-                    baud_divisor: baud_div,
-                    baud_rate: baud_from_divisor(baud_div),
-                    crc_errors: chain.read_error_count(),
-                    version: FpgaVersion::from_raw(chain.read_version()),
-                    build_id: chain.read_build_id(),
-                    board_present: plug_detect.get(idx).copied().unwrap_or(false),
-                    board_enabled: false, // TODO: read from GPIO output register
-                }
-            })
-            .collect()
-    }
-
-    /// Initialize all chains for mining.
-    ///
-    /// This is the FPGA-level initialization sequence, run before ASIC
-    /// chip enumeration. Sets up baud rate, resets FIFOs, and enables
-    /// the chain controllers.
-    ///
-    /// # Arguments
-    ///
-    /// * `bm139x_mode` - Set true for BM1397+ chips (bit 4 of CTRL_REG).
-    /// * `midstate_count` - Number of midstates per work (1, 2, or 4).
-    pub fn init_chains_for_mining(&mut self, bm139x_mode: bool, midstate_count: u8) {
-        let midstate_bits = match midstate_count {
-            1 => 0u32,
-            2 => 1u32,
-            4 => 2u32,
-            _ => {
-                warn!(midstate_count, "Invalid midstate count, defaulting to 1");
-                0u32
-            }
-        };
-
-        let ctrl_value = fpga_chain::CTRL_ENABLE
-            | if bm139x_mode {
-                fpga_chain::CTRL_BM139X
-            } else {
-                0
-            }
-            | (midstate_bits << fpga_chain::CTRL_MIDSTATE_SHIFT);
-
-        for (idx, chain) in self.chains.iter_mut().enumerate() {
-            let chain_id = self.chain_ids[idx];
-
-            // Reconfigure chain WITHOUT disabling it.
-            //
-            // BUG FIX (2026-03-12): Writing 0 to CTRL_REG (set_enabled(false))
-            // permanently breaks the FPGA UART state machine. After disable+re-enable,
-            // ASICs never respond to commands. This was proven by A/B testing on live
-            // S9 hardware. Use reconfigure() to safely reset FIFOs, set baud, and
-            // write CTRL_REG while keeping the chain enabled.
-            chain.reconfigure(ctrl_value, fpga_chain::BAUD_REG_115200);
-            debug!(
-                chain_id,
-                baud = 115200,
-                divisor = fpga_chain::BAUD_REG_115200,
-                "Baud rate set for enumeration (chain kept enabled)"
-            );
-
-            info!(
-                chain_id,
-                ctrl = format_args!("0x{:08X}", ctrl_value),
-                bm139x = bm139x_mode,
-                midstates = midstate_count,
-                "Chain initialized for mining (no CTRL_REG disable)"
-            );
-        }
-    }
-
-    /// Set the baud rate on all chains simultaneously.
-    pub fn set_all_baud(&mut self, baud: u32) {
-        let divisor = divisor_from_baud(baud);
-        let actual = baud_from_divisor(divisor);
-
-        for chain in &mut self.chains {
-            chain.set_baud(divisor);
-        }
-
-        info!(
-            requested = baud,
-            actual, divisor, "Baud rate set on all chains"
-        );
-    }
-
-    /// Set fan speed (both channels).
-    pub fn set_fan_speed(&self, pwm: u8) {
-        self.fan.set_speed(pwm);
-        debug!(pwm, rpm = self.fan.get_rpm(), "Fan speed set");
-    }
-
-    /// Get fan RPM from tachometer.
-    pub fn get_fan_rpm(&self) -> u32 {
-        self.fan.get_rpm()
-    }
-
-    /// Detect which hash boards are plugged in.
-    pub fn detect_boards(&self) -> [bool; 3] {
-        self.gpio
-            .as_ref()
-            .map(|g| g.read_plug_detect())
-            .unwrap_or([false; 3])
-    }
-
-    /// Enable or disable hash board power for a specific connector.
-    ///
-    /// `board_index`: 0=J6, 1=J7, 2=J8
-    pub fn set_board_enable(&self, board_index: u8, enable: bool) {
-        if let Some(ref gpio) = self.gpio {
-            gpio.set_board_enable(board_index, enable);
-            info!(
-                board_index,
-                enable,
-                chain_id = S9_CHAIN_IDS.get(board_index as usize).copied().unwrap_or(0),
-                "Board power {}",
-                if enable { "enabled" } else { "disabled" }
-            );
-        }
-    }
-
-    /// Enable all hash board power outputs.
-    pub fn enable_all_boards(&self) {
-        if let Some(ref gpio) = self.gpio {
-            gpio.set_all_boards_enable(true);
-            info!("All hash boards enabled");
-        }
-    }
-
-    /// Disable all hash board power outputs (safe shutdown).
-    pub fn disable_all_boards(&self) {
-        if let Some(ref gpio) = self.gpio {
-            gpio.set_all_boards_enable(false);
-            info!("All hash boards disabled");
-        }
-    }
-
-    /// Enable GPIO outputs (must be called before LED or board enable works).
-    pub fn enable_gpio_outputs(&self) {
-        if let Some(ref gpio) = self.gpio {
-            gpio.enable_outputs();
-            debug!("GPIO outputs enabled");
-        }
-    }
-}
+// `FpgaSubsystem` (and `FpgaSubsystem::init`) was deleted DESK_NOW 2026-08-19.
+// It hardcoded FAN_UIO=0 and S9_UIO_BASES=[1,5,9] and could issue chain
+// register writes into fan-control on a non-S9 UIO numbering. Use name-based
+// `dcentrald_hal::platform::zynq::ZynqPlatform` discovery. Never write 0 to
+// CTRL_REG after UART traffic.
 
 // ---------------------------------------------------------------------------
 // Baud rate utilities
@@ -650,6 +268,27 @@ pub struct UioInfo {
     pub map_size: Option<usize>,
 }
 
+impl UioInfo {
+    /// Census report: name + kernel map0 addr/size. BUILD_ID stays `None`
+    /// (sysfs cannot read common+0x04).
+    pub fn to_pl_surface_report(&self) -> PlSurfaceReport {
+        PlSurfaceReport::from_sysfs(
+            self.name.clone(),
+            self.phys_addr,
+            self.map_size.map(|s| s as u64),
+        )
+    }
+}
+
+/// PL surface reports from the live UIO sysfs census. Missing map0 files
+/// stay `None`; addresses are never invented.
+pub fn pl_surface_reports() -> Vec<PlSurfaceReport> {
+    scan_uio_devices()
+        .iter()
+        .map(UioInfo::to_pl_surface_report)
+        .collect()
+}
+
 /// Scan /sys/class/uio/ for all available UIO devices.
 ///
 /// Returns a sorted list of UIO devices with their names and addresses.
@@ -674,18 +313,12 @@ pub fn scan_uio_devices() -> Vec<UioInfo> {
                 let phys_addr =
                     fs::read_to_string(format!("{}/{}/maps/map0/addr", uio_dir, dir_name))
                         .ok()
-                        .and_then(|s| {
-                            let s = s.trim().trim_start_matches("0x");
-                            u64::from_str_radix(s, 16).ok()
-                        });
+                        .and_then(|s| parse_uio_sysfs_hex(&s));
 
                 let map_size =
                     fs::read_to_string(format!("{}/{}/maps/map0/size", uio_dir, dir_name))
                         .ok()
-                        .and_then(|s| {
-                            let s = s.trim().trim_start_matches("0x");
-                            usize::from_str_radix(s, 16).ok()
-                        });
+                        .and_then(|s| parse_uio_sysfs_hex(&s).map(|n| n as usize));
 
                 devices.push(UioInfo {
                     number,
@@ -827,5 +460,65 @@ mod tests {
         // Should not panic on zero baud
         let d = divisor_from_baud(0);
         assert_eq!(d, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn s9_uio_census_pins_are_not_a_discovery_fallback() {
+        assert_eq!(S9_UIO_BASES, [1, 5, 9]);
+        assert_eq!(FAN_UIO, 0);
+        assert_eq!(GLITCH_MONITOR_UIO, 13);
+        assert_eq!(S9_CHAIN_IDS, [6, 7, 8]);
+        assert_eq!(S9_PIC_ADDRS, [0x55, 0x56, 0x57]);
+    }
+
+    #[test]
+    fn s9_version_word_collides_with_am2_ctrl_build_id_is_discriminator() {
+        use dcentrald_hal::pl_surface::{
+            admit_fabric_class, FabricClass, BRAIINS_AM2_BITSTREAM_BUILD_ID,
+            BRAIINS_S9IO_BITSTREAM_BUILD_ID, S9_VERSION_AM2_CTRL_COLLISION,
+        };
+
+        let v = FpgaVersion::from_raw(S9_VERSION_AM2_CTRL_COLLISION);
+        assert!(
+            v.is_s9(),
+            "VERSION decode still sees 0x00901002; BUILD_ID must discriminate"
+        );
+        assert_eq!(
+            dcentrald_hal::fpga_chain::ctrl_am2::BM1362_DEFAULT,
+            S9_VERSION_AM2_CTRL_COLLISION
+        );
+        assert_ne!(
+            BRAIINS_S9IO_BITSTREAM_BUILD_ID,
+            BRAIINS_AM2_BITSTREAM_BUILD_ID
+        );
+        assert!(admit_fabric_class(S9_VERSION_AM2_CTRL_COLLISION, FabricClass::Am2).is_err());
+        assert!(admit_fabric_class(BRAIINS_S9IO_BITSTREAM_BUILD_ID, FabricClass::Am2).is_err());
+        assert!(admit_fabric_class(BRAIINS_AM2_BITSTREAM_BUILD_ID, FabricClass::Am2).is_ok());
+    }
+
+    #[test]
+    fn uio_census_to_pl_surface_report_does_not_invent_addresses() {
+        let named = UioInfo {
+            number: 1,
+            name: "chain6-common".into(),
+            phys_addr: Some(0x43C0_0000),
+            map_size: Some(0x1000),
+        };
+        let report = named.to_pl_surface_report();
+        assert_eq!(report.name, "chain6-common");
+        assert_eq!(report.physaddr, Some(0x43C0_0000));
+        assert_eq!(report.size, Some(0x1000));
+        assert_eq!(report.build_id, None);
+
+        let missing = UioInfo {
+            number: 0,
+            name: "fan-control".into(),
+            phys_addr: None,
+            map_size: None,
+        };
+        let report = missing.to_pl_surface_report();
+        assert_eq!(report.physaddr, None);
+        assert_eq!(report.size, None);
+        assert_ne!(report.physaddr, Some(0x4127_0000));
     }
 }

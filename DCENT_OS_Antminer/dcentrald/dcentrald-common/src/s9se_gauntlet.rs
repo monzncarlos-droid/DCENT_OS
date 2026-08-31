@@ -12,28 +12,21 @@
 //! Ledger: .
 
 use crate::asic_protocol;
-use crate::board_desc::{
-    AsicProtocolIdentity, BoardDesc, ChainTransportKind, WorkEngineKind,
-};
-use dcent_schema::hardware::InstallAuthorization;
+use crate::board_desc::{AsicProtocolIdentity, BoardDesc, ChainTransportKind, WorkEngineKind};
 use crate::pll_model::pll_family_for_protocol;
+use crate::s9se_boot::{admit_boot_header, refuse_boot_bitstream_abi, BOOT_BIN_SIZE};
 use crate::s9se_cooling::{
     admit_s9se_fan_sample, decide_s9se_cooling_action, hash_cut_dhash_word, pack_fan_control_word,
-    CTRL_C43_S9SE_COOLING, FAN_CONTROL_OFFSET, FAN_SPEED_OFFSET, S9SeCoolingAction,
-    S9SeCoolingDecision, S9SeFanAdmission,
-};
-use crate::s9se_enum::{
-    admit_s9se_geometry, plan_s9se_address_program, refuse_am1_s9_chip_count,
-    refuse_s9k_interval_on_s9se,
-};
-use crate::s9se_vil::{crc5_bits, refuse_fpga_offset_as_uart_opcode as vil_refuse_fpga_offset};
-use crate::s9se_voltage::{
-    power_iic_from_voltage, refuse_s9se_voltage_write, voltage_climb_kind, FACTORY_CONF_VOLTAGE_V,
-    ISSUE2_EEPROM_VOLTAGE_V, S9SeVoltageClimbKind,
+    S9SeCoolingAction, S9SeCoolingDecision, S9SeFanAdmission, CTRL_C43_S9SE_COOLING,
+    FAN_CONTROL_OFFSET, FAN_SPEED_OFFSET,
 };
 use crate::s9se_eeprom::{
     admit_eeprom_crc, admit_major_is_1393, chip_minor_from_byte, eeprom_payload_crc16,
     refuse_s9se_eeprom_write, EEPROM_CRC_LEN,
+};
+use crate::s9se_enum::{
+    admit_s9se_geometry, plan_s9se_address_program, refuse_am1_s9_chip_count,
+    refuse_s9k_interval_on_s9se,
 };
 use crate::s9se_fpga::{
     admit_hardware_version_low16, admit_s9se_fpga_mem_is_256mib_path, admit_three_populated_chains,
@@ -48,6 +41,16 @@ use crate::s9se_identity::{
     admit_factory_conf, admit_uimage_header, refuse_factory_freq_token_as_mhz, ANT_VERSION,
     GPIO_LCD_CS, UIMAGE_SIZE,
 };
+use crate::s9se_init::{
+    admit_expected_asic_count, admit_stock_bringup_order, plan_s9se_open_core,
+    refuse_s9se_init_execute,
+};
+use crate::s9se_job::{
+    coinbase_nonce2_word, decode_s9se_job, dhash_soc_init_word, dhash_start_no_ab_word,
+    job_length_bytes, pack_pre_header_hash_words, pack_s9se_job, refuse_s9se_job_dispatch,
+    S9SeJobPacket, DEFAULT_ASIC_DIFF, DHASH_NO_AB_OR, FLAG_TICKET_UPDATE, JOB_TYPE,
+};
+use crate::s9se_nand::{admit_nand_table, refuse_classic_s9_image, refuse_s9se_flash};
 use crate::s9se_nonce::{
     classify_return_record, classify_s9se_nonce, refuse_s9se_nonce_fifo_io, S9SeFifoRecord,
 };
@@ -56,43 +59,38 @@ use crate::s9se_pic::{
     pack_get_crab_voltage, pack_get_pdcx, pack_get_software_version, pdcx_values, pic_iic_dev_addr,
     refuse_s9se_pic_flash, refuse_t11a_chain_swap_on_s9se, s9se_init_pic_order,
 };
-use crate::s9se_regs::{clock_delay_byte, pack_clock_delay_control};
-use crate::s9se_timeout::{
-    refuse_s9se_timeout_io, stock_timeout_s9se, timeout_control_word, DEFAULT_BAUDDIV,
-    DEFAULT_TICKET_MASK, WORKING_BAUDDIV,
-};
-use crate::s9se_init::{
-    admit_expected_asic_count, admit_stock_bringup_order, plan_s9se_open_core,
-    refuse_s9se_init_execute,
-};
-use crate::s9se_nand::{admit_nand_table, refuse_classic_s9_image, refuse_s9se_flash};
 use crate::s9se_pic::{pack_enable_dc_dc, pack_reset, refuse_s9se_pic_io};
 use crate::s9se_pll::{
     freq_climb_mhz, freq_high_pll_1393_row, freq_pll_1393_row, operational_pll_plan,
     pack_frequency_with_addr, pll_output_mhz, refuse_s9k_asic_times_four_on_s9se,
     refuse_s9se_frequency_program, FREQ_PLL_1393, PLL_FALLBACK_DIVIDER, PLL_FALLBACK_WORD,
 };
+use crate::s9se_regs::{clock_delay_byte, pack_clock_delay_control};
 use crate::s9se_regs::{
     core_reg_name, hash_clock_freq_mhz, pack_baud_one_chain, pack_baud_with_addr, pack_core_number,
     pack_core_reg_read_one, pack_core_reg_write_all, pack_misc_broadcast, pack_read_vil,
     pack_ticket_mask_broadcast, CORE_REG_HASH_CLOCK_COUNTER, MISC_CONTROL_DEFAULT,
     REG_CORE_RESPONSE, REG_MISC_CONTROL, REG_TICKET_MASK,
 };
-use crate::s9se_boot::{admit_boot_header, refuse_boot_bitstream_abi, BOOT_BIN_SIZE};
-use crate::s9se_job::{
-    coinbase_nonce2_word, decode_s9se_job, dhash_soc_init_word, dhash_start_no_ab_word,
-    job_length_bytes, pack_pre_header_hash_words, pack_s9se_job, refuse_s9se_job_dispatch,
-    S9SeJobPacket, DEFAULT_ASIC_DIFF, DHASH_NO_AB_OR, FLAG_TICKET_UPDATE, JOB_TYPE,
-};
 use crate::s9se_temp::{
     calc_offset_simple, local_temp_c, pack_read_temp_vil, refuse_s9se_temp_io, remote_temp_c,
     target_chip_temp_ce_economic, TEMP_DEVICE_DEFAULT,
+};
+use crate::s9se_timeout::{
+    refuse_s9se_timeout_io, stock_timeout_s9se, timeout_control_word, DEFAULT_BAUDDIV,
+    DEFAULT_TICKET_MASK, WORKING_BAUDDIV,
+};
+use crate::s9se_vil::{crc5_bits, refuse_fpga_offset_as_uart_opcode as vil_refuse_fpga_offset};
+use crate::s9se_voltage::{
+    power_iic_from_voltage, refuse_s9se_voltage_write, voltage_climb_kind, S9SeVoltageClimbKind,
+    FACTORY_CONF_VOLTAGE_V, ISSUE2_EEPROM_VOLTAGE_V,
 };
 use crate::s9se_work::{
     admit_send_job_type_is_not_tw_length, refuse_12_word_send_job_as_ssot,
     refuse_s9se_work_dispatch, vil_tw_register_offsets, SEND_JOB_TYPE,
 };
 use crate::voltage_rail::{voltage_ownership_for_asic, VoltageOwnership};
+use dcent_schema::hardware::InstallAuthorization;
 
 /// Board-target string. Own row — must not alias `am1-s9` or `am1-s15`.
 pub const S9SE_BOARD_TARGET: &str = "am1-s9se";
@@ -134,10 +132,8 @@ pub const DHASH_RAW_TW: u32 = 0x8100;
 pub const EEPROM_MAJOR_1393: u8 = 0;
 
 pub const CGMINER_OPKG_SOURCE_NEEDLE: &str = "cgminer_1393";
-pub const CGMINER_SHA256: &str =
-    "e113eab6d2480ec1596f23992ce013b855196821b276760441c2bc060d9bc9fb";
-pub const UIMAGE_SHA256: &str =
-    "85f7da5f8205a684acb057ce7268d2e395bc4f39e5ae4c088bbf4ede1fcb638f";
+pub const CGMINER_SHA256: &str = "e113eab6d2480ec1596f23992ce013b855196821b276760441c2bc060d9bc9fb";
+pub const UIMAGE_SHA256: &str = "85f7da5f8205a684acb057ce7268d2e395bc4f39e5ae4c088bbf4ede1fcb638f";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum S9SeGauntletError {
@@ -277,9 +273,7 @@ pub fn admit_s9se_board_desc_fail_closed(d: &BoardDesc) -> Result<(), S9SeGauntl
     if d.mining_default_enabled {
         return Err(S9SeGauntletError::MiningDefaultOn);
     }
-    if d.public_beta_install
-        || d.enablement.install_authorization != InstallAuthorization::Denied
-    {
+    if d.public_beta_install || d.enablement.install_authorization != InstallAuthorization::Denied {
         return Err(S9SeGauntletError::InstallNotDenied);
     }
     if d.chain_transport != ChainTransportKind::None {
@@ -290,11 +284,8 @@ pub fn admit_s9se_board_desc_fail_closed(d: &BoardDesc) -> Result<(), S9SeGauntl
     if d.work_engine != WorkEngineKind::ManagementOnly {
         return Err(S9SeGauntletError::WorkEngineNotManagementOnly);
     }
-    if asic_protocol::admit_protocol_over_transport(
-        d.asic_protocol,
-        ChainTransportKind::StockFpga,
-    )
-    .is_ok()
+    if asic_protocol::admit_protocol_over_transport(d.asic_protocol, ChainTransportKind::StockFpga)
+        .is_ok()
     {
         return Err(S9SeGauntletError::ActiveTransport {
             observed: "StockFpga admitted".into(),
@@ -356,8 +347,12 @@ pub fn admit_s9se_pll_formula_family_none() -> Result<(), S9SeGauntletError> {
 
 /// : 60 × stride 2 address program. Not a live enum.
 pub fn admit_s9se_enum_program_desk_only() -> Result<(), S9SeGauntletError> {
-    admit_s9se_geometry(S9SE_CHIPS_PER_CHAIN, S9SE_ADDR_INTERVAL, S9SE_LAST_CHIP_ADDR)
-        .map_err(|_| S9SeGauntletError::GeometryMismatch)?;
+    admit_s9se_geometry(
+        S9SE_CHIPS_PER_CHAIN,
+        S9SE_ADDR_INTERVAL,
+        S9SE_LAST_CHIP_ADDR,
+    )
+    .map_err(|_| S9SeGauntletError::GeometryMismatch)?;
     if refuse_s9k_interval_on_s9se(4).is_ok() {
         return Err(S9SeGauntletError::GeometryMismatch);
     }
@@ -498,7 +493,8 @@ pub fn admit_s9se_job_packet_dispatch_refused() -> Result<(), S9SeGauntletError>
         support_ab: false,
         version_num: 1,
     };
-    let bytes = pack_s9se_job(&job, &[0u8; 80], &[]).map_err(|_| S9SeGauntletError::GeometryMismatch)?;
+    let bytes =
+        pack_s9se_job(&job, &[0u8; 80], &[]).map_err(|_| S9SeGauntletError::GeometryMismatch)?;
     if bytes.first() != Some(&JOB_TYPE) {
         return Err(S9SeGauntletError::GeometryMismatch);
     }
@@ -566,8 +562,8 @@ pub fn admit_s9se_timeout_baud_ticket_desk_only() -> Result<(), S9SeGauntletErro
 ///  desk: nonce HIBYTE/interval classify; FIFO I/O refused.
 pub fn admit_s9se_nonce_classify_fifo_refused() -> Result<(), S9SeGauntletError> {
     let buf = (u32::from(10 * S9SE_ADDR_INTERVAL) << 24) | 7;
-    let place =
-        classify_s9se_nonce(0, buf, S9SE_ADDR_INTERVAL).map_err(|_| S9SeGauntletError::GeometryMismatch)?;
+    let place = classify_s9se_nonce(0, buf, S9SE_ADDR_INTERVAL)
+        .map_err(|_| S9SeGauntletError::GeometryMismatch)?;
     if place.chip != 10 || place.core != 7 {
         return Err(S9SeGauntletError::GeometryMismatch);
     }
@@ -760,7 +756,8 @@ pub fn admit_s9se_core_reg_and_all_reset_desk_only() -> Result<(), S9SeGauntletE
 ///  desk leftover: high-PLL table, PLL0-only freq-with-addr, AXI job
 /// slots, send_job DHASH/version words. I/O still refused.
 pub fn admit_s9se_wave9_desk_leftover() -> Result<(), S9SeGauntletError> {
-    if freq_high_pll_1393_row(4).map_err(|_| S9SeGauntletError::GeometryMismatch)? != (200, 15, 3000)
+    if freq_high_pll_1393_row(4).map_err(|_| S9SeGauntletError::GeometryMismatch)?
+        != (200, 15, 3000)
     {
         return Err(S9SeGauntletError::GeometryMismatch);
     }
@@ -859,11 +856,7 @@ pub fn s9se_board() -> BoardDesc {
 
 /// Keep a compile-visible use of the asic-side CRC helper module docs.
 pub fn cgminer_evidence_needles() -> [&'static str; 3] {
-    [
-        CGMINER_OPKG_SOURCE_NEEDLE,
-        CGMINER_SHA256,
-        UIMAGE_SHA256,
-    ]
+    [CGMINER_OPKG_SOURCE_NEEDLE, CGMINER_SHA256, UIMAGE_SHA256]
 }
 
 #[cfg(test)]

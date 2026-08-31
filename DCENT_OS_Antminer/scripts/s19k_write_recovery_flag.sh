@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# s19k_write_recovery_flag.sh — plan / host fixture / env-gated execute of
-# the am3-s19k U-Boot recovery-flag byte.
+# s19k_write_recovery_flag.sh — plan / host fixture only for the am3-s19k
+# U-Boot recovery-flag byte. The historical target-side writer is retired.
 #
 # Values:
 #   0x01 — verify-only InstallArm / FirstBosThenSetFlag2 plan + 128 KiB fixture.
@@ -14,10 +14,12 @@
 #
 # Default is --verify-only.
 # --fixture-in/--fixture-out rewrites a 128 KiB buffer on the host (no NAND).
-# --execute requires DCENT_S19K_RECOVERY_FLAG_EXECUTE=1, CLEAR_FOR_FLASH=true,
-# live /etc/dcentos/board_target (am3-s19k aliases), GPIO437 SafeOff=1, and
-# an eraseblock-aligned flag (byte_in_block=0) using the S99upgrade
-# flash_erase + one-byte nandwrite pattern.
+# --execute requests require DCENT_S19K_RECOVERY_FLAG_EXECUTE=1 and exact live
+# platform:target identity, then unconditionally stop at CLEAR_FOR_FLASH=false.
+# No current invocation can reach GPIO or NAND. The
+# historical flash_erase + one-byte nandwrite path is retired: held .78 U-Boot
+# already performs that destructive rewrite and it is safe only after the
+# installer proves the full eraseblock tail is erased.
 #
 # FLASH NOT_YET. Env=1 is not a NAND write. Braiins /tmp success is not stock GO.
 
@@ -36,6 +38,8 @@ VERIFY_ONLY=true
 EXECUTE=false
 FIXTURE_IN=""
 FIXTURE_OUT=""
+PLATFORM_FILE=${DCENTOS_PLATFORM_FILE:-/etc/dcentos-platform}
+BOARD_TARGET_FILE=${DCENTOS_BOARD_TARGET_FILE:-/etc/dcentos/board_target}
 
 usage() {
     cat >&2 <<USAGE
@@ -45,8 +49,8 @@ Usage: $(basename "$0") [--value 0x02] [--mtd5-base 0x06700000|--proc-mtd FILE] 
   --value 0x02: U-Boot stock revert (default).
   --value 0x03: verify-only SuccessfulKeepBos plan + 128 KiB fixture (execute FLASH NOT_YET).
   --fixture-in/--fixture-out: rewrite a 131072-byte eraseblock buffer (host CI, 0x01/0x02/0x03).
-  --execute is refused unless DCENT_S19K_RECOVERY_FLAG_EXECUTE=1 (0x02 only).
-  FLASH-false, missing live board_target, and missing GPIO437 SafeOff also refuse.
+  --execute is unconditionally refused; the env and exact identity gates are
+  retained only as fail-closed evidence for a future full-eraseblock writer.
 USAGE
     exit 2
 }
@@ -190,8 +194,10 @@ if [ "$VALUE" = "0x03" ]; then
     echo "byte_in_block=$EB_OFF_HEX"
     echo "erase_count=1"
     echo "rewriter=eraseblock_rewrite"
-    echo "dry_flash_erase=flash_erase /dev/mtd5 $EB_START_HEX 1"
-    echo "dry_nandwrite=printf '\\\\x03' | nandwrite -p -s $EB_START_HEX /dev/mtd5"
+    echo "candidate_required=full-0x20000-byte-eraseblock"
+    echo "candidate_source=host-fixture-only"
+    echo "write_command=false"
+    echo "readback_required=full-0x20000-byte-sha256-and-byte-compare"
     echo "uboot_action=BootBos"
     echo "promote_from=0x02"
     echo "firstboot=S99_WAL_companion_only"
@@ -229,8 +235,10 @@ if [ "$VALUE" = "0x01" ]; then
     echo "byte_in_block=$EB_OFF_HEX"
     echo "erase_count=1"
     echo "rewriter=eraseblock_rewrite"
-    echo "dry_flash_erase=flash_erase /dev/mtd5 $EB_START_HEX 1"
-    echo "dry_nandwrite=printf '\\\\x01' | nandwrite -p -s $EB_START_HEX /dev/mtd5"
+    echo "candidate_required=full-0x20000-byte-eraseblock"
+    echo "candidate_source=host-fixture-only"
+    echo "write_command=false"
+    echo "readback_required=full-0x20000-byte-sha256-and-byte-compare"
     echo "uboot_action=FirstBosThenSetFlag2"
     echo "firstboot=S99_WAL_companion_only"
     echo "bootcmd_reads_firstboot=false"
@@ -259,8 +267,10 @@ echo "eraseblock_start=$EB_START_HEX"
 echo "byte_in_block=$EB_OFF_HEX"
 echo "erase_count=1"
 echo "rewriter=eraseblock_rewrite"
-echo "dry_flash_erase=flash_erase /dev/mtd5 $EB_START_HEX 1"
-echo "dry_nandwrite=printf '\\\\x02' | nandwrite -p -s $EB_START_HEX /dev/mtd5"
+echo "candidate_required=full-0x20000-byte-eraseblock"
+echo "candidate_source=host-fixture-only"
+echo "write_command=false"
+echo "readback_required=full-0x20000-byte-sha256-and-byte-compare"
 echo "clear_for_flash=false"
 echo "env_flip=false"
 echo "recover_env_source=nandrecovery_env.bin"
@@ -290,27 +300,20 @@ if [ "${DCENT_S19K_RECOVERY_FLAG_EXECUTE:-0}" != 1 ]; then
     exit 1
 fi
 
-if [ "$EB_OFF" -ne 0 ]; then
-    echo "ERROR: byte_in_block must be 0 for S99-style one-byte nandwrite after erase; unaligned needs a full 128 KiB rewrite" >&2
+if [ ! -r "$PLATFORM_FILE" ] || [ ! -r "$BOARD_TARGET_FILE" ]; then
+    echo "ERROR: missing exact live platform:target identity; refuse recovery-flag execute" >&2
+    exit 1
+fi
+LIVE_PLATFORM=$(tr -d ' \t\r\n' < "$PLATFORM_FILE")
+LIVE_TARGET=$(tr -d ' \t\r\n' < "$BOARD_TARGET_FILE")
+if [ "$LIVE_PLATFORM:$LIVE_TARGET" != "am3-aml-s19k:am3-s19k" ]; then
+    echo "ERROR: live platform:target='$LIVE_PLATFORM:$LIVE_TARGET' is not exact am3-aml-s19k:am3-s19k; refuse recovery-flag execute" >&2
     exit 1
 fi
 
-if [ -n "$FIXTURE_OUT" ]; then
-    echo "mode=fixture-execute-offline"
-    echo "nand=skipped"
-    exit 0
-fi
-
-if ! command -v flash_erase >/dev/null 2>&1 || ! command -v nandwrite >/dev/null 2>&1; then
-    echo "ERROR: flash_erase/nandwrite missing; refuse on-device execute" >&2
-    exit 1
-fi
-if [ ! -e /dev/mtd5 ]; then
-    echo "ERROR: /dev/mtd5 missing; refuse on-device execute" >&2
-    exit 1
-fi
-
-# : env=1 is not a NAND write. Do not flash_erase/nandwrite then refuse.
+# The one-byte execution lane is retired, not merely hidden behind an env var.
+# A future live writer must accept and verify a complete 128 KiB candidate and
+# independent readback; this helper remains host fixture/plan-only.
 CLEAR_FOR_FLASH=false
 if [ "$CLEAR_FOR_FLASH" != true ]; then
     echo "ERROR: CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite."
@@ -319,62 +322,8 @@ if [ "$CLEAR_FOR_FLASH" != true ]; then
     echo "gpio_write=false"
     echo "execute=CLEAR_FOR_FLASH"
     echo "clear_for_flash=false"
-    echo "verify-only/fixture already host-safe; FLASH NOT_YET"
+    echo "one_byte_execute_retired=true"
+    echo "full_eraseblock_candidate_required=true"
+    echo "verify-only/fixture is host-safe; on-device FLASH remains NOT_YET"
     exit 1
 fi
-
-if [ ! -r /etc/dcentos/board_target ]; then
-    echo "ERROR: missing live /etc/dcentos/board_target; refuse fail-open recovery-flag write" >&2
-    exit 1
-fi
-BT=$(tr -d ' \t\r\n' < /etc/dcentos/board_target)
-case "$BT" in
-    am3-s19k|am3-s19kpro|am3-aml-s19kpro) ;;
-    *)
-        echo "ERROR: live board_target='$BT' is not am3-s19k; refuse fail-open recovery-flag write" >&2
-        exit 1
-        ;;
-esac
-
-echo "Step 1: gpio437 SafeOff (am3-s19k-active-low, value=1) before NAND write..."
-PWR_GPIO=437
-SYS=/sys/class/gpio
-if [ ! -d "$SYS/gpio$PWR_GPIO" ]; then
-    echo "$PWR_GPIO" > "$SYS/export" 2>/dev/null || true
-fi
-if [ ! -d "$SYS/gpio$PWR_GPIO" ]; then
-    echo "ERROR: gpio437 missing after export — refusing recovery-flag NAND write" >&2
-    exit 1
-fi
-echo 0 > "$SYS/gpio$PWR_GPIO/active_low"
-echo high > "$SYS/gpio$PWR_GPIO/direction"
-echo 1 > "$SYS/gpio$PWR_GPIO/value"
-VAL=$(cat "$SYS/gpio$PWR_GPIO/value")
-if [ "$VAL" != "1" ]; then
-    echo "ERROR: gpio437 value=$VAL after SafeOff (want 1 / DISABLE on am3-s19k)" >&2
-    exit 1
-fi
-echo "  gpio437 SafeOff OK polarity=am3-s19k-active-low value=$VAL"
-
-sync
-if ! flash_erase /dev/mtd5 "$EB_START_HEX" 1; then
-    echo "ERROR: flash_erase /dev/mtd5 $EB_START_HEX failed" >&2
-    exit 1
-fi
-if ! printf '\002' | nandwrite -p -s "$EB_START_HEX" /dev/mtd5; then
-    echo "ERROR: nandwrite 0x02 at $EB_START_HEX failed" >&2
-    exit 1
-fi
-if command -v nanddump >/dev/null 2>&1; then
-    READBACK=$(nanddump -q -s "$LOCAL_HEX" -l 1 /dev/mtd5 | od -An -tx1 | tr -d ' \n')
-    case "$READBACK" in
-        02*) echo "readback=0x02" ;;
-        *)
-            echo "ERROR: nanddump readback=$READBACK expected 02" >&2
-            exit 1
-            ;;
-    esac
-fi
-echo "mode=execute-eraseblock-rewrite"
-echo "nand=erased+programmed"
-echo "clear_for_flash=false"

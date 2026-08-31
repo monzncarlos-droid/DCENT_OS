@@ -15,6 +15,7 @@
 //! Linux/CI only — `dcentrald-api` pulls Unix-only HAL crates.
 
 #![cfg(unix)]
+#![allow(clippy::await_holding_lock, clippy::type_complexity)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};

@@ -1,0 +1,52 @@
+{
+  "schema": "dcent.nano3.a-session-admission-template.v1",
+  "status": "INTENTIONALLY_INVALID_NONAUTHORIZING_TEMPLATE",
+  "purpose": "nano3_authorization_a_exact_session_composition_only",
+  "production_key_pins": {
+    "admission_reviewer": null,
+    "operator": null,
+    "recovery_authority": null,
+    "telemetry_authority": null,
+    "post_cut_authority": null,
+    "pool_topology_authority": null,
+    "trusted_time_authority": null,
+    "result_reviewer": null
+  },
+  "required_components": [
+    "image_candidate",
+    "image_receipt",
+    "recovery_authority",
+    "telemetry_capture_request",
+    "telemetry_contract",
+    "post_cut_plan",
+    "pool_plan",
+    "pool_topology",
+    "safety_qualification",
+    "rollback_custody",
+    "trusted_time_record",
+    "global_replay_record"
+  ],
+  "required_results": [
+    "pool_receipt",
+    "post_cut_receipt",
+    "restoration_receipt"
+  ],
+  "temporal_policy": {
+    "prior_live_qualification_must_precede_session": true,
+    "pre_session_authority_must_precede_contact": true,
+    "current_session_results_are_result_only": true,
+    "finalize_cannot_rewrite_or_retroactively_grant_prepare": true
+  },
+  "claims": {
+    "authorization_a_granted": false,
+    "device_contact_authorized": false,
+    "energization_authorized": false,
+    "flash_authorized": false,
+    "hardware_action_performed": false,
+    "post_session_results_can_retroactively_authorize": false,
+    "production_authority_granted": false,
+    "reboot_authorized": false,
+    "rollback_authorized_by_a": false,
+    "unattended_operation_authorized": false
+  }
+}

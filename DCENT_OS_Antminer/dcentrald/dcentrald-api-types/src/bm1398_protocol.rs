@@ -18,6 +18,13 @@ use crate::asic_command::LinearAddressPlan;
 use crate::asic_protocol_spec::{AsicResponseLengthSpec, RESPONSE_PREAMBLE_BYTES};
 use crate::bm13xx_pll::{FourDividerPll, FourDividerPllSearchSpec};
 
+/// Byte identity of the held stock NBP1901 miner used for this contract.
+pub const NBP1901_STOCK_BMMINER_SHA256: &str =
+    "e91e6d9fa7b8524abdb05ac5ca4b7118c6f50a58b6075541139c6f56c1b21d14";
+/// Byte identity of the independently held BM1398 repair jig.
+pub const BM1398_REPAIR_JIG_SHA256: &str =
+    "ddb73ebe334908767360a1b9a15144daa751d45c7f22a4965788371957ff6317";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RegisterWrite {
     pub register: u8,
@@ -375,6 +382,65 @@ pub const S19_PRO_NBP1901_BM1398_PROFILE: Bm1398ProtocolProfile = Bm1398Protocol
     fifo: BM1398_FPGA_FIFO_SPEC,
 };
 
+/// Maturity of the evidence-scoped software protocol surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bm1398Nbp1901SoftwareMaturity {
+    /// Chip identity/response, geometry, PLL, staged core writes, production
+    /// relay writes, FPGA FIFO/work-id semantics, and the driver codec are
+    /// reconstructed and host-tested. This says nothing about physical-board
+    /// admission or live accepted shares.
+    ReconstructedHostTested,
+}
+
+/// Independent physical-identity evidence available to native admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bm1398Nbp1901PhysicalIdentityMaturity {
+    /// No held deployed S19 Pro EEPROM page currently supplies a decoded exact
+    /// board name that can be independently bound to BM1398.
+    MissingHeldDeployedPage,
+}
+
+/// Native runtime posture resulting from the independent evidence axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bm1398Nbp1901NativeRuntimeMaturity {
+    /// `serial_mining` must refuse before hardware observation/construction.
+    RefusedMissingPhysicalIdentity,
+}
+
+/// Machine-readable BM1398/NBP1901 readiness split.
+///
+/// This is deliberately data, not an admission token. There is no conversion
+/// from this record to hardware authority: reconstructed software evidence and
+/// an admitted physical runtime are different axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Bm1398Nbp1901Readiness {
+    pub software: Bm1398Nbp1901SoftwareMaturity,
+    pub physical_identity: Bm1398Nbp1901PhysicalIdentityMaturity,
+    pub native_runtime: Bm1398Nbp1901NativeRuntimeMaturity,
+    pub mining_default_enabled: bool,
+    pub stock_bmminer_sha256: &'static str,
+    pub repair_jig_sha256: &'static str,
+}
+
+impl Bm1398Nbp1901Readiness {
+    /// Explicit non-authority predicate for API/tooling consumers.
+    pub const fn permits_native_runtime(self) -> bool {
+        false
+    }
+}
+
+pub const S19_PRO_NBP1901_BM1398_READINESS: Bm1398Nbp1901Readiness = Bm1398Nbp1901Readiness {
+    software: Bm1398Nbp1901SoftwareMaturity::ReconstructedHostTested,
+    physical_identity: Bm1398Nbp1901PhysicalIdentityMaturity::MissingHeldDeployedPage,
+    native_runtime: Bm1398Nbp1901NativeRuntimeMaturity::RefusedMissingPhysicalIdentity,
+    mining_default_enabled: false,
+    stock_bmminer_sha256: NBP1901_STOCK_BMMINER_SHA256,
+    repair_jig_sha256: BM1398_REPAIR_JIG_SHA256,
+};
+
 // ============================================================================
 // BM1398 native bring-up spec, as inert host-testable data (jig-recovered)
 // ============================================================================
@@ -554,6 +620,70 @@ mod tests {
             bm1398_core_reg_pwth_ccdly_swpf(0xFF, 0xFF, 0xFF),
             0x8000_80F1
         );
+    }
+
+    #[test]
+    fn readiness_separates_reconstructed_protocol_from_native_authority() {
+        use dcentrald_common::bm1398_nbp1901_stub as legacy;
+
+        let readiness = S19_PRO_NBP1901_BM1398_READINESS;
+        assert_eq!(
+            readiness.software,
+            Bm1398Nbp1901SoftwareMaturity::ReconstructedHostTested
+        );
+        assert_eq!(
+            readiness.physical_identity,
+            Bm1398Nbp1901PhysicalIdentityMaturity::MissingHeldDeployedPage
+        );
+        assert_eq!(
+            readiness.native_runtime,
+            Bm1398Nbp1901NativeRuntimeMaturity::RefusedMissingPhysicalIdentity
+        );
+        assert!(!readiness.mining_default_enabled);
+        assert!(!readiness.permits_native_runtime());
+        assert_eq!(readiness.stock_bmminer_sha256, NBP1901_STOCK_BMMINER_SHA256);
+        assert_eq!(readiness.repair_jig_sha256, BM1398_REPAIR_JIG_SHA256);
+
+        let profile = S19_PRO_NBP1901_BM1398_PROFILE;
+        let identity = legacy::BM1398_NBP1901_IDENTITY;
+        assert!(identity.protocol_reconstructed);
+        assert!(!identity.deployed_identity_held);
+        assert!(!identity.admit);
+        assert!(!identity.implemented);
+        assert!(!identity.mining_default_enabled);
+        assert_eq!(identity.chip_id, profile.chip.chip_id);
+        assert_eq!(
+            identity.chain_asic_num as u16,
+            profile.chain.expected_chip_count
+        );
+        assert_eq!(
+            identity.asic_addr_interval,
+            profile.chain.address_plan.address_interval()
+        );
+        assert_eq!(
+            identity.chain_domain_num,
+            profile.chain.voltage_domain_count
+        );
+        assert_eq!(
+            identity.domain_asic_num,
+            profile.chain.chips_per_voltage_domain
+        );
+        assert!(matches!(
+            legacy::admit_bm1398_nbp1901(),
+            Err(legacy::Bm1398Nbp1901StubError::MissingDeployedIdentityEvidence)
+        ));
+
+        let serialized = serde_json::to_value(readiness).unwrap();
+        assert_eq!(serialized["software"], "reconstructed_host_tested");
+        assert_eq!(
+            serialized["physical_identity"],
+            "missing_held_deployed_page"
+        );
+        assert_eq!(
+            serialized["native_runtime"],
+            "refused_missing_physical_identity"
+        );
+        assert_eq!(serialized["mining_default_enabled"], false);
     }
 
     #[test]

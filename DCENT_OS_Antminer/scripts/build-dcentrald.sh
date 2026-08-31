@@ -6,6 +6,7 @@
 #
 # Targets:
 #   zynq      - Antminer S9/S17/S19 Zynq boards (ARMv7-A, Cortex-A9)  [default]
+#   s19k-tmp  - S19k Pro Braiins /tmp handoff (ARMv7 hard-float compatibility ABI)
 #   amlogic   - Antminer S19XP/S21+ Amlogic A113D boards (AArch64, Cortex-A53)
 #   beaglebone - Antminer S19j BeagleBone AM335x boards (ARMv7-A, Cortex-A8)
 #   native    - Build for the host machine (development/testing)
@@ -34,11 +35,19 @@ CAPSULE_MODE=0
 CAPSULE_SOURCE_WORKSPACE="DCENT_OS_Antminer/dcentrald"
 CARGO_VOLUME_CREATED=0
 BUILDER_TAG_CREATED=0
+BUILDER_IMAGE_REUSED=0
 CAPSULE_CONTAINER_STARTED=0
+CAPSULE_BUILDER_RECIPE_SHA256=""
+CAPSULE_BUILDER_RECIPE_TAG=""
 BUILD_INPUT_SNAPSHOT=""
 BUILD_INPUT_DESTROY_TOKEN=""
 BUILD_INPUT_OWNED=0
 DOCKER_BIN="${DCENT_DOCKER_BIN:-}"
+S19K_SOURCE_RECEIPT=""
+S19K_POST_SOURCE_SNAPSHOT=""
+S19K_TMP_BUILD_RECEIPT=""
+S19K_BUILD_OBSERVATION_ID=""
+S19K_TMP_BUILD_VERIFIER="$SCRIPT_DIR/s19k_tmp_build_artifact.py"
 
 _is_truthy() {
     case "${1:-}" in
@@ -65,9 +74,9 @@ if [ -z "$RELEASE_CONTEXT" ] && [ -n "${DCENT_MANIFEST_PUBLIC_KEY_HEX+set}" ] \
     RELEASE_CONTEXT="DCENT_MANIFEST_PUBLIC_KEY_HEX exported but empty"
 fi
 
-# S9 release-capsule v1 is deliberately all-or-nothing.  The caller supplies
-# independent source, invocation, result-stage, and external-input authorities;
-# a partial capsule is never interpreted as a development build.
+# Cargo release-capsule mode is deliberately all-or-nothing. The caller
+# supplies independent source, invocation, result-stage, and external-input
+# authorities; a partial capsule is never interpreted as a development build.
 CAPSULE_ENV_NAMES=(
     DCENT_CAPSULE_GIT_OBJECT_REPO
     DCENT_CAPSULE_SOURCE_SNAPSHOT
@@ -128,10 +137,13 @@ normalize_shell_path() {
 
 if [ "$CAPSULE_ENV_COUNT" -eq "${#CAPSULE_ENV_NAMES[@]}" ]; then
     CAPSULE_MODE=1
-    [ "$TARGET" = "zynq" ] || {
-        echo "ERROR: release capsule v1 supports only target zynq" >&2
-        exit 1
-    }
+    case "$TARGET" in
+        zynq|amlogic) ;;
+        *)
+            echo "ERROR: Cargo release capsule supports only targets zynq and amlogic" >&2
+            exit 1
+            ;;
+    esac
     SNAPSHOT_VERIFY_RESULT="$(python3 "$SCRIPT_DIR/source_snapshot.py" verify-against-git \
         --repo-root "$DCENT_CAPSULE_GIT_OBJECT_REPO" \
         --commit "$DCENT_CAPSULE_SOURCE_COMMIT" \
@@ -342,32 +354,29 @@ cleanup_build_resources() {
         fi
     fi
     if [ "$BUILDER_TAG_CREATED" -eq 1 ]; then
-        observed_image="$("$DOCKER_BIN" image inspect --format '{{.Id}}|{{index .Config.Labels "org.dcentral.dcentos.release-invocation-id"}}' "$CAPSULE_BUILDER_TAG" 2>/dev/null || true)"
+        observed_image="$("$DOCKER_BIN" image inspect --format '{{.Id}}|{{index .Config.Labels "org.dcentral.dcentos.builder-recipe-sha256"}}|{{index .Config.Labels "org.dcentral.dcentos.builder-base-reference"}}' "$CAPSULE_BUILDER_TAG" 2>/dev/null || true)"
         observed_image_id="${observed_image%%|*}"
-        observed_image_invocation="${observed_image#*|}"
-        if printf '%s\n' "$observed_image_id" | grep -qE '^sha256:[0-9a-f]{64}$' \
-            && [ "$observed_image_invocation" = "$CAPSULE_INVOCATION_ID" ] \
+        observed_image_labels="${observed_image#*|}"
+        observed_image_recipe="${observed_image_labels%%|*}"
+        observed_image_base="${observed_image_labels#*|}"
+        if [ -z "$observed_image" ]; then
+            :
+        elif printf '%s\n' "$observed_image_id" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            && [ "$observed_image_recipe" = "$CAPSULE_BUILDER_RECIPE_SHA256" ] \
+            && [ "$observed_image_base" = "$RUST_BUILDER_BASE" ] \
             && { [ -z "${DOCKER_IMAGE_ID:-}" ] || [ "$observed_image_id" = "$DOCKER_IMAGE_ID" ]; }; then
-            retained_cache_tag="dcentos-cargo-cache:${observed_image_id#sha256:}"
-            retained_cache_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
-            if [ -z "$retained_cache_id" ]; then
-                "$DOCKER_BIN" image tag "$observed_image_id" "$retained_cache_tag" >/dev/null 2>&1 || {
-                    echo "ERROR: failed to retain content-addressed Cargo builder cache tag" >&2
-                    [ "$status" -ne 0 ] || status=1
-                }
-                retained_cache_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$retained_cache_tag" 2>/dev/null || true)"
-            fi
-            if [ "$retained_cache_id" = "$observed_image_id" ]; then
+            retained_recipe_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$CAPSULE_BUILDER_RECIPE_TAG" 2>/dev/null || true)"
+            if [ "$retained_recipe_id" = "$observed_image_id" ]; then
                 "$DOCKER_BIN" image rm "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1 || {
                     echo "ERROR: failed to remove invocation-owned builder tag: $CAPSULE_BUILDER_TAG" >&2
                     [ "$status" -ne 0 ] || status=1
                 }
             else
-                echo "ERROR: refusing builder-tag removal without an exact retained cache reference" >&2
+                echo "ERROR: refusing builder-alias removal without its exact recipe tag" >&2
                 [ "$status" -ne 0 ] || status=1
             fi
         else
-            echo "ERROR: refusing to remove changed invocation builder tag: $CAPSULE_BUILDER_TAG" >&2
+            echo "ERROR: refusing to remove changed invocation builder alias: $CAPSULE_BUILDER_TAG" >&2
             [ "$status" -ne 0 ] || status=1
         fi
     fi
@@ -398,6 +407,12 @@ cleanup_build_resources() {
             --token "$BUILD_INPUT_DESTROY_TOKEN" "$BUILD_INPUT_SNAPSHOT" \
             >/dev/null 2>&1 || {
             echo "ERROR: failed to remove private build-input snapshot: $BUILD_INPUT_STAGE" >&2
+            [ "$status" -ne 0 ] || status=1
+        }
+    fi
+    if [ -n "$S19K_POST_SOURCE_SNAPSHOT" ]; then
+        rm -f -- "$S19K_POST_SOURCE_SNAPSHOT" || {
+            echo "ERROR: failed to remove owned S19k post-build source snapshot: $S19K_POST_SOURCE_SNAPSHOT" >&2
             [ "$status" -ne 0 ] || status=1
         }
     fi
@@ -438,8 +453,8 @@ if [ -n "${DCENT_MANIFEST_PUBLIC_KEY_HEX:-}" ]; then
     # Same shape gate as build_in_docker.sh: 64 hex chars = raw 32-byte
     # ed25519 verifying key. A typo here would otherwise surface only at the
     # build_in_docker.sh Phase-5 strings check, after the full cargo build.
-    if ! printf '%s' "$DCENT_MANIFEST_PUBLIC_KEY_HEX" | grep -qE '^[0-9a-fA-F]{64}$'; then
-        echo "ERROR: DCENT_MANIFEST_PUBLIC_KEY_HEX must be exactly 64 hex chars" >&2
+    if ! printf '%s' "$DCENT_MANIFEST_PUBLIC_KEY_HEX" | grep -qE '^[0-9a-f]{64}$'; then
+        echo "ERROR: DCENT_MANIFEST_PUBLIC_KEY_HEX must be exactly 64 lowercase hex chars" >&2
         echo "       (raw 32-byte ed25519 verifying key). Got length ${#DCENT_MANIFEST_PUBLIC_KEY_HEX}." >&2
         exit 1
     fi
@@ -457,11 +472,28 @@ if [ -n "$RELEASE_CONTEXT" ] \
     echo "       mutable Docker tags are development-only" >&2
     exit 1
 fi
+if [ "$TARGET" = "s19k-tmp" ] \
+    && ! printf '%s\n' "$RUST_BUILDER_BASE" \
+        | grep -qE '^([^/@]+/)*[^/@]+@sha256:[0-9a-f]{64}$'; then
+    echo "ERROR: s19k-tmp requires DCENT_RUST_BUILDER_BASE=<image>@sha256:<64-hex>" >&2
+    echo "       an experimental handoff still requires an immutable builder base" >&2
+    exit 1
+fi
 
 # Map board name to Rust target triple and one C-toolchain ABI contract.
 MUSL_ZIG_BUILDER=0
 ZIG_CC_FLAGS=""
+ZIG_VERSION="0.13.0"
+ZIG_ARCHIVE_SHA256="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
 BUILDER_PACKAGE_RESOLUTION="apt-bookworm-live-not-reconstructibly-pinned"
+TARGET_OUTPUT_PREFIX="target"
+PATH_REMAP_FLAGS=""
+# rustc applies the last matching --remap-path-prefix.  Keep the broad source
+# mapping first so the later, more-specific normal target path wins; the
+# capsule target path is disjoint and maps to the same stable build prefix.
+# Carry all three flags in either build layout so compile-env evidence proves
+# one canonical S19k /tmp path contract rather than the directory used today.
+S19K_TMP_PATH_REMAP_FLAGS="--remap-path-prefix=/src=/dcent-source --remap-path-prefix=/src/target/s19k-tmp=/dcent-build --remap-path-prefix=/cargo-target=/dcent-build"
 case "$TARGET" in
     zynq)
         # Canonical Zynq target per root  is musleabihf (static
@@ -479,6 +511,29 @@ case "$TARGET" in
         BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
         ARCH_FLAGS="-C target-cpu=cortex-a9 -C target-feature=+crt-static"
         echo "Building for Zynq (S9/S17/S19) — ARMv7-A Cortex-A9 (musl, static)"
+        ;;
+    s19k-tmp)
+        # Track-1 is a userspace handoff into the held Braiins environment,
+        # not the persistent DCENT_OS rootfs. Retained .88 runs prove that
+        # ELF32 ARM EABI5 hard-float, static-musl binaries execute and reach
+        # accepted shares on the A113D. Keep this compatibility artifact in
+        # its own Cargo target directory so a later Zynq build cannot silently
+        # replace it. Persistent am3-s19kpro images remain AArch64.
+        TRIPLE="armv7-unknown-linux-musleabihf"
+        CROSS_PKG=""
+        CROSS_LINKER="rust-lld"
+        CROSS_CC="/usr/local/bin/zig-cc-target-musl"
+        CROSS_AR="/usr/local/bin/zig-ar"
+        MUSL_ZIG_BUILDER=1
+        # Stay generic ARMv7, matching the retained `.88` build instructions
+        # and `.cargo/config.toml`. The logs prove the artifact ABI, not a
+        # Cortex-specific optimization profile, so do not invent one here.
+        ZIG_CC_FLAGS="-target arm-linux-musleabihf"
+        BUILDER_PACKAGE_RESOLUTION="official-zig-0.13.0-sha256-d45312e6"
+        ARCH_FLAGS="-C target-feature=+crt-static"
+        TARGET_OUTPUT_PREFIX="target/s19k-tmp"
+        PATH_REMAP_FLAGS="$S19K_TMP_PATH_REMAP_FLAGS"
+        echo "Building S19k Braiins /tmp handoff - ARMv7 hard-float on A113D (musl, static)"
         ;;
     amlogic)
         # Amlogic A113D (S19j Pro AML / S19XP / S21 / S21 Pro) = AArch64
@@ -540,7 +595,7 @@ case "$TARGET" in
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Valid targets: zynq, amlogic, beaglebone, native"
+        echo "Valid targets: zynq, s19k-tmp, amlogic, beaglebone, native"
         exit 1
         ;;
 esac
@@ -548,9 +603,43 @@ esac
 echo "Target triple: $TRIPLE"
 echo ""
 
+if [ "$CAPSULE_MODE" -eq 1 ]; then
+    CAPSULE_BUILDER_RECIPE_SHA256="$(
+        python3 - "$SCRIPT_DIR/build-dcentrald.sh" "$TARGET" "$TRIPLE" \
+            "$RUST_BUILDER_BASE" "$ZIG_VERSION" "$ZIG_ARCHIVE_SHA256" \
+            "$BUILDER_PACKAGE_RESOLUTION" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+script, target, triple, base, zig_version, zig_sha256, packages = sys.argv[1:]
+recipe = {
+    "builder_base_reference": base,
+    "builder_driver_sha256": hashlib.sha256(Path(script).read_bytes()).hexdigest(),
+    "builder_package_resolution": packages,
+    "target": target,
+    "target_triple": triple,
+    "zig_archive_sha256": zig_sha256,
+    "zig_version": zig_version,
+}
+raw = (json.dumps(recipe, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+print(hashlib.sha256(raw).hexdigest())
+PY
+    )"
+    printf '%s\n' "$CAPSULE_BUILDER_RECIPE_SHA256" \
+        | grep -qE '^[0-9a-f]{64}$' || {
+        echo "ERROR: failed to derive the immutable Cargo builder recipe" >&2
+        exit 1
+    }
+    CAPSULE_BUILDER_RECIPE_TAG="dcentos-cargo-builder:${CAPSULE_BUILDER_RECIPE_SHA256}"
+fi
+
 # Development uses the historical cached tag.  Capsule builds reject any
-# pre-existing invocation name, allocate an invocation-labeled Cargo volume,
-# and use an invocation-unique builder tag which is inspected before execution.
+# pre-existing invocation alias and allocate an invocation-labeled Cargo
+# volume. Independent invocations reuse one recipe-qualified immutable builder
+# image ID; invocation identity lives on the alias, container and resources,
+# not in the image configuration.
 if [ "$CAPSULE_MODE" -eq 1 ]; then
     if "$DOCKER_BIN" image inspect "$CAPSULE_BUILDER_TAG" >/dev/null 2>&1; then
         echo "ERROR: invocation builder tag already exists: $CAPSULE_BUILDER_TAG" >&2
@@ -581,8 +670,24 @@ if [ "$CAPSULE_MODE" -eq 1 ]; then
     printf '%s\n' "$CARGO_INSPECT_JSON" \
         | python3 "$SCRIPT_DIR/release_docker_resources.py" verify-inspect \
             --role cargo "$DCENT_CAPSULE_INVOCATION_STAGE" >/dev/null
+    retained_builder="$("$DOCKER_BIN" image inspect --format '{{.Id}}|{{index .Config.Labels "org.dcentral.dcentos.builder-recipe-sha256"}}|{{index .Config.Labels "org.dcentral.dcentos.builder-base-reference"}}' "$CAPSULE_BUILDER_RECIPE_TAG" 2>/dev/null || true)"
+    if [ -n "$retained_builder" ]; then
+        retained_builder_id="${retained_builder%%|*}"
+        retained_builder_labels="${retained_builder#*|}"
+        retained_builder_recipe="${retained_builder_labels%%|*}"
+        retained_builder_base="${retained_builder_labels#*|}"
+        if ! printf '%s\n' "$retained_builder_id" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            || [ "$retained_builder_recipe" != "$CAPSULE_BUILDER_RECIPE_SHA256" ] \
+            || [ "$retained_builder_base" != "$RUST_BUILDER_BASE" ]; then
+            echo "ERROR: retained Cargo builder recipe tag is stale or malformed" >&2
+            exit 1
+        fi
+        "$DOCKER_BIN" image tag "$retained_builder_id" "$CAPSULE_BUILDER_TAG"
+        DOCKER_IMAGE_ID="$retained_builder_id"
+        BUILDER_IMAGE_REUSED=1
+        BUILDER_TAG_CREATED=1
+    fi
     DOCKER_IMAGE="$CAPSULE_BUILDER_TAG"
-    BUILDER_TAG_CREATED=1
 else
     DOCKER_IMAGE="dcentrald-cross-${TARGET}"
 fi
@@ -595,16 +700,20 @@ if [ "$DOCKER_BIN" = docker.exe ] && command -v wslpath >/dev/null 2>&1 \
 elif command -v cygpath >/dev/null 2>&1; then
     DOCKER_BUILD_CONTEXT="$(cygpath -w "$DCENTRALD_DIR")"
 fi
-"$DOCKER_BIN" build \
-    --label "org.dcentral.dcentos.release-invocation-id=${CAPSULE_INVOCATION_ID:-development}" \
-    -t "$DOCKER_IMAGE" -f - "$DOCKER_BUILD_CONTEXT" <<DOCKERFILE
+if [ "$BUILDER_IMAGE_REUSED" -eq 0 ]; then
+    [ "$CAPSULE_MODE" -ne 1 ] || BUILDER_TAG_CREATED=1
+    "$DOCKER_BIN" build \
+        --provenance=false \
+        --label "org.dcentral.dcentos.builder-recipe-sha256=${CAPSULE_BUILDER_RECIPE_SHA256:-development}" \
+        --label "org.dcentral.dcentos.builder-base-reference=${RUST_BUILDER_BASE}" \
+        -t "$DOCKER_IMAGE" -f - "$DOCKER_BUILD_CONTEXT" <<DOCKERFILE
 FROM ${RUST_BUILDER_BASE}
 RUN if [ "${MUSL_ZIG_BUILDER}" = "1" ]; then \
-        archive=/tmp/zig-linux-x86_64-0.13.0.tar.xz; \
+        archive=/tmp/zig-linux-x86_64-${ZIG_VERSION}.tar.xz; \
         curl --fail --show-error --location \
-            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz \
             --output "\$archive"; \
-        echo 'd45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  /tmp/zig-linux-x86_64-0.13.0.tar.xz' \
+        echo '${ZIG_ARCHIVE_SHA256}  /tmp/zig-linux-x86_64-${ZIG_VERSION}.tar.xz' \
             | sha256sum --check --strict; \
         mkdir -p /opt/zig; \
         tar -xJf "\$archive" -C /opt/zig --strip-components=1; \
@@ -632,6 +741,10 @@ RUN if [ "${MUSL_ZIG_BUILDER}" = "1" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 RUN rustup target add ${TRIPLE}
+RUN if [ "${TARGET}" = "s19k-tmp" ]; then \
+        test "\$(rustc -vV | sed -n 's/^release: //p')" = "1.90.0"; \
+        cargo -V | grep -qE '^cargo 1\.90\.0 '; \
+    fi
 # Resolve exactly one host rust-lld rather than an arbitrary search result.
 RUN host_triple="\$(rustc -vV | sed -n 's/^host: //p')"; \
     rust_lld="\$(rustc --print sysroot)/lib/rustlib/\${host_triple}/bin/rust-lld"; \
@@ -641,11 +754,20 @@ RUN host_triple="\$(rustc -vV | sed -n 's/^host: //p')"; \
 RUN mkdir -p /knowledge-base/firmware-archive
 WORKDIR /src
 DOCKERFILE
+fi
 
 DOCKER_IMAGE_ID="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$DOCKER_IMAGE")"
 if ! printf '%s\n' "$DOCKER_IMAGE_ID" | grep -qE '^sha256:[0-9a-f]{64}$'; then
     echo "ERROR: Docker returned a non-immutable cross-builder image identity: $DOCKER_IMAGE_ID" >&2
     exit 1
+fi
+if [ "$CAPSULE_MODE" -eq 1 ] && [ "$BUILDER_IMAGE_REUSED" -eq 0 ]; then
+    "$DOCKER_BIN" image tag "$DOCKER_IMAGE_ID" "$CAPSULE_BUILDER_RECIPE_TAG"
+    retained_builder_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$CAPSULE_BUILDER_RECIPE_TAG")"
+    [ "$retained_builder_id" = "$DOCKER_IMAGE_ID" ] || {
+        echo "ERROR: immutable Cargo builder recipe tag changed during publication" >&2
+        exit 1
+    }
 fi
 
 echo ""
@@ -670,6 +792,33 @@ for required_manifest_input in "$STOCK_MANIFEST" "$STOCK_MANIFEST_SIGNATURE"; do
         exit 1
     }
 done
+
+if [ "$TARGET" = "s19k-tmp" ]; then
+    [ -f "$S19K_TMP_BUILD_VERIFIER" ] || {
+        echo "ERROR: S19k build-artifact verifier is missing: $S19K_TMP_BUILD_VERIFIER" >&2
+        exit 1
+    }
+    if [ "$CAPSULE_MODE" -eq 1 ]; then
+        S19K_ARTIFACT_ROOT="$CAPSULE_RESULT_ROOT_SHELL"
+    else
+        S19K_ARTIFACT_ROOT="$DCENTRALD_DIR"
+    fi
+    S19K_INVENTORY_DIR="$S19K_ARTIFACT_ROOT/$TARGET_OUTPUT_PREFIX/release-inventory"
+    mkdir -p "$S19K_INVENTORY_DIR"
+    S19K_SOURCE_RECEIPT="$S19K_INVENTORY_DIR/s19k-tmp.source.json"
+    S19K_TMP_BUILD_RECEIPT="$S19K_INVENTORY_DIR/s19k-tmp.build.json"
+    S19K_BUILD_OBSERVATION_ID="$(python3 "$S19K_TMP_BUILD_VERIFIER" new-observation)"
+    S19K_POST_SOURCE_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/dcentos-s19k-source-after.XXXXXX.json")"
+    python3 "$S19K_TMP_BUILD_VERIFIER" source-snapshot \
+        --repo-root "$REPO_ROOT" \
+        --dcentrald-root "$DCENTRALD_DIR" \
+        --dcent-schema-root "$DCENT_SCHEMA_DIR" \
+        --stock-manifest "$STOCK_MANIFEST" \
+        --stock-signature "$STOCK_MANIFEST_SIGNATURE" \
+        --build-script "$SCRIPT_DIR/build-dcentrald.sh" \
+        --verifier "$S19K_TMP_BUILD_VERIFIER" \
+        --output "$S19K_SOURCE_RECEIPT"
+fi
 
 # Cargo per-target env var name forms for the selected triple:
 #   - upper/underscore for CARGO_TARGET_<TRIPLE>_{LINKER,RUSTFLAGS}
@@ -748,7 +897,19 @@ if [ "$CAPSULE_MODE" -eq 1 ]; then
     CAPSULE_CONTAINER_STARTED=1
 else
     DOCKER_ENV_ARGS+=( -e "DCENT_CAPSULE_MODE=0" )
+    if [ "$TARGET_OUTPUT_PREFIX" != "target" ]; then
+        DOCKER_ENV_ARGS+=(
+            -e "CARGO_TARGET_DIR=/src/$TARGET_OUTPUT_PREFIX"
+            -e "DCENT_DEVELOPMENT_INVENTORY_DIR=/src/$TARGET_OUTPUT_PREFIX/release-inventory"
+        )
+    fi
     DOCKER_RUN_IDENTITY_ARGS=()
+fi
+DOCKER_ENV_ARGS+=( -e "DCENT_TARGET_OUTPUT_PREFIX=${TARGET_OUTPUT_PREFIX}" )
+
+BUILD_RUSTFLAGS="-C link-arg=-s ${ARCH_FLAGS}"
+if [ -n "$PATH_REMAP_FLAGS" ]; then
+    BUILD_RUSTFLAGS="$BUILD_RUSTFLAGS $PATH_REMAP_FLAGS"
 fi
 
 MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
@@ -756,24 +917,29 @@ MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
     "${DOCKER_MOUNT_ARGS[@]}" \
     -e "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=${CROSS_LINKER}" \
     "${DOCKER_ENV_ARGS[@]}" \
-    -e "RUSTFLAGS=-C link-arg=-s ${ARCH_FLAGS}" \
+    -e "RUSTFLAGS=${BUILD_RUSTFLAGS}" \
     -e "DCENT_MANIFEST_PUBLIC_KEY_HEX=${DCENT_MANIFEST_PUBLIC_KEY_HEX:-}" \
     -e "DCENT_MANIFEST_KEY_ID=${DCENT_MANIFEST_KEY_ID:-}" \
     -e "DCENT_BUILDER_KIND=docker-cross" \
     -e "DCENT_BUILDER_BASE_REFERENCE=${RUST_BUILDER_BASE}" \
     -e "DCENT_BUILDER_IMAGE_ID=${DOCKER_IMAGE_ID}" \
     -e "DCENT_BUILDER_PACKAGE_RESOLUTION=${BUILDER_PACKAGE_RESOLUTION}" \
+    -e "DCENT_ZIG_ARCHIVE_SHA256=${ZIG_ARCHIVE_SHA256}" \
     -e "DCENT_METADATA_TARGET=${TRIPLE}" \
     "$DOCKER_IMAGE_ID" \
     bash -c '
         set -e
+        # Cargo gives CARGO_ENCODED_RUSTFLAGS precedence over RUSTFLAGS.  A
+        # builder-image value would bypass the canonical path-remap contract
+        # while leaving a misleading ordinary RUSTFLAGS line in the receipt.
+        unset CARGO_ENCODED_RUSTFLAGS
         # Fetch the complete locked graph (including dev-only packages used by
         # Cargo metadata) before entering the offline build/receipt phase.
         cargo fetch --locked
         cargo build --release --locked --offline --target "$DCENT_METADATA_TARGET"
         if [ "$DCENT_CAPSULE_MODE" = 1 ]; then
-            release_dir="/results/target/${DCENT_METADATA_TARGET}/release"
-            inventory_dir="/results/target/release-inventory"
+            release_dir="/results/${DCENT_TARGET_OUTPUT_PREFIX}/${DCENT_METADATA_TARGET}/release"
+            inventory_dir="/results/${DCENT_TARGET_OUTPUT_PREFIX}/release-inventory"
             mkdir -p "$release_dir" "$inventory_dir"
             for binary in dcentrald dcentos-init dcentos-discovery; do
                 install -m 0755 \
@@ -781,8 +947,18 @@ MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
                     "$release_dir/${binary}"
             done
         else
-            inventory_dir="/src/target/release-inventory"
+            inventory_dir="${DCENT_DEVELOPMENT_INVENTORY_DIR:-/src/target/release-inventory}"
             mkdir -p "$inventory_dir"
+            # Cargo normally hard-links the top-level executable to release/deps.
+            # The receipt reader deliberately admits only a single-link frozen
+            # pathname, so replace just the S19k handoff executable with an
+            # independently allocated inode after compilation.
+            if [ "$DCENT_TARGET_OUTPUT_PREFIX" = target/s19k-tmp ]; then
+                s19k_binary="/src/${DCENT_TARGET_OUTPUT_PREFIX}/${DCENT_METADATA_TARGET}/release/dcentrald"
+                s19k_snapshot="${s19k_binary}.receipt-snapshot.$$"
+                install -m 0755 "$s19k_binary" "$s19k_snapshot"
+                mv -f "$s19k_snapshot" "$s19k_binary"
+            fi
         fi
         cargo metadata --locked --offline --filter-platform "$DCENT_METADATA_TARGET" \
             --format-version 1 \
@@ -793,6 +969,10 @@ MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
             printf "%s\n" "builder_base_reference=$DCENT_BUILDER_BASE_REFERENCE"
             printf "%s\n" "builder_image_id=$DCENT_BUILDER_IMAGE_ID"
             printf "%s\n" "builder_package_resolution=$DCENT_BUILDER_PACKAGE_RESOLUTION"
+            if [ -x /opt/zig/zig ]; then
+                printf "%s\n" "zig_version=$(/opt/zig/zig version)"
+                printf "%s\n" "zig_archive_sha256=$DCENT_ZIG_ARCHIVE_SHA256"
+            fi
         } > "${inventory_dir}/${DCENT_METADATA_TARGET}.toolchain.txt"
         {
             printf "%s\n" "CARGO_BUILD_PROFILE=release"
@@ -803,20 +983,49 @@ MSYS_NO_PATHCONV=1 "$DOCKER_BIN" run --rm \
             > "${inventory_dir}/${DCENT_METADATA_TARGET}.compile-env.txt"
     '
 
+if [ "$TARGET" = "s19k-tmp" ]; then
+    python3 "$S19K_TMP_BUILD_VERIFIER" source-snapshot \
+        --repo-root "$REPO_ROOT" \
+        --dcentrald-root "$DCENTRALD_DIR" \
+        --dcent-schema-root "$DCENT_SCHEMA_DIR" \
+        --stock-manifest "$STOCK_MANIFEST" \
+        --stock-signature "$STOCK_MANIFEST_SIGNATURE" \
+        --build-script "$SCRIPT_DIR/build-dcentrald.sh" \
+        --verifier "$S19K_TMP_BUILD_VERIFIER" \
+        --output "$S19K_POST_SOURCE_SNAPSHOT"
+    python3 "$S19K_TMP_BUILD_VERIFIER" compare-source-snapshots \
+        "$S19K_SOURCE_RECEIPT" "$S19K_POST_SOURCE_SNAPSHOT"
+fi
+
 # Check result
 if [ "$CAPSULE_MODE" -eq 1 ]; then
     BUILD_RESULT_ROOT="$CAPSULE_RESULT_ROOT_SHELL"
 else
     BUILD_RESULT_ROOT="$DCENTRALD_DIR"
 fi
-BINARY="$BUILD_RESULT_ROOT/target/$TRIPLE/release/dcentrald"
+BINARY="$BUILD_RESULT_ROOT/$TARGET_OUTPUT_PREFIX/$TRIPLE/release/dcentrald"
 if [ -f "$BINARY" ]; then
-    RELEASE_DIR="$BUILD_RESULT_ROOT/target/$TRIPLE/release"
-    METADATA_FILE="$BUILD_RESULT_ROOT/target/release-inventory/${TRIPLE}.metadata.json"
-    TOOLCHAIN_CONTEXT="$BUILD_RESULT_ROOT/target/release-inventory/${TRIPLE}.toolchain.txt"
-    COMPILE_ENVIRONMENT="$BUILD_RESULT_ROOT/target/release-inventory/${TRIPLE}.compile-env.txt"
-    emit_build_receipts "$TRIPLE" "$TARGET" "$RELEASE_DIR" "$METADATA_FILE" \
-        "$TOOLCHAIN_CONTEXT" "$COMPILE_ENVIRONMENT"
+    RELEASE_DIR="$BUILD_RESULT_ROOT/$TARGET_OUTPUT_PREFIX/$TRIPLE/release"
+    METADATA_FILE="$BUILD_RESULT_ROOT/$TARGET_OUTPUT_PREFIX/release-inventory/${TRIPLE}.metadata.json"
+    TOOLCHAIN_CONTEXT="$BUILD_RESULT_ROOT/$TARGET_OUTPUT_PREFIX/release-inventory/${TRIPLE}.toolchain.txt"
+    COMPILE_ENVIRONMENT="$BUILD_RESULT_ROOT/$TARGET_OUTPUT_PREFIX/release-inventory/${TRIPLE}.compile-env.txt"
+    if [ "$TARGET" = "s19k-tmp" ]; then
+        python3 "$S19K_TMP_BUILD_VERIFIER" verify \
+            --dcentrald-root "$DCENTRALD_DIR" \
+            --artifact-root "$S19K_ARTIFACT_ROOT" \
+            --binary "$BINARY" \
+            --source-snapshot "$S19K_SOURCE_RECEIPT" \
+            --post-source-snapshot "$S19K_POST_SOURCE_SNAPSHOT" \
+            --metadata "$METADATA_FILE" \
+            --toolchain-context "$TOOLCHAIN_CONTEXT" \
+            --compile-environment "$COMPILE_ENVIRONMENT" \
+            --expected-builder-base "$RUST_BUILDER_BASE" \
+            --build-observation-id "$S19K_BUILD_OBSERVATION_ID" \
+            --receipt "$S19K_TMP_BUILD_RECEIPT"
+    else
+        emit_build_receipts "$TRIPLE" "$TARGET" "$RELEASE_DIR" "$METADATA_FILE" \
+            "$TOOLCHAIN_CONTEXT" "$COMPILE_ENVIRONMENT"
+    fi
     if [ "$CAPSULE_MODE" -eq 1 ]; then
         seal_result_stage() {
             python3 "$SCRIPT_DIR/release_result_stage.py" seal \
@@ -842,13 +1051,24 @@ if [ -f "$BINARY" ]; then
     fi
     SIZE=$(ls -lh "$BINARY" | awk '{print $5}')
     echo ""
-    echo "Build successful!"
+    if [ "$TARGET" = "s19k-tmp" ]; then
+        echo "S19k /tmp artifact admitted for experimental ephemeral handoff."
+        echo "Production readiness and two-build reproducibility are NOT proven."
+    else
+        echo "Build successful!"
+    fi
     echo "Binary: $BINARY"
     echo "Size: $SIZE"
     echo "Target: $TRIPLE"
     echo ""
     if [ "$CAPSULE_MODE" -eq 1 ]; then
         echo "Sealed result stage: $CAPSULE_RESULT_STAGE_SHELL"
+    elif [ "$TARGET" = "s19k-tmp" ]; then
+        echo "Source receipt: $S19K_SOURCE_RECEIPT"
+        echo "Build receipt: $S19K_TMP_BUILD_RECEIPT"
+        echo "Two-observation byte comparison: python3 $S19K_TMP_BUILD_VERIFIER compare-receipts <first-build-receipt> <second-build-receipt>"
+        echo "Phase-0 (zero target contact/mutation): ./scripts/dcentrald_s19k_tmp_deploy.sh --dry-run --expected-artifact-sha256 <sha256> --expected-artifact-bytes <bytes> --known-hosts <known-hosts> --expected-host-key-sha256 SHA256:<fingerprint> <miner-ip> $BINARY ./dcentrald/dcentrald_s19k.toml"
+        echo "Stage-only contact (/tmp mutation; no daemon): ./scripts/dcentrald_s19k_tmp_deploy.sh --expected-artifact-sha256 <sha256> --expected-artifact-bytes <bytes> --known-hosts <known-hosts> --expected-host-key-sha256 SHA256:<fingerprint> <miner-ip> $BINARY ./dcentrald/dcentrald_s19k.toml"
     else
         echo "Deploy: scp $BINARY root@<miner-ip>:/usr/bin/dcentrald"
     fi

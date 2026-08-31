@@ -96,11 +96,14 @@ pub const POWER_LIMIT_MAX_W: u32 = 4500;
 /// **RE 2026-06-02 (Ghidra of the unstripped Bitmain S21 jig `single_board_test`) —
 /// this register-0x20 model is the WRONG abstraction for the actual S21 APW121215f.**
 /// The jig proves: (1) rail ENABLE is a **GPIO** (`bitmain_power_on` = `gpio_write(907,0)`
-/// active-LOW on the jig; S21-Amlogic = PWR_EN gpio437 active-HIGH, already driven by
-/// `PsuGpioGate`) — there is NO register-0x20 control word; (2) APW121215f control is the
+/// active-LOW on the jig). gpio437 PWR_EN polarity is **board_target scoped**
+/// (never one Amlogic pin for all boards): S19k / am3-s19k software `0=ON`,
+/// `1=OFF`; S21-class NoPic software `1=ON` / SafeOff=`0`. Neither is DMM rail
+/// proof. `PsuGpioGate` does not confer a universal gpio437 polarity.
+/// There is NO register-0x20 control word; (2) APW121215f control is the
 /// `0x55 0xAA` **frame protocol** via I2C reg `0x11` (watchdog `0x81`, set-voltage frame/DAC-N,
 /// 16-bit-sum checksum) — exactly `psu.rs::Apw121215a`. So the S21/AML PSU should route through
-/// `Apw121215a` frame protocol + gpio437, NOT this register model. Full RE:
+/// `Apw121215a` frame protocol + board_target-scoped gpio437, NOT this register model. Full RE:
 /// . These constants
 /// are retained only for a genuinely register-mapped APW12+ variant (if one exists); do NOT
 /// trust them for APW121215f. Live S21 routing change is the next (PSU-gated) step.
@@ -110,8 +113,10 @@ pub const POWER_LIMIT_MAX_W: u32 = 4500;
 /// PSU path uses the SAME `0x55 0xAA LEN CMD …` frame family over I2C (set-slave ioctl
 /// `0x0703` → write reg-pointer → read/write N bytes), with `CMD 0x06` = read
 /// calibration/telemetry (39–40-byte table). There is **NO register-0x20 control word** in the
-/// VNish cgminer either — rail enable is GPIO (S11board drives PWR_EN gpio437 HIGH, no
-/// `active_low`), exactly as the jig showed. New detail: the VNish cgminer verifies the
+/// VNish cgminer either — rail enable is GPIO. VNish S11board `echo 1` is an
+/// S21-class / VNish start pattern, **not** a universal Amlogic gpio437
+/// polarity (am3-s19k software SafeOff is also sysfs `1`). Not DMM proof.
+/// New detail: the VNish cgminer verifies the
 /// PSU **calibration table with CRC16/0xFFFF over 30 bytes** (`crc16(table[..30], init=0xFFFF)`),
 /// distinct from the host→PSU command-frame SUM checksum the jig pinned. Two independent
 /// firmwares (Bitmain jig + VNish cgminer) now agree on the GPIO-enable + `55 AA` frame model,
@@ -307,8 +312,10 @@ pub fn set_power_limit_steps(watts: u32) -> Vec<I2cTransactionStep> {
 // CMD + payload + the 2 checksum bytes), whereas am2 APW121215a uses an **8-bit**
 // checksum with `LEN = payload+2`. Reusing the am2 8-bit frame on an APW121215f
 // would fail the PSU's checksum. Frames are written byte-by-byte to I2C register
-// 0x11 (`exec_power_cmd_v2`). Rail ENABLE is a GPIO (gpio437 active-HIGH on
-// S21-AML), NOT a frame command. These builders are RE-exact but NOT yet wired
+// 0x11 (`exec_power_cmd_v2`). Rail ENABLE is a GPIO, NOT a frame command.
+// gpio437 polarity is board_target scoped: S21-class NoPic 1=ON / SafeOff=0;
+// S19k / am3-s19k 0=ON / 1=OFF. Never one Amlogic pin polarity. These builders
+// are RE-exact but NOT yet wired
 // into a live S21 cold-boot path — that drives a live PSU, so an operator live-A/B
 // on `a lab unit` is owed before any default-on routing.
 // ===========================================================================
@@ -422,9 +429,11 @@ pub fn build_apw_float_frame(voltage_v: f32) -> Vec<u8> {
 ///
 /// NOTE: this is the byte-exact TRANSPORT for the S21 APW121215f frame protocol, host-testable and
 /// pure. It is NOT yet wired into the live S21/AML cold-boot dispatch — executing it asserts a real PSU
-/// rail, so the cold-boot integration (assert gpio437 → version-detect → watchdog-disable → set-voltage
-/// → enable) ships default-OFF and needs an operator live-A/B on `a lab unit` (plus the confirmed AML i2c
-/// bus/slave-addr) before any default-on routing.
+/// rail, so the cold-boot integration (board_target-scoped gpio437 SafeOff/ON
+/// → version-detect → watchdog-disable → set-voltage → enable) ships default-OFF
+/// and needs an operator live-A/B on `a lab unit` (plus the confirmed AML i2c
+/// bus/slave-addr) before any default-on routing. gpio437 is not one Amlogic
+/// polarity: S21-class 1=ON / SafeOff=0; am3-s19k 0=ON / 1=OFF. Not VerifiedRailCut.
 pub fn apw121215f_reg11_transaction(frame: &[u8]) -> Vec<I2cTransactionStep> {
     frame
         .iter()

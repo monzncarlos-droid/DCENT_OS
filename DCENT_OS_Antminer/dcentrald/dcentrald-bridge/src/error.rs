@@ -83,6 +83,12 @@ pub enum BridgeError {
     #[error("bridge paired to a different miner (HTTP 403)")]
     WrongMiner,
 
+    /// A caller supplied an OTA request that violates the bridge's bounded
+    /// wire contract. Rejected locally before any request or flash-triggering
+    /// command reaches the bridge.
+    #[error("invalid bridge OTA request: {0}")]
+    InvalidOtaRequest(String),
+
     /// Catch-all.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

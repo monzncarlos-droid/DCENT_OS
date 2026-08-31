@@ -379,6 +379,24 @@ TOLERATED_ORPHANS = {
         "the work that gives the axis a real consumer -- not a drive-by that "
         "removes the signal while the axis stays unconsumed."
     ),
+    # -- deliberate fail-closed desk-evidence surfaces (2026-08-20) --------
+    "Apw9Codec": (
+        "2026-08-20: host-only APW9 held-frame codec "
+        "(dcentrald-hal/src/psu_apw9.rs:78); all constructions are in its "
+        "own tests and LIVE_DISPATCH_AVAILABLE is false. The type has no I2C "
+        "handle, its SET method always refuses, and it intentionally ships "
+        "unreachable so exact signed-root evidence can be decoded without "
+        "minting an APW9 probe, voltage scale, dispatcher, or rail authority."
+    ),
+    "FailClosedPsuRoute": (
+        "2026-08-20: APW8 refusal catalog enum "
+        "(dcentrald-hal/src/psu_routing.rs:16); both constructions are in its "
+        "own test and there is deliberately no production dispatcher. Its row "
+        "leaves address, enable GPIO, opcode, and millivolt units unset and "
+        "set_voltage_mv always errors. Wiring it merely to satisfy reachability "
+        "would falsely imply a shipped APW8 control route; live wiring requires "
+        "separate exact endpoint and electrical evidence."
+    ),
 }
 
 

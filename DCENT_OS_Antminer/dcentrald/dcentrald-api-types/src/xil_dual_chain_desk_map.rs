@@ -7,8 +7,6 @@
 //! `dcentrald::work_ledger` (Linux/CI); this module pins the desk map keys that
 //! ledger must use so traffic cannot cross-correlate.
 
-use dcentrald_common::am2_topology::{dspic_address_for_slot, slot_for_uart, uart_for_slot};
-
 use crate::bm1398_get_address::{
     admit_nbp1901_bm1398_get_address_window, locked_bm1398_unassigned_get_address_body,
     Nbp1901Bm1398GetAddressAdmission,
@@ -58,6 +56,7 @@ pub fn admit_independent_nbp1901_windows() -> [Nbp1901Bm1398GetAddressAdmission;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dcentrald_common::am2_topology::{dspic_address_for_slot, slot_for_uart, uart_for_slot};
 
     #[test]
     fn desk_map_pins_independent_ttys1_and_ttys3_cmd_endpoints() {
@@ -121,8 +120,14 @@ mod tests {
         // Desk contract for ChainWorkLedger wiring: each CMD endpoint's
         // chain_id is the ledger_key. Same logical work_id on two chains must
         // never share a table (enforced by distinct keys + foreign-commit refuse).
-        let keys: Vec<u8> = XIL_DUAL_CHAIN_DESK_MAP.iter().map(|ep| ep.chain_id).collect();
+        let keys: Vec<u8> = XIL_DUAL_CHAIN_DESK_MAP
+            .iter()
+            .map(|ep| ep.chain_id)
+            .collect();
         assert_eq!(keys, vec![0, 1]);
-        assert_eq!(keys.len(), keys.iter().collect::<std::collections::BTreeSet<_>>().len());
+        assert_eq!(
+            keys.len(),
+            keys.iter().collect::<std::collections::BTreeSet<_>>().len()
+        );
     }
 }

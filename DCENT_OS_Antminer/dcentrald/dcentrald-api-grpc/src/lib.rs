@@ -1,5 +1,4 @@
-//! `dcentrald-api-grpc` — Supremacy S5.1 gRPC + protobuf + reflection
-//! scaffold for dcentrald.
+//! `dcentrald-api-grpc` — default-off gRPC telemetry and control surface.
 //!
 //! ## Status (Wave I, 2026-05-19 — read RPCs wired)
 //!
@@ -22,30 +21,25 @@
 //!   the gRPC control plane cannot bypass it. **Until the daemon installs a
 //!   delegate, every write RPC returns `Status::unimplemented`** — byte-
 //!   identical to the prior read-only contract, so this is strictly additive.
-//! - `tonic-reflection` is enabled so `grpcurl -plaintext <host>:50051 list`
-//!   discovers every service.
+//! - `tonic-reflection` is operator-configurable. When enabled,
+//!   `grpcurl -plaintext <host>:50051 list` discovers every service.
 //!
 //! ## Wiring (dcentrald)
 //!
 //! `[api.grpc] enabled = false` by default. When enabled, `dcentrald/src/main.rs`
-//! calls `serve(addr, home_mode)` alongside the existing REST/CGMiner API, and
-//! `Daemon::run` installs the runtime snapshot that backs the read RPCs. Calling
-//! a WRITE RPC returns a clean `UNIMPLEMENTED` with no side-effects.
-//!
-//! ## Why a scaffold first
-//!
-//! Per Supremacy S5 sequencing: shipping the proto contract + transport now
-//! lets every downstream (Python tooling, Go fleet manager, third-party
-//! pyasic-style libs) pin to v1 message shapes immediately. Handler bodies
-//! land as the dcentrald runtime grows the AppState surface needed to back
-//! each RPC. The `unimplemented` stubs are an explicit contract: "this RPC
-//! exists, the wire format is stable, but the runtime isn't backing it yet".
+//! calls [`serve`] alongside the existing REST/CGMiner API, and `Daemon::run`
+//! installs the runtime snapshot and write delegate. A write RPC returns
+//! `UNIMPLEMENTED` only until that delegate is installed.
 
 #![forbid(unsafe_code)]
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use thiserror::Error;
 use tokio::sync::watch;
 use tonic::{service::Interceptor, transport::Server, Request, Response, Status};
 use tracing::info;
@@ -65,39 +59,161 @@ const RELEASE_IMAGE_MARKER: &str = "/etc/dcentos/release-image";
 
 /// Token files the interceptor accepts on a release image, in order. The
 /// daemon's REST auth surface (`/data/dcent/auth.json`) is not directly
-/// linkable from this scaffold crate without a heavy dependency, so the
-/// interceptor reads a dedicated root-only gRPC token; the daemon provisions
-/// it from the same secret as the REST session model. If no token is
-/// provisioned on a release image, the interceptor fails CLOSED (rejects all
-/// RPCs) rather than fail-open.
+/// linkable from this lean crate, so the interceptor reads a dedicated
+/// root-only gRPC token. This crate has no token writer: an operator or image
+/// provisioner must create it explicitly. If no admitted token exists on a
+/// release image, server startup fails before listener bind.
 const GRPC_TOKEN_FILES: &[&str] = &["/run/dcentos/grpc_token", "/data/dcent/grpc_token"];
+
+/// Bearer tokens are secrets, not arbitrary configuration text. This lower
+/// bound rejects accidental placeholders; the upper bound keeps request-time
+/// file reads bounded. One optional LF or CRLF terminator is accepted so a
+/// root-only provisioning tool can write a conventional text file.
+const GRPC_TOKEN_MIN_LEN: usize = 32;
+const GRPC_TOKEN_MAX_LEN: usize = 1024;
+const GRPC_TOKEN_FILE_MAX_LEN: usize = GRPC_TOKEN_MAX_LEN + 2;
+
+/// A token-file admission failure. The token bytes are deliberately never
+/// retained in or rendered by this error.
+#[derive(Debug, Error)]
+#[error("gRPC token file {path}: {reason}")]
+pub struct GrpcTokenError {
+    path: PathBuf,
+    reason: String,
+}
+
+impl GrpcTokenError {
+    fn new(path: &Path, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Typed server-startup failures. Authentication admission is evaluated
+/// before tonic attempts to bind the listener.
+#[derive(Debug, Error)]
+pub enum GrpcServeError {
+    #[error("gRPC startup refused: unauthenticated development image may bind only to loopback, not {0}")]
+    UnauthenticatedDevelopmentBind(SocketAddr),
+    #[error("gRPC startup refused: release image has no admitted root-only bearer token")]
+    MissingReleaseToken,
+    #[error("gRPC startup refused: {0}")]
+    InvalidReleaseToken(#[from] GrpcTokenError),
+    #[error("gRPC reflection service construction failed: {0}")]
+    Reflection(String),
+    #[error("gRPC transport failed: {0}")]
+    Transport(#[from] tonic::transport::Error),
+}
 
 fn release_image() -> bool {
     std::path::Path::new(RELEASE_IMAGE_MARKER).exists()
 }
 
-fn read_grpc_token() -> Option<String> {
+fn token_error(path: &Path, reason: impl Into<String>) -> GrpcTokenError {
+    GrpcTokenError::new(path, reason)
+}
+
+#[cfg(unix)]
+fn validate_unix_token_metadata(uid: u32, mode: u32) -> Result<(), &'static str> {
+    if uid != 0 {
+        return Err("owner uid is not root (0)");
+    }
+    match mode & 0o777 {
+        0o400 | 0o600 => Ok(()),
+        _ => Err("mode must be exactly 0400 or 0600"),
+    }
+}
+
+fn normalize_grpc_token(raw: &str) -> Result<String, &'static str> {
+    let token = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(raw);
+    if token.len() < GRPC_TOKEN_MIN_LEN {
+        return Err("token is shorter than 32 bytes");
+    }
+    if token.len() > GRPC_TOKEN_MAX_LEN {
+        return Err("token is longer than 1024 bytes");
+    }
+    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("token must contain visible ASCII with no whitespace or control bytes");
+    }
+    Ok(token.to_string())
+}
+
+fn read_grpc_token_file(path: &Path) -> Result<Option<String>, GrpcTokenError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(token_error(path, format!("secure open failed: {error}")));
+        }
+    };
+    validate_open_token_file(path, file).map(Some)
+}
+
+fn validate_open_token_file(path: &Path, file: File) -> Result<String, GrpcTokenError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| token_error(path, format!("metadata read failed: {error}")))?;
+    if !metadata.is_file() {
+        return Err(token_error(path, "not a regular file"));
+    }
+    if metadata.len() > GRPC_TOKEN_FILE_MAX_LEN as u64 {
+        return Err(token_error(path, "file is larger than 1026 bytes"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_unix_token_metadata(metadata.uid(), metadata.mode())
+            .map_err(|reason| token_error(path, reason))?;
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((GRPC_TOKEN_FILE_MAX_LEN + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| token_error(path, format!("read failed: {error}")))?;
+    if bytes.len() > GRPC_TOKEN_FILE_MAX_LEN {
+        return Err(token_error(
+            path,
+            "file grew beyond 1026 bytes while being read",
+        ));
+    }
+    let raw =
+        std::str::from_utf8(&bytes).map_err(|_| token_error(path, "token is not valid UTF-8"))?;
+    normalize_grpc_token(raw).map_err(|reason| token_error(path, reason))
+}
+
+fn read_grpc_token() -> Result<Option<String>, GrpcTokenError> {
     for path in GRPC_TOKEN_FILES {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        match read_grpc_token_file(Path::new(path))? {
+            Some(token) => return Ok(Some(token)),
+            None => continue,
         }
     }
-    None
+    Ok(None)
 }
 
 /// Constant-time string comparison (length difference mixed into the
 /// accumulator) so a release-image attacker cannot time-oracle the token.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    let mut diff = a.len() ^ b.len();
     let n = a.len().max(b.len());
     for i in 0..n {
         let ba = a.get(i).copied().unwrap_or(0);
         let bb = b.get(i).copied().unwrap_or(0);
-        diff |= ba ^ bb;
+        diff |= usize::from(ba ^ bb);
     }
     diff == 0
 }
@@ -114,11 +230,12 @@ impl Interceptor for BearerAuthInterceptor {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        match evaluate_grpc_auth(
-            release_image(),
-            read_grpc_token().as_deref(),
-            presented.as_deref(),
-        ) {
+        let is_release = release_image();
+        let required_token = is_release
+            .then(read_grpc_token)
+            .and_then(Result::ok)
+            .flatten();
+        match evaluate_grpc_auth(is_release, required_token.as_deref(), presented.as_deref()) {
             Ok(()) => Ok(request),
             Err(status) => Err(status),
         }
@@ -149,9 +266,7 @@ fn evaluate_grpc_auth(
             ));
         }
     };
-    let presented = presented_authorization
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|s| s.trim());
+    let presented = presented_authorization.and_then(|h| h.strip_prefix("Bearer "));
     match presented {
         Some(tok) if constant_time_eq(tok, required) => Ok(()),
         _ => Err(Status::unauthenticated(
@@ -405,7 +520,7 @@ pub fn runtime_snapshot() -> Option<GrpcRuntimeSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
-// MinerService — GetStatus is LIVE (read); Reboot stays unimplemented (write).
+// MinerService — live status read plus delegate-backed reboot.
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -444,7 +559,7 @@ impl MinerService for MinerSvc {
 }
 
 // ---------------------------------------------------------------------------
-// TunerService — GetConstraints is the ONE real handler in the S5.1 scaffold.
+// TunerService — live mode/constraints reads plus delegate-backed mutation.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -523,7 +638,7 @@ impl TunerService for TunerSvc {
 }
 
 // ---------------------------------------------------------------------------
-// PoolService scaffold.
+// PoolService — live redacted reads plus delegate-backed configuration.
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -572,7 +687,7 @@ impl PoolService for PoolSvc {
 }
 
 // ---------------------------------------------------------------------------
-// FanService scaffold.
+// FanService — live fan reads plus delegate-backed control.
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -646,7 +761,7 @@ impl FanService for FanSvc {
 }
 
 // ---------------------------------------------------------------------------
-// LocateService scaffold.
+// LocateService — delegate-backed physical-find indication.
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -685,38 +800,37 @@ impl LocateService for LocateSvc {
 /// on shutdown signal forwarded by tonic). `home_mode` propagates the
 /// home-mining fan cap into `GetConstraints` replies.
 ///
-/// Reflection is always enabled — there's no security cost (reflection
-/// only enumerates services already exposed) and it dramatically improves
-/// CLI debuggability with `grpcurl` / `bloomrpc` / Postman.
+/// `reflection_enabled` honors the operator's `[api.grpc].reflection` choice.
+/// On a release image, a valid root-owned token must exist before any listener
+/// bind is attempted. On a development image, unauthenticated serving is
+/// constrained to loopback.
 pub async fn serve(
     addr: SocketAddr,
     home_mode: bool,
     chip_family: String,
-) -> Result<(), tonic::transport::Error> {
+    reflection_enabled: bool,
+) -> Result<(), GrpcServeError> {
+    preflight_grpc_startup(addr)?;
     info!(
         %addr,
         home_mode,
         chip_family = %chip_family,
-        "starting dcentrald-api-grpc server (S5.1 scaffold)"
+        reflection_enabled,
+        "starting admitted dcentrald-api-grpc server"
     );
 
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(dcent::v1::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .expect("reflection service builder cannot fail with a valid descriptor set");
-
     // SEC-W24-4: wrap each RPC service with the Bearer interceptor. On a DEV
-    // image the interceptor is a pass-through (open, as today); on a release
-    // image it enforces a constant-time Bearer token. Reflection is left
-    // un-intercepted — it only enumerates service names already public, and
-    // CLI debuggability (`grpcurl list`) must keep working.
+    // loopback listener the interceptor is a pass-through; on a release image
+    // it revalidates the root-only token and enforces a constant-time match on
+    // every request. Reflection, if selected, is descriptive only and remains
+    // un-intercepted.
     info!(
         release_image = release_image(),
         "gRPC Bearer auth interceptor installed (enforced on release images only)"
     );
     let auth = BearerAuthInterceptor;
 
-    Server::builder()
+    let router = Server::builder()
         .add_service(MinerServiceServer::with_interceptor(MinerSvc, auth))
         .add_service(TunerServiceServer::with_interceptor(
             TunerSvc {
@@ -730,10 +844,46 @@ pub async fn serve(
             FanSvc { home_mode },
             auth,
         ))
-        .add_service(LocateServiceServer::with_interceptor(LocateSvc, auth))
-        .add_service(reflection)
-        .serve(addr)
-        .await
+        .add_service(LocateServiceServer::with_interceptor(LocateSvc, auth));
+
+    if reflection_enabled {
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(dcent::v1::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .map_err(|error| GrpcServeError::Reflection(error.to_string()))?;
+        router.add_service(reflection).serve(addr).await?;
+    } else {
+        router.serve(addr).await?;
+    }
+    Ok(())
+}
+
+fn evaluate_grpc_startup(
+    is_release_image: bool,
+    addr: SocketAddr,
+    release_token_available: bool,
+) -> Result<(), GrpcServeError> {
+    if !is_release_image {
+        return if addr.ip().is_loopback() {
+            Ok(())
+        } else {
+            Err(GrpcServeError::UnauthenticatedDevelopmentBind(addr))
+        };
+    }
+    if release_token_available {
+        Ok(())
+    } else {
+        Err(GrpcServeError::MissingReleaseToken)
+    }
+}
+
+fn preflight_grpc_startup(addr: SocketAddr) -> Result<(), GrpcServeError> {
+    let is_release = release_image();
+    if !is_release {
+        return evaluate_grpc_startup(false, addr, false);
+    }
+    let token_available = read_grpc_token()?.is_some();
+    evaluate_grpc_startup(true, addr, token_available)
 }
 
 #[cfg(test)]
@@ -791,6 +941,10 @@ mod tests {
         let err = evaluate_grpc_auth(true, Some("s3cr3t"), Some("Basic s3cr3t"))
             .expect_err("basic scheme rejected");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        // The credential is exact: leading/trailing whitespace is not silently
+        // normalized into an accepted secret.
+        assert!(evaluate_grpc_auth(true, Some("s3cr3t"), Some("Bearer  s3cr3t")).is_err());
+        assert!(evaluate_grpc_auth(true, Some("s3cr3t"), Some("Bearer s3cr3t ")).is_err());
     }
 
     #[test]
@@ -810,6 +964,84 @@ mod tests {
         assert!(!constant_time_eq("abc123", "abc124"));
         assert!(!constant_time_eq("abc", "abc123"));
         assert!(constant_time_eq("", ""));
+        // Regression: truncating the length XOR to u8 made a 256-byte NUL
+        // suffix compare equal to a missing string.
+        assert!(!constant_time_eq("", &"\0".repeat(256)));
+    }
+
+    #[test]
+    fn grpc_token_text_is_bounded_exact_visible_ascii() {
+        let token = "A".repeat(GRPC_TOKEN_MIN_LEN);
+        assert_eq!(normalize_grpc_token(&token).unwrap(), token);
+        assert_eq!(
+            normalize_grpc_token(&(token.clone() + "\n")).unwrap(),
+            token
+        );
+        assert_eq!(
+            normalize_grpc_token(&(token.clone() + "\r\n")).unwrap(),
+            token
+        );
+        assert!(normalize_grpc_token("short").is_err());
+        assert!(normalize_grpc_token(&("A".repeat(GRPC_TOKEN_MAX_LEN + 1))).is_err());
+        assert!(normalize_grpc_token(&(token.clone() + " ")).is_err());
+        assert!(normalize_grpc_token(&(token.clone() + "\n\n")).is_err());
+        assert!(normalize_grpc_token(&("A".repeat(31) + "é")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grpc_token_metadata_requires_root_and_exact_owner_only_mode() {
+        assert!(validate_unix_token_metadata(0, 0o400).is_ok());
+        assert!(validate_unix_token_metadata(0, 0o600).is_ok());
+        assert!(validate_unix_token_metadata(1000, 0o600).is_err());
+        assert!(validate_unix_token_metadata(0, 0o440).is_err());
+        assert!(validate_unix_token_metadata(0, 0o644).is_err());
+        assert!(validate_unix_token_metadata(0, 0o700).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grpc_token_reader_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "dcentrald-grpc-token-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create unique test directory");
+        let target = directory.join("target");
+        let link = directory.join("token");
+        std::fs::write(&target, "A".repeat(GRPC_TOKEN_MIN_LEN)).expect("write target");
+        symlink(&target, &link).expect("create token symlink");
+        let result = read_grpc_token_file(&link);
+        std::fs::remove_file(&link).expect("remove test symlink");
+        std::fs::remove_file(&target).expect("remove test target");
+        std::fs::remove_dir(&directory).expect("remove test directory");
+        assert!(result.is_err(), "O_NOFOLLOW must reject token symlinks");
+    }
+
+    #[test]
+    fn grpc_startup_admission_is_release_and_bind_scoped() {
+        let ipv4_loopback: SocketAddr = "127.0.0.1:50051".parse().unwrap();
+        let ipv6_loopback: SocketAddr = "[::1]:50051".parse().unwrap();
+        let non_loopback: SocketAddr = "0.0.0.0:50051".parse().unwrap();
+
+        assert!(evaluate_grpc_startup(false, ipv4_loopback, false).is_ok());
+        assert!(evaluate_grpc_startup(false, ipv6_loopback, false).is_ok());
+        assert!(matches!(
+            evaluate_grpc_startup(false, non_loopback, false),
+            Err(GrpcServeError::UnauthenticatedDevelopmentBind(_))
+        ));
+        assert!(matches!(
+            evaluate_grpc_startup(true, non_loopback, false),
+            Err(GrpcServeError::MissingReleaseToken)
+        ));
+        assert!(evaluate_grpc_startup(true, non_loopback, true).is_ok());
     }
 
     #[test]
@@ -1195,7 +1427,8 @@ mod tests {
         // tonic-reflection refuses to start with an empty FDS — pin the build
         // output so a botched build.rs regression fails the test rather than
         // silently shipping a no-reflection server.
-        assert!(!dcent::v1::FILE_DESCRIPTOR_SET.is_empty());
-        assert!(dcent::v1::FILE_DESCRIPTOR_SET.len() > 32);
+        let descriptor = std::hint::black_box(dcent::v1::FILE_DESCRIPTOR_SET);
+        assert!(!descriptor.is_empty());
+        assert!(descriptor.len() > 32);
     }
 }

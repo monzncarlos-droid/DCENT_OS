@@ -90,8 +90,8 @@ pub enum GuideControlInterface {
     NoneFirstParty,
     /// 4-pin signal terminal: SDA/SCL ("the I2C protocol", voltage adjust)
     /// + EN enable, **effective in low level**, + GND. Main rail regulated
-    /// by an on-board PIC. No address/register/opcode is stated in the
-    /// guide — wire-level protocol remains UNSPECIFIED by this corpus.
+    ///   by an on-board PIC. No address/register/opcode is stated in the
+    ///   guide — wire-level protocol remains UNSPECIFIED by this corpus.
     I2cPicWithEnActiveLow,
 }
 

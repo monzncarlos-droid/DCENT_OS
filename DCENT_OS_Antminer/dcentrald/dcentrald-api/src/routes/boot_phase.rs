@@ -92,10 +92,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(expose_timeline: bool) -> Arc<AppState> {
-        let mut api_config = crate::ApiConfig::default();
-        api_config.expose_boot_timeline = expose_timeline;
-        let s = crate::build_minimal_app_state(crate::MinimalAppStateInputs {
-            api_config,
+        crate::build_minimal_app_state(crate::MinimalAppStateInputs {
+            api_config: crate::ApiConfig {
+                expose_boot_timeline: expose_timeline,
+                ..crate::ApiConfig::default()
+            },
             pool_url: "stratum+tcp://example.com:3333".into(),
             pool_protocol: "sv1".into(),
             mode: dcentrald_api_types::OperatingMode::Standard,
@@ -106,8 +107,7 @@ mod tests {
             control_board_label: "am3-aml".into(),
             chip_type_label: "BM1362".into(),
             external_state_rx: None,
-        });
-        s
+        })
     }
 
     #[tokio::test]

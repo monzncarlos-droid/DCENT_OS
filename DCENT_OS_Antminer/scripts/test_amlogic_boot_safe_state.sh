@@ -30,10 +30,19 @@ require_literal() {
     FILE=$1
     LITERAL=$2
     LABEL=$3
-    if grep -Fq "$LITERAL" "$FILE"; then
+    if grep -Fq -- "$LITERAL" "$FILE"; then
         pass "$LABEL"
     else
         fail "$LABEL"
+    fi
+}
+
+require_file() {
+    FILE=$1
+    if [ -f "$FILE" ]; then
+        pass "required file exists: $FILE"
+    else
+        fail "required file missing: $FILE"
     fi
 }
 
@@ -67,12 +76,24 @@ require_literal "$S37" 'for GPIO in 476 477' \
     'S37 configures both management-fabric pinmux guards together'
 require_literal "$S37" 'configure_input_gpio "$GPIO" || return 1' \
     'S37 GPIO476/477 setup uses checked input direction'
-require_literal "$S37" 'schema=dcentos.amlogic-safe-state/v1' \
-    'S37 emits a versioned boot-safe receipt'
+require_literal "$S37" 'schema=dcentos.amlogic-safe-state/v2' \
+    'S37 emits the reset-polarity-bound boot-safe receipt v2'
 require_literal "$S37" 'gpio_active_low=0' \
     'S37 receipt records raw active-high GPIO semantics'
 require_literal "$S37" 'physical_rail_measured=false' \
     'S37 receipt does not overclaim electrical rail proof'
+require_literal "$S37" 'hashboard_reset_low_bitmap=0x7' \
+    'S37 receipt binds all three checked reset-low legs'
+require_literal "$S37" 'hashboard_reset_gpio454_active_low=0' \
+    'S37 receipt binds reset GPIO454 to raw active_low=0'
+require_literal "$S37" 'hashboard_reset_gpio456_active_low=0' \
+    'S37 receipt binds reset GPIO456 to raw active_low=0'
+require_literal "$S37" 'configure_reset_output_low_gpio "$GPIO"' \
+    'S37 normalizes reset active_low before output-low assertion'
+require_literal "$S37" 'verify_hashboards_reset_low || return 1' \
+    'S37 live-revalidates all reset-low legs with the receipt'
+require_literal "$S37" 'continuing to GPIO437 SafeOff' \
+    'S37 emergency path still cuts the rail after a reset-leg failure'
 require_literal "$S37" 'WANT_SAFE_OFF=1' \
     'S37 runtime handoff accepts GPIO437=1 SafeOff on am3-s19k'
 require_literal "$S37" 'write_receipt runtime-handoff' \
@@ -129,7 +150,7 @@ else
     fail 'session supervisor can delay emergency cut behind journal promotion'
 fi
 
-STOP_LINE=$(grep -n -F 'run_init_scripts("stop");' "$INIT" | head -n 1 | cut -d: -f1)
+STOP_LINE=$(grep -n -F 'run_init_scripts("stop", service_posture);' "$INIT" | head -n 1 | cut -d: -f1)
 TERM_LINE=$(grep -n -F 'libc::kill(-1, libc::SIGTERM)' "$INIT" | head -n 1 | cut -d: -f1)
 KILL_LINE=$(grep -n -F 'libc::kill(-1, libc::SIGKILL)' "$INIT" | head -n 1 | cut -d: -f1)
 if [ -n "$STOP_LINE" ] && [ -n "$TERM_LINE" ] && [ -n "$KILL_LINE" ] \
@@ -147,6 +168,16 @@ require_literal "$HAL" '"state", "runtime-handoff"' \
     'HAL accepts only the supervisor-published runtime handoff state'
 require_literal "$HAL" '"physical_rail_measured", "false"' \
     'HAL pins the non-electrical evidence grade'
+require_literal "$HAL" 'require("hashboard_reset_low_bitmap", "0x7")?;' \
+    'HAL refuses runtime handoff without the complete reset-low bitmap'
+require_literal "$HAL" 'require("hashboard_reset_gpio455_active_low", "0")?;' \
+    'HAL refuses runtime handoff without reset active_low=0 evidence'
+require_literal "$HAL" 'read_live("/sys/class/gpio/gpio454/direction")?;' \
+    'HAL live-revalidates the first hashboard reset leg before admission'
+require_literal "$HAL" 'read_live("/sys/class/gpio/gpio454/active_low")?;' \
+    'HAL live-revalidates reset GPIO454 raw polarity before admission'
+require_literal "$HAL" 'read_live("/sys/class/gpio/gpio456/value")?;' \
+    'HAL live-revalidates the final hashboard reset leg before admission'
 require_literal "$HAL" 'let active_low = read_live("/sys/class/gpio/gpio437/active_low")?;' \
     'HAL revalidates raw active-high mode before runtime admission'
 
@@ -176,7 +207,7 @@ require_literal "$INIT" 'libc::TIMER_ABSTIME' \
     'PID 1 shutdown deadline cannot be reset by EINTR retries'
 ARM_LINE=$(grep -n -F 'arm_emergency_watchdog(rb_action, SHUTDOWN_WATCHDOG_MS);' "$INIT" | head -n 1 | cut -d: -f1)
 SHUTDOWN_LOG_LINE=$(grep -n -F '"[init] Shutdown requested (signal {} -> {})"' "$INIT" | head -n 1 | cut -d: -f1)
-ORDERLY_LINE=$(grep -n -F 'do_shutdown();' "$INIT" | head -n 1 | cut -d: -f1)
+ORDERLY_LINE=$(grep -n -F 'do_shutdown(service_posture, &external_started_services);' "$INIT" | head -n 1 | cut -d: -f1)
 if [ -n "$ARM_LINE" ] && [ -n "$SHUTDOWN_LOG_LINE" ] && [ -n "$ORDERLY_LINE" ] \
     && [ "$ARM_LINE" -lt "$SHUTDOWN_LOG_LINE" ] && [ "$SHUTDOWN_LOG_LINE" -lt "$ORDERLY_LINE" ]; then
     pass 'PID 1 arms its terminal deadline before shutdown logging or orderly work'
@@ -230,21 +261,37 @@ require_literal "$INSTALL_PERSISTENT" 'ERROR: gpio437 value=' \
     'persistent Amlogic install proves GPIO437 matches SKU SafeOff after write'
 require_literal "$INSTALL_PERSISTENT" 'refusing NAND mutation' \
     'persistent Amlogic install refuses flash when SafeOff fails'
-# Ordering: SafeOff step text must appear before flash_erase invocation.
+# Ordering: immutable refusal must precede the dormant SafeOff and root-FD
+# transaction; inside that one target-side shell, binding and hashing the root
+# inode plus the final live SafeOff check must all precede erase, which must
+# precede the FD-backed write.
+CLEAR_FOR_FLASH_LINE=$(grep -n -F -x 'CLEAR_FOR_FLASH=false' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
 SAFEOFF_LINE=$(grep -n -F 'Step 7b/10: GPIO437 PWR_EN SafeOff' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
-# Match the real destructive flash_erase invocation, not the dry-run log line.
-FLASH_LINE=$(grep -n -F 'ssh_run "flash_erase $ROOTFS_MTD' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
-if [ -n "$SAFEOFF_LINE" ] && [ -n "$FLASH_LINE" ] && [ "$SAFEOFF_LINE" -lt "$FLASH_LINE" ]; then
-    pass 'persistent Amlogic install SafeOff precedes flash_erase'
+ROOT_FD_LINE=$(grep -n -F "exec 3< '\$REMOTE_PREFIX/root'" "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+ROOT_FD_HASH_LINE=$(grep -n -F 'sha256sum /proc/self/fd/3' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+LIVE_SAFEOFF_LINE=$(grep -n -F 'cat /sys/class/gpio/gpio437/value' "$INSTALL_PERSISTENT" | tail -n 1 | cut -d: -f1)
+FLASH_LINE=$(grep -n -F 'flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT || exit 1' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+NANDWRITE_LINE=$(grep -n -F 'nandwrite -p -s $ROOTFS_OFFSET_HEX $ROOTFS_MTD /proc/self/fd/3 || exit 1' "$INSTALL_PERSISTENT" | head -n 1 | cut -d: -f1)
+if [ -n "$CLEAR_FOR_FLASH_LINE" ] && [ -n "$SAFEOFF_LINE" ] \
+   && [ -n "$ROOT_FD_LINE" ] && [ -n "$ROOT_FD_HASH_LINE" ] \
+   && [ -n "$LIVE_SAFEOFF_LINE" ] && [ -n "$FLASH_LINE" ] \
+   && [ -n "$NANDWRITE_LINE" ] \
+   && [ "$CLEAR_FOR_FLASH_LINE" -lt "$SAFEOFF_LINE" ] \
+   && [ "$SAFEOFF_LINE" -lt "$ROOT_FD_LINE" ] \
+   && [ "$ROOT_FD_LINE" -lt "$ROOT_FD_HASH_LINE" ] \
+   && [ "$ROOT_FD_HASH_LINE" -lt "$LIVE_SAFEOFF_LINE" ] \
+   && [ "$LIVE_SAFEOFF_LINE" -lt "$FLASH_LINE" ] \
+   && [ "$FLASH_LINE" -lt "$NANDWRITE_LINE" ]; then
+    pass 'persistent Amlogic install refusal, SafeOff, bound root hash, live GPIO check, erase, and FD-backed write are strictly ordered'
 else
-    fail 'persistent Amlogic install can flash_erase without prior GPIO437 SafeOff'
+    fail 'persistent Amlogic install root-FD transaction can bypass immutable refusal, SafeOff, content binding, or erase-before-write ordering'
 fi
 
 S19K_RAIL="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos/rail_gpio"
 S19K_TARGET="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos/board_target"
 S19K_PLATFORM="$PROJECT_DIR/br2_external_dcentos/board/amlogic/am3-s19kpro/rootfs-overlay/etc/dcentos-platform"
 
-LAB_ROOTFS="$ROOT/scripts/amlogic_lab_rootfs.sh"
+LAB_ROOTFS="$PROJECT_DIR/scripts/amlogic_lab_rootfs.sh"
 require_file "$LAB_ROOTFS"
 require_literal "$LAB_ROOTFS" 'require_gpio437_safe_off_before_mutation' \
     'lab Amlogic rootfs write/restore requires GPIO437 SafeOff helper'
@@ -256,10 +303,17 @@ require_literal "$LAB_ROOTFS" 'ERROR: gpio437 value=' \
     'lab Amlogic rootfs proves GPIO437 matches SKU SafeOff after write'
 require_literal "$LAB_ROOTFS" 'refusing NAND mutation' \
     'lab Amlogic rootfs refuses flash when SafeOff fails'
-require_literal "$LAB_ROOTFS" 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' \
+require_literal "$LAB_ROOTFS" 'CLEAR_FOR_FLASH=false - refusing gpio437 SafeOff/flash_erase/nandwrite' \
     'lab Amlogic rootfs refuses NAND while FLASH-false'
 require_literal "$LAB_ROOTFS" '--lab-only is not a FLASH override' \
     'lab Amlogic rootfs lab flags do not override FLASH'
+require_literal "$LAB_ROOTFS" 'tr -d " \t\r\n"' \
+    'lab Amlogic rootfs uses BusyBox-safe board-target whitespace deletion'
+if grep -F 'tr -d "[:space:]"' "$LAB_ROOTFS" >/dev/null 2>&1; then
+    fail 'lab Amlogic rootfs retains BusyBox-corrupting tr character-class deletion'
+else
+    pass 'lab Amlogic rootfs rejects BusyBox-corrupting tr character-class deletion'
+fi
 LAB_WRITE_FLASH=$(grep -n -F 'flash_erase $ROOTFS_MTD' "$LAB_ROOTFS" | head -n 1 | cut -d: -f1)
 LAB_RESTORE_FLASH=$(grep -n -F 'flash_erase $ROOTFS_MTD' "$LAB_ROOTFS" | tail -n 1 | cut -d: -f1)
 LAB_WRITE_CALL=$(grep -n -F 'require_gpio437_safe_off_before_mutation "$MINER_IP"' "$LAB_ROOTFS" | head -n 1 | cut -d: -f1)

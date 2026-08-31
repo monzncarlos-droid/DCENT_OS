@@ -6,9 +6,10 @@
 # GetAddress receipt containing exact chain ID, enumerated chip count, and ASIC
 # family for every active chain. They must therefore remain non-Measured:
 #
-# P0 serial_mining: family/geometry are resolved from model/config; some
-#    GetAddress response counts are checked but not retained as identity, and
-#    BM1366 may deliberately continue with a partial response set.
+# P0 serial_mining: generic family/geometry are resolved from model/config and
+#    transient GetAddress observations are not promoted to Measured identity.
+#    The exact native BM1366 owner separately requires its joined 77/77 receipt,
+#    but still cannot mint the standard composition token audited below.
 # P0 am3_bb_mining: GetAddress can retain CRC-verified repetitions of the one
 #    captured BM1362 unassigned payload, but repetitions are not unique-chip or
 #    chip-count evidence and the engine owns no composition generation. Address
@@ -81,8 +82,8 @@ require_pattern "$serial_rs" 'native serial mining requires an explicit recogniz
     'serial identity remains explicitly declarative'
 require_pattern "$serial_rs" 'let pre_responses = serial.read_all_responses(500)?;' \
     'serial GetAddress responses remain transient init checks'
-require_pattern "$serial_rs" 'rambo_mode tolerance' \
-    'serial partial-chain continuation remains visible'
+require_pattern "$serial_rs" 'population remains unpublished until exact post-assignment coverage' \
+    'serial configured geometry remains unpublished as measured population'
 require_pattern "$am3_rs" 'assigned_chips: usize,' \
     'AM3 result distinguishes assigned geometry from enumeration'
 require_pattern "$am3_rs" 'initial_get_address_rx_bytes: usize,' \

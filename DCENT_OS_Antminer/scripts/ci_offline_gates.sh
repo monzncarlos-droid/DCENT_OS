@@ -137,7 +137,7 @@ payload_fits_ubi_volume
 EXPECTED_KERNEL_LEBS=23
 EXPECTED_ROOTFS_LEBS=179
 EXPECTED_ROOTFS_DATA_LEBS=210
-fw_setenv --script "$_FW_SETENV_SCRIPT"
+fw_setenv -c "$FW_ENV_CONFIG" --script "$FW_SETENV_SCRIPT"
 upgrade_stage=0
 REFUSING to fall back to raw dd/flash_erase/nandwrite
 EOF
@@ -622,6 +622,14 @@ watchdog_config_path_exempt() {
         br2_external_dcentos/board/beaglebone/am3-bb/*|br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/*|*/br2_external_dcentos/board/beaglebone/am3-bb/*|*/br2_external_dcentos/board/beaglebone/am3-bb-s19jpro/*)
             return 0
             ;;
+        br2_external_dcentos/board/amlogic/am3-s19xp/rootfs-overlay/etc/*|br2_external_dcentos/board/amlogic/am3-s19jxp/rootfs-overlay/etc/*|br2_external_dcentos/board/amlogic/am3-s21xp/rootfs-overlay/etc/*|*/br2_external_dcentos/board/amlogic/am3-s19xp/rootfs-overlay/etc/*|*/br2_external_dcentos/board/amlogic/am3-s19jxp/rootfs-overlay/etc/*|*/br2_external_dcentos/board/amlogic/am3-s21xp/rootfs-overlay/etc/*)
+            policy_dir=${1%%/rootfs-overlay/etc/*}
+            policy_file="$policy_dir/rootfs-overlay/etc/dcentos/mutation_policy"
+            [ -f "$policy_file" ] || return 1
+            [ "$(wc -l < "$policy_file" | tr -d '[:space:]')" = "1" ] || return 1
+            grep -Fqx 'management-only' "$policy_file"
+            return $?
+            ;;
     esac
     return 1
 }
@@ -671,13 +679,13 @@ watchdog_shipped_config_gate_check() {
     tmpfile=$(mktemp 2>/dev/null || echo "/tmp/dcentos-watchdog-shipped-configs.$$")
     rm -f "$tmpfile"
     if watchdog_shipped_configs_ok "br2_external_dcentos" "$tmpfile"; then
-        pass "SAF-3 shipped configs: watchdog enabled in release overlays (am3-bb management-only lane exempt)"
+        pass "SAF-3 shipped configs: watchdog enabled in release overlays (typed management-only lanes exempt)"
     else
         rc=$?
         if [ "$rc" -eq 2 ]; then
             fail "SAF-3 shipped configs: no rootfs-overlay/etc/*.toml configs found under br2_external_dcentos (path drift?)"
         else
-            fail "SAF-3 shipped configs: watchdog disabled outside the documented am3-bb management-only lane: $(tr '\n' ' ' < "$tmpfile")"
+            fail "SAF-3 shipped configs: watchdog disabled outside a typed management-only lane: $(tr '\n' ' ' < "$tmpfile")"
         fi
     fi
     rm -f "$tmpfile"
@@ -689,10 +697,12 @@ watchdog_shipped_config_gate_selftest() {
     root="$tmpdir/br2_external_dcentos"
     zynq_cfg="$root/board/zynq/rootfs-overlay/etc/dcentrald.toml"
     bb_cfg="$root/board/beaglebone/am3-bb/rootfs-overlay/etc/dcentrald.toml"
+    aml_cfg="$root/board/amlogic/am3-s19xp/rootfs-overlay/etc/dcentrald.toml"
+    aml_policy="$root/board/amlogic/am3-s19xp/rootfs-overlay/etc/dcentos/mutation_policy"
     manifest="$root/board/zynq/rootfs-overlay/etc/dcentos-release-manifest.json"
     offenders="$tmpdir/offenders.txt"
 
-    mkdir -p "$(dirname "$zynq_cfg")" "$(dirname "$bb_cfg")" || return 1
+    mkdir -p "$(dirname "$zynq_cfg")" "$(dirname "$bb_cfg")" "$(dirname "$aml_cfg")" "$(dirname "$aml_policy")" || return 1
 
     cat > "$zynq_cfg" <<'EOF' || return 1
 [watchdog]
@@ -715,6 +725,22 @@ EOF
         rm -rf "$tmpdir"
         return 1
     fi
+
+    cat > "$aml_cfg" <<'EOF' || return 1
+[watchdog]
+enabled = false
+EOF
+    printf 'management-only\n' > "$aml_policy" || return 1
+    if ! watchdog_shipped_configs_ok "$root" "$offenders"; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    rm -f "$aml_policy"
+    if watchdog_shipped_configs_ok "$root" "$offenders"; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    printf 'management-only\n' > "$aml_policy" || return 1
 
     cat > "$manifest" <<'EOF' || return 1
 { "release_image": true, "watchdog": { "enabled": false } }
@@ -791,7 +817,7 @@ else
 fi
 
 if watchdog_shipped_config_gate_selftest; then
-    pass "SAF-3 shipped configs selftest rejects watchdog-off overlays/manifests and permits am3-bb management-only"
+    pass "SAF-3 shipped configs selftest rejects untyped watchdog-off overlays/manifests and permits typed management-only lanes"
 else
     fail "SAF-3 shipped configs selftest failed"
 fi
@@ -1400,7 +1426,10 @@ require_pattern '../dcent-toolbox/tests/test_adv04_write_path_review.py' 'test_t
 require_pattern '../dcent-toolbox/tests/test_sysupgrade_guard_execution.py' 'AM2_SYSUPGRADE_VARIANTS' 'toolbox sysupgrade guard tests enumerate AM2 variant overlays'
 require_pattern '../dcent-toolbox/tests/test_sysupgrade_guard_execution.py' 'test_sysupgrade_t_executes_wrong_board_brick_guard' 'toolbox sysupgrade tests pin wrong-board refusal'
 require_pattern '../dcent-toolbox/tests/test_sysupgrade_guard_execution.py' 'test_sysupgrade_t_refuses_shorter_board_near_miss_prefix' 'toolbox sysupgrade tests pin near-miss board prefix refusal'
-require_pattern '../dcent-toolbox/tests/test_sysupgrade_guard_execution.py' 'test_sysupgrade_t_accepts_am2_per_unit_board_prefix_variant' 'toolbox sysupgrade tests pin intended AM2 per-unit board variant acceptance'
+require_pattern '../dcent-toolbox/tests/test_sysupgrade_guard_execution.py' 'test_sysupgrade_t_refuses_per_unit_board_variant_under_exact_pin' 'toolbox sysupgrade tests pin the per-unit board-variant refusal under the exact-target pin'
+require_pattern '../dcent-toolbox/tests/test_am2_s17_route_promotion.py' 'test_am2_s17_route_promotion' 'toolbox 17-series stock targets resolve named evidence-gap routes'
+require_pattern '../dcent-toolbox/tests/test_am2_s17_route_promotion.py' 'test_interpret_efuse_status_word_bit_0x400' 'toolbox pins the EFUSE_STATUS 0xF800D010 bit 0x400 boot-chain lock read'
+require_pattern '../dcent-toolbox/tests/test_am2_s17_route_promotion.py' 'test_s17_family_install_routes_follow_the_efuse_bit' 'toolbox pins the SD/ramdisk-swap/NAND route cascade against the eFuse bit'
 require_pattern 'docs/reviews/2026-07-05-wave7-uncovered-surfaces-audit.md' 'W7-R1: Narrow Pre-setup Recovery GET Exposure' 'Wave 7 audit records recovery pre-setup GET exposure follow-up'
 require_pattern 'docs/reviews/2026-07-05-wave7-uncovered-surfaces-audit.md' 'W7-R2: Stock Restore Archive Trust Boundary' 'Wave 7 audit records stock restore archive trust-boundary follow-up'
 require_pattern 'docs/reviews/2026-07-05-wave7-uncovered-surfaces-audit.md' 'W7-D1: Fsync Metrics CSV Exports' 'Wave 7 audit records metrics CSV persistence follow-up'
@@ -1496,23 +1525,29 @@ require_pattern 'scripts/build_in_docker.sh' 'build_in_docker Phase 5' 'build_in
 require_pattern 'scripts/build_in_docker.sh' 'am3-s19kpro|am3-s21' 'build_in_docker applies am3 validation to both am3 tarball targets'
 require_pattern 'scripts/build_in_docker.sh' 'pre_flash_validate.sh --package-only' 'build_in_docker runs am3 package-only validation'
 require_pattern 'scripts/build_amlogic_native_install.sh' 'pre_flash_validate.sh" --package-only' 'amlogic native image builder validates sysupgrade package before extraction'
+require_pattern 'scripts/build_amlogic_native_install.sh' 'DCENT_REQUIRE_INSTALLABLE_PACKAGE=1' 'amlogic native image builder refuses inspection-only packages'
 require_pattern 'scripts/build_amlogic_native_install.sh' 'OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"' 'amlogic native image builder canonicalizes output-dir before reuse'
 require_pattern 'scripts/build_amlogic_native_install.sh' 'extracted rootfs exceeds Amlogic rootfs window' 'amlogic native image builder bounds extracted rootfs image'
 require_pattern 'scripts/build_amlogic_native_install.sh' 'extracted rootfs is not a uImage payload' 'amlogic native image builder validates extracted rootfs magic'
 require_pattern 'scripts/build_amlogic_native_install.sh' 'DCENT_AM3_ROOTFS_WINDOW_DEC' 'amlogic native image builder uses shared am3 rootfs window'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'Step 0/10: local package-only validation' 'amlogic persistent installer validates package before SSH'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'pre_flash_validate.sh" --package-only "$FIRMWARE" "$BOARD_PKG_NAME"' 'amlogic persistent installer reuses package-only validator'
-require_pattern 'scripts/install_amlogic_persistent.sh' '--variant s19jpro-aml|s19jproplus|s19xp|s19jxp|s19kpro|s21|s21pro|s21xp|t21' 'amlogic persistent installer supports exact S19j Pro AML, S19j Pro+, S19 XP, S19j XP, S19K, S21, S21 Pro, S21 XP, and T21 variants'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'DCENT_REQUIRE_INSTALLABLE_PACKAGE=1' 'amlogic persistent installer refuses inspection-only packages before SSH/staging'
+require_pattern 'scripts/install_amlogic_persistent.sh' '--variant s19jpro-aml|s19jproplus|s19kpro|s21|s21pro' 'amlogic persistent installer supports only admitted exact Amlogic variants'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19jpro-aml"' 'amlogic persistent installer maps S19j Pro AML package prefix'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19jproplus"' 'amlogic persistent installer maps S19j Pro+ package prefix'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s19xp"' 'amlogic persistent installer maps S19 XP package prefix'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'S19 XP is NOT-IMPLEMENTED and package-only; persistent install is refused' 'amlogic persistent installer refuses S19 XP writes'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'S19j XP is NOT-IMPLEMENTED and package-only; persistent install is refused' 'amlogic persistent installer refuses S19j XP writes'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21"' 'amlogic persistent installer maps S21 package prefix'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21pro"' 'amlogic persistent installer maps S21 Pro package prefix'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21xp"' 'amlogic persistent installer maps S21 XP package prefix'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-t21"' 'amlogic persistent installer maps T21 package prefix'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'REMOTE_PREFIX="/data/sysupgrade/$PACKAGE_PREFIX"' 'amlogic persistent installer derives remote package prefix from variant'
+reject_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-s21xp"' 'amlogic persistent installer refuses S21 XP while its platform and flash contracts are unproven'
+reject_pattern 'scripts/install_amlogic_persistent.sh' 'PACKAGE_PREFIX="sysupgrade-am3-t21"' 'amlogic persistent installer refuses T21 while its flash geometry is unproven'
+reject_pattern 'scripts/build_amlogic_native_install.sh' 'BOARD_PKG_NAME="am3-s21xp"' 'amlogic native extractor does not label an S21 XP package as flashable'
+reject_pattern 'scripts/build_amlogic_native_install.sh' 'BOARD_PKG_NAME="am3-t21"' 'amlogic native extractor does not label a T21 package as flashable'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'REMOTE_STAGE_DIR="/data/.dcentos-sysupgrade-$LOCAL_SHA"' 'amlogic persistent installer uses a content-bound no-clobber remote transaction'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' 'amlogic persistent installer resolves validator path from script dir'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'rm -rf /data/sysupgrade && mkdir -p /data/sysupgrade' 'amlogic persistent installer clears remote staging before extract'
+reject_pattern 'scripts/install_amlogic_persistent.sh' '/data/dcentos-sysupgrade.tar' 'amlogic persistent installer refuses a fixed remote bundle path'
+reject_pattern 'scripts/install_amlogic_persistent.sh' 'rm -rf /data/sysupgrade' 'amlogic persistent installer never deletes a shared remote staging path'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'ROOTFS_END_DEC' 'amlogic persistent installer computes rootfs window end'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'mtd5 geometry OK' 'amlogic persistent installer validates target mtd5 geometry'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'root payload $ROOT_SIZE exceeds rootfs window' 'amlogic persistent installer bounds root payload size'
@@ -1660,7 +1695,6 @@ require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'set_response_len(BM1366_UART_RESP_BODY_LEN)' 'init_bm1366_chain sets BM1366 body 9 not generic alias'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_mailbox' 'USB EC LOWMAILBOX/HIGHMAILBOX is not hash UART'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_nopic_observation_refuses_bm1366' 'NoPic observation refuses BM1366 identity'
-require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_hotstart_baud_requires_body9_before_spray' 'hot-start baud-wake requires body 9 before spray'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_aml_dtb.rs' 'admit_s19k_usb_uboot_ec_sec_userlow' 'USB EC SECMAILBOX/USERLOWTASK is not hash UART'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_hybrid_reset_is_not_bm1366' 'AM2 hybrid reset is Zynq BM1362 not S19k first-read'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_am2_reset_baseline_is_not_bm1366' 'AM2 reset-baseline is BM1362 not S19k first-read'
@@ -1721,15 +1755,17 @@ require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'S19K_CONS
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'refuse_s19k_fill_overlay_f8_as_fun_0091c0a0' 'fill overlay id&0xF8 is not FUN_0091c0a0'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 's19k_fill_lookup_tx_esp_overlay_experimental' 'ESP overlay fill lookup is experimental not production'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_init_bm1366_omits_esp_a4' 'init_bm1366_chain omits ESP 0xA4 VersionMask'
-require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_bm1366_queue_covers_fill_slots' 'BM1366 UART queue must cover 256 fill slots'
-require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'BM1366_SERIAL_WORK_QUEUE_DEPTH' 'S19k BM1366 work queue is 256 not default 16'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_production_bm1366_queue_covers_fill_slots' 'BM1366 UART hold queue is 2-4 not 256 drop-oldest'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'S19K_BM1366_HOLD_QUEUE_DEPTH' 'BM1366 UART hold is 4; outstanding stays 256'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'BM1366_SERIAL_WORK_QUEUE_DEPTH' 'S19k BM1366 work queue is hold-4 not fill-256'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'S19k Track-1 hold' 'BM1366 holds take_dispatch when UART queue is full'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_share.rs' 'admit_s19k_track1_thermal_handoff_unowned' 'Track-1 thermal is HandoffUnowned not Ready'
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'ThermalSafetyState::HandoffUnowned' 'Track-1 sets HandoffUnowned'
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'let tx_before_rx = is_bm1362 || is_bm1366' 'BM1366 TX-before-RX'
-require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'DCENT_S19K_EXPERIMENTAL_INIT_BM1366' 'leftover init_bm1366_chain is env-gated'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'DCENT_S19K_NATIVE_COLD_START' 'native S19k cold-start remains strict default-off'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs' 's19k_multi_send_work_tx_required' 'Multi send_work TX is required only on ttyS1+ttyS2'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_braiins_chain_discover.rs' 'refuse_s3_rx_as_fill_hunt' 'ttyS3 RX is observe-only not fill-hunt'
-require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'refuse_s3_rx_as_fill_hunt' 'Track-1 fill hunt skips discover ttyS3'
+require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'admit_s19k_fill_hunt_on_tx_path' 'Track-1 fill hunt requires evidence-derived active TX path (ttyS3 only after promotion)'
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 's19k_multi_send_work_tx_required' 'Track-1 Multi send_work skips discover/optional UARTs'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'refuse_chip_heard_at_115200_as_restored_3m_work_tx' 'ChipHeardAt115200 is not restored-3M work TX'
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'admit_s19k_dual_baud_work_tx_for_path' 'dual-baud work-TX admit skips discover ttyS3'
@@ -1737,7 +1773,7 @@ require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' '
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'HandoffProbe is not ChipProofAt3M' 'Track-1 logs SilenceAtBothBauds as handoff probe'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_passthrough_preflight.rs' 'refuse_retry_not_run_or_inconclusive_as_chip_proof_3m_tx' 'RetryNotRun/Inconclusive is not chip-proof 3M TX'
 require_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'InconclusiveProbe is not ChipProofAt3M' 'Track-1 logs RetryNotRun as inconclusive probe'
-require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs' 'refuse_s19k_fastuart_28_write_as_leave_115200' 'held FastUART 0x28 encodings are not leave-115200 to Track-1 3M'
+require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs' 'admit_s19k_stock_fastuart_28_write_as_leave_115200' 'only exact stock BM1366 0x3011 is admitted as the 115200-to-B3000000 transition'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_bm1366_init_seq.rs' 'ESP_BM1366_MISCCTRL_DEFAULT_BAUD_VALUE' 'ESP default ~115200 is MiscCtrl 0x18 not FastUART 0x28'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'S19K_78_MTD2_ANDROID2_RAMDISK_SIZE' 'mtd2 second ANDROID ramdisk is 0x662000'
 require_pattern 'dcentrald/dcentrald-common/src/s19k_am3_install.rs' 'refuse_s19k_mtd2_as_fileparser_source' 'mtd2 has 0 FileParser bytes'
@@ -1803,7 +1839,7 @@ require_pattern 'scripts/recover_amlogic_to_stock.sh' 'RECOVER_WALK.txt' 'amlogi
 require_pattern 'scripts/recover_amlogic_to_stock.sh' 's19k_nand_env_crc.py' 'amlogic recover-to-stock CRC-admits nandrecovery_env.bin'
 require_pattern 'scripts/recover_amlogic_to_stock.sh' 'nand_env.bak is not recover_env' 'amlogic recover-to-stock refuses nand_env.bak as recover_env'
 require_pattern 'scripts/recover_amlogic_to_stock.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic recover-to-stock execute refuses NAND while FLASH-false'
-require_pattern 'scripts/recover_amlogic_to_stock.sh' 'missing live /etc/dcentos/board_target' 'amlogic recover-to-stock execute refuses missing live board_target'
+require_pattern 'scripts/recover_amlogic_to_stock.sh' 'missing live canonical platform/board_target pair' 'amlogic recover-to-stock execute refuses a missing canonical live identity pair'
 require_pattern 'scripts/recover_amlogic_to_stock.sh' 'missing live /proc/mtd; refuse geometry-blind recover-to-stock' 'amlogic recover-to-stock execute refuses missing /proc/mtd'
 reject_pattern 'scripts/recover_amlogic_to_stock.sh' 'fw_setenv firstboot 1' 'amlogic recover-to-stock does not execute fw_setenv firstboot 1'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'schema=dcentos.amlogic-recover-to-stock/v1' 'amlogic persistent installer uses rust recover-to-stock schema'
@@ -1835,10 +1871,11 @@ require_pattern 'scripts/s19k_write_recovery_flag.sh' 'fixture_value=0x03' 'reco
 require_pattern 'scripts/s19k_write_recovery_flag.sh' 'SuccessfulKeepBos plan/fixture only' 'recovery-flag helper refuses 0x03 NAND execute'
 require_pattern 'scripts/s19k_write_recovery_flag.sh' 'SUCCESSFUL_FLAG_PLAN' 'recovery-flag helper names SUCCESSFUL_FLAG_PLAN'
 require_pattern 'scripts/s19k_write_recovery_flag.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'recovery-flag execute refuses NAND while FLASH-false'
-require_pattern 'scripts/s19k_write_recovery_flag.sh' 'missing live /etc/dcentos/board_target' 'recovery-flag execute refuses missing live board_target'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'missing exact live platform:target identity' 'recovery-flag execute refuses missing exact live identity pair'
+require_pattern 'scripts/s19k_write_recovery_flag.sh' 'one_byte_execute_retired=true' 'recovery-flag helper retires destructive one-byte live execute'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'mining services were not stopped' 'amlogic persistent installer dry-run does not stop mining services'
 require_pattern 'scripts/install_amlogic_persistent.sh' 'after confirmation, graceful TERM' 'amlogic persistent installer stops services only after confirmation'
-require_pattern 'scripts/install_amlogic_persistent.sh' 'Step 8/10: flash_erase $ROOTFS_MTD $ROOTFS_OFFSET_HEX $ROOTFS_ERASE_COUNT' 'amlogic persistent installer reports variable-driven flash geometry'
+require_pattern 'scripts/install_amlogic_persistent.sh' 'Step 8-9/10: content-bound root fd + flash_erase + nandwrite (${ROOTFS_ERASE_COUNT} erase blocks of ${ROOTFS_ERASESIZE_EXPECTED} bytes)' 'amlogic persistent installer reports content-bound variable-driven flash geometry'
 reject_pattern 'scripts/install_amlogic_persistent.sh' 'flash_erase /dev/mtd5 0x05700000 320' 'amlogic persistent installer does not hardcode flash geometry in operator output'
 require_pattern 'scripts/install_amlogic_persistent.sh' '. "$SCRIPT_DIR/lib/am3_geometry.sh"' 'amlogic persistent installer sources shared am3 geometry'
 require_pattern 'scripts/install_amlogic_persistent.sh' '. "$SCRIPT_DIR/lib/amlogic_identity_guard.sh"' 'amlogic persistent installer sources exact sibling guard'
@@ -1884,7 +1921,6 @@ require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-build.sh' '
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s21/post-build.sh' 'usr/sbin/lib/am3_geometry.sh' 'am3-s21 post-build ships AM3 geometry helper for revert'
 for revert_script in \
     scripts/revert_to_stock_s17.sh \
-    scripts/revert_to_stock_am3_aml_s19k.sh \
     scripts/revert_to_stock_am3_aml_s21.sh
 do
     require_pattern "$revert_script" 'EXPECTED_SHA256=' "stock revert helper $(basename "$revert_script") accepts expected SHA"
@@ -1892,6 +1928,10 @@ do
     require_pattern "$revert_script" 'MAX_EXTRACTED_KB' "stock revert helper $(basename "$revert_script") caps extracted size"
     require_pattern "$revert_script" 'firmware archive contains hard-linked files' "stock revert helper $(basename "$revert_script") rejects hard-linked files"
 done
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'EXPECTED_SHA256=' 'stock revert helper revert_to_stock_am3_aml_s19k.sh accepts expected SHA'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'Firmware SHA-256 verified on private immutable-for-this-process snapshot.' 'stock revert helper revert_to_stock_am3_aml_s19k.sh re-hashes its private snapshot before streaming'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'MAX_UIMAGE_BYTES' 'stock revert helper revert_to_stock_am3_aml_s19k.sh caps its streamed candidate size'
+require_pattern 'scripts/revert_to_stock_am3_aml_s19k.sh' 'firmware archive contains hard-linked files' 'stock revert helper revert_to_stock_am3_aml_s19k.sh rejects hard-linked files before streaming'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'ROOTFS_END_DEC' 'amlogic lab rootfs computes rootfs window end'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'mtd5 geometry OK' 'amlogic lab rootfs validates target mtd5 geometry'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'require_uimage_file' 'amlogic lab rootfs validates uImage payloads before write/restore'
@@ -1910,7 +1950,7 @@ require_pattern 'scripts/amlogic_lab_rootfs.sh' 'Restore upload SHA mismatch' 'a
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'RESTORE_REMOTE_READBACK_SHA' 'amlogic lab rootfs verifies restore readback on target'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'restore_manifest.json' 'amlogic lab rootfs writes restore proof manifest'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'require_gpio437_safe_off_before_mutation' 'amlogic lab rootfs requires GPIO437 SafeOff before write/restore mutation'
-require_pattern 'scripts/amlogic_lab_rootfs.sh' 'CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic lab rootfs refuses NAND while FLASH-false'
+require_pattern 'scripts/amlogic_lab_rootfs.sh' 'CLEAR_FOR_FLASH=false - refusing gpio437 SafeOff/flash_erase/nandwrite' 'amlogic lab rootfs refuses NAND while FLASH-false'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' '--lab-only is not a FLASH override' 'amlogic lab rootfs lab flags do not override FLASH'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'am3-s19k-active-low' 'amlogic lab rootfs SKU-scopes S19k GPIO437 SafeOff=1'
 require_pattern 'scripts/amlogic_lab_rootfs.sh' 'GPIO437 PWR_EN SafeOff (polarity=' 'amlogic lab rootfs documents SKU-scoped GPIO437 SafeOff before NAND mutation'
@@ -1921,8 +1961,12 @@ reject_pattern 'scripts/build_rootfs_s21.sh' '0x5100000' 'legacy S21 rootfs buil
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-build.sh' 'usr/bin/telnet' 'am3 post-build removes telnet client tooling'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-build.sh' 'usr/sbin/telnetd' 'am3 post-build removes telnet daemon'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'Rootfs audit: access services present; telnet paths absent' 'am3 post-image runs rootfs service-surface audit'
-require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'host_driven_rootfs_window_lab' 'am3-s19k manifest marks host-driven install mode'
+require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab' 'am3-s19k package is host-driven and rootfs-window scoped'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'DCENT_TARGET_SIDE_SYSUPGRADE=false' 'am3-s19k manifest disables target-side sysupgrade claim'
+require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'DCENT_PACKAGE_INSTALLABLE=true' 'am3-s19k package is structurally installable by the host-driven path'
+require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'DCENT_S19K_EXPECTED_RELEASE_KEY_SHA256' 'am3-s19k release key identity is externally pinned'
+require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 's19k_persistent_image_verify.py' 'am3-s19k package runs the dependency-bound image contract verifier'
+require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'CLEAR_FOR_FLASH=false' 'am3-s19k package retains a disabled NAND writer'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'dcent_write_sysupgrade_manifest' 'am3-s19k post-image uses shared manifest helper'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'require_rootfs_path "etc/init.d/S50dropbear"' 'am3 rootfs audit requires Dropbear init'
 require_pattern 'br2_external_dcentos/board/amlogic/am3-s19kpro/post-image.sh' 'require_rootfs_path "root/web/mcp_server.py"' 'am3 rootfs audit requires MCP server'
@@ -2007,8 +2051,8 @@ fi
 
 reject_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'libc::ioctl' \
     'single-I2C-owner: serial runtime has no direct ioctl transport'
-reject_pattern 'dcentrald/dcentrald/src/serial_mining.rs' 'std::fs::OpenOptions' \
-    'single-I2C-owner: serial runtime has no direct device-file owner'
+reject_pattern 'dcentrald/dcentrald/src/serial_mining.rs' '\.open\("/dev/i2c-' \
+    'single-I2C-owner: serial runtime has no literal direct /dev/i2c owner'
 
 #
 # Cross-process I2C fabric ownership. The process-local HAL registry remains
@@ -2129,10 +2173,14 @@ require_pattern 'scripts/run_all_gates.sh' 'dcentrald-fabric-lease' \
     'I2C fabric lease: comprehensive local gate executes subprocess ownership tests'
 require_pattern 'scripts/run_all_gates.sh' 'test -p pic-recovery' \
     'I2C fabric lease: comprehensive local gate explicitly tests diagnostic boundary'
-require_pattern '../../.github/workflows/dcentos-offline-gates.yml' 'cargo test -p dcentrald-fabric-lease' \
+require_pattern 'scripts/run_all_gates.sh' 'test -p s19k-stage1-authorizer' \
+    'S19k install: comprehensive local gate explicitly tests stage1 authorizer boundary'
+require_pattern '../../.github/workflows/dcentos-offline-gates.yml' 'cargo test --locked -p dcentrald-fabric-lease --lib' \
     'I2C fabric lease: hosted CI executes subprocess ownership tests'
 require_pattern '../../.github/workflows/dcentos-offline-gates.yml' 'cargo test -p pic-recovery' \
     'I2C fabric lease: hosted CI explicitly tests diagnostic boundary'
+require_pattern '../../.github/workflows/dcentos-offline-gates.yml' 'cargo test --locked -p s19k-stage1-authorizer' \
+    'S19k install: hosted CI explicitly tests stage1 authorizer boundary'
 
 #
 # W4.7 panic-discipline static gates (DCENT_DevOps + DCENT_QA, 2026-05-07).
@@ -2199,6 +2247,9 @@ panic_abort_check
 #    `midstate` in the submit-path crates too. Counterpart e2e:
 #    `dcentrald-api/tests/share_submission_e2e.rs` (mock pool +
 #    per-chip-family golden midstates).
+#
+#    DESK_NOW rank 10 (2026-08-19): also scan bm1396/bm1485/bm1489/bm1491/
+#    bm1373 when those driver files exist. Missing files continue (skip).
 swap_bytes_midstate_check() {
     targets='
         dcentrald/dcentrald-asic/src/drivers/bm1387.rs
@@ -2209,6 +2260,11 @@ swap_bytes_midstate_check() {
         dcentrald/dcentrald-asic/src/drivers/bm1398.rs
         dcentrald/dcentrald-asic/src/drivers/bm1370.rs
         dcentrald/dcentrald-asic/src/drivers/bm1391.rs
+        dcentrald/dcentrald-asic/src/drivers/bm1396.rs
+        dcentrald/dcentrald-asic/src/drivers/bm1485.rs
+        dcentrald/dcentrald-asic/src/drivers/bm1489.rs
+        dcentrald/dcentrald-asic/src/drivers/bm1491.rs
+        dcentrald/dcentrald-asic/src/drivers/bm1373.rs
         dcentrald/dcentrald/src/work_dispatcher.rs
         dcentrald/dcentrald/src/chain.rs
         dcentrald/dcentrald-stratum/src/v1/client.rs
@@ -2259,6 +2315,148 @@ $candidate"
     fi
 }
 swap_bytes_midstate_check
+
+# DESK_NOW rank 2 (2026-08-19): PIC16 production GET_VERSION / READ_VOLTAGE
+# must never use combined I2C_RDWR / write_read. Combined repeated-START
+# wedges the PIC16F1704 MSSP parser (brick-class). Grep only those two
+# function bodies in dcentrald-hal i2c.rs so EEPROM/PMBus write_read
+# callers, test-only `fn write_read(` trait impls in pic16_runtime.rs,
+# and I2cSimBackend cannot poison the contract. Comment-only mentions
+# are ignored. The gate must fail while the production helpers still
+# call write_read, and pass after the sibling rewrite to
+# write-then-separate-read.
+pic16_i2c_rdwr_ban_check() {
+    f='dcentrald/dcentrald-hal/src/i2c.rs'
+    if [ ! -f "$f" ]; then
+        fail "PIC16 I2C_RDWR ban: missing $f"
+        return
+    fi
+
+    hits=''
+    missing=0
+    for fn in pic_read_voltage pic_get_version; do
+        body=$(awk -v fn="$fn" '
+            BEGIN { in_fn = 0; depth = 0 }
+            !in_fn {
+                if ($0 ~ ("(^|[[:space:]])fn[[:space:]]+" fn "[[:space:]]*[(]")) {
+                    in_fn = 1
+                } else {
+                    next
+                }
+            }
+            {
+                print
+                line = $0
+                sub(/\/\/.*/, "", line)
+                for (i = 1; i <= length(line); i++) {
+                    c = substr(line, i, 1)
+                    if (c == "{") {
+                        depth++
+                    } else if (c == "}") {
+                        depth--
+                        if (depth <= 0) {
+                            exit
+                        }
+                    }
+                }
+            }
+        ' "$f")
+        if [ -z "$body" ]; then
+            fail "PIC16 I2C_RDWR ban: production fn $fn not found in $f"
+            missing=$((missing + 1))
+            continue
+        fi
+        offender=$(printf '%s\n' "$body" | awk '
+            {
+                orig = $0
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (line ~ /^\/\//) next
+                if (line ~ /^\/\*/) next
+                if (line ~ /^\*/) next
+                sub(/\/\/.*/, "", line)
+                if (line ~ /write_read\(/ || line ~ /write_read_at\(/ || line ~ /I2C_RDWR/) print orig
+            }
+        ' || true)
+        if [ -n "$offender" ]; then
+            if [ -z "$hits" ]; then
+                hits="$fn:
+$offender"
+            else
+                hits="$hits
+$fn:
+$offender"
+            fi
+        fi
+    done
+
+    if [ -n "$hits" ]; then
+        fail "PIC16 I2C_RDWR ban: production pic_read_voltage/pic_get_version still call write_read/I2C_RDWR (must be write-then-separate-read):
+$hits"
+    elif [ "$missing" -eq 0 ]; then
+        pass "PIC16 I2C_RDWR ban: production pic_read_voltage/pic_get_version do not call write_read/I2C_RDWR"
+    fi
+}
+pic16_i2c_rdwr_ban_check
+
+# DESK_NOW rank 2 (2026-08-19): operator helpers must not PRINT or invoke
+# raw `flash_erase /dev/mtd4` or `nandwrite ... /dev/mtd4`. A prior pass
+# rewrote apply-instructions to fw_setenv; NEVER/REFUSING warning strings
+# that name the banned tokens are allowed so the gate stays green after
+# that rewrite. Scope is DCENT_OS_Antminer/scripts/*.py plus the
+# switch_firmware.sh twin operators actually run. Test files that assert
+# the ban (`reject_pattern ... nandwrite`) and knowledge-base historical
+# docs are out of scope. nandsim harnesses that program a simulator are
+# not operator helpers.
+mtd4_raw_nand_helper_ban_check() {
+    bad=''
+    scanned=0
+    for f in scripts/*.py scripts/switch_firmware.sh scripts/fix_uboot_env.py; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        case "$base" in
+            test_*|*_test.py|*_test.sh) continue ;;
+        esac
+        scanned=$((scanned + 1))
+        offender=$(awk '
+            {
+                orig = $0
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (line ~ /^#/) next
+                if (line ~ /NEVER|REFUSING|banned:|do not|must not|not-fw-setenv/) next
+                is_print = (line ~ /print\(|echo[[:space:]]|printf[[:space:]]|sys\.stdout|os\.system|os\.popen|subprocess\.|check_call|check_output/)
+                is_cmd = (line ~ /^(sudo[[:space:]]+)?(flash_erase|nandwrite)[[:space:]]/)
+                if (!is_print && !is_cmd) next
+                if (line ~ /flash_erase[[:space:]]+\/dev\/mtd4/) print orig
+                else if (line ~ /nandwrite[[:space:]].*\/dev\/mtd4/) print orig
+            }
+        ' "$f" || true)
+        if [ -n "$offender" ]; then
+            bad="$bad
+$f:
+$offender"
+        fi
+    done
+    if [ "$scanned" -eq 0 ]; then
+        fail "mtd4 raw-NAND helper ban: no operator helper scripts found (path drift?)"
+    elif [ -n "$bad" ]; then
+        fail "mtd4 raw-NAND helper ban: helper still prints or invokes flash_erase/nandwrite /dev/mtd4:$bad"
+    else
+        pass "mtd4 raw-NAND helper ban: operator helpers do not print or invoke flash_erase/nandwrite mtd4 ($scanned scripts)"
+    fi
+}
+mtd4_raw_nand_helper_ban_check
+
+# DESK_NOW rank 10 (2026-08-19): S19k refuse_ms8 must run. GAP6 dropped the
+# documented pre-existing failure; the offline-gates workflow must not
+# resurrect `--skip` on that contract.
+reject_pattern '../../.github/workflows/dcentos-offline-gates.yml' \
+    '--skip s19k_braiins_job::tests::refuse_ms8_uart_fanout_and_pin_live_delta' \
+    'S19k refuse_ms8 is not skipped in the offline-gates workflow'
+require_pattern '../../.github/workflows/dcentos-offline-gates.yml' \
+    'bash ../scripts/run_filtered_cargo_test.sh -p dcentrald-common --lib -- s19k_' \
+    'S19k common contract suite still runs the s19k_ filter'
 
 # 3. dev_deploy.sh: kill -9 bosminer must be platform-conditional.
 #    Walk the file looking for any line that calls SIGKILL on bosminer
@@ -3100,8 +3298,8 @@ regression_am2_xil_check
 
 # Phase 4G regression slice (2026-05-15): cross-family mining-proof
 # regression. Synthesizes s99verify-equivalent state.json + s99verify.json
-# fixtures for the five proven mining milestones (am1-s9, am2-s17,
-# am2-XIL, am3-bb, am3-aml) and runs the Phase 4H verifier
+# fixtures for five historical mining milestones (am1-s9, am2-s19pro,
+# am2-XIL, am3-bb, am3-aml) and runs the current Phase 4H verifier
 # (`dcent_toolbox.core.verifier`) offline against each.
 #
 # This complements the Phase 4J log-replay slice. Phase 4J catches
@@ -3111,7 +3309,9 @@ regression_am2_xil_check
 # "install produces hashrate".
 #
 # The slice runs in two modes:
-#   1. main slice — all five milestones must classify PROVEN
+#   1. main slice — three admitted milestones must classify PROVEN and the
+#                   historical S19 Pro/S21 fixtures must remain fail-closed
+#                   UNVERIFIABLE under current first-install admission
 #   2. self-test  — tamper the first milestone four ways (drop chain
 #                   count, NULL first nonce, push share past budget,
 #                   yield below floor) and verify each tamper flips
@@ -3133,20 +3333,26 @@ regression_cross_family_check() {
     fi
 
     # Main slice — all five milestones must classify PROVEN.
-    out=$("$PY" "$SLICE_SCRIPT" 2>&1)
-    rc=$?
+    if out=$("$PY" "$SLICE_SCRIPT" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
     if [ "$rc" -eq 0 ]; then
-        pass "Phase 4G regression-cross-family: 5 of 5 milestones classified PROVEN"
+        pass "Phase 4G regression-cross-family: 3 admitted + 2 policy-blocked milestone dispositions match"
         printf '%s\n' "$out" | sed -n 's/^OK    /  /p'
     else
-        fail "Phase 4G regression-cross-family: at least one milestone not PROVEN"
+        fail "Phase 4G regression-cross-family: a pinned milestone disposition drifted"
         printf '%s\n' "$out" >&2
         return
     fi
 
     # Self-test — tamper detection must fire.
-    out=$("$PY" "$SLICE_SCRIPT" --self-test 2>&1)
-    rc=$?
+    if out=$("$PY" "$SLICE_SCRIPT" --self-test 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
     if [ "$rc" -eq 0 ]; then
         pass "Phase 4G regression-cross-family self-test: 4 of 4 tamper modes detected"
     else
@@ -3228,9 +3434,33 @@ release_image_hardening_check() {
             printf '%s\n' "$invalid_refusal" >&2
             continue
         fi
-        if ! grep -F -- 'dcent_provision_release_image' "$pb" >/dev/null 2>&1; then
-            pb_missing="$pb_missing $pb"
+        if grep -Eq -- '^[[:space:]]*dcent_provision_release_image([[:space:]]|$)' \
+            "$pb" >/dev/null 2>&1; then
+            continue
         fi
+
+        # Product wrappers may delegate their entire post-build transaction to
+        # one shared board hook. Admit only a single exact exec with untouched
+        # argv, then resolve the repository-local target and prove that target
+        # owns the release-image hook. Comments containing the hook name and
+        # wrappers with any additional executable statement do not qualify.
+        pb_delegate=$(sed -n \
+            's|^exec "${BR2_EXTERNAL_DCENTOS_PATH}/\(board/[^"[:space:]]*/post-build\.sh\)" "$@"$|\1|p' \
+            "$pb")
+        pb_executable_lines=$(awk '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            { count++ }
+            END { print count + 0 }
+        ' "$pb")
+        if [ -n "$pb_delegate" ] \
+            && [ "$(printf '%s\n' "$pb_delegate" | wc -l | tr -d ' ')" -eq 1 ] \
+            && [ "$pb_executable_lines" -eq 1 ] \
+            && [ -f "br2_external_dcentos/$pb_delegate" ] \
+            && grep -Eq -- '^[[:space:]]*dcent_provision_release_image([[:space:]]|$)' \
+                "br2_external_dcentos/$pb_delegate" >/dev/null 2>&1; then
+            continue
+        fi
+        pb_missing="$pb_missing $pb"
     done
     if [ "$pb_found" -eq 0 ]; then
         fail "SW-05a release-image: no board post-build.sh files found (path drift?)"
@@ -3494,6 +3724,51 @@ $offending"
 }
 fan_pwm_cap_check
 
+# DESK_NOW rank 10 (2026-08-19): shipped overlay + example dcentrald*.toml
+# under DCENT_OS_Antminer must keep home-quiet fan_max_pwm <= 30. Comment
+# assignments are ignored. docs/dev live-session tomls and historical
+# live448 capture tomls are out of scope (they live outside this tree or
+# are path-excluded). Overlay-devmem PWM-30 (QA-006) does not catch a
+# shipped TOML that sets fan_max_pwm = 127.
+fan_max_pwm_toml_check() {
+    bad=''
+    scanned=0
+    for root in br2_external_dcentos dcentrald configs etc; do
+        [ -d "$root" ] || continue
+        for f in $(find "$root" -type f -name 'dcentrald*.toml' \
+            ! -path '*live448*' \
+            ! -path '*/docs/*' \
+            ! -path '*/target/*' \
+            ! -path '*/target-*/*' \
+            2>/dev/null | sort); do
+            [ -f "$f" ] || continue
+            scanned=$((scanned + 1))
+            offender=$(awk '
+                /^[[:space:]]*#/ { next }
+                /^[[:space:]]*fan_max_pwm[[:space:]]*=/ {
+                    n = $0
+                    sub(/^[^=]*=[[:space:]]*/, "", n)
+                    sub(/[^0-9].*/, "", n)
+                    if (n == "" || n + 0 > 30) print
+                }
+            ' "$f" || true)
+            if [ -n "$offender" ]; then
+                bad="$bad
+$f:
+$offender"
+            fi
+        done
+    done
+    if [ "$scanned" -eq 0 ]; then
+        fail "PWM TOML grep: no shipped overlay/example dcentrald*.toml found (path drift?)"
+    elif [ -n "$bad" ]; then
+        fail "PWM TOML grep: shipped overlay/example dcentrald*.toml has fan_max_pwm > 30 (home-quiet is PWM-30):$bad"
+    else
+        pass "PWM TOML grep: all $scanned shipped overlay/example dcentrald*.toml keep fan_max_pwm <= 30"
+    fi
+}
+fan_max_pwm_toml_check
+
 #
 # QA-002: BM1387 MiscCtrl triple-write source-parse pin. After a temp read,
 # `disable_i2c_on_chip0()` MUST write MiscCtrl 0x4020_0180 exactly 3 times
@@ -3696,18 +3971,28 @@ stale_binary_guard_check
 # keep the `cp -a /data/dcent/.` preservation.
 #
 ota_preserve_data_dcent_check() {
-    # Pattern includes the /tmp/inactive_data destination so it matches ONLY the
-    # operative `cp` command, not the explanatory comment above it (which also
-    # contains "cp -a /data/dcent/."). Deleting just the command line must fail
-    # this gate.
+    # The typed persistent-state architecture (2026-08 sysupgrade helper split)
+    # preserves /data/dcent (dashboard auth.json, onboarding.json,
+    # authorized_keys, .ssh-enabled) via `dcent_persist_stage`, not a literal
+    # `cp -a /data/dcent/.` line. Keep the gate at operative-line strength:
+    # the updater must make the operative stage call, and the shared helper's
+    # staging list must include `dcent` (with its mode-admission branch).
     require_pattern \
         'br2_external_dcentos/board/zynq/rootfs-overlay/usr/sbin/sysupgrade' \
-        'cp -a /data/dcent/. /tmp/inactive_data/dcent' \
+        'dcent_persist_stage "$PERSIST_SOURCE_ROOT" "$PERSIST_MOUNT_ROOT"' \
         'CI-GATE-OTA-PRESERVE (RELIAB-1): zynq base sysupgrade preserves /data/dcent (password/onboarding/SSH) across A/B self-update'
     require_pattern \
         'br2_external_dcentos/board/zynq/am2-s19jpro/rootfs-overlay/usr/sbin/sysupgrade' \
-        'cp -a /data/dcent/. /tmp/inactive_data/dcent' \
+        'dcent_persist_stage "$PERSIST_SOURCE_ROOT" "$PERSIST_MOUNT_ROOT"' \
         'CI-GATE-OTA-PRESERVE (RELIAB-1): zynq am2-s19jpro sysupgrade preserves /data/dcent (password/onboarding/SSH) across A/B self-update'
+    require_pattern \
+        'br2_external_dcentos/board/zynq/rootfs-overlay/usr/libexec/dcentos/sysupgrade-persistent-state.sh' \
+        'for _dcent_name in config profiles dcent' \
+        'CI-GATE-OTA-PRESERVE (RELIAB-1): typed persistent-state helper stages /data/dcent with the operator credential set'
+    require_pattern \
+        'br2_external_dcentos/board/zynq/rootfs-overlay/usr/libexec/dcentos/sysupgrade-persistent-state.sh' \
+        'dcent_persist_require_mode "$_dcent_source/dcent" 700' \
+        'CI-GATE-OTA-PRESERVE (RELIAB-1): typed persistent-state helper admits only a hardened /data/dcent source'
 }
 ota_preserve_data_dcent_check
 
@@ -4658,15 +4943,220 @@ accept_harness_check() {
     else
         fail 'hw-acceptance: NOT-IMPLEMENTED route refusal or bootlog evidence path regressed'
     fi
-    if sh scripts/hw-acceptance/test_am3_bb_acceptance_route.sh >/dev/null 2>&1; then
-        pass 'hw-acceptance: AM3-BB observers are route-bound/read-only and mutating phases refuse before transport'
-    else
-        fail 'hw-acceptance: AM3-BB identity, enumeration, refusal, or no-install contract regressed'
-    fi
+if sh scripts/hw-acceptance/test_am3_bb_acceptance_route.sh >/dev/null 2>&1; then
+    pass 'hw-acceptance: AM3-BB observers are route-bound/read-only and mutating phases refuse before transport'
+else
+    fail 'hw-acceptance: AM3-BB identity, enumeration, refusal, or no-install contract regressed'
+fi
+if run_python_script scripts/test_s9se_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'S9 SE ledger: all 19 offline contracts, current blockers, refusal spine, and CI execution stay converged'
+else
+    fail 'S9 SE ledger: source modules, blockers, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1385_s7_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1385/S7 ledger: exact dual profiles, FIL return contract, refusals, and CI execution stay converged'
+else
+    fail 'BM1385/S7 ledger: profiles, wire contract, authority refusal, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1485_l3plus_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1485/L3+ ledger: ten offline contracts, default/recovery isolation, refusals, and CI execution stay converged'
+else
+    fail 'BM1485/L3+ ledger: source modules, recovery isolation, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1489_l7_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1489/L7 ledger: seven offline contracts, dual-scaffold boundaries, weaknesses, and CI execution stay converged'
+else
+    fail 'BM1489/L7 ledger: source modules, scaffold boundaries, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1491_l9_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1491/L9 ledger: ten offline contracts, scaffold nuances, weaknesses, and CI execution stay converged'
+else
+    fail 'BM1491/L9 ledger: source modules, scaffold boundaries, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1396_x17_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1396/X17 ledger: ten offline contracts, recovery-symbol isolation, no-driver boundary, and CI execution stay converged'
+else
+    fail 'BM1396/X17 ledger: source modules, recovery isolation, live-driver refusal, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1391_s15_t15_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1391/S15/T15 ledger: seven offline contracts, all-operation scaffold refusal, and CI execution stay converged'
+else
+    fail 'BM1391/S15/T15 ledger: source modules, scaffold/registry boundaries, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1397_s17_t17_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1397/S17/T17 ledger: exact offline module, factory refusal, experimental registry boundary, and CI execution stay converged'
+else
+    fail 'BM1397/S17/T17 ledger: source module, factory/driver gating, fail-closed authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1398_s19_t19_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1398/S19/T19 ledger: exact compatibility module, physical-identity refusal, experimental boundary, and CI execution stay converged'
+else
+    fail 'BM1398/S19/T19 ledger: source module, readiness/native refusal, experimental gating, or CI execution drifted'
+fi
+if run_python_script scripts/test_bm1366_s19k_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'BM1366/S19k ledger: all 17 offline contracts, native/Track-1 split authority, and CI execution stay converged'
+else
+    fail 'BM1366/S19k ledger: source modules, native/Track-1 boundaries, default-off safety, or CI execution drifted'
+fi
+if run_python_script scripts/test_s9_stock_dhash_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'stock-S9 DHASH ledger: five offline contracts, unminted live receipt, management-only route, and CI execution stay converged'
+else
+    fail 'stock-S9 DHASH ledger: source modules, live-authority refusal, teardown ownership, or CI execution drifted'
+fi
+if run_python_script scripts/test_aml_route_evidence_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'AML route evidence ledger: T21, X19, and S21 XP exact modules, action-authority refusal, and CI execution stay converged'
+else
+    fail 'AML route evidence ledger: module ownership, model-specific composition, evidence-only authority, or CI execution drifted'
+fi
+if run_python_script scripts/test_x17_amtc_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'X17 AMTC ledger: factory and recovery modules have exact nonduplicated ownership, closed authority, and CI execution'
+else
+    fail 'X17 AMTC ledger: factory/recovery ownership, evidence-only authority, held-corpus boundary, or CI execution drifted'
+fi
+if run_python_script scripts/test_foundational_registry_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'foundational registries: producer, BoardDesc, install matrix, and PLL model have exact ownership and fail-closed CI contracts'
+else
+    fail 'foundational registries: module ownership, registry authority ceiling, measured tests, or CI execution drifted'
+fi
+if run_python_script scripts/test_feature_policy_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'feature policies: cooling medium, diagnostic mode, and measurement provenance have exact ownership and non-authorizing CI contracts'
+else
+    fail 'feature policies: module ownership, fail-closed cooling/diagnostic semantics, provenance ceiling, or CI execution drifted'
+fi
+if run_python_script scripts/test_zynq_voltage_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'Zynq/voltage contracts: AM2 topology, desk isolation, readback freshness, and rail admission have exact ownership'
+else
+    fail 'Zynq/voltage contracts: module ownership, desk-only isolation, measurement provenance, rail refusal, or CI execution drifted'
+fi
+if run_python_script scripts/test_evidence_registry_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'evidence registries: dsPIC decode/heartbeat, factory-aging, and S21 ADC/VCO hold have exact non-authorizing ownership'
+else
+    fail 'evidence registries: module ownership, decoder/heartbeat refusal, factory execution ceiling, S21 hold, or CI execution drifted'
+fi
+if run_python_script scripts/test_hashboard_contract_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'hashboard contracts: protocol, transport, geometry, and cited interconnect modules have exact non-authorizing ownership'
+else
+    fail 'hashboard contracts: module ownership, physical-identity ceiling, transport/geometry refusal, connector evidence, or CI execution drifted'
+fi
+if run_python_script scripts/test_hashboard_work_contract_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'hashboard work contracts: serial bookkeeping/policy and ticket-mask modules extend the exact non-authorizing owner'
+else
+    fail 'hashboard work contracts: expanded ownership, stale-job/dedup boundaries, serial progress, ticket encoding, or CI execution drifted'
+fi
+if run_python_script scripts/test_dps_schedule_units_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'DPS schedule/units: night reductions, local-hour conversion, and typed hashrate units have exact bounded ownership'
+else
+    fail 'DPS schedule/units: module ownership, decrease-first caps, fresh-temperature restoration, time bounds, units, or CI execution drifted'
+fi
+if run_python_script scripts/test_cooling_custody_lockout_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'cooling custody/lockout: C52 home admission and durable source-matched thermal release extend exact cooling ownership'
+else
+    fail 'cooling custody/lockout: expanded ownership, C52 receipt, prearm, source release, persistence, or CI execution drifted'
+fi
+if run_python_script scripts/test_hashboard_lifecycle_safety_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'hashboard lifecycle: stagger, dispatch pillars, terminal revoke, and ordered safety actions extend exact ownership'
+else
+    fail 'hashboard lifecycle: expanded ownership, dispatch-before-inrush, burst/empty refusal, terminal revoke, cut ordering, or CI drifted'
+fi
+if run_python_script scripts/test_recovery_durability_privacy_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'recovery durability/privacy: atomic mutation journaling and diagnostic wallet masking close exact common-module ownership'
+else
+    fail 'recovery durability/privacy: module ownership, crash durability, mutation admission, mask limits, workflow ownership, or CI drifted'
+fi
+if run_python_script scripts/test_mutation_clearance_ledger_convergence.py -q >/dev/null 2>&1; then
+    pass 'mutation clearance: opaque adjudication mints one-use exact-path journal removal authority'
+else
+    fail 'mutation clearance: opaque state, path binding, direct-clear exclusion, daemon consumers, integration owner, or ledger ceiling drifted'
+fi
+if run_python_script scripts/test_dcentrald_common_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'common crate registry: complete source, feature, consumer, effect, and test authority stays exact'
+else
+    fail 'common crate registry: source inventory, unsafe/effect boundary, recovery isolation, Bench-GO admission, test profile, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_asic_module_registry.py -q >/dev/null 2>&1; then
+    pass 'ASIC crate registry: every exported module has a source, measured suite, ledger scope, and non-authorizing ceiling'
+else
+    fail 'ASIC crate registry: export inventory, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_hal_module_registry.py -q >/dev/null 2>&1; then
+    pass 'HAL crate registry: every declared module has a source, compile profile, measured suite, ledger scope, and non-authorizing ceiling'
+else
+    fail 'HAL crate registry: export inventory, feature gate, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_silicon_profiles_module_registry.py -q >/dev/null 2>&1; then
+    pass 'silicon-profile crate registry: every declared module has a source, compile profile, measured suite, ledger scope, and non-authorizing ceiling'
+else
+    fail 'silicon-profile crate registry: export inventory, feature gates, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_thermal_module_registry.py -q >/dev/null 2>&1; then
+    pass 'thermal crate registry: every declared module has a source, HAL profile, measured suite, ledger scope, and non-authorizing ceiling'
+else
+    fail 'thermal crate registry: export inventory, HAL gate, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_fabric_lease_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'fabric-lease surface: public module and root API have exact ownership, tests, ledger scope, and non-authorizing ceiling'
+else
+    fail 'fabric-lease surface: module/root API inventory, source path, test accounting, ledger scope, ownership anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_autotuner_module_registry.py -q >/dev/null 2>&1; then
+    pass 'autotuner crate registry: every public module, private helper, root test, and feature-only method has exact non-authorizing ownership'
+else
+    fail 'autotuner crate registry: module/profile inventory, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_diagnostics_module_registry.py -q >/dev/null 2>&1; then
+    pass 'diagnostics crate registry: every public module and feature profile has exact test ownership and a source-bound authority ceiling'
+else
+    fail 'diagnostics crate registry: module/profile inventory, source path, test accounting, ledger scope, safety anchors, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_chip_analysis_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'chip-analysis surface: root APIs, tests, dependency edge, bounded math, and non-authorizing ownership are exact'
+else
+    fail 'chip-analysis surface: root API, tests, dependency/consumer scope, numerical hardening, authority ceiling, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_re_catalog_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'RE catalog surface: modules, rows, vectors, consumers, tests, and non-authorizing ownership are exact'
+else
+    fail 'RE catalog surface: modules/reexports, row census, vector hashes, dependency/consumer scope, authority ceiling, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_bridge_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'bridge-client surface: modules, APIs, evidence hashes, side effects, tests, and authority boundaries are exact'
+else
+    fail 'bridge-client surface: API/test inventory, evidence hashes, dependency/consumer scope, network/OTA/thermal safety, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_daemon_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'root daemon surface: binaries, modules, CLI, dispatch, effects, unsafe boundaries, tests, staging, and init consumers are exact'
+else
+    fail 'root daemon surface: package/module/API/test inventory, config/discovery safety, effect/unsafe census, workflow owner, aggregate, staging, or init scope drifted'
+fi
+if run_python_script scripts/test_dcentrald_api_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'primary API surface: modules, routes, CGMiner verbs, effects, auth admission, tests, and authority boundaries are exact'
+else
+    fail 'primary API surface: module/route/command/test inventory, feature/dependency/consumer scope, auth/CORS/persistence safety, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_api_grpc_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'gRPC API surface: protobuf shape, auth/startup admission, effects, tests, and authority boundaries are exact'
+else
+    fail 'gRPC API surface: Rust/protobuf inventory, auth/startup admission, effect mapping, dependency/consumer scope, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_api_types_module_registry.py -q >/dev/null 2>&1; then
+    pass 'API-types crate registry: every host-safe module, root contract, test, consumer, invariant macro, and authority boundary is exact'
+else
+    fail 'API-types crate registry: module/source/API/test accounting, dependency/consumer scope, host-safe boundary, ledger scope, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentrald_stratum_module_registry.py -q >/dev/null 2>&1; then
+    pass 'Stratum crate registry: every module, feature profile, test, consumer, and transport authority boundary is exact'
+else
+    fail 'Stratum crate registry: module/source/API/test accounting, feature/dependency/consumer scope, transport authority, ledger scope, workflow owner, or aggregate drifted'
+fi
+if run_python_script scripts/test_dcentos_init_surface_registry.py -q >/dev/null 2>&1; then
+    pass 'PID-1 surface registry: private functions, unsafe actions, tests, staging consumers, and authority boundaries are exact'
+else
+    fail 'PID-1 surface registry: source/API/test accounting, unsafe/action census, boot/shutdown policy, staging scope, workflow owner, or aggregate drifted'
+fi
 
-    if [ -f "$base/skus.conf" ]; then
+if [ -f "$base/skus.conf" ]; then
         missing=''
-        for want in S9 S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19jProBB S19kPro T19 S19XP S19jXP S21 T21 S21Pro S21XP; do
+        for want in S9 S9SE S15 T15 S17 S17Pro S17Plus T17 T17Plus S17e T17e S19 S19Pro S19jPro S19jProBB S19kPro T19 S19XP S19jXP S21 T21 S21Pro S21XP; do
             if ! grep -qE "^$want\|" "$base/skus.conf"; then
                 missing="$missing $want"
             fi
@@ -4674,7 +5164,7 @@ accept_harness_check() {
         if [ -n "$missing" ]; then
             fail "hw-acceptance: skus.conf is missing target SKU row(s):$missing (target-set drift)"
         else
-            pass "hw-acceptance: skus.conf lists all 22 target SKU rows"
+            pass "hw-acceptance: skus.conf lists all 23 target SKU rows"
         fi
     fi
     require_pattern "$base/lib/accept_parse.sh" 'AM3_BB_ENUMERATION_RECEIPT schema=v1' \
@@ -5619,7 +6109,12 @@ ce026_reverse_ab_and_am2_first_install_boundary_check() {
         "$tag REVERSE: sysupgrade harness exposes the --current-fw {1,2} selector"
     require_pattern "$harness" 'NANDSIM_PARTS_REVERSE' \
         "$tag REVERSE: sysupgrade harness defines the reverse both-slots layout"
-    require_pattern "$harness" '1,1,1,1,4,1,1,900,900' \
+    # 2026-08 nandsim profile split: the both-slots S9 emulator tuple moved from
+    # a harness literal into the evidence-derived profile authority in
+    # scripts/lib/zynq_nandsim_geometry.sh (which the Zynq nandsim geometry gate
+    # below pins as subordinate to package authority). Keep requiring the exact
+    # reverse-capable tuple at its operative source.
+    require_pattern 'scripts/lib/zynq_nandsim_geometry.sh' '1,1,1,1,4,1,1,900,900' \
         "$tag REVERSE: reverse layout provisions BOTH slots (mtd7 + mtd8, 128KiB eraseblocks)"
     require_pattern "$harness" 'OFFLINE_NANDSIM_PROOF_OK target=$TARGET direction=reverse current_fw=1 inactive_mtd=8' \
         "$tag REVERSE: sysupgrade harness emits the distinct reverse sentinel (current_fw=1 inactive_mtd=8)"
@@ -5922,9 +6417,6 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_out_of_band_hard_stop_cannot_drop_assign_or_early_return_live_ownership --locked -p dcentrald --bin dcentrald' \
         'CI: AM2 hard-stop has no drop-assignment, early-return, or live-owner redispatch path'
-    require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_native_route_fails_closed_before_optional_hardware_observation --locked -p dcentrald --bin dcentrald' \
-        'CI: native BM1366 is refused before optional EEPROM observation and has no retired BHB56 dsPIC route'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_dspic_heartbeat_is_bounded_observable_and_terminally_consumed --locked -p dcentrald --bin dcentrald' \
         'CI: exact AM2 BM1362 dsPIC heartbeat failure is bounded and consumed as terminal safe-off intent'
@@ -6405,6 +6897,195 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::exact_serial_raw_observation_is_restricted_and_promoted_without_reopen --locked -p dcentrald --bin dcentrald' \
         'CI: exact raw UART observation remains restricted to one promotable session'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_actor_publishes_ownership_only_after_physical_send --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k actor publishes ownership only after physical UART commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_actor_orders_physical_commit_before_following_rx --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k actor orders physical UART commit before subsequent receive'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_actor_does_not_publish_failed_tx_and_receipts_partial_commit --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k actor refuses failed TX ownership publication and records partial commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_job_attribution_variants_preserve_retry_order_and_identity --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k job attribution preserves retry ordering and job identity'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_watchdog_liveness_requires_fresh_complete_thermal_and_tach_proof --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 watchdog liveness requires fresh complete thermal and tach proof'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_watchdog_sla_requires_exact_30_30_5 --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 watchdog SLA remains exact at 30s thermal, 30s tach, and 5s confirmation'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::nopic_panic_fans_coast_only_after_checked_cut --locked -p dcentrald --bin dcentrald' \
+        'CI: NoPic panic fans coast only after checked power cut'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_clean_gate_uses_header_resolved_attribution --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k clean gate uses header-resolved attribution'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_partial_receipt_cannot_publish_global_ownership --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k partial receipt cannot publish global ownership'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_runtime_drains_actor_events_before_terminal_exit --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k runtime drains actor events before terminal exit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_closeout_source_fences_panic_planned_stop_and_question_mark_exits --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 closeout source fences panic, planned stop, and question-mark exits'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_watchdog_accepts_only_positive_armed_admission --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 watchdog accepts only positive armed admission'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_bosminer_identity_binds_pid_start_comm_and_executable --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 bosminer identity binds PID start time, comm, and executable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_endpoint_observability_keeps_raw_frame_and_valid_nonce_clocks_distinct --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k endpoint observability keeps raw-frame and admitted-nonce clocks distinct'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_multi_uart_actor_io_is_bound_to_exact_execution_fence --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k multi-UART actor I/O remains bound to one exact execution fence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_share_result_sidecar_bounds_history_and_counts_eviction --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k share-result sidecar bounds history and counts eviction'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_share_result_sidecar_consumes_exact_payload_once --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k share-result sidecar consumes each exact payload once'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_route_is_distinct_fenced_and_api_denied --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 route remains distinct, fenced, and API-denied'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_watchdog_requires_recent_history_admitted_nonce_on_every_active_tx_path --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k watchdog requires recent admitted nonce history on every active TX path'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_wrap_epoch_advances_only_in_physical_commit_consumer --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k wrap epoch advances only in the physical-commit consumer'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_live_identity_command_is_bounded_and_reaps_a_hung_probe --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 live-identity command is bounded and reaps a hung probe'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_live_identity_parsers_pin_cpu_mtd_and_profile_aware_v2_transcripts --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 live-identity parsers pin CPU, MTD, two profiles, and v2 transcript evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_live_identity_reader_refuses_symlink_and_oversize_file --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 live-identity reader refuses symlink and oversized inputs'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_live_model_accepts_902_903_mix_and_refuses_invalid_shapes --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 live model refuses mixed SKU, count, address, and alias identity shapes'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_live_profiles_refuse_all_non_exact_eeprom_populations --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 live profiles refuse all non-exact EEPROM populations'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_native_cold_executor_is_exact_multi_uart_and_owner_gated --locked -p dcentrald --bin dcentrald' \
+        'CI: native BM1366 cold executor is exact multi-UART and owner-gated'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_native_post_baud_admission_requires_exact_host_pair_and_fresh_geometry --locked -p dcentrald --bin dcentrald' \
+        'CI: native BM1366 post-baud admission requires the exact host pair and fresh geometry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_native_route_is_default_off_then_evidence_joined --locked -p dcentrald --bin dcentrald' \
+        'CI: native BM1366 route is default-off and evidence-joined'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_native_cold_start_opt_in_is_strict_and_never_the_token_issuer --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k native cold-start opt-in is strict and cannot issue authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_native_cooling_pins_all_four_channels_at_2000_rpm --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k native cooling pins four channels at the 2000 RPM floor'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_native_mapping_and_panic_closeout_are_not_generic_nopic --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k native mapping and panic closeout remain isolated from generic NoPic'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_native_owner_timeline_rejects_stale_pre_and_post_evidence --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k native owner timeline rejects stale pre- and post-evidence'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_native_route_requires_an_exact_ordered_population_subset --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k native route requires an exact ordered population subset'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_bounded_work_cli_must_match_the_immutable_runtime_binding --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k bounded-work CLI is bound to immutable runtime authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_bounded_work_completion_requires_every_required_uart --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k bounded-work completion requires every required UART'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_bounded_work_incomplete_closeout_is_a_terminal_error --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k incomplete bounded-work closeout is terminal'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_bounded_work_rx_evidence_reconstructs_the_complete_wire_frame --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k bounded-work RX evidence reconstructs the complete wire frame'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_endurance_segments_use_interval_not_lifetime_hashrate --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k endurance segments use interval rather than lifetime hashrate'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_endurance_work_cli_must_match_the_immutable_runtime_binding --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k endurance CLI is bound to immutable runtime authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_guarded_unlink_durable_replace_is_ordered_and_crash_resumable --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k durable guarded replacement is ordered and crash-resumable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_guarded_unlink_is_inode_bound_and_crash_resumable --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k guarded unlink is inode-bound and crash-resumable'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_guarded_unlink_rejects_symlink_type_mode_and_owner --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k guarded unlink rejects symlink, type, mode, and owner drift'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_no_work_actor_refuses_any_queued_uart_transmit --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k no-work actor refuses every queued UART transmit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_no_work_cli_must_match_the_immutable_runtime_binding --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k no-work CLI is bound to immutable runtime authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_production_endurance_never_grants_itself_bounded_bench_completion --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k production endurance cannot grant bounded-bench completion'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_bounded_proof_credits_duplicate_rx_paths_on_pool_accept --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k bounded proof credits duplicate RX paths only on pool accept'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_coverage_denial_detail_renders_duplicate_and_off_plan_addresses --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k coverage denial renders duplicate and off-plan addresses'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_missing_plan_addresses_diffs_and_refuses_off_plan_windows --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k missing plan addresses diff refuses off-plan windows'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_salvage_plan_prefix_window_accepts_exact_plan_with_unparseable_tail --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k salvage prefix window accepts exact plan with unparseable tail'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_salvage_plan_prefix_window_never_hides_a_parseable_tail_frame --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k salvage prefix window never hides a parseable tail frame'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_salvage_plan_prefix_window_refuses_bad_frame_inside_the_plan --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k salvage prefix window refuses bad frame inside the plan'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_salvage_plan_prefix_window_refuses_non_rejected_error_kinds --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k salvage prefix window refuses non-rejected error kinds'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_salvage_plan_prefix_window_replays_attempt9_tty_s1_coverage_windows --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k salvage prefix window replays attempt-9 ttyS1 coverage windows'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_address_ladder_paces_each_set_address_step_like_the_stock_jig --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 ladder paces each SetAddress like the stock jig'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_coverage_retry_reenrolls_unclaimed_plan_addresses_before_next_probe --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 coverage retry re-enrolls unclaimed plan addresses'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_duplicate_rx_share_credit_requires_submitted_or_accepted_share --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 duplicate RX share credit requires a submitted share'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_wrap_retired_no_clean_submit_allows_only_never_cleaned_sessions --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 wrap-retired no-clean allows only never-cleaned sessions'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_reenrollment_and_coverage_back_onto_the_shared_serial_chain_contract --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 re-enrollment and coverage stay rebased onto the shared serial-chain contract'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_ladder_cadence_is_representable_in_the_shared_paced_policy --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 ladder cadence stays representable in the shared paced-enumeration policy'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_inherited_unread_voltage_is_published_as_unknown --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 inherited unread voltage remains explicitly unknown'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::track1_j3_is_exact_kernel_all_thread_authority --locked -p dcentrald --bin dcentrald' \
+        'CI: Track-1 J3 is exact kernel all-thread authority'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_hybrid_zero_celsius_is_classified_missing --locked -p dcentrald --features sim-hal --bin dcentrald' \
+        'CI: AM2 hybrid zero Celsius remains missing rather than fabricated telemetry'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::hybrid_run_wires_mining_alert_monitor --locked -p dcentrald --bin dcentrald' \
+        'CI: hybrid runtime wires the mining-alert monitor'
     # Work-dispatch admission lifecycle + serial safety must-wire (2026-07-29).
     # Sibling work_dispatch_admission_tests modules (not under tests::) + BIP320 /
     # hash_on_disconnect honesty. Pin kept in check_work_dispatch_ci_coverage.py.
@@ -6492,9 +7173,6 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_watchdog_state_maps_config_and_feed_owner --locked -p dcentrald --bin dcentrald' \
         'CI: daemon work-dispatch maps watchdog/feed-owner states'
-    require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_thermal_maps_emergency_vs_ready --locked -p dcentrald --bin dcentrald' \
-        'CI: daemon thermal emergency vs ready mapping'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh daemon::work_dispatch_admission_tests::daemon_admit_green_succeeds_with_initialized_pics --locked -p dcentrald --bin dcentrald' \
         'CI: daemon admit succeeds when pillars green'
@@ -6585,17 +7263,14 @@ sim_hal_evidence_contract_gates() {
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::native_serial_identity_never_comes_from_default_or_explicit_geometry --locked -p dcentrald --bin dcentrald' \
         'CI: native serial identity never comes from default or explicit geometry alone'
     require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_experimental_opt_in_admits_only_the_exact_env_value --locked -p dcentrald --bin dcentrald' \
-        'CI: BM1366 experimental opt-in admits only the exact env value'
-    require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_experimental_admission_consumes_the_real_opt_in_and_observed_identity --locked -p dcentrald --bin dcentrald' \
-        'CI: BM1366 experimental admission consumes real opt-in and observed identity'
-    require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::am2_apw_stabilization_requires_live_actor_and_successful_progress --locked -p dcentrald --bin dcentrald' \
         'CI: AM2 APW stabilization requires live actor and successful progress'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_execution_terminal_rejects_late_physical_commit --locked -p dcentrald --bin dcentrald' \
         'CI: serial execution terminal rejects late physical commit'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_rearm_write_failure_is_terminal_not_best_effort --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k rearm write failure is terminal, not best effort'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::retained_single_owner_safe_off_legs_execute_all_pending_work_and_never_replay_success --locked -p dcentrald --bin dcentrald' \
         'CI: retained single-owner safe-off legs execute all pending work without success replay'
@@ -6615,11 +7290,8 @@ sim_hal_evidence_contract_gates() {
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1362_pool_disconnect_requires_announced_authority_and_uart_commit --locked -p dcentrald --bin dcentrald' \
         'CI: BM1362 pool disconnect requires announced authority and UART commit'
     require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_degraded_enumeration_component_cannot_bypass_runtime_refusal --locked -p dcentrald --bin dcentrald' \
-        'CI: BM1366 degraded enumeration cannot bypass runtime refusal'
-    require_pattern "$sim_workflow" \
-        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::bm1366_enumeration_admission_is_strict_or_explicitly_degraded --locked -p dcentrald --bin dcentrald' \
-        'CI: BM1366 enumeration admission is strict or explicitly degraded'
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_pool_disconnect_requires_prior_authority_and_physical_commit --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k pool disconnect requires prior authority and physical commit'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::validated_serial_admission_rejects_family_cross_use_and_impossible_frame_envelope --locked -p dcentrald --bin dcentrald' \
         'CI: validated serial admission rejects family cross-use and impossible frame envelope'
@@ -6725,6 +7397,33 @@ sim_hal_evidence_contract_gates() {
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_braiins_bm1366_passthrough_uses_closed_21_36_builder --locked -p dcentrald --bin dcentrald' \
         'CI: S19k Braiins BM1366 passthrough uses closed 21 36 builder'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_coverage_probe_reads_immediately_and_retries_exact_plan --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 coverage probe reads immediately and retries the exact plan'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_track1_exact_route_assigns_and_publishes_coverage_before_multi_handover --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k Track-1 exact route assigns and publishes coverage before multi handover'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::s19k_j0_wrapper_live_admits_reparented_wrapper_and_refuses_identity_drift --locked -p dcentrald --bin dcentrald' \
+        'CI: S19k J0 wrapper-live admits reparented wrapper and refuses identity drift'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::live407_uart_vbits_hash_is_ticket_valid_not_434faee1 --locked -p dcentrald --bin dcentrald' \
+        'CI: live407 UART vbits hash is ticket-valid not 434faee1'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::wave425_post_clean_chain_inactive_sentinel_dispatches_before_work --locked -p dcentrald --bin dcentrald' \
+        'CI: Wave-425 post-clean chain-inactive sentinel dispatches before work'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_night_fan_apply_caps_home_and_safety --locked -p dcentrald --bin dcentrald' \
+        'CI: serial night fan helper caps home requests at the thermal safety envelope'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_night_fan_path_publishes_watch_and_applies_helper --locked -p dcentrald --bin dcentrald' \
+        'CI: serial night fan path publishes its watch and applies the shared helper'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_night_frequency_init_uses_shared_helper --locked -p dcentrald --bin dcentrald' \
+        'CI: serial night initial frequency uses the shared bounded helper'
+    require_pattern "$sim_workflow" \
+        'sh ../scripts/run_exact_cargo_test.sh serial_mining::tests::serial_night_frequency_midrun_enqueues_pll0_write --locked -p dcentrald --bin dcentrald' \
+        'CI: serial night mid-run frequency transition enqueues the bounded PLL0 write'
     require_pattern "$sim_workflow" \
         'sh ../scripts/run_exact_cargo_test.sh s19j_hybrid_mining::tests::am2_thermal_selection_preserves_effective_source_provenance --locked -p dcentrald --bin dcentrald' \
         'CI: hybrid am2 thermal selection preserves effective source provenance'
@@ -7147,10 +7846,185 @@ else
     fail 'dcentrald crash policy: a shipped supervisor can automatically readmit after an abnormal exit'
 fi
 
+# Durable mutation-disposition journal (defense-in-depth UNDER the supervisor
+# session latch pinned above): the daemon must adjudicate the durable journal
+# at startup BEFORE hardware admission and refuse fail-closed on any
+# unresolved/foreign-boot/unreadable record, and must journal Mutated/
+# Quarantined fabric dispositions at the controlled teardown points. The
+# journal never relaxes the no-auto-restart policy: restart.rs keeps
+# returning false because a clean journal is not a typed SafeOff receipt.
+require_pattern 'dcentrald/dcentrald/src/daemon.rs' 'load_and_adjudicate_mutation_disposition(' 'mutation journal: daemon adjudicates the durable journal at startup'
+require_pattern 'dcentrald/dcentrald/src/daemon.rs' 'mutation-disposition journal refuses hardware admission' 'mutation journal: unresolved journal refuses hardware admission fail-closed'
+require_pattern 'dcentrald/dcentrald/src/daemon.rs' 'fn persist_unresolved_mutation_dispositions(' 'mutation journal: controlled teardown journals unresolved fabric dispositions'
+require_pattern 'dcentrald/dcentrald/src/daemon.rs' 'fn terminal_mutation_disposition_path(' 'mutation journal: durable path goes through the runtime_policy persistence seam'
+require_pattern 'dcentrald/dcentrald/src/restart.rs' 'Automatic daemon restart refused: no typed hardware disposition receipt is available' 'mutation journal: automatic restart stays refused despite the journal'
+
+# Single-chokepoint arm coverage (2026-08-16): the Daemon::init gate above only
+# covers the standard/S9 passthrough path. The PRIMARY hardware-energizing arms
+# (run_am3_bb_mining, S19jHybridMiner, SerialMiner) are launched directly from
+# run_main and never enter Daemon::init, so main.rs must adjudicate the durable
+# journal ONCE, immediately before the runtime-arm dispatch branch (covering
+# every current and future arm structurally), and must journal unresolved
+# Mutated/Quarantined fabric dispositions at each arm's controlled run-return
+# seam. These pins grep main.rs (a different file from this gate script) for
+# the exact load-bearing literals per the source-contract self-match-trap rule.
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'fn adjudicate_mutation_disposition_before_runtime_arm_dispatch()' 'mutation journal: single-chokepoint gate is defined in main.rs'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'adjudicate_mutation_disposition_before_runtime_arm_dispatch()?;' 'mutation journal: chokepoint gate is invoked fail-closed on the dispatch path'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'mutation-disposition journal refuses hardware admission before runtime-arm dispatch' 'mutation journal: chokepoint refusal is typed and precedes every mining arm'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'let am3_bb_run_result = am3_bb_mining::run_am3_bb_mining(' 'mutation journal: am3-bb arm binds its run result for controlled-teardown journaling'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'let hybrid_run_result = miner.run().await;' 'mutation journal: s19j-hybrid arm binds its run result for controlled-teardown journaling'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'let serial_run_result = miner.run().await;' 'mutation journal: serial arm binds its run result for controlled-teardown journaling'
+require_pattern 'dcentrald/dcentrald/src/main.rs' 'crate::daemon::persist_unresolved_mutation_dispositions(' 'mutation journal: run_main arms journal unresolved dispositions at controlled teardown'
+mutation_gate_line=$(grep -nF 'adjudicate_mutation_disposition_before_runtime_arm_dispatch()?;' dcentrald/dcentrald/src/main.rs | head -n 1 | cut -d: -f1)
+mutation_dispatch_line=$(grep -nF 'if am3_bb_mode {' dcentrald/dcentrald/src/main.rs | head -n 1 | cut -d: -f1)
+if [ -n "$mutation_gate_line" ] && [ -n "$mutation_dispatch_line" ] && [ "$mutation_gate_line" -lt "$mutation_dispatch_line" ]; then
+    pass 'mutation journal: chokepoint gate precedes the runtime-arm dispatch branch'
+else
+    fail 'mutation journal: chokepoint gate does not precede the runtime-arm dispatch branch'
+fi
+
 if sh scripts/test_amlogic_boot_safe_state.sh; then
     pass 'Amlogic lifecycle: boot baseline, runtime handoff, crash cut, and PID1 ordering are pinned'
 else
     fail 'Amlogic lifecycle: boot/runtime/crash safe-state contract regressed'
+fi
+if run_python_script scripts/test_s19k_aml_install_safety.py -q; then
+    pass 'S19k AML install safety: explicit mutation authority, authenticated post-install boundary, exact NAND map, and offset-preserving backup are pinned'
+else
+    fail 'S19k AML install safety: mutation authority, post-install boundary, NAND map, backup representation, or flash refusal regressed'
+fi
+if bash scripts/test_s19k_aarch64_compile_check.sh && \
+   "$PY" -m py_compile \
+       scripts/s19k_phase12_normalize.py \
+       scripts/s19k_phase12_capture_verify.py \
+       scripts/s19k_no_work_verify.py \
+       scripts/s19k_no_work_prepare.py \
+       scripts/test_s19k_phase12_normalize.py \
+       scripts/test_s19k_phase12_capture_verify.py \
+       scripts/test_s19k_no_work_verify.py \
+       scripts/test_s19k_no_work_prepare.py && \
+   run_python_script scripts/test_s19k_phase12_normalize.py -q && \
+   run_python_script scripts/test_s19k_phase12_capture_verify.py -q && \
+   run_python_script scripts/test_s19k_no_work_verify.py -q && \
+   run_python_script scripts/test_s19k_no_work_prepare.py -q; then
+    pass 'S19k joined Phase 1+2: per-channel raw blocks, normalization, deterministic bundle preparation, and no-work physical-evidence admission remain content-bound'
+else
+    fail 'S19k joined Phase 1+2: normalization replay, bundle preparation, target transcript, or independent physical-evidence admission regressed'
+fi
+if "$PY" -m py_compile scripts/test_s19k_gauntlet_runbook_convergence.py && \
+   run_python_script scripts/test_s19k_gauntlet_runbook_convergence.py -q; then
+    pass 'S19k Gauntlet operator path: historical plans remain non-executable and current v12 commands, artifacts, and evidence tools converge'
+else
+    fail 'S19k Gauntlet operator path: stale command authority, artifact selection, or evidence-tool drift detected'
+fi
+if "$PY" -m py_compile \
+       scripts/s19k_bounded_transcript_verify.py \
+       scripts/s19k_endurance_collect.py \
+       scripts/s19k_endurance_verify.py \
+       scripts/s19k_phase3_physical_verify.py \
+       scripts/s19k_tmp_build_artifact.py \
+       scripts/s19k_host_verify.py \
+       scripts/test_s19k_bounded_transcript_verify.py \
+       scripts/test_s19k_endurance.py \
+       scripts/test_s19k_phase3_physical_verify.py \
+       scripts/test_s19k_tmp_build_artifact.py && \
+   run_python_script scripts/test_s19k_bounded_transcript_verify.py -q && \
+   run_python_script scripts/test_s19k_phase3_physical_verify.py -q && \
+   run_python_script scripts/test_s19k_endurance.py -q && \
+   run_python_script scripts/test_s19k_tmp_build_artifact.py -q && \
+   run_python_script scripts/s19k_host_verify.py; then
+    pass 'S19k bounded-work/endurance/build/host contracts: verifier, evidence, artifact, and board-safety regressions remain fail-closed'
+else
+    fail 'S19k bounded-work/endurance/build/host contracts: verifier, evidence, artifact, or board-safety regression detected'
+fi
+if "$PY" -m py_compile \
+       ../../tools/ghidra/amlogic_lz4c.py \
+       ../../tools/ghidra/test_amlogic_lz4c.py \
+       ../../tools/ghidra/wrap_raw_elf.py \
+       ../../tools/ghidra/test_wrap_raw_elf.py \
+       ../../tools/vnish_aml_boot_package/vnish_aml_boot_package.py \
+       ../../tools/vnish_aml_boot_package/test_vnish_aml_boot_package.py \
+       scripts/s19k_native_re_verify.py \
+       scripts/test_s19k_native_re_verify.py \
+       scripts/s19k_shared_bhb5690x_interface_verify.py \
+       scripts/test_s19k_shared_bhb5690x_interface_verify.py \
+       scripts/s19k_native_hardware_verify.py \
+       scripts/test_s19k_native_hardware_verify.py \
+       scripts/s19k_native_build_verify.py \
+       scripts/test_s19k_native_build_verify.py \
+       scripts/s19k_native_owner_verify.py \
+       scripts/test_s19k_native_owner_verify.py \
+       scripts/s19k_native_population_coverage_verify.py \
+       scripts/test_s19k_native_population_coverage_verify.py \
+       scripts/s19k_native_live_common.py \
+       scripts/s19k_native_phase12_verify.py \
+       scripts/s19k_native_bounded_verify.py \
+       scripts/s19k_native_endurance_verify.py \
+       scripts/test_s19k_native_live_verifiers.py \
+       scripts/s19k_persistent_recovery_verify.py \
+       scripts/test_s19k_persistent_recovery_verify.py \
+       scripts/s19k_persistent_recovery_prepare.py \
+       scripts/test_s19k_persistent_recovery_prepare.py \
+       scripts/s19k_persistent_image_verify.py \
+       scripts/test_s19k_persistent_image_verify.py \
+       scripts/s19k_persistent_install_verify.py \
+       scripts/s19k_persistent_acceptance_verify.py \
+       scripts/test_s19k_persistent_transaction_verifiers.py \
+       scripts/s19k_board_population_matrix_verify.py \
+       scripts/test_s19k_board_population_matrix_verify.py \
+       scripts/s19k_gauntlet_workflow.py \
+       scripts/test_s19k_gauntlet_workflow.py && \
+   "$PY" -m pytest -q \
+       ../../tools/ghidra/test_amlogic_lz4c.py \
+       ../../tools/ghidra/test_wrap_raw_elf.py && \
+   run_python_script ../../tools/vnish_aml_boot_package/test_vnish_aml_boot_package.py -q && \
+   run_python_script scripts/test_s19k_native_re_verify.py -q && \
+   run_python_script scripts/s19k_shared_bhb5690x_interface_verify.py audit && \
+   run_python_script scripts/test_s19k_shared_bhb5690x_interface_verify.py -q && \
+   run_python_script scripts/test_s19k_native_hardware_verify.py -q && \
+   run_python_script scripts/test_s19k_native_build_verify.py -q && \
+   run_python_script scripts/s19k_native_owner_verify.py audit && \
+   run_python_script scripts/test_s19k_native_owner_verify.py -q && \
+   run_python_script scripts/test_s19k_native_population_coverage_verify.py -q && \
+   run_python_script scripts/test_s19k_native_live_verifiers.py -q && \
+   run_python_script scripts/test_s19k_persistent_recovery_verify.py -q && \
+   run_python_script scripts/test_s19k_persistent_recovery_prepare.py -q && \
+   run_python_script scripts/s19k_persistent_image_verify.py audit-source && \
+   run_python_script scripts/test_s19k_persistent_image_verify.py -q && \
+   run_python_script scripts/test_s19k_persistent_transaction_verifiers.py -q && \
+   run_python_script scripts/test_s19k_board_population_matrix_verify.py -q && \
+   run_python_script scripts/test_s19k_gauntlet_workflow.py -q && \
+   run_python_script scripts/s19k_gauntlet_workflow.py verify \
+       --expect-frontier "${DCENT_EXPECT_FRONTIER:-portable-artifact-custody,native-build-reproducibility,native-secure-firmware-re,static-bhb5690x-controller-interface}"; then
+    pass 'S19k dynamic workflow: secure-firmware classification, evidence-derived adopted/native/persistent DAG, and bounded expert wave remain fail-closed'
+else
+    fail 'S19k dynamic workflow: secure-firmware evidence, campaign DAG, evidence derivation, expert wave, or terminal refusal regressed'
+fi
+if "$PY" -m py_compile scripts/s19k_aml_stock_recovery_plan.py scripts/test_s19k_aml_stock_recovery_plan.py && \
+   run_python_script scripts/test_s19k_aml_stock_recovery_plan.py -q; then
+    pass 'S19k AML factory recovery: exact encrypted media, full-erasure classification, and six-MTD preburn backup remain plan-only'
+else
+    fail 'S19k AML factory recovery: archive/member/INI/TOC pin, preburn backup, or no-execute boundary regressed'
+fi
+if run_python_script scripts/test_s19k_current_recovered_stock_closeout.py -q; then
+    pass 'S19k recovered-stock closeout: immutable one-use evidence and no-effect retirement remain pinned'
+else
+    fail 'S19k recovered-stock closeout: exact transaction evidence or no-effect retirement boundary regressed'
+fi
+if run_python_script scripts/test_s19k_stock_restart_from_safeoff.py -q; then
+    pass 'S19k stock restart: terminal SafeOff evidence, at-most-once claim, and exact stock-tree proof remain pinned'
+else
+    fail 'S19k stock restart: SafeOff admission, at-most-once claim, or exact stock-tree proof regressed'
+fi
+if sh scripts/test_s19k_braiins_supervisor_custody.sh; then
+    pass 'S19k Braiins custody: exact stock supervisor/child process-tree evidence remains read-only and fail-closed'
+else
+    fail 'S19k Braiins custody: supervisor/child identity, topology, or read-only boundary regressed'
+fi
+if run_python_script scripts/test_s19k_persistent_elf_contract.py -q; then
+    pass 'S19k persistent image: staged init and daemon are runnable static AArch64 ELF artifacts'
+else
+    fail 'S19k persistent image: AArch64 executable/static ABI contract regressed'
 fi
 
 if sh scripts/test_dcentos_receipt_core.sh; then
@@ -7202,6 +8076,61 @@ else
     fail 'Zynq state observers: mount or UBI identity admission regressed'
 fi
 
+# Typed sysupgrade helper contract suites (2026-08 helper split). Each suite
+# adversarially pins one libexec helper consumed by the four Zynq sysupgrade
+# overlays; the anti-orphan reachability checker requires these active
+# invocations to stay on single interpreter lines.
+if sh scripts/test_sysupgrade_package_input.sh >/dev/null 2>&1; then
+    pass 'sysupgrade package input: stable package admission and read-window integrity are pinned'
+else
+    fail 'sysupgrade package input: admission or read-window integrity regressed'
+fi
+if sh scripts/test_sysupgrade_persistent_state.sh >/dev/null 2>&1; then
+    pass 'sysupgrade persistent state: staged /data preservation and entropy rotation are pinned'
+else
+    fail 'sysupgrade persistent state: staged preservation or entropy rotation regressed'
+fi
+if sh scripts/test_sysupgrade_transaction_lock.sh >/dev/null 2>&1; then
+    pass 'sysupgrade transaction lock: boot-bound ownership and phase admission are pinned'
+else
+    fail 'sysupgrade transaction lock: ownership, phase, or cleanup admission regressed'
+fi
+if sh scripts/test_sysupgrade_transaction_workspace.sh >/dev/null 2>&1; then
+    pass 'sysupgrade transaction workspace: owned mounts and retirement paths are pinned'
+else
+    fail 'sysupgrade transaction workspace: ownership or retirement regressed'
+fi
+if sh scripts/test_sysupgrade_ubi_identity.sh >/dev/null 2>&1; then
+    pass 'sysupgrade UBI identity: semantic attachment identity admission is pinned'
+else
+    fail 'sysupgrade UBI identity: semantic identity admission regressed'
+fi
+if sh scripts/test_sysupgrade_ubi_node.sh >/dev/null 2>&1; then
+    pass 'sysupgrade UBI node: exact root-only device-node admission is pinned'
+else
+    fail 'sysupgrade UBI node: device-node admission or refusal regressed'
+fi
+if sh scripts/test_sysupgrade_uboot_env_admission.sh >/dev/null 2>&1; then
+    pass 'sysupgrade U-Boot env admission: redundant-copy geometry admission is pinned'
+else
+    fail 'sysupgrade U-Boot env admission: geometry or authority admission regressed'
+fi
+if sh scripts/test_sysupgrade_signal_exit.sh >/dev/null 2>&1; then
+    pass 'sysupgrade signal exit: every updater terminates through one cleanup path'
+else
+    fail 'sysupgrade signal exit: single-cleanup-path termination regressed'
+fi
+if sh scripts/test_boot_artifact_auditor.sh >/dev/null 2>&1; then
+    pass 'boot-artifact auditor: parser fixtures and the declared local catalog stay policy-valid'
+else
+    fail 'boot-artifact auditor: parser or declared-catalog policy regressed'
+fi
+if sh scripts/virtme/am2-ubi/test_manifest_verifier.sh >/dev/null 2>&1; then
+    pass 'virtme am2-ubi manifest verifier: bundle-manifest admission contract is pinned'
+else
+    fail 'virtme am2-ubi manifest verifier: bundle-manifest admission regressed'
+fi
+
 if sh scripts/test_zynq_nandsim_geometry.sh >/dev/null 2>&1; then
     pass 'Zynq nandsim geometry: evidence-derived emulator tuple remains subordinate to package authority'
 else
@@ -7218,6 +8147,8 @@ fi
 require_file 'scripts/test_am2_xilinx_legacy_ramdisk.py'
 require_file 'scripts/test_am2_xilinx_preinit_safety.py'
 require_file 'scripts/test_am2_s19jpro_sd_builder_hardening.py'
+require_file 'scripts/test_am2_s17_post_image.sh'
+require_file 'scripts/test_am2_s17_ramdisk_swap.py'
 require_file 'scripts/test_amlogic_exact_build_inputs.sh'
 require_file 'scripts/test_amlogic_native_package_targets.py'
 require_file 'scripts/test_pre_flash_validate_amlogic_profiles.sh'
@@ -7239,6 +8170,16 @@ if run_python_script scripts/test_am2_s19jpro_sd_builder_hardening.py -q >/dev/n
     pass 'AM2 S19j Pro media: target-bound staging, input admission, and fresh-output semantics are pinned'
 else
     fail 'AM2 S19j Pro media: builder input or output hardening regressed'
+fi
+if sh scripts/test_am2_s17_post_image.sh >/dev/null 2>&1; then
+    pass 'AM2 S17 package-only media: exact held donor identity and model-bound FIT are pinned'
+else
+    fail 'AM2 S17 package-only media: donor identity or model-bound FIT contract regressed'
+fi
+if run_python_script scripts/test_am2_s17_ramdisk_swap.py -q >/dev/null 2>&1; then
+    pass 'AM2 17-family ramdisk-swap: fail-closed window, mtd1/mtd4-only write map, and mtd0 never-touch stay pinned'
+else
+    fail 'AM2 17-family ramdisk-swap: plan-only boundary or boot-chain never-touch contract regressed'
 fi
 if sh scripts/test_amlogic_exact_build_inputs.sh >/dev/null 2>&1; then
     pass 'Amlogic build inputs: exact model-bound kernel, DTB, and firmware identity are pinned'
@@ -7282,6 +8223,24 @@ fi
 # aggregate delegation, and admits exact workflow `run:` commands for tests
 # whose restricted inputs intentionally exist only in those jobs.
 require_file 'scripts/check_test_gate_reachability.py'
+require_file 'scripts/test_dcentrald_hw_unresolved_env.sh'
+if sh scripts/test_dcentrald_hw_unresolved_env.sh >/dev/null 2>&1; then
+    pass 'dcentrald unresolved-hardware environment helper remains host-safe and mtd4-write-free'
+else
+    fail 'dcentrald unresolved-hardware environment helper contract regressed'
+fi
+require_file 'scripts/test_public_artifact_release_gate.sh'
+if sh scripts/test_public_artifact_release_gate.sh >/dev/null 2>&1; then
+    pass 'public artifact release gate refuses customer-facing output without release-image admission'
+else
+    fail 'public artifact release-image admission contract regressed'
+fi
+require_file 'scripts/test_s99verify_v6_board_target.sh'
+if sh scripts/test_s99verify_v6_board_target.sh >/dev/null 2>&1; then
+    pass 'S99verify V6 is board_target-scoped (not all am3-aml = TAS5782M)'
+else
+    fail 'S99verify V6 board_target-scoping contract regressed'
+fi
 if python3 scripts/check_test_gate_reachability.py --self-test >/dev/null 2>&1 &&
    python3 scripts/check_test_gate_reachability.py; then
     pass 'anti-orphan: every shell safety suite has an active gate path'

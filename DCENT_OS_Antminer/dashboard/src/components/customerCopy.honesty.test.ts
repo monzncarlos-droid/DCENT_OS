@@ -21,6 +21,8 @@ const BANNED_CUSTOMER_COPY = [
   /no [^'"\n.]*endpoint exists/i,
   /don't affect dcentrald/i,
   /not supported on this hardware path yet/i,
+  /for ~20% hashrate improvement/i,
+  /~20% hashrate improvement/i,
 ];
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -52,5 +54,20 @@ describe('customer-facing dashboard copy', () => {
     }
 
     expect(offenders).toEqual([]);
+  });
+
+  it('surfaces the canonical Fund URL in shell, nav, footer, and About chrome', () => {
+    const required = [
+      'AppShell.tsx',
+      'standard/Sidebar.tsx',
+      'standard/KitTopBar.tsx',
+      'common/AboutPage.tsx',
+    ];
+    for (const rel of required) {
+      const source = readFileSync(join(COMPONENTS_DIR, rel), 'utf8');
+      expect(source, `${rel} must include the canonical Fund URL`).toContain(
+        'https://d-central.tech/fund/',
+      );
+    }
   });
 });

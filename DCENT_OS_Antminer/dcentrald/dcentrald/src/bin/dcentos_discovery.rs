@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+
+use dcentrald_common::board_desc::{canonical_board_target, BoardDesc};
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -329,40 +332,79 @@ fn detect_model(platform: &str) -> String {
         }
     }
 
-    if platform_contains_am335x() {
-        return "Antminer S19j Pro".to_string();
-    }
-
     model_from_platform_token(platform)
 }
+
+const BOARD_TARGET_MODEL_LABELS: &[(&str, &str)] = &[
+    ("am1-s9", "Antminer S9"),
+    ("am1-s9i", "Antminer S9i"),
+    ("am1-s9j", "Antminer S9j"),
+    ("am1-s9se", "Antminer S9 SE"),
+    ("am1-s11", "Antminer S11"),
+    ("am1-s15", "Antminer S15"),
+    ("am1-t15", "Antminer T15"),
+    ("am1-t9plus", "Antminer T9+"),
+    ("am2-s19j", "Antminer S19j Pro"),
+    ("am2-s19pro", "Antminer S19 Pro"),
+    ("am2-s17p", "Antminer S17 / S17 Pro"),
+    ("am2-s17plus", "Antminer S17+"),
+    ("am2-t17", "Antminer T17"),
+    ("am2-t17plus", "Antminer T17+"),
+    ("am2-s17e", "Antminer S17e"),
+    ("am2-t17e", "Antminer T17e"),
+    ("am2-t19", "Antminer T19"),
+    ("am3-bb-s19jpro", "Antminer S19j Pro"),
+    ("am3-s21", "Antminer S21"),
+    ("am3-s21pro", "Antminer S21 Pro"),
+    ("am3-s21xp", "Antminer S21 XP"),
+    ("am3-t21", "Antminer T21"),
+    ("am3-s19k", "Antminer S19K Pro"),
+    ("am3-s19xp", "Antminer S19 XP"),
+    ("am3-s19jxp", "Antminer S19j XP"),
+    ("am3-s19jproplus", "Antminer S19j Pro+"),
+    ("am3-s19jpro-aml", "Antminer S19j Pro"),
+    ("cv1835-s19jpro", "Antminer S19j Pro"),
+    ("bcb100-s19jpro", "Antminer S19j Pro"),
+];
+
+const EXACT_MODEL_TOKEN_LABELS: &[(&str, &str)] = &[
+    ("s9", "Antminer S9"),
+    ("s19j", "Antminer S19j Pro"),
+    ("s19jpro", "Antminer S19j Pro"),
+    ("s19j-pro", "Antminer S19j Pro"),
+    ("s19jpro-bb", "Antminer S19j Pro"),
+    ("s19j-pro-bb", "Antminer S19j Pro"),
+    ("s19kpro", "Antminer S19K Pro"),
+    ("s19k-pro", "Antminer S19K Pro"),
+    ("am3-aml-s19k", "Antminer S19K Pro"),
+    ("s19xp", "Antminer S19 XP"),
+    ("s19-xp", "Antminer S19 XP"),
+    ("am3-aml-s19xp", "Antminer S19 XP"),
+    ("s21", "Antminer S21"),
+    ("am3-aml-s21", "Antminer S21"),
+];
 
 fn model_from_platform_token(token: &str) -> String {
     let trimmed = token.trim();
     let lowered = trimmed.to_ascii_lowercase();
 
-    match lowered.as_str() {
-        "am3-bb" | "s19jpro-bb" | "s19j-pro-bb" => "Antminer S19j Pro".to_string(),
-        "am3-aml-s19k" | "s19kpro" | "s19k-pro" => "Antminer S19K Pro".to_string(),
-        "am3-aml-s19xp" | "s19xp" | "s19-xp" => "Antminer S19 XP".to_string(),
-        "am3-aml-s21" | "am3-aml" | "s21" => "Antminer S21".to_string(),
-        "am2-s19j" | "s19j" | "s19jpro" | "s19j-pro" => "Antminer S19j Pro".to_string(),
-        "am1-s9" | "s9" => "Antminer S9".to_string(),
-        _ => {
-            if lowered.contains("am3-bb") || lowered.contains("s19j") {
-                "Antminer S19j Pro".to_string()
-            } else if lowered.contains("s19k") {
-                "Antminer S19K Pro".to_string()
-            } else if lowered.contains("s19xp") {
-                "Antminer S19 XP".to_string()
-            } else if lowered.contains("s21") || lowered.contains("am3-aml") {
-                "Antminer S21".to_string()
-            } else if lowered.contains("s9") {
-                "Antminer S9".to_string()
-            } else {
-                trimmed.to_string()
-            }
-        }
+    if let Some((_, label)) = EXACT_MODEL_TOKEN_LABELS
+        .iter()
+        .find(|(candidate, _)| *candidate == lowered)
+    {
+        return (*label).to_string();
     }
+
+    let canonical = canonical_board_target(&lowered);
+    if BoardDesc::lookup(canonical).is_none() {
+        return trimmed.to_string();
+    }
+
+    BOARD_TARGET_MODEL_LABELS
+        .iter()
+        .find(|(target, _)| *target == canonical)
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 fn detect_platform() -> String {
@@ -718,9 +760,52 @@ mod tests {
     }
 
     #[test]
-    fn am3_bb_platform_tokens_map_to_s19j_pro() {
-        assert_eq!(model_from_platform_token("am3-bb"), "Antminer S19j Pro");
+    fn exact_platform_tokens_map_to_models() {
+        assert_eq!(
+            model_from_platform_token("am3-bb-s19jpro"),
+            "Antminer S19j Pro"
+        );
         assert_eq!(model_from_platform_token("s19jpro-bb"), "Antminer S19j Pro");
+        assert_eq!(
+            model_from_platform_token("am2-s19jpro-zynq"),
+            "Antminer S19j Pro"
+        );
+        assert_eq!(model_from_platform_token("am1-s9se"), "Antminer S9 SE");
+        assert_eq!(model_from_platform_token("am2-s19"), "Antminer S19 Pro");
+        assert_eq!(model_from_platform_token("am3-s19jxp"), "Antminer S19j XP");
+    }
+
+    #[test]
+    fn registered_model_targets_are_exact_and_generic_rows_stay_raw() {
+        for (target, label) in BOARD_TARGET_MODEL_LABELS {
+            assert!(
+                BoardDesc::lookup(target).is_some(),
+                "discovery mapping {target} must name a registered board target"
+            );
+            assert_eq!(model_from_platform_token(target), *label);
+        }
+
+        assert!(BoardDesc::lookup("am3-bb").is_some());
+        assert_eq!(model_from_platform_token("am3-bb"), "am3-bb");
+    }
+
+    #[test]
+    fn substrings_and_generic_soc_tokens_never_guess_a_model() {
+        for token in [
+            "prototype-s9-controller",
+            "am1-s9se-unknown-revision",
+            "s19j-lab-carrier",
+            "am3-aml",
+            "amlogic-a113d",
+            "zynq-bm3-am2",
+            "unknown-s21-like-board",
+        ] {
+            assert_eq!(
+                model_from_platform_token(token),
+                token,
+                "{token:?} must remain raw until an exact mapping exists"
+            );
+        }
     }
 
     #[test]

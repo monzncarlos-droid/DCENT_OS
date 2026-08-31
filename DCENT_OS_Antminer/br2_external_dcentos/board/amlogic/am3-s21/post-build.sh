@@ -147,15 +147,29 @@ fi
 echo "$PLATFORM_NAME" > "${TARGET_DIR}/etc/dcentos/board_family"
 echo "$PLATFORM_NAME" > "${TARGET_DIR}/etc/dcentos/platform"
 
-# The AM3 revert helpers source lib/am3_geometry.sh beside /usr/sbin.
-AM3_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/am3_geometry.sh"
-if [ -f "$AM3_GEOMETRY_SRC" ]; then
-    mkdir -p "${TARGET_DIR}/usr/sbin/lib"
-    cp "$AM3_GEOMETRY_SRC" "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh"
-    chmod 644 "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh" 2>/dev/null || true
-    echo "${LOG_PREFIX}: installed am3_geometry.sh for revert helpers"
+MUTATION_POLICY=$(tr -d ' \t\r\n' < "${TARGET_DIR}/etc/dcentos/mutation_policy" 2>/dev/null || true)
+case "$BOARD_NAME" in
+    am3-s19xp|am3-s19jxp)
+        if [ "$MUTATION_POLICY" != management-only ]; then
+            echo "${LOG_PREFIX}: ERROR: X19 AML package is missing management-only mutation policy" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+if [ "$MUTATION_POLICY" != management-only ]; then
+    # The AM3 revert helpers source lib/am3_geometry.sh beside /usr/sbin.
+    AM3_GEOMETRY_SRC="${BR2_EXTERNAL_DCENTOS_PATH}/../scripts/lib/am3_geometry.sh"
+    if [ -f "$AM3_GEOMETRY_SRC" ]; then
+        mkdir -p "${TARGET_DIR}/usr/sbin/lib"
+        cp "$AM3_GEOMETRY_SRC" "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh"
+        chmod 644 "${TARGET_DIR}/usr/sbin/lib/am3_geometry.sh" 2>/dev/null || true
+        echo "${LOG_PREFIX}: installed am3_geometry.sh for revert helpers"
+    else
+        echo "${LOG_PREFIX}: WARNING: am3_geometry.sh not found at $AM3_GEOMETRY_SRC" >&2
+    fi
 else
-    echo "${LOG_PREFIX}: WARNING: am3_geometry.sh not found at $AM3_GEOMETRY_SRC" >&2
+    echo "${LOG_PREFIX}: management-only target; no AM3 write geometry staged"
 fi
 
 #  W12-B: install the per-platform revert script keyed by

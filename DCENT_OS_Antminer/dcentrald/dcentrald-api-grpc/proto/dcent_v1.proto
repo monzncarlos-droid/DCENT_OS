@@ -1,12 +1,11 @@
-// DCENT_OS gRPC API v1 — Supremacy S5.1 scaffold (2026-05-15).
+// DCENT_OS gRPC API v1 — default-off telemetry and control contract.
 //
-// 5 services scaffolded: MinerService, TunerService, PoolService,
-// FanService, LocateService. Most RPCs return Status::unimplemented in
-// the lib.rs server impl — they're placeholders until the runtime is
-// wired. The one real handler is TunerService.GetConstraints, which
-// returns voltage / fan / frequency envelopes from
-// `dcentrald-silicon-profiles` with the SUPREMACY-CONTRACT clamps
-// (voltage_mv <= 14500 am2, fan_pwm <= 30 in home mode).
+// Five services are implemented: MinerService, TunerService, PoolService,
+// FanService, and LocateService. Reads use daemon-installed snapshots and
+// silicon profiles. Mutations use a daemon-installed delegate that routes to
+// the same safety-gated handlers as REST. Before either installation is ready,
+// affected RPCs return UNAVAILABLE or UNIMPLEMENTED instead of fabricating
+// state or bypassing policy.
 //
 // Backwards-compatibility contract: never remove or renumber a field;
 // new fields go on the end and are optional. v1 is the canonical

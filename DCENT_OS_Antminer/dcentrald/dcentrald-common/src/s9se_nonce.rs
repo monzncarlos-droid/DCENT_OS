@@ -4,7 +4,9 @@
 //! Valid only when `chain<=15`, `chip<=59`, `core<=207`, `buf!=0`.
 //! This module does not consume the FPGA nonce FIFO.
 
-use crate::s9se_enum::{S9SE_ADDR_INTERVAL, S9SE_CHIPS_PER_CHAIN};
+#[cfg(test)]
+use crate::s9se_enum::S9SE_ADDR_INTERVAL;
+use crate::s9se_enum::S9SE_CHIPS_PER_CHAIN;
 
 pub const NONCE_CORE_MAX: u8 = 207;
 pub const NONCE_CHAIN_MAX: u8 = 15;

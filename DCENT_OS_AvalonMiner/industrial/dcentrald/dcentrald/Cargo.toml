@@ -1,0 +1,54 @@
+[package]
+name = "dcentrald-avalon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "DCENT_OS Avalon — mining daemon for Canaan industrial Avalon (Avalon Q + A14xx/A15xx/A16xx, K230 + K210)"
+
+[[bin]]
+name = "dcentrald-avalon"
+path = "src/main.rs"
+
+[[bin]]
+name = "nano3-stratum-sim"
+path = "src/bin/nano3-stratum-sim.rs"
+required-features = ["nano3-shadow-sim"]
+
+[features]
+default = []
+# Desk/bench-side Stratum V1 fixture server. The binary hard-refuses every
+# non-loopback bind and has no upstream client or hardware transport.
+nano3-shadow-sim = ["dep:serde_json"]
+
+[dependencies]
+dcentrald-avalon-hal = { path = "../dcentrald-avalon-hal" }
+dcentrald-avalon-asic = { path = "../dcentrald-avalon-asic" }
+dcent-avalon-proto.workspace = true
+
+# Stratum + dispatcher come from the DCENT_axe family — `dcentaxe-mining`'s
+# MiningDispatcher channel types are hardcoded to `dcentaxe-stratum`'s
+# `StratumEvent` / `MiningEvent`, so DCENT_OS Avalon adopts the same stack
+# instead of forking via `dcentrald-stratum` (which uses incompatible types).
+# Decision recorded in Plan 3.
+dcentaxe-stratum = { path = "../../../../DCENT_OS_ESP/dcentaxe-stratum" }
+dcentaxe-mining  = { path = "../../../../DCENT_OS_ESP/dcentaxe-mining", features = ["asic-avalon"] }
+
+# AsicDriver trait + AsicModel — same canonical chip enum DCENT_axe Avalon
+# uses. We don't construct BM-family drivers here; we just need the trait
+# methods on the AvalonShimDriver our dcentrald-avalon-asic crate exposes.
+dcentaxe-asic = { path = "../../../../DCENT_OS_ESP/dcentaxe-asic", features = ["asic-avalon"] }
+
+tokio.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio-util.workspace = true
+sha2 = "0.10"
+serde_json = { version = "1", optional = true }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

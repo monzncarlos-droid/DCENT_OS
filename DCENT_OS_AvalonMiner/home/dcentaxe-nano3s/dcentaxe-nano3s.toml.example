@@ -1,0 +1,24 @@
+# DCENT_axe Avalon home daemon — example config.
+#
+# Copy to one of the loader paths and edit:
+#   - $DCENTAXE_NANO3S_CONFIG (env var)
+#   - /data/dcentaxe-nano3s.toml (canonical on K230 rootfs)
+#   - ./dcentaxe-nano3s.toml (next to the binary, dev)
+#
+# If no config file is present, compiled-in defaults are used (solo.ckpool.org
+# with a throwaway worker name) so the daemon still starts for smoke testing.
+
+[pool]
+url = "solo.ckpool.org"
+port = 3333
+worker_name = "bc1qexampleworkerreplacewithyours"
+password = "x"
+version_rolling = true
+suggest_difficulty = 0
+
+[miner]
+# Avalon A3xxx target frequency in MHz. Range 100-600 per
+# AVALON_ASIC_PROTOCOL.md §8. 500 MHz is the mid-range Plan-1 default.
+frequency_mhz = 500.0
+# Optional: pin the chip count. 0 = let driver.init() detect (Nano 3S = 12).
+asic_count = 0

@@ -127,10 +127,6 @@ pub mod efficiency;
 /// strictness (`DCENT_AM2_STRICT_SKU_REFUSE=1`, default OFF for
 /// first-deploy telemetry-only rollout).
 pub mod energize_gate;
-/// S19k Pro / BM1366 Amlogic NoPic profile admission (BETA offline gates).
-/// Fabric identity + LM75-before-probe + Has_Pic:false refuse; mining stays
-/// NOT IMPLEMENTED.
-pub mod s19k_nopic_admission;
 ///  tune-A: BraiinsOS GDTUNER state machine port.
 pub mod gdtuner;
 /// 9: per-control-board GPIO maps (CV1835 / AM335x / Amlogic /
@@ -174,13 +170,17 @@ pub mod pics;
 /// control-binding name and read-only-PMBus applicability. Data only —
 /// constructs no driver, carries no polarity, wires into no live path.
 pub mod power_topology;
-/// 9: PSU catalog (15 PSUs from APW3++ → APW12+ → APW121215a).
+/// 9: PSU catalog (16 PSUs from APW3++ → APW8 → APW12+ → APW121215a).
 pub mod psus;
 ///  W5-A: runtime profile registry + JSON-bundle loader.
 ///
 /// Owns the disk-backed profile catalog at `/etc/dcentrald/profiles.d/`.
 /// See `plans/wave4-profile-import-infrastructure.md` §B for the spec.
 pub mod registry;
+/// S19k Pro / BM1366 Amlogic NoPic profile admission (BETA offline gates).
+/// Fabric identity + LM75-before-probe + Has_Pic:false refuse; mining stays
+/// NOT IMPLEMENTED.
+pub mod s19k_nopic_admission;
 /// Round-15 A5 (2026-08-07): Scrypt product-line (L3+ / L7 / L9) topology
 /// transcribed byte-exactly from authentic Bitmain stock images, plus the
 /// stock L3+ chain-UART baud whitelist decoded from its own termios mapper.

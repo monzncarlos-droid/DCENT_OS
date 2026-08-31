@@ -14,19 +14,42 @@ bad() {
     fails=$((fails + 1))
 }
 
+# Derive the refusal roster from the acceptance SSOT. Every NOT-IMPLEMENTED
+# row must fail one representative live phase before transport; a separate
+# phase-completeness loop below proves all live/deploy/install entry points use
+# the same release-state gate without multiplying every phase by every SKU.
+while IFS='|' read -r sku target arch chip chip_id enum_expect soc boot_chain release_state package note
+do
+    case "$sku" in
+        ''|'#'*) continue ;;
+    esac
+    [ "$release_state" = "NOT-IMPLEMENTED" ] || continue
+
+    phase=enum
+    output=$(sh "$harness" "$phase" "$sku" 192.0.2.1 2>&1)
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+        bad "$sku $phase returned $rc instead of refusal rc=1"
+    fi
+    case "$output" in
+        *"$phase is refused for NOT-IMPLEMENTED route $sku ($target)"*) : ;;
+        *) bad "$sku $phase did not report the release-state refusal" ;;
+    esac
+    case "$output" in
+        *"only offline bootlog diagnosis"*) : ;;
+        *) bad "$sku $phase did not point to the capture-first evidence route" ;;
+    esac
+done < "$here/skus.conf"
+
 for phase in detect backup firstlight enum shares soak bench all ota install-hint; do
     output=$(sh "$harness" "$phase" S15 192.0.2.1 2>&1)
     rc=$?
     if [ "$rc" -ne 1 ]; then
-        bad "$phase returned $rc instead of refusal rc=1"
+        bad "S15 $phase returned $rc instead of refusal rc=1"
     fi
     case "$output" in
         *"$phase is refused for NOT-IMPLEMENTED route S15 (am1-s15)"*) : ;;
-        *) bad "$phase did not report the release-state refusal" ;;
-    esac
-    case "$output" in
-        *"only offline bootlog diagnosis"*) : ;;
-        *) bad "$phase did not point to the capture-first evidence route" ;;
+        *) bad "S15 $phase did not report the release-state refusal" ;;
     esac
 done
 
@@ -40,42 +63,16 @@ case "$boot_output" in
     *) bad "bootlog did not process the capture-first evidence" ;;
 esac
 
-for route in \
-    "S17Plus am2-s17plus" \
-    "T17 am2-t17" \
-    "T17Plus am2-t17plus" \
-    "T19 am2-t19"
-do
-    set -- $route
-    output=$(sh "$harness" install-hint "$1" 192.0.2.1 2>&1)
-    rc=$?
-    if [ "$rc" -ne 1 ]; then
-        bad "$1 install-hint returned $rc instead of policy refusal rc=1"
-    fi
-    case "$output" in
-        *"typed hardware matrix denies install and declares no artifact for $2"*) : ;;
-        *) bad "$1 install-hint did not report its typed no-artifact policy" ;;
-    esac
-    case "$output" in
-        *"dcent install "*) bad "$1 install-hint printed an install command" ;;
-    esac
-done
-
 if grep -Fq 'artifact_package_target()' "$harness"; then
     bad "install-hint still carries a second hardcoded artifact alias table"
 fi
 
 for route in \
     "S9 am1-s9 dcentos-sysupgrade-118.tar managed_s9_install" \
-    "S19 am2-s19pro dcentos-sysupgrade-am2-s19pro.tar guarded_am2_self_update" \
-    "S19Pro am2-s19pro dcentos-sysupgrade-am2-s19pro.tar guarded_am2_self_update" \
     "S19jPro am2-s19j dcentos-sysupgrade-am2-s19jpro.tar guarded_am2_self_update" \
     "S19kPro am3-s19k dcentos-sysupgrade-am3-s19kpro.tar guarded_amlogic_rootfs_window" \
-    "S19XP am3-s19xp dcentos-sysupgrade-am3-s19xp.tar guarded_amlogic_rootfs_window" \
     "S21 am3-s21 dcentos-sysupgrade-am3-s21.tar guarded_amlogic_rootfs_window" \
-    "T21 am3-t21 dcentos-sysupgrade-am3-t21.tar guarded_amlogic_rootfs_window" \
-    "S21Pro am3-s21pro dcentos-sysupgrade-am3-s21pro.tar guarded_amlogic_rootfs_window" \
-    "S21XP am3-s21xp dcentos-sysupgrade-am3-s21xp.tar guarded_amlogic_rootfs_window"
+    "S21Pro am3-s21pro dcentos-sysupgrade-am3-s21pro.tar guarded_amlogic_rootfs_window"
 do
     set -- $route
     output=$(sh "$harness" install-hint "$1" 192.0.2.1 2>&1)
@@ -148,26 +145,18 @@ do
 done
 
 for route in \
-    "S17 am2-s17p dcentos-sysupgrade-am2-s17pro.tar" \
-    "S17Pro am2-s17p dcentos-sysupgrade-am2-s17pro.tar"
+    "am2-s17p dcentos-sysupgrade-am2-s17pro.tar package_only_denied" \
+    "am2-s19pro dcentos-sysupgrade-am2-s19pro.tar guarded_am2_self_update" \
+    "am3-s19xp dcentos-sysupgrade-am3-s19xp.tar package_only_denied" \
+    "am3-s19jxp dcentos-sysupgrade-am3-s19jxp.tar package_only_denied" \
+    "am3-s21xp dcentos-sysupgrade-am3-s21xp.tar package_only_denied" \
+    "am3-t21 dcentos-sysupgrade-am3-t21.tar package_only_denied"
 do
     set -- $route
-    output=$(sh "$harness" install-hint "$1" 192.0.2.1 2>&1)
-    rc=$?
-    if [ "$rc" -ne 1 ]; then
-        bad "$1 package-only hint returned $rc instead of refusal rc=1"
-    fi
-    case "$output" in
-        *"Offline package-only artifact: output/$3"*'package_only_denied'*) : ;;
-        *) bad "$1 package-only refusal omitted its typed artifact/contract" ;;
-    esac
-    case "$output" in
-        *"dcent install "*) bad "$1 package-only refusal printed an install command" ;;
-    esac
-    producer_row=$(grep -F "\"board_target\":\"$2\"" "$producer_manifest")
+    producer_row=$(grep -F "\"board_target\":\"$1\"" "$producer_manifest")
     case "$producer_row" in
-        *"\"artifact_filename\":\"$3\""*'"install_contract":"package_only_denied"'*) : ;;
-        *) bad "$1 package-only producer identity/contract drifted" ;;
+        *"\"artifact_filename\":\"$2\""*"\"install_contract\":\"$3\""*) : ;;
+        *) bad "$1 non-callable runtime lost its orthogonal artifact metadata" ;;
     esac
 done
 

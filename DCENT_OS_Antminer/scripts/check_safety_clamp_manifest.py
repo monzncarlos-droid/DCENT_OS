@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-EXPECTED_SAFETY_CLAMP_COUNT = 97
+EXPECTED_SAFETY_CLAMP_COUNT = 103
 # G30: BM1368 ramp clamp site content/line drift after pure plan thin-wrap;
 # classified count unchanged (91). Digest re-pin only.
 # G42: BM1391 open-coded freq/25 clamp removed; pure-pin ban string replaces site.
@@ -53,13 +53,42 @@ EXPECTED_SAFETY_CLAMP_COUNT = 97
 # G46 (2026-08-15/16 S19k + S9 SE desk wave): 94 -> 97. Three additional
 # classified `.clamp(` sites in the tree-scanning walk (pattern, not a new
 # live PWM/voltage actuator). Digest re-pin only; do not exempt.
+# G47 (2026-08-17 S19k Track-1 leftover): 97 -> 102. Five additional
+# classified `.clamp(` sites from the leftover Serial+BM1366 / thermal-Ready
+# walk (pattern classification, including PWM-adjacent statements). Digest
+# re-pin only; do not exempt.
+# G48 (2026-08-19 offline-gate convergence): count remains 102. Commit
+# 99f66c060f applied rustfmt to the existing WattTargetPid integral bound, so
+# the fingerprint expanded from a continuation-line `.clamp(...)` to the same
+# `(self.integral + error * self.dt).clamp(...)` expression. A frozen-tree
+# comparison against the G47 pin found this as the sole fingerprint delta;
+# category, call, lower/upper bounds, and behavior are unchanged. Digest
+# re-pin only; do not exempt.
+# G49 (2026-08-20 offline-gate convergence): count remains 102. Comparison
+# against the retained  frozen tree found no added/removed classified
+# site: the G48 WattTargetPid rustfmt expansion remains, and the existing
+# `safe_pwm_clamp` fingerprint moved from `thermal` to the more accurate
+# `fan_pwm` category after nearby documentation explicitly named PWM. The
+# clamp call and bounds (`requested.clamp(low, high)`) are unchanged. Digest
+# re-pin only; do not exempt.
+# G50 (2026-08-27 S17 unlock armada convergence): 102 -> 103. ONE new
+# classified clamp, `s17_hybrid_mining.rs:315`
+# `raw.clamp(0.0, 255.0) as u8` inside `apw9_dac_from_centi_volts`, the APW9
+# PSU DAC bound of the new BM1397 (S17 family) recipe (A1 §V3 stock
+# `bitmain-voltage` -> DAC law; DAC=156 at 17.00 V, saturated 0/255 at the
+# documented envelope edges). Voltage clamp by pattern; it is the deliberate
+# fail-closed bound of a typed executor whose SET_VOLTAGE is deferred until 5
+# stable PIC heartbeats. Re-pinned rather than exempted, for the same reason
+# as G43/G45: the manifest classifies by pattern, not by reachability, and
+# hand-carving exceptions would put the count at the mercy of a judgement it
+# cannot check. Digest re-pin only; do not exempt.
 #
 # PROCESS NOTE (why this drifted silently): `bm1491.rs` was an UNTRACKED file,
 # so `git diff HEAD -- '*.rs'` showed zero added `.clamp(` while this gate,
 # which walks `source_root.rglob("*.rs")`, saw it immediately. A tree-scanning
 # gate and an index diff look at different sets — check
 # `git status --porcelain | grep '^??'` before concluding the gate is wrong.
-EXPECTED_SAFETY_CLAMP_DIGEST = "5295c06e0c5d700eeaf9b501b4cbf4f6ce36d9f578b70af209c259c260287de3"
+EXPECTED_SAFETY_CLAMP_DIGEST = "3ab56c59ceeec5a555cd78cb0d98f15385b2fef97e32680a8a57a9d1a29cff86"
 
 CLAMP_RE = re.compile(r"\.clamp\s*\(")
 COMMENT_PREFIXES = ("//", "///", "//!","/*", "*")

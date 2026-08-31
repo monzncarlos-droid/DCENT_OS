@@ -18,10 +18,11 @@
 //! Phase 1 shipped a skeleton: ctors returned `Ok` without touching any
 //! FPGA register, and every trait method returned
 //! [`HalError::NotImplemented`]. Phase 2 fills the body — the ctors now
-//! actually open the FPGA chain, the init helper writes the proven
-//! `ctrl_am2::BM1362_DEFAULT` (`0x00901002`) + BAUD `0x6C` + FIFO reset
-//! sequence, and the command/work paths use [`FpgaChain::write_cmd`] +
-//! [`FpgaChain::write_work`].
+//! actually open the FPGA chain, the init helper **fails closed** unless
+//! BUILD_ID classifies as AM2 (`0x63848B7B`; s9io is `0x5FCA47E9`), then
+//! writes the proven `ctrl_am2::BM1362_DEFAULT` (`0x00901002`) + BAUD `0x6C`
+//! + FIFO reset sequence. Command/work paths use [`FpgaChain::write_cmd`] +
+//! [`FpgaChain::write_work`]. S9 VERSION collides with AM2 CTRL at +0x00.
 //!
 //! ## Drop is empty by design (D-4 + D-5)
 //!
@@ -39,16 +40,15 @@ use crate::chain_backend::Bm1397PlusChainBackend;
 use crate::fpga_chain::{
     am2_regs, ctrl_am2, DevmemFpgaChain, FpgaChain, BAUD_REG_115200, STAT_RX_EMPTY,
 };
+use crate::pl_surface::{self, FabricClass, FabricIdentityError};
 use crate::uio_discover::discover_uio_number_by_name;
 use crate::{HalError, Result};
 
 /// Expected BUILD_ID readback for the BraiinsOS am2 bitstream on `a lab unit`.
 ///
-/// Live-captured 2026-05-22 via `devmem 0x43C00004 32` on `a lab unit` while
-/// running BraiinsOS — see `CONTEXT-LINKS.md` §"`a lab unit` chain1-common
-/// register state". Pinned here so a future bitstream swap can be
-/// detected without a silent regression.
-pub const BRAIINS_AM2_BITSTREAM_BUILD_ID: u32 = 0x6384_8B7B;
+/// Canonical value lives in [`pl_surface`]. A mismatch is a typed refusal —
+/// `initialize_chain_for_bm1362` must not continue CTRL/BAUD/FIFO writes.
+pub use crate::pl_surface::BRAIINS_AM2_BITSTREAM_BUILD_ID;
 
 /// Phase-2 default BM1397+ response body length (post-preamble). Per
 /// `serial_chain.rs::BM139X_RESP_BODY_LEN`. Phase 3 B-run will confirm
@@ -213,19 +213,32 @@ impl FpgaChainBackend {
         })
     }
 
+    /// Fail-closed AM2 BUILD_ID class gate used by
+    /// [`Self::initialize_chain_for_bm1362`]. Host-testable without MMIO.
+    pub fn admit_bm1362_fpga_build_id(build: u32) -> std::result::Result<(), FabricIdentityError> {
+        pl_surface::admit_fabric_class(build, FabricClass::Am2)?;
+        Ok(())
+    }
+
     /// Run the proven BM1362 chain-init register sequence on `a lab unit`-class
-    /// bitstreams: verify BUILD_ID, preserve-or-write CTRL, set BAUD to
-    /// 115200, reset FIFOs. Idempotent + non-destructive (CTRL is only
+    /// bitstreams: **require** AM2 BUILD_ID, preserve-or-write CTRL, set BAUD
+    /// to 115200, reset FIFOs. Idempotent + non-destructive (CTRL is only
     /// written if it differs from `BM1362_DEFAULT`).
+    ///
+    /// S9 `VERSION` at +0x00 equals AM2 `CTRL` (`0x00901002`). BUILD_ID at
+    /// +0x04 is the discriminator. A mismatch returns [`FabricIdentityError`]
+    /// (as [`HalError::Platform`]) and does **not** write CTRL/BAUD/FIFOs.
     pub fn initialize_chain_for_bm1362(&self) -> Result<()> {
         let build = self.read_build_id();
-        if build != BRAIINS_AM2_BITSTREAM_BUILD_ID {
-            tracing::warn!(
+        if let Err(err) = Self::admit_bm1362_fpga_build_id(build) {
+            tracing::error!(
                 chain_id = self.chain_id,
                 build = format_args!("0x{:08X}", build),
                 expected = format_args!("0x{:08X}", BRAIINS_AM2_BITSTREAM_BUILD_ID),
-                "FPGA BUILD_ID mismatch — bitstream may differ from the .25 baseline"
+                classified = ?err.classified_as,
+                "FPGA BUILD_ID class gate refused BM1362 chain init — CTRL/BAUD/FIFO writes skipped"
             );
+            return Err(err.into());
         }
 
         let ctrl = self.read_ctrl();
@@ -614,9 +627,37 @@ mod tests {
     #[test]
     fn braiins_am2_bitstream_build_id_pinned() {
         // Live-captured 2026-05-22 on `a lab unit`. A bitstream swap that changes
-        // this value should produce a loud log warning at init time, not
-        // silently mine on the wrong register map.
+        // this value must fail closed at init, not warn-and-continue on the
+        // wrong register map.
         assert_eq!(BRAIINS_AM2_BITSTREAM_BUILD_ID, 0x6384_8B7B);
+        assert_eq!(
+            BRAIINS_AM2_BITSTREAM_BUILD_ID,
+            crate::pl_surface::BRAIINS_AM2_BITSTREAM_BUILD_ID
+        );
+    }
+
+    #[test]
+    fn initialize_chain_for_bm1362_build_id_gate_is_fail_closed() {
+        use crate::pl_surface::{BRAIINS_S9IO_BITSTREAM_BUILD_ID, S9_VERSION_AM2_CTRL_COLLISION};
+
+        assert!(
+            FpgaChainBackend::admit_bm1362_fpga_build_id(BRAIINS_AM2_BITSTREAM_BUILD_ID).is_ok()
+        );
+
+        let s9 = FpgaChainBackend::admit_bm1362_fpga_build_id(BRAIINS_S9IO_BITSTREAM_BUILD_ID)
+            .expect_err("s9io BUILD_ID must not admit AM2 BM1362 init");
+        assert_eq!(s9.classified_as, Some(FabricClass::S9io));
+
+        let collision = FpgaChainBackend::admit_bm1362_fpga_build_id(S9_VERSION_AM2_CTRL_COLLISION)
+            .expect_err("VERSION/CTRL collision word is not a BUILD_ID");
+        assert_eq!(collision.classified_as, None);
+
+        assert_eq!(ctrl_am2::BM1362_DEFAULT, S9_VERSION_AM2_CTRL_COLLISION);
+        let as_hal = HalError::from(s9);
+        assert!(
+            matches!(as_hal, HalError::Platform(_)),
+            "typed identity error must surface as HalError::Platform, not a warn-only path"
+        );
     }
 
     #[test]

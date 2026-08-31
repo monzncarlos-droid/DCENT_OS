@@ -30,7 +30,8 @@
 //! operator-CONTROL surface (HA `number` / `select` / `climate` COMMAND
 //! entities: target watts, autotuner mode, target chip temperature) is
 //! **default-OFF** and is only advertised + subscribed when
-//! `mqtt.commands_enabled` is set. Every commanded value is CLAMPED here to the
+//! `mqtt.commands_enabled` is set **and** deployment/runtime board policy permits
+//! operational mutations. Every commanded value is CLAMPED here to the
 //! SAME safety envelope the local REST/autotuner setters enforce (the
 //! target-watts / target-temp bounds mirror `chip_profiles_bitaxe`'s
 //! `validate_autotune_target` limits, pinned equal by a `dcentaxe-core` test;
@@ -553,6 +554,14 @@ impl EnergyAccumulator {
 // it is NOT live-broker-proven on hardware (that stays operator/broker-gated).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The command surface is effective only when the operator requested it AND the
+/// build/runtime deployment policy permits operational mutations. Keeping this
+/// decision host-pure lets the transport, discovery plan, and API representation
+/// share a fail-closed truth table.
+pub fn command_surface_enabled(operator_requested: bool, deployment_allowed: bool) -> bool {
+    operator_requested && deployment_allowed
+}
+
 /// Min target power (W) advertised to HA AND enforced by [`parse_command`]'s
 /// clamp. A single Bitaxe-class board idles well under this; below it there is no
 /// meaningful watt-target.
@@ -570,6 +579,12 @@ pub const CMD_TARGET_TEMP_MIN_C: f32 = 40.0;
 /// thermal-shutdown ceiling, so a remote HA setpoint can never park the target
 /// at a dangerous temperature.
 pub const CMD_TARGET_TEMP_MAX_C: f32 = 95.0;
+/// Safe target selected when HA changes the mode to `target_watts` while the
+/// prior mode's target is not a valid watt budget.
+pub const DEFAULT_TARGET_WATTS: f32 = 15.0;
+/// Safe target selected when HA changes the mode to `target_temp` while the
+/// prior mode's target is not a valid temperature setpoint.
+pub const DEFAULT_TARGET_TEMP_C: f32 = 65.0;
 
 /// Canonical autotuner-mode API strings (mirror `shared::AutotuneMode::as_api_str`;
 /// pinned by a `dcentaxe-core` source-text guard). These are the HA `select`
@@ -641,6 +656,60 @@ pub enum HaCommand {
     TargetTempC(f32),
 }
 
+/// Atomic autotuner update derived from one already-parsed MQTT command.
+/// `target_value=None` means the selected mode ignores the existing target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutotuneCommandUpdate {
+    pub mode: &'static str,
+    pub target_value: Option<f32>,
+}
+
+/// Convert a command to the mode/target pair the runtime applies atomically.
+/// Mode-only commands never strand the autotuner with the previous mode's
+/// incompatible target (for example 15 W becoming a 15 °C temperature target).
+pub fn autotune_update_for_command(
+    command: &HaCommand,
+    current_target: f32,
+) -> AutotuneCommandUpdate {
+    match command {
+        HaCommand::TargetWatts(watts) => AutotuneCommandUpdate {
+            mode: AUTOTUNE_MODE_TARGET_WATTS,
+            target_value: Some(*watts),
+        },
+        HaCommand::TargetTempC(temp_c) => AutotuneCommandUpdate {
+            mode: AUTOTUNE_MODE_TARGET_TEMP,
+            target_value: Some(*temp_c),
+        },
+        HaCommand::AutotuneMode(mode) => {
+            let target_value = match *mode {
+                AUTOTUNE_MODE_TARGET_WATTS => Some(
+                    if current_target.is_finite()
+                        && (CMD_TARGET_WATTS_MIN..=CMD_TARGET_WATTS_MAX).contains(&current_target)
+                    {
+                        current_target
+                    } else {
+                        DEFAULT_TARGET_WATTS
+                    },
+                ),
+                AUTOTUNE_MODE_TARGET_TEMP => Some(
+                    if current_target.is_finite()
+                        && (CMD_TARGET_TEMP_MIN_C..=CMD_TARGET_TEMP_MAX_C).contains(&current_target)
+                    {
+                        current_target
+                    } else {
+                        DEFAULT_TARGET_TEMP_C
+                    },
+                ),
+                _ => None,
+            };
+            AutotuneCommandUpdate {
+                mode: *mode,
+                target_value,
+            }
+        }
+    }
+}
+
 /// Normalize + validate an autotuner-mode payload. Mirrors
 /// `shared::AutotuneMode::from_api_str` (trim, lowercase, `-`→`_`). Returns the
 /// canonical `&'static str` on match, or `None` (FAIL-CLOSED — an unknown mode
@@ -708,6 +777,24 @@ pub fn command_state_echo(topics: &CommandTopics, cmd: &HaCommand) -> (String, S
             format!("{}", t.round() as i64),
         ),
     }
+}
+
+/// Empty retained HA discovery messages remove previously-advertised command
+/// entities from the broker when the operator or deployment policy disables the
+/// surface. Without these tombstones, retained controls survive a reconnect and
+/// falsely look writable even though the firmware correctly rejects commands.
+pub fn command_discovery_tombstones(device_id: &str) -> [MqttPublishOp; 3] {
+    [
+        format!("homeassistant/number/{device_id}/target_watts_set/config"),
+        format!("homeassistant/select/{device_id}/autotune_mode_set/config"),
+        format!("homeassistant/climate/{device_id}/heater/config"),
+    ]
+    .map(|topic| MqttPublishOp {
+        topic,
+        payload: String::new(),
+        retain: true,
+        qos: MqttQos::AtLeastOnce,
+    })
 }
 
 /// Build the operator-CONTROL discovery entities (a `number` for target watts, a
@@ -1155,7 +1242,12 @@ mod tests {
         /// A single publish: stash retained payloads + append to the wire log.
         fn publish(&mut self, op: &MqttPublishOp) {
             if op.retain {
-                self.retained.insert(op.topic.clone(), op.payload.clone());
+                if op.payload.is_empty() {
+                    // MQTT retained-message deletion semantics.
+                    self.retained.remove(&op.topic);
+                } else {
+                    self.retained.insert(op.topic.clone(), op.payload.clone());
+                }
             }
             self.published.push(op.clone());
         }
@@ -1775,6 +1867,80 @@ mod tests {
             parse_command(&t, &t.autotune_mode_set, b"best_efficiency"),
             Some(HaCommand::AutotuneMode(AUTOTUNE_MODE_BEST_EFFICIENCY))
         );
+    }
+
+    #[test]
+    fn command_surface_requires_operator_opt_in_and_deployment_permission() {
+        assert!(!command_surface_enabled(false, false));
+        assert!(!command_surface_enabled(false, true));
+        assert!(!command_surface_enabled(true, false));
+        assert!(command_surface_enabled(true, true));
+    }
+
+    #[test]
+    fn mode_commands_replace_incompatible_targets_with_safe_defaults() {
+        assert_eq!(
+            autotune_update_for_command(&HaCommand::AutotuneMode(AUTOTUNE_MODE_TARGET_TEMP), 15.0,),
+            AutotuneCommandUpdate {
+                mode: AUTOTUNE_MODE_TARGET_TEMP,
+                target_value: Some(DEFAULT_TARGET_TEMP_C),
+            }
+        );
+        assert_eq!(
+            autotune_update_for_command(
+                &HaCommand::AutotuneMode(AUTOTUNE_MODE_TARGET_WATTS),
+                f32::NAN,
+            ),
+            AutotuneCommandUpdate {
+                mode: AUTOTUNE_MODE_TARGET_WATTS,
+                target_value: Some(DEFAULT_TARGET_WATTS),
+            }
+        );
+        assert_eq!(
+            autotune_update_for_command(&HaCommand::AutotuneMode(AUTOTUNE_MODE_TARGET_TEMP), 70.0,)
+                .target_value,
+            Some(70.0),
+            "a target already valid for the selected mode must be preserved"
+        );
+        assert_eq!(
+            autotune_update_for_command(
+                &HaCommand::AutotuneMode(AUTOTUNE_MODE_BEST_EFFICIENCY),
+                70.0,
+            )
+            .target_value,
+            None,
+            "target-free modes must not reinterpret or rewrite the stored target"
+        );
+    }
+
+    #[test]
+    fn command_discovery_tombstones_remove_retained_controls() {
+        let d = sample_device();
+        let mut broker = MockBroker::default();
+        broker.drive(&build_publish_plan(
+            &d,
+            &busy_snapshot(),
+            PublishPhase::OnConnect,
+            true,
+        ));
+        let tombstones = command_discovery_tombstones(&d.device_id);
+        assert_eq!(tombstones.len(), 3);
+        for op in &tombstones {
+            assert!(op.topic.starts_with("homeassistant/"));
+            assert!(op.topic.ends_with("/config"));
+            assert!(op.payload.is_empty());
+            assert!(op.retain);
+            assert_eq!(op.qos, MqttQos::AtLeastOnce);
+            assert!(broker.retained.contains_key(&op.topic));
+        }
+        broker.drive(&tombstones);
+        for op in &tombstones {
+            assert!(
+                !broker.retained.contains_key(&op.topic),
+                "empty retained publish must remove stale HA control {}",
+                op.topic
+            );
+        }
     }
 
     #[test]

@@ -18,19 +18,26 @@
 //! the serial port requires software to handle the full wire protocol:
 //!
 //!   Command (host -> ASIC): [0x55] [0xAA] [header] [length] [payload...] [CRC5]
-//!   Response (ASIC -> host): [0xAA] [0x55] [payload (5 or 7 bytes)] [CRC5+flags]
+//!   Response (ASIC -> host): [0xAA] [0x55] [chip-specific body]
 //!
-//! ## BM139X 9-Byte Response Format
+//! ## Response formats
 //!
-//! BM1397/BM1398/BM1362/BM1366/BM1368/BM1370 chips send 9-byte nonce responses:
-//!   [0xAA] [0x55] [nonce_3] [nonce_2] [nonce_1] [nonce_0] [midstate_idx] [job_id] [crc5+flags]
+//! Generic BM1397/BM1398-family handling uses a 9-byte wire response
+//! (`AA 55` + 7-byte body):
+//!   [0xAA] [0x55] [raw nonce bytes x4] [midstate_idx] [job_id] [crc5+flags]
+//!
+//! S19k/BM1366 uses an 11-byte wire response (`AA 55` + 9-byte body):
+//!   [0xAA] [0x55] [raw nonce/value bytes x4] [midstate/address]
+//!   [job/register] [version bytes x2] [crc5+flags]
+//! The effective Braiins header/submission nonce is reconstructed by the
+//! protocol layer; these raw bytes are not labelled network-order here.
 //!
 //! BM1387 sends 7-byte responses:
-//!   [0xAA] [0x55] [nonce_3] [nonce_2] [nonce_1] [nonce_0] [crc5+addr]
+//!   [0xAA] [0x55] [raw nonce bytes x4] [crc5+addr]
 //!
 //! The response length is chip-dependent and must be set via `set_response_len()`.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::serial::{pl_uart_assert_mcr_out2, pl_uart_diag_registers, DevmemUart, SerialChain};
@@ -160,11 +167,11 @@ const RESP_PREAMBLE: [u8; 2] = [0xAA, 0x55];
 #[allow(dead_code)]
 const MAX_CMD_FRAME: usize = 16;
 
-/// Maximum response frame size (preamble + 9 payload for BM139X).
+/// Maximum response frame size (preamble + 9-byte BM1366 body).
 #[allow(dead_code)]
 const MAX_RESP_FRAME: usize = 11;
 
-/// Default response body length (after preamble). 7 for BM1387, 9 for BM139X.
+/// Default response body length (after preamble). Generic BM139X body 7.
 /// : this default is **not** the BM1366 UART body. S19k/BM1366
 /// must use [`BM1366_UART_RESP_BODY_LEN`] (9) so the wire is 11 bytes.
 const DEFAULT_RESP_BODY_LEN: usize = 7;
@@ -218,6 +225,19 @@ fn crc5(data: &[u8]) -> u8 {
 ///
 /// Thread-safe: the inner serial port is wrapped in a Mutex so multiple
 /// threads (e.g., heartbeat thread + mining thread) can share access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialRxObservation {
+    /// Bytes returned by the OS/UART backend to the framed response path.
+    pub wire_bytes: u64,
+    /// Complete response frames accepted by the response assembler.
+    pub framed_responses: u64,
+    /// Complete BM1366-shaped candidates rejected by the full-frame CRC5
+    /// remainder gate before they could reach protocol consumers.
+    pub crc_rejected_frames: u64,
+    /// Bytes currently retained while waiting for a complete frame.
+    pub buffered_bytes: usize,
+}
+
 pub struct SerialChainBackend {
     /// UART backend (thread-safe via Mutex). Either file-based or devmem.
     serial: Mutex<UartBackend>,
@@ -235,6 +255,10 @@ pub struct SerialChainBackend {
     rx_unframed_log_budget: AtomicU32,
     /// Bounded budget for logging timeout exits with buffered RX residue.
     rx_timeout_log_budget: AtomicU32,
+    /// Cumulative bytes observed below the response frame assembler.
+    rx_wire_bytes: AtomicU64,
+    /// Cumulative complete frames accepted by the response frame assembler.
+    rx_framed_responses: AtomicU64,
 }
 
 fn preview_hex(bytes: &[u8], max: usize) -> String {
@@ -256,6 +280,8 @@ struct RxBuffer {
     buf: Vec<u8>,
     /// Number of valid bytes in buf[0..len].
     len: usize,
+    /// Complete BM1366 candidates rejected since construction.
+    crc_rejected: u64,
 }
 
 impl RxBuffer {
@@ -263,6 +289,7 @@ impl RxBuffer {
         Self {
             buf: vec![0u8; 1024],
             len: 0,
+            crc_rejected: 0,
         }
     }
 
@@ -293,6 +320,16 @@ impl RxBuffer {
             if self.buf[i] == RESP_PREAMBLE[0] && self.buf[i + 1] == RESP_PREAMBLE[1] {
                 // Found preamble at position i
                 if i + frame_len <= self.len {
+                    if body_len == BM1366_UART_RESP_BODY_LEN
+                        && crc5(&self.buf[i + 2..i + frame_len]) != 0
+                    {
+                        self.crc_rejected = self.crc_rejected.saturating_add(1);
+                        // Do not consume a whole false candidate: an embedded
+                        // or immediately following AA55 may start a valid
+                        // response. Advance the hunter by one byte.
+                        i += 1;
+                        continue;
+                    }
                     // Complete frame available
                     let body_start = i + 2;
                     let copy_len = body_len.min(out.len());
@@ -368,6 +405,8 @@ impl SerialChainBackend {
             rx_buf: Mutex::new(RxBuffer::new()),
             rx_unframed_log_budget: AtomicU32::new(8),
             rx_timeout_log_budget: AtomicU32::new(8),
+            rx_wire_bytes: AtomicU64::new(0),
+            rx_framed_responses: AtomicU64::new(0),
         })
     }
 
@@ -459,6 +498,8 @@ impl SerialChainBackend {
             rx_buf: Mutex::new(RxBuffer::new()),
             rx_unframed_log_budget: AtomicU32::new(8),
             rx_timeout_log_budget: AtomicU32::new(8),
+            rx_wire_bytes: AtomicU64::new(0),
+            rx_framed_responses: AtomicU64::new(0),
         })
     }
 
@@ -824,6 +865,19 @@ impl SerialChainBackend {
     // Response reception
     // -----------------------------------------------------------------------
 
+    /// Snapshot cumulative receive activity on both sides of the frame
+    /// assembler. This is diagnostic-only: reading it does not flush bytes,
+    /// alter timeouts, or change serial scheduling.
+    pub fn rx_observation(&self) -> SerialRxObservation {
+        let rx = self.rx_buf.lock().unwrap();
+        SerialRxObservation {
+            wire_bytes: self.rx_wire_bytes.load(Ordering::Relaxed),
+            framed_responses: self.rx_framed_responses.load(Ordering::Relaxed),
+            crc_rejected_frames: rx.crc_rejected,
+            buffered_bytes: rx.len,
+        }
+    }
+
     /// Read a single command response from the serial port.
     ///
     /// Blocks up to `CMD_RESPONSE_TIMEOUT_MS` waiting for a complete response
@@ -854,6 +908,7 @@ impl SerialChainBackend {
             let mut rx = self.rx_buf.lock().unwrap();
             let n = rx.try_extract_frame(body_len, &mut out);
             if n > 0 {
+                self.rx_framed_responses.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(out[..n].to_vec()));
             }
         }
@@ -870,10 +925,12 @@ impl SerialChainBackend {
 
             if n > 0 {
                 observed_bytes += n;
+                self.rx_wire_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 let mut rx = self.rx_buf.lock().unwrap();
                 rx.push(&tmp[..n]);
                 let extracted = rx.try_extract_frame(body_len, &mut out);
                 if extracted > 0 {
+                    self.rx_framed_responses.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(out[..extracted].to_vec()));
                 }
 
@@ -936,6 +993,7 @@ impl SerialChainBackend {
             let mut rx = self.rx_buf.lock().unwrap();
             let n = rx.try_extract_frame(body_len, &mut out);
             if n > 0 {
+                self.rx_framed_responses.fetch_add(1, Ordering::Relaxed);
                 responses.push(out[..n].to_vec());
             } else {
                 break;
@@ -950,6 +1008,7 @@ impl SerialChainBackend {
             };
 
             if n > 0 {
+                self.rx_wire_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 let mut rx = self.rx_buf.lock().unwrap();
                 rx.push(&tmp[..n]);
 
@@ -957,6 +1016,7 @@ impl SerialChainBackend {
                 loop {
                     let extracted = rx.try_extract_frame(body_len, &mut out);
                     if extracted > 0 {
+                        self.rx_framed_responses.fetch_add(1, Ordering::Relaxed);
                         responses.push(out[..extracted].to_vec());
                     } else {
                         break;
@@ -1135,7 +1195,8 @@ impl SerialChainBackend {
     }
 }
 
-// SAFETY: SerialChainBackend is Send+Sync because all mutable state is behind Mutex.
+// SAFETY: SerialChainBackend is Send+Sync because mutable state is behind
+// Mutex or represented by atomics.
 unsafe impl Send for SerialChainBackend {}
 unsafe impl Sync for SerialChainBackend {}
 
@@ -1300,6 +1361,21 @@ mod tests {
         assert!(src.contains("set_response_len(BM1366_UART_RESP_BODY_LEN)"));
         assert!(src.contains("fn require_bm1366_response_body"));
         assert!(src.contains("fn response_body_len"));
+        assert!(src.contains("S19k/BM1366 uses an 11-byte wire response"));
+        // 2026-08-28 C1 convergence fix: this fence is scoped to the
+        // PRODUCTION source only. As written (whole-file `src.contains`) it
+        // was self-referential — the retired blanket "all BM136x chips send
+        // 9-byte responses" doc sentence matched the assert's own literal, so
+        // the test failed from the moment it landed no matter what production
+        // said. The fence's intent — that the retired blanket claim stays out
+        // of production docs — is preserved by the split below.
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        assert!(
+            !production.contains("BM1362/BM1366/BM1368/BM1370 chips send 9-byte nonce responses")
+        );
     }
 
     /// (a) A complete BM139X (7-byte body) frame at the correct length is
@@ -1336,11 +1412,13 @@ mod tests {
     #[test]
     fn rx_buffer_extracts_complete_bm1366_frame() {
         let mut rx = RxBuffer::new();
-        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        rx.push(&[
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10,
+        ]);
         let mut out = [0u8; BM1366_UART_RESP_BODY_LEN];
         let n = rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out);
         assert_eq!(n, BM1366_UART_RESP_BODY_LEN);
-        assert_eq!(out, [0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        assert_eq!(out, [0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10]);
         assert_eq!(rx.len, 0);
     }
 
@@ -1348,7 +1426,7 @@ mod tests {
     #[test]
     fn rx_buffer_body7_on_bm1366_wire_leaves_trailer() {
         let wire = [
-            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E,
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10,
         ];
         let mut rx = RxBuffer::new();
         rx.push(&wire);
@@ -1358,14 +1436,19 @@ mod tests {
         assert_eq!(out7, [0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00]);
         assert_eq!(rx.len, 2, "version+trailer must remain after body-7 cut");
         let mut out9 = [0u8; BM1366_UART_RESP_BODY_LEN];
-        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out9), 0);
+        assert_eq!(
+            rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out9),
+            0
+        );
     }
 
     /// `set_response_len(11)` hunts a 13-byte frame. Incomplete on 11-byte wire.
     #[test]
     fn rx_buffer_body11_on_bm1366_wire_is_incomplete() {
         let mut rx = RxBuffer::new();
-        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x0E]);
+        rx.push(&[
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10,
+        ]);
         let mut out = [0u8; 11];
         assert_eq!(rx.try_extract_frame(11, &mut out), 0);
         assert_eq!(rx.len, 11);
@@ -1375,14 +1458,53 @@ mod tests {
     #[test]
     fn rx_buffer_two_bm1366_frames() {
         let mut rx = RxBuffer::new();
-        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
-        rx.push(&[0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x02]);
+        rx.push(&[
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+        ]);
+        rx.push(&[
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10,
+        ]);
         let mut a = [0u8; BM1366_UART_RESP_BODY_LEN];
         let mut b = [0u8; BM1366_UART_RESP_BODY_LEN];
         assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut a), 9);
         assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut b), 9);
         assert_eq!(a[3], 0x00);
         assert_eq!(b[3], 0x02);
+        assert_eq!(rx.len, 0);
+    }
+
+    #[test]
+    fn rx_buffer_rejects_crc_bad_bm1366_candidate_then_recovers_valid_frame() {
+        let mut bad = [
+            0xAA, 0x55, 0x13, 0x66, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10,
+        ];
+        bad[4] ^= 0x01;
+        let good = [
+            0xAA, 0x55, 0x40, 0x1B, 0x16, 0x52, 0x00, 0x4F, 0x66, 0x5F, 0x8D,
+        ];
+        let mut rx = RxBuffer::new();
+        rx.push(&bad);
+        rx.push(&good);
+        let mut out = [0u8; BM1366_UART_RESP_BODY_LEN];
+        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out), 9);
+        assert_eq!(out, good[2..]);
+        assert_eq!(rx.crc_rejected, 1);
+        assert_eq!(rx.len, 0);
+    }
+
+    #[test]
+    fn rx_buffer_crc_resync_preserves_overlapping_valid_preamble() {
+        let good = [
+            0xAA, 0x55, 0x22, 0x4E, 0x64, 0xC8, 0x00, 0x48, 0x72, 0xC0, 0x90,
+        ];
+        let mut overlapped = vec![0xAA, 0x55];
+        overlapped.extend_from_slice(&good);
+        let mut rx = RxBuffer::new();
+        rx.push(&overlapped);
+        let mut out = [0u8; BM1366_UART_RESP_BODY_LEN];
+        assert_eq!(rx.try_extract_frame(BM1366_UART_RESP_BODY_LEN, &mut out), 9);
+        assert_eq!(out, good[2..]);
+        assert_eq!(rx.crc_rejected, 1);
         assert_eq!(rx.len, 0);
     }
 
@@ -1395,7 +1517,7 @@ mod tests {
             0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x80,
         ];
         let next = [
-            0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x80,
+            0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x9F,
         ];
         let mut rx = RxBuffer::new();
         rx.push(&first);

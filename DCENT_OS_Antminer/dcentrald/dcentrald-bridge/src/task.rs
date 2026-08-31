@@ -296,7 +296,8 @@ async fn discover(client: &BridgeClient, shutdown: &CancellationToken) -> bool {
         Ok(Some(_h)) => return true,
         Ok(None) => { /* maybe 404 ⇒ try telemetry fallback */ }
         Err(e) => {
-            tracing::debug!(error = %e, "health probe failed; trying telemetry fallback");
+            tracing::debug!(error = %e, "health probe failed; refusing legacy telemetry fallback");
+            return false;
         }
     }
     let tel = tokio::select! {
@@ -359,7 +360,7 @@ async fn serve_loop(
                     asic_voltage_v: status.asic_voltage_v(),
                     block_found_height: status.block_found_height(),
                 };
-                let outcome = client.heartbeat(&req, Some(secret)).await;
+                let outcome = client.heartbeat(&req, secret).await;
                 match outcome {
                     Ok(HeartbeatOutcome::Ok) => {}
                     Ok(HeartbeatOutcome::NeedsRepair) => return true,

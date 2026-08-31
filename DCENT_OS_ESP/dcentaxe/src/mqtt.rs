@@ -2,42 +2,47 @@
 // Copyright (C) 2026 D-Central Technologies
 // License: GPL-3.0
 //
-//! Thin, fail-soft, default-OFF MQTT publisher for Home Assistant integration.
+//! Thin, fail-soft, default-OFF MQTT integration for Home Assistant.
 //!
 //! All the testable logic (HA discovery topics/payloads + the state payload)
 //! lives in the host-pure [`crate::mqtt_ha`] module. This file is ONLY the
-//! esp-idf transport: it owns the broker connection and the publish cadence.
+//! esp-idf transport: it owns the broker connection, publish cadence, and the
+//! bounded command handoff from the MQTT callback to this worker thread.
 //!
 //! ## Invariants (do not regress)
 //! - **Default-OFF.** Nothing runs unless `config.mqtt.enabled` is true AND a
 //!   broker host is configured.
 //! - **Fail-soft.** Every broker/network error is logged + retried with backoff.
-//!   MQTT NEVER touches mining or the safety paths and NEVER blocks them — it
-//!   runs on its own thread and only ever READS a telemetry snapshot.
+//!   MQTT runs on its own thread; the broker callback never blocks or takes a
+//!   device-state lock. Optional controls only update shared autotuner intent;
+//!   the normal board/thermal safety path remains authoritative.
 //! - **No HTTP handler.** MQTT is outbound, so `MAX_URI_HANDLERS` is unchanged.
 //! - **panic=abort safe.** We snapshot-then-drop every `SharedState` lock (never
 //!   hold one across a publish) and use `unwrap_or_else(|e| e.into_inner())`, so
 //!   a fault on this thread can never poison a `Mutex` another thread unwraps.
-//! - **Publish-only.** We never subscribe to a command topic, matching the
-//!   read-only entity set `mqtt_ha` advertises (no over-claimed control surface).
+//! - **Controls are doubly opt-in.** Command topics are advertised/subscribed
+//!   only when `mqtt.commands_enabled` is true AND the compiled/runtime
+//!   deployment policy permits operational mutations. Policy is rechecked on
+//!   every command, and stale retained discovery controls are tombstoned.
 //!
 //! Field-delivery status: implemented + host-unit-tested (the payload builder)
 //! and xtensa-built; live broker delivery is not yet field-proven. See README /
 //!  for the honest claim wording.
 
 use crate::mqtt_ha::{
-    build_publish_plan, command_state_echo, command_subscribe_topics, device_id_from_mac, lwt_spec,
-    parse_command, state_topic, CommandTopics, EnergyAccumulator, HaCommand, HaDevice, HaState,
+    autotune_update_for_command, build_publish_plan, command_discovery_tombstones,
+    command_state_echo, command_subscribe_topics, command_surface_enabled, device_id_from_mac,
+    lwt_spec, parse_command, state_topic, CommandTopics, EnergyAccumulator, HaDevice, HaState,
     MqttPublishOp, MqttQos, PublishPhase,
 };
-use crate::shared::SharedState;
+use crate::shared::{AutotuneMode, SharedState};
 use esp_idf_svc::mqtt::client::{
     Details, EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
 };
 use esp_idf_svc::sys;
 use log::{info, warn};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, TrySendError};
+use std::time::{Duration, Instant};
 
 /// Map the host-pure [`MqttQos`] (used by the publish plan) onto the esp-idf
 /// `QoS` enum. Keeps `mqtt_ha` free of any esp-idf dependency so it host-tests.
@@ -58,6 +63,23 @@ const MQTT_BUFFER_SIZE: usize = 1024;
 const RECONNECT_BACKOFF_MAX_S: u64 = 60;
 /// Never publish faster than this (avoids a busy loop on a bad config value).
 const MIN_PUBLISH_INTERVAL_S: u16 = 5;
+/// The MQTT callback cannot block the esp-mqtt task. A small bounded channel
+/// absorbs a brief burst; excess commands are dropped and can be retried by HA.
+const MQTT_COMMAND_QUEUE_CAPACITY: usize = 8;
+/// Command payloads are scalar numbers/mode tokens. Reject larger input before
+/// allocating/copying it out of the esp-mqtt callback.
+const MAX_COMMAND_PAYLOAD_BYTES: usize = 64;
+/// We subscribe to three exact short topics; reject any unexpected large topic.
+const MAX_COMMAND_TOPIC_BYTES: usize = 128;
+/// Wake periodically even when telemetry is slow so config/policy revocation is
+/// reflected promptly and forces a reconnect/tombstone pass.
+const MQTT_POLICY_POLL: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct InboundMqttCommand {
+    topic: String,
+    payload: Vec<u8>,
+}
 
 /// Read the device MAC (last 3 octets feed the stable HA device id).
 fn device_mac_string() -> String {
@@ -192,15 +214,74 @@ fn run_session(
         ..Default::default()
     };
 
-    // new_cb pumps the connection internally (no extra pump thread needed); the
-    // callback is publish-only, so it just drops inbound events.
-    let mut client =
-        EspMqttClient::new_cb(&url, &conf, |_event| {}).map_err(|e| format!("connect: {e}"))?;
+    // The effective command surface is stricter than the persisted opt-in: an
+    // identity-only/blocked build or an unsafe runtime board profile always
+    // wins and leaves MQTT read-only.
+    let commands_enabled = command_surface_enabled(
+        cfg.commands_enabled,
+        crate::auth::deployment_mutations_allowed(state),
+    );
+    if cfg.commands_enabled && !commands_enabled {
+        warn!("MQTT commands requested but denied by deployment/board policy; telemetry remains read-only");
+    }
 
-    // Whether the operator opted into the HA COMMAND surface (number/select/
-    // climate). DEFAULT-OFF: when false the plan advertises ONLY the read-only
-    // telemetry entities and never publishes a `command_topic`.
-    let commands_enabled = cfg.commands_enabled;
+    // new_cb pumps the connection internally. Copy only complete, tiny command
+    // messages into a bounded channel: the esp-mqtt task never blocks, never
+    // locks SharedState, and never applies a command inside the C callback.
+    let (command_tx, command_rx) = sync_channel(MQTT_COMMAND_QUEUE_CAPACITY);
+    let mut client = EspMqttClient::new_cb(&url, &conf, move |event| {
+        let EventPayload::Received {
+            topic: Some(topic),
+            data,
+            details,
+            ..
+        } = event.payload()
+        else {
+            return;
+        };
+        if details != Details::Complete {
+            warn!("MQTT command chunk rejected (fragmented payloads are not accepted)");
+            return;
+        }
+        if topic.len() > MAX_COMMAND_TOPIC_BYTES || data.len() > MAX_COMMAND_PAYLOAD_BYTES {
+            warn!(
+                "MQTT command rejected: topic/payload exceeds bounded input ({} / {} bytes)",
+                topic.len(),
+                data.len()
+            );
+            return;
+        }
+        let inbound = InboundMqttCommand {
+            topic: topic.to_string(),
+            payload: data.to_vec(),
+        };
+        if let Err(error) = command_tx.try_send(inbound) {
+            match error {
+                TrySendError::Full(_) => warn!("MQTT command queue full; dropping command"),
+                TrySendError::Disconnected(_) => {
+                    warn!("MQTT command worker unavailable; dropping command")
+                }
+            }
+        }
+    })
+    .map_err(|e| format!("connect: {e}"))?;
+
+    if commands_enabled {
+        for topic in command_subscribe_topics(device_id) {
+            client
+                .subscribe(&topic, QoS::AtLeastOnce)
+                .map_err(|e| format!("command subscribe to {topic}: {e}"))?;
+        }
+        info!("MQTT/HA command surface enabled (3 bounded command topics)");
+    } else {
+        // Retained discovery survives broker reconnects. Explicit empty retained
+        // payloads remove controls advertised by an older/permitted session.
+        for op in command_discovery_tombstones(device_id) {
+            client
+                .enqueue(&op.topic, esp_qos(op.qos), op.retain, op.payload.as_bytes())
+                .map_err(|e| format!("command discovery tombstone {}: {e}", op.topic))?;
+        }
+    }
 
     // On-connect plan: retained discovery configs (so a freshly started HA still
     // auto-creates the entities) -> availability `online` -> the first state
@@ -234,49 +315,158 @@ fn run_session(
     // byte-identical to the prior inline loop (which published state, then the
     // availability heartbeat, then slept).
     let mut first_tick = true;
+    let mut next_publish = Instant::now();
+    let command_topics = CommandTopics::new(device_id);
     loop {
-        // Stop cleanly if MQTT was disabled at runtime.
-        let still_enabled = state
+        // Stop cleanly if MQTT was disabled at runtime. A change to the
+        // effective command surface forces a fresh session so subscriptions and
+        // retained discovery/tombstones converge with current policy.
+        let (still_enabled, commands_requested_now) = state
             .config
             .lock()
-            .map(|c| c.mqtt.enabled)
-            .unwrap_or_else(|e| e.into_inner().mqtt.enabled);
+            .map(|c| (c.mqtt.enabled, c.mqtt.commands_enabled))
+            .unwrap_or_else(|e| {
+                let c = e.into_inner();
+                (c.mqtt.enabled, c.mqtt.commands_enabled)
+            });
         if !still_enabled {
             return Ok(());
         }
+        let commands_enabled_now = command_surface_enabled(
+            commands_requested_now,
+            crate::auth::deployment_mutations_allowed(state),
+        );
+        if commands_enabled_now != commands_enabled {
+            return Err("effective MQTT command policy changed".to_string());
+        }
 
-        // Snapshot once per tick: the state payload carries the cumulative energy
-        // integrated so far, and we reuse its `power_w` to advance the accumulator
-        // for the interval we are about to sleep.
-        let snap = snapshot_state(state, energy.energy_kwh());
+        if Instant::now() >= next_publish {
+            // Snapshot once per tick: the state payload carries the cumulative
+            // energy integrated so far, and we reuse its `power_w` to advance
+            // the accumulator for the next interval.
+            let snap = snapshot_state(state, energy.energy_kwh());
 
-        // Periodic plan: the state payload (load-bearing — reconnect on failure)
-        // then a cheap retained availability heartbeat (best-effort, matching the
-        // prior inline behavior).
-        let tick_plan =
-            build_publish_plan(&device, &snap, PublishPhase::Periodic, commands_enabled);
-        for op in &tick_plan {
-            // First tick: the on-connect plan already published this state, so
-            // skip the duplicate (still refresh availability below).
-            if first_tick && op.topic == state_t {
-                continue;
+            // Periodic plan: the state payload (load-bearing — reconnect on
+            // failure) then a retained availability heartbeat (best-effort).
+            let tick_plan =
+                build_publish_plan(&device, &snap, PublishPhase::Periodic, commands_enabled);
+            for op in &tick_plan {
+                // The on-connect plan already published the first state; only
+                // refresh availability on this immediate first tick.
+                if first_tick && op.topic == state_t {
+                    continue;
+                }
+                let r =
+                    client.enqueue(&op.topic, esp_qos(op.qos), op.retain, op.payload.as_bytes());
+                if op.topic == state_t {
+                    r.map_err(|e| format!("state publish: {e}"))?;
+                } else {
+                    let _ = r;
+                }
             }
-            let r = client.enqueue(&op.topic, esp_qos(op.qos), op.retain, op.payload.as_bytes());
-            if op.topic == state_t {
-                r.map_err(|e| format!("state publish: {e}"))?;
-            } else {
-                let _ = r; // availability refresh — best-effort heartbeat
+            first_tick = false;
+
+            // `add_sample` is fail-benign for non-finite/negative readings.
+            energy.add_sample(snap.power_w, interval_s as f64);
+            next_publish = Instant::now() + interval;
+        }
+
+        let wait = next_publish
+            .saturating_duration_since(Instant::now())
+            .min(MQTT_POLICY_POLL);
+        match command_rx.recv_timeout(wait) {
+            Ok(inbound) => {
+                if let Some(echo) = apply_inbound_command(state, &command_topics, inbound) {
+                    client
+                        .enqueue(
+                            &echo.topic,
+                            esp_qos(echo.qos),
+                            echo.retain,
+                            echo.payload.as_bytes(),
+                        )
+                        .map_err(|e| format!("command state echo to {}: {e}", echo.topic))?;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("MQTT command callback disconnected".to_string());
             }
         }
-        first_tick = false;
-
-        // Integrate this interval's energy from the just-read input power BEFORE
-        // sleeping, so the NEXT state publish reports the updated cumulative kWh.
-        // `add_sample` is fail-benign (non-finite/negative power is ignored), so a
-        // garbage reading can never corrupt or decrease the monotonic total.
-        energy.add_sample(snap.power_w, interval_s as f64);
-        std::thread::sleep(interval);
     }
+}
+
+/// Parse, policy-check, validate, and atomically apply one queued HA command.
+/// Rejected input never publishes a success echo.
+fn apply_inbound_command(
+    state: &SharedState,
+    topics: &CommandTopics,
+    inbound: InboundMqttCommand,
+) -> Option<MqttPublishOp> {
+    let Some(command) = parse_command(topics, &inbound.topic, &inbound.payload) else {
+        warn!("MQTT command rejected: unknown topic or invalid payload");
+        return None;
+    };
+
+    // Lock order is config -> autotuner, matching the rest of the runtime. Hold
+    // both only for the small atomic state update; no broker call occurs here.
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    let profile_allows_mining = config
+        .board_profile_resolution()
+        .mining_allowed_without_lab_bypass;
+    let deployment_allowed = crate::capabilities::deployment_allows_operational_mutations(
+        env!("DCENTAXE_RUNTIME_MODE"),
+        env!("DCENTAXE_INSTALL_POLICY"),
+        profile_allows_mining,
+    );
+    if !command_surface_enabled(config.mqtt.commands_enabled, deployment_allowed) {
+        warn!("MQTT command rejected: command surface is disabled by config/deployment policy");
+        return None;
+    }
+
+    let mut autotuner = state.autotuner.lock().unwrap_or_else(|e| e.into_inner());
+    let update = autotune_update_for_command(&command, autotuner.target_value);
+    let mode = match AutotuneMode::from_api_str(update.mode) {
+        Some(mode) => mode,
+        None => {
+            warn!("MQTT command rejected: unsupported autotuner mode");
+            return None;
+        }
+    };
+    let pure_mode = match mode {
+        AutotuneMode::MaxHashrate => crate::chip_profiles_bitaxe::BestPointMode::MaxHashrate,
+        AutotuneMode::TargetWatts => crate::chip_profiles_bitaxe::BestPointMode::TargetWatts,
+        AutotuneMode::BestEfficiency => crate::chip_profiles_bitaxe::BestPointMode::BestEfficiency,
+        AutotuneMode::TargetTemp => crate::chip_profiles_bitaxe::BestPointMode::TargetTemp,
+    };
+    let validated_target = match update.target_value {
+        Some(target) => {
+            match crate::chip_profiles_bitaxe::validate_autotune_target(pure_mode, target) {
+                Ok(target) => Some(target),
+                Err(message) => {
+                    warn!("MQTT command rejected by autotuner target validator: {message}");
+                    return None;
+                }
+            }
+        }
+        None => None,
+    };
+
+    autotuner.enabled = true;
+    autotuner.mode = mode;
+    if let Some(target) = validated_target {
+        autotuner.target_value = target;
+    }
+    autotuner.status = format!("MQTT command accepted: {}", update.mode);
+    drop(autotuner);
+    drop(config);
+
+    let (topic, payload) = command_state_echo(topics, &command);
+    Some(MqttPublishOp {
+        topic,
+        payload,
+        retain: true,
+        qos: MqttQos::AtLeastOnce,
+    })
 }
 
 /// Build the stable HA device identity from the current config (name/model/url

@@ -73,11 +73,21 @@ pub const S19K_78_PROC_MTD_NAMES: &[&str] = &[
     "system",
 ];
 pub const S19K_78_PROC_MTD_SIZES: &[u64] = &[
-    0x0020_0000, 0x0080_0000, 0x0320_0000, 0x0050_0000, 0x0200_0000, 0x0990_0000,
+    0x0020_0000,
+    0x0080_0000,
+    0x0320_0000,
+    0x0050_0000,
+    0x0200_0000,
+    0x0990_0000,
 ];
 /// Held S21 Braiins `/proc/mtd` sizes from `nand_and_ubi.txt`. Same as `a lab unit`.
 pub const S21_HELD_PROC_MTD_SIZES: &[u64] = &[
-    0x0020_0000, 0x0080_0000, 0x0320_0000, 0x0050_0000, 0x0200_0000, 0x0990_0000,
+    0x0020_0000,
+    0x0080_0000,
+    0x0320_0000,
+    0x0050_0000,
+    0x0200_0000,
+    0x0990_0000,
 ];
 
 pub fn admit_s21_held_proc_mtd_matches_78() -> Result<(), &'static str> {
@@ -232,7 +242,10 @@ pub fn admit_s19k_78_nand_env(env: &S19kNandEnv) -> Result<(), &'static str> {
     {
         return Err("`a lab unit` try_to_boot_bos_normally mismatch");
     }
-    if env.vars.get("try_to_boot_bos_after_install").map(String::as_str)
+    if env
+        .vars
+        .get("try_to_boot_bos_after_install")
+        .map(String::as_str)
         != Some(S19K_78_TRY_BOS_AFTER_INSTALL)
     {
         return Err("`a lab unit` try_to_boot_bos_after_install mismatch");
@@ -248,7 +261,9 @@ pub fn admit_s19k_78_nand_env(env: &S19kNandEnv) -> Result<(), &'static str> {
     }
     if env.vars.get("recovery_set_flag_2").map(String::as_str) != Some(S19K_78_RECOVERY_SET_FLAG_2)
     {
-        return Err("`a lab unit` recovery_set_flag_2 writes recovery_flag_first_boot then recovery_set_flag");
+        return Err(
+            "`a lab unit` recovery_set_flag_2 writes recovery_flag_first_boot then recovery_set_flag",
+        );
     }
     if env.vars.get("boot_bos").map(String::as_str) != Some(S19K_78_BOOT_BOS) {
         return Err("`a lab unit` boot_bos mismatch");
@@ -299,7 +314,9 @@ pub fn admit_s19k_78_nand_env(env: &S19kNandEnv) -> Result<(), &'static str> {
 }
 
 /// Interrupt policy from env. Does not invent a custom key sequence.
-pub fn classify_s19k_uboot_interrupt(env: &S19kNandEnv) -> Result<S19kUbootInterrupt, &'static str> {
+pub fn classify_s19k_uboot_interrupt(
+    env: &S19kNandEnv,
+) -> Result<S19kUbootInterrupt, &'static str> {
     if env.vars.contains_key("bootstopkey") || env.vars.contains_key("bootdelaykey") {
         return Err("custom bootstopkey/bootdelaykey present; refuse default any-key claim");
     }
@@ -457,6 +474,33 @@ pub fn admit_s19k_78_recovery_set_flag(env: &S19kNandEnv) -> Result<(), &'static
     Ok(())
 }
 
+/// Proves that the eraseblock used by the held `a lab unit` U-Boot
+/// `recovery_set_flag` command contains no data other than its first flag byte.
+///
+/// The vendor command erases 128 KiB and writes back only one byte. A DCENT
+/// installer must therefore refuse its `0x01 -> 0x02` first-boot path unless
+/// every adjacent byte is already erased (`0xFF`). This is an offline
+/// admission check, not permission to mutate NAND.
+pub fn admit_s19k_78_flag_eraseblock_exclusive(block: &[u8]) -> Result<(), &'static str> {
+    if block.len() != S19K_78_RECOVERY_FLAG_ERASE as usize {
+        return Err("S19k recovery-flag eraseblock must be exactly 128 KiB");
+    }
+    if !matches!(
+        block[0],
+        S19K_78_RECOVERY_FLAG_INSTALLED
+            | S19K_78_RECOVERY_FLAG_FIRST_BOOT
+            | S19K_78_RECOVERY_FLAG_SUCCESSFUL
+    ) {
+        return Err("S19k recovery-flag byte is not a held 0x01/0x02/0x03 state");
+    }
+    if block[1..].iter().any(|byte| *byte != 0xFF) {
+        return Err(
+            "S19k .78 U-Boot erase+writes one flag byte; adjacent non-FF data would be destroyed",
+        );
+    }
+    Ok(())
+}
+
 /// `0x02` falls through to `recover_to_stock`. It does not `bootm` mtd2.
 pub fn refuse_s19k_flag_02_as_direct_mtd2_boot(flag: u8) -> Result<(), &'static str> {
     if flag == S19K_78_RECOVERY_FLAG_FIRST_BOOT {
@@ -605,9 +649,7 @@ pub fn admit_s19k_78_recover_env_default_before_import() -> Result<(), &'static 
     let imp_i = cmd
         .find("env import -d -c")
         .ok_or("recover_env missing env import -d -c")?;
-    let save_i = cmd
-        .find("env save")
-        .ok_or("recover_env missing env save")?;
+    let save_i = cmd.find("env save").ok_or("recover_env missing env save")?;
     if !(read_i < def_i && def_i < imp_i && imp_i < save_i) {
         return Err("recover_env must nand-read, env default -a, import -d -c, then env save");
     }
@@ -631,10 +673,8 @@ pub fn refuse_s19k_uboot_compiled_defaults_as_nandrecovery_env() -> Result<(), &
 /// U-Boot 2015.01 `common/cmd_nvedit.c` `do_env_import` help.
 /// Held `a lab unit` `ver` is [`S19K_78_UBOOT_VERSION`]. Factory AML USB
 /// UBOOT item 2 has 0 of these strings (W379 classified as BL30).
-pub const S19K_UBOOT_2015_ENV_IMPORT_DASH_D: &str =
-    "delete existing environment before importing";
-pub const S19K_UBOOT_2015_ENV_IMPORT_DASH_C: &str =
-    "assume checksum protected environment format";
+pub const S19K_UBOOT_2015_ENV_IMPORT_DASH_D: &str = "delete existing environment before importing";
+pub const S19K_UBOOT_2015_ENV_IMPORT_DASH_C: &str = "assume checksum protected environment format";
 
 /// `a lab unit` `recover_env` is `env import -d -c` on U-Boot 2015.01:
 /// `-d` deletes existing env, `-c` is the CRC env blob format.
@@ -655,9 +695,7 @@ pub fn admit_s19k_78_recover_env_import_flags() -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_dry_run_as_env_import_dash_d() -> Result<(), &'static str> {
-    Err(
-        "DCENT [DRY RUN] is a host walk; U-Boot 2015.01 env import -d deletes existing env",
-    )
+    Err("DCENT [DRY RUN] is a host walk; U-Boot 2015.01 env import -d deletes existing env")
 }
 
 pub fn refuse_s19k_env_import_dash_c_as_continue() -> Result<(), &'static str> {
@@ -665,9 +703,7 @@ pub fn refuse_s19k_env_import_dash_c_as_continue() -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_zynq_do_env_import_as_78_recover_env() -> Result<(), &'static str> {
-    Err(
-        "20231108 BMU part01 do_env_import sits next to zynq_load/sdhci; not S19k AML recover_env",
-    )
+    Err("20231108 BMU part01 do_env_import sits next to zynq_load/sdhci; not S19k AML recover_env")
 }
 
 pub fn refuse_firstboot_as_mtd2_boot() -> Result<(), &'static str> {
@@ -689,7 +725,10 @@ pub fn refuse_androidboot_firstboot_as_fw_setenv(cmdline: &str) -> Result<(), &'
 /// `a lab unit` has `firstboot=1` **and** `androidboot.firstboot=1` in bootargs.
 /// Neither is consulted by `bootcmd`.
 pub fn admit_s19k_78_firstboot_unused_by_bootcmd(env: &S19kNandEnv) -> Result<(), &'static str> {
-    if env.vars.get(S19K_DCENT_FIRSTBOOT_ENV_KEY).map(String::as_str)
+    if env
+        .vars
+        .get(S19K_DCENT_FIRSTBOOT_ENV_KEY)
+        .map(String::as_str)
         != Some(S19K_78_FIRSTBOOT_ENV_VALUE)
     {
         return Err(".78 nand_env firstboot is 1 (present; unused by bootcmd)");
@@ -724,9 +763,7 @@ pub fn classify_s19k_stock_return_path(
 
 /// `FirstbootEnvFlip` is historical/S99, not an admitted `a lab unit` path.
 pub fn refuse_s19k_firstboot_env_flip_as_stock_return() -> Result<(), &'static str> {
-    Err(
-        "S19k stock-return is recover_to_stock via flag 0x02; FirstbootEnvFlip is not admitted",
-    )
+    Err("S19k stock-return is recover_to_stock via flag 0x02; FirstbootEnvFlip is not admitted")
 }
 
 /// `a lab unit` mtd3 is `stock_config` (UBI). `reserved` is a stale README name.
@@ -815,14 +852,22 @@ mod tests {
         assert!(admit_s19k_78_bootcmd_has_no_firstboot(S19K_78_BOOTCMD).is_ok());
         let bootcmd_plan = format_s19k_uboot_bootcmd_plan();
         assert!(admit_s19k_uboot_bootcmd_plan(&bootcmd_plan).is_ok());
-        assert_eq!(S19K_UBOOT_BOOTCMD_ARMS[0], S19kUbootBootcmdArm::TryBosNormally);
-        assert_eq!(S19K_UBOOT_BOOTCMD_ARMS[2], S19kUbootBootcmdArm::RecoverToStock);
+        assert_eq!(
+            S19K_UBOOT_BOOTCMD_ARMS[0],
+            S19kUbootBootcmdArm::TryBosNormally
+        );
+        assert_eq!(
+            S19K_UBOOT_BOOTCMD_ARMS[2],
+            S19kUbootBootcmdArm::RecoverToStock
+        );
         assert!(bootcmd_plan.contains("action0=BootBos"));
         assert!(bootcmd_plan.contains("action1=FirstBosThenSetFlag2"));
         assert!(bootcmd_plan.contains("action2=RecoverToStock"));
         assert!(admit_s19k_uboot_bootcmd_plan("arm0=only").is_err());
         assert!(admit_s19k_78_firstboot_unused_by_bootcmd(&env).is_ok());
-        assert!(admit_s19k_78_bootcmd_has_no_firstboot("run firstboot; run recover_to_stock").is_err());
+        assert!(
+            admit_s19k_78_bootcmd_has_no_firstboot("run firstboot; run recover_to_stock").is_err()
+        );
         assert!(refuse_firstboot_as_recover_to_stock().is_err());
         assert!(refuse_firstboot_as_mtd2_boot().is_err());
         assert!(refuse_recovery_flag_first_boot_name_as_fw_setenv().is_err());
@@ -892,7 +937,9 @@ mod tests {
         assert_eq!(S19K_78_BOOTDELAY, 1);
         assert!(S19K_78_TRY_BOS_AFTER_INSTALL.contains("recovery_set_flag_2"));
         assert!(admit_s19k_78_recovery_set_flag(&env).is_ok());
-        assert!(S19K_78_RECOVERY_SET_FLAG.contains("nand erase ${nandrecovery_flag_offset} 0x20000"));
+        assert!(
+            S19K_78_RECOVERY_SET_FLAG.contains("nand erase ${nandrecovery_flag_offset} 0x20000")
+        );
         assert!(S19K_78_RECOVERY_SET_FLAG_2.contains("recovery_flag_first_boot"));
         assert_eq!(S19K_78_RECOVERY_FLAG_ERASE, 0x2_0000);
         assert_eq!(
@@ -901,26 +948,27 @@ mod tests {
         );
         assert_eq!(S19K_78_NAND_ENV_CRC, 0x471D_6B1A);
         assert_eq!(S19K_78_PROC_MTD_SIZES.iter().sum::<u64>(), 0x0FA0_0000);
-        assert_eq!(
-            S19K_78_PROC_MTD_SIZES[..5].iter().sum::<u64>(),
-            0x0610_0000
-        );
+        assert_eq!(S19K_78_PROC_MTD_SIZES[..5].iter().sum::<u64>(), 0x0610_0000);
         assert_eq!(S19K_78_PROC_MTD_SIZES[0], 0x0020_0000);
         assert_eq!(S19K_78_PROC_MTD_SIZES[1], 0x0080_0000);
         assert!(admit_s19k_board_readme_mtd_sizes(
             "SoT 0x00200000 0x00800000 0x03200000 0x00500000 0x02000000 0x09900000"
         )
         .is_ok());
-        assert!(admit_s19k_board_readme_mtd_sizes("| 0   | bootloader | 0x00000000 | 4 MiB |").is_err());
+        assert!(
+            admit_s19k_board_readme_mtd_sizes("| 0   | bootloader | 0x00000000 | 4 MiB |").is_err()
+        );
     }
 
     #[test]
     fn s19k_recover_to_stock_erases_nvdata_after_recover_env() {
         assert!(admit_s19k_78_recover_erases_nvdata_after_recover_env().is_ok());
-        assert!(S19K_78_RECOVER_TO_STOCK.find("run recover_env").unwrap()
-            < S19K_78_RECOVER_TO_STOCK
-                .find("nand erase.part nvdata")
-                .unwrap());
+        assert!(
+            S19K_78_RECOVER_TO_STOCK.find("run recover_env").unwrap()
+                < S19K_78_RECOVER_TO_STOCK
+                    .find("nand erase.part nvdata")
+                    .unwrap()
+        );
         assert!(!S19K_78_PROC_MTD_NAMES.contains(&"nvdata"));
         assert_eq!(S19K_78_PROC_MTD_NAMES[4], "overlay");
         assert!(refuse_s19k_erase_nvdata_before_recover_env().is_err());
@@ -933,20 +981,40 @@ mod tests {
             .vars
             .insert("mtdparts".into(), "aml-nand:1m(boot)".into());
         assert!(admit_s19k_78_nand_env_has_no_mtdparts(&with_parts).is_err());
-        assert!(crate::s19k_aml_dtb::refuse_s19k_78_linux_mtd_as_uboot_nvdata(
-            S19K_78_PROC_MTD_NAMES
-        )
-        .is_err());
+        assert!(
+            crate::s19k_aml_dtb::refuse_s19k_78_linux_mtd_as_uboot_nvdata(S19K_78_PROC_MTD_NAMES)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn s19k_78_vendor_flag_rewrite_requires_an_exclusive_eraseblock() {
+        let mut block = vec![0xFF; S19K_78_RECOVERY_FLAG_ERASE as usize];
+        block[0] = S19K_78_RECOVERY_FLAG_SUCCESSFUL;
+        assert!(admit_s19k_78_flag_eraseblock_exclusive(&block).is_ok());
+
+        for state in [
+            S19K_78_RECOVERY_FLAG_INSTALLED,
+            S19K_78_RECOVERY_FLAG_FIRST_BOOT,
+            S19K_78_RECOVERY_FLAG_SUCCESSFUL,
+        ] {
+            block[0] = state;
+            assert!(admit_s19k_78_flag_eraseblock_exclusive(&block).is_ok());
+        }
+
+        block[0] = 0x00;
+        assert!(admit_s19k_78_flag_eraseblock_exclusive(&block).is_err());
+        block[0] = S19K_78_RECOVERY_FLAG_SUCCESSFUL;
+        block[0x1_FFFF] = 0x7A;
+        assert!(admit_s19k_78_flag_eraseblock_exclusive(&block).is_err());
+        assert!(admit_s19k_78_flag_eraseblock_exclusive(&block[..block.len() - 1]).is_err());
     }
 
     #[test]
     fn s19k_recover_env_defaults_before_import() {
         assert!(admit_s19k_78_recover_env_default_before_import().is_ok());
         let cmd = S19K_78_RECOVER_ENV;
-        assert!(
-            cmd.find("nand read 01060000").unwrap()
-                < cmd.find("env default -a").unwrap()
-        );
+        assert!(cmd.find("nand read 01060000").unwrap() < cmd.find("env default -a").unwrap());
         assert!(cmd.find("env default -a").unwrap() < cmd.find("env import -d -c").unwrap());
         assert!(cmd.find("env import -d -c").unwrap() < cmd.find("env save").unwrap());
         assert!(refuse_s19k_env_default_a_as_recover_env().is_err());

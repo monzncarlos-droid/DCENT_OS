@@ -1072,6 +1072,7 @@ mod tests {
         let back: AutotuneConfig = toml::from_str(&s).unwrap();
         assert_eq!(parent, back);
         assert!(back.bad_chip.enabled);
+        assert!(!back.bad_chip.actuate);
         assert_eq!(back.bad_chip.repeated_bad_windows, 3);
         // Other controllers untouched.
         assert!(!back.power_target.enabled);

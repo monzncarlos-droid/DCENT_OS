@@ -9,6 +9,19 @@
 //! 6. Reconnects with exponential backoff on disconnect
 //!
 //! Communication with the rest of dcentrald is via typed mpsc channels.
+//!
+//! # Hash-on-disconnect (three behaviors; this client implements #1)
+//!
+//! This is **not** a LuxOS `hash_on_disconnect` clone. See
+//! [`crate::types::HashOnDisconnectPolicy`]:
+//!
+//! 1. **disconnect-while-hashing** ([`KeepLastJob`](crate::types::HashOnDisconnectPolicy::KeepLastJob))
+//!    — **this V1 path.** Same-pool reconnect keeps the last job. The legacy
+//!    `hash_on_disconnect` bool is a log note, **not** a safety stop.
+//! 2. **stop-on-disconnect** ([`StopOnDisconnect`](crate::types::HashOnDisconnectPolicy::StopOnDisconnect))
+//!    — LuxOS-style work-cut / ePIC idle. **Not what our V1 flag does.**
+//! 3. **(future) pool-requested** ([`PoolRequested`](crate::types::HashOnDisconnectPolicy::PoolRequested))
+//!    — not implemented; refused fail-closed.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -83,6 +96,62 @@ fn shadow_failover_observe(
 
 fn no_notify_failover_due(last_notify_at: Instant, timeout: Duration, now: Instant) -> bool {
     !timeout.is_zero() && now.saturating_duration_since(last_notify_at) >= timeout
+}
+
+/// Upper bound on the in-session failover watchdog poll cadence. The historical
+/// hardcoded value; kept as the default so a shipped config (no-notify 300s,
+/// proactive-return disabled, reject-rate off) polls at exactly this cadence and
+/// is byte-identical to the pre-fix daemon.
+const FAILOVER_WATCHDOG_MAX_INTERVAL: Duration = Duration::from_secs(15);
+/// Lower bound so an aggressive/test config can't spin the watchdog into a busy
+/// loop.
+const FAILOVER_WATCHDOG_MIN_INTERVAL: Duration = Duration::from_millis(200);
+/// Poll cadence cap while reject-rate failover is armed — reject-rate is
+/// sample-based (no time window of its own), so this keeps detection prompt once
+/// the min-sample floor is crossed instead of waiting up to a full 15s tick.
+const FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Pool-failover robustness — responsive in-session watchdog cadence
+/// (pure → deterministically unit-tested).
+///
+/// The no-notify / reject-rate / proactive-primary-return checks all ride one
+/// periodic tick inside `run_session`. That tick used to be a fixed 15s, which
+/// meant a small configured window (e.g. an aggressive operator setting, or a
+/// deterministic test) could not fail over "within seconds" — the first check
+/// only landed 15s into the session, so the effective granularity of every
+/// time-based failover feature was 15s regardless of config.
+///
+/// This derives a cadence bounded to
+/// [`FAILOVER_WATCHDOG_MIN_INTERVAL`, `FAILOVER_WATCHDOG_MAX_INTERVAL`]: for each
+/// enabled TIME window (no-notify, proactive-primary-return) it targets ~4
+/// checks across the window (`window / 4`), and while reject-rate is armed it
+/// caps at [`FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL`]. `0` for a window means
+/// "disabled — don't tighten the cadence for it".
+///
+/// The shipped defaults (`no_notify_failover_secs = 300`, proactive-return
+/// disabled → `0`, `reject_rate_failover_pct = 0`) yield exactly
+/// `FAILOVER_WATCHDOG_MAX_INTERVAL`, so default cadence is unchanged. Only
+/// opt-in aggressive configs (a small no-notify window, an armed proactive
+/// return, or an enabled reject-rate) poll faster — strictly the intended
+/// direction of those opt-in features.
+fn failover_watchdog_interval(
+    no_notify_secs: u64,
+    proactive_primary_return_secs: u64,
+    reject_rate_enabled: bool,
+) -> Duration {
+    let mut interval = FAILOVER_WATCHDOG_MAX_INTERVAL;
+    for window in [no_notify_secs, proactive_primary_return_secs] {
+        if window > 0 {
+            interval = interval.min(Duration::from_secs(window) / 4);
+        }
+    }
+    if reject_rate_enabled {
+        interval = interval.min(FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL);
+    }
+    interval.clamp(
+        FAILOVER_WATCHDOG_MIN_INTERVAL,
+        FAILOVER_WATCHDOG_MAX_INTERVAL,
+    )
 }
 
 /// SW-03: Bitcoin consensus ntime drift window, in seconds. A block header's
@@ -791,6 +860,131 @@ mod no_notify_failover_tests {
 }
 
 #[cfg(test)]
+mod failover_watchdog_interval_tests {
+    use super::{
+        failover_watchdog_interval, FAILOVER_WATCHDOG_MAX_INTERVAL, FAILOVER_WATCHDOG_MIN_INTERVAL,
+        FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL,
+    };
+    use proptest::prelude::*;
+    use std::time::Duration;
+
+    #[test]
+    fn shipped_default_config_keeps_the_historical_15s_cadence() {
+        // no-notify default 300s, proactive-return disabled (0), reject-rate off.
+        // This is the load-bearing "default behavior unchanged" pin.
+        assert_eq!(
+            failover_watchdog_interval(300, 0, false),
+            FAILOVER_WATCHDOG_MAX_INTERVAL
+        );
+        assert_eq!(FAILOVER_WATCHDOG_MAX_INTERVAL, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn all_windows_disabled_is_the_max_interval() {
+        assert_eq!(
+            failover_watchdog_interval(0, 0, false),
+            FAILOVER_WATCHDOG_MAX_INTERVAL
+        );
+    }
+
+    #[test]
+    fn small_no_notify_window_tightens_cadence_to_a_quarter() {
+        // 4s window → ~4 checks across it → 1s cadence.
+        assert_eq!(
+            failover_watchdog_interval(4, 0, false),
+            Duration::from_secs(1)
+        );
+        // 1s window → quarter (250ms) is above the 200ms floor → 250ms.
+        assert_eq!(
+            failover_watchdog_interval(1, 0, false),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn large_no_notify_window_stays_capped_at_max() {
+        // 61s → quarter is >15s → capped at the 15s ceiling.
+        assert_eq!(
+            failover_watchdog_interval(61, 0, false),
+            FAILOVER_WATCHDOG_MAX_INTERVAL
+        );
+    }
+
+    #[test]
+    fn proactive_return_window_also_tightens_cadence() {
+        // no-notify disabled but proactive-return armed with a 2s cool-down →
+        // quarter = 500ms.
+        assert_eq!(
+            failover_watchdog_interval(0, 2, false),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn reject_rate_enabled_caps_cadence_even_with_default_no_notify() {
+        // Default no-notify (300s → 15s) with reject-rate armed drops to the
+        // reject-rate cap so a pathological session is caught promptly.
+        assert_eq!(
+            failover_watchdog_interval(300, 0, true),
+            FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL
+        );
+        assert_eq!(
+            FAILOVER_WATCHDOG_REJECT_RATE_INTERVAL,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn tightest_enabled_window_wins() {
+        // no-notify 8s (→2s) vs proactive 2s (→500ms) → the tighter 500ms wins;
+        // reject-rate cap (1s) does not loosen it.
+        assert_eq!(
+            failover_watchdog_interval(8, 2, true),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn never_busy_loops_below_the_floor() {
+        // A 1s window's quarter (250ms) is above the floor; a hypothetical
+        // sub-floor derivation is still clamped. Assert the floor is respected.
+        assert!(failover_watchdog_interval(1, 1, true) >= FAILOVER_WATCHDOG_MIN_INTERVAL);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// The cadence is always within the documented bounds and never panics,
+        /// for any config — including pathological huge windows.
+        #[test]
+        fn interval_is_always_bounded(
+            no_notify in 0u64..1_000_000,
+            proactive in 0u64..1_000_000,
+            reject in any::<bool>(),
+        ) {
+            let interval = failover_watchdog_interval(no_notify, proactive, reject);
+            prop_assert!(interval >= FAILOVER_WATCHDOG_MIN_INTERVAL);
+            prop_assert!(interval <= FAILOVER_WATCHDOG_MAX_INTERVAL);
+        }
+
+        /// Enabling a feature (a non-zero window, or reject-rate) can only ever
+        /// tighten (or leave unchanged) the cadence — never loosen it. This pins
+        /// the "opt-in features are strictly more responsive" contract.
+        #[test]
+        fn enabling_a_feature_never_loosens_cadence(
+            no_notify in 0u64..1_000,
+            proactive in 0u64..1_000,
+        ) {
+            let base = failover_watchdog_interval(no_notify, 0, false);
+            let with_proactive = failover_watchdog_interval(no_notify, proactive.max(1), false);
+            let with_reject = failover_watchdog_interval(no_notify, 0, true);
+            prop_assert!(with_proactive <= base);
+            prop_assert!(with_reject <= base);
+        }
+    }
+}
+
+#[cfg(test)]
 mod stable_primary_return_tests {
     use super::should_prefer_primary_return;
     use std::time::{Duration, Instant};
@@ -883,6 +1077,11 @@ enum SessionEndReason {
     UserSplitSwitch,
     /// Auto mode wants to leave V1 fallback and retry SV2.
     AutoRetrySv2,
+    /// Proactive stable-primary-return (LuxOS/bosminer `smart_switch` parity):
+    /// while mining healthily on a backup, the primary's anti-flap cool-down has
+    /// fully elapsed, so leave the (healthy) backup to re-try the higher-priority
+    /// primary pool. Drive-armed + default-OFF (see `proactive_primary_return_armed`).
+    PrimaryReturnDue,
     /// The active finite V1 extranonce2 domain was consumed.
     Extranonce2Exhausted {
         generation: WorkGeneration,
@@ -897,6 +1096,34 @@ enum SessionEndReason {
         port: u16,
         wait_seconds: u32,
     },
+    /// Share channel closed (daemon clean-stop / sysupgrade). Pending submits
+    /// were flushed and the write half was shut down; do not reconnect.
+    CleanStop,
+}
+
+/// Bound on waiting for in-flight `mining.submit` acks during a daemon
+/// clean-stop. Long enough for a LAN pool to ACK; short enough that a wedged
+/// pool cannot stall sysupgrade. Not a rail-cut proof.
+const CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Plan for pairing daemon clean-stop with the pool session.
+/// Host-testable: reconnect is always false; write-side shutdown is always
+/// requested; pending share + in-flight submits are flushed first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CleanStopFlushPlan {
+    submit_pending_share: bool,
+    await_pending_submit_acks: usize,
+    shutdown_write: bool,
+    reconnect: bool,
+}
+
+fn plan_clean_stop_flush(pending_share: bool, pending_submit_count: usize) -> CleanStopFlushPlan {
+    CleanStopFlushPlan {
+        submit_pending_share: pending_share,
+        await_pending_submit_acks: pending_submit_count.saturating_add(usize::from(pending_share)),
+        shutdown_write: true,
+        reconnect: false,
+    }
 }
 
 #[derive(Debug)]
@@ -1510,6 +1737,21 @@ impl StratumV1Client {
     /// drive arm is observe-equivalent for pool *advancement*; do not rely on it to
     /// change pools until an advancing trigger is wired here (itself a soak-gated
     /// behavior change). Pinned by `fov6_production_triggers_do_not_advance_under_drive`.
+    /// Whether the proactive stable-primary-return path (LuxOS/bosminer
+    /// `smart_switch` parity) is armed. **Default-OFF, opt-in, config-gated** —
+    /// requires BOTH `smart_failover_enabled` AND the `smart_failover_drive`
+    /// drive arm, the same explicit "let smart failover actively change pools"
+    /// gate the FSM-drive path already uses. With either off (the shipped
+    /// default) the client only returns to the primary reactively — when the
+    /// active backup itself faults AND the cool-down elapsed — exactly as today,
+    /// so default behavior is byte-identical. When armed, the client also leaves
+    /// a *healthy* backup to re-try a recovered higher-priority primary (matching
+    /// competitors that fail back proactively), still bounded by the
+    /// `primary_return_stability_secs` anti-flap window.
+    fn proactive_primary_return_armed(&self) -> bool {
+        self.config.smart_failover_enabled && self.config.smart_failover_drive
+    }
+
     fn shadow_observe_failover(&mut self, trigger: LuxosFailoverTrigger) {
         if !self.config.smart_failover_enabled {
             return;
@@ -2001,12 +2243,13 @@ impl StratumV1Client {
             primary_pool = %crate::pool_api::sanitize_pool_url(&self.config.pool1.url),
             worker = %dcentrald_common::wallet_mask::mask_wallet(&self.config.pool1.worker),
             version_rolling = self.config.version_rolling,
-            hash_on_disconnect = self.config.hash_on_disconnect,
-            "Stratum V1 client starting — connecting to pool to receive mining jobs and submit shares"
+            hash_on_disconnect_legacy_flag = self.config.hash_on_disconnect,
+            hash_on_disconnect_policy = %self.config.hash_on_disconnect_policy(),
+            "Stratum V1 client starting — connecting to pool to receive mining jobs and submit shares (hash-on-disconnect policy is keep_last_job; the legacy bool is a log note, not a LuxOS work-cut)"
         );
 
         if self.config.version_rolling {
-            info!("ASICBoost (BIP 310 version rolling) is ENABLED — this gives ~20% hashrate boost by rolling bits in the block header version field");
+            info!("ASICBoost (BIP320/BIP310 version rolling) is ENABLED — mask 0x1FFFE000; not a +20% hashrate product claim");
         }
 
         self.send_failover_status("startup", backoff.attempt(), 0)
@@ -2193,6 +2436,16 @@ impl StratumV1Client {
             }
 
             let user_failure_reason: String;
+            // POOL-FAILOVER FAST-ADVANCE (2026-08-16, R2): tracks whether THIS
+            // session ended on an EXPLICIT "this pool is bad" watchdog signal —
+            // `NoNotifyTimeout` (no `mining.notify` for the whole configured
+            // window) or `HighRejectRate` (opt-in reject-rate breach). Such a
+            // session already spent a full configured window proving the pool is
+            // bad, so a SINGLE one justifies advancing the pool (see the
+            // fast-advance gate below). Hoisted out of the `Ok(conn)` arm so it
+            // is readable at the pool-switch decision; stays `false` for connect
+            // errors and every ordinary fault.
+            let mut session_ended_in_failover_signal = false;
 
             match self
                 .connect_endpoint_with_share_drain(endpoint, CONNECT_TIMEOUT)
@@ -2249,7 +2502,29 @@ impl StratumV1Client {
                     // gate could never trip, stranding the miner on a broken pool.
                     // A genuinely healthy primary still resets (it submits shares
                     // and/or stays up), so normal reconnect/failover is unchanged.
+                    //
+                    // POOL-FAILOVER FIX (2026-08-16): a session that ended because
+                    // the no-notify watchdog fired (`NoNotifyTimeout`) or the
+                    // reject-rate watchdog fired (`HighRejectRate`) is an EXPLICIT
+                    // "this pool is bad" signal and must NEVER count as healthy —
+                    // regardless of how long it stayed connected. Before this fix a
+                    // stalled-but-connected pool (delivers one job, then goes silent
+                    // for the whole `no_notify_failover_secs` window) produced a
+                    // session whose uptime (>= the window, which in production is far
+                    // longer than `SESSION_HEALTHY_UPTIME`) tripped the "stayed up"
+                    // branch and reset the backoff EVERY cycle — so `attempt() >= 3`
+                    // never fired and the client never failed over to the backup.
+                    // The no-notify and reject-rate features ended the session but
+                    // could not switch pools. Excluding those two failover signals
+                    // from "healthy" is what lets the failure counter accumulate to a
+                    // real cutover. Ordinary disconnects on a genuinely healthy pool
+                    // (accepted shares / long clean uptime) still reset as before.
+                    session_ended_in_failover_signal = matches!(
+                        session_result,
+                        Err(SessionError::NoNotifyTimeout) | Err(SessionError::HighRejectRate)
+                    );
                     let session_was_healthy = session_delivered_work
+                        && !session_ended_in_failover_signal
                         && (session_accepted_share || session_uptime >= SESSION_HEALTHY_UPTIME);
                     if !is_donation && session_was_healthy {
                         backoff.reset();
@@ -2301,6 +2576,33 @@ impl StratumV1Client {
                                 self.user_split_switch_count.saturating_add(1);
                             self.send_hashrate_split_status(false).await;
                             continue; // No backoff on planned user split switch
+                        }
+                        Ok(SessionEndReason::PrimaryReturnDue) => {
+                            // Proactive stable-primary-return (drive-armed smart
+                            // failover). This is a PLANNED upgrade to a healthier,
+                            // higher-priority pool — not a failure — so it flushes
+                            // stale work, switches selection to the primary (pool
+                            // #1), and reconnects immediately with a clean backoff,
+                            // exactly like a donation/split switch. If the primary
+                            // is in fact still down, the normal connect-failure
+                            // failover re-arms the cool-down and rotates back to a
+                            // backup, so this can never tight-loop.
+                            self.flush_dispatcher_for_pool_switch(is_donation).await;
+                            self.current_pool_index = 0;
+                            self.failover_switch_count =
+                                self.failover_switch_count.saturating_add(1);
+                            self.last_failover_switch_reason =
+                                Some("proactive_primary_return".to_string());
+                            // We have acted on the cool-down; clear its arm so the
+                            // proactive return can't immediately re-fire. A fresh
+                            // primary failure re-arms it via the `attempt() >= 3`
+                            // block below.
+                            self.last_primary_failure_at = None;
+                            backoff.reset();
+                            self.send_failover_status("pool_switch", backoff.attempt(), 0)
+                                .await;
+                            self.send_hashrate_split_status(false).await;
+                            continue; // No failure backoff on a planned primary return
                         }
                         Ok(SessionEndReason::Extranonce2Exhausted {
                             generation,
@@ -2356,6 +2658,22 @@ impl StratumV1Client {
                                 pool = %crate::pool_api::sanitize_pool_url(&pool.url),
                                 "Pool session ended cleanly — will reconnect"
                             );
+                        }
+                        Ok(SessionEndReason::CleanStop) => {
+                            self.send_status(StratumStatus::StateChanged(
+                                StratumState::Disconnected,
+                            ))
+                            .await;
+                            {
+                                let mut stats = self.stats.lock().await;
+                                stats.connected = false;
+                                stats.shares_unresolved = self.pending_submits.len() as u64;
+                            }
+                            info!(
+                                pool = %crate::pool_api::sanitize_pool_url(&pool.url),
+                                "Pool session ended on daemon clean-stop after submit flush — not reconnecting"
+                            );
+                            return;
                         }
                         Ok(SessionEndReason::AutoRetrySv2) => {
                             user_failure_reason = "auto_retry_sv2".to_string();
@@ -2509,21 +2827,25 @@ impl StratumV1Client {
                 stats.connected = false;
             }
 
-            // POOL-3 (honest framing): on a same-pool reconnect the work
-            // dispatcher is NOT flushed (only a pool *switch* flushes it via
-            // flush_dispatcher_for_pool_switch), so the ASICs keep hashing the
-            // last job across the disconnect REGARDLESS of this flag. The
-            // `hash_on_disconnect` flag therefore does NOT act as a safety stop
-            // when false — it currently only governs whether we emit the
-            // informational note below. This is intentional for the
-            // space-heater posture (continuing to hash the last job prevents
-            // thermal shock from sudden power changes). Do not read the `false`
-            // case as "stops hashing on pool loss"; it does not. The actual
-            // "don't spin hot forever" backstop is the thermal supervisor
-            // (PID/threshold loop) — chips hashing stale work are bounded by
-            // measured temperature, not by pool connection state.
+            // Hash-on-disconnect trichotomy (DESK_NOW rank 12):
+            // 1. KeepLastJob / disconnect-while-hashing — THIS PATH. On a
+            //    same-pool reconnect the work dispatcher is NOT flushed (only a
+            //    pool *switch* flushes it via flush_dispatcher_for_pool_switch),
+            //    so ASICs keep hashing the last job REGARDLESS of the legacy
+            //    bool. That bool is a log note, not a safety stop.
+            // 2. StopOnDisconnect / LuxOS-style work-cut — NOT what our flag
+            //    does. ePIC idle_on_connection_lost is the same named idea.
+            //    Serial AM2 `enabled=false` can terminal-cut after a committed
+            //    UART job; that is a different surface.
+            // 3. PoolRequested — future; not implemented.
+            // Thermal supervisor (PID/threshold) is the "don't spin hot
+            // forever" backstop, not pool reachability.
+            debug_assert_eq!(
+                self.config.hash_on_disconnect_policy(),
+                crate::types::HashOnDisconnectPolicy::KeepLastJob
+            );
             if self.config.hash_on_disconnect && self.last_job.is_some() {
-                info!("Hash-on-disconnect note — ASICs continue hashing the last job while we reconnect. This prevents thermal shock from sudden power changes and doesn't waste electricity. (Note: a same-pool reconnect keeps the last job active regardless of this flag; only a pool switch flushes work.)");
+                info!("Hash-on-disconnect note (policy=keep_last_job, not LuxOS work-cut) — ASICs continue hashing the last job while we reconnect. A same-pool reconnect keeps the last job active regardless of the legacy flag; only a pool switch flushes work. Setting the flag false does not stop hashing.");
             }
 
             if matches!(sv2_retry_deadline, Some(deadline) if Instant::now() >= deadline) {
@@ -2536,7 +2858,32 @@ impl StratumV1Client {
             // in this failure cycle. When wrapping back to the first pool (full
             // cycle complete), keep the backoff accumulating to avoid rapid cycling
             // when all pools are down.
-            if !self.user_split_enabled && backoff.attempt() >= 3 {
+            //
+            // POOL-FAILOVER FAST-ADVANCE (2026-08-16, R2): ORDINARY reconnect
+            // faults (TCP drop, connect/handshake error, auth-fail, clean
+            // disconnect, …) still require `attempt() >= 3` consecutive failures
+            // before cutover — ordinary reconnect aggressiveness is UNCHANGED.
+            // But a session that ended on an EXPLICIT failover watchdog signal
+            // (`NoNotifyTimeout` / `HighRejectRate`) already burned a full
+            // configured window proving the pool is bad, so ONE such session is
+            // enough to advance — closing the ~4×-window cutover lag the previous
+            // "needs 3 bad sessions" gate imposed at shipped defaults. The
+            // features that PRODUCE those signals are themselves the config gate
+            // (`no_notify_failover_secs > 0`, `reject_rate_failover_pct > 0`), so
+            // this rides the existing failover gating with no new knob and can
+            // only make an already-opted-in operator FASTER. `pool_count > 1`
+            // keeps a single-pool setup byte-identical (nothing to advance to →
+            // it stays on the ordinary path). The stable-primary-return anti-flap
+            // window below is still the oscillation guard: each such cutover
+            // costs a full watchdog window, so pools cannot cycle faster than the
+            // configured window.
+            let ordinary_failover_ready = backoff.attempt() >= 3;
+            let fast_failover_ready = session_ended_in_failover_signal && pool_count > 1;
+            if !self.user_split_enabled && (ordinary_failover_ready || fast_failover_ready) {
+                // True only when the explicit-bad-pool signal is what makes us
+                // eligible THIS cycle (the ordinary 3-failure gate has not yet
+                // tripped). Used purely for honest switch telemetry below.
+                let explicit_bad_pool_advance = fast_failover_ready && !ordinary_failover_ready;
                 // Arm the stable-primary-return cool-down the moment we
                 // fail off the primary itself.
                 if self.current_pool_index == 0 {
@@ -2587,8 +2934,17 @@ impl StratumV1Client {
                 } else {
                     self.flush_dispatcher_for_pool_switch(is_donation).await;
                     self.failover_switch_count = self.failover_switch_count.saturating_add(1);
-                    self.last_failover_switch_reason =
-                        Some("consecutive_failure_threshold".to_string());
+                    // Honest telemetry: distinguish a single-cycle "explicit bad
+                    // pool" cutover from the ordinary 3-consecutive-failure gate.
+                    let (switch_reason, switch_detail) = if explicit_bad_pool_advance {
+                        (
+                            "explicit_bad_pool_signal",
+                            "an explicit no-notify/reject-rate failover signal",
+                        )
+                    } else {
+                        ("consecutive_failure_threshold", "3 consecutive failures")
+                    };
+                    self.last_failover_switch_reason = Some(switch_reason.to_string());
                     let next_pool = self.get_pool_config(next);
                     // TEL-1: pool URL can carry `user:pass@` — sanitize for BOTH the
                     // structured field and the interpolated message body.
@@ -2597,8 +2953,8 @@ impl StratumV1Client {
                         old_pool = self.current_pool_index + 1,
                         new_pool = next + 1,
                         new_url = %next_pool_display,
-                        "Failover: switching to pool #{} ({}) after 3 consecutive failures on pool #{}",
-                        next + 1, next_pool_display, self.current_pool_index + 1,
+                        "Failover: switching to pool #{} ({}) after {} on pool #{}",
+                        next + 1, next_pool_display, switch_detail, self.current_pool_index + 1,
                     );
                     backoff.reset();
                 }
@@ -2658,7 +3014,7 @@ impl StratumV1Client {
 
         // Step 1: mining.configure (version rolling / ASICBoost, optional)
         // BIP 310: We tell the pool which version bits we want to roll. The pool
-        // responds with the mask it allows. This enables ASICBoost (~20% hashrate gain).
+        // responds with the mask it allows. This enables BIP320 version rolling.
         if self.config.version_rolling {
             info!(
                 requested_mask = format_args!("0x{:08X}", self.config.version_rolling_mask),
@@ -2800,7 +3156,7 @@ impl StratumV1Client {
                             // Parse version rolling response — the pool tells us which
                             // bits in the block version field we're allowed to roll.
                             // These rolled bits let ASICs explore more nonce space
-                            // (ASICBoost / BIP 310), giving ~20% hashrate boost.
+                            // (ASICBoost / BIP320). Do not claim a +20% hashrate product.
                             if let Some(result) = result {
                                 if let Some(mask) =
                                     result.get("version-rolling.mask").and_then(|v| v.as_str())
@@ -3010,6 +3366,7 @@ impl StratumV1Client {
 
         // Measure session start for uptime tracking
         let session_start = Instant::now();
+        let mut share_rx_open = true;
 
         // === MINING LOOP ===
         // Process pool messages and submit shares concurrently.
@@ -3044,7 +3401,21 @@ impl StratumV1Client {
         // decides. Conservative default; reuses the existing failover path.
         let no_notify_failover_secs = self.config.no_notify_failover_secs;
         let mut last_notify_at = Instant::now();
-        let mut no_notify_check = tokio::time::interval(Duration::from_secs(15));
+        // Responsive watchdog cadence: when the proactive-primary-return path is
+        // armed its cool-down window also drives the tick, and while reject-rate
+        // failover is enabled the cadence tightens so a pathological session is
+        // caught promptly. Default config (no-notify 300s, proactive-return off,
+        // reject-rate off) still resolves to the historical 15s tick.
+        let watchdog_proactive_return_secs = if self.proactive_primary_return_armed() {
+            self.config.primary_return_stability_secs
+        } else {
+            0
+        };
+        let mut no_notify_check = tokio::time::interval(failover_watchdog_interval(
+            no_notify_failover_secs,
+            watchdog_proactive_return_secs,
+            self.config.reject_rate_failover_pct > 0,
+        ));
         no_notify_check.tick().await; // consume the immediate first tick
 
         // Pool-failover increment 3: reject-rate failover (opt-in,
@@ -3210,6 +3581,11 @@ impl StratumV1Client {
                     self.user_split_secondary_shares =
                         self.user_split_secondary_shares.saturating_add(1);
                 }
+            }
+
+            if !share_rx_open {
+                self.flush_pending_submits_on_clean_stop(&mut conn).await;
+                return Ok(SessionEndReason::CleanStop);
             }
 
             tokio::select! {
@@ -3537,7 +3913,7 @@ impl StratumV1Client {
                 // Submit shares from the mining pipeline.
                 // A share is a proof-of-work that meets the pool's difficulty target.
                 // The ASIC found a nonce that makes SHA256d(block_header) <= share_target.
-                share = self.share_rx.recv() => {
+                share = self.share_rx.recv(), if share_rx_open => {
                     match share {
                         Some(share) => {
                             // The active Stratum session is authoritative for the
@@ -3548,14 +3924,19 @@ impl StratumV1Client {
                             });
                         }
                         None => {
-                            // Share channel closed — daemon shutting down
+                            // Share channel closed — daemon clean-stop / sysupgrade.
+                            // Flush the in-flight submit (if any) on the next loop
+                            // tick, drain pending acks, then TCP-FIN the write
+                            // half so the pool is not left hanging on RST.
+                            share_rx_open = false;
                             let uptime = session_start.elapsed();
                             info!(
                                 session_secs = uptime.as_secs(),
-                                "Share channel closed (daemon shutting down). Pool session lasted {:.0}s.",
+                                pending_share = self.pending_share.is_some(),
+                                pending_submits = self.pending_submits.len(),
+                                "Share channel closed (daemon clean-stop). Flushing submits then disconnecting. Pool session lasted {:.0}s.",
                                 uptime.as_secs_f32(),
                             );
-                            return Ok(SessionEndReason::Clean);
                         }
                     }
                 }
@@ -3598,6 +3979,35 @@ impl StratumV1Client {
                     return Ok(SessionEndReason::AutoRetrySv2);
                 }
                 _ = no_notify_check.tick() => {
+                    // Proactive stable-primary-return (LuxOS/bosminer `smart_switch`
+                    // parity; drive-armed, default-OFF). While mining HEALTHILY on a
+                    // backup, once the primary's anti-flap cool-down has fully
+                    // elapsed, leave the backup to re-try the higher-priority primary
+                    // — matching competitors that fail back to a recovered primary
+                    // without waiting for the backup to fault. `should_prefer_primary_return`
+                    // supplies the same hysteresis window used by the reactive path,
+                    // so the two returns share one anti-flap contract and the client
+                    // cannot oscillate faster than `primary_return_stability_secs`.
+                    if self.proactive_primary_return_armed()
+                        && self.current_pool_index != 0
+                        && should_prefer_primary_return(
+                            self.current_pool_index,
+                            self.last_primary_failure_at,
+                            Duration::from_secs(self.config.primary_return_stability_secs),
+                            Instant::now(),
+                        )
+                    {
+                        let uptime = session_start.elapsed();
+                        info!(
+                            session_secs = uptime.as_secs(),
+                            current_pool_index = self.current_pool_index,
+                            cooldown_s = self.config.primary_return_stability_secs,
+                            "Proactive stable-primary-return: primary anti-flap cool-down elapsed — \
+                             leaving healthy backup pool #{} to re-try primary pool #1",
+                            self.current_pool_index + 1,
+                        );
+                        return Ok(SessionEndReason::PrimaryReturnDue);
+                    }
                     if no_notify_failover_due(
                         last_notify_at,
                         Duration::from_secs(no_notify_failover_secs),
@@ -4478,6 +4888,72 @@ impl StratumV1Client {
         );
         self.pending_submits.clear();
         orphaned_count
+    }
+
+    /// Drain in-flight `mining.submit` acks then half-close the write side.
+    ///
+    /// Called only on daemon clean-stop (share channel closed). Does not mint
+    /// `VerifiedRailCut`. Timed out acks stay unresolved in the stats.
+    async fn flush_pending_submits_on_clean_stop(&mut self, conn: &mut StratumConnection) {
+        let plan = plan_clean_stop_flush(self.pending_share.is_some(), self.pending_submits.len());
+        debug_assert!(
+            !plan.reconnect && plan.shutdown_write,
+            "clean-stop must FIN the pool session and must not reconnect"
+        );
+        let deadline = Instant::now() + CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT;
+        while !self.pending_submits.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    orphaned = self.pending_submits.len(),
+                    timeout_ms = CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT.as_millis() as u64,
+                    "Clean-stop submit flush timed out; remaining acks are unresolved (not VerifiedRailCut)"
+                );
+                break;
+            }
+            match tokio::time::timeout(remaining, conn.read_line()).await {
+                Ok(Ok(Some(line))) => match parse_pool_message(&line) {
+                    Ok(PoolMessage::Response { id, result, error }) => {
+                        let _ = self.handle_submit_response(id, result, error).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        debug!(
+                            %error,
+                            line_len = line.len(),
+                            "Skipping un-parseable pool line during clean-stop flush"
+                        );
+                    }
+                },
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        if plan.shutdown_write {
+            if let Err(error) = conn.shutdown_write().await {
+                warn!(
+                    %error,
+                    "Clean-stop write-half shutdown failed; pool may still see a reset"
+                );
+            } else {
+                info!("Clean-stop flushed submits and shut down the Stratum write half");
+            }
+            // Drain unread pool bytes before Drop. Unread data on the read
+            // half turns a TCP FIN into RST, which is the "upgrade OK, pool
+            // hanging" failure this flush exists to prevent.
+            let drain_deadline = Instant::now() + CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT;
+            loop {
+                let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, conn.read_line()).await {
+                    Ok(Ok(Some(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+        let mut stats = self.stats.lock().await;
+        stats.shares_unresolved = self.pending_submits.len() as u64;
     }
 
     /// Get the pool configuration for the given index.
@@ -6841,6 +7317,895 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Two-endpoint e2e failover: no-notify stall, high reject-rate, and
+    // proactive stable-primary-return (2026-08-16). These exercise the real
+    // run-loop over two real TCP loopback pools (primary + backup), proving
+    // the cutover behaviors the recon flagged as unproven-e2e. The no-notify
+    // and reject-rate cutovers depend on the POOL-FAILOVER health-reset fix
+    // (a session ended by NoNotifyTimeout/HighRejectRate is never "healthy",
+    // so the failure counter accumulates to a real switch) AND the responsive
+    // `failover_watchdog_interval` (so detection lands within seconds instead
+    // of the fixed 15s tick). Each would FAIL without those changes.
+    // ---------------------------------------------------------------------
+
+    /// A primary that completes the handshake, authorizes, delivers ONE
+    /// `mining.notify`, then holds the socket open forever WITHOUT sending any
+    /// further job — the classic "stalled pool" (TCP is fine, jobs stopped). It
+    /// keeps draining inbound lines so the connection never drops on its own; the
+    /// only thing that ends the session is the client's no-notify watchdog.
+    async fn spawn_authorize_then_silent_pool(job_id: &'static str) -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authorize-then-silent mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(128);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = requests_tx.send(line.clone()).await;
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                        match method {
+                            "mining.configure" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(
+                                            id,
+                                            json!({
+                                                "version-rolling": true,
+                                                "version-rolling.mask": "1fffe000",
+                                            }),
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.subscribe" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(id, json!([[], "deadbeef", 4])).as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.authorize" => {
+                                let _ = writer
+                                    .write_all(response_line(id, Value::Bool(true)).as_bytes())
+                                    .await;
+                                // Exactly one job, then eternal silence. The
+                                // socket stays open (we keep draining below), so
+                                // ONLY the no-notify watchdog can end the session.
+                                let _ =
+                                    writer.write_all(notify_line(job_id, true).as_bytes()).await;
+                                let _ = writer.flush().await;
+                            }
+                            _ => {}
+                        }
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{}", port),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// A genuinely HEALTHY pool that keeps a session alive under an aggressive
+    /// no-notify window: it handshakes, authorizes, and then sends a fresh
+    /// `mining.notify` every 250ms (keepalive) so the client's no-notify watchdog
+    /// never trips. Accepts every submit. Used as a stable backup in the
+    /// no-notify cutover test (a single-notify backup would itself trip the 1s
+    /// window and cause primary<->backup oscillation).
+    async fn spawn_healthy_keepalive_pool(job_id: &'static str) -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind healthy-keepalive mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(256);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    let mut notify_tick = tokio::time::interval(Duration::from_millis(250));
+                    let mut authorized = false;
+                    loop {
+                        tokio::select! {
+                            line = lines.next_line() => {
+                                let Ok(Some(line)) = line else { break; };
+                                let _ = requests_tx.send(line.clone()).await;
+                                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                                    continue;
+                                };
+                                let method =
+                                    value.get("method").and_then(Value::as_str).unwrap_or("");
+                                let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                                match method {
+                                    "mining.configure" => {
+                                        let _ = writer
+                                            .write_all(
+                                                response_line(
+                                                    id,
+                                                    json!({
+                                                        "version-rolling": true,
+                                                        "version-rolling.mask": "1fffe000",
+                                                    }),
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await;
+                                    }
+                                    "mining.subscribe" => {
+                                        let _ = writer
+                                            .write_all(
+                                                response_line(id, json!([[], "deadbeef", 4]))
+                                                    .as_bytes(),
+                                            )
+                                            .await;
+                                    }
+                                    "mining.authorize" => {
+                                        let _ = writer
+                                            .write_all(
+                                                response_line(id, Value::Bool(true)).as_bytes(),
+                                            )
+                                            .await;
+                                        let _ = writer
+                                            .write_all(notify_line(job_id, true).as_bytes())
+                                            .await;
+                                        authorized = true;
+                                    }
+                                    "mining.submit" => {
+                                        let _ = writer
+                                            .write_all(
+                                                response_line(id, Value::Bool(true)).as_bytes(),
+                                            )
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                                let _ = writer.flush().await;
+                            }
+                            _ = notify_tick.tick(), if authorized => {
+                                let _ = writer
+                                    .write_all(notify_line(job_id, false).as_bytes())
+                                    .await;
+                                let _ = writer.flush().await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{}", port),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// A primary that handshakes/authorizes/delivers a job normally but REJECTS
+    /// every `mining.submit` (non-auth-fatal code 23, "low difficulty"). Drives
+    /// the reject-rate failover path.
+    async fn spawn_reject_all_submits_pool(job_id: &'static str) -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reject-all-submits mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(256);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = requests_tx.send(line.clone()).await;
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                        match method {
+                            "mining.configure" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(
+                                            id,
+                                            json!({
+                                                "version-rolling": true,
+                                                "version-rolling.mask": "1fffe000",
+                                            }),
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.subscribe" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(id, json!([[], "deadbeef", 4])).as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.authorize" => {
+                                let _ = writer
+                                    .write_all(response_line(id, Value::Bool(true)).as_bytes())
+                                    .await;
+                                let _ = writer.flush().await;
+                                let _ = writer
+                                    .write_all(
+                                        json!({
+                                            "id": Value::Null,
+                                            "method": "mining.set_difficulty",
+                                            "params": [1.0],
+                                        })
+                                        .to_string()
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                                let _ = writer.write_all(b"\n").await;
+                                let _ =
+                                    writer.write_all(notify_line(job_id, true).as_bytes()).await;
+                                let _ = writer.flush().await;
+                            }
+                            "mining.submit" => {
+                                // Non-auth-fatal reject: code 23 "low difficulty".
+                                let _ = writer
+                                    .write_all(
+                                        json!({
+                                            "id": id,
+                                            "result": false,
+                                            "error": [23, "low difficulty share", Value::Null],
+                                        })
+                                        .to_string()
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                                let _ = writer.write_all(b"\n").await;
+                            }
+                            _ => {}
+                        }
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{}", port),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// A primary that is DOWN (accepts the TCP connection then immediately closes
+    /// it — dead backend) for the first `down_for`, then RECOVERS into a healthy
+    /// pool (handshake + a job + stays connected). Used to prove proactive
+    /// stable-primary-return: the client fails over to the backup while this is
+    /// down, then returns here once it has recovered.
+    async fn spawn_down_then_healthy_pool(job_id: &'static str, down_for: Duration) -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind down-then-healthy mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(128);
+        let recover_at = Instant::now() + down_for;
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                if Instant::now() < recover_at {
+                    // Still "down": drop the freshly-accepted socket → the client
+                    // sees EOF mid-handshake and counts a failure.
+                    drop(stream);
+                    continue;
+                }
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = requests_tx.send(line.clone()).await;
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                        match method {
+                            "mining.configure" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(
+                                            id,
+                                            json!({
+                                                "version-rolling": true,
+                                                "version-rolling.mask": "1fffe000",
+                                            }),
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.subscribe" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(id, json!([[], "deadbeef", 4])).as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.authorize" => {
+                                let _ = writer
+                                    .write_all(response_line(id, Value::Bool(true)).as_bytes())
+                                    .await;
+                                let _ =
+                                    writer.write_all(notify_line(job_id, true).as_bytes()).await;
+                                let _ = writer.flush().await;
+                                // Stay connected + healthy: keep draining below.
+                            }
+                            "mining.submit" => {
+                                let _ = writer
+                                    .write_all(response_line(id, Value::Bool(true)).as_bytes())
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{}", port),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// Two-endpoint e2e: a primary that completes the handshake and then STALLS
+    /// (no more `mining.notify`) must fail the session on the no-notify watchdog
+    /// and, after the consecutive-failure threshold, cut over to the healthy
+    /// backup. Regression-proves BOTH the health-reset fix (a NoNotifyTimeout
+    /// session must not reset the backoff) and the responsive watchdog cadence.
+    #[tokio::test]
+    async fn mock_primary_no_notify_stall_switches_to_backup() {
+        let primary = spawn_authorize_then_silent_pool("stalled-primary-job").await;
+        // The backup keeps notifying so it does NOT itself trip the aggressive
+        // 1s no-notify window (a single-notify backup would oscillate).
+        let backup = spawn_healthy_keepalive_pool("no-notify-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = primary.url.clone();
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        // Aggressive but valid opt-in window so the test runs in seconds.
+        config.no_notify_failover_secs = 1;
+
+        let (job_tx, mut job_rx) = mpsc::channel(64);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        let returned = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.run_until_sv2_retry(Duration::from_secs(8)),
+        )
+        .await
+        .expect("client should return before test timeout");
+        assert_eq!(
+            returned.current_pool_index, 1,
+            "a stalled (no-notify) primary must eventually fail over to the backup"
+        );
+        drop(returned);
+
+        let mut jobs = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            jobs.push(job);
+        }
+        assert!(
+            jobs.iter().any(|job| job.job_id == "no-notify-backup-job"),
+            "backup pool must deliver work after the no-notify cutover"
+        );
+        let _ = finish_mock_pool(primary).await;
+
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        assert!(
+            statuses.iter().any(|status| matches!(
+                status,
+                StratumStatus::PoolFailoverUpdated(failover)
+                    if failover.event == "pool_switch" && failover.active_pool_index == 1
+            )),
+            "a pool_switch to the backup must be emitted after the no-notify stall"
+        );
+
+        let backup_requests = finish_mock_pool(backup).await;
+        assert!(backup_requests
+            .iter()
+            .any(|request| request.contains("user.backup")));
+    }
+
+    /// R2 SINGLE-CYCLE CUTOVER (2026-08-16): the fast-advance closes the gap the
+    /// reviewer flagged — at shipped defaults an explicit failover signal used to
+    /// need ~4 bad sessions (≈4× the configured window) to trip the `>= 3` gate.
+    /// A `NoNotifyTimeout` session already waited the FULL configured window
+    /// proving the pool is bad, so ONE such session must now advance the pool.
+    ///
+    /// This mirrors `mock_primary_no_notify_stall_switches_to_backup` but asserts
+    /// the STRONGER single-cycle property: the primary receives EXACTLY ONE full
+    /// handshake before cutover (under the old `>= 3` behavior it would have been
+    /// ~4), the client lands on the backup after that one bad session, and the
+    /// switch reason is the dedicated `explicit_bad_pool_signal` (not the ordinary
+    /// `consecutive_failure_threshold`).
+    #[tokio::test]
+    async fn mock_no_notify_single_bad_session_switches_to_backup() {
+        let primary = spawn_authorize_then_silent_pool("single-cycle-primary-job").await;
+        // Healthy keepalive backup so it never trips the aggressive 1s window.
+        let backup = spawn_healthy_keepalive_pool("single-cycle-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = primary.url.clone();
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        // Aggressive but valid opt-in no-notify window so the test runs in
+        // seconds; reject-rate disabled so no-notify is the only signal.
+        config.no_notify_failover_secs = 1;
+        config.reject_rate_failover_pct = 0;
+
+        let (job_tx, mut job_rx) = mpsc::channel(64);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        let returned = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.run_until_sv2_retry(Duration::from_secs(8)),
+        )
+        .await
+        .expect("client should return before test timeout");
+        assert_eq!(
+            returned.current_pool_index, 1,
+            "ONE no-notify (explicit-bad-pool) session must fail over to the backup"
+        );
+        drop(returned);
+
+        // Backup must have delivered work after the single-cycle cutover.
+        let mut jobs = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            jobs.push(job);
+        }
+        assert!(
+            jobs.iter()
+                .any(|job| job.job_id == "single-cycle-backup-job"),
+            "backup pool must deliver work after the single-cycle cutover"
+        );
+
+        // THE single-cycle proof: the primary was handshaked EXACTLY ONCE —
+        // the client advanced after ONE bad session, not the ~4 the old
+        // `attempt() >= 3` gate would have required.
+        let primary_requests = finish_mock_pool(primary).await;
+        let primary_handshakes = primary_requests
+            .iter()
+            .filter(|request| request.contains("\"method\":\"mining.subscribe\""))
+            .count();
+        assert_eq!(
+            primary_handshakes, 1,
+            "single-cycle cutover: the primary must be tried exactly ONCE before \
+             advancing on the explicit no-notify signal (old `>= 3` behavior would \
+             be ~4) — got {primary_handshakes}"
+        );
+
+        // The switch must carry the dedicated fast-advance reason, proving the
+        // single-cycle path fired (not the ordinary consecutive-failure gate).
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        let switch = statuses
+            .iter()
+            .find_map(|status| match status {
+                StratumStatus::PoolFailoverUpdated(failover) if failover.event == "pool_switch" => {
+                    Some(failover)
+                }
+                _ => None,
+            })
+            .expect("a pool_switch to the backup must be emitted");
+        assert_eq!(switch.active_pool_index, 1);
+        assert_eq!(
+            switch.last_switch_reason.as_deref(),
+            Some("explicit_bad_pool_signal"),
+            "a single-cycle no-notify cutover must report the fast-advance reason"
+        );
+
+        let backup_requests = finish_mock_pool(backup).await;
+        assert!(backup_requests
+            .iter()
+            .any(|request| request.contains("user.backup")));
+    }
+
+    /// A primary that completes the handshake + authorize then IMMEDIATELY drops
+    /// the socket (EOF, no job) — an ORDINARY transient reconnect fault
+    /// (`SessionError::Disconnected`), NEVER a no-notify/reject-rate failover
+    /// signal. Records every request line so a test can count how many full
+    /// handshakes the client made before it gave up on this pool.
+    async fn spawn_authorize_then_drop_pool() -> MockPool {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authorize-then-drop mock pool");
+        let port = listener.local_addr().expect("mock local addr").port();
+        let (requests_tx, requests_rx) = mpsc::channel(256);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = requests_tx.send(line.clone()).await;
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = value.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+                        match method {
+                            "mining.configure" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(
+                                            id,
+                                            json!({
+                                                "version-rolling": true,
+                                                "version-rolling.mask": "1fffe000",
+                                            }),
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.subscribe" => {
+                                let _ = writer
+                                    .write_all(
+                                        response_line(id, json!([[], "deadbeef", 4])).as_bytes(),
+                                    )
+                                    .await;
+                            }
+                            "mining.authorize" => {
+                                let _ = writer
+                                    .write_all(response_line(id, Value::Bool(true)).as_bytes())
+                                    .await;
+                                let _ = writer.flush().await;
+                                // Ordinary fault: drop the socket right after
+                                // authorize (no job dispatched) → the client sees
+                                // EOF in the mining loop → SessionError::Disconnected.
+                                // The session delivered no work, so it is never
+                                // "healthy" and the failure counter accumulates.
+                                return;
+                            }
+                            _ => {}
+                        }
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+        });
+
+        MockPool {
+            url: format!("stratum+tcp://127.0.0.1:{}", port),
+            requests_rx,
+            task,
+        }
+    }
+
+    /// R2 NEGATIVE CONTROL (2026-08-16): ORDINARY transient reconnect faults
+    /// (here: repeated post-authorize EOF → `SessionError::Disconnected`) must
+    /// STILL require the `>= 3` consecutive-failure gate — the single-cycle
+    /// fast-advance is reserved for explicit no-notify/reject-rate signals only.
+    /// Both signals are DISABLED here, so the only way to cut over is the ordinary
+    /// gate; the primary must therefore be retried multiple times (≈4) before the
+    /// switch — proving no over-eager switching / no flapping on ordinary faults.
+    #[tokio::test]
+    async fn mock_ordinary_reconnect_faults_still_require_consecutive_gate() {
+        let primary = spawn_authorize_then_drop_pool().await;
+        let backup = spawn_healthy_keepalive_pool("ordinary-fault-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = primary.url.clone();
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        // BOTH explicit failover signals OFF: the only path to a switch is the
+        // ordinary consecutive-failure gate. This isolates the negative property.
+        config.no_notify_failover_secs = 0;
+        config.reject_rate_failover_pct = 0;
+
+        let (job_tx, _job_rx) = mpsc::channel(64);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        let returned = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.run_until_sv2_retry(Duration::from_secs(8)),
+        )
+        .await
+        .expect("client should return before test timeout");
+        // It DOES eventually fail over (the primary faults every session) …
+        assert_eq!(
+            returned.current_pool_index, 1,
+            "repeated ordinary faults must eventually fail over to the backup"
+        );
+        drop(returned);
+
+        // … but ONLY after MORE than one full handshake on the primary. Under a
+        // (wrong) single-cycle advance this would be exactly 1; the `>= 3` gate
+        // makes it ~4. `>= 3` is the load-bearing negative assertion.
+        let primary_requests = finish_mock_pool(primary).await;
+        let primary_handshakes = primary_requests
+            .iter()
+            .filter(|request| request.contains("\"method\":\"mining.subscribe\""))
+            .count();
+        assert!(
+            primary_handshakes >= 3,
+            "ordinary faults must retry the SAME pool (>= 3 consecutive) before \
+             switching — a single-cycle advance would be 1; got {primary_handshakes}"
+        );
+
+        // The cutover reason must be the ordinary-threshold reason, NOT the
+        // explicit-bad-pool fast-advance reason.
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        let switch = statuses
+            .iter()
+            .find_map(|status| match status {
+                StratumStatus::PoolFailoverUpdated(failover) if failover.event == "pool_switch" => {
+                    Some(failover)
+                }
+                _ => None,
+            })
+            .expect("a pool_switch must be emitted after repeated ordinary faults");
+        assert_eq!(switch.active_pool_index, 1);
+        assert_eq!(
+            switch.last_switch_reason.as_deref(),
+            Some("consecutive_failure_threshold"),
+            "ordinary faults must switch via the consecutive-failure gate, not the \
+             single-cycle fast-advance signal"
+        );
+
+        let _ = finish_mock_pool(backup).await;
+    }
+
+    /// Two-endpoint e2e: a primary that delivers work but REJECTS every share
+    /// must trip the (opt-in) reject-rate failover and cut over to a backup that
+    /// accepts. Drives real shares from a feeder task keyed to each dispatched
+    /// job's live work generation. Also depends on the health-reset fix.
+    #[tokio::test]
+    async fn mock_primary_high_reject_rate_switches_to_backup() {
+        let primary = spawn_reject_all_submits_pool("rejecting-primary-job").await;
+        let backup = spawn_mock_pool("reject-rate-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = primary.url.clone();
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        // Opt-in reject-rate failover: 50% over a low sample floor so the test
+        // is fast. no-notify disabled so it can't confound the reject path.
+        config.no_notify_failover_secs = 0;
+        config.reject_rate_failover_pct = 50;
+        config.reject_rate_failover_min_samples = 4;
+
+        let (job_tx, mut job_rx) = mpsc::channel(64);
+        let (share_tx, share_rx) = mpsc::channel(64);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        // Feeder: for every real dispatched job, submit 6 distinct-nonce shares
+        // carrying that job's live work generation so the client actually
+        // submits them (and the primary rejects them).
+        let feeder = tokio::spawn(async move {
+            while let Some(job) = job_rx.recv().await {
+                if job.is_flush_only() || job.job_id.is_empty() {
+                    continue;
+                }
+                for n in 1u32..=6 {
+                    let share = ValidShare {
+                        work_generation: job.work_generation,
+                        worker_name: "user.original".to_string(),
+                        job_id: job.job_id.clone(),
+                        extranonce2: "00000000".to_string(),
+                        ntime: format!("{:08x}", job.ntime),
+                        nonce: format!("{:08x}", n),
+                        version_bits: None,
+                        version: job.version,
+                        achieved_difficulty: Some(1.0),
+                    };
+                    if share_tx.send(share).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let returned = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.run_until_sv2_retry(Duration::from_secs(8)),
+        )
+        .await
+        .expect("client should return before test timeout");
+        assert_eq!(
+            returned.current_pool_index, 1,
+            "a share-rejecting primary must fail over to the accepting backup"
+        );
+        drop(returned);
+        feeder.abort();
+
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        assert!(
+            statuses.iter().any(|status| matches!(
+                status,
+                StratumStatus::PoolFailoverUpdated(failover)
+                    if failover.event == "pool_switch" && failover.active_pool_index == 1
+            )),
+            "a pool_switch to the backup must be emitted after the reject-rate cutover"
+        );
+
+        let primary_requests = finish_mock_pool(primary).await;
+        let backup_requests = finish_mock_pool(backup).await;
+        assert!(
+            primary_requests
+                .iter()
+                .any(|request| request.contains("\"method\":\"mining.submit\"")),
+            "primary must have received the shares it rejected"
+        );
+        assert!(backup_requests
+            .iter()
+            .any(|request| request.contains("user.backup")));
+    }
+
+    /// Two-endpoint e2e (WIN vs bosminer/LuxOS `smart_switch`): with the
+    /// drive-armed proactive path ON, a client that failed over to a healthy
+    /// backup must AUTOMATICALLY return to the primary once it recovers — without
+    /// waiting for the backup to fault — bounded by the anti-flap cool-down.
+    #[tokio::test]
+    async fn mock_proactive_primary_return_when_recovered() {
+        // Primary is down for the first 500ms (so the client fails over to the
+        // backup), then recovers into a healthy pool.
+        let primary =
+            spawn_down_then_healthy_pool("recovered-primary-job", Duration::from_millis(500)).await;
+        let backup = spawn_mock_pool("proactive-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = primary.url.clone();
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        config.no_notify_failover_secs = 0; // isolate the proactive-return path
+        config.primary_return_stability_secs = 1; // short anti-flap window
+        config.smart_failover_enabled = true;
+        config.smart_failover_drive = true; // arm proactive return
+
+        let (job_tx, mut job_rx) = mpsc::channel(64);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        let returned = run_client_for_mock_wave(client, Duration::from_secs(3)).await;
+        assert_eq!(
+            returned.current_pool_index, 0,
+            "the client must proactively return to the recovered primary"
+        );
+        drop(returned);
+
+        let mut jobs = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            jobs.push(job);
+        }
+        // It must have reached the backup first, then returned to the primary.
+        assert!(jobs.iter().any(|job| job.job_id == "proactive-backup-job"));
+        assert!(jobs.iter().any(|job| job.job_id == "recovered-primary-job"));
+
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        assert!(
+            statuses.iter().any(|status| matches!(
+                status,
+                StratumStatus::PoolFailoverUpdated(failover)
+                    if failover.last_switch_reason.as_deref() == Some("proactive_primary_return")
+            )),
+            "the proactive return must emit a proactive_primary_return switch reason"
+        );
+
+        let primary_requests = finish_mock_pool(primary).await;
+        let _ = finish_mock_pool(backup).await;
+        assert!(
+            primary_requests
+                .iter()
+                .any(|request| request.contains("\"method\":\"mining.authorize\"")),
+            "the recovered primary must have been re-authorized on the return"
+        );
+    }
+
+    /// Anti-flap negative control: with a LONG cool-down, a client on a healthy
+    /// backup must NOT proactively return while the cool-down is still running —
+    /// even with the proactive path armed. Guards against oscillation.
+    #[tokio::test]
+    async fn mock_proactive_primary_return_holds_within_cooldown() {
+        let backup = spawn_mock_pool("anti-flap-backup-job").await;
+        let mut config = test_config();
+        config.donation.enabled = false;
+        config.pool1.url = closed_pool_url().await; // primary permanently down
+        config.pool2 = Some(backup_pool(&backup.url, "user.backup"));
+        config.no_notify_failover_secs = 0;
+        config.primary_return_stability_secs = 100; // >> the test window
+        config.smart_failover_enabled = true;
+        config.smart_failover_drive = true;
+
+        let (job_tx, mut job_rx) = mpsc::channel(64);
+        let (_share_tx, share_rx) = mpsc::channel(1);
+        let (status_tx, mut status_rx) = mpsc::channel(256);
+        let client = StratumV1Client::new(config, job_tx, share_rx, status_tx);
+
+        let returned = run_client_for_mock_wave(client, Duration::from_millis(1500)).await;
+        assert_eq!(
+            returned.current_pool_index, 1,
+            "within the anti-flap cool-down the client must stay on the healthy backup"
+        );
+        drop(returned);
+
+        let mut jobs = Vec::new();
+        while let Ok(job) = job_rx.try_recv() {
+            jobs.push(job);
+        }
+        assert!(jobs.iter().any(|job| job.job_id == "anti-flap-backup-job"));
+
+        let mut statuses = Vec::new();
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        assert!(
+            !statuses.iter().any(|status| matches!(
+                status,
+                StratumStatus::PoolFailoverUpdated(failover)
+                    if failover.last_switch_reason.as_deref() == Some("proactive_primary_return")
+            )),
+            "no proactive return may fire while the anti-flap cool-down is still running"
+        );
+
+        let _ = finish_mock_pool(backup).await;
+    }
+
     #[tokio::test]
     async fn mock_donation_primary_failure_routes_submits_to_braiins_fallback() {
         let mut fallback = spawn_mock_pool("donation-fallback-job").await;
@@ -7321,6 +8686,23 @@ mod tests {
         assert_eq!(status.shares_unresolved, MAX_PENDING_SUBMITS as u64);
         assert_eq!(status.pending_submit_dropped, 2);
         assert_eq!(client.pending_submits[0].request_id, 102);
+    }
+
+    #[test]
+    fn plan_clean_stop_flush_never_reconnects_and_always_fins() {
+        let empty = plan_clean_stop_flush(false, 0);
+        assert!(!empty.reconnect);
+        assert!(empty.shutdown_write);
+        assert!(!empty.submit_pending_share);
+        assert_eq!(empty.await_pending_submit_acks, 0);
+
+        let pending = plan_clean_stop_flush(true, 2);
+        assert!(!pending.reconnect);
+        assert!(pending.shutdown_write);
+        assert!(pending.submit_pending_share);
+        assert_eq!(pending.await_pending_submit_acks, 3);
+        assert!(CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT > Duration::ZERO);
+        assert!(CLEAN_STOP_SUBMIT_FLUSH_TIMEOUT <= Duration::from_secs(2));
     }
 
     #[test]

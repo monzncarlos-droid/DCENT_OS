@@ -3,30 +3,31 @@ name: dcentos-esp-release
 on:
   workflow_dispatch:
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: DCENT_OS_ESP
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: targets
+        name: Validate and plan public target matrix
+        run: |
+          python scripts/target_matrix.py validate
+          echo "matrix=$(python scripts/target_matrix.py list --scope public --format github)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - feature: bitaxe-max
-            board_target: bitaxe-max
-            publish: true
-          - feature: bitaxe-ultra
-            board_target: bitaxe-ultra
-            publish: true
-          - feature: bitaxe-supra
-            board_target: bitaxe-supra
-            publish: true
-          - feature: bitaxe-gamma
-            board_target: bitaxe-gamma
-            publish: true
-          - feature: bitaxe-hex-ultra
-            board_target: bitaxe-hex-ultra
-            publish: true
-          - feature: bitaxe-hex-supra
-            board_target: bitaxe-hex-supra
-            publish: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     defaults:
       run:
@@ -56,6 +57,13 @@ jobs:
           default: true
           ldproxy: true
           espidf: v5.4
+
+      - name: Pin deterministic release build epoch
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- .)
+          test -n "$SOURCE_DATE_EPOCH"
+          case "$SOURCE_DATE_EPOCH" in *[!0-9]*) exit 1 ;; esac
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
 
       - name: Prepare OTA signing key
         if: matrix.publish
@@ -134,7 +142,10 @@ jobs:
           PY
 
       - name: Build firmware
-        run: cargo build --locked --release -p dcentaxe --no-default-features --features "${{ matrix.feature }}"
+        run: |
+          test -z "${DCENTAXE_PROMOTION_CANDIDATE_PATH:-}"
+          test -z "${DCENTAXE_PROMOTION_CANDIDATE_VALIDATED:-}"
+          cargo build --locked --release -p dcentaxe --no-default-features --features "${{ matrix.feature }}"
 
       - name: Install stable Rust for host OTA policy gate
         if: matrix.publish
@@ -206,13 +217,11 @@ jobs:
         run: |
           python - <<'PY'
           import hashlib, json, os, pathlib, subprocess, sys
+          registry = json.loads(pathlib.Path('esp-targets.json').read_text(encoding='utf-8'))
           expected_models = {
-              'bitaxe-max': 'max',
-              'bitaxe-ultra': 'ultra',
-              'bitaxe-supra': 'supra',
-              'bitaxe-gamma': 'gamma',
-              'bitaxe-hex-ultra': 'hexultra',
-              'bitaxe-hex-supra': 'suprahex',
+              target['board_target']: target['device_model']
+              for target in registry['targets']
+              if target['package_policy'] == 'public'
           }
           board = os.environ['BOARD_TARGET']
           dist = pathlib.Path('dist') / board
@@ -237,6 +246,10 @@ jobs:
           assert manifest.get('product') == 'DCENT_axe', 'product mismatch'
           assert manifest.get('family') == 'bitaxe', 'family mismatch'
           assert manifest.get('packageType') == 'esp32-factory-and-ota-bundle', 'packageType mismatch'
+          assert manifest.get('promotionState') == 'registry', 'qualification package cannot publish'
+          assert manifest.get('qualificationOnly') is False, 'qualification package cannot publish'
+          assert manifest.get('promotionCandidateId') is None, 'candidate package cannot publish'
+          assert manifest.get('promotionCandidateDescriptorSha256') is None, 'candidate descriptor cannot publish'
           assert manifest.get('boardTarget') == board, 'boardTarget mismatch'
           assert manifest.get('deviceModel') == expected_models.get(board, board), 'deviceModel mismatch'
           payloads = {entry['name']: entry for entry in manifest['payloads']}

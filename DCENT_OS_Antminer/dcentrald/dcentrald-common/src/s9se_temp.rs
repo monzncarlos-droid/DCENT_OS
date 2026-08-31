@@ -5,7 +5,9 @@
 //! `set_iic_for_temperature_by_chain` only sets MISC I²C-enable on the
 //! EEPROM-named temp chips. This module packs. It never talks I²C.
 
-use crate::s9se_vil::{crc5_bits, pack_set_config_single, CRC5_VIL_SET_CONFIG_BITS, HDR_WRITE_SINGLE};
+use crate::s9se_vil::{
+    crc5_bits, pack_set_config_single, CRC5_VIL_SET_CONFIG_BITS, HDR_WRITE_SINGLE,
+};
 
 /// `calibration_sensor_offset(152u, chain)` — default TMP device.
 pub const TEMP_DEVICE_DEFAULT: u8 = 152; // 0x98
@@ -47,13 +49,7 @@ impl S9SeTempSensor {
 }
 
 /// VIL `read_temp` frame: `41 09 chip 1C 01 (write|device) reg data CRC5-64`.
-pub fn pack_read_temp_vil(
-    chip_addr: u8,
-    device: u8,
-    reg: u8,
-    data: u8,
-    write: bool,
-) -> [u8; 9] {
+pub fn pack_read_temp_vil(chip_addr: u8, device: u8, reg: u8, data: u8, write: bool) -> [u8; 9] {
     let write_bit = u8::from(write);
     let mut frame = pack_set_config_single(chip_addr, REG_GENERAL_I2C, 0);
     frame[0] = HDR_WRITE_SINGLE;

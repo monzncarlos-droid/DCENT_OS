@@ -176,6 +176,11 @@ pub struct CarrierFifoFabric {
 /// CVitek, STM32MP15) have no Braiins-layout FPGA FIFO and take no row.
 pub static CARRIER_FIFO_FABRIC: &[CarrierFifoFabric] = &[
     CarrierFifoFabric {
+        board_target: "am1-s11",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
         board_target: "am1-s9",
         fifo_fabric_hz: Some(200_000_000),
         provenance: "DECLARED: S9 bitstream serializer (100 MHz FCLK doubled by PL PLL); \
@@ -189,6 +194,26 @@ pub static CARRIER_FIFO_FABRIC: &[CarrierFifoFabric] = &[
     },
     CarrierFifoFabric {
         board_target: "am1-t15",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-s9i",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-s9j",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-s9se",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
+        board_target: "am1-t9plus",
         fifo_fabric_hz: None,
         provenance: "UNDECLARED: capture-first target, no bitstream probe",
     },
@@ -215,6 +240,11 @@ pub static CARRIER_FIFO_FABRIC: &[CarrierFifoFabric] = &[
         provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
     },
     CarrierFifoFabric {
+        board_target: "am2-s17e",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
+    },
+    CarrierFifoFabric {
         board_target: "am2-t17",
         fifo_fabric_hz: None,
         provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
@@ -223,6 +253,11 @@ pub static CARRIER_FIFO_FABRIC: &[CarrierFifoFabric] = &[
         board_target: "am2-t17plus",
         fifo_fabric_hz: None,
         provenance: "UNDECLARED: no am2 FIFO serializer clock declared",
+    },
+    CarrierFifoFabric {
+        board_target: "am2-t17e",
+        fifo_fabric_hz: None,
+        provenance: "UNDECLARED: capture-first target, no bitstream probe",
     },
     CarrierFifoFabric {
         board_target: "am2-t19",
@@ -239,6 +274,16 @@ pub fn fifo_fabric_hz(board_target: &str) -> Option<u32> {
         .iter()
         .find(|row| row.board_target == board_target)
         .and_then(|row| row.fifo_fabric_hz)
+}
+
+/// Convert a BAUD_REG divisor to a line rate, fail-closed.
+///
+/// Returns `None` when the carrier has no declared FIFO fabric clock
+/// (am2, capture-first Zynq rows, unknown board_target). Callers must not
+/// fall back to [`FPGA_CLK_HZ`] — that constant is S9-only and is 2× off
+/// on a 100 MHz FCLK0 bitstream.
+pub fn baud_hz_declared(board_target: &str, divisor: u32) -> Option<u32> {
+    fifo_fabric_hz(board_target).map(|hz| baud_from_divisor_on(hz, divisor))
 }
 
 /// BAUD_REG value for 115200 baud (default for enumeration).
@@ -1135,6 +1180,15 @@ impl FpgaChain {
         }
     }
 
+    /// Whether this chain uses the held/live-verified am2 common-register and
+    /// CTRL-bit layout rather than the S9/am1 layout.
+    ///
+    /// Read-only telemetry consumers use this to avoid decoding am2 CTRL and
+    /// common+0x00 under S9 semantics. It grants no register-access authority.
+    pub const fn uses_am2_register_layout(&self) -> bool {
+        self.is_am2
+    }
+
     /// Write the common-block CTRL register, routing am1/am2 correctly.
     pub fn write_ctrl(&self, value: u32) {
         if self.is_am2 && !am2_ctrl_value_is_safe(value) {
@@ -1456,6 +1510,11 @@ impl FpgaChain {
         self.work_rx.read_reg(REG_WORK_RX_STAT) & STAT_RX_EMPTY == 0
     }
 
+    /// Read the CMD FIFO status register without consuming either FIFO.
+    pub fn read_cmd_status(&self) -> u32 {
+        self.cmd.read_reg(REG_CMD_STAT)
+    }
+
     /// Read the WORK RX status register.
     pub fn read_work_rx_status(&self) -> u32 {
         self.work_rx.read_reg(REG_WORK_RX_STAT)
@@ -1684,8 +1743,10 @@ mod carrier_fifo_fabric_tests {
             "am2-s19pro",
             "am2-s17p",
             "am2-s17plus",
+            "am2-s17e",
             "am2-t17",
             "am2-t17plus",
+            "am2-t17e",
             "am2-t19",
         ] {
             assert_eq!(
@@ -1746,6 +1807,18 @@ mod carrier_fifo_fabric_tests {
         assert_eq!(baud_from_divisor_on(100_000_000, 0x6C), 57_339);
         // Zero-baud never divides by zero.
         assert_eq!(divisor_from_baud_on(200_000_000, 0), u32::MAX);
+    }
+
+    #[test]
+    fn undeclared_fabric_refuses_hz_conversion() {
+        assert_eq!(baud_hz_declared("am1-s9", 0x6C), Some(114_678));
+        assert_eq!(
+            baud_hz_declared("am2-s19jpro", 0x6C),
+            None,
+            "am2 FIFO serializer clock is undeclared — refuse, never invent 200 MHz"
+        );
+        assert_eq!(baud_hz_declared("am1-s15", 0x07), None);
+        assert_eq!(baud_hz_declared("unknown-board", 0x03), None);
     }
 }
 

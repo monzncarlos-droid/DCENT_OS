@@ -1,0 +1,46 @@
+#!/bin/sh
+# Start key-only OpenSSH on the otherwise stock Nano 3 root filesystem.
+
+DAEMON=/usr/sbin/sshd
+PIDFILE=/var/run/sshd.pid
+MANAGEMENT_NICE=-5
+
+start() {
+    printf 'Starting DCENT first-light SSH: '
+    mkdir -p /var/empty /var/run
+    chmod 0755 /var/empty
+
+    if [ ! -s /etc/ssh/ssh_host_ed25519_key ]; then
+        /usr/bin/ssh-keygen -A >/dev/null 2>&1 || {
+            echo "FAIL (host keys)"
+            return 1
+        }
+    fi
+
+    # The held Nano 3 btcminer raises its main cgminer thread to nice -10 and
+    # lowers its API thread to nice +10.  Reserve a middle CFS weight for the
+    # authenticated recovery plane so a short SSH/SFTP request can make
+    # progress under hashing load, while the stock mining-control thread keeps
+    # the higher priority.  This only sets sshd's inherited launch priority; it
+    # never signals, renices, wraps, or otherwise changes btcminer.
+    /bin/nice -n "$MANAGEMENT_NICE" /sbin/start-stop-daemon \
+        -S -q -p "$PIDFILE" -x "$DAEMON" -- -o PidFile="$PIDFILE"
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+    fi
+    return "$status"
+}
+
+stop() {
+    /sbin/start-stop-daemon -K -q -p "$PIDFILE"
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

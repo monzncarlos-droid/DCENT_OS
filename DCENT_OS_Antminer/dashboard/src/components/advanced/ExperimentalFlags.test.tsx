@@ -7,6 +7,8 @@
 // surface of dead-but-live-looking controls in the public beta. The full toggle
 // grid returns automatically the moment any flag flips `comingSoon: false`.
 
+import { readFileSync } from 'node:fs';
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 
@@ -16,6 +18,8 @@ import {
   normalizeExperimentalFlagState,
   type FlagDef,
 } from './ExperimentalFlags';
+
+const flagsSrc = readFileSync('src/components/advanced/ExperimentalFlags.tsx', 'utf8');
 
 beforeEach(() => localStorage.clear());
 afterEach(() => {
@@ -60,5 +64,15 @@ describe('ExperimentalFlags — FE-DEAD-2 / SLOP-TOOL-06 coming-soon honesty', (
 
     expect(normalized).toEqual({ available: true });
     expect(countEnabledAvailableFlags(normalized, defs)).toBe(1);
+  });
+});
+
+describe('ExperimentalFlags — ASICBoost / BIP320 claim honesty', () => {
+  it('does not advertise a fake ~20% hashrate AsicBoost toggle', () => {
+    expect(flagsSrc).not.toMatch(/~20%\s*hashrate/i);
+    expect(flagsSrc).not.toMatch(/20%\s*hashrate improvement/i);
+    expect(flagsSrc).toMatch(/BIP320/);
+    expect(flagsSrc).toMatch(/not a \+20% hashrate/i);
+    expect(flagsSrc).toMatch(/does not add terahash/i);
   });
 });

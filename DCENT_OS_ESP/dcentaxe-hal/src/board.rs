@@ -1493,15 +1493,10 @@ impl BitAxeModel {
             // NerdQX: one sensor, 4 ASICs, channel i -> ASIC i. Polarity is
             // passed explicitly. A0 = GPIO2, A1 = **GPIO3**.
             //
-            // ⚠ Declared, not wired: `main.rs` moves `gpio3` unconditionally in
-            // the Hammer DC02 binder arm, so taking it here is a static
-            // double-move. Do NOT "fix" that by weakening
-            // `board_gpio_tuple_is_bindable_for_every_model`.
-            //
-            // ⚠ On this board the probe is also the IDENTITY check: upstream
-            // concludes "not a QX" when the mux does not answer and clamps to
-            // 1150 mV / 495 MHz. Our row already declares the CLAMPED envelope,
-            // so a missing mux costs temperature detail and nothing else.
+            // Wired on `--features nerdqx` (`temp-tmp451`): `main.rs` binds
+            // GPIO2/GPIO3 and the Hammer DC02 gpio3 arm is cfg-gated out of
+            // that image. The static row stays clamped; a positive mux
+            // bring-up calls [`BoardConfig::apply_nerdqx_tmp451_identity`].
             Self::NerdQX => Some(Tmp451DiodeMux {
                 sensors: &[Tmp451Sensor {
                     addr: 0x4C,
@@ -4224,6 +4219,19 @@ impl BoardConfig {
         Self::for_profile_with_model(BoardVersionProfile::default_for_model(model), model)
     }
 
+    /// NerdQX identity probe. Upstream treats the TMP451 mux answering on
+    /// GPIO2/GPIO3 at 0x4C as "this is a QX" and only then keeps the nominal
+    /// 777 MHz / 1200 mV envelope. The static row stays clamped; call this
+    /// with `mux_answered = true` only after a successful mux bring-up.
+    pub fn apply_nerdqx_tmp451_identity(&mut self, mux_answered: bool) {
+        if self.model != BitAxeModel::NerdQX || !mux_answered {
+            return;
+        }
+        self.default_frequency = 777.0;
+        self.default_voltage_mv = 1200;
+        self.max_voltage_mv = 1200;
+    }
+
     pub fn for_profile(profile: &BoardVersionProfile) -> Self {
         Self::for_profile_with_model(profile, profile.model)
     }
@@ -6010,10 +6018,9 @@ mod dcent_axe_bm1397_variants {
     fn the_nerdqx_envelope_is_the_clamped_one_not_the_nominal_one() {
         // NerdQX's TMP451 mux IS its identity check upstream: probe fails =>
         // "assuming non-QX board" => absMax drops to 495 MHz / 1150 mV and
-        // loadSettings pulls the setpoint down with it. No mux probe is wired
-        // here yet, so the row must declare the CLAMPED ceiling. If this test
-        // is ever changed to the nominal 777 MHz / 1200 mV without a runtime
-        // probe landing alongside it, a mis-identified board gets 1375 mV.
+        // loadSettings pulls the setpoint down with it. The static row must
+        // declare the CLAMPED ceiling. Nominal 777 MHz / 1200 mV is a runtime
+        // reward for a positive mux bring-up, never a row default.
         let cfg = BoardConfig::for_model(BitAxeModel::NerdQX);
         assert_eq!(cfg.default_frequency, 495.0);
         assert_eq!(cfg.default_voltage_mv, 1150);
@@ -6023,6 +6030,49 @@ mod dcent_axe_bm1397_variants {
             "a default above the ceiling is a setpoint that cannot be applied"
         );
         assert!(cfg.min_voltage_mv <= cfg.default_voltage_mv);
+    }
+
+    #[test]
+    fn nerdqx_nominal_envelope_is_reachable_only_behind_a_positive_probe() {
+        let mut cfg = BoardConfig::for_model(BitAxeModel::NerdQX);
+        cfg.apply_nerdqx_tmp451_identity(false);
+        assert_eq!(cfg.default_frequency, 495.0);
+        assert_eq!(cfg.default_voltage_mv, 1150);
+        cfg.apply_nerdqx_tmp451_identity(true);
+        assert_eq!(cfg.default_frequency, 777.0);
+        assert_eq!(cfg.default_voltage_mv, 1200);
+        assert_eq!(cfg.max_voltage_mv, 1200);
+        assert!(cfg.min_voltage_mv <= cfg.default_voltage_mv);
+        assert!(cfg.default_voltage_mv <= cfg.max_voltage_mv);
+
+        let mut plus = BoardConfig::for_model(BitAxeModel::NerdQaxePlus);
+        let before = plus.default_frequency;
+        plus.apply_nerdqx_tmp451_identity(true);
+        assert_eq!(plus.default_frequency, before, "non-QX rows must not move");
+    }
+
+    #[test]
+    fn original_qaxe_quad_bm1366_is_stm32_not_an_esp_row() {
+        // : original QAxe is a
+        // Quad-BM1366 on STM32L072 (USB DFU), not ESP32-S3. Registering it as
+        // a BitAxeModel would bind NerdQAxe+/ESP pins onto STM32 hardware.
+        // Identity-only named gap until a native STM32 runtime exists.
+        assert!(
+            BitAxeModel::from_device_model("qaxe").is_none(),
+            "bare 'qaxe' must not silently become an ESP mining row"
+        );
+        assert!(
+            BitAxeModel::from_device_model("nerdqaxe").is_none(),
+            "bare 'nerdqaxe' is the STM32-era name; ESP rows are nerdqaxe+ / ++"
+        );
+        let nerdaxe = BoardConfig::for_model(BitAxeModel::NerdAxe);
+        assert_eq!(
+            nerdaxe.asic_count, 1,
+            "NerdAxe is 1x BM1366, not the quad QAxe"
+        );
+        let plus = BoardConfig::for_model(BitAxeModel::NerdQaxePlus);
+        assert_eq!(plus.asic_count, 4);
+        assert_eq!(plus.model, BitAxeModel::NerdQaxePlus);
     }
 
     #[test]
@@ -7881,9 +7931,11 @@ mod hammer_bc0x_boards {
 
     // ── Fail-closed: no Hammer peripheral driver exists, so the boards must
     // refuse mining (no trusted temperature source) while still registering,
-    // booting and identifying. This is deliberate — flipping any of the None
-    // capabilities to a real part is only allowed together with a verified
-    // driver at the RE-confirmed I2C address. ──
+    // booting and identifying. TMP75 vs TMP1075 can be classified from a
+    // Device ID read (`tmp1075_convert::classify_ti_temp_part`) but Hammer
+    // has no live 0x0F capture, and `RailBringup::NoActuator` still cannot
+    // cut the rail. Do not invert this test until both a verified decode
+    // AND a rail-cut path exist for the exact SKU. ──
     #[test]
     fn hammer_boards_refuse_mining_until_drivers_exist() {
         for (model, _key, _target, ver, _chips, _domains, _def, _max, _id) in HAMMER {

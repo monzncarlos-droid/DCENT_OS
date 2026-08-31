@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DCENT <dev@d-central.tech>
+Date: 2026-08-15
+Subject: [PATCH] dcent: add k230-nano3s board (Canaan Avalon Nano 3S)
+
+Adds a device tree for the Canaan Avalon Nano 3S K230 home miner:
+SPI-NAND on spi0 with the stock fixed-partition map taken from the
+vendor USB_UP.AUP update records (build 2026-04-02) and the factory
+master image:
+
+    uboot_env  0x0500000  1 MiB   (redundant copies 0x500000/0x580000)
+    rtt        0x0600000  4 MiB
+    linux      0x0A00000  8 MiB
+    rootfs     0x1200000 48 MiB   (UBI)
+    app        0x4200000 12 MiB   (UBI)
+
+Console on uart0 (stock bootargs use console=ttyS0).
+
+Signed-off-by: DCENT <dev@d-central.tech>
+---
+ arch/riscv/boot/dts/canaan/Makefile        |  1 +
+ arch/riscv/boot/dts/canaan/k230-nano3s.dts | 68 ++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+ create mode 100644 arch/riscv/boot/dts/canaan/k230-nano3s.dts
+
+diff --git a/arch/riscv/boot/dts/canaan/Makefile b/arch/riscv/boot/dts/canaan/Makefile
+index 1111111..2222222 100644
+--- a/arch/riscv/boot/dts/canaan/Makefile
++++ b/arch/riscv/boot/dts/canaan/Makefile
+@@ -4,6 +4,7 @@ dtb-$(CONFIG_ARCH_CANAAN) += k210_generic.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-canmv.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230d-canmv.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-evb.dtb
++dtb-$(CONFIG_ARCH_CANAAN) += k230-nano3s.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_bit.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_dock.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_go.dtb
+diff --git a/arch/riscv/boot/dts/canaan/k230-nano3s.dts b/arch/riscv/boot/dts/canaan/k230-nano3s.dts
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/arch/riscv/boot/dts/canaan/k230-nano3s.dts
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * DCENT board file for the Canaan Avalon Nano 3S (K230).
++ *
++ * Hardware: K230 dual-core (RV64 1.6GHz + RT-Smart small core),
++ * 256 MiB SPI-NAND, 12x A3197S hashing dies.
++ *
++ * Partition map: stock USB_UP.AUP item records (nand_a/nand_b slots),
++ * build 2026-04-02 - see DCENT_OS_AvalonMiner in the DCENT monorepo.
++ */
++
++/dts-v1/;
++
++#include "k230.dtsi"
++
++/ {
++	model = "Canaan Avalon Nano 3S (DCENT)";
++	compatible = "canaan,k230-nano3s", "canaan,kendryte-k230";
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++&spi0 {
++	status = "okay";
++	rx-sample-delay-ns = <5>;
++
++	spi-nand@0 {
++		compatible = "spi-nand";
++		reg = <0>;
++		spi-max-frequency = <50000000>;
++		spi-tx-bus-width = <8>;
++		spi-rx-bus-width = <8>;
++		status = "okay";
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			uboot-env@500000 {
++				label = "uboot_env";
++				reg = <0x0500000 0x0010000>;
++			};
++			rtt@600000 {
++				label = "rtt";
++				reg = <0x0600000 0x0400000>;
++			};
++			linux@a00000 {
++				label = "linux";
++				reg = <0x0a00000 0x0800000>;
++			};
++			rootfs@1200000 {
++				label = "rootfs";
++				reg = <0x1200000 0x3000000>;
++			};
++			app@4200000 {
++				label = "app";
++				reg = <0x4200000 0x0c00000>;
++			};
++		};
++	};
++};
+--
+2.43.0

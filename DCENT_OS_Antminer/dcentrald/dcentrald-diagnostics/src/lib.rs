@@ -44,6 +44,10 @@ pub mod chip_health;
 /// Honest snapshot vs active-stim labels (P2-5).
 pub mod diagnostic_mode;
 pub mod evidence;
+/// Exact-artifact AMTC factory-plan importer (default-OFF `factory-test-plan`).
+/// Pure evidence IR only: structurally offline/non-authorizing, with no executor.
+#[cfg(feature = "factory-test-plan")]
+pub mod factory_test_plan;
 /// First-party fault/diagnostic knowledge layer transcribed from the Bitmain ATA
 /// maintenance-training corpus. Pure, declarative, read-only reference data
 /// (symptom→suspect→test→remedy chains + reference measurement values). Never a
@@ -99,7 +103,11 @@ use uuid::Uuid;
 use crate::board_health::BoardHealthResult;
 use crate::chip_health::ChipHealthSnapshot;
 use crate::progress::{DiagnosticProgress, ProgressTracker};
-use crate::troubleshoot::AsicCommSnapshot;
+use crate::troubleshoot::{
+    AsicCommSnapshot, FpgaStatusSnapshot, I2cScanSnapshot, NetworkTestSnapshot, PsuProbeSnapshot,
+    RuntimeOwnedFpgaTelemetry, RuntimeOwnedI2cTelemetry, UnattestedFpgaTelemetry,
+    UnattestedNetworkTelemetry, UnattestedPsuTelemetry,
+};
 
 /// Diagnostic subsystem error type.
 #[derive(Debug, Error)]
@@ -206,6 +214,9 @@ pub enum DiagnosticInterfaceCapabilityState {
     /// A production route publishes an immediate typed snapshot derived from
     /// already-retained daemon telemetry, without active hardware commands.
     ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+    /// A synchronous typed publisher accepts explicitly unattested telemetry,
+    /// but no production route yet supplies a producer-attested snapshot.
+    ImmediateTelemetrySnapshotPublisherNoProductionRouteNoMeasuredPass,
     /// The public type is declared, but no matching [`DiagnosticJobConfig`]
     /// engine is implemented.
     DeclaredNoJobEngine,
@@ -263,30 +274,33 @@ pub const DIAGNOSTIC_INTERFACE_CAPABILITIES: &[DiagnosticInterfaceCapability] = 
     },
     DiagnosticInterfaceCapability {
         test_type: TestType::NetworkTest,
-        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
-        evidence: "public TestType only; no DiagnosticJobConfig engine",
-        runtime_job_engine_implemented: false,
-        production_route_integrated: false,
+        state:
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "bounded production REST route publishes its validated IP/route/gateway/DNS stage outcomes plus explicitly cached pool state through a synchronous typed lifecycle publisher; no hardware or live pool-connect probe is issued by the publisher",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
         typed_measured_pass_authorized: false,
         manufacturing_grade_authorized: false,
         hardware_mutation_authorized: false,
     },
     DiagnosticInterfaceCapability {
         test_type: TestType::PsuProbe,
-        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
-        evidence: "public TestType only; no DiagnosticJobConfig engine",
-        runtime_job_engine_implemented: false,
-        production_route_integrated: false,
+        state:
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "production REST route publishes the retained power_rx sample using its producer timestamp, or explicit Unavailable when no timestamped sample exists; the synchronous typed publisher re-evaluates age and performs no PMBus/I2C/UART/device access",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
         typed_measured_pass_authorized: false,
         manufacturing_grade_authorized: false,
         hardware_mutation_authorized: false,
     },
     DiagnosticInterfaceCapability {
         test_type: TestType::FpgaStatus,
-        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
-        evidence: "public TestType only; no DiagnosticJobConfig engine",
-        runtime_job_engine_implemented: false,
-        production_route_integrated: false,
+        state:
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "standard WorkDispatcher publishes a retained source-owned register snapshot from the FPGA chains it already owns; the production REST route clones that snapshot or records explicit Unavailable, while the synchronous lifecycle publisher performs no MMIO/UIO/devmem/device access and grants no measured-pass authority",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
         typed_measured_pass_authorized: false,
         manufacturing_grade_authorized: false,
         hardware_mutation_authorized: false,
@@ -304,10 +318,11 @@ pub const DIAGNOSTIC_INTERFACE_CAPABILITIES: &[DiagnosticInterfaceCapability] = 
     },
     DiagnosticInterfaceCapability {
         test_type: TestType::I2cScan,
-        state: DiagnosticInterfaceCapabilityState::DeclaredNoJobEngine,
-        evidence: "public TestType only; no DiagnosticJobConfig engine",
-        runtime_job_engine_implemented: false,
-        production_route_integrated: false,
+        state:
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass,
+        evidence: "serialized I2C service owners retain only successful endpoint operations; the production REST route clones sender-free readers or publishes explicit Unavailable and issues no scan, probe, or new bus transaction",
+        runtime_job_engine_implemented: true,
+        production_route_integrated: true,
         typed_measured_pass_authorized: false,
         manufacturing_grade_authorized: false,
         hardware_mutation_authorized: false,
@@ -457,6 +472,38 @@ pub struct BoardHealthJobConfig {
     boards: Vec<BoardHealthResult>,
 }
 
+/// Prepared input for the synchronous bounded network snapshot publisher.
+///
+/// The config carries no process, socket, sysfs, or hardware handle. The
+/// production REST route completes its independently bounded probes first and
+/// then submits only the validated observation value.
+pub struct NetworkTestSnapshotJobConfig {
+    snapshot: NetworkTestSnapshot,
+}
+
+impl NetworkTestSnapshotJobConfig {
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        self.snapshot
+            .validate()
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        let warnings = self.snapshot.publication_warnings();
+        let data = serde_json::to_value(self.snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize bounded network snapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::NetworkTest,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings,
+            recommendations: Vec::new(),
+        })
+    }
+}
+
 impl BoardHealthJobConfig {
     #[cfg(test)]
     fn from_results(boards: Vec<BoardHealthResult>) -> Self {
@@ -476,6 +523,111 @@ impl BoardHealthJobConfig {
             data,
             grade: None,
             warnings: Vec::new(),
+            recommendations: Vec::new(),
+        })
+    }
+}
+
+/// Prepared input for the synchronous passive PSU snapshot publisher.
+///
+/// Production construction is exposed only through
+/// [`DiagnosticService::publish_psu_probe_telemetry`]. Validation happens
+/// before lifecycle insertion and the value carries no hardware handle.
+pub struct PsuProbeSnapshotJobConfig {
+    snapshot: PsuProbeSnapshot,
+}
+
+impl PsuProbeSnapshotJobConfig {
+    #[cfg(test)]
+    fn from_snapshot(snapshot: PsuProbeSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        self.snapshot
+            .validate()
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        let warnings = self.snapshot.publication_warnings();
+        let data = serde_json::to_value(self.snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize passive PSU snapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::PsuProbe,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings,
+            recommendations: Vec::new(),
+        })
+    }
+}
+
+/// Prepared input for the synchronous passive FPGA snapshot publisher.
+///
+/// This records only caller-supplied, explicitly unattested values after the
+/// service has evaluated their claimed capture time. It cannot open MMIO, UIO,
+/// `/dev/mem`, or any other device path.
+pub struct FpgaStatusSnapshotJobConfig {
+    snapshot: FpgaStatusSnapshot,
+}
+
+/// Prepared input for the synchronous passive I2C observation publisher.
+///
+/// This carries only retained positive evidence. It has no request sender and
+/// cannot scan, probe, infer absence, identify device models, or mutate a bus.
+pub struct I2cScanSnapshotJobConfig {
+    snapshot: I2cScanSnapshot,
+}
+
+impl I2cScanSnapshotJobConfig {
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        self.snapshot
+            .validate()
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        let warnings = self.snapshot.publication_warnings();
+        let data = serde_json::to_value(self.snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize passive I2C observation snapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::I2cScan,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings,
+            recommendations: Vec::new(),
+        })
+    }
+}
+
+impl FpgaStatusSnapshotJobConfig {
+    #[cfg(test)]
+    fn from_snapshot(snapshot: FpgaStatusSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn into_result(self, test_id: Uuid) -> Result<TestResult> {
+        self.snapshot
+            .validate()
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        let warnings = self.snapshot.publication_warnings();
+        let data = serde_json::to_value(self.snapshot).map_err(|error| {
+            DiagnosticError::ReportGeneration(format!(
+                "cannot serialize passive FPGA snapshot: {error}"
+            ))
+        })?;
+        Ok(TestResult {
+            test_id,
+            test_type: TestType::FpgaStatus,
+            duration_s: 0,
+            data,
+            grade: None,
+            warnings,
             recommendations: Vec::new(),
         })
     }
@@ -522,7 +674,11 @@ pub enum DiagnosticJobConfig {
     HashReport(HashReportJobConfig),
     ChipHealth(ChipHealthJobConfig),
     BoardHealth(BoardHealthJobConfig),
+    NetworkTest(NetworkTestSnapshotJobConfig),
+    PsuProbe(PsuProbeSnapshotJobConfig),
+    FpgaStatus(FpgaStatusSnapshotJobConfig),
     AsicCommTest(AsicCommSnapshotJobConfig),
+    I2cScan(I2cScanSnapshotJobConfig),
 }
 
 impl DiagnosticJobConfig {
@@ -532,7 +688,11 @@ impl DiagnosticJobConfig {
             Self::HashReport(_) => TestType::HashReport,
             Self::ChipHealth(_) => TestType::ChipHealth,
             Self::BoardHealth(_) => TestType::BoardHealth,
+            Self::NetworkTest(_) => TestType::NetworkTest,
+            Self::PsuProbe(_) => TestType::PsuProbe,
+            Self::FpgaStatus(_) => TestType::FpgaStatus,
             Self::AsicCommTest(_) => TestType::AsicCommTest,
+            Self::I2cScan(_) => TestType::I2cScan,
         }
     }
 }
@@ -646,6 +806,127 @@ impl DiagnosticService {
         )
     }
 
+    /// Publish the bounded production route's network observations.
+    ///
+    /// The publisher samples its own wall clock, validates the supplied stage
+    /// relationships, and records an ungraded synchronous result. It opens no
+    /// process, socket, sysfs node, or hardware device; pool connectivity stays
+    /// explicitly cached rather than becoming a live-connect claim.
+    pub fn publish_network_test_telemetry(
+        &mut self,
+        telemetry: UnattestedNetworkTelemetry,
+    ) -> Result<Uuid> {
+        self.publish_network_test_telemetry_at(telemetry, unix_now_ms())
+    }
+
+    fn publish_network_test_telemetry_at(
+        &mut self,
+        telemetry: UnattestedNetworkTelemetry,
+        publication_time_ms: u64,
+    ) -> Result<Uuid> {
+        let snapshot = NetworkTestSnapshot::from_unattested_at(telemetry, publication_time_ms)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::NetworkTest,
+            DiagnosticJobConfig::NetworkTest(NetworkTestSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish caller-supplied, unattested PSU telemetry.
+    ///
+    /// The production boundary samples its own wall clock and re-evaluates the
+    /// caller-supplied capture timestamp against the fixed freshness policy.
+    /// It performs no hardware access and grants no health/pass authority.
+    pub fn publish_psu_probe_telemetry(
+        &mut self,
+        telemetry: UnattestedPsuTelemetry,
+    ) -> Result<Uuid> {
+        self.publish_psu_probe_telemetry_at(telemetry, unix_now_ms())
+    }
+
+    fn publish_psu_probe_telemetry_at(
+        &mut self,
+        telemetry: UnattestedPsuTelemetry,
+        publication_time_ms: u64,
+    ) -> Result<Uuid> {
+        let snapshot = PsuProbeSnapshot::from_unattested_at(telemetry, publication_time_ms)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::PsuProbe,
+            DiagnosticJobConfig::PsuProbe(PsuProbeSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish an explicit PSU telemetry-unavailable snapshot.
+    pub fn publish_psu_probe_unavailable(&mut self, reason: impl Into<String>) -> Result<Uuid> {
+        let snapshot = PsuProbeSnapshot::try_unavailable(reason)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::PsuProbe,
+            DiagnosticJobConfig::PsuProbe(PsuProbeSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish caller-supplied, unattested FPGA telemetry.
+    ///
+    /// The production boundary samples its own wall clock and re-evaluates the
+    /// caller-supplied capture timestamp. It cannot open MMIO, UIO, `/dev/mem`,
+    /// or any device path and grants no health/pass authority.
+    pub fn publish_fpga_status_telemetry(
+        &mut self,
+        telemetry: UnattestedFpgaTelemetry,
+    ) -> Result<Uuid> {
+        self.publish_fpga_status_telemetry_at(telemetry, unix_now_ms())
+    }
+
+    fn publish_fpga_status_telemetry_at(
+        &mut self,
+        telemetry: UnattestedFpgaTelemetry,
+        publication_time_ms: u64,
+    ) -> Result<Uuid> {
+        let snapshot = FpgaStatusSnapshot::from_unattested_at(telemetry, publication_time_ms)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::FpgaStatus,
+            DiagnosticJobConfig::FpgaStatus(FpgaStatusSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish a source-owned FPGA snapshot retained by the mining runtime.
+    ///
+    /// The diagnostics boundary validates carrier-specific CTRL semantics and
+    /// required status fields, then re-evaluates age using its own wall clock.
+    /// It never opens MMIO/UIO/devmem and grants no measured-pass authority.
+    pub fn publish_fpga_status_runtime_telemetry(
+        &mut self,
+        telemetry: RuntimeOwnedFpgaTelemetry,
+    ) -> Result<Uuid> {
+        self.publish_fpga_status_runtime_telemetry_at(telemetry, unix_now_ms())
+    }
+
+    fn publish_fpga_status_runtime_telemetry_at(
+        &mut self,
+        telemetry: RuntimeOwnedFpgaTelemetry,
+        publication_time_ms: u64,
+    ) -> Result<Uuid> {
+        let snapshot = FpgaStatusSnapshot::from_runtime_owned_at(telemetry, publication_time_ms)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::FpgaStatus,
+            DiagnosticJobConfig::FpgaStatus(FpgaStatusSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish an explicit FPGA telemetry-unavailable snapshot.
+    pub fn publish_fpga_status_unavailable(&mut self, reason: impl Into<String>) -> Result<Uuid> {
+        let snapshot = FpgaStatusSnapshot::try_unavailable(reason)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::FpgaStatus,
+            DiagnosticJobConfig::FpgaStatus(FpgaStatusSnapshotJobConfig { snapshot }),
+        )
+    }
+
     /// Publish a passive ASIC communication snapshot from retained telemetry.
     ///
     /// This synchronous path validates the typed aggregate and records a
@@ -655,6 +936,42 @@ impl DiagnosticService {
         self.start_test(
             TestType::AsicCommTest,
             DiagnosticJobConfig::AsicCommTest(AsicCommSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish retained positive endpoint observations from serialized I2C
+    /// owners. The publisher performs no scan or bus access and grants no
+    /// absence, device-identity, health/pass, or manufacturing authority.
+    pub fn publish_i2c_runtime_telemetry(
+        &mut self,
+        telemetry: RuntimeOwnedI2cTelemetry,
+    ) -> Result<Uuid> {
+        self.publish_i2c_runtime_telemetry_at(telemetry, unix_now_ms())
+    }
+
+    fn publish_i2c_runtime_telemetry_at(
+        &mut self,
+        telemetry: RuntimeOwnedI2cTelemetry,
+        publication_time_ms: u64,
+    ) -> Result<Uuid> {
+        let snapshot = I2cScanSnapshot::from_runtime_owned_at(telemetry, publication_time_ms)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::I2cScan,
+            DiagnosticJobConfig::I2cScan(I2cScanSnapshotJobConfig { snapshot }),
+        )
+    }
+
+    /// Publish explicit absence of retained positive I2C observations.
+    pub fn publish_i2c_observations_unavailable(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<Uuid> {
+        let snapshot = I2cScanSnapshot::try_unavailable(reason)
+            .map_err(|reason| DiagnosticError::SnapshotAdmission { reason })?;
+        self.start_test(
+            TestType::I2cScan,
+            DiagnosticJobConfig::I2cScan(I2cScanSnapshotJobConfig { snapshot }),
         )
     }
 
@@ -686,19 +1003,40 @@ impl DiagnosticService {
                     result: config.into_result(test_id)?,
                 }
             }
+            DiagnosticJobConfig::NetworkTest(config) => {
+                PreparedDiagnosticJob::SynchronousSnapshot {
+                    result: config.into_result(test_id)?,
+                }
+            }
+            DiagnosticJobConfig::PsuProbe(config) => PreparedDiagnosticJob::SynchronousSnapshot {
+                result: config.into_result(test_id)?,
+            },
+            DiagnosticJobConfig::FpgaStatus(config) => PreparedDiagnosticJob::SynchronousSnapshot {
+                result: config.into_result(test_id)?,
+            },
             DiagnosticJobConfig::AsicCommTest(config) => {
                 PreparedDiagnosticJob::SynchronousSnapshot {
                     result: config.into_result(test_id)?,
                 }
             }
+            DiagnosticJobConfig::I2cScan(config) => PreparedDiagnosticJob::SynchronousSnapshot {
+                result: config.into_result(test_id)?,
+            },
         };
         let cancel_token = CancellationToken::new();
         let started_at_epoch_s = unix_now_s();
 
         let terminal_progress = match &prepared {
-            PreparedDiagnosticJob::SynchronousSnapshot { result } => {
-                Some(DiagnosticProgress::completed(test_id, result.test_type, 0))
-            }
+            PreparedDiagnosticJob::SynchronousSnapshot { result } => Some(DiagnosticProgress::new(
+                test_id,
+                result.test_type,
+                u8::MAX,
+                "snapshot_published",
+                100,
+                0,
+                0,
+                "Diagnostic snapshot published; no health or pass verdict implied",
+            )),
             PreparedDiagnosticJob::HashReport { .. } => None,
         };
         let mut completed_tests = if terminal_progress.is_some() {
@@ -1152,6 +1490,12 @@ fn unix_now_s() -> u64 {
         .as_secs()
 }
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;
@@ -1178,7 +1522,11 @@ mod capability_tests {
                     TestType::HashReport
                         | TestType::ChipHealth
                         | TestType::BoardHealth
+                        | TestType::NetworkTest
+                        | TestType::PsuProbe
+                        | TestType::FpgaStatus
                         | TestType::AsicCommTest
+                        | TestType::I2cScan
                 )
             );
             assert_eq!(
@@ -1188,7 +1536,11 @@ mod capability_tests {
                     TestType::HashReport
                         | TestType::ChipHealth
                         | TestType::BoardHealth
+                        | TestType::NetworkTest
+                        | TestType::PsuProbe
+                        | TestType::FpgaStatus
                         | TestType::AsicCommTest
+                        | TestType::I2cScan
                 )
             );
             assert!(!capability.typed_measured_pass_authorized);
@@ -1228,6 +1580,169 @@ mod capability_tests {
                 status: "Degraded".to_string(),
             },
         ])
+    }
+
+    fn unattested_psu_telemetry(
+        captured_at_ms: u64,
+    ) -> crate::troubleshoot::UnattestedPsuTelemetry {
+        crate::troubleshoot::UnattestedPsuTelemetry {
+            telemetry_source: "caller-labelled-power-watch".to_string(),
+            captured_at_ms,
+            detected: Some(true),
+            vin_v: Some(240.5),
+            vout_v: Some(12.4),
+            iout_a: Some(82.0),
+            board_power_w: Some(1_016.8),
+            wall_power_w: Some(1_075.0),
+            efficiency_pct: Some(94.6),
+            temp_c: Some(49.0),
+            fan_rpm: None,
+            faults: Some(Vec::new()),
+            status_word: Some(0),
+            calibrated: Some(false),
+        }
+    }
+
+    fn network_stage(
+        status: crate::troubleshoot::NetworkProbeStatus,
+    ) -> crate::troubleshoot::NetworkProbeStageTelemetry {
+        crate::troubleshoot::NetworkProbeStageTelemetry {
+            status,
+            detail: None,
+        }
+    }
+
+    fn unattested_network_telemetry(
+        captured_at_ms: u64,
+    ) -> crate::troubleshoot::UnattestedNetworkTelemetry {
+        crate::troubleshoot::UnattestedNetworkTelemetry {
+            telemetry_source: "bounded-rest-network-route".to_string(),
+            captured_at_ms,
+            interface: Some("eth0".to_string()),
+            ip_cidr: Some("192.0.2.10/24".to_string()),
+            ip_address: Some("192.0.2.10".to_string()),
+            mac: Some("02:00:00:00:00:10".to_string()),
+            link_up: Some(true),
+            gateway: Some("192.0.2.1".to_string()),
+            gateway_reachable: Some(true),
+            dns_test_host: Some("pool.example.com".to_string()),
+            dns_ok: Some(true),
+            cached_pool_status: Some("Alive".to_string()),
+            cached_pool_connected: true,
+            ip_address_probe: network_stage(crate::troubleshoot::NetworkProbeStatus::Ok),
+            route_probe: network_stage(crate::troubleshoot::NetworkProbeStatus::Ok),
+            gateway_probe: network_stage(crate::troubleshoot::NetworkProbeStatus::Ok),
+            dns_probe: network_stage(crate::troubleshoot::NetworkProbeStatus::Ok),
+        }
+    }
+
+    fn unattested_fpga_chain(chain_id: u8) -> crate::troubleshoot::UnattestedFpgaChainTelemetry {
+        crate::troubleshoot::UnattestedFpgaChainTelemetry {
+            chain_id,
+            register_layout: None,
+            identity_word: None,
+            version: Some("0x00901002".to_string()),
+            build_id: None,
+            ctrl_reg: Some(0x0d),
+            enabled: Some(true),
+            bm139x_mode: None,
+            baud_reg: Some(7),
+            baud_rate: Some(1_562_500),
+            work_time: None,
+            error_count: Some(3),
+            cmd_tx_empty: None,
+            cmd_rx_empty: None,
+            work_tx_empty: None,
+            work_rx_empty: None,
+        }
+    }
+
+    fn runtime_owned_fpga_telemetry(
+        captured_at_ms: u64,
+    ) -> crate::troubleshoot::RuntimeOwnedFpgaTelemetry {
+        crate::troubleshoot::RuntimeOwnedFpgaTelemetry {
+            telemetry_source: "standard WorkDispatcher retained FPGA register snapshot".to_string(),
+            captured_at_ms,
+            chains: vec![crate::troubleshoot::UnattestedFpgaChainTelemetry {
+                chain_id: 6,
+                register_layout: Some(crate::troubleshoot::FpgaRegisterLayout::Am1S9),
+                identity_word: Some(0x0090_1002),
+                version: Some("0x00901002".to_string()),
+                build_id: Some(0x6500_0000),
+                ctrl_reg: Some(0x18),
+                enabled: Some(true),
+                bm139x_mode: Some(true),
+                baud_reg: Some(7),
+                baud_rate: Some(1_562_500),
+                work_time: Some(0x0004_0507),
+                error_count: Some(0),
+                cmd_tx_empty: Some(true),
+                cmd_rx_empty: Some(true),
+                work_tx_empty: Some(false),
+                work_rx_empty: Some(true),
+            }],
+        }
+    }
+
+    fn runtime_owned_i2c_telemetry(
+        captured_at_ms: u64,
+    ) -> crate::troubleshoot::RuntimeOwnedI2cTelemetry {
+        use crate::troubleshoot::{
+            I2cObservedEndpointRole as Role, I2cObservedOperationKind as Operation,
+            RuntimeOwnedI2cEndpointObservation,
+        };
+
+        crate::troubleshoot::RuntimeOwnedI2cTelemetry {
+            telemetry_source: "serialized-owner-test-ledger".to_string(),
+            captured_at_ms,
+            endpoints: vec![
+                RuntimeOwnedI2cEndpointObservation {
+                    bus: 0,
+                    address: 0x50,
+                    operation: Operation::HashboardEepromRead,
+                    endpoint_role: Role::HashboardEepromEndpoint,
+                    observed_at_ms: captured_at_ms.saturating_sub(10),
+                    successful_operation_count: 1,
+                },
+                RuntimeOwnedI2cEndpointObservation {
+                    bus: 0,
+                    address: 0x55,
+                    operation: Operation::PicHeartbeat,
+                    endpoint_role: Role::ControllerProtocolEndpoint,
+                    observed_at_ms: captured_at_ms,
+                    successful_operation_count: 7,
+                },
+            ],
+        }
+    }
+
+    fn runtime_owned_am2_fpga_telemetry(
+        captured_at_ms: u64,
+    ) -> crate::troubleshoot::RuntimeOwnedFpgaTelemetry {
+        let mut telemetry = runtime_owned_fpga_telemetry(captured_at_ms);
+        let chain = &mut telemetry.chains[0];
+        chain.chain_id = 1;
+        chain.register_layout = Some(crate::troubleshoot::FpgaRegisterLayout::Am2);
+        chain.identity_word = chain.build_id;
+        chain.version = None;
+        chain.ctrl_reg = Some(0x0090_1002);
+        chain.enabled = Some(true);
+        chain.bm139x_mode = None;
+        chain.baud_rate = None;
+        chain.work_time = None;
+        chain.error_count = None;
+        telemetry
+    }
+
+    fn unattested_fpga_telemetry(
+        captured_at_ms: u64,
+        chains: Vec<crate::troubleshoot::UnattestedFpgaChainTelemetry>,
+    ) -> crate::troubleshoot::UnattestedFpgaTelemetry {
+        crate::troubleshoot::UnattestedFpgaTelemetry {
+            telemetry_source: "caller-labelled-fpga-watch".to_string(),
+            captured_at_ms,
+            chains,
+        }
     }
 
     #[test]
@@ -1278,6 +1793,46 @@ mod capability_tests {
             }
         ));
 
+        let psu_snapshot =
+            PsuProbeSnapshot::from_unattested_at(unattested_psu_telemetry(1_000), 1_100)
+                .expect("valid unattested PSU fixture");
+        let error = service
+            .start_test(
+                TestType::FpgaStatus,
+                DiagnosticJobConfig::PsuProbe(PsuProbeSnapshotJobConfig::from_snapshot(
+                    psu_snapshot,
+                )),
+            )
+            .expect_err("FPGA status must not borrow passive PSU telemetry configuration");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::FpgaStatus,
+                configured: TestType::PsuProbe,
+            }
+        ));
+
+        let fpga_snapshot = FpgaStatusSnapshot::from_unattested_at(
+            unattested_fpga_telemetry(1_000, vec![unattested_fpga_chain(6)]),
+            1_100,
+        )
+        .expect("valid unattested FPGA fixture");
+        let error = service
+            .start_test(
+                TestType::PsuProbe,
+                DiagnosticJobConfig::FpgaStatus(FpgaStatusSnapshotJobConfig::from_snapshot(
+                    fpga_snapshot,
+                )),
+            )
+            .expect_err("PSU probe must not borrow passive FPGA telemetry configuration");
+        assert!(matches!(
+            error,
+            DiagnosticError::TestConfigMismatch {
+                requested: TestType::PsuProbe,
+                configured: TestType::FpgaStatus,
+            }
+        ));
+
         let asic_comm_config = DiagnosticJobConfig::AsicCommTest(
             AsicCommSnapshotJobConfig::from_snapshot(passive_asic_comm_snapshot()),
         );
@@ -1324,7 +1879,11 @@ mod capability_tests {
         assert_eq!(stored.elapsed_s, progress.elapsed_s);
         assert_eq!(progress.test_id, test_id);
         assert_eq!(progress.test_type, TestType::ChipHealth);
-        assert_eq!(progress.phase_name, "completed");
+        assert_eq!(progress.phase_name, "snapshot_published");
+        assert_eq!(
+            progress.detail,
+            "Diagnostic snapshot published; no health or pass verdict implied"
+        );
         assert_eq!(progress.progress_pct, 100);
         assert!(matches!(
             progress_rx.try_recv(),
@@ -1462,6 +2021,574 @@ mod capability_tests {
         assert!(!capability.typed_measured_pass_authorized);
         assert!(!capability.manufacturing_grade_authorized);
         assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn bounded_network_publication_is_typed_ungraded_and_pool_cached() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let test_id = service
+            .publish_network_test_telemetry_at(unattested_network_telemetry(10_000), 10_125)
+            .expect("valid bounded network observation");
+        let result = service
+            .get_result(&test_id)
+            .expect("published network result");
+
+        assert_eq!(result.test_type, TestType::NetworkTest);
+        assert_eq!(result.data["source"], NetworkTestSnapshot::SOURCE);
+        assert_eq!(result.data["provenance"], "caller_supplied_unattested");
+        assert_eq!(result.data["freshness"]["availability"], "fresh_unattested");
+        assert_eq!(result.data["freshness"]["age_ms"], 125);
+        assert_eq!(result.data["interface"], "eth0");
+        assert_eq!(result.data["gateway_reachable"], true);
+        assert_eq!(result.data["dns_ok"], true);
+        assert_eq!(result.data["cached_pool_connected"], true);
+        assert_eq!(
+            result.data["pool_connectivity_source"],
+            NetworkTestSnapshot::POOL_CONNECTIVITY_SOURCE
+        );
+        assert_eq!(result.data["live_pool_probe_performed"], false);
+        assert!(result.grade.is_none());
+        assert_eq!(result.warnings.len(), 2);
+        assert!(result.warnings[0].contains("not a miner health or pass verdict"));
+        assert!(result.warnings[1].contains("cached runtime state"));
+
+        let progress = progress_rx.try_recv().expect("network publication event");
+        assert_eq!(progress.test_type, TestType::NetworkTest);
+        assert_eq!(progress.phase_name, "snapshot_published");
+        assert!(!progress.detail.contains("success"));
+
+        let capability = diagnostic_interface_capability(TestType::NetworkTest);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn bounded_network_publication_refuses_inconsistent_or_unbounded_values() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+
+        let mut inconsistent_gateway = unattested_network_telemetry(1_000);
+        inconsistent_gateway.gateway_reachable = Some(false);
+        assert!(service
+            .publish_network_test_telemetry_at(inconsistent_gateway, 1_100)
+            .is_err());
+
+        let mut invalid_mac = unattested_network_telemetry(1_000);
+        invalid_mac.mac = Some("not-a-mac".to_string());
+        assert!(service
+            .publish_network_test_telemetry_at(invalid_mac, 1_100)
+            .is_err());
+
+        let mut unbound_connected = unattested_network_telemetry(1_000);
+        unbound_connected.cached_pool_status = None;
+        assert!(service
+            .publish_network_test_telemetry_at(unbound_connected, 1_100)
+            .is_err());
+
+        assert!(service
+            .publish_network_test_telemetry_at(unattested_network_telemetry(2_000), 1_999)
+            .is_err());
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn passive_psu_publication_rechecks_age_and_marks_values_unattested() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let mut telemetry = unattested_psu_telemetry(10_000);
+        telemetry.vin_v = None;
+        telemetry.iout_a = None;
+        telemetry.temp_c = None;
+        telemetry.status_word = None;
+
+        let test_id = service
+            .publish_psu_probe_telemetry_at(telemetry, 10_250)
+            .expect("publication boundary should classify the supplied timestamp");
+        let result = service.get_result(&test_id).expect("published PSU result");
+        assert_eq!(result.test_type, TestType::PsuProbe);
+        assert_eq!(result.data["source"], PsuProbeSnapshot::SOURCE);
+        assert_eq!(result.data["provenance"], "caller_supplied_unattested");
+        assert_eq!(result.data["freshness"]["availability"], "fresh_unattested");
+        assert_eq!(result.data["freshness"]["captured_at_ms"], 10_000);
+        assert_eq!(result.data["freshness"]["evaluated_at_ms"], 10_250);
+        assert_eq!(result.data["freshness"]["age_ms"], 250);
+        assert_eq!(
+            result.data["freshness"]["stale_after_ms"],
+            crate::troubleshoot::PASSIVE_TELEMETRY_STALE_AFTER_MS
+        );
+        assert!(result.data["vin_v"].is_null());
+        assert!(result.data["iout_a"].is_null());
+        assert!(result.data["temp_c"].is_null());
+        assert!(result.data["status_word"].is_null());
+        assert!(result.grade.is_none());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("caller-supplied and unattested"));
+
+        let progress = progress_rx.try_recv().expect("neutral publication event");
+        assert_eq!(progress.test_type, TestType::PsuProbe);
+        assert_eq!(progress.phase_name, "snapshot_published");
+        assert_eq!(
+            progress.detail,
+            "Diagnostic snapshot published; no health or pass verdict implied"
+        );
+
+        let before_publication = unix_now_ms();
+        let old_capture = before_publication
+            .saturating_sub(crate::troubleshoot::PASSIVE_TELEMETRY_STALE_AFTER_MS + 1_000);
+        let production_id = service
+            .publish_psu_probe_telemetry(unattested_psu_telemetry(old_capture))
+            .expect("production method should use its own publication clock");
+        let production = service
+            .get_result(&production_id)
+            .expect("production result");
+        assert_eq!(
+            production.data["freshness"]["availability"],
+            "stale_unattested"
+        );
+        assert!(production.data["freshness"]["evaluated_at_ms"]
+            .as_u64()
+            .is_some_and(|evaluated| evaluated >= before_publication));
+
+        let capability = diagnostic_interface_capability(TestType::PsuProbe);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn passive_psu_health_bearing_and_unavailable_snapshots_are_neutral() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let mut telemetry = unattested_psu_telemetry(20_000);
+        telemetry.detected = Some(false);
+        telemetry.faults = Some(vec!["overtemperature".to_string()]);
+        telemetry.status_word = Some(1);
+        let health_id = service
+            .publish_psu_probe_telemetry_at(telemetry, 20_100)
+            .expect("health-bearing unattested values remain publishable as warnings");
+        let health = service
+            .get_result(&health_id)
+            .expect("health-bearing result");
+        assert!(health.grade.is_none());
+        assert_eq!(health.warnings.len(), 4);
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("detected=false")));
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("1 non-empty fault")));
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-zero status")));
+        let health_progress = progress_rx.try_recv().expect("health publication event");
+        assert_eq!(health_progress.phase_name, "snapshot_published");
+        assert!(!health_progress.detail.contains("success"));
+
+        let unavailable_id = service
+            .publish_psu_probe_unavailable("  power watch has not published a sample  ")
+            .expect("valid unavailable reason should normalize and publish");
+        let unavailable = service
+            .get_result(&unavailable_id)
+            .expect("unavailable PSU result");
+        assert!(unavailable.grade.is_none());
+        assert_eq!(unavailable.warnings.len(), 1);
+        assert!(unavailable.warnings[0].contains("unavailable"));
+        assert_eq!(unavailable.data["provenance"], "unavailable");
+        assert_eq!(
+            unavailable.data["freshness"]["unavailable_reason"],
+            "power watch has not published a sample"
+        );
+        assert!(unavailable.data["wall_power_w"].is_null());
+        assert!(unavailable.data["vin_v"].is_null());
+        let unavailable_progress = progress_rx.try_recv().expect("unavailable event");
+        assert_eq!(unavailable_progress.phase_name, "snapshot_published");
+        assert!(!unavailable_progress.detail.contains("success"));
+
+        for reason in ["   ".to_string(), "x".repeat(513)] {
+            let error = service
+                .publish_psu_probe_unavailable(reason)
+                .expect_err("invalid unavailable reasons must fail before insertion");
+            assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+        }
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn passive_psu_refuses_nonfinite_empty_zero_and_future_samples() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        let mut invalid = unattested_psu_telemetry(1_000);
+        invalid.wall_power_w = Some(f64::NAN);
+        assert!(service
+            .publish_psu_probe_telemetry_at(invalid, 1_100)
+            .is_err());
+
+        let mut empty = unattested_psu_telemetry(1_000);
+        empty.detected = None;
+        empty.vin_v = None;
+        empty.vout_v = None;
+        empty.iout_a = None;
+        empty.board_power_w = None;
+        empty.wall_power_w = None;
+        empty.efficiency_pct = None;
+        empty.temp_c = None;
+        empty.fan_rpm = None;
+        empty.faults = None;
+        empty.status_word = None;
+        empty.calibrated = None;
+        assert!(service
+            .publish_psu_probe_telemetry_at(empty, 1_100)
+            .is_err());
+        assert!(service
+            .publish_psu_probe_telemetry_at(unattested_psu_telemetry(0), 1_100)
+            .is_err());
+        assert!(service
+            .publish_psu_probe_telemetry_at(unattested_psu_telemetry(2_000), 1_999)
+            .is_err());
+
+        let mut too_many_faults = unattested_psu_telemetry(1_000);
+        too_many_faults.faults = Some(vec!["fault".to_string(); 129]);
+        assert!(service
+            .publish_psu_probe_telemetry_at(too_many_faults, 1_100)
+            .is_err());
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn passive_fpga_publication_rechecks_age_and_surfaces_error_counters() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let telemetry = unattested_fpga_telemetry(
+            30_000,
+            vec![unattested_fpga_chain(6), unattested_fpga_chain(7)],
+        );
+        let test_id = service
+            .publish_fpga_status_telemetry_at(telemetry, 30_125)
+            .expect("publication boundary should classify FPGA timestamp");
+        let result = service.get_result(&test_id).expect("FPGA result");
+        assert_eq!(result.test_type, TestType::FpgaStatus);
+        assert_eq!(result.data["source"], FpgaStatusSnapshot::SOURCE);
+        assert_eq!(result.data["provenance"], "caller_supplied_unattested");
+        assert_eq!(result.data["freshness"]["availability"], "fresh_unattested");
+        assert_eq!(result.data["chain_count"], 2);
+        assert!(result.data["chains"][0]["bm139x_mode"].is_null());
+        assert!(result.data["chains"][0]["cmd_tx_empty"].is_null());
+        assert!(result.grade.is_none());
+        assert_eq!(result.warnings.len(), 2);
+        assert!(result.warnings[0].contains("caller-supplied and unattested"));
+        assert!(result.warnings[1].contains("non-zero error counters"));
+        let progress = progress_rx.try_recv().expect("FPGA publication event");
+        assert_eq!(progress.phase_name, "snapshot_published");
+
+        let am2_id = service
+            .publish_fpga_status_runtime_telemetry_at(
+                runtime_owned_am2_fpga_telemetry(40_000),
+                40_125,
+            )
+            .expect("AM2 telemetry without S9-only interpretations should publish");
+        let am2 = service.get_result(&am2_id).expect("AM2 FPGA result");
+        assert_eq!(am2.data["chains"][0]["register_layout"], "am2");
+        assert!(am2.data["chains"][0]["version"].is_null());
+        assert!(am2.data["chains"][0]["baud_rate"].is_null());
+        assert!(am2.data["chains"][0]["work_time"].is_null());
+        assert!(am2.data["chains"][0]["error_count"].is_null());
+        assert!(!progress.detail.contains("success"));
+
+        let before_publication = unix_now_ms();
+        let old_capture = before_publication
+            .saturating_sub(crate::troubleshoot::PASSIVE_TELEMETRY_STALE_AFTER_MS + 1_000);
+        let production_id = service
+            .publish_fpga_status_telemetry(unattested_fpga_telemetry(
+                old_capture,
+                vec![unattested_fpga_chain(6)],
+            ))
+            .expect("production FPGA method should use its own publication clock");
+        let production = service
+            .get_result(&production_id)
+            .expect("production FPGA result");
+        assert_eq!(
+            production.data["freshness"]["availability"],
+            "stale_unattested"
+        );
+
+        let capability = diagnostic_interface_capability(TestType::FpgaStatus);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn runtime_owned_fpga_publication_is_typed_ungraded_and_layout_bound() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(4);
+        let mut service = DiagnosticService::new(progress_tx);
+        let test_id = service
+            .publish_fpga_status_runtime_telemetry_at(runtime_owned_fpga_telemetry(40_000), 40_125)
+            .expect("retained runtime-owner FPGA telemetry should publish");
+        let result = service.get_result(&test_id).expect("FPGA result");
+        assert_eq!(result.test_type, TestType::FpgaStatus);
+        assert_eq!(result.data["schema"], FpgaStatusSnapshot::SCHEMA);
+        assert_eq!(
+            result.data["provenance"],
+            "runtime_owned_retained_observation"
+        );
+        assert_eq!(result.data["chains"][0]["register_layout"], "am1_s9");
+        assert_eq!(result.data["chains"][0]["identity_word"], 0x0090_1002);
+        assert_eq!(result.data["chains"][0]["build_id"], 0x6500_0000);
+        assert_eq!(result.data["chains"][0]["work_time"], 0x0004_0507);
+        assert!(result.grade.is_none());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("retained runtime-owner snapshot")));
+        assert!(result
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("pass verdict")));
+        let progress = progress_rx.try_recv().expect("FPGA publication event");
+        assert_eq!(progress.phase_name, "snapshot_published");
+    }
+
+    #[test]
+    fn runtime_owned_fpga_publication_refuses_layout_decode_drift() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+
+        let mut wrong_enabled = runtime_owned_fpga_telemetry(1_000);
+        wrong_enabled.chains[0].enabled = Some(false);
+        assert!(service
+            .publish_fpga_status_runtime_telemetry_at(wrong_enabled, 1_100)
+            .is_err());
+
+        let mut wrong_version = runtime_owned_fpga_telemetry(1_000);
+        wrong_version.chains[0].version = Some("0x00000000".to_string());
+        assert!(service
+            .publish_fpga_status_runtime_telemetry_at(wrong_version, 1_100)
+            .is_err());
+
+        let mut relabelled_am2 = runtime_owned_fpga_telemetry(1_000);
+        let chain = &mut relabelled_am2.chains[0];
+        chain.register_layout = Some(crate::troubleshoot::FpgaRegisterLayout::Am2);
+        chain.identity_word = chain.build_id;
+        chain.ctrl_reg = Some(0x0090_1002);
+        chain.enabled = Some(true);
+        assert!(service
+            .publish_fpga_status_runtime_telemetry_at(relabelled_am2, 1_100)
+            .is_err());
+
+        let mut invented_am2_crc = runtime_owned_am2_fpga_telemetry(1_000);
+        invented_am2_crc.chains[0].error_count = Some(0);
+        assert!(service
+            .publish_fpga_status_runtime_telemetry_at(invented_am2_crc, 1_100)
+            .is_err());
+
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn passive_fpga_unavailable_snapshot_is_fallible_neutral_and_value_free() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(8);
+        let mut service = DiagnosticService::new(progress_tx);
+        let test_id = service
+            .publish_fpga_status_unavailable(
+                "daemon does not retain FPGA registers after dispatcher handoff",
+            )
+            .expect("valid FPGA unavailable reason");
+        let result = service
+            .get_result(&test_id)
+            .expect("unavailable FPGA result");
+        assert!(result.grade.is_none());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("unavailable"));
+        assert_eq!(result.data["provenance"], "unavailable");
+        assert!(result.data["chain_count"].is_null());
+        assert!(result.data["chains"].is_null());
+        let progress = progress_rx.try_recv().expect("unavailable FPGA event");
+        assert_eq!(progress.phase_name, "snapshot_published");
+        assert!(!progress.detail.contains("success"));
+
+        for reason in ["".to_string(), "x".repeat(513)] {
+            let error = service
+                .publish_fpga_status_unavailable(reason)
+                .expect_err("invalid FPGA unavailable reason must fail closed");
+            assert!(matches!(error, DiagnosticError::SnapshotAdmission { .. }));
+        }
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn passive_fpga_refuses_empty_duplicate_unobserved_and_overlong_inputs() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(1);
+        let mut service = DiagnosticService::new(progress_tx);
+        assert!(service
+            .publish_fpga_status_telemetry_at(unattested_fpga_telemetry(1_000, Vec::new()), 1_100)
+            .is_err());
+
+        let unobserved = crate::troubleshoot::UnattestedFpgaChainTelemetry {
+            chain_id: 6,
+            register_layout: None,
+            identity_word: None,
+            version: None,
+            build_id: None,
+            ctrl_reg: None,
+            enabled: None,
+            bm139x_mode: None,
+            baud_reg: None,
+            baud_rate: None,
+            work_time: None,
+            error_count: None,
+            cmd_tx_empty: None,
+            cmd_rx_empty: None,
+            work_tx_empty: None,
+            work_rx_empty: None,
+        };
+        assert!(service
+            .publish_fpga_status_telemetry_at(
+                unattested_fpga_telemetry(1_000, vec![unobserved]),
+                1_100,
+            )
+            .is_err());
+        assert!(service
+            .publish_fpga_status_telemetry_at(
+                unattested_fpga_telemetry(
+                    1_000,
+                    vec![unattested_fpga_chain(6), unattested_fpga_chain(6)],
+                ),
+                1_100,
+            )
+            .is_err());
+        let mut overlong = unattested_fpga_telemetry(1_000, vec![unattested_fpga_chain(6)]);
+        overlong.telemetry_source = "x".repeat(257);
+        assert!(service
+            .publish_fpga_status_telemetry_at(overlong, 1_100)
+            .is_err());
+        assert!(service
+            .publish_fpga_status_telemetry_at(
+                unattested_fpga_telemetry(2_000, vec![unattested_fpga_chain(6)]),
+                1_999,
+            )
+            .is_err());
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn retained_i2c_publication_is_positive_only_ungraded_and_age_evaluated() {
+        let (progress_tx, mut progress_rx) = broadcast::channel(4);
+        let mut service = DiagnosticService::new(progress_tx);
+        let test_id = service
+            .publish_i2c_runtime_telemetry_at(runtime_owned_i2c_telemetry(10_000), 10_125)
+            .expect("retained I2C observations should publish");
+        let result = service.get_result(&test_id).expect("I2C result");
+
+        assert_eq!(result.test_type, TestType::I2cScan);
+        assert_eq!(result.data["schema"], I2cScanSnapshot::SCHEMA);
+        assert_eq!(
+            result.data["provenance"],
+            "runtime_owned_retained_observation"
+        );
+        assert_eq!(
+            result.data["coverage"],
+            "successful_runtime_operations_only"
+        );
+        assert_eq!(result.data["scan_performed"], false);
+        assert_eq!(result.data["absence_inference_authorized"], false);
+        assert_eq!(result.data["endpoint_count"], 2);
+        assert_eq!(result.data["endpoints"][0]["address_hex"], "0x50");
+        assert_eq!(result.data["endpoints"][0]["age_ms"], 135);
+        assert_eq!(result.data["endpoints"][1]["age_ms"], 125);
+        assert!(result.grade.is_none());
+        assert!(result.warnings[0].contains("unlisted addresses are unknown, not absent"));
+        let progress = progress_rx.try_recv().expect("I2C publication event");
+        assert_eq!(progress.phase_name, "snapshot_published");
+        assert!(!progress.detail.contains("success"));
+
+        let capability = diagnostic_interface_capability(TestType::I2cScan);
+        assert_eq!(
+            capability.state,
+            DiagnosticInterfaceCapabilityState::ImmediateTelemetrySnapshotPublisherProductionRouteNoMeasuredPass
+        );
+        assert!(capability.runtime_job_engine_implemented);
+        assert!(capability.production_route_integrated);
+        assert!(!capability.typed_measured_pass_authorized);
+        assert!(!capability.manufacturing_grade_authorized);
+        assert!(!capability.hardware_mutation_authorized);
+    }
+
+    #[test]
+    fn retained_i2c_publication_rejects_relabelled_future_and_empty_evidence() {
+        use crate::troubleshoot::I2cObservedEndpointRole;
+
+        let (progress_tx, mut progress_rx) = broadcast::channel(2);
+        let mut service = DiagnosticService::new(progress_tx);
+
+        let mut relabelled = runtime_owned_i2c_telemetry(1_000);
+        relabelled.endpoints[0].endpoint_role = I2cObservedEndpointRole::TemperatureSensorEndpoint;
+        assert!(service
+            .publish_i2c_runtime_telemetry_at(relabelled, 1_100)
+            .is_err());
+
+        assert!(service
+            .publish_i2c_runtime_telemetry_at(runtime_owned_i2c_telemetry(2_000), 1_999)
+            .is_err());
+
+        let mut empty = runtime_owned_i2c_telemetry(1_000);
+        empty.endpoints.clear();
+        assert!(service
+            .publish_i2c_runtime_telemetry_at(empty, 1_100)
+            .is_err());
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let unavailable_id = service
+            .publish_i2c_observations_unavailable("no serialized owner observation yet")
+            .expect("explicit I2C unavailability should publish");
+        let unavailable = service
+            .get_result(&unavailable_id)
+            .expect("unavailable I2C result");
+        assert_eq!(unavailable.data["coverage"], "unavailable");
+        assert_eq!(unavailable.data["scan_performed"], false);
+        assert!(unavailable.data["endpoints"].is_null());
+        assert!(unavailable.grade.is_none());
     }
 
     #[test]

@@ -189,6 +189,9 @@ pub struct AutotunerRuntimeStatus {
     pub resume_state: Option<AutotunerResumeStateStatus>,
     pub last_update_s: u64,
     pub message: String,
+    /// Live night-power policy the tuner is actually using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub night_power: Option<crate::config::NightPowerPolicy>,
 }
 
 impl Default for AutotunerRuntimeStatus {
@@ -220,6 +223,7 @@ impl Default for AutotunerRuntimeStatus {
             resume_state: None,
             last_update_s: 0,
             message: "Autotuner runtime unavailable".to_string(),
+            night_power: None,
         }
     }
 }
@@ -614,6 +618,16 @@ pub struct AutoTuner {
     /// `rolling_acceptance_pct >= 99.0` AND
     /// `worst_chip_hw_err_rate < 0.02`.
     step_up_gate_rx: Option<tokio::sync::watch::Receiver<crate::StepUpGateSignal>>,
+    /// Closed-loop watt PID for `TuneTarget::Power`. Constructed on first
+    /// Power-mode tick. Estimate-only samples HOLD to `allocate_budget_safe`.
+    watt_target: Option<crate::WattTargetController>,
+    /// Latest power sample (PMBus from snapshots when present).
+    last_power_sample: Option<crate::PowerAuthoritySample>,
+    /// Last Power-mode setpoint after night + immersion resolution.
+    last_resolved_power_target_watts: Option<u32>,
+    /// Test-only local hour so Power-mode night resolution is deterministic.
+    #[cfg(any(test, feature = "test-helpers"))]
+    night_hour_override: Option<u8>,
 }
 
 impl AutoTuner {
@@ -818,6 +832,49 @@ impl AutoTuner {
                     self.apply_runtime_silicon_profile(miner_model, hashboard, profile_id, presets);
                 let _ = ack_tx.send(result);
             }
+            crate::AutoTunerCommand::ApplyNightPowerPolicy { policy, ack_tx } => {
+                let result = self.apply_runtime_night_power(policy, freq_cmd_tx).await;
+                let _ = ack_tx.send(result);
+            }
+        }
+    }
+
+    /// Record a home night-power policy and, when Power mode is live,
+    /// recompute the watt setpoint immediately.
+    async fn apply_runtime_night_power(
+        &mut self,
+        policy: crate::config::NightPowerPolicy,
+        freq_cmd_tx: &mpsc::Sender<FreqCommand>,
+    ) -> crate::AutoTunerNightPowerResult {
+        self.config.night_power = policy.clone();
+        self.requested_config.night_power = policy.clone();
+
+        let runtime_ready = matches!(
+            self.state,
+            TunerState::Tuned | TunerState::PartiallyTuned | TunerState::BackgroundAdjust
+        );
+        self.publish_runtime_status("night power policy updated", None);
+        if runtime_ready && matches!(self.config.target_mode, TuneTarget::Power) {
+            let chain_infos = self.runtime_chain_infos_from_profiles();
+            self.apply_target_mode(&chain_infos, freq_cmd_tx).await;
+            self.publish_runtime_status("night power policy applied to Power setpoint", None);
+            return crate::AutoTunerNightPowerResult {
+                status: crate::AutoTunerCommandStatus::Applied,
+                applied_runtime: true,
+                night_power: policy,
+                power_target_watts: self.last_resolved_power_target_watts,
+                message: "live Power-mode tuner adopted the night policy".to_string(),
+            };
+        }
+
+        crate::AutoTunerNightPowerResult {
+            status: crate::AutoTunerCommandStatus::Deferred,
+            applied_runtime: false,
+            night_power: policy,
+            power_target_watts: self.last_resolved_power_target_watts,
+            message:
+                "night policy recorded on the live tuner; Power-mode setpoint applies on the next cycle"
+                    .to_string(),
         }
     }
 
@@ -1208,24 +1265,6 @@ impl AutoTuner {
         if self.active_silicon_profile_presets.is_empty() {
             return;
         }
-        // W15-A scope is single-platform (one miner = one model).
-        // Pick the first non-empty preset table; cross-platform
-        // mixed-hashboard support stays deferred behind per-chain
-        // model/hashboard binding (TBD wave 17+ for am2 family).
-        let preset_table: Vec<crate::SiliconPreset> = self
-            .active_silicon_profile_presets
-            .values()
-            .find(|v| !v.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        if preset_table.is_empty() {
-            return;
-        }
-        let Some(preset) = Self::select_preset_for_mode(&preset_table, self.config.target_mode)
-        else {
-            return;
-        };
-        let preset = *preset;
 
         let chain_ids: Vec<u8> = self.profiles.keys().copied().collect();
         if chain_ids.is_empty() {
@@ -1233,6 +1272,26 @@ impl AutoTuner {
         }
 
         for chain_id in chain_ids {
+            let chain_hashboard = self.chain_skus.get(&chain_id).map(|sku| sku.hashboard_id());
+            let Some(preset_table) = crate::select_silicon_preset_table(
+                &self.active_silicon_profile_presets,
+                chain_hashboard,
+            ) else {
+                if self.active_silicon_profile_presets.len() > 1 {
+                    warn!(
+                        chain_id,
+                        hashboard = chain_hashboard.unwrap_or("unbound"),
+                        "Silicon profile: refusing first-table-wins on mixed boards without a unique SKU match"
+                    );
+                }
+                continue;
+            };
+            let Some(preset) = Self::select_preset_for_mode(preset_table, self.config.target_mode)
+            else {
+                continue;
+            };
+            let preset = *preset;
+
             let (target_freq_mhz, target_voltage_mv) =
                 self.derive_silicon_profile_target(chain_id, &preset);
 
@@ -1444,6 +1503,27 @@ impl AutoTuner {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_target_mode_for_test(&mut self, mode: TuneTarget) {
         self.config.target_mode = mode;
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_night_hour_override_for_test(&mut self, hour: u8) {
+        self.night_hour_override = Some(hour);
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn last_resolved_power_target_watts_for_test(&self) -> Option<u32> {
+        self.last_resolved_power_target_watts
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn runtime_status_for_test(&self) -> AutotunerRuntimeStatus {
+        self.build_runtime_status("test", None)
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn apply_target_mode_for_test(&mut self, freq_cmd_tx: &mpsc::Sender<FreqCommand>) {
+        let chain_infos = self.runtime_chain_infos_from_profiles();
+        self.apply_target_mode(&chain_infos, freq_cmd_tx).await;
     }
 
     /// Test-only helper that drives a single iteration of the runtime
@@ -1724,6 +1804,11 @@ impl AutoTuner {
             last_applied_silicon_targets: HashMap::new(),
             chain_skus: HashMap::new(),
             step_up_gate_rx: None,
+            watt_target: None,
+            last_power_sample: None,
+            last_resolved_power_target_watts: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            night_hour_override: None,
         }
     }
 
@@ -2379,6 +2464,7 @@ impl AutoTuner {
             resume_state: self.resume_state_status.clone(),
             last_update_s: now_unix_s(),
             message: message.to_string(),
+            night_power: Some(self.config.night_power.clone()),
         }
     }
 
@@ -4919,6 +5005,8 @@ impl AutoTuner {
                         // the chain that triggered the snapshot. PSU measures total power
                         // across all 3 chains, so C_eff calibration needs total freq sum.
                         if let Some(measured_w) = snapshot.psu_power_w {
+                            self.last_power_sample =
+                                Some(crate::pmbus_power_sample(measured_w));
                             if dashboard_counter == 0 {
                                 if self.mixed_chain_chip_ids() {
                                     debug!("Skipping PSU calibration during mixed-chip autotune run");
@@ -5015,6 +5103,20 @@ impl AutoTuner {
                                     chip_idx, chain_id, ema * 100.0,
                                 );
                             }
+                        }
+                    }
+
+                    // Close the watt loop on a measured sample. DPS schedule
+                    // keeps exclusive ramp ownership when enabled.
+                    if crate::watt_pid_should_step(
+                        matches!(self.config.target_mode, TuneTarget::Power),
+                        !self.schedule.enabled,
+                        self.last_power_sample.as_ref(),
+                    ) {
+                        let chain_infos = self.runtime_chain_infos_from_profiles();
+                        if !chain_infos.is_empty() {
+                            self.apply_target_mode(&chain_infos, freq_cmd_tx).await;
+                            Self::sync_monitors_from_profiles(&mut monitors, &self.profiles);
                         }
                     }
 
@@ -5567,23 +5669,23 @@ impl AutoTuner {
                 } else {
                     snapshot.current_difficulty
                 };
-                let expected_nps = crate::chip_geometry::expected_nps_for_chip(
+                if let Some(expected_nps) = crate::chip_geometry::expected_nps_for_chip(
                     monitor.chip_id,
                     monitor.current_freq_mhz,
                     diff,
-                );
-                let expected = expected_nps * snapshot.window_duration_s;
-                if expected > 0.0 {
-                    let ratio = nonces as f64 / expected;
-                    if ratio < self.config.min_hashrate_ratio {
-                        monitor.consecutive_hashrate_deficit += 1;
-                        if monitor.consecutive_hashrate_deficit
-                            >= self.config.max_consecutive_errors
-                        {
-                            let old_freq = monitor.current_freq_mhz;
-                            let new_freq = self.step_down_freq(old_freq, monitor.chip_id);
-                            if new_freq < old_freq {
-                                warn!(
+                ) {
+                    let expected = expected_nps * snapshot.window_duration_s;
+                    if expected > 0.0 {
+                        let ratio = nonces as f64 / expected;
+                        if ratio < self.config.min_hashrate_ratio {
+                            monitor.consecutive_hashrate_deficit += 1;
+                            if monitor.consecutive_hashrate_deficit
+                                >= self.config.max_consecutive_errors
+                            {
+                                let old_freq = monitor.current_freq_mhz;
+                                let new_freq = self.step_down_freq(old_freq, monitor.chip_id);
+                                if new_freq < old_freq {
+                                    warn!(
                                     chain_id = snapshot.chain_id,
                                     chip = chip_idx,
                                     hashrate_ratio = format_args!("{:.2}", ratio),
@@ -5596,31 +5698,32 @@ impl AutoTuner {
                                     old_freq,
                                     new_freq,
                                 );
-                                if let Err(e) = Self::set_chip_freq_checked(
-                                    freq_cmd_tx,
-                                    snapshot.chain_id,
-                                    chip_idx,
-                                    new_freq,
-                                )
-                                .await
-                                {
-                                    warn!(chain_id = snapshot.chain_id, chip = chip_idx, error = %e,
-                                        "Hashrate deficit backoff: failed to apply frequency change");
-                                } else {
-                                    monitor.desired_freq_mhz = new_freq;
-                                    Self::refresh_monitor_frequency(monitor);
-                                    chip_health_tracker.record_backoff(
+                                    if let Err(e) = Self::set_chip_freq_checked(
+                                        freq_cmd_tx,
                                         snapshot.chain_id,
                                         chip_idx,
-                                        monitor.current_freq_mhz,
-                                    );
-                                    needs_work_time_update = true;
+                                        new_freq,
+                                    )
+                                    .await
+                                    {
+                                        warn!(chain_id = snapshot.chain_id, chip = chip_idx, error = %e,
+                                        "Hashrate deficit backoff: failed to apply frequency change");
+                                    } else {
+                                        monitor.desired_freq_mhz = new_freq;
+                                        Self::refresh_monitor_frequency(monitor);
+                                        chip_health_tracker.record_backoff(
+                                            snapshot.chain_id,
+                                            chip_idx,
+                                            monitor.current_freq_mhz,
+                                        );
+                                        needs_work_time_update = true;
+                                    }
                                 }
+                                monitor.consecutive_hashrate_deficit = 0;
                             }
+                        } else {
                             monitor.consecutive_hashrate_deficit = 0;
                         }
-                    } else {
-                        monitor.consecutive_hashrate_deficit = 0;
                     }
                 }
             }
@@ -6305,6 +6408,20 @@ impl AutoTuner {
         true
     }
 
+    fn power_mode_local_hour(&self) -> u8 {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(hour) = self.night_hour_override {
+            return hour;
+        }
+        dcentrald_common::night_power::local_hour_from_unix_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            self.config.night_power.timezone_offset_hours,
+        )
+    }
+
     /// Apply the configured target mode (Hashrate/Power/Efficiency) to all tuned chains.
     ///
     /// After characterization and voltage optimization, this adjusts per-chip frequencies
@@ -6353,24 +6470,24 @@ impl AutoTuner {
                     return;
                 }
 
-                // Temperature-compensated power budget: C_eff increases ~0.3%/°C
-                // above the 55°C reference point. In immersion mode (running at
-                // 70-80°C), actual power is 4-7% higher than the model predicts.
-                // Reduce the budget to prevent PSU overload.
-                let target_watts = if self.config.immersion_mode {
-                    let thermal_overhead = 0.955; // ~4.5% correction for elevated temps
-                    let adjusted = (raw_target_watts as f64 * thermal_overhead) as u32;
-                    if adjusted < raw_target_watts {
-                        info!(
-                            raw_watts = raw_target_watts,
-                            adjusted_watts = adjusted,
-                            "Immersion mode: reducing power budget by 4.5% for thermal C_eff correction"
-                        );
-                    }
-                    adjusted
-                } else {
-                    raw_target_watts
-                };
+                let local_hour = self.power_mode_local_hour();
+                let target_watts = crate::resolve_power_mode_target_watts(
+                    raw_target_watts,
+                    &self.config.night_power,
+                    local_hour,
+                    self.config.immersion_mode,
+                );
+                self.last_resolved_power_target_watts = Some(target_watts);
+                if target_watts != raw_target_watts {
+                    info!(
+                        raw_watts = raw_target_watts,
+                        adjusted_watts = target_watts,
+                        night_enabled = self.config.night_power.enabled,
+                        local_hour,
+                        immersion = self.config.immersion_mode,
+                        "Power mode: applying night/immersion setpoint"
+                    );
+                }
 
                 info!(
                     target_watts,
@@ -6426,14 +6543,23 @@ impl AutoTuner {
                 };
                 let voltage_v = voltage_mv as f64 / 1000.0;
 
-                let budget_freqs = power_model.allocate_budget_safe(
+                if self.watt_target.is_none() {
+                    self.watt_target = Some(crate::WattTargetController::new(power_model.clone()));
+                }
+                let sample = self.last_power_sample.clone();
+                let budget_freqs = crate::allocate_power_target_step(
+                    self.watt_target
+                        .as_mut()
+                        .expect("watt_target just inserted"),
                     target_watts as f64,
+                    sample.as_ref(),
                     voltage_v,
                     &all_chips,
                     self.config.min_freq_mhz,
                     num_chains,
-                    saved_calibrated_c_eff,
-                );
+                    None,
+                )
+                .freqs;
 
                 // Apply the budget-allocated frequencies to each chain
                 for &(chain_id, _voltage, start, count) in &chain_chip_ranges {
@@ -6896,6 +7022,7 @@ impl AutoTuner {
                     .iter()
                     .map(|c| {
                         crate::chip_geometry::chip_hashrate_ghs_for_chip(chip_id, c.operating_mhz)
+                            .unwrap_or(0.0)
                     })
                     .sum();
 
@@ -7003,7 +7130,9 @@ impl AutoTuner {
                     let hashrate_ths = crate::chip_geometry::chip_hashrate_ghs_for_chip(
                         chip_id,
                         chip.operating_mhz,
-                    ) / 1000.0;
+                    )
+                    .unwrap_or(0.0)
+                        / 1000.0;
                     let jth = if hashrate_ths > 0.0 {
                         power / hashrate_ths
                     } else {
@@ -9253,5 +9382,109 @@ mod tests {
             let table = crate::pvt_envelope::pvt_envelope(*sku);
             assert!(!table.is_empty(), "{} envelope empty", sku.hashboard_id());
         }
+    }
+
+    #[tokio::test]
+    async fn apply_target_mode_uses_home_night_power_setpoint() {
+        let mut config = AutoTunerConfig::default();
+        config.target_mode = TuneTarget::Power;
+        config.target_watts = 1000;
+        config.night_power = crate::config::NightPowerPolicy {
+            enabled: true,
+            start_hour: 22,
+            end_hour: 7,
+            power_reduction_pct: 40,
+            timezone_offset_hours: 0,
+        };
+        let mut tuner = AutoTuner::new(
+            config,
+            500,
+            "BM1387".to_string(),
+            "pic16".to_string(),
+            default_power_calibration(),
+        );
+        tuner.set_night_hour_override_for_test(23);
+        let (freq_tx, _freq_rx) = mpsc::channel::<FreqCommand>(8);
+        tuner.apply_target_mode_for_test(&freq_tx).await;
+        assert_eq!(
+            tuner.last_resolved_power_target_watts_for_test(),
+            Some(600),
+            "apply_target_mode must allocate the night-cut Power setpoint, not raw 1000 W"
+        );
+
+        tuner.set_night_hour_override_for_test(12);
+        tuner.apply_target_mode_for_test(&freq_tx).await;
+        assert_eq!(
+            tuner.last_resolved_power_target_watts_for_test(),
+            Some(1000),
+            "daytime Power mode must keep the raw target"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_night_power_command_adopts_on_running_power_tuner() {
+        let mut config = AutoTunerConfig::default();
+        config.target_mode = TuneTarget::Power;
+        config.target_watts = 1000;
+        let mut tuner = AutoTuner::new(
+            config,
+            500,
+            "BM1387".to_string(),
+            "pic16".to_string(),
+            default_power_calibration(),
+        );
+        tuner.force_state_for_test(TunerState::BackgroundAdjust);
+        tuner.set_night_hour_override_for_test(23);
+        let (freq_tx, _freq_rx) = mpsc::channel::<FreqCommand>(8);
+        tuner.apply_target_mode_for_test(&freq_tx).await;
+        assert_eq!(
+            tuner.last_resolved_power_target_watts_for_test(),
+            Some(1000),
+            "night policy default-off must keep raw 1000 W"
+        );
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<crate::AutoTunerCommand>(4);
+        tuner.set_command_receiver(cmd_rx);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(crate::AutoTunerCommand::ApplyNightPowerPolicy {
+                policy: crate::config::NightPowerPolicy {
+                    enabled: true,
+                    start_hour: 22,
+                    end_hour: 7,
+                    power_reduction_pct: 40,
+                    timezone_offset_hours: 0,
+                },
+                ack_tx,
+            })
+            .await
+            .expect("send night policy");
+        assert!(
+            tuner.tick_runtime_commands_for_test(&freq_tx).await,
+            "ApplyNightPowerPolicy must be consumed by the live command path"
+        );
+        let result = ack_rx.await.expect("ack");
+        assert!(result.applied_runtime);
+        assert!(matches!(
+            result.status,
+            crate::AutoTunerCommandStatus::Applied
+        ));
+        assert_eq!(result.power_target_watts, Some(600));
+        assert_eq!(
+            tuner.last_resolved_power_target_watts_for_test(),
+            Some(600),
+            "running Power-mode tuner must adopt the POST night cut without restart"
+        );
+        assert_eq!(tuner.config.night_power.power_reduction_pct, 40);
+        let status = tuner.runtime_status_for_test();
+        let live = status
+            .night_power
+            .expect("live status must publish night_power");
+        assert!(live.matches_saved(true, 22, 7, 40));
+        let truth = crate::night_mode_read_truth(true, 22, 7, 40, Some(&live));
+        assert!(
+            truth.runtime_adopted,
+            "GET truth helper must report adopted after the live command"
+        );
     }
 }

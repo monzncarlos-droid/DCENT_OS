@@ -56,7 +56,7 @@ require_lab_flags() {
 refuse_clear_for_flash_nand() {
     CLEAR_FOR_FLASH=false
     if [ "$CLEAR_FOR_FLASH" != true ]; then
-        echo "ERROR: CLEAR_FOR_FLASH=false — refusing gpio437 SafeOff/flash_erase/nandwrite." >&2
+        echo "ERROR: CLEAR_FOR_FLASH=false - refusing gpio437 SafeOff/flash_erase/nandwrite." >&2
         echo "schema=dcentos.amlogic-lab-rootfs/v1"
         echo "nandwrite=false"
         echo "gpio_write=false"
@@ -151,7 +151,10 @@ require_exact_amlogic_target() {
     local normalized
 
     identity=$(ssh $SSH_OPTS "root@$miner_ip" '
-        printf "BOARD_TARGET=%s\n" "$(cat /etc/dcentos/board_target 2>/dev/null | head -1 | tr -d "[:space:]")"
+        # BusyBox 1.29.x treats `[:space:]` here as a literal character set
+        # and corrupts values such as am3-s19k. Delete the four admitted ASCII
+        # separators explicitly, matching the production installer.
+        printf "BOARD_TARGET=%s\n" "$(cat /etc/dcentos/board_target 2>/dev/null | head -1 | tr -d " \t\r\n")"
         printf "MODEL=%s\n" "$(cat /config/CONF_MINER_TYPE 2>/dev/null | head -1)"
         printf "HWID=%s\n" "$(cat /config/CONF_HARDWARE_ID 2>/dev/null | head -1)"
         printf "BOS_MODEL=%s\n" "$(grep "^model" /etc/bosminer.toml 2>/dev/null | head -1)"
@@ -238,7 +241,7 @@ VAL=\$(cat \"\$SYS/gpio\$PWR_GPIO/value\")
 [ \"\$DIR\" = \"out\" ] || { echo \"ERROR: gpio437 direction=\$DIR\" >&2; exit 1; }
 [ \"\$VAL\" = \"\$SAFE_OFF\" ] || { echo \"ERROR: gpio437 value=\$VAL after SafeOff (want \$SAFE_OFF)\" >&2; exit 1; }
 echo \"gpio437 SafeOff OK polarity=$polarity active_low=\$AL direction=\$DIR value=\$VAL\"" \
-        || { echo "ERROR: GPIO437 SafeOff failed — refusing NAND mutation" >&2; exit 1; }
+        || { echo "ERROR: GPIO437 SafeOff failed - refusing NAND mutation" >&2; exit 1; }
     echo "GPIO437 SafeOff verified (polarity=$polarity value=$safe_off)"
 }
 

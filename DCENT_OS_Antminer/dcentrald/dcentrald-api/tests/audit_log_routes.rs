@@ -13,6 +13,7 @@
 //! Linux/CI only — `dcentrald-api` pulls Unix-only HAL crates.
 
 #![cfg(unix)]
+#![allow(clippy::await_holding_lock)]
 
 use std::io::Write as _;
 use std::path::PathBuf;

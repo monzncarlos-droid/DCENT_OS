@@ -1,0 +1,8 @@
+[toolchain]
+channel = "1.90.0"
+profile = "minimal"
+targets = [
+    "armv7-unknown-linux-musleabihf",
+    "aarch64-unknown-linux-musl",
+]
+

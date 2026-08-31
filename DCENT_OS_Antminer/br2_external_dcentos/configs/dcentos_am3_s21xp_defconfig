@@ -1,9 +1,9 @@
-# DCENTos Buildroot defconfig — Antminer S21 XP (Amlogic am3-aml NoPic).
+# DCENTos Buildroot defconfig — Antminer S21 XP package-only evidence target.
 # D-Central Technologies, 2026.
 #
 # Target: Amlogic A113D (ARM Cortex-A53 quad, aarch64).
-# Chip:   BM1370 (3 nm) — BUILD-CLEAN SCAFFOLD, no live unit (chip count TODO-confirm).
-# PSU:    APW12 class, PMBus enable plus GPIO 437 PSU_nEN.
+# Chip:   BM1370 (3 nm), exact A3HB70501 topology; runtime is not implemented.
+# PSU:    Unresolved. GPIO437 is observed but polarity/protocol/safe-off are unproved.
 # Boot:   BL2 -> FIP -> U-Boot 2015.01 -> kernel 4.9.113 (no FPGA bitstream).
 #
 # Per-product OVERRIDE layer. Shared content lives in:
@@ -18,7 +18,7 @@
 # Per-product identity.
 # =============================================================================
 BR2_TARGET_GENERIC_HOSTNAME="dcentos-s21xp"
-BR2_TARGET_GENERIC_ISSUE="DCENTos for S21 XP (am3-aml NoPic) - D-Central Technologies"
+BR2_TARGET_GENERIC_ISSUE="DCENTos S21 XP management-only evidence package - D-Central Technologies"
 
 # =============================================================================
 # Overlay-on-overlay — shared amlogic overlay first, am3-s21xp identity last.

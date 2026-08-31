@@ -1,0 +1,36 @@
+# DCENT K230 kernel fragment (nano3s first-light image).
+#
+# The k230_defconfig already carries CONFIG_MTD=y, CONFIG_MTD_SPI_NAND=y,
+# CONFIG_MTD_UBI=y and the DesignWare MMIO SPI driver (spi0), but no UBIFS.
+# The DCENT rootfs is a UBI volume, so:
+CONFIG_UBIFS_FS=y
+
+# First-light ACM gadget prerequisites. Pin these explicitly instead of
+# relying on the vendor defconfig's incidental module selection.
+CONFIG_USB=y
+CONFIG_USB_DWC2=y
+CONFIG_USB_DWC2_DUAL_ROLE=y
+CONFIG_USB_GADGET=y
+CONFIG_CONFIGFS_FS=m
+CONFIG_USB_LIBCOMPOSITE=m
+CONFIG_USB_U_SERIAL=m
+CONFIG_USB_F_ACM=m
+CONFIG_USB_CONFIGFS=m
+CONFIG_USB_CONFIGFS_ACM=y
+
+# Headless trim: the stock map gives the linux partition exactly 8 MiB
+# (0xA00000+0x800000 = 0x1200000 = rootfs start, zero slack). The vendor
+# k230_defconfig builds in the whole display/camera/audio stack (~19 MiB
+# Image -> ~10 MiB container, which does not fit); a miner needs none of it.
+# NOTE: this also disables the k230-evb.dtb's display pipeline — use the
+# k230-nano3s.dtb (headless) with this fragment.
+# CONFIG_DRM is not set
+# CONFIG_DRM_CANAAN is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_VPU_CANAAN is not set
+# CONFIG_SND is not set
+# CONFIG_USB_VIDEO_CLASS is not set
+# CONFIG_ACPI is not set
+# CONFIG_EFI is not set
+# CONFIG_VGA_CONSOLE is not set
+# CONFIG_IKCONFIG is not set

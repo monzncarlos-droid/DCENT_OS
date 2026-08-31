@@ -1,0 +1,94 @@
+{
+  "schema": "dcent.nano3.a-authority-materialization-template.v1",
+  "status": "INTENTIONALLY_INVALID_NONAUTHORIZING_TEMPLATE",
+  "purpose": "stage_exact_protected_w4_prepare_inputs_without_authority",
+  "production_authority_key_pins": {
+    "materialization_reviewer": null,
+    "recovery_engineering": null,
+    "recovery_operator": null,
+    "telemetry_authority": null,
+    "post_cut_authority": null,
+    "pool_topology_authority": null,
+    "trusted_time_authority": null,
+    "global_replay_authority": null,
+    "operator_authorization_a": null
+  },
+  "production_w4_key_pins": {},
+  "required_supplemental_roles": [
+    "recovery_engineering_signature",
+    "recovery_operator_ack",
+    "recovery_operator_signature",
+    "telemetry_compiled_contract",
+    "telemetry_source_bundle",
+    "telemetry_identity_receipt",
+    "telemetry_capture_receipt",
+    "telemetry_raw_01_version",
+    "telemetry_raw_02_summary",
+    "telemetry_raw_03_stats",
+    "telemetry_raw_04_devs",
+    "telemetry_raw_05_pools",
+    "telemetry_raw_06_lcd",
+    "telemetry_raw_07_version",
+    "telemetry_raw_08_summary",
+    "telemetry_raw_09_stats",
+    "telemetry_raw_10_devs",
+    "telemetry_raw_11_pools",
+    "telemetry_raw_12_lcd",
+    "post_cut_prior_receipt",
+    "post_cut_raw_evidence",
+    "pool_topology_raw_evidence"
+  ],
+  "external_states": {
+    "trusted_time": {
+      "receipt_byte_bound": true,
+      "cryptographically_bound_to_unpinned_key": true,
+      "production_provider_pin_verified": false,
+      "provider_identity_and_custody_proven": false,
+      "trusted_time_verified": false,
+      "freshness_verified": false
+    },
+    "global_replay": {
+      "receipt_byte_bound": true,
+      "cryptographically_bound_to_unpinned_key": true,
+      "production_provider_pin_verified": false,
+      "provider_identity_and_durability_proven": false,
+      "reservation_is_consumption": false,
+      "global_one_shot_consumed": false
+    },
+    "recovery": {
+      "four_file_structure_and_signatures_verified": true,
+      "production_recovery_pins_verified": false,
+      "exact_restore_artifact_bytes_verified": false,
+      "recovery_authority_proven": false,
+      "recovery_execution_authorized": false
+    },
+    "telemetry": {
+      "source_bundle_recompiled_from_snapshotted_raw_bytes": true,
+      "compiled_contract_bytes_matched": true,
+      "production_source_authority_verified": false,
+      "auto_mode_and_source_sample_freshness_proven": false,
+      "authentic_live_capability_verified": false
+    },
+    "physical_qualifications": {
+      "post_cut_raw_bytes_bound": true,
+      "pool_topology_raw_bytes_bound": true,
+      "instrument_placement_and_calibration_proven": false,
+      "network_observation_completeness_proven": false,
+      "prior_physical_qualifications_verified": false
+    }
+  },
+  "public_states": {
+    "file_contract_valid": true,
+    "production_pins_verified": false,
+    "trusted_time_verified": false,
+    "global_one_shot_consumed": false,
+    "prior_physical_qualifications_verified": false,
+    "operator_authorization_a_signature_verified": false,
+    "precontact_admission_conditions_met": false,
+    "live_session_performed": false,
+    "postrun_result_accepted": false,
+    "authorization_a_granted_by_compiler": false
+  },
+  "authorization_a_granted": false,
+  "device_contact": "none"
+}

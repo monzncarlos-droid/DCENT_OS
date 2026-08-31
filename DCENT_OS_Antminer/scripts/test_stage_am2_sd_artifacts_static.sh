@@ -373,7 +373,11 @@ cat >"$COMP_IMG.manifest.json" <<JSON
   }
 }
 JSON
-"$PKG" --image "$COMP_IMG" --label test-complete --output-root "$TMP/pkg-ok" --require-complete \
+# Synthetic bytes are deliberately not a RELEASE image. Exercise the complete
+# manifest path under the packager's explicit DEV authority instead of
+# accidentally asking the public-artifact gate to bless unsigned bytes.
+"$PKG" --image "$COMP_IMG" --label test-complete --output-root "$TMP/pkg-ok" \
+  --require-complete --allow-dev-image \
   || fail "complete package should succeed"
 [ -f "$TMP/pkg-ok/TESTER_README.txt" ] || fail "tester readme"
 grep -qi "NOT A NAND" "$TMP/pkg-ok/TESTER_README.txt" || fail "NAND disclaimer missing"

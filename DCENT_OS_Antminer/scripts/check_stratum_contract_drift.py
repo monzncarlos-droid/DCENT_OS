@@ -214,7 +214,23 @@ def main() -> int:
     #
     # This is an ENUMERATED allowance, not a relaxation: any field other than these still
     # fails the gate on either side, and the Antminer side stays exactly the shared set.
-    esp_only_work_fields = {"algorithm"}
+    #
+    # 2026-08-29 additions (coinbase interface extension): `coinbase`,
+    # `merkle_branches`, `nonce2_offset`, `nonce2_size` carry the serialized
+    # coinbase and extranonce2 geometry next_work already computes, exposed
+    # for chain-side splicing drivers — the Avalon mm_work SET_JOB path
+    # (both Avalon lines consume dcentaxe-stratum, see the dependency pins
+    # below). The Antminer daemon's BM-family drivers splice nothing
+    # chain-side, so mirroring would add dead fields there; when an
+    # Antminer path ever needs coinbase carriage, mirror the set properly
+    # instead of extending this allowance.
+    esp_only_work_fields = {
+        "algorithm",
+        "coinbase",
+        "merkle_branches",
+        "nonce2_offset",
+        "nonce2_size",
+    }
     # Antminer-only extension, deliberately NOT mirrored into the ESP crate
     # (acknowledged 2026-08-02).
     #

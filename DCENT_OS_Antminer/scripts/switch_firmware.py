@@ -229,4 +229,4 @@ with open("/tmp/uboot_env_patched.bin", "wb") as f:
     f.write(output)
 
 print("Patched: /tmp/uboot_env_patched.bin")
-print("Flash:   flash_erase /dev/mtd4 0 0 && nandwrite -p /dev/mtd4 /tmp/uboot_env_patched.bin")
+print("Apply:   fw_setenv --script  (NEVER flash_erase/nandwrite /dev/mtd4)")

@@ -24,6 +24,111 @@ use crate::serial_work_policy::{
 };
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
+/// What changed at the serial receive boundary during one observation interval.
+///
+/// This deliberately separates bytes delivered by the UART driver from complete
+/// frames accepted by the response assembler. A `WireOnlyProgress` interval is
+/// therefore evidence of wire activity without frame completion (for example,
+/// partial/garbled input or a framing mismatch), while `Silent` means the host
+/// observed no receive bytes at all. Neither state claims a chip-side cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialRxIntervalState {
+    FramedProgress,
+    WireOnlyProgress,
+    Silent,
+    CounterReset,
+}
+
+impl SerialRxIntervalState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FramedProgress => "framed-progress",
+            Self::WireOnlyProgress => "wire-only-progress",
+            Self::Silent => "silent",
+            Self::CounterReset => "counter-reset",
+        }
+    }
+
+    /// Compact code for the serial actor → mining-loop atomic.
+    /// `0xFF` is reserved for "no interval published yet".
+    pub const fn as_code(self) -> u8 {
+        match self {
+            Self::Silent => 0,
+            Self::WireOnlyProgress => 1,
+            Self::FramedProgress => 2,
+            Self::CounterReset => 3,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Silent),
+            1 => Some(Self::WireOnlyProgress),
+            2 => Some(Self::FramedProgress),
+            3 => Some(Self::CounterReset),
+            _ => None,
+        }
+    }
+}
+
+/// live438 wrap-5 / live434 wrap-4 MULTI death is host nonce-silent.
+/// Parser interval is an orthogonal axis: wire-only bytes are not chip
+/// silence, and framed-progress is not wrap-7 survival or replace.
+pub fn s19k_track1_rx_death_parser_note(state: Option<SerialRxIntervalState>) -> &'static str {
+    match state {
+        None => "parser-unknown",
+        Some(SerialRxIntervalState::Silent) => "host-silent",
+        Some(SerialRxIntervalState::WireOnlyProgress) => "wire-only-no-frame",
+        Some(SerialRxIntervalState::FramedProgress) => "framed-still-progress",
+        Some(SerialRxIntervalState::CounterReset) => "counter-reset",
+    }
+}
+
+/// Delta and classification for two cumulative serial receive observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialRxInterval {
+    pub wire_bytes: u64,
+    pub framed_responses: u64,
+    pub state: SerialRxIntervalState,
+}
+
+/// Classify cumulative RX counters without mistaking parser silence for wire
+/// silence. Counter regression is kept explicit rather than hidden by a
+/// saturating subtraction so a backend replacement/reset cannot forge a quiet
+/// interval.
+pub fn classify_serial_rx_interval(
+    previous_wire_bytes: u64,
+    current_wire_bytes: u64,
+    previous_framed_responses: u64,
+    current_framed_responses: u64,
+) -> SerialRxInterval {
+    if current_wire_bytes < previous_wire_bytes
+        || current_framed_responses < previous_framed_responses
+    {
+        return SerialRxInterval {
+            wire_bytes: current_wire_bytes,
+            framed_responses: current_framed_responses,
+            state: SerialRxIntervalState::CounterReset,
+        };
+    }
+
+    let wire_bytes = current_wire_bytes - previous_wire_bytes;
+    let framed_responses = current_framed_responses - previous_framed_responses;
+    let state = if framed_responses > 0 {
+        SerialRxIntervalState::FramedProgress
+    } else if wire_bytes > 0 {
+        SerialRxIntervalState::WireOnlyProgress
+    } else {
+        SerialRxIntervalState::Silent
+    };
+
+    SerialRxInterval {
+        wire_bytes,
+        framed_responses,
+        state,
+    }
+}
+
 /// One stored work candidate keyed by ASIC job-id slot (pure common fields).
 ///
 /// Engines that need richer match metadata (nbits, merkle, share_target) keep a
@@ -100,6 +205,26 @@ impl<T> WorkHistoryRing<T> {
     pub fn clear_all(&mut self) {
         for q in &mut self.slots {
             q.clear();
+        }
+    }
+}
+
+impl<T: Clone> WorkHistoryRing<T> {
+    /// live448 wrap-5 `retired_s19k_history = work_history.clone()` wiped
+    /// wrap-4 leftover share_targets, so leftover_hit stayed 0 leftover_header=8.
+    /// Merge POST-admit history into wrap-4 leftover generations.
+    pub fn merge_from(&mut self, other: &Self) {
+        for slot in 0u8..=255 {
+            let oldest_first: Vec<T> = other
+                .iter_newest_first(slot)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            for entry in oldest_first {
+                self.push(slot, entry);
+            }
         }
     }
 }
@@ -502,6 +627,310 @@ impl SerialMiningEngineBookkeeping {
     pub fn on_clean_jobs(&mut self) {
         self.seen.clear();
     }
+
+    /// Track-1 mid-run clean: restart fill `0..255`. live414/417/418 left the
+    /// cursor running after `clean_jobs`, so new midstates reused later slots
+    /// while chips kept hashing the pre-clean first-load jobs.
+    pub fn reset_s19k_braiins_fill(&mut self) {
+        *self = Self::s19k_braiins_fill();
+    }
+}
+
+/// /424: post-clean share-funnel counters for S19k Track-1.
+///
+/// live414/417/418: after the first mid-run `clean_jobs`, ticket nonces keep
+/// correlating (`JobNonceFillOk` at the full TX pace) but none ever pass the
+/// pool-target check. live412 `...8bd1` is **not** occupied-slot replace
+/// proof — that notify arrived ~65 TX into the first 256-slot fill. Session
+/// start shares also follow GetAddress/discover (live415 died when that was
+/// tried mid-run). The remaining question is whether post-clean ticket
+/// nonces still solve the **retired** pre-clean generation. These counters
+/// plus the nonce/TX dump make that desk-decidable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct S19kCleanFunnel {
+    /// Mid-run cleans observed since run start (session-start job excluded).
+    pub cleans: u32,
+    /// Tagged BM1366 RX bodies that entered the nonce branch since last clean.
+    pub rxs: u32,
+    /// `hunt_s19k_bm1366_fill_from_tagged_slot` refused (not counted at all).
+    pub correlate_fail: u32,
+    /// Counted, but no retry slot had a work-history entry.
+    pub history_stale: u32,
+    /// Counted with history, but `serial_rolled_version` returned None.
+    pub version_none: u32,
+    /// Header hash met the pool share target.
+    pub meets: u32,
+    /// Header hash below the **current** post-clean target.
+    pub misses: u32,
+    /// Missed the new target, but met a retired pre-clean **21 36 wire**.
+    pub leftover_hit: u32,
+    /// Header-history leftover that did **not** hash a retired 21 36 wire
+    /// (live425 `LeftoverPreClean` + `retired_tx_meets=false`).
+    pub leftover_header: u32,
+    /// Missed both the new target and every retired slot.
+    pub unknown_miss: u32,
+    /// Nonce/TX dump lines still owed after the latest clean.
+    pub dumps_left: u32,
+    /// First post-clean `21 36` TX still owed (session `total_work` is not reset).
+    pub frame_dump_owed: bool,
+}
+
+impl S19kCleanFunnel {
+    /// Nonces to dump per clean for offline hash-verification.
+    pub const DUMPS_PER_CLEAN: u32 = 24;
+
+    /// A new mid-run clean: reset per-clean stages, re-arm the dump budget.
+    pub fn on_clean(&mut self) {
+        self.cleans = self.cleans.saturating_add(1);
+        self.rxs = 0;
+        self.correlate_fail = 0;
+        self.history_stale = 0;
+        self.version_none = 0;
+        self.meets = 0;
+        self.misses = 0;
+        self.leftover_hit = 0;
+        self.leftover_header = 0;
+        self.unknown_miss = 0;
+        self.dumps_left = Self::DUMPS_PER_CLEAN;
+        self.frame_dump_owed = true;
+    }
+
+    /// Snapshot leftover/meets **before** `on_clean` wipes them. The
+    /// second mid-run clean must plan from the first clean's leftover
+    /// (live431 leftover_hit=4). Planning after `on_clean` always sees 0.
+    pub fn snapshot_for_post_clean_plan(&self) -> (u32, u32, u32) {
+        (self.leftover_hit, self.leftover_header, self.meets)
+    }
+
+    /// After leftover-admitted Chain Inactive, leftover/meets must
+    /// measure the post-flush generation. Do not increment `cleans`
+    /// (that is a pool clean, not a flush).
+    pub fn on_leftover_admitted_inactive(&mut self) {
+        self.rxs = 0;
+        self.correlate_fail = 0;
+        self.history_stale = 0;
+        self.version_none = 0;
+        self.meets = 0;
+        self.misses = 0;
+        self.leftover_hit = 0;
+        self.leftover_header = 0;
+        self.unknown_miss = 0;
+        self.dumps_left = Self::DUMPS_PER_CLEAN;
+        self.frame_dump_owed = true;
+    }
+}
+
+/// wrap-4 early snapshot calls [`S19kCleanFunnel::on_clean`], which
+/// wipes leftover_hit. Restore wrap-retire leftover so leftover-admitted
+/// inactive can still fire on the next tick.
+pub fn s19k_restore_wrap_retire_leftover_after_clean_snapshot(
+    funnel: &mut S19kCleanFunnel,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+) {
+    funnel.leftover_hit = leftover_hit;
+    funnel.leftover_header = leftover_header;
+    funnel.meets = meets;
+}
+
+pub fn admit_s19k_wrap4_snapshot_preserves_wrap_retire_leftover() -> Result<(), &'static str> {
+    let mut funnel = S19kCleanFunnel::default();
+    funnel.leftover_hit = crate::s19k_braiins_job::S19K_LIVE431_LEFTOVER_HIT;
+    funnel.leftover_header = crate::s19k_braiins_job::S19K_LIVE431_LEFTOVER_HEADER;
+    funnel.meets = crate::s19k_braiins_job::S19K_LIVE431_MEETS;
+    let (hit, header, meets) = funnel.snapshot_for_post_clean_plan();
+    funnel.on_clean();
+    if funnel.leftover_hit != 0 {
+        return Err("on_clean must wipe leftover_hit before restore");
+    }
+    s19k_restore_wrap_retire_leftover_after_clean_snapshot(&mut funnel, hit, header, meets);
+    if funnel.leftover_hit != crate::s19k_braiins_job::S19K_LIVE431_LEFTOVER_HIT {
+        return Err("wrap-4 snapshot must restore wrap-retire leftover_hit");
+    }
+    if !crate::s19k_braiins_job::s19k_leftover_hit_admits_experimental_inactive(
+        funnel.leftover_hit,
+        funnel.leftover_header,
+        funnel.meets,
+    ) {
+        return Err("restored wrap-retire leftover must still admit leftover-admitted inactive");
+    }
+    if funnel.cleans != 1 {
+        return Err("wrap-4 snapshot still arms the funnel");
+    }
+    Ok(())
+}
+
+impl S19kCleanFunnel {
+    /// Consume one dump slot; `false` once the per-clean budget is spent.
+    pub fn take_dump(&mut self) -> bool {
+        if self.dumps_left == 0 {
+            return false;
+        }
+        self.dumps_left -= 1;
+        true
+    }
+
+    /// live425: the 24-slot budget was spent on ticket-256 UnknownMiss, so
+    /// the six leftover_hit pool-valid nonces were never dumped. Leftover
+    /// and new-block classes always dump; UnknownMiss still uses the budget.
+    pub fn take_dump_for(&mut self, class: S19kPostCleanNonceClass) -> bool {
+        match class {
+            S19kPostCleanNonceClass::LeftoverPreClean | S19kPostCleanNonceClass::NewBlockShare => {
+                true
+            }
+            S19kPostCleanNonceClass::UnknownMiss => self.take_dump(),
+        }
+    }
+
+    /// Consume the one-shot post-clean FULL FRAME dump.
+    pub fn take_frame_dump(&mut self) -> bool {
+        if !self.frame_dump_owed {
+            return false;
+        }
+        self.frame_dump_owed = false;
+        true
+    }
+}
+
+/// live412/414 only logged `FULL FRAME` when `total_work <= 1`. Mid-run
+/// clean does not reset that counter, so post-clean TX never hit the log.
+/// Dump the session-first frame **or** the first frame after a mid-run clean.
+pub fn s19k_should_log_full_work_frame(total_work: u64, post_clean_frame_owed: bool) -> bool {
+    // Call site increments first: session-first work is `total_work == 1`.
+    total_work == 1 || post_clean_frame_owed
+}
+
+/// `true` only after a mid-run clean (the session-start job is not a cliff risk).
+pub fn s19k_clean_funnel_armed(funnel: &S19kCleanFunnel) -> bool {
+    funnel.cleans > 0
+}
+
+/// Production pin: the serial nonce path must count every funnel stage and
+/// dump post-clean nonce/TX pairs ( discriminator for the cliff).
+pub fn admit_s19k_production_clean_funnel_instrumented(src: &str) -> Result<(), &'static str> {
+    if !src.contains("clean_funnel.on_clean()") {
+        return Err("serial_mining clean path must arm the S19k clean funnel");
+    }
+    if !src.contains("snapshot_for_post_clean_plan") {
+        return Err(
+            "second clean must plan leftover from pre-reset snapshot (live431 leftover_hit=4)",
+        );
+    }
+    if !src.contains("on_leftover_admitted_inactive") {
+        return Err("leftover-admitted inactive must reset leftover/meets for the post-flush bar");
+    }
+    if !src.contains("s19k_post_inactive_replace_proven") {
+        return Err("funnel line must compute replace_proven from post-inactive leftover vs meets");
+    }
+    if !src.contains("s19k_post_inactive_flush_measured_not_replace") {
+        return Err("funnel line must distinguish leftover-admit flush from replace (live438 leftover_hit=0)");
+    }
+    if !src.contains("flush_measured") {
+        return Err("funnel line must print flush_measured");
+    }
+    if !src.contains("replace_proven") {
+        return Err("funnel line must print replace_proven");
+    }
+    if !src.contains("let midrun_clean = is_bm1366 && total_work > 0") {
+        return Err(
+            "funnel must arm only after the first work (session-start clean is not the cliff)",
+        );
+    }
+    if !src.contains("clean_funnel.take_dump_for(") {
+        return Err("serial_mining nonce path must dump leftover/meets even after the 24 UnknownMiss budget");
+    }
+    if !src.contains("S19k post-clean funnel") {
+        return Err("serial_mining must log the post-clean funnel line");
+    }
+    if !src.contains("S19k post-clean nonce dump") {
+        return Err("serial_mining must log the post-clean nonce dump line");
+    }
+    if !src.contains("classify_s19k_post_clean_nonce") {
+        return Err("serial_mining must classify leftover vs new-block after clean");
+    }
+    if !src.contains("leftover_hit") {
+        return Err("serial_mining must count leftover_hit against retired history");
+    }
+    if !src.contains("s19k_track1_count_wrap_retire_leftover") {
+        return Err("leftover_hit must count wrap-retire leftover before funnel arm");
+    }
+    if !src.contains("s19k_restore_wrap_retire_leftover_after_clean_snapshot") {
+        return Err("wrap-4 snapshot must restore wrap-retire leftover after on_clean");
+    }
+    if !src.contains("S19k wrap-retire leftover") {
+        return Err("alive tick must print wrap-retire leftover before first clean");
+    }
+    if !src.contains("s19k_post_clean_submit_allowed") {
+        return Err("serial_mining must refuse leftover/ambiguous post-clean submits");
+    }
+    if !src.contains("retired_s19k_tx") {
+        return Err("serial_mining must snapshot outstanding TX on mid-run clean");
+    }
+    if !src.contains("retired_tx_wire") {
+        return Err("serial_mining leftover dump must include the retired pre-clean TX");
+    }
+    if !src.contains("s19k_should_log_full_work_frame") {
+        return Err("serial_mining must dump the first post-clean FULL FRAME");
+    }
+    if !src.contains("s19k_compact_tx_meets_share_target") {
+        return Err("serial_mining leftover dump must hash nonce vs unpacked TX");
+    }
+    if !src.contains("s19k_first_tx_hex_where") {
+        return Err("leftover class/dump must search retired TX wires, not first-occupied");
+    }
+    if !src.contains("s19k_leftover_hit_from_retired_store") {
+        return Err(
+            "leftover_hit must use s19k_leftover_hit_from_retired_store on retired 21 36 wires",
+        );
+    }
+    if !src.contains("s19k_leftover_class_matches_retired_tx") {
+        return Err("serial_mining must pin leftover class to the same retired TX meet");
+    }
+    if !src.contains("leftover_header") {
+        return Err("serial_mining must count header-only leftover separately from TX leftover");
+    }
+    if !src.contains("s19k_leftover_header_is_not_tx_leftover") {
+        return Err("leftover_header increment must use s19k_leftover_header_is_not_tx_leftover (live438 leftover_header=3 leftover_hit=0)");
+    }
+    if !src.contains("nonce_silent_s") {
+        return Err("serial_mining alive line must print nonce_silent_s");
+    }
+    if !src.contains("new_tx_meets") || !src.contains("retired_tx_meets") {
+        return Err("serial_mining leftover dump must log new_tx_meets and retired_tx_meets");
+    }
+    Ok(())
+}
+
+/// : a post-clean ticket nonce either meets the new template,
+/// still solves the retired pre-clean slot (leftover), or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kPostCleanNonceClass {
+    NewBlockShare,
+    LeftoverPreClean,
+    UnknownMiss,
+}
+
+pub fn classify_s19k_post_clean_nonce(
+    new_meets: bool,
+    retired_meets: bool,
+) -> S19kPostCleanNonceClass {
+    // Both-meet is remapped leftover (new job_id, old work still hashes).
+    // Must match `s19k_post_clean_submit_allowed`.
+    if retired_meets {
+        S19kPostCleanNonceClass::LeftoverPreClean
+    } else if new_meets {
+        S19kPostCleanNonceClass::NewBlockShare
+    } else {
+        S19kPostCleanNonceClass::UnknownMiss
+    }
+}
+
+/// Leftover-safe submit: only a nonce that meets the **new** template and
+/// does **not** still solve the retired pre-clean slot may go to the pool.
+/// Both-meet is treated as remapped leftover, not a new-block share.
+pub fn s19k_post_clean_submit_allowed(new_meets: bool, retired_meets: bool) -> bool {
+    new_meets && !retired_meets
 }
 
 /// One pure dispatch assignment from [`SerialMiningEngineBookkeeping::take_dispatch`].
@@ -531,6 +960,12 @@ pub enum SerialBringUpPluginKind {
     AmlogicBm1370,
     /// BM1398 serial class (when admitted on serial transport).
     SerialBm1398,
+    /// AM2 Zynq hybrid BM1397 (S17/S17+/T17/T17+ class; 2026-08-27
+    /// `2026-08-27-antminer17-unlock-armada` promotion). Speaks the BM1397+
+    /// command surface (ChainInactive/GetAddress/SetAddress) with the
+    /// `floor(256/N)` address stride and the 4-midstate AsicBoost job codec —
+    /// NOT BIP320 version rolling.
+    Am2ZynqBm1397,
 }
 
 impl SerialBringUpPluginKind {
@@ -542,6 +977,7 @@ impl SerialBringUpPluginKind {
             Self::AmlogicBm1368 => "amlogic_bm1368",
             Self::AmlogicBm1370 => "amlogic_bm1370",
             Self::SerialBm1398 => "serial_bm1398",
+            Self::Am2ZynqBm1397 => "am2_zynq_bm1397",
         }
     }
 
@@ -549,6 +985,9 @@ impl SerialBringUpPluginKind {
     pub const fn default_job_id_step(self) -> u8 {
         match self {
             Self::SerialBm1398 => 4, // historical BM1398 midstate stride class
+            // BM1397 4-midstate AsicBoost: job-id +4 mod 128 (ESP-Miner
+            // `for_bm1397` dispatcher; dcentaxe-asic).
+            Self::Am2ZynqBm1397 => 4,
             _ => DEFAULT_SERIAL_JOB_ID_STEP,
         }
     }
@@ -562,6 +1001,7 @@ impl SerialBringUpPluginKind {
             Self::AmlogicBm1368 => AsicProtocolIdentity::Bm1368,
             Self::AmlogicBm1370 => AsicProtocolIdentity::Bm1370,
             Self::SerialBm1398 => AsicProtocolIdentity::Bm1398,
+            Self::Am2ZynqBm1397 => AsicProtocolIdentity::Bm1397,
         }
     }
 }
@@ -788,8 +1228,7 @@ pub fn plan_serial_bring_up(
     use crate::chain_transport::{
         admit_transport_op, plan_bm1397plus_chain_inactive_burst,
         plan_bm1397plus_full_population_address_ladder, plan_bm1397plus_set_address_ladder,
-        protocol_speaks_bm1397plus_commands,
-        TransportOp,
+        protocol_speaks_bm1397plus_commands, TransportOp,
     };
 
     // Plugin must be admissible for this transport (protocol×transport matrix).
@@ -993,6 +1432,18 @@ pub fn admit_serial_bring_up_plugin(
             | ChainTransportKind::ZynqHybrid
             | ChainTransportKind::UartTrans,
         ) => Ok(SerialBringUpPluginKind::SerialBm1398),
+        // 2026-08-27 S17 hybrid promotion (`2026-08-27-antminer17-unlock-armada`,
+        // agent B1): BM1397 on the Zynq hybrid carrier gets its own plugin kind.
+        // The pure plan is the shared BM1397+ surface (ChainInactive burst →
+        // GetAddress → floor(256/N) SetAddress ladder); the family recipe
+        // (MiscCtrl 0x18 baud ladder, 4-midstate job codec) lives in the
+        // dcentrald S17 hybrid engine, not here.
+        (
+            AsicProtocolIdentity::Bm1397,
+            ChainTransportKind::ZynqHybrid
+            | ChainTransportKind::Serial
+            | ChainTransportKind::UartTrans,
+        ) => Ok(SerialBringUpPluginKind::Am2ZynqBm1397),
         _ => Err(SerialBringUpAdmitError::UnsupportedComposition {
             protocol,
             transport,
@@ -1017,6 +1468,68 @@ pub fn refine_bm1362_bring_up_for_board_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_rx_interval_separates_wire_silence_from_parser_stall() {
+        assert_eq!(
+            classify_serial_rx_interval(100, 100, 8, 8),
+            SerialRxInterval {
+                wire_bytes: 0,
+                framed_responses: 0,
+                state: SerialRxIntervalState::Silent,
+            }
+        );
+        assert_eq!(
+            classify_serial_rx_interval(100, 112, 8, 8),
+            SerialRxInterval {
+                wire_bytes: 12,
+                framed_responses: 0,
+                state: SerialRxIntervalState::WireOnlyProgress,
+            }
+        );
+        assert_eq!(
+            classify_serial_rx_interval(100, 118, 8, 10),
+            SerialRxInterval {
+                wire_bytes: 18,
+                framed_responses: 2,
+                state: SerialRxIntervalState::FramedProgress,
+            }
+        );
+    }
+
+    #[test]
+    fn serial_rx_interval_exposes_counter_reset() {
+        assert_eq!(
+            classify_serial_rx_interval(100, 4, 8, 1),
+            SerialRxInterval {
+                wire_bytes: 4,
+                framed_responses: 1,
+                state: SerialRxIntervalState::CounterReset,
+            }
+        );
+    }
+
+    #[test]
+    fn s19k_rx_death_parser_note_is_orthogonal_to_leftover_replace() {
+        assert_eq!(s19k_track1_rx_death_parser_note(None), "parser-unknown");
+        assert_eq!(
+            s19k_track1_rx_death_parser_note(Some(SerialRxIntervalState::Silent)),
+            "host-silent"
+        );
+        assert_eq!(
+            s19k_track1_rx_death_parser_note(Some(SerialRxIntervalState::WireOnlyProgress)),
+            "wire-only-no-frame"
+        );
+        assert_eq!(
+            s19k_track1_rx_death_parser_note(Some(SerialRxIntervalState::FramedProgress)),
+            "framed-still-progress"
+        );
+        assert_eq!(
+            SerialRxIntervalState::from_code(SerialRxIntervalState::WireOnlyProgress.as_code()),
+            Some(SerialRxIntervalState::WireOnlyProgress)
+        );
+        assert_eq!(SerialRxIntervalState::from_code(0xFF), None);
+    }
 
     #[test]
     fn seen_share_set_default_dedups_like_new() {
@@ -1219,6 +1732,13 @@ mod tests {
             crate::s19k_bm1366_wire_b::S19K_WIRE_JOB_ID_STEP,
             "ESP/wire step-8 is not the Braiins fill cursor"
         );
+        for _ in 0..40 {
+            let _ = bk.take_dispatch();
+        }
+        assert_ne!(bk.take_dispatch().job_id, 0);
+        bk.reset_s19k_braiins_fill();
+        assert_eq!(bk.take_dispatch().job_id, 0);
+        assert_eq!(bk.dispatch_generation(), 1);
     }
 
     #[test]
@@ -1237,6 +1757,99 @@ mod tests {
         bk.on_clean_jobs();
         assert!(bk.history.latest(0).is_none());
         assert!(bk.seen.is_empty());
+    }
+
+    /// : the post-clean funnel must re-arm per clean, keep the clean
+    /// count monotonic, bound dumps, and stay disarmed before the first
+    /// mid-run clean (the session-start job is not a cliff risk).
+    #[test]
+    fn s19k_clean_funnel_rearms_per_clean_and_bounds_dumps() {
+        let mut funnel = S19kCleanFunnel::default();
+        assert!(!s19k_clean_funnel_armed(&funnel));
+        funnel.on_clean();
+        assert!(s19k_clean_funnel_armed(&funnel));
+        assert_eq!(funnel.cleans, 1);
+        funnel.leftover_hit = 4;
+        funnel.meets = 0;
+        let (hit, header, meets) = funnel.snapshot_for_post_clean_plan();
+        assert_eq!((hit, header, meets), (4, 0, 0));
+        funnel.on_leftover_admitted_inactive();
+        assert_eq!(funnel.leftover_hit, 0);
+        assert_eq!(funnel.meets, 0);
+        assert_eq!(funnel.cleans, 1);
+        assert_eq!(funnel.dumps_left, S19kCleanFunnel::DUMPS_PER_CLEAN);
+        funnel.rxs = 7;
+        funnel.correlate_fail = 3;
+        funnel.misses = 4;
+        funnel.leftover_hit = 2;
+        funnel.unknown_miss = 2;
+        for _ in 0..S19kCleanFunnel::DUMPS_PER_CLEAN {
+            assert!(funnel.take_dump());
+        }
+        assert!(!funnel.take_dump(), "dump budget must be bounded");
+        assert!(
+            !funnel.take_dump_for(S19kPostCleanNonceClass::UnknownMiss),
+            "UnknownMiss must not dump after the 24-slot budget"
+        );
+        assert!(
+            funnel.take_dump_for(S19kPostCleanNonceClass::LeftoverPreClean),
+            "live425 leftover_hit=6 was after the UnknownMiss budget"
+        );
+        assert!(
+            funnel.take_dump_for(S19kPostCleanNonceClass::NewBlockShare),
+            "a post-clean meet must dump even after the UnknownMiss budget"
+        );
+        funnel.on_clean();
+        assert_eq!(funnel.cleans, 2);
+        assert_eq!(funnel.rxs, 0, "per-clean stages reset on the next clean");
+        assert_eq!(funnel.misses, 0);
+        assert_eq!(funnel.leftover_hit, 0);
+        assert_eq!(funnel.leftover_header, 0);
+        assert_eq!(funnel.unknown_miss, 0);
+        assert_eq!(funnel.dumps_left, S19kCleanFunnel::DUMPS_PER_CLEAN);
+        assert!(funnel.frame_dump_owed);
+        assert!(funnel.take_frame_dump());
+        assert!(!funnel.take_frame_dump());
+        assert!(s19k_should_log_full_work_frame(1, false));
+        assert!(!s19k_should_log_full_work_frame(2, false));
+        assert!(s19k_should_log_full_work_frame(300, true));
+        assert!(!s19k_should_log_full_work_frame(0, false));
+    }
+
+    #[test]
+    fn s19k_post_clean_nonce_class_prefers_leftover_when_both_meet() {
+        assert_eq!(
+            classify_s19k_post_clean_nonce(true, true),
+            S19kPostCleanNonceClass::LeftoverPreClean
+        );
+        assert_eq!(
+            classify_s19k_post_clean_nonce(true, false),
+            S19kPostCleanNonceClass::NewBlockShare
+        );
+        assert_eq!(
+            classify_s19k_post_clean_nonce(false, true),
+            S19kPostCleanNonceClass::LeftoverPreClean
+        );
+        assert_eq!(
+            classify_s19k_post_clean_nonce(false, false),
+            S19kPostCleanNonceClass::UnknownMiss
+        );
+        assert!(s19k_post_clean_submit_allowed(true, false));
+        assert!(!s19k_post_clean_submit_allowed(true, true));
+        assert!(!s19k_post_clean_submit_allowed(false, true));
+        assert!(!s19k_post_clean_submit_allowed(false, false));
+    }
+
+    ///  production pin: the serial nonce path must instrument every
+    /// post-clean drop stage and dump nonce/TX pairs for offline verification.
+    #[test]
+    fn s19k_production_clean_funnel_is_instrumented() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = std::fs::read_to_string(root.join("dcentrald/src/serial_mining.rs"))
+            .expect("read serial_mining source");
+        assert!(admit_s19k_production_clean_funnel_instrumented(&src).is_ok());
+        assert!(admit_s19k_production_clean_funnel_instrumented("no funnel here").is_err());
+        assert!(admit_s19k_wrap4_snapshot_preserves_wrap_retire_leftover().is_ok());
     }
 
     #[test]
@@ -1374,7 +1987,7 @@ mod tests {
             .expect("read serial_mining");
         let marker = "let mut work_builder = dcentrald_stratum::share_pipeline::WorkBuilder::new()";
         let start = src.find(marker).expect("serial work_builder init");
-        let body = &src[start..start.saturating_add(2500)];
+        let body = &src[start..start.saturating_add(6500)];
         assert!(
             body.contains("WorkHistoryRing"),
             "serial_mining loop must use WorkHistoryRing"
@@ -1384,8 +1997,10 @@ mod tests {
             "serial_mining loop must use SerialMiningEngineBookkeeping façade"
         );
         assert!(
-            body.contains("SerialMiningEngineBookkeeping::serial_mining"),
-            "serial_mining must construct bookkeeping via serial_mining preset"
+            body.contains("let mut bookkeeping = if is_bm1366")
+                && body.contains("SerialMiningEngineBookkeeping::s19k_braiins_fill")
+                && body.contains("SerialMiningEngineBookkeeping::serial_mining"),
+            "serial_mining must select the exact Track-1 fill or ordinary serial preset"
         );
         assert!(
             !body.contains("VecDeque::with_capacity(history_per_id)"),
@@ -1416,10 +2031,15 @@ mod tests {
         );
         assert!(
             serial.contains("SerialBringUpPluginKind::Am2ZynqBm1362")
-                && serial.contains("SerialBringUpPluginKind::AmlogicBm1366")
                 && serial.contains("SerialBringUpPluginKind::AmlogicBm1368")
-                && serial.contains("SerialBringUpPluginKind::AmlogicBm1370"),
-            "serial_mining BM1362/66/68/70 paths must name bring-up plugin kinds"
+                && serial.contains("SerialBringUpPluginKind::AmlogicBm1370")
+                && serial.contains("s19k_bm1366_native_execution_program")
+                && serial.contains("native_program.pre_baud_commands"),
+            "serial_mining BM1362/68/70 paths must name bring-up plugins while exact BM1366 consumes its typed cold program"
+        );
+        assert!(
+            !serial.contains("SerialBringUpPluginKind::AmlogicBm1366"),
+            "native BM1366 must not fall back to the generic bring-up plugin in serial_mining"
         );
         // BM1368/BM1370 init regions must not open-code SetAddress loops.
         let bm1368 = serial

@@ -1,0 +1,81 @@
+{
+  "schema": "dcent-s19k-ptrace-kat-v1",
+  "status": "offline-source-only-no-production-authority",
+  "kernel_contract": {
+    "os": "linux",
+    "release": "4.9.113",
+    "machine": "aarch64",
+    "wait_flag": "__WALL",
+    "wait_flag_value": 1073741824,
+    "initial_ptrace_options": [
+      "PTRACE_O_TRACEFORK",
+      "PTRACE_O_TRACEVFORK",
+      "PTRACE_O_TRACECLONE",
+      "PTRACE_O_TRACEEXEC",
+      "PTRACE_O_TRACEEXIT"
+    ],
+    "initial_exitkill": false
+  },
+  "build_contract": {
+    "host": "x86_64-pc-windows-msvc",
+    "shell": "MINGW64 Git-Bash",
+    "cargo_offline": true,
+    "cargo_locked": true,
+    "cargo_incremental": false,
+    "linker": "explicit hash-bound bundled rust-lld",
+    "elf_verifier": "stdlib-only exact program-header parser",
+    "reject_program_headers": [
+      "PT_INTERP",
+      "PT_DYNAMIC"
+    ],
+    "source_manifest": "canonical complete package file universe"
+  },
+  "artifacts": [
+    {
+      "package": "s19k-ptrace-tracer",
+      "role": "lifecycle-only-tracer",
+      "target": "armv7-unknown-linux-musleabihf",
+      "elf_class": 32,
+      "elf_machine": "ARM",
+      "static": true
+    },
+    {
+      "package": "s19k-ptrace-fixture",
+      "role": "multithreaded-supervisor-child-churn",
+      "target": "aarch64-unknown-linux-musl",
+      "elf_class": 64,
+      "elf_machine": "AArch64",
+      "static": true
+    }
+  ],
+  "cases": [
+    "events-freeze-detach-rollback-progress",
+    "precommit-tracer-death-without-exitkill",
+    "committed-supervisor-first-kill-exit-drain-reap"
+  ],
+  "required_events": [
+    "fork",
+    "vfork",
+    "clone",
+    "exec",
+    "exit",
+    "interrupt-stop"
+  ],
+  "allowed_runtime_roots": [
+    "/proc",
+    "/tmp/dcent-s19k-ptrace-kat."
+  ],
+  "forbidden_runtime_prefixes": [
+    "/dev",
+    "/etc",
+    "/usr/bin/bos-tools",
+    "/usr/bin/bosminer",
+    "/var/run/bosminer.pid",
+    "/sys/class/gpio",
+    "/sys/class/watchdog",
+    "/mnt",
+    "/config",
+    "/persistent"
+  ],
+  "production_authority": false
+}

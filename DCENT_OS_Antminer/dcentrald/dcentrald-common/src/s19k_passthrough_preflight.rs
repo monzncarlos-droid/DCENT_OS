@@ -8,9 +8,7 @@ use crate::s19k_am3_gpio437::{
     classify_s19k_am3_gpio437, passthrough_must_keep_gpio437_engaged, s19k_am3_plug_present,
     s19k_am3_plug_present_count, S19kAm3Gpio437Rail,
 };
-use crate::s19k_braiins_chain_discover::{
-    s19k_multi_send_work_tx_required, S19kPortAnswer,
-};
+use crate::s19k_braiins_chain_discover::{s19k_multi_send_work_tx_required, S19kPortAnswer};
 
 /// Why GetAddress / work RX can be empty. Silence is not a parser error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,9 +314,7 @@ pub fn refuse_silence_at_both_bauds_as_chip_proof_3m_tx(
     class: S19kDualBaudSilence,
 ) -> Result<(), &'static str> {
     if class == S19kDualBaudSilence::SilenceAtBothBauds {
-        return Err(
-            "SilenceAtBothBauds is a Track-1 handoff 21 36 probe, not chip-proof 3M TX",
-        );
+        return Err("SilenceAtBothBauds is a Track-1 handoff 21 36 probe, not chip-proof 3M TX");
     }
     Ok(())
 }
@@ -327,9 +323,7 @@ pub fn refuse_handoff_probe_as_chip_proof_3m_tx(
     kind: S19kDualBaudWorkTxKind,
 ) -> Result<(), &'static str> {
     if kind == S19kDualBaudWorkTxKind::HandoffProbe {
-        return Err(
-            "HandoffProbe is not ChipProofAt3M; GetAddress silence is not a 3M chip admit",
-        );
+        return Err("HandoffProbe is not ChipProofAt3M; GetAddress silence is not a 3M chip admit");
     }
     Ok(())
 }
@@ -339,12 +333,12 @@ pub fn refuse_retry_not_run_or_inconclusive_as_chip_proof_3m_tx(
     class: S19kDualBaudSilence,
 ) -> Result<(), &'static str> {
     match class {
-        S19kDualBaudSilence::RetryNotRun => Err(
-            "RetryNotRun is an inconclusive Track-1 probe, not chip-proof 3M TX",
-        ),
-        S19kDualBaudSilence::Inconclusive => Err(
-            "Inconclusive dual-baud class is leftover framing, not chip-proof 3M TX",
-        ),
+        S19kDualBaudSilence::RetryNotRun => {
+            Err("RetryNotRun is an inconclusive Track-1 probe, not chip-proof 3M TX")
+        }
+        S19kDualBaudSilence::Inconclusive => {
+            Err("Inconclusive dual-baud class is leftover framing, not chip-proof 3M TX")
+        }
         _ => Ok(()),
     }
 }
@@ -390,9 +384,7 @@ pub fn admit_s19k_dual_baud_work_tx_for_path(
 }
 
 /// Production dual-baud work-TX admit must be path-gated to ttyS1+ttyS2.
-pub fn admit_s19k_production_dual_baud_admit_skips_discover(
-    src: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_production_dual_baud_admit_skips_discover(src: &str) -> Result<(), &'static str> {
     if !src.contains("admit_s19k_dual_baud_work_tx_for_path")
         && !(src.contains("s19k_multi_send_work_tx_required")
             && src.contains("admit_s19k_dual_baud_work_tx"))
@@ -403,9 +395,7 @@ pub fn admit_s19k_production_dual_baud_admit_skips_discover(
 }
 
 /// Production must label SilenceAtBothBauds as handoff probe, not chip-proof.
-pub fn admit_s19k_production_labels_silence_handoff_probe(
-    src: &str,
-) -> Result<(), &'static str> {
+pub fn admit_s19k_production_labels_silence_handoff_probe(src: &str) -> Result<(), &'static str> {
     if !src.contains("refuse_silence_at_both_bauds_as_chip_proof_3m_tx") {
         return Err("production must refuse SilenceAtBothBauds as chip-proof 3M TX");
     }
@@ -463,7 +453,10 @@ mod tests {
         assert_eq!(parse_sysfs_gpio_bit("1"), Some(1));
         assert_eq!(parse_sysfs_gpio_bit("x"), None);
         assert_eq!(crate::s19k_am3_gpio437::S19K_AM3_GPIO437_VALUE_ON, 0);
-        assert_eq!(crate::s19k_am3_gpio437::S19K_AM3_PLUG_GPIOS, [439, 440, 441]);
+        assert_eq!(
+            crate::s19k_am3_gpio437::S19K_AM3_PLUG_GPIOS,
+            [439, 440, 441]
+        );
         let silent_up = S19kPassthroughPreflight {
             gpio437: Some(0),
             plugs: [Some(0), Some(1), Some(1)],
@@ -536,10 +529,7 @@ mod tests {
             answered_3m: false,
             retry: S19kDualBaudRetry::ChipHeardAt115200,
         });
-        assert_eq!(
-            heard_off,
-            S19kDualBaudSilence::ChipHeardWhileRailsDisabled
-        );
+        assert_eq!(heard_off, S19kDualBaudSilence::ChipHeardWhileRailsDisabled);
         assert!(refuse_chip_heard_while_rails_disabled_as_safeoff_proof(heard_off).is_err());
         assert!(admit_s19k_dual_baud_work_tx(heard_off).is_err());
         let heard_up = classify_s19k_dual_baud_silence(S19kDualBaudObserve {
@@ -681,14 +671,12 @@ mod tests {
         );
         assert!(refuse_silence_at_both_bauds_as_chip_proof_3m_tx(silence).is_err());
         assert!(refuse_silence_at_both_bauds_as_chip_proof_3m_tx(chip).is_ok());
-        assert!(refuse_handoff_probe_as_chip_proof_3m_tx(
-            S19kDualBaudWorkTxKind::HandoffProbe
-        )
-        .is_err());
-        assert!(refuse_handoff_probe_as_chip_proof_3m_tx(
-            S19kDualBaudWorkTxKind::ChipProofAt3M
-        )
-        .is_ok());
+        assert!(
+            refuse_handoff_probe_as_chip_proof_3m_tx(S19kDualBaudWorkTxKind::HandoffProbe).is_err()
+        );
+        assert!(
+            refuse_handoff_probe_as_chip_proof_3m_tx(S19kDualBaudWorkTxKind::ChipProofAt3M).is_ok()
+        );
         assert!(admit_s19k_dual_baud_work_tx(silence).is_ok());
         let serial = include_str!("../../dcentrald/src/serial_mining.rs");
         assert!(admit_s19k_production_labels_silence_handoff_probe(serial).is_ok());

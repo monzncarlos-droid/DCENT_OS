@@ -1166,8 +1166,8 @@ pub const S21_PLUS_HYDRO_POINTS: [OperatingPoint; 4] = [
     ),
 ];
 
-/// Antminer S21 XP Hydro / Immersion (BM1370 flagship). VNish §2.20/§2.21.
-pub const S21_XP_POINTS: [OperatingPoint; 3] = [
+/// Antminer S21 XP Hydro (BM1370 flagship). VNish §2.20.
+pub const S21_XP_HYDRO_POINTS: [OperatingPoint; 2] = [
     vnish(
         "XP Hydro flat 12.0 J/TH (flagship eff)",
         385.0,
@@ -1184,15 +1184,17 @@ pub const S21_XP_POINTS: [OperatingPoint; 3] = [
         3,
         "POWER_PROFILES_CATALOG.md §2.20 top",
     ),
-    vnish(
-        "XP Immersion perf best (13.5 J/TH)",
-        218.0,
-        2943,
-        13.5,
-        3,
-        "POWER_PROFILES_CATALOG.md §2.21 + §5.1 (S21 XP Immersion 13.5 J/TH)",
-    ),
 ];
+
+/// Antminer S21 XP Immersion (BM1370 flagship). VNish §2.21.
+pub const S21_XP_IMMERSION_POINTS: [OperatingPoint; 1] = [vnish(
+    "XP Immersion perf best (13.5 J/TH)",
+    218.0,
+    2943,
+    13.5,
+    3,
+    "POWER_PROFILES_CATALOG.md §2.21 + §5.1 (S21 XP Immersion 13.5 J/TH)",
+)];
 
 // ===========================================================================
 // Per-model registry + lookup.
@@ -1511,16 +1513,31 @@ pub const S21_PLUS_HYDRO: ModelPowerProfile = ModelPowerProfile {
     points: &S21_PLUS_HYDRO_POINTS,
 };
 
-/// Antminer S21 XP Hydro / Immersion (BM1370 flagship).
-pub const S21_XP: ModelPowerProfile = ModelPowerProfile {
-    model: "Antminer S21 XP Hydro / Immersion",
+/// Antminer S21 XP Hydro (BM1370 flagship).
+pub const S21_XP_HYDRO: ModelPowerProfile = ModelPowerProfile {
+    model: "Antminer S21 XP Hydro",
     chip_family: "BM1370",
     chip_id: 0x1370,
-    hashboards: 1,
-    chips_per_board: 230, // support-matrix scaffold; first-light still pending
+    hashboards: 3,
+    // Exact VNish 1.2.7 matrix row H6HB70501: 20 domains x 8 chips.
+    chips_per_board: 160,
+    cores_per_chip: 1280,
+    cooling: Cooling::Hydro,
+    points: &S21_XP_HYDRO_POINTS,
+};
+
+/// Antminer S21 XP Immersion (BM1370 flagship).
+pub const S21_XP_IMMERSION: ModelPowerProfile = ModelPowerProfile {
+    model: "Antminer S21 XP Immersion",
+    chip_family: "BM1370",
+    chip_id: 0x1370,
+    hashboards: 3,
+    // Exact held Bosminer M1HB70602 row and the independent VNish matrix
+    // M1HB70601/02 rows agree on 13 domains x 7 chips per hashboard.
+    chips_per_board: 91,
     cores_per_chip: 1280,
     cooling: Cooling::Immersion,
-    points: &S21_XP_POINTS,
+    points: &S21_XP_IMMERSION_POINTS,
 };
 
 /// Every harvested model, S9 → S21. The single registry consumers iterate.
@@ -1551,7 +1568,8 @@ pub const ALL_MODELS: &[&ModelPowerProfile] = &[
     &S21E_HYDRO,
     &S21_PRO,
     &S21_PLUS_HYDRO,
-    &S21_XP,
+    &S21_XP_HYDRO,
+    &S21_XP_IMMERSION,
 ];
 
 /// Look up a model power profile by exact model name (case-sensitive).
@@ -1732,6 +1750,32 @@ mod tests {
                 point.source
             );
         }
+    }
+
+    #[test]
+    fn s21xp_hydro_and_immersion_keep_distinct_exact_geometries() {
+        assert_eq!(S21_XP_HYDRO.chip_family, "BM1370");
+        assert_eq!(S21_XP_HYDRO.chip_id, 0x1370);
+        assert_eq!(S21_XP_HYDRO.hashboards, 3);
+        assert_eq!(S21_XP_HYDRO.chips_per_board, 160);
+        assert_eq!(S21_XP_HYDRO.cooling, Cooling::Hydro);
+        assert_eq!(S21_XP_HYDRO.points.len(), 2);
+
+        assert_eq!(S21_XP_IMMERSION.chip_family, "BM1370");
+        assert_eq!(S21_XP_IMMERSION.chip_id, 0x1370);
+        assert_eq!(S21_XP_IMMERSION.hashboards, 3);
+        assert_eq!(S21_XP_IMMERSION.chips_per_board, 91);
+        assert_eq!(S21_XP_IMMERSION.cooling, Cooling::Immersion);
+        assert_eq!(S21_XP_IMMERSION.points.len(), 1);
+
+        assert_eq!(
+            u16::from(S21_XP_HYDRO.hashboards) * S21_XP_HYDRO.chips_per_board,
+            480
+        );
+        assert_eq!(
+            u16::from(S21_XP_IMMERSION.hashboards) * S21_XP_IMMERSION.chips_per_board,
+            273
+        );
     }
 
     #[test]

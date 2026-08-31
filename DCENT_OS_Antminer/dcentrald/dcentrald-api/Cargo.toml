@@ -69,6 +69,11 @@ fuzzing = []
 # the normal daemon router. Enabling this feature does not mount the handlers;
 # a future repair image also needs an exclusive hardware-owner lifecycle.
 recovery-tool = []
+# MQTT TLS (mqtts://). DEFAULT-OFF: production/default builds refuse mqtts://
+# rather than silently downgrade to plaintext (MQTT-TLS-DOWNGRADE-1). Opt in
+# with `--features mqtt-tls` (or the dcentrald crate passthrough). Re-enables
+# rumqttc's rustls transport which was stripped to avoid a second rustls stack.
+mqtt-tls = ["rumqttc/use-rustls"]
 
 [dev-dependencies]
 proptest = { workspace = true }

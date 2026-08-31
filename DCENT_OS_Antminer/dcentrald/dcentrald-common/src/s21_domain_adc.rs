@@ -125,9 +125,7 @@ pub struct UpwardPowerAdmitRequest {
 /// Admit upward power only when wall/board telemetry are present and climb/
 /// autotune are not requested. `require_power_telemetry` is always true.
 /// Converters do not enable climb; sealed F/V envelopes remain DESK_PENDING.
-pub fn admit_upward_power(
-    req: &UpwardPowerAdmitRequest,
-) -> Result<(), S21DomainAdcError> {
+pub fn admit_upward_power(req: &UpwardPowerAdmitRequest) -> Result<(), S21DomainAdcError> {
     debug_assert!(S21_REQUIRE_POWER_TELEMETRY);
     if !S21_REQUIRE_POWER_TELEMETRY {
         return Err(S21DomainAdcError::MissingWallBoardTelemetry);

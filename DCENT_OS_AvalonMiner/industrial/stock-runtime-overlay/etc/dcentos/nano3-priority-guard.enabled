@@ -1,0 +1,11 @@
+# Presence of this file enables /etc/init.d/S99dcent-priority-guard at boot.
+#
+# The guard admits only the exact held btcminer SHA-256, requires exactly one
+# API, watchdog_thread, and live `/proc` comm `watchpool_threa` (the kernel-
+# truncated form of source/DWARF `watchpool_thread`) at evidenced nice 10 or 0,
+# then raises and post-checks those stock-demoted threads at the default 0 so
+# the management plane survives mining load. It touches nothing else:
+# see stock-runtime-overlay/README.md and
+#
+#
+# Remove this file and rebuild the image to ship the guard inert.

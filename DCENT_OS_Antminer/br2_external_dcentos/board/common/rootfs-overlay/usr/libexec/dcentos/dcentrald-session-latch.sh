@@ -235,8 +235,22 @@ admit_update_window() {
         log 'update transaction ownership disappeared during session admission'
         UPDATE_ADMISSION_RESULT=1
     elif path_exists "$CRASH_LATCH_FILE"; then
-        log "update blocked by unresolved hardware disposition $CRASH_LATCH_FILE"
-        UPDATE_ADMISSION_RESULT=1
+        # Operator 2026-08-19: expected-zero + successful software SafeOff
+        # may sysupgrade. S82 start still refuses. This is not VerifiedRailCut.
+        LATCH_STATE=$(awk -F= '/^state=/{print $2; exit}' "$CRASH_LATCH_FILE" 2>/dev/null || true)
+        case "$LATCH_STATE" in
+            *safeoff-failed*)
+                log "update blocked by failed software SafeOff $CRASH_LATCH_FILE"
+                UPDATE_ADMISSION_RESULT=1
+                ;;
+            *expected-zero-awaiting-typed-disposition*)
+                log "update admitted after expected-zero software SafeOff; rails not proven"
+                ;;
+            *)
+                log "update blocked by unresolved hardware disposition $CRASH_LATCH_FILE"
+                UPDATE_ADMISSION_RESULT=1
+                ;;
+        esac
     elif path_exists "$UNRESOLVED_FILE"; then
         log "update blocked by active or unresolved hardware session $UNRESOLVED_FILE"
         UPDATE_ADMISSION_RESULT=1
@@ -256,7 +270,10 @@ write_marker() {
     TMP_FILE=$MARKER.tmp.$$
     BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)
     IMAGE_VERSION=$(cat /etc/dcentos-version 2>/dev/null || printf unknown)
-    PLATFORM=$(cat /etc/dcentos-platform 2>/dev/null || printf unknown)
+    # POSIX sh variables are global unless the shell provides a non-portable
+    # `local`.  Do not overwrite a caller's PLATFORM identity: the safety
+    # script invoked later in the same helper process consumes that value.
+    MARKER_PLATFORM=$(cat /etc/dcentos-platform 2>/dev/null || printf unknown)
 
     umask 077
     if path_exists "$TMP_FILE"; then
@@ -268,7 +285,7 @@ write_marker() {
         printf 'state=%s\n' "$STATE"
         printf 'boot_id=%s\n' "$BOOT_ID"
         printf 'image_version=%s\n' "$IMAGE_VERSION"
-        printf 'platform=%s\n' "$PLATFORM"
+        printf 'platform=%s\n' "$MARKER_PLATFORM"
         printf 'writer_pid=%s\n' "$$"
         printf 'recorded_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unknown)"
     } > "$TMP_FILE"; then
@@ -622,6 +639,7 @@ self_test() {
     TEST_FAILURES=0
     SELF_TEST_SAFETY_SCRIPT=${DCENT_TEST_SAFETY_SCRIPT:-/bin/true}
     SELF_TEST_EXPECT_SAFEOFF=${DCENT_TEST_EXPECT_SAFEOFF:-default}
+    SELF_TEST_CALLER_PLATFORM=${PLATFORM-}
     # The compiled parent-death boundary has its own native lifecycle test.
     # Keep this pure shell state-machine fixture independent of the target rootfs.
     PARENT_DEATH_HELPER=
@@ -672,7 +690,22 @@ self_test() {
         TEST_FAILURES=$((TEST_FAILURES + 1))
     fi
     rm -f "$UNRESOLVED_FILE"
+    write_marker "$CRASH_LATCH_FILE" \
+        "crash-latched:session-x-boot-y-pid-1-start-1-expected-zero-awaiting-typed-disposition" \
+        || TEST_FAILURES=$((TEST_FAILURES + 1))
+    admit_update_window "$PERSISTENCE_PATH" "$UPDATE_LOCK_DIR" 7 \
+        >/dev/null 2>&1 || TEST_FAILURES=$((TEST_FAILURES + 1))
+    write_marker "$CRASH_LATCH_FILE" \
+        "crash-latched:session-x-boot-y-pid-1-start-1-expected-zero-awaiting-typed-disposition-safeoff-failed" \
+        || TEST_FAILURES=$((TEST_FAILURES + 1))
+    if admit_update_window "$PERSISTENCE_PATH" "$UPDATE_LOCK_DIR" 7 \
+        >/dev/null 2>&1; then
+        TEST_FAILURES=$((TEST_FAILURES + 1))
+    fi
+    rm -f "$CRASH_LATCH_FILE"
     rmdir "$UPDATE_LOCK_DIR"
+    [ "${PLATFORM-}" = "$SELF_TEST_CALLER_PLATFORM" ] \
+        || TEST_FAILURES=$((TEST_FAILURES + 1))
 
     TOKEN=$(prepare_session 2>/dev/null) || TEST_FAILURES=$((TEST_FAILURES + 1))
     path_exists "$UNRESOLVED_FILE" || TEST_FAILURES=$((TEST_FAILURES + 1))

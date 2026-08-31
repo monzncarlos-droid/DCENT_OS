@@ -10,7 +10,9 @@
 //! no ioctl, no energize, no mining engine.
 //!
 //! Desk 11e: **1** ring entry → **1** UART frame. Refuse host 4×/8× UART fan-out.
-//! `job_id = slot << 3`.
+//! History snapshot uses `job_id = slot << 3`. Stock `pack_asic_work` UART
+//! `job_id` is `work_id & 0xff` (fill-identity at log 0). Track-1 Closed11d
+//! is the Ghidra 82B body, not this 36+28 packer.
 //!
 //! Desk 11f (CLOSED): `data[64]` is **not** mid0‖mid1 / 2×32 midstate pick.
 //! Stock make-work always fills a **36+28 header-chunk**, then byte-rev 64B:
@@ -184,7 +186,8 @@ pub fn admit_uart_trans_mmap_layout(
     if stride != UART_TRANS_RING_STRIDE {
         return Err("uart_trans ring stride must be 0xA8");
     }
-    if UART_TRANS_MMAP_HEADER + UART_TRANS_RING_SLOTS * UART_TRANS_RING_STRIDE != UART_TRANS_MMAP_LEN
+    if UART_TRANS_MMAP_HEADER + UART_TRANS_RING_SLOTS * UART_TRANS_RING_STRIDE
+        != UART_TRANS_MMAP_LEN
     {
         return Err("mmap header+800*0xA8 must equal 0x20d0c");
     }
@@ -327,7 +330,6 @@ pub fn refuse_bm1362_ioctl_as_s19k_aml() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Required Track-1 pair. `a lab unit` dmesg also wakes ttyS3 (see DISCOVER).
 pub const BRAIINS_TTYS_CANDIDATES: &[&str] = &["/dev/ttyS1", "/dev/ttyS2"];
 /// Hash UARTs bosminer actually termios-wakes on `a lab unit` (9600 then 115200).
@@ -367,9 +369,18 @@ pub const BRAIINS_RAW_TTYS_PINS: BraiinsRawTtySPins = BraiinsRawTtySPins {
     frames_per_work: UART_FRAMES_PER_RING_ENTRY,
 };
 
-/// job_id on wire = slot<<3 (nonce lookup >>3).
+/// History snapshot dialect (map+0x1F80C): `job_id = slot<<3`, lookup `>>3`.
+/// Stock kernel `pack_asic_work` UART byte is `work_id & 0xff`. Track-1
+/// Closed11d fill is `job_id = work_id`. This helper is **not** on-wire
+/// Track-1 and is **not** the stock UART job_id.
 pub const fn job_id_from_slot(slot: u8) -> u8 {
     slot.wrapping_shl(3)
+}
+
+pub fn refuse_s19k_stock_uart_job_id_as_slot_shift() -> Result<(), &'static str> {
+    Err(
+        "stock pack_asic_work job_id is work_id&0xff; slot<<3 is the 32-deep history snapshot, not Track-1 Closed11d",
+    )
 }
 
 pub const fn slot_from_job_id(job_id: u8) -> u8 {
@@ -435,7 +446,6 @@ pub fn admit_job_tx_path(path: &str) -> Result<(), &'static str> {
     Err("Track 1: unknown job TX path; expected /dev/uart_trans")
 }
 
-
 /// Braiins Track-1: ttyS1|ttyS2 required, ttyS3 discover (`a lab unit` dmesg wake).
 /// Refuses ttyS0 (console) and uart_trans.
 pub fn admit_braiins_job_tx_path(path: &str) -> Result<(), &'static str> {
@@ -457,7 +467,10 @@ pub fn admit_braiins_job_tx_path(path: &str) -> Result<(), &'static str> {
 /// Dispatch job-TX path admit by transport.
 /// `stock_uart_trans=true` keeps Track-2/stock refuse-raw-ttyS polarity.
 /// `stock_uart_trans=false` is Braiins Track-1 opt-in (ttyS1|ttyS2 only).
-pub fn admit_job_tx_path_for_transport(stock_uart_trans: bool, path: &str) -> Result<(), &'static str> {
+pub fn admit_job_tx_path_for_transport(
+    stock_uart_trans: bool,
+    path: &str,
+) -> Result<(), &'static str> {
     if stock_uart_trans {
         admit_job_tx_path(path)
     } else {
@@ -550,8 +563,7 @@ pub fn pack_uart_trans_ring_element(elem: &UartTransRingElement) -> [u8; UART_TR
     out[UART_TRANS_ELEM_DATA2_OFF..UART_TRANS_ELEM_SNO_OFF].copy_from_slice(&elem.data2);
     out[UART_TRANS_ELEM_SNO_OFF..UART_TRANS_ELEM_MERKLE_OFF]
         .copy_from_slice(&elem.sno.to_le_bytes());
-    out[UART_TRANS_ELEM_MERKLE_OFF..UART_TRANS_ELEM_NONCE2_OFF]
-        .copy_from_slice(&elem.merkle_root);
+    out[UART_TRANS_ELEM_MERKLE_OFF..UART_TRANS_ELEM_NONCE2_OFF].copy_from_slice(&elem.merkle_root);
     out[UART_TRANS_ELEM_NONCE2_OFF..UART_TRANS_ELEM_BBVERSION_OFF]
         .copy_from_slice(&elem.nonce2.to_le_bytes());
     out[UART_TRANS_ELEM_BBVERSION_OFF..UART_TRANS_ELEM_NBIT_OFF]
@@ -619,7 +631,9 @@ mod tests {
         assert_eq!(UART_TRANS_BIND.ring_stride, 0xA8);
         assert_eq!(UART_TRANS_BIND.frames_per_ring_entry, 1);
         assert!(UART_TRANS_BIND.refuse_raw_ttys_job_write);
-        assert!(admit_uart_trans_mmap_layout(UART_TRANS_MMAP_LEN, 0xA8, UART_TRANS_WQ_DEFAULT).is_ok());
+        assert!(
+            admit_uart_trans_mmap_layout(UART_TRANS_MMAP_LEN, 0xA8, UART_TRANS_WQ_DEFAULT).is_ok()
+        );
         assert!(admit_uart_trans_mmap_layout(0x20d0c, 0xA8, 0x300).is_ok());
         assert!(admit_uart_trans_mmap_layout(0x20d0c, 0xA8, 1).is_err());
         assert!(admit_uart_trans_history_layout().is_ok());
@@ -629,7 +643,10 @@ mod tests {
         assert!(uart_trans_ring_slot_offset(768).is_err());
         assert!(uart_trans_ring_slot_offset(800).is_err());
         assert_eq!(uart_trans_history_slot_offset(0).unwrap(), 0x1F80C);
-        assert_eq!(uart_trans_history_slot_offset(31).unwrap(), 0x1F80C + 31 * 0xA8);
+        assert_eq!(
+            uart_trans_history_slot_offset(31).unwrap(),
+            0x1F80C + 31 * 0xA8
+        );
         assert!(uart_trans_history_slot_offset(32).is_err());
         assert_eq!(uart_trans_next_write_idx(0).unwrap(), 1);
         assert_eq!(uart_trans_next_write_idx(767).unwrap(), 0);
@@ -647,11 +664,10 @@ mod tests {
         assert!(refuse_braiins_uart_trans_mmap(false).is_ok());
         assert!(refuse_work_base_plus8_given_history().is_err());
         assert_eq!(admit_uart_trans_work_base_from_history().unwrap(), 0xC);
-        assert!(admit_uart_trans_host_bind_plan(
-            UART_TRANS_MMAP_LEN,
-            &UART_TRANS_HOST_BIND_STEPS
-        )
-        .is_ok());
+        assert!(
+            admit_uart_trans_host_bind_plan(UART_TRANS_MMAP_LEN, &UART_TRANS_HOST_BIND_STEPS)
+                .is_ok()
+        );
         assert!(refuse_uart_trans_host_bind_execution().is_err());
         assert_ne!(UART_TRANS_CAPSTONE_WORK_BASE, UART_TRANS_MMAP_HEADER);
         assert!(refuse_uart_trans_work_base_sot_without_4cc0().is_err());
@@ -685,6 +701,7 @@ mod tests {
         assert_eq!(job_id_from_slot(2), 0x10);
         assert_eq!(slot_from_job_id(0x08), 1);
         assert_eq!(slot_from_job_id(0x10), 2);
+        assert!(refuse_s19k_stock_uart_job_id_as_slot_shift().is_err());
     }
 
     #[test]
@@ -720,7 +737,10 @@ mod tests {
             JOB_DATA_BBVERSION_LEN + JOB_DATA_PREV_HASH_LEN,
             JOB_DATA_HEADER_CHUNK_LEN
         );
-        assert_eq!(JOB_DATA_HEADER_CHUNK_LEN + JOB_DATA_MERKLE_PREFIX_LEN, JOB_DATA_LEN);
+        assert_eq!(
+            JOB_DATA_HEADER_CHUNK_LEN + JOB_DATA_MERKLE_PREFIX_LEN,
+            JOB_DATA_LEN
+        );
         assert_eq!(MERKLE_BRANCH_ENTRY_LEN, 0x20);
         assert!(!MAKE_WORK_CONSULTS_MID_AUTO_GEN);
         let bbv = [0xA1, 0xA2, 0xA3, 0xA4];
@@ -738,10 +758,7 @@ mod tests {
         byte_rev_job_data(&mut rev);
         assert_eq!(rev[0], 0xCF);
         assert_eq!(rev[63], 0xA1);
-        assert_eq!(
-            fill_job_data_header_chunk_byte_rev(&bbv, &prev, &merk),
-            rev
-        );
+        assert_eq!(fill_job_data_header_chunk_byte_rev(&bbv, &prev, &merk), rev);
         assert!(refuse_midstate_pair_data_fill(0).is_err());
         assert!(refuse_midstate_pair_data_fill(1).is_err());
     }
@@ -815,7 +832,13 @@ mod tests {
         let ntime = [0xE0, 0xE1, 0xE2, 0xE3];
         let nbit = [0xF0, 0xF1, 0xF2, 0xF3];
         let elem = pack_uart_trans_ring_from_header_chunk(
-            &bbv, &prev, &merkle, &ntime, &nbit, 0x1122_3344_5566_7788, 0xAABB_CCDD,
+            &bbv,
+            &prev,
+            &merkle,
+            &ntime,
+            &nbit,
+            0x1122_3344_5566_7788,
+            0xAABB_CCDD,
         );
         assert_eq!(elem.len(), 0xA8);
         assert_eq!(elem[0], 0xCF);
@@ -840,5 +863,4 @@ mod tests {
         assert_ne!(wire[3], 0x56);
         assert!(refuse_midstate_pair_data_fill(0).is_err());
     }
-
 }

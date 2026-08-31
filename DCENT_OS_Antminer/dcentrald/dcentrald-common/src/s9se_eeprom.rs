@@ -146,7 +146,10 @@ mod tests {
         assert_eq!(EEPROM_PCB_VERSION_OFFSET, 252);
         assert_eq!(EEPROM_BOM_VERSION_OFFSET, 253);
         assert_eq!(EEPROM_TEMP_SENSOR_TYPE_OFFSET, 121);
-        assert_eq!(hashrate_from_eeprom_bytes([0x11, 0x22, 0x33, 0x44]), 0x4433_2211);
+        assert_eq!(
+            hashrate_from_eeprom_bytes([0x11, 0x22, 0x33, 0x44]),
+            0x4433_2211
+        );
         assert_eq!(chip_minor_from_byte(0b00_101_000), 5);
         assert_eq!(chip_level_from_byte(0b10_000_000), 2);
         assert_eq!(temp_sensor_pos_offset(0), Some(123));

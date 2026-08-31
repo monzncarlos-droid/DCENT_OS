@@ -63,6 +63,24 @@ pub struct MiningWork {
     /// Pool share target (32 bytes, big-endian).
     pub share_target: [u8; 32],
 
+    /// Full serialized coinbase transaction for THIS work unit (coinbase1 +
+    /// extranonce1 + the assigned extranonce2 + coinbase2). Carried so
+    /// chain-side splicing drivers (the Avalon mm_work path) can ship the
+    /// exact bytes the pool expects; midstate-only drivers ignore it.
+    pub coinbase: Vec<u8>,
+
+    /// Merkle branches from the pool notify (internal byte order). Paired
+    /// with `coinbase` for drivers whose controller folds the merkle root
+    /// itself.
+    pub merkle_branches: Vec<[u8; 32]>,
+
+    /// Byte offset of extranonce2 inside `coinbase` (coinbase1.len() +
+    /// extranonce1.len()). Chain-side splicers rewrite exactly these bytes.
+    pub nonce2_offset: usize,
+
+    /// extranonce2 width in bytes, as negotiated with the pool.
+    pub nonce2_size: usize,
+
     /// Proof-of-work algorithm this work unit is mined under (P1 Scrypt seam).
     /// Always `Sha256d` on every shipping path today; `Scrypt1024` work is
     /// fail-closed (empty midstates, reject-all share_target) until P2.
@@ -270,6 +288,10 @@ impl WorkBuilder {
             job_id: job.job_id.clone(),
             extranonce2: extranonce2_hex,
             share_target,
+            coinbase: coinbase_tx,
+            merkle_branches,
+            nonce2_offset: coinbase1_bytes.len() + self.extranonce1.len(),
+            nonce2_size: self.extranonce2_size,
             algorithm: self.algorithm,
         }
     }
@@ -1948,6 +1970,38 @@ mod tests {
             !work.midstates.is_empty(),
             "Sha256d path must keep computing midstates"
         );
+    }
+
+    /// The coinbase-carrying fields (2026-08-29 interface extension for
+    /// chain-side splicing drivers): next_work must expose the exact
+    /// serialized coinbase, the branch list, and the extranonce2 geometry
+    /// it used internally — nothing recomputed, nothing discarded.
+    #[test]
+    fn next_work_carries_coinbase_branches_and_nonce2_geometry() {
+        let mut job = dedup_test_job();
+        job.coinbase1 = "0102030405".into(); // 5 bytes
+        job.merkle_branches = vec!["11".repeat(32), "22".repeat(32)];
+        let mut wb = WorkBuilder::new("aabbccdd", 4); // en1 = 4 bytes
+        let work = wb.next_work(&job);
+
+        // coinbase = coinbase1(5) + en1(4) + en2(4) + coinbase2(1)
+        assert_eq!(work.coinbase.len(), 5 + 4 + 4 + 1);
+        assert_eq!(&work.coinbase[0..5], &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(&work.coinbase[5..9], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // First extranonce2 is zero — the spliced bytes are 00 00 00 00.
+        assert_eq!(&work.coinbase[9..13], &[0x00; 4]);
+        // The merkle branches ride through verbatim.
+        assert_eq!(work.merkle_branches.len(), 2);
+        assert_eq!(work.merkle_branches[0], [0x11u8; 32]);
+        assert_eq!(work.merkle_branches[1], [0x22u8; 32]);
+        // nonce2 geometry: en2 sits after coinbase1 + en1, 4 bytes wide.
+        assert_eq!(work.nonce2_offset, 5 + 4);
+        assert_eq!(work.nonce2_size, 4);
+        // The carried coinbase hashes to the same merkle root the work
+        // reports — the two can never disagree.
+        let coinbase_hash = double_sha256(&work.coinbase);
+        let folded = compute_merkle_root(&coinbase_hash, &work.merkle_branches);
+        assert_eq!(folded, work.merkle_root);
     }
 
     #[test]

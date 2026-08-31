@@ -1,11 +1,15 @@
+#![forbid(unsafe_code)]
+
 //! Shared no-HAL contract utilities for dcentrald.
 //!
-//! This crate is intentionally HAL-free, OS-free, and async-runtime-free, in
-//! the same spirit as `dcentrald-api-types`. It is the host-safe boundary
-//! for utilities that must be reachable from both the API surface
-//! (`dcentrald-api`) and the protocol clients (`dcentrald-stratum`) without
-//! pulling in a hardware dependency. New no-HAL helpers (config-validation,
-//! ID redaction, units conversion) belong here.
+//! This crate is intentionally HAL-free, network-free, subprocess-free, and
+//! async-runtime-free, in the same spirit as `dcentrald-api-types`. It is the
+//! host-safe boundary for utilities that must be reachable from both the API
+//! surface (`dcentrald-api`) and the protocol clients (`dcentrald-stratum`)
+//! without pulling in a hardware dependency. Filesystem effects are restricted
+//! to [`atomic_file`], [`mutation_disposition`], [`thermal_lockout`], and the
+//! regular-file-only S19k Bench-GO marker. New no-HAL helpers
+//! (config-validation, ID redaction, units conversion) belong here.
 //!
 //! Modules:
 //! - [`wallet_mask`] — Bitcoin/Litecoin wallet-address masking for log and
@@ -23,51 +27,16 @@
 //!   deletion with directory fsync plus explicit publication/failure evidence.
 
 pub mod am2_topology;
-/// Desk-only XIL dual-chain CMD slot map for missing-SKU bring-up (RE-4A).
-pub mod xil_dual_chain_desk;
-pub mod s19k_bm1366_nopic_beta;
-pub mod s19k_bm1366_wire_b;
-/// Amlogic /dev/uart_trans job pack (desk 11d/11e) — host-testable.
-pub mod s19k_uart_trans_job;
-/// Braiins Track-1 mining-off raw-tty set_address probe (env-gated; host-testable).
-pub mod s19k_braiins_wire_try;
-/// Braiins Track-1 CLOSED 21 36 mining-on work TX (desk 11d/11f).
-pub mod s19k_braiins_job;
-/// am3-s19k GPIO437 PWR_CONTROL polarity pin (active LOW). Do not apply to S21.
-pub mod s19k_am3_gpio437;
-/// BM1366 raw-UART GetAddress + 11-byte RX classify (T4/T5). No dispatch hook.
-pub mod s19k_bm1366_uart_rx;
-/// BM1366 UART nonce → share reconstruction (ESP-Miner process_work).
-pub mod s19k_bm1366_share;
-/// Braiins Track-1 board#↔ttyS discover policy (T8). No hardcoded map.
-pub mod s19k_braiins_chain_discover;
-/// BM1366 EXPERIMENTAL init program (GetAddress / 0x53 inactive / set_address).
-pub mod s19k_bm1366_init_seq;
-/// Amlogic NAND install architecture + SKU-scoped GPIO437 SafeOff. FLASH NOT_YET.
-pub mod s19k_am3_install;
-/// Braiins `/tmp` deploy policy (ELF32 armhf, dual tty, rails held).
-pub mod s19k_braiins_tmp_deploy;
-/// Track-1 GetAddress silence vs GPIO437 / plug-detect (not a job-shape proof).
-pub mod s19k_passthrough_preflight;
-/// `a lab unit` bosminer `read_register(reg=0x0)` enum shortfall (77 expected).
-pub mod s19k_bosminer_enum;
-/// `a lab unit` `/dev/nand_env` U-Boot env (interrupt window + BOS/stock sequencer).
-pub mod s19k_nand_env;
-/// LuxOS-captured `axg_s400_antminer.dtb` NAND plats (`nand device 1` / nvdata).
-pub mod s19k_aml_dtb;
-/// BM1397 / S17 BHB07601 bring-up skeleton (IMPLEMENT items 1-12; host-testable).
-pub mod bm1397_s17_bhb07601;
-/// BM1398 / NBP1901 identity+geometry stub (admit=false; DESK_PENDING_BINARY wire).
-pub mod bm1398_nbp1901_stub;
-/// S21 VCO / domain climb HOLD pin (jig_clamp; autotune enabled=false).
-pub mod s21_vco_hold;
-pub mod s21_domain_adc;
 /// Canonical build target and published filename for each artifact claim.
 pub mod artifact_producer;
 /// Transport-neutral ASIC protocol pure admission + init program seed (ADR-0010 / P1-3).
 pub mod asic_protocol;
 pub mod at3_rail;
 pub mod atomic_file;
+/// Exact S7-45/S7-54 factory profiles and BM1385 FIL response contract; pure and no-I/O.
+pub mod bm1385_s7_offline;
+/// Exact S15/T15 APW8-adjacent software/guide evidence; pure and no-I/O.
+pub mod bm1391_apw8_evidence;
 /// Offline exact-release facts and fail-closed S15/T15 BM1391 carrier gaps.
 pub mod bm1391_carrier_profile;
 /// Exact-release S15/T15 BM1391 thermal/PIC safety evidence; pure and no-I/O.
@@ -95,6 +64,10 @@ pub mod bm1396_submit_receiver;
 pub mod bm1396_work;
 /// Exact BM1396 outstanding-work expansion and host nonce-ring consumer.
 pub mod bm1396_work_binding;
+/// BM1397 / S17 BHB07601 bring-up skeleton (IMPLEMENT items 1-12; host-testable).
+pub mod bm1397_s17_bhb07601;
+/// Legacy BM1398 / NBP1901 identity+geometry compatibility (protocol recovered; native admission false).
+pub mod bm1398_nbp1901_stub;
 /// Exact held L3+ PIC application and dormant updater replay; no authority.
 pub mod bm1485_l3plus_pic_firmware;
 /// Exact 2017 stock L3+ BM1485 UART/address/MISC facts; pure and no-I/O.
@@ -156,28 +129,94 @@ pub mod chain_transport;
 pub mod chain_voltage;
 /// C52 cooling custody policy for home AM2 profiles (P1-7).
 pub mod cooling_custody;
-/// Ctrl_C43 / S9 SE: FPGA PWM is not an actuator; tach 0x04 is not evidence.
-pub mod s9se_cooling;
+/// Cooling-medium axis (Air/Hydro/Immersion) + cut-ladder validation
+/// (Round-15 A3, hardware-enablement axis 4). Fanless boards get NO
+/// fan-raise rung — absent, not zero.
+pub mod cooling_medium;
+pub mod dspic_decode;
+pub mod dspic_heartbeat;
+/// In-miner factory aging / frequency-scan planner. Execute refused.
+pub mod factory_aging;
+/// Night-hour watt reduction (home night mode → Power-mode setpoint).
+pub mod night_power;
+/// Pure PLL frequency model + TransportOp expansion (decade P1-4 seed).
+pub mod pll_model;
+pub mod s19_bm1398_runtime;
+/// am3-s19k GPIO437 PWR_CONTROL polarity pin (active LOW). Do not apply to S21.
+pub mod s19k_am3_gpio437;
+/// Amlogic NAND install architecture + SKU-scoped GPIO437 SafeOff. FLASH NOT_YET.
+pub mod s19k_am3_install;
+/// LuxOS-captured `axg_s400_antminer.dtb` NAND plats (`nand device 1` / nvdata).
+pub mod s19k_aml_dtb;
+/// Exact held-stock APW121215f lifecycle/profile facts and SafeOff evidence boundary.
+pub mod s19k_apw121215f_stock;
+/// Exact AMTC BM1366 golden-pattern record layout and physical core geometry.
+pub mod s19k_bm1366_amtc_pattern;
+/// Exact Bosminer BM1366 nonce attribution; separate from ESP/AMTC decoding.
+pub mod s19k_bm1366_braiins_nonce;
+/// BM1366 EXPERIMENTAL init program (GetAddress / 0x53 inactive / set_address).
+pub mod s19k_bm1366_init_seq;
+pub mod s19k_bm1366_nopic_beta;
+/// BM1366 UART nonce → share reconstruction (ESP-Miner process_work).
+pub mod s19k_bm1366_share;
+/// BM1366 raw-UART GetAddress + 11-byte RX classify (T4/T5). No dispatch hook.
+pub mod s19k_bm1366_uart_rx;
+pub mod s19k_bm1366_wire_b;
+/// FR-1.28 `.bmu` payload-protection scheme evidence (Gap-3 Track-2;
+/// signature-only BMU layer, AML inner bodies stay opaque; zero install authority).
+pub mod s19k_bmu_payload_evidence;
+/// `a lab unit` bosminer `read_register(reg=0x0)` enum shortfall (77 expected).
+pub mod s19k_bosminer_enum;
+/// Gap-4 desk RE: bosminer TYPE_JOB pack chain, work-id math, HCN divider
+/// (first-hand capstone/Ghidra pins; evidence only, no dispatch hook).
+pub mod s19k_bosminer_t1_pack;
+/// Braiins Track-1 board#↔ttyS discover policy (T8). No hardcoded map.
+pub mod s19k_braiins_chain_discover;
+/// Braiins Track-1 CLOSED 21 36 mining-on work TX (desk 11d/11f).
+pub mod s19k_braiins_job;
+/// Braiins `/tmp` deploy policy (ELF32 armhf, dual tty, rails held).
+pub mod s19k_braiins_tmp_deploy;
+/// Retired Braiins raw-UART probe; admission is permanently fail-closed.
+pub mod s19k_braiins_wire_try;
+/// Gap-1 desk RE: no held firmware emits a chip-side work-invalidate mid-run
+/// (VNish gateway census, stock flush-api flag chain, AMTC jig vocabulary).
+pub mod s19k_midrun_flush_evidence;
+/// `a lab unit` `/dev/nand_env` U-Boot env (interrupt window + BOS/stock sequencer).
+pub mod s19k_nand_env;
+/// Track-1 GetAddress silence vs GPIO437 / plug-detect (not a job-shape proof).
+pub mod s19k_passthrough_preflight;
+/// FR-1.28 (251010) stock S19k Pro `.bmu` 3-variant TOC parser (RE only; never flash).
+pub mod s19k_stock_bmu_toc;
+/// Amlogic /dev/uart_trans job pack (desk 11d/11e) — host-testable.
+pub mod s19k_uart_trans_job;
+pub mod s21_domain_adc;
+/// Fail-closed S21-generation carrier/controller admission contracts.
+pub mod s21_generation_admission;
+/// S21 VCO / domain climb HOLD pin (jig_clamp; autotune enabled=false).
+pub mod s21_vco_hold;
+pub mod s21xp_aml_evidence;
 /// S9 SE `BOOT.bin` identity. No fabric ABI.
 pub mod s9se_boot;
-/// S9 SE address-assignment program (60 × stride 2). Desk-only.
-pub mod s9se_enum;
+/// Ctrl_C43 / S9 SE: FPGA PWM is not an actuator; tach 0x04 is not evidence.
+pub mod s9se_cooling;
 /// S9 SE EEPROM major-type pin. Write refused.
 pub mod s9se_eeprom;
+/// S9 SE address-assignment program (60 × stride 2). Desk-only.
+pub mod s9se_enum;
 /// S9 SE stock-FPGA AXI map + DMA base. No mmap.
 pub mod s9se_fpga;
 /// S9 SE gauntlet + admit/refuse owner (GitHub DCENT_OS#2).
 pub mod s9se_gauntlet;
 /// S9 SE factory / DTB / firmware identity pins.
 pub mod s9se_identity;
-/// S9 SE FPGA `send_job` packet. Dispatch refused.
-pub mod s9se_job;
-/// S9 SE stock nonce classify. FIFO I/O refused.
-pub mod s9se_nonce;
 /// S9 SE desk bring-up planner. Execute refused.
 pub mod s9se_init;
+/// S9 SE FPGA `send_job` packet. Dispatch refused.
+pub mod s9se_job;
 /// S9 SE NAND / FLASH refuse (DTB + runme.sh).
 pub mod s9se_nand;
+/// S9 SE stock nonce classify. FIFO I/O refused.
+pub mod s9se_nonce;
 /// S9 SE dsPIC33EP16GS202 command catalog. I/O refused.
 pub mod s9se_pic;
 /// S9 SE / BM1393 PLL facts. Frequency program refused.
@@ -194,20 +233,24 @@ pub mod s9se_vil;
 pub mod s9se_voltage;
 /// S9 SE VIL TW 13-word planner. Work dispatch refused.
 pub mod s9se_work;
-/// Cooling-medium axis (Air/Hydro/Immersion) + cut-ladder validation
-/// (Round-15 A3, hardware-enablement axis 4). Fanless boards get NO
-/// fan-raise rung — absent, not zero.
-pub mod cooling_medium;
-pub mod dspic_decode;
-pub mod dspic_heartbeat;
-/// Pure PLL frequency model + TransportOp expansion (decade P1-4 seed).
-pub mod pll_model;
+/// Pure serial enumeration, coverage, path-health, and bounded-work contracts.
+pub mod serial_chain_proof;
 /// Offline declared-route and passive carrier-preflight policy for stock S9 FPGA.
 pub mod stock_fpga_carrier_preflight;
 /// Pure stock FPGA AsicBoost / version-slot packing (G17).
 pub mod stock_fpga_policy;
+/// Exact held T21 Amlogic direct-UART/GPIO/PWM route; evidence only, no I/O.
+pub mod t21_aml_production_route;
 /// Pure ASIC ticket-mask encode (G24).
 pub mod ticket_mask;
+/// Exact offline S17/T17+ AMTC factory profiles; no production or I/O authority.
+pub mod x17_amtc_factory_evidence;
+/// Exact X17 recovery-script and T17e archive evidence; pure and no-I/O.
+pub mod x17_amtc_recovery_evidence;
+/// Exact S19 XP/S19j XP AML production routes; evidence only, no I/O authority.
+pub mod x19_aml_production_route;
+/// Desk-only XIL dual-chain CMD slot map for missing-SKU bring-up (RE-4A).
+pub mod xil_dual_chain_desk;
 // Re-export map builder used by standard-mining heartbeat temp publication.
 pub use dspic_heartbeat::{build_pic_temp_chain_map, heartbeat_extra_addrs};
 /// Honest diagnostic snapshot vs active-stim labels (P2-5).
@@ -223,6 +266,9 @@ pub mod interconnect;
 pub mod measurement;
 /// Composed multi-chain energize + dispatch admission (strangler glue).
 pub mod mining_lifecycle;
+/// Durable, typed, fail-closed hardware mutation-disposition journal +
+/// startup adjudication (crash-surviving quarantine tombstones).
+pub mod mutation_disposition;
 /// Multi-chain power-up stagger policy (P1-5 companion).
 pub mod powerup_schedule;
 /// Exact ordinary-S9 stock carrier/fan identity matcher; offline data only.
@@ -584,13 +630,18 @@ pub use safety_command::{
     HOME_FAN_PWM_SAFETY_MAX,
 };
 pub use serial_work_engine::{
-    admit_serial_bring_up_plugin, execute_serial_bring_up_plan, plan_serial_bring_up,
-    plan_serial_bring_up_for_board, refine_bm1362_bring_up_for_board_family,
-    serial_work_min_interval_ms, AsicJobIdCursor, GenerationSeenShareSet, SeenShareSet,
+    admit_s19k_production_clean_funnel_instrumented,
+    admit_s19k_wrap4_snapshot_preserves_wrap_retire_leftover, admit_serial_bring_up_plugin,
+    classify_s19k_post_clean_nonce, classify_serial_rx_interval, execute_serial_bring_up_plan,
+    plan_serial_bring_up, plan_serial_bring_up_for_board, refine_bm1362_bring_up_for_board_family,
+    s19k_clean_funnel_armed, s19k_post_clean_submit_allowed,
+    s19k_restore_wrap_retire_leftover_after_clean_snapshot, s19k_should_log_full_work_frame,
+    s19k_track1_rx_death_parser_note, serial_work_min_interval_ms, AsicJobIdCursor,
+    GenerationSeenShareSet, S19kCleanFunnel, S19kPostCleanNonceClass, SeenShareSet,
     SerialBringUpAdmitError, SerialBringUpPhases, SerialBringUpPlan, SerialBringUpPlanError,
     SerialBringUpPlanParams, SerialBringUpPlugin, SerialBringUpPluginKind, SerialDispatchTicket,
-    SerialMiningEngineBookkeeping, SerialWorkBookkeeping, WorkHistoryEntry, WorkHistoryRing,
-    SERIAL_WORK_MAX_FRAMES_PER_SEC,
+    SerialMiningEngineBookkeeping, SerialRxInterval, SerialRxIntervalState, SerialWorkBookkeeping,
+    WorkHistoryEntry, WorkHistoryRing, SERIAL_WORK_MAX_FRAMES_PER_SEC,
 }; // WorkHistoryRing is generic over entry type (P1-1)
 pub use serial_work_policy::{
     generation_dedup_cutoff, generation_share_dedup_key, next_asic_job_id, serial_share_dedup_key,
@@ -662,10 +713,11 @@ pub use stock_fpga_policy::{
     STOCK_VIL_SET_ADDRESS_HDR, STOCK_VIL_SHORT_CMD_LEN,
 };
 pub use ticket_mask::{
-    bit_reverse_u32_bytewise, largest_power_of_two_le, resolve_ticket_mask,
-    ticket_mask_encoding_for_chip_id, ticket_mask_esp_miner_pow2_floor,
-    ticket_mask_from_difficulty, TicketMaskEncoding, TICKET_MASK_REG_BM1387,
-    TICKET_MASK_REG_BM1397PLUS,
+    bit_reverse_u32_bytewise, compute_ticket_mask_policy, largest_power_of_two_le,
+    resolve_ticket_mask, ticket_mask_encoding_for_chip_id, ticket_mask_esp_miner_pow2_floor,
+    ticket_mask_from_difficulty, ticket_mask_register_for_chip_id,
+    try_ticket_mask_encoding_for_chip_id, TicketMaskEncoding, TicketMaskPolicy,
+    TicketMaskPolicyError, TICKET_MASK_REG_BM1387, TICKET_MASK_REG_BM1397PLUS,
 };
 pub use voltage_rail::{
     admit_dspic_firmware_for_energize, admit_pic1704_short_form_set_mv,

@@ -45,12 +45,28 @@ POLICIES = {
         release_stem="DCENTOS_XIL3_S19jPro",
         publication_admitted=False,
     ),
+    # S19k has a canonical build/package/name identity, but the outer
+    # publication lifecycle remains deliberately closed.  Promotion requires
+    # a new portable-evidence schema that composes the canonical persistent-
+    # image v3 receipt, production capsule/stage1 bindings, signing ceremony,
+    # terminal campaign evidence, and dual CLEAR_FOR_FLASH review.  Merely
+    # adding this target record must never make portable v2 accept it.
+    "am3-s19kpro": ReleaseCapsuleTargetPolicy(
+        target="am3-s19kpro",
+        cargo_variant="amlogic",
+        primary_artifact="dcentos-sysupgrade-am3-s19kpro.tar",
+        package_board="am3-s19kpro",
+        release_stem="DCENTOS_AML3_S19kPro",
+        publication_admitted=False,
+    ),
 }
 
 # Portable evidence schemas are long-lived verification contracts.  Adding or
 # changing current policy requires a new evidence schema rather than silently
 # reinterpreting already-signed v2 indexes.
-PORTABLE_EVIDENCE_V2_POLICIES = MappingProxyType(dict(POLICIES))
+PORTABLE_EVIDENCE_V2_POLICIES = MappingProxyType(
+    {target: POLICIES[target] for target in ("s9", "am2-s19jpro")}
+)
 
 BLOCKED_TARGETS = {
     "am2-s19jpro-sd": (

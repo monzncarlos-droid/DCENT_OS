@@ -1,0 +1,5 @@
+# Shipped K230 rootfs files must retain Unix line endings even when their
+# init-script names have no .sh suffix and the host uses core.autocrlf.
+stock-rootfs-overlay/** text=auto eol=lf
+stock-runtime-overlay/** text=auto eol=lf
+buildroot/rootfs-overlay/** text=auto eol=lf

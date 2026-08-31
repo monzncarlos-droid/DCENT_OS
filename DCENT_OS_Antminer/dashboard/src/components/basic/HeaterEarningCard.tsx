@@ -1,10 +1,13 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useMinerStore } from '../../store/miner';
 import {
   wattsToBtu, estimateDailyCost, estimateDailySats,
+  applyTakeRates, donationTakePercent, DEFAULT_DONATION_PERCENT,
+  loadPoolFeePercent,
 } from '../../utils/thermal';
 import { getDisplayPowerWatts, getLiveDisplayWallWatts } from '../../utils/power';
 import { glossaryText } from '../../utils/glossary';
+import { api } from '../../api/client';
 
 /**
  * "Earning sats while heating" card — emits the kit `nest-earning` grammar
@@ -16,7 +19,8 @@ import { glossaryText } from '../../utils/glossary';
  *                          same field SatsCounter/HeaterStatus read). When
  *                          0 but mining, an explicit "~projected" estimate
  *                          via `estimateDailySats` (clearly labelled).
- *   - BTC value (USD)   → sats / 1e8 * settings.btcPrice (HeaterStatus calc).
+ *   - BTC value (USD)   → net sats after donation + pool fee / 1e8 * settings.btcPrice.
+ *                          Heat-credit is never added to this Bitcoin figure.
  *   - heating cost      → `estimateDailyCost(livePower, settings.electricityRate)`
  *                          where livePower = `getLiveDisplayWallWatts(heater, stats)`.
  *                          Display/model fallback watts can show heat estimates
@@ -32,6 +36,20 @@ export function HeaterEarningCard() {
   const status = useMinerStore(s => s.status);
   const stats = useMinerStore(s => s.stats);
   const settings = useMinerStore(s => s.settings);
+  const [donationPercent, setDonationPercent] = useState(DEFAULT_DONATION_PERCENT);
+  const [poolFeePercent] = useState(() => loadPoolFeePercent());
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getDonationConfig()
+      .then(cfg => {
+        if (!cancelled) setDonationPercent(donationTakePercent(cfg));
+      })
+      .catch(() => {
+        if (!cancelled) setDonationPercent(DEFAULT_DONATION_PERCENT);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const hasConnection = status != null || heater != null;
 
@@ -52,7 +70,10 @@ export function HeaterEarningCard() {
   const projectedSats = isMining ? estimateDailySats(hashrate, heater?.network_difficulty) : 0;
   const usingProjection = reportedSats <= 0 && projectedSats > 0;
   const visibleSats = reportedSats > 0 ? reportedSats : projectedSats;
-  const satsUsd = (visibleSats / 100_000_000) * settings.btcPrice;
+  const taken = applyTakeRates(visibleSats, donationPercent, poolFeePercent);
+  const netSats = taken.netSats;
+  const satsUsd = (netSats / 100_000_000) * settings.btcPrice;
+  const grossUsd = (visibleSats / 100_000_000) * settings.btcPrice;
 
   // Heating electricity cost (canonical HeaterStatus calc).
   const dailyCost = liveWallPower > 0 ? estimateDailyCost(liveWallPower, settings.electricityRate) : 0;
@@ -119,7 +140,7 @@ export function HeaterEarningCard() {
       <div className="nest-earning-amount">
         <span className="nest-earning-usd">${satsUsd.toFixed(2)}</span>
         <span className="nest-earning-sats">
-          {visibleSats.toLocaleString()} sats {usingProjection ? '/day projected' : 'today'}
+          {netSats.toLocaleString()} net sats {usingProjection ? '/day projected' : 'today'}
         </span>
       </div>
       <div
@@ -140,9 +161,18 @@ export function HeaterEarningCard() {
       </div>
       <div className="nest-earning-rows">
         <div>
-          <span>Bitcoin {usingProjection ? 'projected' : 'earned'}</span>
+          <span>Bitcoin {usingProjection ? 'projected' : 'earned'} (net)</span>
           <strong style={{ color: 'var(--green)' }}>+${satsUsd.toFixed(2)}</strong>
         </div>
+        {(donationPercent > 0 || poolFeePercent > 0) && (
+          <div>
+            <span>
+              Gross before donation {donationPercent.toFixed(1)}%
+              {poolFeePercent > 0 ? ` + pool fee ${poolFeePercent.toFixed(1)}%` : ''}
+            </span>
+            <strong>+${grossUsd.toFixed(2)}</strong>
+          </div>
+        )}
         <div>
           <span>
             {dailyCost > 0

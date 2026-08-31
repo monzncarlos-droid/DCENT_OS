@@ -6,6 +6,43 @@ import { useMinerStore } from '../store/miner';
 import { useHashRoute, setHash, normalizePageForMode } from '../utils/router';
 import { StandardDashboard } from './standard/StandardDashboard';
 
+/** Canonical Fund / Donate / Support hub (Stripe + BTCPay). */
+export const DCENT_FUND_CANONICAL_URL = 'https://d-central.tech/fund/';
+
+export function fundContributeUrl(placement: string): string {
+  return `${DCENT_FUND_CANONICAL_URL}go?source=dcent_os&placement=${placement}`;
+}
+
+/** Cross-mode Fund chip for heater / hacker chrome (Standard uses Sidebar + KitTopBar). */
+export function FundSupportLink({ placement }: { placement: string }) {
+  return (
+    <a
+      href={fundContributeUrl(placement)}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label="Fund the Sovereign Stack"
+      style={{
+        position: 'fixed',
+        right: 12,
+        bottom: 12,
+        zIndex: 30,
+        fontSize: '0.75rem',
+        fontWeight: 700,
+        letterSpacing: '0.04em',
+        textTransform: 'uppercase',
+        color: 'var(--accent, #FAA500)',
+        textDecoration: 'none',
+        padding: '6px 12px',
+        borderRadius: 999,
+        background: 'rgba(250, 165, 0, 0.12)',
+        border: '1px solid rgba(250, 165, 0, 0.32)',
+      }}
+    >
+      Fund
+    </a>
+  );
+}
+
 // Code-split the two non-default mode trees. Standard is the default
 // first-paint, so it stays eagerly imported (lazy-loading it would only add a
 // Suspense flash on the most-common path). Hacker (the large password-gated
@@ -72,6 +109,7 @@ export function AppShell() {
       }
     >
       {content}
+      {mode !== 'standard' && <FundSupportLink placement="appshell" />}
     </React.Suspense>
   );
 }

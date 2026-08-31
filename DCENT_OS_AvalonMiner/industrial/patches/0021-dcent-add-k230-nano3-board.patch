@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DCENT <dev@d-central.tech>
+Date: 2026-08-15
+Subject: [PATCH] dcent: add k230-nano3 board (Canaan Avalon Nano 3)
+
+Adds a device tree for the Canaan Avalon Nano 3 K230 home miner:
+SPI-NAND on spi0 with the stock fixed-partition map taken from the
+held recovery master image (heater_nano3_master_image.img boundary
+scan + env re-scan, 2026-08-15):
+
+    spl        0x0000000 512 KiB  (A/B pair, second slot 0x80000)
+    uboot      0x0100000   1 MiB  (A/B pair, second slot 0x200000)
+    uboot_env  0x0300000 512 KiB  (A/B pair, second slot 0x380000)
+    linux      0x0400000  8 MiB   (A/B pair, second slot 0xC00000)
+    rootfs     0x1400000 24 MiB   (UBI; A/B pair, second slot 0x2C00000)
+    app        0x4400000 16 MiB   (UBI; A/B pair, second slot 0x5400000)
+    data       0x6400000 28 MiB
+
+No rtt partition on this model. The memory tuple and uart0 console are
+copied from the factory Nano 3 DTB extracted from linux@0x400000.
+
+Signed-off-by: DCENT <dev@d-central.tech>
+---
+ arch/riscv/boot/dts/canaan/Makefile        |  1 +
+ arch/riscv/boot/dts/canaan/k230-nano3.dts  | 115 +++++++++++++++++++++++++++
+ 2 files changed, 116 insertions(+)
+ create mode 100644 arch/riscv/boot/dts/canaan/k230-nano3.dts
+
+--- a/arch/riscv/boot/dts/canaan/Makefile
++++ b/arch/riscv/boot/dts/canaan/Makefile
+@@ -4,6 +4,7 @@
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-canmv.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230d-canmv.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-evb.dtb
++dtb-$(CONFIG_ARCH_CANAAN) += k230-nano3.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-nano3s.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_bit.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_dock.dtb
+
+--- /dev/null
++++ b/arch/riscv/boot/dts/canaan/k230-nano3.dts
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * DCENT board file for the Canaan Avalon Nano 3 (K230).
++ *
++ * Hardware: K230 dual-core (RV64 1.6GHz + RT-Smart small core),
++ * 128 MiB SPI-NAND (recovery master image bound).
++ *
++ * Partition map: recovery master boundary scan + env re-scan
++ * (2026-08-15) - see DCENT_OS_AvalonMiner in the DCENT monorepo.
++ */
++
++/dts-v1/;
++
++#include "k230.dtsi"
++
++/ {
++	model = "Canaan Avalon Nano 3 (DCENT)";
++	compatible = "canaan,k230-nano3", "canaan,kendryte-k230";
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x00 0x00200000 0x00 0x07dfe000>;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++&spi0 {
++	status = "okay";
++	rx-sample-delay-ns = <5>;
++
++	spi-nand@0 {
++		compatible = "spi-nand";
++		reg = <0>;
++		spi-max-frequency = <50000000>;
++		spi-tx-bus-width = <8>;
++		spi-rx-bus-width = <8>;
++		status = "okay";
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "uboot_spl_a";
++				reg = <0x0000000 0x0080000>;
++			};
++			partition@80000 {
++				label = "uboot_spl_b";
++				reg = <0x0080000 0x0080000>;
++			};
++			partition@100000 {
++				label = "uboot_a";
++				reg = <0x0100000 0x0100000>;
++			};
++			partition@200000 {
++				label = "uboot_b";
++				reg = <0x0200000 0x0100000>;
++			};
++			partition@300000 {
++				label = "uboot_env_a";
++				reg = <0x0300000 0x0080000>;
++			};
++			partition@380000 {
++				label = "uboot_env_b";
++				reg = <0x0380000 0x0080000>;
++			};
++			partition@400000 {
++				label = "linux_a";
++				reg = <0x0400000 0x0800000>;
++			};
++			partition@c00000 {
++				label = "linux_b";
++				reg = <0x0c00000 0x0800000>;
++			};
++			partition@1400000 {
++				label = "rootfs_ubi_a";
++				reg = <0x1400000 0x1800000>;
++			};
++			partition@2c00000 {
++				label = "rootfs_ubi_b";
++				reg = <0x2c00000 0x1800000>;
++			};
++			partition@4400000 {
++				label = "app_ubi_a";
++				reg = <0x4400000 0x1000000>;
++			};
++			partition@5400000 {
++				label = "app_ubi_b";
++				reg = <0x5400000 0x1000000>;
++			};
++			partition@6400000 {
++				label = "data";
++				reg = <0x6400000 0x1c00000>;
++			};
++		};
++	};
++};
++
++// DCENT first-light: enable the burn-port USB controller (the same one the
++// BROM gadget uses — K230D boards enable usbotg0) as a fixed peripheral so
++// the console/RNDIS gadget binds. Host mode (Wi-Fi dongle) is a later call.
++// Bench evidence 2026-08-21: with both controllers disabled (k230.dtsi
++// default) the V2 first-light image booted blind — no UDC, no gadget.
++&usb0 {
++	status = "okay";
++	dr_mode = "peripheral";
++};
+-- 
+2.43.0

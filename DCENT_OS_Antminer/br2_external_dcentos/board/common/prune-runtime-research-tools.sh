@@ -50,3 +50,29 @@ rm -f "$TARGET_DIR/usr/bin/dcent-shell"
 # the former raw-environment patcher to a production image.
 rm -f "$TARGET_DIR/usr/sbin/switch_firmware.py" \
     "$TARGET_DIR/usr/sbin/switch_firmware.sh"
+
+# Convenience debug binaries (strace, leftover i2c-tools) stay on DEV/LAB
+# images. RELEASE images must not ship them: dcentrald owns I2C, and strace
+# is a research/debug executor, not a product surface. BR2_PACKAGE_STRACE
+# remains enabled in dcentos-common.fragment so DEV builds keep the tool.
+case "${DCENT_RELEASE_IMAGE:-0}" in
+    1|true|TRUE|yes|YES|y|Y)
+        for tool in \
+            usr/bin/strace \
+            usr/bin/strace-log-merge \
+            usr/sbin/strace \
+            usr/bin/i2cget \
+            usr/bin/i2cset \
+            usr/bin/i2cdump \
+            usr/bin/i2cdetect \
+            usr/bin/i2ctransfer \
+            usr/sbin/i2cget \
+            usr/sbin/i2cset \
+            usr/sbin/i2cdump \
+            usr/sbin/i2cdetect \
+            usr/sbin/i2ctransfer
+        do
+            rm -f "$TARGET_DIR/$tool"
+        done
+        ;;
+esac

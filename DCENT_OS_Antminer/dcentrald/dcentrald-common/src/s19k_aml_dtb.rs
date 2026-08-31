@@ -179,12 +179,18 @@ pub const S19K_FACTORY_MESON1_ENTRY1_SIZE: u32 = 0xB800;
 pub const S19K_USB_UBOOT_GPIOAO3: &str = "GPIOAO_3";
 pub const S19K_USB_UBOOT_BYTES: usize = 769_024;
 /// Unique `GPIOAO_3` in plaintext USB UBOOT. Packed image, not a C string table.
-pub const S19K_USB_UBOOT_GPIOAO3_OFF: usize = 675_920;
+///
+/// Held `usb2_UBOOT` SHA-256:
+/// `c651391e0c9a3ec56491fae5e19d695138f09a9883c02dafc23e9c39b71458cb`.
+pub const S19K_USB_UBOOT_GPIOAO3_OFF: usize = 675_925;
 /// Packed `gpio ` word 9 bytes before GPIOAO_3. Not `gpio GPIOAO_3`.
-pub const S19K_USB_UBOOT_GPIO_WORD_OFF: usize = 675_911;
+pub const S19K_USB_UBOOT_GPIO_WORD_OFF: usize = 675_916;
 /// Item 6 SDC UBOOT has the same packed GPIOAO_3 tail as USB UBOOT.
-pub const S19K_SDC_UBOOT_GPIOAO3_OFF: usize = 725_584;
-pub const S19K_UBOOT_GPIOAO3_FROM_END: usize = 93_104;
+///
+/// Held `uboot_aml_sdc_burn` SHA-256:
+/// `2ef29d8f2d1eb9d34bfc9084519515e98ac5c6f280c1cfa1967172f396264593`.
+pub const S19K_SDC_UBOOT_GPIOAO3_OFF: usize = 725_589;
+pub const S19K_UBOOT_GPIOAO3_FROM_END: usize = 93_099;
 /// `gpio ` + 4 packed bytes + `GPIOAO_3` shared by USB and SDC U-Boot.
 pub const S19K_UBOOT_PACKED_GPIOAO3: &[u8] = b"gpio \xf0\x38\x98 GPIOAO_3";
 pub const S19K_USB_UBOOT_PACKED_CONSOLE: &[u8] = b"console=ttyS0";
@@ -459,7 +465,9 @@ pub fn parse_s19k_aml_multi_dtb(blob: &[u8]) -> Result<S19kAmlMultiDtb, &'static
     Ok(S19kAmlMultiDtb { version, entries })
 }
 
-pub fn classify_s19k_factory_meson1_variant(variant: &str) -> Result<S19kFactoryMeson1Kind, &'static str> {
+pub fn classify_s19k_factory_meson1_variant(
+    variant: &str,
+) -> Result<S19kFactoryMeson1Kind, &'static str> {
     if variant == S19K_FACTORY_MESON1_VARIANT_G1 || variant == "g1" {
         return Ok(S19kFactoryMeson1Kind::G1AndroidTv);
     }
@@ -502,10 +510,12 @@ pub fn refuse_s19k_factory_g1_as_miner_nand(
     Ok(())
 }
 
-pub fn refuse_s19k_factory_s30v_sizes_as_78_linux(parts: &[S19kDtbNandPart]) -> Result<(), &'static str> {
-    let has_stock = parts.iter().any(|p| {
-        matches!(p.name.as_str(), "misc" | "recovery" | "boot" | "config")
-    });
+pub fn refuse_s19k_factory_s30v_sizes_as_78_linux(
+    parts: &[S19kDtbNandPart],
+) -> Result<(), &'static str> {
+    let has_stock = parts
+        .iter()
+        .any(|p| matches!(p.name.as_str(), "misc" | "recovery" | "boot" | "config"));
     if has_stock {
         return Err(
             "factory s30v nand_partition names/sizes are stock misc/recovery/boot/config, not .78 2/8/50/5/32/153 MiB",
@@ -519,7 +529,9 @@ pub fn refuse_s19k_factory_meson1_as_gpio437() -> Result<(), &'static str> {
 }
 
 pub fn refuse_s19k_usb_uboot_gpioao3_as_gpio437(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(S19K_USB_UBOOT_GPIOAO3.len()).any(|w| w == S19K_USB_UBOOT_GPIOAO3.as_bytes())
+    if blob
+        .windows(S19K_USB_UBOOT_GPIOAO3.len())
+        .any(|w| w == S19K_USB_UBOOT_GPIOAO3.as_bytes())
     {
         return Err("USB UBOOT GPIOAO_3 is AO pinmux, not am3-s19k gpio437/PWR_CONTROL");
     }
@@ -527,7 +539,9 @@ pub fn refuse_s19k_usb_uboot_gpioao3_as_gpio437(blob: &[u8]) -> Result<(), &'sta
 }
 
 pub fn refuse_s19k_usb_uboot_as_recover_env(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"recover_env".len()).any(|w| w == b"recover_env")
+    if blob
+        .windows(b"recover_env".len())
+        .any(|w| w == b"recover_env")
         || blob
             .windows(b"nandrecovery_env".len())
             .any(|w| w == b"nandrecovery_env")
@@ -587,7 +601,9 @@ pub fn admit_s19k_factory_s30v_nand_sizes(parts: &[S19kDtbNandPart]) -> Result<(
 }
 
 /// s30v miner I2C vs g1 Android-TV audio. Not a gpio437 map.
-pub fn classify_s19k_factory_meson1_i2c(blob: &[u8]) -> Result<S19kFactoryMeson1Kind, &'static str> {
+pub fn classify_s19k_factory_meson1_i2c(
+    blob: &[u8],
+) -> Result<S19kFactoryMeson1Kind, &'static str> {
     let miner = blob_has(blob, S19K_FACTORY_S30V_MCU.as_bytes())
         && blob_has(blob, S19K_FACTORY_S30V_TAS.as_bytes());
     let tv = blob_has(blob, S19K_FACTORY_G1_TAS5707.as_bytes())
@@ -646,7 +662,9 @@ pub fn admit_s19k_usb_uboot_packed_setenv(blob: &[u8]) -> Result<(), &'static st
 }
 
 pub fn refuse_s19k_usb_setenv_as_bootcmd(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"setenv bootcmd".len()).any(|w| w == b"setenv bootcmd")
+    if blob
+        .windows(b"setenv bootcmd".len())
+        .any(|w| w == b"setenv bootcmd")
         || blob.windows(b"bootcmd".len()).any(|w| w == b"bootcmd")
     {
         return Ok(());
@@ -655,7 +673,9 @@ pub fn refuse_s19k_usb_setenv_as_bootcmd(blob: &[u8]) -> Result<(), &'static str
 }
 
 pub fn refuse_s19k_usb_setenv_as_firstboot(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"setenv firstboot".len()).any(|w| w == b"setenv firstboot")
+    if blob
+        .windows(b"setenv firstboot".len())
+        .any(|w| w == b"setenv firstboot")
         || blob.windows(b"firstboot".len()).any(|w| w == b"firstboot")
     {
         return Ok(());
@@ -1149,7 +1169,10 @@ pub fn refuse_s19k_usb_es_chip_as_miner_identity() -> Result<(), &'static str> {
 
 pub fn admit_s19k_usb_uboot_dvfs_freq(blob: &[u8]) -> Result<(), &'static str> {
     for (off, needle) in [
-        (S19K_USB_UBOOT_GET_INIT_DVFS_OFF, S19K_USB_UBOOT_GET_INIT_DVFS),
+        (
+            S19K_USB_UBOOT_GET_INIT_DVFS_OFF,
+            S19K_USB_UBOOT_GET_INIT_DVFS,
+        ),
         (S19K_USB_UBOOT_GET_DVFS_OFF, S19K_USB_UBOOT_GET_DVFS),
         (S19K_USB_UBOOT_FREQ_TO_IDX_OFF, S19K_USB_UBOOT_FREQ_TO_IDX),
     ] {
@@ -1177,7 +1200,10 @@ pub fn refuse_s19k_usb_freq_to_idx_as_hash_pll() -> Result<(), &'static str> {
 
 pub fn admit_s19k_usb_uboot_dvfs_sys_pll(blob: &[u8]) -> Result<(), &'static str> {
     for (off, needle) in [
-        (S19K_USB_UBOOT_SET_DVFS_INFO_OFF, S19K_USB_UBOOT_SET_DVFS_INFO),
+        (
+            S19K_USB_UBOOT_SET_DVFS_INFO_OFF,
+            S19K_USB_UBOOT_SET_DVFS_INFO,
+        ),
         (S19K_USB_UBOOT_USE_SYS_PLL_OFF, S19K_USB_UBOOT_USE_SYS_PLL),
     ] {
         if blob.len() >= off + needle.len() && &blob[off..off + needle.len()] == needle {
@@ -1238,8 +1264,7 @@ fn usb_has_standalone_set_dvfs(blob: &[u8]) -> bool {
     {
         return true;
     }
-    blob.windows(needle.len() + 1)
-        .any(|w| w == b"set_dvfs\x00")
+    blob.windows(needle.len() + 1).any(|w| w == b"set_dvfs\x00")
 }
 
 pub fn admit_s19k_usb_uboot_dvfs_thermal(blob: &[u8]) -> Result<(), &'static str> {
@@ -1251,7 +1276,10 @@ pub fn admit_s19k_usb_uboot_dvfs_thermal(blob: &[u8]) -> Result<(), &'static str
             S19K_USB_UBOOT_CPU_CLK_SUSPEND_OFF,
             S19K_USB_UBOOT_CPU_CLK_SUSPEND,
         ),
-        (S19K_USB_UBOOT_SET_DVFS_BUSY_OFF, S19K_USB_UBOOT_SET_DVFS_BUSY),
+        (
+            S19K_USB_UBOOT_SET_DVFS_BUSY_OFF,
+            S19K_USB_UBOOT_SET_DVFS_BUSY,
+        ),
         (
             S19K_USB_UBOOT_HIGH_TASK_SET_DVFS_OFF,
             S19K_USB_UBOOT_HIGH_TASK_SET_DVFS,
@@ -1435,7 +1463,10 @@ pub fn admit_s19k_usb_uboot_a53_ao_untrimmed(blob: &[u8]) -> Result<(), &'static
             S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR_OFF,
             S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR,
         ),
-        (S19K_USB_UBOOT_BL30_UNTRIMMED_OFF, S19K_USB_UBOOT_BL30_UNTRIMMED),
+        (
+            S19K_USB_UBOOT_BL30_UNTRIMMED_OFF,
+            S19K_USB_UBOOT_BL30_UNTRIMMED,
+        ),
     ] {
         if blob.len() >= off + needle.len() && &blob[off..off + needle.len()] == needle {
             continue;
@@ -1698,7 +1729,9 @@ pub fn parse_s19k_aml_dtb_gpio_controllers(
                 while off < end && blob[off] != 0 {
                     off += 1;
                 }
-                let name = std::str::from_utf8(&blob[start..off]).unwrap_or("").to_string();
+                let name = std::str::from_utf8(&blob[start..off])
+                    .unwrap_or("")
+                    .to_string();
                 off = (off + 4) & !3;
                 stack.push(Open {
                     name,
@@ -1731,7 +1764,8 @@ pub fn parse_s19k_aml_dtb_gpio_controllers(
                     return Err("truncated FDT_PROP");
                 }
                 let plen = u32::from_be_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
-                let nameoff = u32::from_be_bytes(blob[off + 4..off + 8].try_into().unwrap()) as usize;
+                let nameoff =
+                    u32::from_be_bytes(blob[off + 4..off + 8].try_into().unwrap()) as usize;
                 off += 8;
                 if off + plen > end {
                     return Err("truncated FDT prop value");
@@ -1765,9 +1799,7 @@ pub fn parse_s19k_aml_dtb_gpio_controllers(
 }
 
 /// Admit the two AXG gpiochips. Does not emit linux gpio 437.
-pub fn admit_s19k_s30v_axg_gpio_controllers(
-    ctrls: &[S19kDtbGpioCtrl],
-) -> Result<(), &'static str> {
+pub fn admit_s19k_s30v_axg_gpio_controllers(ctrls: &[S19kDtbGpioCtrl]) -> Result<(), &'static str> {
     let periphs = ctrls
         .iter()
         .find(|c| c.mux == S19K_AXG_PERIPHS_MUX)
@@ -1785,17 +1817,16 @@ pub fn admit_s19k_s30v_axg_gpio_controllers(
 
 /// 437 = vendor pin_base 411 + GPIOA_0(26). meson1 has neither cell.
 pub fn refuse_s19k_dt_math_as_gpio437(ctrls: &[S19kDtbGpioCtrl]) -> Result<(), &'static str> {
-    if ctrls.iter().any(|c| {
-        c.linux_gpio_base == Some(S19K_AXG_VENDOR_GPIOCHIP_BASE) && c.has_line_names
-    }) {
+    if ctrls
+        .iter()
+        .any(|c| c.linux_gpio_base == Some(S19K_AXG_VENDOR_GPIOCHIP_BASE) && c.has_line_names)
+    {
         return Ok(());
     }
     Err("437 is 4.9 gpiochip.base 411 + GPIOA_0(26); meson1 has no linux,gpio-base or line-names")
 }
 
-pub fn refuse_s19k_vendor_gpiochip_base_as_dt_cell(
-    base: Option<u32>,
-) -> Result<(), &'static str> {
+pub fn refuse_s19k_vendor_gpiochip_base_as_dt_cell(base: Option<u32>) -> Result<(), &'static str> {
     if base.is_none() {
         return Err("linux,gpio-base 411 is not a meson1 cell; it is 4.9 gpiolib pin_base");
     }
@@ -1812,7 +1843,7 @@ pub fn admit_s19k_usb_uboot_gpioao3_offset(blob: &[u8]) -> Result<(), &'static s
         return Err("USB UBOOT shorter than GPIOAO_3 offset");
     }
     if &blob[off..off + S19K_USB_UBOOT_GPIOAO3.len()] != S19K_USB_UBOOT_GPIOAO3.as_bytes() {
-        return Err("USB UBOOT GPIOAO_3 is at file offset 675920");
+        return Err("USB UBOOT GPIOAO_3 is at file offset 675925");
     }
     Ok(())
 }
@@ -1834,7 +1865,7 @@ pub fn admit_s19k_usb_uboot_packed_gpio_word(blob: &[u8]) -> Result<(), &'static
         return Err("USB UBOOT shorter than packed gpio neighborhood");
     }
     if &blob[off..off + 5] != b"gpio " {
-        return Err("USB UBOOT packed gpio word is at 675911");
+        return Err("USB UBOOT packed gpio word is at 675916");
     }
     if off + 9 != S19K_USB_UBOOT_GPIOAO3_OFF {
         return Err("gpio word is 9 bytes before GPIOAO_3");
@@ -1846,21 +1877,31 @@ pub fn admit_s19k_usb_uboot_packed_gpio_word(blob: &[u8]) -> Result<(), &'static
 }
 
 pub fn refuse_s19k_usb_uboot_contiguous_gpio_cmd(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"gpio GPIOAO_3".len()).any(|w| w == b"gpio GPIOAO_3") {
+    if blob
+        .windows(b"gpio GPIOAO_3".len())
+        .any(|w| w == b"gpio GPIOAO_3")
+    {
         return Ok(());
     }
     Err("USB UBOOT has no contiguous gpio GPIOAO_3 command; 4 packed bytes sit between gpio and GPIOAO_3")
 }
 
-pub fn admit_s19k_uboot_gpioao3_from_end(blob_len: usize, gpio_off: usize) -> Result<(), &'static str> {
+pub fn admit_s19k_uboot_gpioao3_from_end(
+    blob_len: usize,
+    gpio_off: usize,
+) -> Result<(), &'static str> {
     if blob_len.saturating_sub(gpio_off) != S19K_UBOOT_GPIOAO3_FROM_END {
-        return Err("USB/SDC UBOOT GPIOAO_3 is 93104 bytes from EOF");
+        return Err("USB/SDC UBOOT GPIOAO_3 is 93099 bytes from EOF");
     }
     Ok(())
 }
 
-pub fn admit_s19k_uboot_packed_gpioao3_seq(blob: &[u8], gpio_off: usize) -> Result<(), &'static str> {
-    let start = gpio_off.saturating_sub(S19K_UBOOT_PACKED_GPIOAO3.len() - S19K_USB_UBOOT_GPIOAO3.len());
+pub fn admit_s19k_uboot_packed_gpioao3_seq(
+    blob: &[u8],
+    gpio_off: usize,
+) -> Result<(), &'static str> {
+    let start =
+        gpio_off.saturating_sub(S19K_UBOOT_PACKED_GPIOAO3.len() - S19K_USB_UBOOT_GPIOAO3.len());
     if start + S19K_UBOOT_PACKED_GPIOAO3.len() > blob.len() {
         return Err("packed GPIOAO_3 sequence out of range");
     }
@@ -1884,8 +1925,12 @@ pub fn admit_s19k_usb_uboot_packed_console(blob: &[u8]) -> Result<(), &'static s
 }
 
 pub fn refuse_s19k_usb_uboot_packed_as_nand_env(blob: &[u8]) -> Result<(), &'static str> {
-    if blob.windows(b"recover_env=".len()).any(|w| w == b"recover_env=")
-        || blob.windows(b"nandrecovery_env=".len()).any(|w| w == b"nandrecovery_env=")
+    if blob
+        .windows(b"recover_env=".len())
+        .any(|w| w == b"recover_env=")
+        || blob
+            .windows(b"nandrecovery_env=".len())
+            .any(|w| w == b"nandrecovery_env=")
     {
         return Ok(());
     }
@@ -1901,12 +1946,10 @@ pub fn admit_vnish_ao_uart0_is_console_mmio(mmio: u32) -> Result<(), &'static st
 
 /// DTB stock names (misc/recovery/boot/config/nvdata) are not live BOS names.
 pub fn refuse_s19k_dtb_stock_names_as_78_linux(names: &[&str]) -> Result<(), &'static str> {
-    if names.iter().any(|n| {
-        matches!(
-            *n,
-            "misc" | "recovery" | "boot" | "config" | "nvdata"
-        )
-    }) {
+    if names
+        .iter()
+        .any(|n| matches!(*n, "misc" | "recovery" | "boot" | "config" | "nvdata"))
+    {
         return Err("DTB nand_partition stock names are not `a lab unit` Linux mtd names");
     }
     Ok(())
@@ -1975,7 +2018,9 @@ pub fn parse_s19k_aml_nand_dtb(blob: &[u8]) -> Result<S19kDtbNandLayout, &'stati
                 while off < end && blob[off] != 0 {
                     off += 1;
                 }
-                let name = std::str::from_utf8(&blob[start..off]).unwrap_or("").to_string();
+                let name = std::str::from_utf8(&blob[start..off])
+                    .unwrap_or("")
+                    .to_string();
                 off = (off + 4) & !3;
                 path.push(name);
             }
@@ -1987,7 +2032,8 @@ pub fn parse_s19k_aml_nand_dtb(blob: &[u8]) -> Result<S19kDtbNandLayout, &'stati
                     return Err("truncated FDT_PROP");
                 }
                 let plen = u32::from_be_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
-                let nameoff = u32::from_be_bytes(blob[off + 4..off + 8].try_into().unwrap()) as usize;
+                let nameoff =
+                    u32::from_be_bytes(blob[off + 4..off + 8].try_into().unwrap()) as usize;
                 off += 8;
                 if off + plen > end {
                     return Err("truncated FDT prop value");
@@ -2128,12 +2174,7 @@ mod tests {
         emit_end(&mut st);
         emit_node(&mut st, "nand_partition");
         emit_node(&mut st, "nvdata");
-        emit_prop(
-            &mut st,
-            &mut strings,
-            "offset",
-            &u64::MAX.to_be_bytes(),
-        );
+        emit_prop(&mut st, &mut strings, "offset", &u64::MAX.to_be_bytes());
         emit_prop(&mut st, &mut strings, "size", &0u64.to_be_bytes());
         emit_end(&mut st);
         emit_end(&mut st);
@@ -2223,6 +2264,49 @@ mod tests {
         out
     }
 
+    fn unique_offset(blob: &[u8], needle: &[u8]) -> usize {
+        let mut hits = blob
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(off, window)| (window == needle).then_some(off));
+        let first = hits.next().expect("held U-Boot needle");
+        assert!(hits.next().is_none(), "held U-Boot needle must be unique");
+        first
+    }
+
+    #[test]
+    fn held_s19k_uboot_gpioao3_offsets_match_raw_artifacts() {
+        let held = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../\
+             s19kpro-aml-sd/upgrade_extracted",
+        );
+        let usb = std::fs::read(held.join("usb2_UBOOT")).expect("held S19k USB U-Boot");
+        let sdc = std::fs::read(held.join("uboot_aml_sdc_burn")).expect("held S19k SDC U-Boot");
+
+        assert_eq!(usb.len(), S19K_USB_UBOOT_BYTES);
+        assert_eq!(sdc.len(), 818_688);
+        assert_eq!(
+            unique_offset(&usb, S19K_USB_UBOOT_GPIOAO3.as_bytes()),
+            S19K_USB_UBOOT_GPIOAO3_OFF
+        );
+        assert_eq!(unique_offset(&usb, b"gpio "), S19K_USB_UBOOT_GPIO_WORD_OFF);
+        assert_eq!(
+            unique_offset(&sdc, S19K_USB_UBOOT_GPIOAO3.as_bytes()),
+            S19K_SDC_UBOOT_GPIOAO3_OFF
+        );
+        assert_eq!(
+            unique_offset(&sdc, b"gpio "),
+            S19K_SDC_UBOOT_GPIOAO3_OFF - 9
+        );
+
+        assert!(admit_s19k_usb_uboot_gpioao3_offset(&usb).is_ok());
+        assert!(admit_s19k_usb_uboot_packed_gpio_word(&usb).is_ok());
+        assert!(admit_s19k_uboot_packed_gpioao3_seq(&usb, S19K_USB_UBOOT_GPIOAO3_OFF).is_ok());
+        assert!(admit_s19k_uboot_packed_gpioao3_seq(&sdc, S19K_SDC_UBOOT_GPIOAO3_OFF).is_ok());
+        assert!(admit_s19k_uboot_gpioao3_from_end(usb.len(), S19K_USB_UBOOT_GPIOAO3_OFF).is_ok());
+        assert!(admit_s19k_uboot_gpioao3_from_end(sdc.len(), S19K_SDC_UBOOT_GPIOAO3_OFF).is_ok());
+    }
+
     #[test]
     fn parse_dtb_and_refuse_linux_nvdata_alias() {
         let blob = build_dtb();
@@ -2253,7 +2337,13 @@ mod tests {
         )
         .is_err());
         assert!(refuse_s19k_s19j_mtd6_nvdata_as_78(&[
-            "bootloader", "tpl", "misc", "recovery", "boot", "config", "nvdata"
+            "bootloader",
+            "tpl",
+            "misc",
+            "recovery",
+            "boot",
+            "config",
+            "nvdata"
         ])
         .is_err());
         assert!(refuse_s19k_dtb_stock_names_as_78_linux(&["tpl", "misc", "nvdata"]).is_err());
@@ -2331,7 +2421,9 @@ mod tests {
             S19kFactoryMeson1Kind::S30vMinerStock
         );
         assert!(refuse_s19k_factory_g1_as_miner_nand(S19kFactoryMeson1Kind::G1AndroidTv).is_err());
-        assert!(refuse_s19k_factory_g1_as_miner_nand(S19kFactoryMeson1Kind::S30vMinerStock).is_ok());
+        assert!(
+            refuse_s19k_factory_g1_as_miner_nand(S19kFactoryMeson1Kind::S30vMinerStock).is_ok()
+        );
         let s30v_fdt = s19k_aml_multi_dtb_inner(&packed, &multi.entries[1]).unwrap();
         let s30v = parse_s19k_aml_nand_dtb(s30v_fdt).unwrap();
         assert!(admit_s19k_78_dtb_nand(&s30v).is_ok());
@@ -2439,8 +2531,8 @@ mod tests {
         packed_cmd[S19K_USB_UBOOT_UILD_EXPECT_OFF
             ..S19K_USB_UBOOT_UILD_EXPECT_OFF + S19K_USB_UBOOT_UILD_EXPECT.len()]
             .copy_from_slice(S19K_USB_UBOOT_UILD_EXPECT);
-        packed_cmd[S19K_USB_UBOOT_ACMDLIN_OFF
-            ..S19K_USB_UBOOT_ACMDLIN_OFF + S19K_USB_UBOOT_ACMDLIN.len()]
+        packed_cmd
+            [S19K_USB_UBOOT_ACMDLIN_OFF..S19K_USB_UBOOT_ACMDLIN_OFF + S19K_USB_UBOOT_ACMDLIN.len()]
             .copy_from_slice(S19K_USB_UBOOT_ACMDLIN);
         assert!(admit_s19k_usb_uboot_packed_uild_expect(&packed_cmd).is_ok());
         assert!(admit_s19k_usb_uboot_packed_acmdlin(&packed_cmd).is_ok());
@@ -2450,7 +2542,8 @@ mod tests {
         assert!(refuse_s19k_usb_saradc_ch2_as_bl2_error().is_err());
         assert!(refuse_s19k_usb_saradc_ch2_as_miner_adc().is_err());
         assert_eq!(S19K_USB_UBOOT_SARADC_CH2_OFF, 686_169);
-        let mut usb_ctrl = vec![0u8; S19K_USB_UBOOT_SPEED_ENUM_OFF + S19K_USB_UBOOT_SPEED_ENUM.len()];
+        let mut usb_ctrl =
+            vec![0u8; S19K_USB_UBOOT_SPEED_ENUM_OFF + S19K_USB_UBOOT_SPEED_ENUM.len()];
         usb_ctrl[S19K_USB_UBOOT_TXFIFO_FULL_OFF
             ..S19K_USB_UBOOT_TXFIFO_FULL_OFF + S19K_USB_UBOOT_TXFIFO_FULL.len()]
             .copy_from_slice(S19K_USB_UBOOT_TXFIFO_FULL);
@@ -2470,18 +2563,18 @@ mod tests {
         assert!(refuse_s19k_usb_addr_mask_as_nandrecovery().is_err());
         assert_eq!(S19K_USB_UBOOT_ADDR_MASK_OFF, 257_284);
         let mut ramoops = vec![0u8; S19K_USB_UBOOT_RAMOOPS_OFF + S19K_USB_UBOOT_RAMOOPS.len()];
-        ramoops[S19K_USB_UBOOT_RAMOOPS_OFF
-            ..S19K_USB_UBOOT_RAMOOPS_OFF + S19K_USB_UBOOT_RAMOOPS.len()]
+        ramoops
+            [S19K_USB_UBOOT_RAMOOPS_OFF..S19K_USB_UBOOT_RAMOOPS_OFF + S19K_USB_UBOOT_RAMOOPS.len()]
             .copy_from_slice(S19K_USB_UBOOT_RAMOOPS);
         assert!(admit_s19k_usb_uboot_ramoops(&ramoops).is_ok());
         assert!(refuse_s19k_usb_ramoops_as_recover_env().is_err());
         assert_eq!(S19K_USB_UBOOT_RAMOOPS_OFF, 674_787);
-        let mut cortex = vec![0u8; S19K_USB_UBOOT_CORTEX_TASK_OFF + S19K_USB_UBOOT_CORTEX_TASK.len()];
+        let mut cortex =
+            vec![0u8; S19K_USB_UBOOT_CORTEX_TASK_OFF + S19K_USB_UBOOT_CORTEX_TASK.len()];
         cortex[S19K_USB_UBOOT_EXCEPTION_OFF
             ..S19K_USB_UBOOT_EXCEPTION_OFF + S19K_USB_UBOOT_EXCEPTION.len()]
             .copy_from_slice(S19K_USB_UBOOT_EXCEPTION);
-        cortex[S19K_USB_UBOOT_PSTACK_OFF
-            ..S19K_USB_UBOOT_PSTACK_OFF + S19K_USB_UBOOT_PSTACK.len()]
+        cortex[S19K_USB_UBOOT_PSTACK_OFF..S19K_USB_UBOOT_PSTACK_OFF + S19K_USB_UBOOT_PSTACK.len()]
             .copy_from_slice(S19K_USB_UBOOT_PSTACK);
         cortex[S19K_USB_UBOOT_CORTEX_TASK_OFF
             ..S19K_USB_UBOOT_CORTEX_TASK_OFF + S19K_USB_UBOOT_CORTEX_TASK.len()]
@@ -2578,10 +2671,8 @@ mod tests {
         assert!(refuse_s19k_usb_ec_sec_userlow_as_nandrecovery().is_err());
         assert_eq!(S19K_USB_UBOOT_SECMAILBOX_OFF, 42_990);
         assert_eq!(S19K_USB_UBOOT_USERLOWTASK_OFF, 43_001);
-        let mut high = vec![
-            0u8;
-            S19K_USB_UBOOT_USERSECURETASK_OFF + S19K_USB_UBOOT_USERSECURETASK.len()
-        ];
+        let mut high =
+            vec![0u8; S19K_USB_UBOOT_USERSECURETASK_OFF + S19K_USB_UBOOT_USERSECURETASK.len()];
         high[S19K_USB_UBOOT_USERHIGHTASK_OFF
             ..S19K_USB_UBOOT_USERHIGHTASK_OFF + S19K_USB_UBOOT_USERHIGHTASK.len()]
             .copy_from_slice(S19K_USB_UBOOT_USERHIGHTASK);
@@ -2609,7 +2700,8 @@ mod tests {
         let mut es = vec![0u8; S19K_USB_UBOOT_DVFS_VOL_OFF + S19K_USB_UBOOT_DVFS_VOL.len()];
         es[S19K_USB_UBOOT_ES_CHIP_OFF..S19K_USB_UBOOT_ES_CHIP_OFF + S19K_USB_UBOOT_ES_CHIP.len()]
             .copy_from_slice(S19K_USB_UBOOT_ES_CHIP);
-        es[S19K_USB_UBOOT_DVFS_VOL_OFF..S19K_USB_UBOOT_DVFS_VOL_OFF + S19K_USB_UBOOT_DVFS_VOL.len()]
+        es[S19K_USB_UBOOT_DVFS_VOL_OFF
+            ..S19K_USB_UBOOT_DVFS_VOL_OFF + S19K_USB_UBOOT_DVFS_VOL.len()]
             .copy_from_slice(S19K_USB_UBOOT_DVFS_VOL);
         assert!(admit_s19k_usb_uboot_es_chip_dvfs(&es).is_ok());
         assert!(refuse_s19k_usb_es_chip_dvfs_as_hash_uart().is_err());
@@ -2635,7 +2727,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_GET_INIT_DVFS_OFF, 43_144);
         assert_eq!(S19K_USB_UBOOT_GET_DVFS_OFF, 43_160);
         assert_eq!(S19K_USB_UBOOT_FREQ_TO_IDX_OFF, 43_172);
-        let mut syspll = vec![0u8; S19K_USB_UBOOT_USE_SYS_PLL_OFF + S19K_USB_UBOOT_USE_SYS_PLL.len()];
+        let mut syspll =
+            vec![0u8; S19K_USB_UBOOT_USE_SYS_PLL_OFF + S19K_USB_UBOOT_USE_SYS_PLL.len()];
         syspll[S19K_USB_UBOOT_SET_DVFS_INFO_OFF
             ..S19K_USB_UBOOT_SET_DVFS_INFO_OFF + S19K_USB_UBOOT_SET_DVFS_INFO.len()]
             .copy_from_slice(S19K_USB_UBOOT_SET_DVFS_INFO);
@@ -2648,7 +2741,8 @@ mod tests {
         assert!(refuse_s19k_usb_use_sys_pll_as_hash_pll().is_err());
         assert_eq!(S19K_USB_UBOOT_SET_DVFS_INFO_OFF, 43_184);
         assert_eq!(S19K_USB_UBOOT_USE_SYS_PLL_OFF, 43_200);
-        let mut fix = vec![0u8; S19K_USB_UBOOT_SYS_PLL_LOCK_OFF + S19K_USB_UBOOT_SYS_PLL_LOCK.len()];
+        let mut fix =
+            vec![0u8; S19K_USB_UBOOT_SYS_PLL_LOCK_OFF + S19K_USB_UBOOT_SYS_PLL_LOCK.len()];
         fix[S19K_USB_UBOOT_USE_FIX_CLK_OFF
             ..S19K_USB_UBOOT_USE_FIX_CLK_OFF + S19K_USB_UBOOT_USE_FIX_CLK.len()]
             .copy_from_slice(S19K_USB_UBOOT_USE_FIX_CLK);
@@ -2661,7 +2755,8 @@ mod tests {
         assert!(refuse_s19k_usb_sys_pll_lock_as_hash_pll().is_err());
         assert_eq!(S19K_USB_UBOOT_USE_FIX_CLK_OFF, 43_380);
         assert_eq!(S19K_USB_UBOOT_SYS_PLL_LOCK_OFF, 43_595);
-        let mut therm = vec![0u8; S19K_USB_UBOOT_AML_THERMAL_OFF + S19K_USB_UBOOT_AML_THERMAL.len()];
+        let mut therm =
+            vec![0u8; S19K_USB_UBOOT_AML_THERMAL_OFF + S19K_USB_UBOOT_AML_THERMAL.len()];
         therm[S19K_USB_UBOOT_SET_DVFS_OFF
             ..S19K_USB_UBOOT_SET_DVFS_OFF + S19K_USB_UBOOT_SET_DVFS.len()]
             .copy_from_slice(S19K_USB_UBOOT_SET_DVFS);
@@ -2689,7 +2784,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_HIGH_TASK_SET_DVFS_OFF, 43_868);
         assert_eq!(S19K_USB_UBOOT_AML_THERMAL_OFF, 44_476);
         assert!(admit_s19k_usb_uboot_dvfs_thermal(b"set_dvfs_info").is_err());
-        let mut bl30 = vec![0u8; S19K_USB_UBOOT_BL30_THERMAL_OFF + S19K_USB_UBOOT_BL30_THERMAL.len()];
+        let mut bl30 =
+            vec![0u8; S19K_USB_UBOOT_BL30_THERMAL_OFF + S19K_USB_UBOOT_BL30_THERMAL.len()];
         bl30[S19K_USB_UBOOT_CPU_CLK_RESUME_OFF
             ..S19K_USB_UBOOT_CPU_CLK_RESUME_OFF + S19K_USB_UBOOT_CPU_CLK_RESUME.len()]
             .copy_from_slice(S19K_USB_UBOOT_CPU_CLK_RESUME);
@@ -2718,10 +2814,12 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_EFUSE_PW_EN_OFF, 43_985);
         let mut trim = vec![
             0u8;
-            S19K_USB_UBOOT_BL30_THERMAL_TRIM_OFF + S19K_USB_UBOOT_BL30_THERMAL_TRIM.len()
+            S19K_USB_UBOOT_BL30_THERMAL_TRIM_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_TRIM.len()
         ];
         trim[S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL_OFF
-            ..S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL_OFF + S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL.len()]
+            ..S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL_OFF
+                + S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL.len()]
             .copy_from_slice(S19K_USB_UBOOT_HIGH_TASK_INIT_DVFSTBL);
         trim[S19K_USB_UBOOT_DISABLE_M3_JTAG_OFF
             ..S19K_USB_UBOOT_DISABLE_M3_JTAG_OFF + S19K_USB_UBOOT_DISABLE_M3_JTAG.len()]
@@ -2741,7 +2839,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_DISABLE_M3_JTAG_OFF, 43_952);
         assert_eq!(S19K_USB_UBOOT_EFUSE_BITS_DISABLED_OFF, 44_004);
         assert_eq!(S19K_USB_UBOOT_BL30_THERMAL_TRIM_OFF, 44_496);
-        let mut gxl = vec![0u8; S19K_USB_UBOOT_GXL_ES_THERMAL_OFF + S19K_USB_UBOOT_GXL_ES_THERMAL.len()];
+        let mut gxl =
+            vec![0u8; S19K_USB_UBOOT_GXL_ES_THERMAL_OFF + S19K_USB_UBOOT_GXL_ES_THERMAL.len()];
         gxl[S19K_USB_UBOOT_DISABLE_A53_JTAG_OFF
             ..S19K_USB_UBOOT_DISABLE_A53_JTAG_OFF + S19K_USB_UBOOT_DISABLE_A53_JTAG.len()]
             .copy_from_slice(S19K_USB_UBOOT_DISABLE_A53_JTAG);
@@ -2763,7 +2862,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_ENABLE_M3_JTAG_OFF, 44_037);
         assert_eq!(S19K_USB_UBOOT_BL30_THERMAL_CALIB_OFF, 44_540);
         assert_eq!(S19K_USB_UBOOT_GXL_ES_THERMAL_OFF, 44_949);
-        let mut untrim = vec![0u8; S19K_USB_UBOOT_BL30_UNTRIMMED_OFF + S19K_USB_UBOOT_BL30_UNTRIMMED.len()];
+        let mut untrim =
+            vec![0u8; S19K_USB_UBOOT_BL30_UNTRIMMED_OFF + S19K_USB_UBOOT_BL30_UNTRIMMED.len()];
         untrim[S19K_USB_UBOOT_ENABLE_A53_JTAG_OFF
             ..S19K_USB_UBOOT_ENABLE_A53_JTAG_OFF + S19K_USB_UBOOT_ENABLE_A53_JTAG.len()]
             .copy_from_slice(S19K_USB_UBOOT_ENABLE_A53_JTAG);
@@ -2771,7 +2871,8 @@ mod tests {
             ..S19K_USB_UBOOT_JTAG_TO_AO_OFF + S19K_USB_UBOOT_JTAG_TO_AO.len()]
             .copy_from_slice(S19K_USB_UBOOT_JTAG_TO_AO);
         untrim[S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR_OFF
-            ..S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR_OFF + S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR.len()]
+            ..S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR.len()]
             .copy_from_slice(S19K_USB_UBOOT_BL30_THERMAL_CALIB_ERR);
         untrim[S19K_USB_UBOOT_BL30_UNTRIMMED_OFF
             ..S19K_USB_UBOOT_BL30_UNTRIMMED_OFF + S19K_USB_UBOOT_BL30_UNTRIMMED.len()]
@@ -2787,7 +2888,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_BL30_UNTRIMMED_OFF, 44_695);
         let mut ee = vec![
             0u8;
-            S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF + S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA.len()
+            S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA.len()
         ];
         ee[S19K_USB_UBOOT_JTAG_TO_EE_OFF
             ..S19K_USB_UBOOT_JTAG_TO_EE_OFF + S19K_USB_UBOOT_JTAG_TO_EE.len()]
@@ -2796,7 +2898,8 @@ mod tests {
             ..S19K_USB_UBOOT_INCORRECT_PASSWORD_OFF + S19K_USB_UBOOT_INCORRECT_PASSWORD.len()]
             .copy_from_slice(S19K_USB_UBOOT_INCORRECT_PASSWORD);
         ee[S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF
-            ..S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF + S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA.len()]
+            ..S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA.len()]
             .copy_from_slice(S19K_USB_UBOOT_BL30_THERMAL_CAL_DATA);
         ee[S19K_USB_UBOOT_BL30_AXG_VER_OFF
             ..S19K_USB_UBOOT_BL30_AXG_VER_OFF + S19K_USB_UBOOT_BL30_AXG_VER.len()]
@@ -2813,7 +2916,8 @@ mod tests {
         assert_eq!(S19K_USB_UBOOT_BL30_AXG_VER_OFF, 44_738);
         let mut inv = vec![
             0u8;
-            S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF + S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR.len()
+            S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR.len()
         ];
         inv[S19K_USB_UBOOT_INVALID_INPUT_OFF
             ..S19K_USB_UBOOT_INVALID_INPUT_OFF + S19K_USB_UBOOT_INVALID_INPUT.len()]
@@ -2825,7 +2929,8 @@ mod tests {
             ..S19K_USB_UBOOT_BL30_AXG_THERMAL0_OFF + S19K_USB_UBOOT_BL30_AXG_THERMAL0.len()]
             .copy_from_slice(S19K_USB_UBOOT_BL30_AXG_THERMAL0);
         inv[S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF
-            ..S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF + S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR.len()]
+            ..S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR_OFF
+                + S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR.len()]
             .copy_from_slice(S19K_USB_UBOOT_BL30_THERMAL_INIT_ERR);
         assert!(admit_s19k_usb_uboot_invalid_try_thermal0(&inv).is_ok());
         assert!(refuse_s19k_usb_invalid_try_thermal0_as_hash_uart().is_err());
@@ -2849,7 +2954,9 @@ mod tests {
         assert!(admit_s19k_s30v_axg_gpio_controllers(&gpios).is_ok());
         assert_eq!(gpios.len(), 2);
         assert!(gpios.iter().all(|c| c.linux_gpio_base.is_none()));
-        assert!(gpios.iter().all(|c| !c.has_line_names && !c.has_gpio_ranges));
+        assert!(gpios
+            .iter()
+            .all(|c| !c.has_line_names && !c.has_gpio_ranges));
         assert!(refuse_s19k_dt_math_as_gpio437(&gpios).is_err());
         assert!(refuse_s19k_vendor_gpiochip_base_as_dt_cell(None).is_err());
         assert!(refuse_s19k_vendor_gpiochip_base_as_dt_cell(Some(411)).is_ok());
@@ -2865,7 +2972,11 @@ mod tests {
         assert!(admit_s19k_usb_uboot_packed_gpio_word(&usb_fix).is_ok());
         assert!(refuse_s19k_usb_uboot_contiguous_gpio_cmd(&usb_fix).is_err());
         assert!(refuse_s19k_usb_uboot_gpioao_as_pin_table(&usb_fix).is_err());
-        assert!(admit_s19k_uboot_gpioao3_from_end(S19K_USB_UBOOT_BYTES, S19K_USB_UBOOT_GPIOAO3_OFF).is_ok());
+        assert!(admit_s19k_uboot_gpioao3_from_end(
+            S19K_USB_UBOOT_BYTES,
+            S19K_USB_UBOOT_GPIOAO3_OFF
+        )
+        .is_ok());
         assert!(admit_s19k_uboot_gpioao3_from_end(818_688, S19K_SDC_UBOOT_GPIOAO3_OFF).is_ok());
         assert!(admit_s19k_uboot_packed_gpioao3_seq(&usb_fix, S19K_USB_UBOOT_GPIOAO3_OFF).is_ok());
         let mut packed_console = usb_fix.clone();
@@ -2878,7 +2989,10 @@ mod tests {
         assert!(refuse_s19k_usb_uboot_gpioao_as_pin_table(&usb_fix).is_ok());
         assert_eq!(S19K_AXG_GPIOA0_LOCAL + S19K_AXG_VENDOR_GPIOCHIP_BASE, 437);
         assert_eq!(S19K_AXG_GPIOAO3_LOCAL, 3);
-        assert_eq!(S19K_AXG_PERIPHS_PINCTRL, "amlogic,meson-axg-periphs-pinctrl");
+        assert_eq!(
+            S19K_AXG_PERIPHS_PINCTRL,
+            "amlogic,meson-axg-periphs-pinctrl"
+        );
         assert_eq!(S19K_AXG_AOBUS_PINCTRL, "amlogic,meson-axg-aobus-pinctrl");
     }
 }

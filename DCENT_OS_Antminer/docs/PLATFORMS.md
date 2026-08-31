@@ -35,17 +35,21 @@ from mining evidence and should match DCENT_Toolbox readiness output; help from 
 | Miner | ASIC | Board | Mining / driver evidence | Public install readiness |
 | --- | --- | --- | --- | --- |
 | **Antminer S9** | BM1387 | Zynq | **Mining achieved** — sustained standalone cold-boot mining with accepted pool shares | Lab-gated: Toolbox route exists, public artifact + witnessed live-install capstone still required |
-| **Antminer S19 Pro** | BM1398 | Zynq | Hashing achieved (cold boot, full chain enumeration, clean nonce flow); accepted shares untested on latest binaries | Lab-gated: dedicated signed package/runbook/live capstone pending |
+| **Antminer S9 SE** | BM1393 | Ctrl_C43 / XC7Z007S | Exact identity and detect-only evidence; no callable mining runtime | Evidence gap: not the classic S9 install path; no install or recovery-write authority |
+| **Antminer S19 Pro** | BM1398 | Zynq | Historical `a lab unit` cold-boot produced 146K nonces at 3x114, but no pool-accepted share was proven; current electrical admission remains fail-closed | Evidence gap: no callable native BM1398 runtime and no customer write route |
 | **Antminer S19j Pro** | BM1362 | Zynq | **Mining achieved** — standalone cold-boot mining with accepted pool shares | Guarded DCENT_OS-source self-update only; vendor-source first install remains evidence-gap |
 | **Antminer S19j Pro** | BM1362 | BeagleBone | Historical accepted-share/all-chain proof; current retained-GPIO59/watchdog lifecycle is **EXPERIMENTAL**, host-validated, and not bench-revalidated | Lab-gated: installed profile has watchdog disabled and is management-only; authorized temporary-config SD/runtime validation required, not a general NAND/sysupgrade production install |
 | **Antminer S21** | BM1368 | Amlogic | **Mining achieved** — sustained hashing with accepted pool shares (runtime path); untested on latest binaries | Lab-gated: runtime evidence exists; stock AMLCtrl in-place install remains blocked |
-| **Antminer S17 / S17 Pro** | BM1397 | Zynq | Bring-up: drivers in place; validation expanding | Evidence gap: no public install route |
-| **Antminer T17** | BM1397 | Zynq | In development: explicit model profile and X17 runtime identity exist; validation expanding | Evidence gap: no public install route |
-| **Antminer S19** | BM1398 | Zynq | Bring-up: shares the S19 Pro driver path | Evidence gap: does not inherit S19 Pro install readiness |
-| **Antminer T19** | BM1398 | CVITEK | In development: explicit model profile exists; chip geometry and tuning defaults remain hardware-gated | Evidence gap: no public install route |
-| **Antminer S19 XP** | BM1366 | Amlogic / CVITEK variants | Bring-up: driver present; validation expanding | Evidence gap: no public install route |
-| **Antminer S19j Pro (Amlogic)** | BM1362 | Amlogic | Bring-up: code paths in place; validation expanding | Evidence gap / lab-only: AMLCtrl route boundaries still apply |
-| **Antminer S19k Pro** | BM1366 | Amlogic | Bring-up: Amlogic port in progress | Evidence gap / lab-only: first-flash route proof pending |
+| **Antminer S17 / S17 Pro** | BM1397 | Zynq | Package/driver evidence retained; current BoardDesc is management-only with no callable mining runtime | Evidence gap: no public install route |
+| **Antminer T17** | BM1397 | Zynq | Exact identity and driver evidence retained; current BoardDesc is management-only | Evidence gap: no public install route |
+| **Antminer S19** | BM1398 | Zynq | Package/identity evidence retained; current BoardDesc is management-only | Evidence gap: does not inherit S19 Pro install readiness |
+| **Antminer T19** | BM1398 | Zynq / CVITEK variants | Exact model evidence exists; chip geometry and runtime admission remain unresolved or management-only | Evidence gap: no public install route |
+| **Antminer S19 XP** | BM1366 | Amlogic / CVITEK variants | Exact 3×110 Amlogic package/identity evidence; no runtime PIC/PSU authority | Package-only evidence gap: install/update/recovery writes blocked |
+| **Antminer S19j XP** | BM1366 | Amlogic | Exact 3×110 package/identity evidence; no runtime PIC/PSU authority | Package-only evidence gap: install/update/recovery writes blocked |
+| **Antminer S19j Pro+ (Amlogic)** | BM1362 | Amlogic | Exact identity/package evidence; TD-003 intercepts before runtime dispatch | Evidence gap: no install route |
+| **Antminer S19k Pro** | BM1366 | Amlogic | Track-1 `/tmp` mining live-proven to the bounded 2-of-2 UART work proof (COMPLETE 2026-08-29, share accepted, terminal SafeOff, wrapper exit 0); default-off joined native cold-start owner is host-compiled and source-audited | Lab-only source route: endurance, recovery rehearsal, signed two-build image, install, and cold-boot acceptance evidence pending |
+| **Antminer T21** | BM1368 | Amlogic | Exact 3×108 desk geometry and package-format evidence; runtime remains unvalidated | Package-only evidence gap: install/update/recovery writes blocked |
+| **Antminer S21 XP** | BM1370 | Amlogic | Exact 3×91 A3HB70501/02/03 topology and package-format evidence; management-only runtime | Package-only evidence gap: install/update/recovery writes blocked |
 | **AvalonMiner (Canaan)** | — | K230 RISC-V | In development | Not public-install-ready |
 | **WhatsMiner (M-series)** | — | H616 | In development | Not public-install-ready |
 

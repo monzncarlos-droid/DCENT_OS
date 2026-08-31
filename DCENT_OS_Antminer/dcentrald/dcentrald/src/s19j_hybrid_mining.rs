@@ -1676,10 +1676,32 @@ pub(crate) enum Am2ThermalSource {
     XadcSocDie,
 }
 
+/// AM2 hybrid honesty fold: board/chip temps `<= 0.0 °C` are missing, not a
+/// real ice-point reading. Matches serial/AM3-BB fail-closed (`max_temp > 0.0`)
+/// and the daemon fold (`temp_c > 0.0`). A 0 °C sample is never a PID input.
+fn am2_hybrid_temp_or_missing(temp_c: f32) -> Option<f32> {
+    if temp_c.is_finite() && temp_c > 0.0 {
+        Some(temp_c)
+    } else {
+        None
+    }
+}
+
+/// Hybrid LM75 window plus the `<= 0.0 °C` missing fold. `filter_hybrid_window`
+/// still owns the inclusive `[-20, 125]` band (coverage crate); this consumer
+/// then drops non-positive samples so a failed/unpowered LM75 cannot become a
+/// cool PID sample.
+fn filter_am2_hybrid_temps(readings: [Option<f32>; 4]) -> [Option<f32>; 4] {
+    board_sensor_coverage::filter_hybrid_window(readings)
+        .map(|reading| reading.and_then(am2_hybrid_temp_or_missing))
+}
+
 fn select_am2_thermal_sample(
     board_c: Option<f32>,
     calibrated_die_c: Option<f32>,
 ) -> Option<(f32, Am2ThermalSource)> {
+    let board_c = board_c.and_then(am2_hybrid_temp_or_missing);
+    let calibrated_die_c = calibrated_die_c.and_then(am2_hybrid_temp_or_missing);
     match (board_c, calibrated_die_c) {
         (Some(board_c), Some(die_c)) if board_c >= die_c => {
             Some((board_c, Am2ThermalSource::DspicBoardSensor))
@@ -1750,12 +1772,10 @@ impl Am2ThermalSupervisor {
             // parser-corruption hazard, and this poll is heartbeat-adjacent on
             // `a lab unit`-class hardware.
             //
-            // Selection is byte-equivalent to the previous `max` over
-            // `read_all_temperatures`: a failed read was the `-999.0` sentinel
-            // and is now `None`, and the surviving set is the same finite
-            // readings inside the same inclusive `[-20, 125]` window.
-            let readings =
-                board_sensor_coverage::filter_hybrid_window(pic.lm75a_sweep(LM75A_ADDRS));
+            // Window is the hybrid inclusive `[-20, 125]` band, then `<= 0.0 °C`
+            // is folded to missing so a failed/unpowered LM75 cannot become a
+            // cool PID sample. `-999.0` is already None after the window.
+            let readings = filter_am2_hybrid_temps(pic.lm75a_sweep(LM75A_ADDRS));
             let sweep = SensorSweep::from_readings(&readings, LM75A_ADDRS.len() as u16);
             board_sensor_coverage::report_board_sensor_coverage(
                 "am2-hybrid",
@@ -4382,6 +4402,13 @@ fn build_am2_freq_only_autotuner_config(
     config: &DcentraldConfig,
 ) -> dcentrald_autotuner::AutoTunerConfig {
     let mut autotune_config = config.autotuner.clone();
+    autotune_config.night_power = dcentrald_autotuner::NightPowerPolicy::from_home_night_mode(
+        config.mode.home.night_mode.enabled,
+        config.mode.home.night_mode.start_hour,
+        config.mode.home.night_mode.end_hour,
+        config.mode.home.night_mode.power_reduction_pct,
+        config.thermal.night_mode.timezone_offset_hours,
+    );
 
     // (1) The am2 freq-only opt-in IS the enable for this path.
     autotune_config.enabled = true;
@@ -4468,8 +4495,8 @@ impl Am2SerialChainStats {
 
     #[inline]
     fn set_temp(&mut self, temp_c: Option<f32>) {
-        if temp_c.is_some() {
-            self.last_temp_c = temp_c;
+        if let Some(temp_c) = temp_c.and_then(am2_hybrid_temp_or_missing) {
+            self.last_temp_c = Some(temp_c);
         }
     }
 
@@ -7718,6 +7745,8 @@ impl S19jHybridMiner {
             accepted: accounting.accepted(),
             rejected: accounting.rejected(),
             chains,
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: dcentrald_api::FanState {
                 // Display-only: the hybrid path caps fans via the home hard-stop
                 // guard; report the configured idle floor, never a max-blast
@@ -10322,6 +10351,43 @@ impl S19jHybridMiner {
 
         if self.shutdown.is_cancelled() {
             anyhow::bail!("AM2 hybrid run was cancelled before hardware admission");
+        }
+
+        // Rank-19: MiningAlertMonitor on the hybrid path. Daemon::run already
+        // owns one; serial/am3-bb were wired by sibling alertevent. Default-OFF
+        // webhook dispatch — no pages until `[webhook]` is enabled.
+        if let Some(state_tx) = self.state_tx.as_ref() {
+            let alert_tx = crate::runtime::notifications::spawn_alert_event_dispatcher(
+                crate::runtime::notifications::RuntimeWebhookConfig::from(
+                    self.config.webhook.clone(),
+                ),
+                self.config.general.hostname.clone(),
+                self.shutdown.clone(),
+            );
+            let alert_bind =
+                crate::runtime::notifications::MiningAlertMonitorBind::from_config(&self.config);
+            let mut alert_state_rx = state_tx.subscribe();
+            let alert_shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut alert_monitor = crate::runtime::notifications::MiningAlertMonitor::new();
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = alert_shutdown.cancelled() => break,
+                        _ = interval.tick() => {
+                            let state = alert_state_rx.borrow().clone();
+                            let snap = crate::runtime::notifications::mining_health_snapshot_from_state(
+                                &state,
+                                &alert_bind,
+                            );
+                            for event in alert_monitor.evaluate(&snap, Instant::now()) {
+                                let _ = alert_tx.try_send(event);
+                            }
+                        }
+                    }
+                }
+            });
         }
 
         //  finding: hybrid mode bypasses `daemon.rs::Daemon::run()` so the
@@ -17103,6 +17169,7 @@ mod tests {
         am2_graded_throttle_target_mhz,
         am2_hb_reset_attempt_budget,
         am2_hybrid_reconstruct_rolled_version,
+        am2_hybrid_temp_or_missing,
         am2_mid_run_nonce_stall_timeout,
         am2_mid_run_nonce_stalled,
         am2_nonce_recently_active,
@@ -17118,6 +17185,7 @@ mod tests {
         build_am2_freq_only_autotuner_config,
         compute_quiet_idle_pwm,
         detected_dspic_fw_allows_voltage_commands,
+        filter_am2_hybrid_temps,
         hybrid_build_header,
         parse_ablation_fields,
         parse_gpio_number_spec,
@@ -17353,6 +17421,54 @@ mod tests {
             Some((64.0, Am2ThermalSource::DspicBoardSensor))
         );
         assert_eq!(select_am2_thermal_sample(None, None), None);
+    }
+
+    #[test]
+    fn am2_hybrid_zero_celsius_is_classified_missing() {
+        assert_eq!(am2_hybrid_temp_or_missing(0.0), None);
+        assert_eq!(am2_hybrid_temp_or_missing(-0.1), None);
+        assert_eq!(am2_hybrid_temp_or_missing(f32::NEG_INFINITY), None);
+        assert!(am2_hybrid_temp_or_missing(f32::NAN).is_none());
+        assert_eq!(am2_hybrid_temp_or_missing(0.1), Some(0.1));
+        assert_eq!(am2_hybrid_temp_or_missing(48.5), Some(48.5));
+
+        assert_eq!(
+            filter_am2_hybrid_temps([Some(0.0), Some(48.5), Some(-5.0), None]),
+            [None, Some(48.5), None, None]
+        );
+        assert_eq!(select_am2_thermal_sample(Some(0.0), None), None);
+        assert_eq!(
+            select_am2_thermal_sample(Some(0.0), Some(61.0)),
+            Some((61.0, Am2ThermalSource::XadcSocDie))
+        );
+        assert_eq!(
+            select_am2_thermal_sample(Some(48.5), Some(0.0)),
+            Some((48.5, Am2ThermalSource::DspicBoardSensor))
+        );
+
+        let mut cs = Am2SerialChainStats::new(0);
+        cs.set_temp(Some(0.0));
+        assert_eq!(cs.last_temp_c, None);
+        cs.set_temp(Some(52.0));
+        assert_eq!(cs.last_temp_c, Some(52.0));
+        cs.set_temp(Some(0.0));
+        assert_eq!(
+            cs.last_temp_c,
+            Some(52.0),
+            "a 0.0 sample must not clobber last-good as a PID input"
+        );
+    }
+
+    #[test]
+    fn hybrid_run_wires_mining_alert_monitor() {
+        let src = include_str!("s19j_hybrid_mining.rs");
+        let run_idx = src.find("pub async fn run(&mut self)").expect("hybrid run");
+        let monitor_idx = src
+            .find("MiningAlertMonitor::new()")
+            .expect("hybrid run must construct MiningAlertMonitor");
+        assert!(monitor_idx > run_idx);
+        assert!(src.contains("spawn_alert_event_dispatcher"));
+        assert!(src.contains("mining_health_snapshot_from_state"));
     }
 
     #[test]
@@ -19142,7 +19258,8 @@ fan_max_pwm = 28
         // Expected-NPS scales linearly with the enumerated chip count
         // (894 slots/chip, the W6.8 BM1362 geometry) Ã¢â‚¬â€ proves the
         // chain estimate is chip-count-aware, not fixed-126.
-        let per_chip = dcentrald_autotuner::chip_geometry::expected_nps_for_chip(0x1362, 500, 256);
+        let per_chip = dcentrald_autotuner::chip_geometry::expected_nps_for_chip(0x1362, 500, 256)
+            .expect("BM1362 geometry");
         assert!(per_chip > 0.0);
         let nps_28 = per_chip * 28.0;
         let nps_110 = per_chip * 110.0;

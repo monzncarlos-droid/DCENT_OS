@@ -15,7 +15,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use dcentrald_bridge::{BridgeClient, HeartbeatOutcome, HeartbeatRequest, UnitSecret};
+use dcentrald_bridge::{BridgeClient, BridgeError, HeartbeatOutcome, HeartbeatRequest, UnitSecret};
 
 /// What the mock captured from a heartbeat POST — the RAW body bytes and the two
 /// freshness/signature headers, so the test can act as the bridge VERIFIER.
@@ -205,7 +205,7 @@ async fn full_pair_heartbeat_telemetry_flow() {
         ..Default::default()
     };
     let hb = client
-        .heartbeat(&hb_req, Some(&secret))
+        .heartbeat(&hb_req, &secret)
         .await
         .expect("heartbeat ok");
     assert_eq!(hb, HeartbeatOutcome::Ok);
@@ -250,6 +250,54 @@ async fn full_pair_heartbeat_telemetry_flow() {
 }
 
 #[tokio::test]
+async fn health_probe_refuses_server_error_and_product_mismatch() {
+    let cases = [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok": false, "error": "restarting"}),
+            "http",
+        ),
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "version": "0.2.0",
+                "product": "not-dcent-pack"
+            }),
+            "identity",
+        ),
+    ];
+
+    for (status, body, expected_kind) in cases {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind ephemeral port");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let app = Router::new().route(
+            "/api/v1/health",
+            get(move || {
+                let body = body.clone();
+                async move { (status, Json(body)) }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let err = BridgeClient::new(&base)
+            .expect("client")
+            .probe_health()
+            .await
+            .expect_err("non-genuine health must fail closed");
+        match (expected_kind, err) {
+            ("http", BridgeError::Http { status: 503, .. }) => {}
+            ("identity", BridgeError::Other(_)) => {}
+            (kind, other) => panic!("unexpected {kind} probe error: {other}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn heartbeat_paired_false_signals_repair() {
     // A separate mock that always returns paired:false.
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -272,7 +320,10 @@ async fn heartbeat_paired_false_signals_repair() {
         mode: "idle".into(),
         ..Default::default()
     };
-    // Unsigned path (secret None) preserves today's behavior — staged rollout.
-    let hb = client.heartbeat(&hb_req, None).await.expect("heartbeat ok");
+    // Even the re-pair signal is accepted only through the signed client path.
+    let hb = client
+        .heartbeat(&hb_req, &UnitSecret::from_bytes([0x42; 32]))
+        .await
+        .expect("heartbeat ok");
     assert_eq!(hb, HeartbeatOutcome::NeedsRepair);
 }

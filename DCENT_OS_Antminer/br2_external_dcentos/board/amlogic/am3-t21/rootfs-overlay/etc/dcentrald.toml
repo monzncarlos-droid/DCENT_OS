@@ -1,19 +1,20 @@
 # DCENT_OS dcentrald config — Antminer T21 Amlogic (am3-aml-t21)
 # D-Central Technologies — Phase 4B scaffold (2026-05-15)
 #
-# T21 is the second NoPic Amlogic carrier (lower-tier sibling of S21).
-# Same A113D SoC, same 4.9.113 kernel, same BM1368 ASIC family. The
-# difference vs S21 is per-chain chip count (76 vs 108) and rated
-# hashrate / power envelope.
+# This is a disabled Amlogic T21 packaging scaffold. Held stock firmware proves
+# Amlogic, Zynq7007, and CV controller variants for the BHB6870X family. Held
+# VNish/ePIC desk registries consistently describe BM1368 T21 hashboards as
+# three 108-chip chains; controller-specific PIC, PSU, and reset topology is
+# still unresolved.
 #
 # Platform identity:
 #   /etc/dcentos-platform           = am3-aml-t21
 #   /etc/dcentos/board_family       = am3
 #   /etc/dcentos/board_target       = am3-t21
 #
-# Status: NO LIVE UNIT yet. Mining disabled by default. NoPic
-# voltage-control path inherits from S21 (TAS5782M DAC, kernel-managed)
-# — `S21AmlogicNoPic` sentinel in `dcentrald-silicon-profiles::pics`.
+# Status: NO LIVE UNIT yet. Mining is disabled and runtime admission is
+# management-only. S21 NoPic/TAS5782M behavior is not T21 evidence and must not
+# authorize voltage or rail control for this target.
 #
 # Override order: /data/dcentrald.toml > /etc/dcentrald.toml. Operator
 # customizations belong in /data/ (survives sysupgrade).
@@ -24,9 +25,11 @@ log_level = "info"
 
 [mining]
 enabled = false
-chip = "BM1368"
-chips_per_chain = 76
-chains = 3
+# These are schema-valid desk-evidence hints, not release-authoritative
+# geometry. BHB68701/BHB68703 records agree on 108 chips per chain, but runtime
+# admission remains management-only pending raw constructor or live proof.
+serial_chip_type = "BM1368"
+serial_chip_count = 108
 frequency_mhz = 525
 voltage_mv = 13550
 model = "t21"
@@ -36,6 +39,7 @@ version_rolling = true
 
 [platform]
 target = "am3-aml-t21"
+board_target = "am3-t21"
 
 [pool]
 url = ""
@@ -43,18 +47,15 @@ worker = ""
 password = "d=1"
 
 [thermal]
-target_temp_c = 60.0
-hot_temp_c = 70.0
-dangerous_temp_c = 80.0
-die_dangerous_c = 105.0
-cooldown_temp_c = 45.0
-min_fan_rpm = 2000
+target_temp_c = 60
+hot_temp_c = 70
+dangerous_temp_c = 80
 fan_max_pwm = 30
 fan_min_pwm = 10
 
 [psu]
-# APW12-class (PMBus) plus GPIO 437 rail gate. Same APW12 SMBus driver
-# as S21 (`dcentrald-hal::psu_apw12_smbus`).
+# Inactive S21-derived placeholder. VNish separately reports via-PIC voltage
+# control and APW171215a/APW380 with PSU-v2; their exact binding is unresolved.
 model = "APW12"
 power_target_w = 1500
 power_step_w = 300
@@ -71,9 +72,9 @@ model = "APW12"
 voltage_v = 14.0
 
 [hashboard]
-# T21 ships S21-class hashboards. NoPic — voltage rail is TAS5782M
-# DAC at I²C 0x49/0x4A/0x4B (bus 0), kernel-managed via DTB.
-eeprom_parser = "bhb42xxx"
+# No parser family is claimed. Held T21 board identities are BHB68701/BHB68703;
+# exact EEPROM and PIC routing remain unresolved, and mining stays disabled.
+eeprom_parser = "auto"
 
 [api]
 cgminer_port = 4028
@@ -101,10 +102,9 @@ fallback_password = "x"
 cycle_duration_s = 3600
 
 [watchdog]
-# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
-# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
-# hang would otherwise leave the boards energized indefinitely (thermal risk on a
-# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
+# Autonomous crash-recovery for the Amlogic scaffold. No T21 PIC/dsPIC
+# heartbeat contract is proven, so software must not assume a hardware backstop.
+# The kicker opens /dev/watchdog AFTER hardware init (the
 # bring-up window can't trip it) and degrades gracefully (warns + continues) if
 # the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
 # zynq/am1 production config; restores the struct default (enabled=true) these

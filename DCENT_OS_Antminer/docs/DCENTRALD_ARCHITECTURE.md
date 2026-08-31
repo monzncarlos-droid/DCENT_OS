@@ -1935,7 +1935,8 @@ Action:    1. Disable voltage on ALL chains (PIC ENABLE_VOLTAGE = 0)
 ```
 
 For native NoPic, missing or dangerous temperature and checked fan-actuation
-failure immediately request checked GPIO437-low safe-off. PWM readback proves a
+failure immediately request the board-scoped checked rail safe state. On
+am3-s19k, GPIO437 is active-LOW, so SafeOff is checked HIGH (`1=OFF`). PWM readback proves a
 command path, not airflow. Fan blast is not the home-mining emergency policy;
 hash power is cut first and the default safety cap remains PWM 30.
 
@@ -2216,7 +2217,7 @@ enum TestType {
     PsuProbe,          // PSU PMBus readings
     FpgaStatus,        // FPGA register status
     AsicCommTest,      // ASIC communication test
-    I2cScan,           // I2C bus scan
+    I2cScan,           // Passive serialized-owner endpoint observations (legacy name)
 }
 ```
 
@@ -2476,14 +2477,15 @@ ASIC Comm Test (/api/diagnostics/troubleshoot/asic-comm):
   Output: Per-chain communication report
 
 I2C Scan (/api/diagnostics/troubleshoot/i2c-scan):
-  - Scan /dev/i2c-0 addresses 0x08-0x77
-  - Identify known devices (PIC at 0x55-0x57, TMP75 at 0x48-0x4F, etc.)
-  - Report: list of responding addresses with device type
-  Output: { devices: Vec<{ addr, addr_hex, device_type, description }> }
-  NOTE: On S9 with no 12V PSU to hash boards, only PICs (0x55-0x57) respond.
-  No TMP75 temp sensors appear on the I2C bus — they are powered by the
-  DC-DC converters which require 12V input. Temperature sensing depends on
-  hash board power being present.
+  - Legacy URL/name; performs no scan, probe, or new I2C transaction
+  - Clones positive endpoint observations retained by serialized runtime owners
+  - Reports bus/address, last successful operation, conservative protocol role,
+    observation timestamp/age, and service-lifetime success count
+  - Unlisted addresses are unknown, not absent; operation role is not a device
+    model identity
+  Output fixes scan_performed=false, absence_inference_authorized=false, and
+  coverage=successful_runtime_operations_only. With no positive retained
+  observation it publishes explicit Unavailable, not an empty-bus claim.
 ```
 
 ### Report Generation

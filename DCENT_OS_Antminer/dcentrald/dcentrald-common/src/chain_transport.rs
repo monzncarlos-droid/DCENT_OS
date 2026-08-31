@@ -1777,35 +1777,37 @@ mod tests {
     }
 
     #[test]
-    fn serial_mining_reset_asic_baud_uses_pure_hot_start_plan() {
+    fn serial_mining_native_bm1366_is_cold_only_not_hot_start_reinit() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let src = std::fs::read_to_string(root.join("dcentrald/src/serial_mining.rs"))
             .expect("serial_mining");
-        let start = src.find("fn reset_asic_baud(").expect("reset_asic_baud");
-        let body = &src[start..start.saturating_add(2200)];
+        let start = src
+            .find("fn init_bm1366_chain(")
+            .expect("native BM1366 cold executor");
+        let end = src[start..]
+            .find("fn init_bm1370_chain(")
+            .map(|offset| start + offset)
+            .expect("native BM1366 executor boundary");
+        let body = &src[start..end];
         assert!(
-            body.contains("plan_hot_start_baud_wake_ladder_from_fast_baud")
-                || body.contains("plan_hot_start_baud_wake_ladder"),
-            "reset_asic_baud must use pure baud-wake ladder"
+            body.contains("serial: &ValidatedSerialBackend")
+                && body.contains("S19kBm1366NativeExecutionProgram")
+                && body.contains("fn init_bm1366_chains("),
+            "native BM1366 cold executor must use validated multi-UART typed custody"
         );
         assert!(
-            body.contains("plan_hot_start_dual_spray_ops"),
-            "reset_asic_baud must execute pure dual-spray plan (BM1387-form + BM1397+)"
+            !body.contains("reset_asic_baud(")
+                && !body.contains("plan_hot_start")
+                && !body.contains("HotStartCommandFamily")
+                && !body.contains("SerialChainBackend::open("),
+            "native BM1366 cold executor must not retain hot-reinit or raw-UART escape paths"
         );
+        let pre_ladder = body
+            .find("native_program.pre_baud_commands")
+            .expect("exact cold pre-baud ladder");
         assert!(
-            body.contains("HotStartCommandFamily::Bm1387Form")
-                && body.contains("HotStartCommandFamily::Bm1397Plus"),
-            "reset_asic_baud must family-dispatch dual-spray (not open-code one half)"
-        );
-        // Must not re-open-code BM1387-form half outside the pure plan dispatch.
-        assert!(
-            !body.contains("HOT_START_MISC_CTRL_BAUD_RESET")
-                || body.contains("plan_hot_start_dual_spray"),
-            "MiscCtrl baud-reset value must come from pure dual-spray plan"
-        );
-        assert!(
-            !body.contains("1_562_500") || body.contains("plan_hot_start"),
-            "1.5625M intermediate must come from pure planner, not open-coded alone"
+            !body[..pre_ladder].contains("send_get_address_bm1397plus"),
+            "cold BM1366 must not demand assigned-address uniqueness before SetAddress"
         );
     }
 

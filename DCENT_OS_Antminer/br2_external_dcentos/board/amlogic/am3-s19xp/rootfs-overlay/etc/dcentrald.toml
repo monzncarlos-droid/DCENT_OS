@@ -1,4 +1,5 @@
-# Package-only A113D identity. Hardware install and mining remain denied.
+# Package-only A113D identity. Runtime, hardware install, and mining are denied;
+# route/geometry values below are non-authorizing identity observations.
 [general]
 hostname = "dcentos-s19xp"
 log_level = "info"
@@ -12,6 +13,16 @@ chains = 3
 
 [platform]
 target = "am3-aml-s19xp"
+board_target = "am3-s19xp"
+
+[watchdog]
+enabled = false
+
+[hash_on_disconnect]
+enabled = false
+
+[autotuner]
+enabled = false
 
 [pool]
 url = ""

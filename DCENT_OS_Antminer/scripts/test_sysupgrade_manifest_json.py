@@ -17,6 +17,7 @@ from sysupgrade_manifest_json import (  # noqa: E402
     admit_manifest,
     compare_versions,
     read_version_file,
+    require_package_authority,
     require_payload_binding,
 )
 
@@ -143,6 +144,61 @@ class ManifestAdmissionTests(unittest.TestCase):
                 10,
                 "1" * 64,
             )
+
+    def test_installable_package_authority_requires_exact_boolean(self) -> None:
+        manifest = {
+            "board": "am3-s21",
+            "board_target": "am3-s21",
+            "installable": True,
+            "toolbox": {"install_mode": "target_sysupgrade"},
+        }
+        require_package_authority(manifest, "am3-s21")
+        manifest["installable"] = "true"
+        with self.assertRaisesRegex(AdmissionError, "JSON boolean"):
+            require_package_authority(manifest, "am3-s21")
+
+    def test_amlogic_package_only_denial_is_exact_and_non_dispatching(self) -> None:
+        toolbox = {
+            "install_command": None,
+            "update_command": None,
+            "upload_endpoint": None,
+            "board_target_header": None,
+            "requires_inactive_slot": False,
+            "install_mode": "package_only_denied",
+            "target_side_sysupgrade": False,
+        }
+        for board in ("am3-s19xp", "am3-s19jxp", "am3-s21xp", "am3-t21"):
+            manifest = {
+                "board": board,
+                "board_target": board,
+                "installable": False,
+                "toolbox": toolbox,
+            }
+            require_package_authority(manifest, board)
+
+            for field, bad_value in (
+                ("install_command", f"dcent install 192.0.2.1 -f {board}.tar"),
+                ("update_command", f"dcent ota update-fleet 192.0.2.1 -f {board}.tar"),
+                ("upload_endpoint", "/cgi-bin/upgrade.cgi"),
+                ("board_target_header", "X-DCENT-Board-Target"),
+                ("requires_inactive_slot", True),
+                ("install_mode", "host_driven_rootfs_window_lab"),
+                ("target_side_sysupgrade", True),
+            ):
+                with self.subTest(board=board, field=field):
+                    tampered = {**manifest, "toolbox": {**toolbox, field: bad_value}}
+                    with self.assertRaisesRegex(AdmissionError, f"toolbox.{field}"):
+                        require_package_authority(tampered, board)
+
+    def test_noninstallable_package_is_not_a_generic_authority_lane(self) -> None:
+        manifest = {
+            "board": "am3-s21",
+            "board_target": "am3-s21",
+            "installable": False,
+            "toolbox": {"install_mode": "package_only_denied"},
+        }
+        with self.assertRaisesRegex(AdmissionError, "not admitted"):
+            require_package_authority(manifest, "am3-s21")
 
 
 class VersionAdmissionTests(unittest.TestCase):

@@ -55,6 +55,16 @@ pub(crate) fn default_model_for_build() -> BitAxeModel {
         BitAxeModel::NerdOctaxePlus
     } else if cfg!(feature = "nerdoctaxe-gamma") {
         BitAxeModel::NerdOctaxeGamma
+    } else if cfg!(feature = "nerdqx") {
+        BitAxeModel::NerdQX
+    } else if cfg!(feature = "nerdhaxe-gamma") {
+        BitAxeModel::NerdHaxeGamma
+    } else if cfg!(feature = "nerdeko") {
+        BitAxeModel::NerdEko
+    } else if cfg!(feature = "q1370") {
+        BitAxeModel::Q1370
+    } else if cfg!(feature = "q1373") {
+        BitAxeModel::Q1373
     } else if cfg!(feature = "dcent-axe-bm1397") {
         BitAxeModel::DcentAxeBm1397
     } else if cfg!(feature = "dcent-axe-quad-bm1397") {
@@ -958,8 +968,10 @@ fn default_mqtt_publish_interval_s() -> u16 {
 ///
 /// When `enabled`, the firmware connects (outbound) to the configured broker and
 /// publishes HA MQTT discovery configs + periodic telemetry (see `mqtt_ha.rs` for
-/// the payload schema and `mqtt.rs` for the transport). MQTT is publish-only and
-/// fail-soft — it NEVER affects mining or the safety paths.
+/// the payload schema and `mqtt.rs` for the transport). Telemetry is publish-only
+/// and fail-soft. The separately opt-in command surface is bounded, clamped, and
+/// deployment-policy-gated before it can update autotuner intent; board/thermal
+/// safety remains authoritative.
 ///
 /// `password` at-rest threat-model note mirrors `wifi_password`/`stratum.password`:
 /// it is persisted in cleartext in the default (unencrypted) NVS partition. The

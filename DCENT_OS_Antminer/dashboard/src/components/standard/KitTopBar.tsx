@@ -175,6 +175,15 @@ export function KitTopBar(props: KitTopBarProps) {
         >
           Documentation
         </a>
+        <a
+          className="topbar-link"
+          href="https://d-central.tech/fund/go?source=dcent_os&placement=topbar"
+          target="_blank"
+          rel="noopener noreferrer"
+          data-tip="Keep this open firmware alive — Bitcoin or card."
+        >
+          Fund
+        </a>
         <span className="topbar-divider" aria-hidden="true" />
         <span className="topbar-refresh" aria-label="Live telemetry">
           <TopbarClock />

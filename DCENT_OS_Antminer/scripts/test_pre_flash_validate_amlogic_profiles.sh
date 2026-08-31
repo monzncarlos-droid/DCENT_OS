@@ -7,6 +7,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 VALIDATOR="$SCRIPT_DIR/pre_flash_validate.sh"
 EXTRACTOR="$SCRIPT_DIR/build_amlogic_native_install.sh"
+PYTHON3=${PYTHON3:-python3}
 TMPDIR_T=$(mktemp -d 2>/dev/null || echo "/tmp/dcent-amlogic-profiles.$$")
 rm -rf "$TMPDIR_T"
 mkdir -p "$TMPDIR_T"
@@ -25,6 +26,11 @@ make_package() {
     board=$1
     tar_name=$2
     installable=${3:-true}
+    if [ "$installable" = "false" ]; then
+        toolbox_fields='"install_command": null, "update_command": null, "upload_endpoint": null, "board_target_header": null, "requires_inactive_slot": false, "install_mode": "package_only_denied", "target_side_sysupgrade": false'
+    else
+        toolbox_fields='"install_command": "dcent install <ip> -f <artifact> --artifact-dir <restore_verified_dir>", "update_command": "dcent ota update-fleet <ip> -f <artifact> --artifact-dir <restore_verified_dir>", "upload_endpoint": "/cgi-bin/upgrade.cgi", "board_target_header": "X-DCENT-Board-Target", "requires_inactive_slot": false, "install_mode": "target_sysupgrade", "target_side_sysupgrade": true'
+    fi
     pkgdir="$TMPDIR_T/sysupgrade-$board"
 
     rm -rf "$pkgdir"
@@ -52,6 +58,7 @@ make_package() {
   "board_target": "$board",
   "version": "0.0.0-test",
   "status": "lab_unsigned",
+  "toolbox": { $toolbox_fields },
   "payloads": {
     "kernel": { "path": "sysupgrade-$board/kernel", "size": $kernel_size, "sha256": "$kernel_sha" },
     "rootfs": { "path": "sysupgrade-$board/root", "size": $root_size, "sha256": "$root_sha" },
@@ -74,6 +81,11 @@ check_profile() {
         sh "$VALIDATOR" --package-only "$TMPDIR_T/$tar_name" "$board" >/dev/null \
         || fail "$board package profile was rejected"
     pass "$board package profile validates offline"
+    DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab_unsigned \
+        DCENT_REQUIRE_INSTALLABLE_PACKAGE=1 \
+        sh "$VALIDATOR" --package-only "$TMPDIR_T/$tar_name" "$board" >/dev/null \
+        || fail "$board installable package was rejected by the writer-authority gate"
+    pass "$board installable package satisfies the writer-authority gate"
 
     DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab_unsigned \
         bash "$EXTRACTOR" --variant "$variant" --output-dir "$TMPDIR_T" --lab-unsigned >/dev/null \
@@ -87,12 +99,49 @@ check_profile() {
 check_profile am3-s19jpro-aml s19jpro-aml dcentos-sysupgrade-am3-s19jpro-aml.tar dcentos-amlogic-s19jpro-aml.bin
 check_profile am3-s19jproplus s19jproplus dcentos-sysupgrade-am3-s19jproplus.tar dcentos-amlogic-s19jproplus.bin
 check_profile am3-s19k s19kpro dcentos-sysupgrade-am3-s19kpro.tar dcentos-amlogic-s19kpro.bin
-check_profile am3-s19xp s19xp dcentos-sysupgrade-am3-s19xp.tar dcentos-amlogic-s19xp.bin
-check_profile am3-s19jxp s19jxp dcentos-sysupgrade-am3-s19jxp.tar dcentos-amlogic-s19jxp.bin
 check_profile am3-s21 s21 dcentos-sysupgrade-am3-s21.tar dcentos-amlogic-s21.bin
 check_profile am3-s21pro s21pro dcentos-sysupgrade-am3-s21pro.tar dcentos-amlogic-s21pro.bin
-check_profile am3-s21xp s21xp dcentos-sysupgrade-am3-s21xp.tar dcentos-amlogic-s21xp.bin
-check_profile am3-t21 t21 dcentos-sysupgrade-am3-t21.tar dcentos-amlogic-t21.bin
+
+make_package am3-t21 dcentos-sysupgrade-am3-t21.tar false
+make_package am3-s21xp dcentos-sysupgrade-am3-s21xp.tar false
+make_package am3-s19xp dcentos-sysupgrade-am3-s19xp.tar false
+make_package am3-s19jxp dcentos-sysupgrade-am3-s19jxp.tar false
+printf '#!/bin/sh\nexit 97\n' > "$TMPDIR_T/poison-am3-geometry.sh"
+for package_only_case in \
+    'am3-s19xp:s19xp:dcentos-sysupgrade-am3-s19xp.tar' \
+    'am3-s19jxp:s19jxp:dcentos-sysupgrade-am3-s19jxp.tar' \
+    'am3-s21xp:s21xp:dcentos-sysupgrade-am3-s21xp.tar'
+do
+    board=${package_only_case%%:*}
+    remainder=${package_only_case#*:}
+    variant=${remainder%%:*}
+    tar_name=${remainder#*:}
+    DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab_unsigned \
+        AM3_GEOMETRY_HELPER="$TMPDIR_T/poison-am3-geometry.sh" \
+        sh "$VALIDATOR" --package-only "$TMPDIR_T/$tar_name" "$board" >/dev/null \
+        || fail "$board package-only profile was rejected"
+    pass "$board non-installable package structure validates without importing flash geometry"
+    if bash "$EXTRACTOR" --variant "$variant" --output-dir "$TMPDIR_T" --lab-unsigned >/dev/null 2>&1; then
+        fail "$variant native-install extraction was unexpectedly admitted"
+    fi
+    pass "$variant native-install extraction is refused"
+done
+DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab_unsigned \
+    AM3_GEOMETRY_HELPER="$TMPDIR_T/poison-am3-geometry.sh" \
+    sh "$VALIDATOR" --package-only "$TMPDIR_T/dcentos-sysupgrade-am3-t21.tar" am3-t21 >/dev/null \
+    || fail "am3-t21 package-only profile was rejected"
+pass "am3-t21 non-installable package structure validates without importing flash geometry"
+if DCENT_ALLOW_UNSIGNED_SYSUPGRADE=1 DCENT_PACKAGE_STATUS=lab_unsigned \
+    DCENT_REQUIRE_INSTALLABLE_PACKAGE=1 \
+    sh "$VALIDATOR" --package-only "$TMPDIR_T/dcentos-sysupgrade-am3-t21.tar" am3-t21 >/dev/null 2>&1; then
+    fail "am3-t21 inspection-only package was admitted as writer authority"
+fi
+pass "inspection-only package is refused when a writer requires installable=true"
+if bash "$EXTRACTOR" --variant t21 --output-dir "$TMPDIR_T" --lab-unsigned >/dev/null 2>&1; then
+    fail "t21 native-install extraction was unexpectedly admitted"
+else
+    pass "t21 remains package-validation-only with no native-install extraction"
+fi
 
 check_output_alias_refused() {
     alias_kind=$1
@@ -118,7 +167,7 @@ check_output_alias_refused symlink
 check_output_alias_refused hardlink
 
 make_package am3-s21 swapped-hashes.tar
-python3 - "$TMPDIR_T/sysupgrade-am3-s21/MANIFEST.json" <<'PY'
+"$PYTHON3" - "$TMPDIR_T/sysupgrade-am3-s21/MANIFEST.json" <<'PY'
 import json
 import pathlib
 import sys

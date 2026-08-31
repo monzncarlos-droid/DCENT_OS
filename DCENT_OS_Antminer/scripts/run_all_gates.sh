@@ -108,11 +108,12 @@ run_gate "offline-gates" sh "$SCRIPT_DIR/ci_offline_gates.sh"
 #    dcentrald-asic is Linux/WSL-host-testable and carries the EEPROM denylist,
 #    recovery double-gate, and BIP320 behavioral pins.
 #    The fabric-lease crate is Linux-host-testable and carries the actual
-#    subprocess/SIGKILL ownership proof. pic-recovery is intentionally outside
-#    default-members, so it must be named explicitly here or its diagnostic
-#    boundary can silently stop compiling.
+#    subprocess/SIGKILL ownership proof. pic-recovery and the S19k stage-1
+#    authorizer are intentionally outside default-members, so they must be
+#    named explicitly here or their release boundaries can silently stop
+#    compiling.
 if configure_cargo; then
-    run_gate "rust-host-tests" sh -c "cd '$DCENTOS_DIR/dcentrald' && for c in dcentrald-api-types dcentrald-common dcentrald-stratum dcentrald-silicon-profiles dcentrald-asic dcentrald-fabric-lease; do echo \"[host-test] \$c\"; $CARGO_RUN test -p \"\$c\" --quiet || exit 1; done && echo '[host-test] pic-recovery (explicit diagnostic boundary)' && $CARGO_RUN test -p pic-recovery --quiet && echo '[host-test] dcentrald-thermal (--no-default-features, HAL-free)' && $CARGO_RUN test -p dcentrald-thermal --no-default-features --quiet"
+    run_gate "rust-host-tests" sh -c "cd '$DCENTOS_DIR/dcentrald' && for c in dcentrald-api-types dcentrald-common dcentrald-stratum dcentrald-silicon-profiles dcentrald-asic dcentrald-fabric-lease dcentrald-api; do echo \"[host-test] \$c\"; if [ \"\$c\" = dcentrald-api ]; then $CARGO_RUN test -p \"\$c\" --tests --quiet || exit 1; else $CARGO_RUN test -p \"\$c\" --quiet || exit 1; fi; done && echo '[host-test] pic-recovery (explicit diagnostic boundary)' && $CARGO_RUN test -p pic-recovery --quiet && echo '[host-test] s19k-stage1-authorizer (explicit transition boundary)' && $CARGO_RUN test -p s19k-stage1-authorizer --quiet && echo '[host-test] dcentrald-thermal (--no-default-features, HAL-free)' && $CARGO_RUN test -p dcentrald-thermal --no-default-features --quiet"
     run_gate "rust-input-clippy" sh -c "cd '$DCENTOS_DIR/dcentrald' && $CARGO_RUN clippy --no-deps -p dcentrald-stratum --lib -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic && $CARGO_RUN clippy --no-deps -p dcentrald-asic --lib -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic"
 else
     run_gate "rust-host-tests" false

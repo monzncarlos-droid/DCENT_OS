@@ -84,6 +84,18 @@ dcent_zynq_geometry_select()
             ZYNQ_KERNEL_MAX_BYTES=$AM2_ZYNQ_KERNEL_MAX_BYTES
             ZYNQ_ROOTFS_MAX_BYTES=$AM2_ZYNQ_ROOTFS_MAX_BYTES
             ;;
+        # 2026-08-27 unlock armada (B2): the remaining BM1397 17-series targets
+        # (S17+ / T17 / T17+) share the exact am2-s17p control board and NAND
+        # plan -- A2 section 3: the ONE held Braiins am2-s17 image + bitstream
+        # serves S17/S17 Pro/S17+/T17/T17+ with no per-SKU DTB/bitstream
+        # variant, so the byte windows are the same physical 7007S geometry.
+        # Experimental maturity is inherited, not independently proven per SKU.
+        am2-s17plus|am2-t17|am2-t17plus)
+            DCENT_ZYNQ_GEOMETRY_PROFILE=am2-s17p
+            DCENT_ZYNQ_GEOMETRY_MATURITY=experimental
+            ZYNQ_KERNEL_MAX_BYTES=$AM2_ZYNQ_KERNEL_MAX_BYTES
+            ZYNQ_ROOTFS_MAX_BYTES=$AM2_ZYNQ_ROOTFS_MAX_BYTES
+            ;;
         *)
             dcent_zynq_geometry_fail "unsupported Zynq board identity: $1"
             return 1

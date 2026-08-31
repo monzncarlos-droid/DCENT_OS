@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# DCENTos post-image script - am3-s21xp (S21 Amlogic NoPic variant)
+# DCENTos post-image script - am3-s21xp evidence/package target
 #
 # Produces dcentos-sysupgrade-am3-s21xp.tar with sysupgrade-am3-s21xp/.
 #
@@ -93,7 +93,10 @@ echo "  SHA256: ${ROOTFS_SHA256}"
 PROJECT_ROOT="$(cd "${BR2_EXTERNAL_DCENTOS_PATH}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
 . "${PROJECT_ROOT}/scripts/lib/sysupgrade_package_common.sh"
-. "${PROJECT_ROOT}/scripts/lib/am3_geometry.sh"
+S21XP_PACKAGE_ROOTFS_MAX_BYTES=41943040
+
+# Build-resource ceiling only. This is not an S21 XP MTD size, offset, or
+# writable window and must never be imported by an installer or recovery tool.
 
 case "$ROOTFS_SIZE" in
     ''|*[!0-9]*)
@@ -101,11 +104,11 @@ case "$ROOTFS_SIZE" in
         exit 1
         ;;
 esac
-if [ "$ROOTFS_SIZE" -gt "$DCENT_AM3_ROOTFS_WINDOW_DEC" ]; then
-    echo "ERROR: rootfs uImage exceeds Amlogic rootfs window: ${ROOTFS_SIZE} > ${DCENT_AM3_ROOTFS_WINDOW_DEC}" >&2
+if [ "$ROOTFS_SIZE" -gt "$S21XP_PACKAGE_ROOTFS_MAX_BYTES" ]; then
+    echo "ERROR: rootfs uImage exceeds the package-format ceiling: ${ROOTFS_SIZE} > ${S21XP_PACKAGE_ROOTFS_MAX_BYTES}" >&2
     exit 1
 fi
-echo "Rootfs window: ${ROOTFS_SIZE} <= ${DCENT_AM3_ROOTFS_WINDOW_DEC} bytes"
+echo "Package rootfs ceiling: ${ROOTFS_SIZE} <= ${S21XP_PACKAGE_ROOTFS_MAX_BYTES} bytes"
 
 read_first_nonempty_line() {
     sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$1"
@@ -172,7 +175,7 @@ DCENT_OS
 D-Central Technologies
 Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board: ${BOARD_NAME}
-Kernel: Amlogic 4.9.113 (am3-aml / S21 NoPic)
+Kernel: Amlogic 4.9.113 (am3-aml / S21 XP evidence target)
 Rootfs: DCENTos (Buildroot, uImage-wrapped gzip CPIO)
 Install contract: host-driven rootfs-window only; target-side AM3 sysupgrade unsupported
 EOF
@@ -213,8 +216,8 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>",
-    "update_command": "dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>",
+    "install_command": null,
+    "update_command": null,
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": false
@@ -222,16 +225,17 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
 }
 EOF
 
-# Final manifest/signature rewrite through shared AM2/AM3 helper. AM3 packages
-# are sysupgrade-shaped artifacts for host-driven rootfs-window tooling only.
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>"
-# OTA fleet form of the SAME guarded route (toolbox 2026-08-15 fleet OTA rail
-# accepts amlogic_rootfs_window; same gates; write+readback, NO auto-reboot).
-DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-s21xp.tar --artifact-dir <restore_verified_dir>"
+# Final manifest/signature rewrite through the shared helper. This is an inner
+# packaging-validation artifact only: the exact production route contradicts
+# the inherited S21 UART/PIC composition, and no S21 XP storage, safe lifecycle,
+# or recovery contract has been admitted.
+DCENT_TOOLBOX_INSTALL_COMMAND=""
+DCENT_TOOLBOX_UPDATE_COMMAND=""
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
-DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
+DCENT_TOOLBOX_INSTALL_MODE=package_only_denied
 DCENT_TARGET_SIDE_SYSUPGRADE=false
-DCENT_PACKAGE_STATUS=host_driven_only
+DCENT_PACKAGE_INSTALLABLE=false
+DCENT_PACKAGE_STATUS=unvalidated_package_only
 dcent_stage_release_key
 dcent_write_sysupgrade_manifest
 dcent_sign_sysupgrade_manifest
@@ -251,7 +255,7 @@ tar tf "$OUTPUT_TAR" | sed 's/^/  /'
 cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
 === DCENTos am3-s21xp Build Info ===
 Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-Board:      ${BOARD_NAME} (S21 Amlogic am3-aml NoPic variant)
+Board:      ${BOARD_NAME} (S21 XP Amlogic management-only evidence target)
 Board family: ${BOARD_FAMILY}
 
 Sysupgrade tarball:

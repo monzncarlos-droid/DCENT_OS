@@ -13,7 +13,8 @@
 //! (`compute_hot_gradient` L189-200, `compute_mean_std` L203-221,
 //! `compute_hot_zscore` L225-241, `compute_slot_avg_nonce` L244-250,
 //! `compute_nonce_deficit` L254-269). The math is byte-faithful to that
-//! source so the port stays verifiable against the original.
+//! source over its physical input domain. Invalid negative/non-finite nonce
+//! inputs are conservatively bounded so they cannot overflow or emit NaN.
 //!
 //! This crate is intentionally independent from HAL, async runtimes,
 //! sockets, the filesystem, and any miner hardware. It is reusable chip-
@@ -131,10 +132,15 @@ pub fn compute_mean_std(temps: &[i32]) -> (f32, f32) {
 /// returned capped at `3.0` ([`ZSCORE_UNIFORM_CAP`]) so a degenerate std
 /// cannot produce a divide-by-tiny blow-up; otherwise the standard
 /// `(temp - mean) / std` z-score is returned.
+/// Non-finite means/standard deviations and negative standard deviations are
+/// invalid statistics and conservatively return the existing `3.0` cap.
 ///
 /// Source: s16b fact **B06** — `compute_hot_zscore`
 /// (`whatsminer_chip_map/src/analysis.rs:225-241`).
 pub fn compute_hot_zscore(temp: i32, mean: f32, std: f32) -> f32 {
+    if !mean.is_finite() || !std.is_finite() || std < 0.0 {
+        return ZSCORE_UNIFORM_CAP;
+    }
     let temp_f = temp as f32;
     let deviation = temp_f - mean;
 
@@ -171,7 +177,9 @@ pub fn compute_cross_slot_zscore(temp: i32, cross_slot_samples: &[i32]) -> f32 {
 /// Average valid-nonce count across the chips in a slot.
 ///
 /// Returns `0.0` for an empty slot. Inputs are `i64` to match the
-/// WhatsMiner `Chip.nonce: i64` model (s16b fact **B01**).
+/// WhatsMiner `Chip.nonce: i64` model (s16b fact **B01**). Negative counters
+/// are invalid and conservatively treated as zero; accumulation uses `f64`
+/// directly so even adversarial `i64` inputs cannot overflow.
 ///
 /// Source: s16b fact **B07** — `compute_slot_avg_nonce`
 /// (`whatsminer_chip_map/src/analysis.rs:244-250`).
@@ -179,8 +187,8 @@ pub fn compute_slot_avg_nonce(chip_nonces: &[i64]) -> f64 {
     if chip_nonces.is_empty() {
         return 0.0;
     }
-    let total: i64 = chip_nonces.iter().sum();
-    total as f64 / chip_nonces.len() as f64
+    let total: f64 = chip_nonces.iter().map(|&nonce| nonce.max(0) as f64).sum();
+    total / chip_nonces.len() as f64
 }
 
 /// Nonce deficit: how far below the slot average (in percent) this chip's
@@ -188,18 +196,24 @@ pub fn compute_slot_avg_nonce(chip_nonces: &[i64]) -> f64 {
 ///
 /// `0.0` = at-or-above the slot average (no deficit); `100.0` = zero nonces
 /// while the slot average is non-zero. Returns `0.0` when the slot average
-/// is non-positive (no nonces on the slot — deficit is undefined).
+/// is non-positive (no nonces on the slot — deficit is undefined). Invalid
+/// negative chip counters and non-finite averages conservatively report the
+/// maximum `100.0` anomaly; every returned value is finite and in
+/// `0.0..=100.0`.
 ///
 /// Source: s16b fact **B07** — `compute_nonce_deficit`
 /// (`whatsminer_chip_map/src/analysis.rs:254-269`). Byte-faithful:
 /// `(slot_avg - chip_nonce) / slot_avg * 100`.
 pub fn compute_nonce_deficit(chip_nonce: i64, slot_avg: f64) -> f32 {
+    if !slot_avg.is_finite() {
+        return 100.0;
+    }
     if slot_avg <= 0.0 {
         // No nonces on slot, can't compute deficit.
         return 0.0;
     }
 
-    let chip_nonce_f = chip_nonce as f64;
+    let chip_nonce_f = chip_nonce.max(0) as f64;
     if chip_nonce_f >= slot_avg {
         // At or above average - no deficit.
         return 0.0;
@@ -207,7 +221,7 @@ pub fn compute_nonce_deficit(chip_nonce: i64, slot_avg: f64) -> f32 {
 
     // Deficit as percentage: (avg - chip) / avg * 100.
     let deficit = (slot_avg - chip_nonce_f) / slot_avg * 100.0;
-    deficit as f32
+    deficit.clamp(0.0, 100.0) as f32
 }
 
 /// Compute all three chip-health axes for one chip into a [`ChipAnalysis`].
@@ -313,6 +327,13 @@ mod tests {
         approx(compute_hot_zscore(70, 60.0, 0.0), 3.0); // dev 10 -> capped 3.0
     }
 
+    #[test]
+    fn zscore_invalid_statistics_are_finite_and_capped() {
+        approx(compute_hot_zscore(60, f32::NAN, 1.0), 3.0);
+        approx(compute_hot_zscore(60, 50.0, f32::INFINITY), 3.0);
+        approx(compute_hot_zscore(60, 50.0, -1.0), 3.0);
+    }
+
     // ---- compute_cross_slot_zscore (s16b B06 + B12) ----
 
     #[test]
@@ -346,6 +367,15 @@ mod tests {
         approx64(compute_slot_avg_nonce(&[0, 0, 0, 400]), 100.0);
     }
 
+    #[test]
+    fn slot_avg_nonce_cannot_overflow_and_clamps_negative_counters() {
+        approx64(
+            compute_slot_avg_nonce(&[i64::MAX, i64::MAX]),
+            i64::MAX as f64,
+        );
+        approx64(compute_slot_avg_nonce(&[-10, 10]), 5.0);
+    }
+
     // ---- compute_nonce_deficit (s16b B07) ----
 
     #[test]
@@ -368,6 +398,14 @@ mod tests {
         approx(compute_nonce_deficit(150, 200.0), 25.0);
         // dead chip (0 nonces) vs avg 200 -> 100%
         approx(compute_nonce_deficit(0, 200.0), 100.0);
+    }
+
+    #[test]
+    fn nonce_deficit_invalid_inputs_are_finite_and_conservative() {
+        approx(compute_nonce_deficit(-1, 200.0), 100.0);
+        approx(compute_nonce_deficit(100, f64::NAN), 100.0);
+        approx(compute_nonce_deficit(100, f64::INFINITY), 100.0);
+        assert!(compute_nonce_deficit(i64::MIN, 1.0).is_finite());
     }
 
     // ---- analyze_chip aggregator (s16b B08 + B09) ----

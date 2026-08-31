@@ -4144,6 +4144,12 @@ mod axe_conform_modular_js_guards {
         );
         assert!(sh_packager.contains("\"factoryFlashMap\""));
         assert!(ps_packager.contains("factoryFlashMap = @("));
+        for token in ["promotionReceiptId", "hardwareEvidenceIndexSha256"] {
+            assert!(
+                sh_packager.contains(token) && ps_packager.contains(token),
+                "both packagers must retain production-evidence trace field {token}"
+            );
+        }
         for token in [
             "bootloader",
             "partition-table",
@@ -4157,6 +4163,9 @@ mod axe_conform_modular_js_guards {
             "allow_internal_targets",
             "otaSignatureAlgorithm",
             "signatureAlgorithm",
+            "promotionReceiptId",
+            "hardwareEvidenceIndexSha256",
+            "production_claim_errors",
         ] {
             assert!(
                 verifier.contains(token),
@@ -4166,14 +4175,26 @@ mod axe_conform_modular_js_guards {
     }
 
     #[test]
+    fn release_build_stamp_can_be_reproduced_from_source_date_epoch() {
+        let build_rs = include_str!("../../dcentaxe/build.rs");
+        let gauntlet = include_str!("../../scripts/production_gauntlet.py");
+        assert!(build_rs.contains("std::env::var(\"SOURCE_DATE_EPOCH\")"));
+        assert!(build_rs.contains("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH"));
+        assert!(gauntlet.contains("env.setdefault(\"SOURCE_DATE_EPOCH\", source_date_epoch())"));
+    }
+
+    #[test]
     fn public_release_build_matrix_defaults_to_toolbox_install_targets() {
+        let registry: serde_json::Value =
+            serde_json::from_str(include_str!("../../esp-targets.json"))
+                .expect("esp-targets.json must be valid JSON");
         let sh_matrix = include_str!("../../scripts/build-matrix.sh");
         let ps_matrix = include_str!("../../scripts/build-matrix.ps1");
         let release_workflow =
             include_str!("../../../../.github/workflows/dcentos-esp-release.yml");
         let ci_matrix_workflow =
             include_str!("../../../../.github/workflows/bitaxe-build-matrix.yml");
-        let public_targets = [
+        let expected_public = [
             "bitaxe-max",
             "bitaxe-ultra",
             "bitaxe-supra",
@@ -4181,82 +4202,46 @@ mod axe_conform_modular_js_guards {
             "bitaxe-hex-ultra",
             "bitaxe-hex-supra",
         ];
-        let internal_targets = [
-            "bitaxe-gamma-duo",
-            "bitaxe-gt",
-            "bitaxe-touch",
-            "bitaxe-gt-touch",
-            "nerdnos",
-            "nerdaxe",
-            "nerdqaxe-plus",
-            "nerdqaxe-pp",
-        ];
-
-        for target in &public_targets {
-            assert!(
-                sh_matrix.contains(&format!("build_one {target} {target}")),
-                "POSIX public matrix must build {target}"
-            );
-            assert!(
-                ps_matrix.contains(&format!("BoardTarget = \"{target}\"")),
-                "PowerShell public matrix must build {target}"
-            );
-            assert!(
-                release_workflow.contains(&format!("board_target: {target}")),
-                "root signed ESP release workflow must publish public target {target}"
-            );
-            assert!(
-                release_workflow.contains(&format!("'{target}':")),
-                "root signed ESP release workflow must validate device model for {target}"
-            );
-            assert!(
-                ci_matrix_workflow.contains(&format!("'{target}':")),
-                "root build-matrix workflow must validate public target {target}"
-            );
-        }
-
-        let sh_internal_gate = sh_matrix
-            .find("if [ \"$INCLUDE_INTERNAL_TARGETS\" = \"1\" ]")
-            .expect("POSIX matrix must keep internal targets opt-in");
-        let sh_default_matrix = &sh_matrix[..sh_internal_gate];
-        let ps_public_start = ps_matrix
-            .find("$publicTargets = @(")
-            .expect("PowerShell matrix must define public targets");
-        let ps_internal_start = ps_matrix
-            .find("$internalTargets = @(")
-            .expect("PowerShell matrix must define internal targets separately");
-        let ps_default_matrix = &ps_matrix[ps_public_start..ps_internal_start];
-
-        for target in &internal_targets {
-            assert!(
-                !sh_default_matrix.contains(target),
-                "POSIX public matrix must not emit internal target {target} by default"
-            );
-            assert!(
-                !ps_default_matrix.contains(target),
-                "PowerShell public matrix must not emit internal target {target} by default"
-            );
-            assert!(
-                !release_workflow.contains(&format!("board_target: {target}")),
-                "root signed ESP release workflow must not publish internal target {target}"
-            );
-            assert!(
-                !release_workflow.contains(&format!("'{target}':")),
-                "root signed ESP release workflow must not validate internal target {target}"
-            );
-            assert!(
-                !ci_matrix_workflow.contains(&format!("'{target}':")),
-                "root build-matrix workflow must not accept internal packaged target {target}"
-            );
-        }
+        let targets = registry["targets"]
+            .as_array()
+            .expect("target registry must contain an array");
+        assert_eq!(
+            targets.len(),
+            37,
+            "every compiled board needs one registry row"
+        );
+        let public_targets: Vec<&str> = targets
+            .iter()
+            .filter(|target| target["release_scope"] == "public")
+            .map(|target| {
+                target["board_target"]
+                    .as_str()
+                    .expect("board_target must be a string")
+            })
+            .collect();
+        assert_eq!(public_targets, expected_public);
 
         assert!(
-            sh_matrix.contains("INCLUDE_INTERNAL_TARGETS"),
-            "POSIX internal targets must stay opt-in"
+            sh_matrix.contains("target_matrix.py") && sh_matrix.contains("build_scope public"),
+            "POSIX matrix must derive the default public slice from the registry"
         );
         assert!(
-            ps_matrix.contains("[switch]$IncludeInternalTargets"),
-            "PowerShell internal targets must stay opt-in"
+            sh_matrix.contains("INCLUDE_INTERNAL_TARGETS")
+                && ps_matrix.contains("[switch]$IncludeInternalTargets"),
+            "internal targets must remain opt-in in both local matrix runners"
+        );
+        assert!(
+            ps_matrix.contains("esp-targets.json") && ps_matrix.contains("release_scope"),
+            "PowerShell matrix must derive its ownership slices from the registry"
+        );
+        assert!(
+            release_workflow.contains("target_matrix.py list --scope public --format github"),
+            "signed release workflow must plan a dynamic public matrix"
+        );
+        assert!(
+            release_workflow.contains("target['package_policy'] == 'public'")
+                && ci_matrix_workflow.contains("target['package_policy'] == 'public'"),
+            "both public package validators must derive exact device bindings from the registry"
         );
         assert!(
             ci_matrix_workflow.contains("found_boards == set(expected_models)"),
@@ -4282,6 +4267,197 @@ mod axe_conform_modular_js_guards {
             API_RS.contains("const MAX_FIRMWARE_SIZE: usize = 3 * 1024 * 1024"),
             "OTA upload max must match partitions.csv ota_0 size"
         );
+    }
+}
+
+/// The release/evidence registry is not only packaging metadata: its
+/// `runtime_mode` and `install_policy` must agree with the compiled board
+/// safety gate, and the selected row must reach both operator-facing APIs.
+#[cfg(test)]
+mod deployment_policy_guards {
+    use dcentaxe_hal::board::{BitAxeModel, BoardConfig};
+
+    const REGISTRY: &str = include_str!("../../esp-targets.json");
+    const BUILD_RS: &str = include_str!("../../dcentaxe/build.rs");
+    const API_RS: &str = include_str!("../../dcentaxe/src/api.rs");
+    const AUTH_RS: &str = include_str!("../../dcentaxe/src/auth.rs");
+    const MQTT_RS: &str = include_str!("../../dcentaxe/src/mqtt.rs");
+    const GAUNTLET_PY: &str = include_str!("../../scripts/production_gauntlet.py");
+    const HARDWARE_EVIDENCE_PY: &str = include_str!("../../scripts/hardware_evidence.py");
+    const PROMOTION_CANDIDATE_PY: &str = include_str!("../../scripts/promotion_candidate.py");
+    const HARDWARE_SESSION_PY: &str = include_str!("../../scripts/hardware_session.py");
+    const HARDWARE_EVIDENCE_INDEX: &str = include_str!("../../hardware-evidence/index.json");
+    const API_SYSTEM_INFO_RS: &str = include_str!("../../dcentaxe/src/api_system_info.rs");
+    const DASHBOARD_RS: &str = include_str!("../../dcentaxe/src/dashboard.rs");
+
+    #[test]
+    fn registry_runtime_mode_matches_the_real_board_safety_gate() {
+        let registry: serde_json::Value =
+            serde_json::from_str(REGISTRY).expect("esp-targets.json must parse");
+        let targets = registry["targets"]
+            .as_array()
+            .expect("registry targets must be an array");
+
+        for target in targets {
+            let board_target = target["board_target"]
+                .as_str()
+                .expect("board_target must be a string");
+            let device_model = target["device_model"]
+                .as_str()
+                .expect("device_model must be a string");
+            let runtime_mode = target["runtime_mode"]
+                .as_str()
+                .expect("runtime_mode must be a string");
+            let install_policy = target["install_policy"]
+                .as_str()
+                .expect("install_policy must be a string");
+            let package_policy = target["package_policy"]
+                .as_str()
+                .expect("package_policy must be a string");
+            let model = BitAxeModel::from_device_model(device_model)
+                .unwrap_or_else(|| panic!("{board_target}: device model is not registered"));
+            assert_eq!(model.board_target(), board_target);
+            let board = BoardConfig::for_model(model);
+
+            match runtime_mode {
+                "mining" => {
+                    assert!(
+                        board.validate().is_ok() && board.mining_capable(),
+                        "{board_target}: registry says mining but BoardConfig refuses it"
+                    );
+                    assert_ne!(install_policy, "blocked", "{board_target}");
+                }
+                "identity-only" => {
+                    assert!(
+                        board.mining_capable() && board.validate().is_err(),
+                        "{board_target}: identity-only registry row must fail the real mining gate"
+                    );
+                    assert_eq!(install_policy, "blocked", "{board_target}");
+                    assert_eq!(package_policy, "diagnostic", "{board_target}");
+                }
+                other => panic!("{board_target}: unsupported runtime_mode {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_policy_reaches_capabilities_system_info_and_dashboard() {
+        for token in [
+            "DCENTAXE_HARDWARE_FAMILY",
+            "DCENTAXE_SUPPORT_TIER",
+            "DCENTAXE_EVIDENCE_LEVEL",
+            "DCENTAXE_RUNTIME_MODE",
+            "DCENTAXE_INSTALL_POLICY",
+            "DCENTAXE_PACKAGE_POLICY",
+            "DCENTAXE_FLASH_LAYOUT",
+            "DCENTAXE_PRODUCTION_BLOCKERS_JSON",
+        ] {
+            assert!(BUILD_RS.contains(token), "build.rs must emit {token}");
+            assert!(
+                API_RS.contains(token),
+                "operator API construction must consume {token}"
+            );
+        }
+        assert!(BUILD_RS.contains("../esp-targets.json"));
+        assert!(BUILD_RS.contains("emit_registry_metadata("));
+        assert!(BUILD_RS.contains("git_dirty"));
+        assert!(BUILD_RS.contains("DCENTAXE_PROMOTION_RECEIPT_ID"));
+        assert!(API_RS.contains("option_env!(\"DCENTAXE_PROMOTION_RECEIPT_ID\")"));
+        assert!(API_SYSTEM_INFO_RS.contains("pub promotion_receipt_id: Option<&'static str>"));
+        assert!(API_SYSTEM_INFO_RS.contains("pub deployment: DeploymentView<'a>"));
+        assert!(DASHBOARD_RS.contains("id=\"deploymentBanner\""));
+        assert!(DASHBOARD_RS.contains("d.dcentaxe.deployment"));
+        assert!(DASHBOARD_RS.contains("sysProductionBlockers"));
+        assert!(
+            AUTH_RS.contains("pub(crate) fn deployment_mutations_allowed(state: &SharedState)")
+                && AUTH_RS.contains("fn authorize_deployment_mutation(state: &SharedState)")
+                && AUTH_RS.contains("DCENTAXE_RUNTIME_MODE")
+                && AUTH_RS.contains("DCENTAXE_INSTALL_POLICY")
+                && AUTH_RS.contains("mining_allowed_without_lab_bypass"),
+            "REST/MCP writes must enforce both compiled policy and runtime board safety"
+        );
+        assert!(
+            AUTH_RS
+                .matches("authorize_deployment_mutation(state)?;")
+                .count()
+                >= 2,
+            "both REST writes and MCP controls must pass the deployment gate"
+        );
+        assert!(
+            MQTT_RS.contains("sync_channel(MQTT_COMMAND_QUEUE_CAPACITY)")
+                && MQTT_RS.contains("details != Details::Complete")
+                && MQTT_RS.contains("command_tx.try_send(inbound)")
+                && MQTT_RS.contains(".subscribe(&topic, QoS::AtLeastOnce)")
+                && MQTT_RS.contains("fn apply_inbound_command(")
+                && MQTT_RS.contains("validate_autotune_target(")
+                && MQTT_RS.contains("deployment_allows_operational_mutations(")
+                && MQTT_RS.contains("command_discovery_tombstones(device_id)"),
+            "real esp-idf MQTT transport must bound, subscribe, policy-check, validate, apply, and tombstone controls"
+        );
+        assert!(
+            API_RS.contains("commands_enabled: crate::mqtt_ha::command_surface_enabled(")
+                && API_RS.contains("deployment_allows_operational_mutations("),
+            "system info must report the effective policy-gated MQTT command surface"
+        );
+        assert!(
+            !MQTT_RS.contains("EspMqttClient::new_cb(&url, &conf, |_event| {})"),
+            "the ESP MQTT callback must never silently drop every inbound event"
+        );
+    }
+
+    #[test]
+    fn production_promotion_requires_a_hashed_exact_sku_receipt() {
+        let registry: serde_json::Value = serde_json::from_str(REGISTRY).unwrap();
+        let contract = &registry["production_gate_contract"];
+        assert_eq!(contract["minimum_soak_seconds"], 259_200);
+        assert_eq!(contract["artifact_schema"], 1);
+        assert_eq!(
+            contract["artifact_authority"],
+            "observed-exact-sku-hardware-gate"
+        );
+        for gate in [
+            "exact-sku-identity",
+            "safe-boot",
+            "fail-safe-power-cut",
+            "trusted-thermal",
+            "accepted-share",
+            "ota-rollback",
+            "sustained-soak",
+            "mqtt-command-roundtrip",
+        ] {
+            assert!(
+                contract["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == gate),
+                "production gate contract must retain {gate}"
+            );
+        }
+        assert!(GAUNTLET_PY.contains("and target[\"support_tier\"] == \"production\""));
+        assert!(GAUNTLET_PY.contains("and target[\"install_policy\"] == \"production\""));
+        assert!(GAUNTLET_PY.contains("and promotion[\"qualified\"]"));
+        assert!(GAUNTLET_PY.contains("and receipt_firmware_matches_package"));
+        assert!(GAUNTLET_PY.contains("package_version == promotion.get(\"firmware_version\")"));
+        assert!(GAUNTLET_PY.contains("and production_signatures_verified"));
+        assert!(HARDWARE_EVIDENCE_PY.contains("unit_fingerprint_sha256"));
+        assert!(HARDWARE_EVIDENCE_PY.contains("gate {gate_name} artifact sha256 mismatch"));
+        assert!(HARDWARE_EVIDENCE_PY.contains("operator and witness must be distinct"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("qualification-only-not-publishable"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("candidate_id"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("source_date_epoch"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("candidate_source_is_clean"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("git_head"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("admit-package"));
+        assert!(PROMOTION_CANDIDATE_PY.contains("without rebuilding payloads"));
+        assert!(HARDWARE_EVIDENCE_PY.contains("promotion_candidate.candidate_id"));
+        assert!(HARDWARE_EVIDENCE_PY.contains("reported_promotion_receipt_id"));
+        assert!(HARDWARE_SESSION_PY.contains("authorization-gated-exact-sku-hardware-session"));
+        assert!(HARDWARE_SESSION_PY.contains("authorize-live-"));
+        assert!(HARDWARE_SESSION_PY.contains("finalize-"));
+        assert!(HARDWARE_SESSION_PY.contains("Registry production admission remains a separate"));
+        let index: serde_json::Value = serde_json::from_str(HARDWARE_EVIDENCE_INDEX).unwrap();
+        assert_eq!(index["authority"], "retained-exact-sku-hardware-receipts");
     }
 }
 

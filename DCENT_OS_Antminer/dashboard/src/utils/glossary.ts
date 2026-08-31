@@ -448,9 +448,9 @@ export const GLOSSARY = {
   bip320_version_rolling: {
     term: 'BIP320 version-rolling',
     body:
-      'ASICBoost: the miner rolls allowed bits of the block-version field ' +
-      '(mask 0x1FFFE000) to search more space per work item. Standard, pool-' +
-      'negotiated, and ~3.4% more efficient.',
+      'The miner rolls allowed bits of the block-version field ' +
+      '(mask 0x1FFFE000) per BIP320. This is pool-negotiated overt version ' +
+      'rolling, not a +20% hashrate toggle and not extra terahash.',
   },
   crc_type: {
     term: 'CRC type',
@@ -582,12 +582,12 @@ export const GLOSSARY = {
   net_value_offset: {
     term: 'Net value',
     body:
-      'Electricity cost minus the Bitcoin value earned, per day. If you ' +
-      'are using the heat you would be paying for anyway, the real cost is ' +
-      'even lower.',
+      'Electricity cost minus net Bitcoin value after donation and pool ' +
+      'fee. Optional seasonal heat-credit is a separate USD estimate ' +
+      '(kWh × seasonal factor) and is never added to sats.',
     note:
       'BTC value uses the manual price you set; it does not change actual ' +
-      'mining.',
+      'mining. Donation defaults to 2% and is disableable.',
   },
   sats_estimate: {
     term: 'Sats estimate',

@@ -1,0 +1,600 @@
+{
+  "registry_size": 39,
+  "registry_sha256": "1c885d0da83800c27d8b0c2d220de7299c8b536b2d4785253ab814e50db213f8",
+  "state_sha256": "1f75a09babd07dfe2280a3a59c7c0d82653cfb06a90880eed6344ddf242233bb",
+  "ready": [],
+  "awaiting_operator": [
+    "op-ceremony"
+  ],
+  "blocked": [
+    "op-discovery",
+    "op-fixture",
+    "op-recovery",
+    "op-bootpolicy",
+    "op-capture",
+    "w2-codec",
+    "w2-route",
+    "w2-firmware",
+    "op-replacement",
+    "w2-safety",
+    "w3-executor",
+    "w3-validation",
+    "w3-rollback",
+    "op-rollback",
+    "op-firstlight",
+    "op-bench",
+    "op-endurance",
+    "op-preauthorize",
+    "op-release",
+    "terminal"
+  ],
+  "blocked_validator": [],
+  "done": [
+    "d0-bspplan",
+    "d0-census",
+    "d0-crossera",
+    "d0-ingest",
+    "d0-rail",
+    "d0-registry",
+    "d0-runbooks",
+    "d0-soc",
+    "w1-bspa",
+    "w1-capture",
+    "w1-capturevalidator",
+    "w1-discoverytool",
+    "w1-fixtureplan",
+    "w1-fixturevalidator",
+    "w1-identityschema",
+    "w1-installplan",
+    "w1-renode",
+    "w1-routeengine"
+  ],
+  "lanes": {
+    "d0-ingest": {
+      "title": "A1246/A1246N stock AUPs ingested as held profiles",
+      "expert": "DCENT_RE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "stock_restore",
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-census": {
+      "title": "Wire-contract asset census (no admissible contract; P1-P4 paths)",
+      "expert": "DCENT_RE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "asic_control",
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-soc": {
+      "title": "K210 SoC boot/flash/ISP desk contract + measurement table",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "boot_policy",
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-crossera": {
+      "title": "AUP cross-era analysis (224-byte prefix spans A12-A15)",
+      "expert": "DCENT_RE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-registry": {
+      "title": "Toolbox 12-profile fail-closed AUP registry",
+      "expert": "DCENT_SE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-rail": {
+      "title": "Toolbox K210 evidence-gap install routes",
+      "expert": "DCENT_SE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-runbooks": {
+      "title": "Trust-anchor ceremony + A1246 first-contact runbooks",
+      "expert": "DCENT_QA",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": null
+    },
+    "d0-bspplan": {
+      "title": "K210 no_std BSP plan (driver inventory, profile schema)",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": null
+    },
+    "w1-bspa": {
+      "title": "BSP Phase A: sealed physical runtime + separate Renode console",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "replacement_firmware",
+      "mission": "Export and host-test sysctl/UARTHS/GPIOHS/FPIOA/CLINT/WDT0 facts; provide a sealed zero-MMIO dual-hart physical runtime plus a separately named Renode-only console. No board pin defaults or packageable console.",
+      "operator_validator": null
+    },
+    "w1-capture": {
+      "title": "K210 capture ingestion (.k210cap) + codec bench skeleton",
+      "expert": "DCENT_Protocol",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "asic_control",
+      "mission": "Parse operator Saleae exports into a canonical bounded capture artifact with channel->signal mapping, clock-recovery stats, and descriptive frame hypotheses; no wire-contract claims.",
+      "operator_validator": null
+    },
+    "w1-installplan": {
+      "title": "Toolbox K210 install plan builder (locked until receipts admit)",
+      "expert": "DCENT_SE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "release_authority",
+      "mission": "Build a structured install/AUP plan generator whose every step requires admitted gauntlet receipts; with zero receipts it emits the canonical refusal enumerating missing gates.",
+      "operator_validator": null
+    },
+    "w1-discoverytool": {
+      "title": "Read-only 4028 discovery collector + recovery drill plan generator",
+      "expert": "DCENT_QA",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "exact_model_identity",
+      "mission": "Bench-laptop collector for the first-contact runbook (allowlisted read-only 4028 commands, MM3 trailing-NUL quirk, evidence-kind file layout, bundle skeleton) plus a dual-path recovery drill plan generator.",
+      "operator_validator": null
+    },
+    "w1-renode": {
+      "title": "Renode K210 emulation feasibility spike",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "replacement_firmware",
+      "mission": "Determine whether Renode's k210 platform can host-test the BSP runtime and candidate images pre-hardware; report only.",
+      "operator_validator": null
+    },
+    "w1-identityschema": {
+      "title": "Revision-bound A1246 identity + semantic discovery admission",
+      "expert": "DCENT_RE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "exact_model_identity",
+      "mission": "Split the generic A1246 row into evidence-honest A3200LC/A3201/X2/X3 variants and derive receipt identity semantically from stock JSON and fully decoded canonical PNG evidence; carry the resolved profile into gauntlet restore decisions and reject placeholders, corrupt bytes, and forced labels.",
+      "operator_validator": null
+    },
+    "w1-fixtureplan": {
+      "title": "A1246 EE fixture qualification contract",
+      "expert": "DCENT_EE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": "thermal_power_safety",
+      "mission": "Define the exact-unit controller supply, 1.8V probing, flash isolation, independent cutoff, cooling custody, ESD, instrument, and stop-condition evidence required before recovery or wire capture.",
+      "operator_validator": null
+    },
+    "w1-fixturevalidator": {
+      "title": "Dual-reviewed exact-unit fixture receipt validator",
+      "expert": "DCENT_QA",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": "Implement canonical semantic fixture evidence, two role-separated SSHSIG reviews, manifest-pinned admission, exact discovery/unit joins, and a non-authorizing workflow claim. Do not qualify a production gate.",
+      "operator_validator": null
+    },
+    "w1-capturevalidator": {
+      "title": "Dual-reviewed source-reproducible P1 capture validator",
+      "expert": "DCENT_Protocol",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": "Bind exact discovery/fixture identity, physical channel maps, source CSVs, byte-reproduced .k210cap artifacts, safe-idle cutoff evidence, bounded stock work, cooling custody, and two role-separated SSHSIG reviews. Admit raw P1 evidence only; do not claim a codec or qualify asic_control.",
+      "operator_validator": null
+    },
+    "w1-routeengine": {
+      "title": "Fail-closed four-path K210 boot-route policy engine",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "done",
+      "missing_dependencies": [],
+      "runbook": null,
+      "target_gate": null,
+      "mission": "Verify a manifest-pinned signed boot-policy result and deterministically rank native AES0 flash, ROM-ISP SRAM, JTAG SRAM, and clean replacement-controller engineering routes. Preserve a fixed false authority ceiling; never claim that a selected next route is install-ready.",
+      "operator_validator": null
+    },
+    "op-ceremony": {
+      "title": "Operator: generate + pin every role-separated trust-anchor key",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "awaiting_operator",
+      "missing_dependencies": [],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_TRUST_ANCHOR_CEREMONY.md",
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": "trust_anchor_ceremony_v1"
+    },
+    "op-discovery": {
+      "title": "Operator: A1246 read-only first-contact discovery session",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-ceremony"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_A1246_FIRST_CONTACT_RUNBOOK.md",
+      "target_gate": "exact_model_identity",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-fixture": {
+      "title": "Operator + EE: qualify the exact A1246 recovery/capture fixture",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-discovery"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_A1246_FIXTURE_QUALIFICATION.md",
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": "fixture_receipt_v1"
+    },
+    "op-recovery": {
+      "title": "Operator: dual-path stock backup/restore + interruption drill",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-discovery",
+        "op-fixture"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_RECOVERY_RECEIPTS.md",
+      "target_gate": "stock_restore",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-bootpolicy": {
+      "title": "Operator: controller-only boot-policy measurement (fuses/ISP/JTAG/AES0 probe)",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-recovery"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_BOOT_POLICY_RECEIPTS.md",
+      "target_gate": "boot_policy",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-capture": {
+      "title": "Operator: authorized passive wire-contract capture campaign (P1; P3 fixture optional)",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-discovery",
+        "op-fixture"
+      ],
+      "runbook": "",
+      "target_gate": null,
+      "mission": null,
+      "operator_validator": "capture_receipt_v1"
+    },
+    "w2-codec": {
+      "title": "K210 ASIC codec from admitted captures (clean-room, per-revision)",
+      "expert": "DCENT_Protocol",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-capture"
+      ],
+      "runbook": null,
+      "target_gate": "asic_control",
+      "mission": "Derive the controller<->ASIC codec from admitted capture artifacts only; admission-gated encoders, hardware-validated decoders, per-revision scope.",
+      "operator_validator": null
+    },
+    "w2-route": {
+      "title": "Measured boot-route adjudication across all replacement paths",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-bootpolicy",
+        "op-discovery",
+        "op-fixture"
+      ],
+      "runbook": null,
+      "target_gate": "replacement_firmware",
+      "mission": "Adjudicate normal AES0 flash, ROM-ISP SRAM bootstrap, JTAG SRAM bootstrap, and a clean replacement-controller path from exact-unit evidence. Record positive, negative, and not-applicable outcomes without treating one failed K210 boot path as the end of the A1246 enablement objective.",
+      "operator_validator": null
+    },
+    "w2-firmware": {
+      "title": "Selected target-bound DCENT runtime (measured route + BSP profile)",
+      "expert": "DCENT_CE",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w2-route",
+        "op-discovery"
+      ],
+      "runbook": null,
+      "target_gate": "replacement_firmware",
+      "mission": "Implement the evidence-selected native-flash, SRAM-bootstrap, or replacement-controller runtime; bind the BSP to the discovered board and produce the reproducible reviewed artifact required by that route.",
+      "operator_validator": null
+    },
+    "op-replacement": {
+      "title": "Builder + reviewer: admit the exact replacement artifact",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w2-firmware",
+        "w2-route",
+        "op-bootpolicy",
+        "op-capture"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_ROUTE_REPLACEMENT_RECEIPTS.md",
+      "target_gate": "replacement_firmware",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "w2-safety": {
+      "title": "Thermal/power custody implementation (model limits, cutoff, watchdog)",
+      "expert": "DCENT_Thermal",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w2-firmware",
+        "w2-codec"
+      ],
+      "runbook": null,
+      "target_gate": "thermal_power_safety",
+      "mission": "Implement model-bound thermal/power safety on real BSP I/O with independent hash-power cut, cooling custody, and latched faults.",
+      "operator_validator": null
+    },
+    "w3-executor": {
+      "title": "Toolbox K210 install executor unlock under admitted replacement receipt",
+      "expert": "DCENT_SE",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w2-firmware",
+        "op-bootpolicy",
+        "op-replacement"
+      ],
+      "runbook": null,
+      "target_gate": "release_authority",
+      "mission": "Wire the locked plan builder into an executor that runs only against an admitted, in-scope replacement receipt with recovery-first ordering.",
+      "operator_validator": null
+    },
+    "w3-validation": {
+      "title": "Signed staged first-light, bench, and endurance evidence validator",
+      "expert": "DCENT_QA",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w2-firmware",
+        "w2-safety",
+        "w3-executor"
+      ],
+      "runbook": null,
+      "target_gate": "bench_mining",
+      "mission": "Admit immutable first-light, bounded bench-mining, and fault/endurance receipts through distinct role keys and the complete exact-unit route chain.",
+      "operator_validator": null
+    },
+    "w3-rollback": {
+      "title": "Exact-route rollback and recovery validation harness",
+      "expert": "DCENT_QA",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w3-executor",
+        "w2-safety",
+        "op-recovery"
+      ],
+      "runbook": null,
+      "target_gate": "rollback_recovery",
+      "mission": "Validate rollback for the selected flash/bootstrap/controller route, including interruption, readback, stock return, identity rejoin, and no-clobber evidence.",
+      "operator_validator": null
+    },
+    "op-rollback": {
+      "title": "Operator: witnessed exact-route rollback/recovery qualification",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w3-rollback"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_ROUTE_ROLLBACK_RECEIPTS.md",
+      "target_gate": "rollback_recovery",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-firstlight": {
+      "title": "Operator + reviewers: staged first light and independent safety proof",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "w3-validation",
+        "op-rollback"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_FIRST_LIGHT_RECEIPTS.md",
+      "target_gate": "asic_control",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-bench": {
+      "title": "Operator + witness: bounded bench mining on the exact unit",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-firstlight"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_BENCH_MINING_RECEIPTS.md",
+      "target_gate": "bench_mining",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-endurance": {
+      "title": "Operator: witnessed fault-injection and endurance qualification",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-bench"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_ENDURANCE_FAULT_RECEIPTS.md",
+      "target_gate": "endurance_faults",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-preauthorize": {
+      "title": "Preauthorizer + reviewer: authorize one exact install capstone",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-endurance"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_RELEASE_RECEIPTS.md",
+      "target_gate": "release_authority",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "op-release": {
+      "title": "Operator: per-model release admission + witnessed install capstone",
+      "expert": "Operator",
+      "kind": "operator",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-preauthorize"
+      ],
+      "runbook": "DCENT_OS_AvalonMiner/gauntlet/K210_RELEASE_RECEIPTS.md",
+      "target_gate": "release_authority",
+      "mission": null,
+      "operator_validator": "gauntlet_gate_v1"
+    },
+    "terminal": {
+      "title": "DCENT_OS enabled on A1246: every gate qualified, executor unlocked",
+      "expert": "Coordinator",
+      "kind": "desk",
+      "status": "blocked",
+      "missing_dependencies": [
+        "op-bench",
+        "op-bootpolicy",
+        "op-capture",
+        "op-ceremony",
+        "op-discovery",
+        "op-endurance",
+        "op-firstlight",
+        "op-fixture",
+        "op-preauthorize",
+        "op-recovery",
+        "op-release",
+        "op-replacement",
+        "op-rollback",
+        "w2-codec",
+        "w2-firmware",
+        "w2-route",
+        "w2-safety",
+        "w3-executor",
+        "w3-rollback",
+        "w3-validation"
+      ],
+      "runbook": null,
+      "target_gate": null,
+      "mission": "Terminal node. Completes only when every desk and operator lane above has completed and the gauntlet reports the exact unit production-ready.",
+      "operator_validator": null
+    }
+  },
+  "gauntlet_gates_a1246": {
+    "asic_control": {
+      "state": "not_implemented",
+      "qualifies": false
+    },
+    "bench_mining": {
+      "state": "not_run",
+      "qualifies": false
+    },
+    "boot_policy": {
+      "state": "missing_measurement",
+      "qualifies": false
+    },
+    "endurance_faults": {
+      "state": "not_run",
+      "qualifies": false
+    },
+    "exact_model_identity": {
+      "state": "documentary_only",
+      "qualifies": false
+    },
+    "release_authority": {
+      "state": "not_admitted",
+      "qualifies": false
+    },
+    "replacement_firmware": {
+      "state": "packaged_safe_idle_pipeline_sentinel_only",
+      "qualifies": false
+    },
+    "rollback_recovery": {
+      "state": "missing_hardware_proof",
+      "qualifies": false
+    },
+    "stock_restore": {
+      "state": "held_package_verified",
+      "qualifies": false
+    },
+    "thermal_power_safety": {
+      "state": "generic_fail_closed_supervisor_only",
+      "qualifies": false
+    }
+  }
+}

@@ -1,0 +1,66 @@
+#!/bin/sh
+# Fail-loud first-light ACM console on the K230 burn-port controller.
+
+case "${1:-}" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+LOG=/var/log/dcent-gadget.log
+G=/sys/kernel/config/usb_gadget/dcent
+UDC=91500000.usb
+
+log() {
+    echo "S10dcentgadget: $*" | tee -a "$LOG"
+}
+
+mkdir -p /var/log
+: > "$LOG"
+
+for module in configfs libcomposite u_serial usb_f_acm; do
+    if ! modprobe "$module" >>"$LOG" 2>&1; then
+        log "module load failed: $module"
+        exit 1
+    fi
+done
+
+if [ ! -d /sys/kernel/config/usb_gadget ]; then
+    if ! mount -t configfs configfs /sys/kernel/config >>"$LOG" 2>&1; then
+        log "configfs mount failed"
+        exit 1
+    fi
+fi
+
+tries=0
+while [ ! -e "/sys/class/udc/$UDC" ] && [ "$tries" -lt 20 ]; do
+    tries=$((tries + 1))
+    sleep 1
+done
+if [ ! -e "/sys/class/udc/$UDC" ]; then
+    log "UDC did not appear: $UDC"
+    ls -la /sys/class/udc >>"$LOG" 2>&1
+    exit 1
+fi
+
+mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409"
+echo 0x1d6b > "$G/idVendor"
+echo 0x0104 > "$G/idProduct"
+echo D-Central > "$G/strings/0x409/manufacturer"
+echo "DCENT_OS Nano 3" > "$G/strings/0x409/product"
+echo console > "$G/configs/c.1/strings/0x409/configuration"
+mkdir -p "$G/functions/acm.GS0"
+[ -e "$G/configs/c.1/acm.GS0" ] || \
+    ln -s "$G/functions/acm.GS0" "$G/configs/c.1/acm.GS0"
+
+if ! echo "$UDC" > "$G/UDC"; then
+    log "UDC bind failed: $UDC"
+    exit 1
+fi
+log "ACM console bound to $UDC"
+
+(
+    while true; do
+        setsid sh -c 'exec /sbin/getty -L ttyGS0 115200 vt100' >>"$LOG" 2>&1
+        sleep 2
+    done
+) &

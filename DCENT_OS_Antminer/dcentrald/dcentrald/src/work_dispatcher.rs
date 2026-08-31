@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,12 @@ use dcentrald_autotuner::power_budget::RuntimeWattCapState;
 use dcentrald_autotuner::power_budget::{efficiency_jth_from, EfficiencyHashrateEma};
 use dcentrald_autotuner::{FreqCommand, FrequencyLimitSource, LivePowerEstimate, PowerCalibration};
 use dcentrald_common::{bm1397plus_addr_interval, SerialMiningEngineBookkeeping};
+use dcentrald_diagnostics::troubleshoot::{
+    FpgaRegisterLayout, RuntimeOwnedFpgaTelemetry, UnattestedFpgaChainTelemetry,
+};
+use dcentrald_hal::fpga_chain::{
+    baud_hz_declared, ctrl_am2, FpgaChain, CTRL_BM139X, CTRL_ENABLE, STAT_RX_EMPTY, STAT_TX_EMPTY,
+};
 use dcentrald_hal::led::LedCommand;
 use dcentrald_stratum::share_pipeline::WorkBuilder;
 use dcentrald_stratum::types::{JobTemplate, ValidShare};
@@ -343,6 +349,8 @@ struct ChainFrequencyLimits {
     /// dedicated slot so it composes with — never clobbers — the autotuner's
     /// own `autotuner_thermal` ceiling and the controller's `thermal` throttle.
     atm_step: Option<u16>,
+    /// Decrease-only bad-chip / healthchipset ceiling. Dedicated slot.
+    bad_chip: Option<u16>,
 }
 
 impl ChainFrequencyLimits {
@@ -365,6 +373,7 @@ impl ChainFrequencyLimits {
             solar_surplus: min_opt(self.solar_surplus, other.solar_surplus),
             power_cap: min_opt(self.power_cap, other.power_cap),
             atm_step: min_opt(self.atm_step, other.atm_step),
+            bad_chip: min_opt(self.bad_chip, other.bad_chip),
         }
     }
 
@@ -379,6 +388,7 @@ impl ChainFrequencyLimits {
             self.solar_surplus,
             self.power_cap,
             self.atm_step,
+            self.bad_chip,
         ]
         .into_iter()
         .flatten()
@@ -396,6 +406,15 @@ impl ChainFrequencyLimits {
             FrequencyLimitSource::SolarSurplus => &mut self.solar_surplus,
             FrequencyLimitSource::PowerCap => &mut self.power_cap,
             FrequencyLimitSource::AtmStep => &mut self.atm_step,
+            FrequencyLimitSource::BadChip => &mut self.bad_chip,
+        };
+        let value = if source == FrequencyLimitSource::BadChip {
+            match (*slot, value) {
+                (Some(old), Some(new)) if new > old => Some(old),
+                (_, new) => new,
+            }
+        } else {
+            value
         };
         let changed = *slot != value;
         *slot = value;
@@ -425,6 +444,9 @@ impl ChainFrequencyLimits {
         if self.fan_clamp.is_some() {
             labels.push("fan_clamp");
         }
+        if self.bad_chip.is_some() {
+            labels.push("bad_chip");
+        }
         labels
     }
 
@@ -452,6 +474,9 @@ impl ChainFrequencyLimits {
         if let Some(limit) = self.fan_clamp {
             candidates.push(("fan_clamp", limit, 5));
         }
+        if let Some(limit) = self.bad_chip {
+            candidates.push(("bad_chip", limit, 0));
+        }
 
         candidates
             .into_iter()
@@ -471,6 +496,9 @@ pub struct WorkDispatcher {
     share_tx: mpsc::Sender<ValidShare>,
     /// MinerState watch channel for updating hashrate/stats.
     state_tx: watch::Sender<dcentrald_api::MinerState>,
+    /// Retained, source-owned FPGA register snapshot for passive diagnostics.
+    /// The dispatcher is the sole FPGA owner; REST receives only the watch copy.
+    fpga_status_tx: Option<watch::Sender<Option<RuntimeOwnedFpgaTelemetry>>>,
     /// Broadcast channel for Hacker Mode mining-sync events.
     mining_sync_tx: broadcast::Sender<String>,
     /// Shutdown token.
@@ -652,6 +680,7 @@ impl WorkDispatcher {
             job_rx,
             share_tx,
             state_tx,
+            fpga_status_tx: None,
             mining_sync_tx,
             shutdown,
             worker_name,
@@ -698,6 +727,110 @@ impl WorkDispatcher {
     /// per the analysis in .
     pub fn set_stale_age_divisor(&mut self, divisor: u32) {
         self.stale_age_divisor = divisor.max(1);
+    }
+
+    /// Install the passive FPGA snapshot publication channel.
+    ///
+    /// This grants no new hardware authority: the dispatcher already owns the
+    /// chain transports, while consumers can only clone the retained value.
+    pub fn set_fpga_status_tx(&mut self, tx: watch::Sender<Option<RuntimeOwnedFpgaTelemetry>>) {
+        self.fpga_status_tx = Some(tx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_fpga_chain_telemetry(
+        chain_id: u8,
+        register_layout: FpgaRegisterLayout,
+        identity_word: u32,
+        build_id: u32,
+        ctrl_reg: u32,
+        baud_reg: u32,
+        work_time: Option<u32>,
+        error_count: Option<u32>,
+        cmd_status: u32,
+        work_tx_status: u32,
+        work_rx_status: u32,
+    ) -> UnattestedFpgaChainTelemetry {
+        let is_am2 = register_layout == FpgaRegisterLayout::Am2;
+        UnattestedFpgaChainTelemetry {
+            chain_id,
+            register_layout: Some(register_layout),
+            identity_word: Some(identity_word),
+            version: (!is_am2).then(|| format!("0x{identity_word:08X}")),
+            build_id: Some(build_id),
+            ctrl_reg: Some(ctrl_reg),
+            enabled: Some(if is_am2 {
+                ctrl_reg & ctrl_am2::IP_ENABLE != 0
+            } else {
+                ctrl_reg & CTRL_ENABLE != 0
+            }),
+            bm139x_mode: (!is_am2).then_some(ctrl_reg & CTRL_BM139X != 0),
+            baud_reg: Some(baud_reg),
+            // Fail-closed: only a declared FIFO fabric may be converted to Hz.
+            // Am2 has no declared serializer clock (`fifo_fabric_hz == None`).
+            baud_rate: match register_layout {
+                FpgaRegisterLayout::Am1S9 => baud_hz_declared("am1-s9", baud_reg),
+                FpgaRegisterLayout::Am2 => None,
+            },
+            work_time,
+            error_count,
+            cmd_tx_empty: Some(cmd_status & STAT_TX_EMPTY != 0),
+            cmd_rx_empty: Some(cmd_status & STAT_RX_EMPTY != 0),
+            work_tx_empty: Some(work_tx_status & STAT_TX_EMPTY != 0),
+            work_rx_empty: Some(work_rx_status & STAT_RX_EMPTY != 0),
+        }
+    }
+
+    fn capture_fpga_runtime_telemetry(&self) -> Option<RuntimeOwnedFpgaTelemetry> {
+        let captured_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())?;
+        let mut chains = Vec::with_capacity(self.chains.len());
+
+        for chain in &self.chains {
+            // The heartbeat owns the shared AXI/I2C fabric while asserted.
+            // Abort the whole sample rather than publish a mixed-time snapshot.
+            if self.i2c_active.load(Ordering::Acquire) {
+                return None;
+            }
+            let register_layout = if chain.fpga.uses_am2_register_layout() {
+                FpgaRegisterLayout::Am2
+            } else {
+                FpgaRegisterLayout::Am1S9
+            };
+            let is_am2 = register_layout == FpgaRegisterLayout::Am2;
+            chains.push(Self::decode_fpga_chain_telemetry(
+                chain.chain_id,
+                register_layout,
+                chain.fpga.read_version(),
+                chain.fpga.read_build_id(),
+                chain.fpga.read_ctrl(),
+                chain.fpga.read_baud(),
+                (!is_am2).then(|| chain.fpga.read_work_time()),
+                // AM2 common+0x18 is not proven to be the S9 CRC counter.
+                (!is_am2).then(|| chain.fpga.read_error_count()),
+                chain.fpga.read_cmd_status(),
+                chain.fpga.read_work_tx_status(),
+                chain.fpga.read_work_rx_status(),
+            ));
+        }
+
+        (!chains.is_empty()).then_some(RuntimeOwnedFpgaTelemetry {
+            telemetry_source: "standard WorkDispatcher retained FPGA register snapshot".to_string(),
+            captured_at_ms,
+            chains,
+        })
+    }
+
+    fn publish_fpga_runtime_telemetry(&self) {
+        let Some(tx) = &self.fpga_status_tx else {
+            return;
+        };
+        let Some(snapshot) = self.capture_fpga_runtime_telemetry() else {
+            return;
+        };
+        let _ = tx.send(Some(snapshot));
     }
 
     ///  W1 — install a shared ring buffer so the dispatcher can
@@ -1127,6 +1260,45 @@ impl WorkDispatcher {
         }
     }
 
+    /// Typed FPGA WORK_TX kind for a production dispatch chip.
+    ///
+    /// `fpga_midstate_cnt` is the FPGA log2 slot field (2 → 4 slots, 3 → 8).
+    /// Packing is length-checked only; this does not write WORK_TX (BM1398
+    /// live FIFO stays on ChipDriver::send_work, BENCH_HOLD).
+    #[allow(dead_code)]
+    fn typed_fpga_work_tx_kind(
+        chip: DispatchWriteChip,
+        fpga_midstate_cnt: u8,
+    ) -> std::result::Result<
+        dcentrald_asic::work_tx::WorkTxKind,
+        dcentrald_asic::work_tx::WorkTxError,
+    > {
+        let midstate_slots = match fpga_midstate_cnt {
+            2 => 4,
+            3 => 8,
+            _ => {
+                return Err(dcentrald_asic::work_tx::WorkTxError::UnsupportedSlots {
+                    chip_id: chip.chip_id(),
+                    midstate_slots: fpga_midstate_cnt,
+                })
+            }
+        };
+        dcentrald_asic::work_tx::fpga_work_tx_kind(chip.chip_id(), midstate_slots)
+    }
+
+    /// Ticket-mask policy for a production dispatch chip. Computes mask +
+    /// register only — never writes TicketMask hardware.
+    #[allow(dead_code)]
+    fn ticket_mask_policy_for_dispatch(
+        chip: DispatchWriteChip,
+        difficulty: u32,
+    ) -> std::result::Result<
+        dcentrald_common::TicketMaskPolicy,
+        dcentrald_common::TicketMaskPolicyError,
+    > {
+        dcentrald_common::compute_ticket_mask_policy(chip.chip_id(), difficulty)
+    }
+
     fn recalc_work_time_for_chain(
         commit_port: &RuntimeExecutionCommitPort,
         chain: &mut Chain,
@@ -1458,6 +1630,7 @@ impl WorkDispatcher {
             FrequencyLimitSource::SolarSurplus => "solar-surplus ceiling",
             FrequencyLimitSource::PowerCap => "power-cap ceiling",
             FrequencyLimitSource::AtmStep => "ATM profile-step ceiling",
+            FrequencyLimitSource::BadChip => "bad-chip health ceiling",
         }
     }
 
@@ -4108,6 +4281,14 @@ impl WorkDispatcher {
                         }
                     });
 
+                    // Publish only from the FPGA owner and only while the
+                    // shared I2C/AXI fabric is not reserved by the heartbeat.
+                    // These are status-register reads; no FIFO is consumed and
+                    // no register is written.
+                    if !self.i2c_active.load(Ordering::Acquire) {
+                        self.publish_fpga_runtime_telemetry();
+                    }
+
                     if hashrate.hashrate_5s > 0.0 {
                         let ths_5s = hashrate.hashrate_5s / 1000.0;
                         let ths_avg = hashrate.hashrate_avg / 1000.0;
@@ -4476,6 +4657,53 @@ mod tests {
     }
 
     #[test]
+    fn retained_fpga_decode_keeps_s9_and_am2_semantics_separate() {
+        let s9 = WorkDispatcher::decode_fpga_chain_telemetry(
+            6,
+            FpgaRegisterLayout::Am1S9,
+            0x0090_1002,
+            0x1234_5678,
+            CTRL_ENABLE | CTRL_BM139X,
+            0x6C,
+            Some(0x0004_0507),
+            Some(3),
+            STAT_TX_EMPTY | STAT_RX_EMPTY,
+            STAT_TX_EMPTY,
+            STAT_RX_EMPTY,
+        );
+        assert_eq!(s9.version.as_deref(), Some("0x00901002"));
+        assert_eq!(s9.enabled, Some(true));
+        assert_eq!(s9.bm139x_mode, Some(true));
+        assert_eq!(s9.baud_rate, baud_hz_declared("am1-s9", 0x6C));
+        assert_eq!(s9.baud_rate, Some(114_678));
+        assert_eq!(s9.work_time, Some(0x0004_0507));
+        assert_eq!(s9.error_count, Some(3));
+        assert_eq!(s9.cmd_tx_empty, Some(true));
+        assert_eq!(s9.cmd_rx_empty, Some(true));
+
+        let am2 = WorkDispatcher::decode_fpga_chain_telemetry(
+            1,
+            FpgaRegisterLayout::Am2,
+            0x6384_8B7B,
+            0x6384_8B7B,
+            ctrl_am2::BM1362_DEFAULT,
+            0x07,
+            None,
+            None,
+            STAT_TX_EMPTY,
+            STAT_TX_EMPTY,
+            STAT_RX_EMPTY,
+        );
+        assert_eq!(am2.enabled, Some(true));
+        assert_eq!(am2.identity_word, am2.build_id);
+        assert_eq!(am2.version, None);
+        assert_eq!(am2.bm139x_mode, None);
+        assert_eq!(am2.baud_rate, None);
+        assert_eq!(am2.work_time, None);
+        assert_eq!(am2.error_count, None);
+    }
+
+    #[test]
     fn normalize_tracker_chip_index_handles_dense_and_strided_families() {
         let bm1397_plan =
             dcentrald_api_types::asic_command::LinearAddressPlan::from_truncated_byte_space(48)
@@ -4706,6 +4934,81 @@ mod tests {
     }
 
     #[test]
+    fn typed_work_tx_admits_known_fifo_lengths_and_refuses_mismatch() {
+        use dcentrald_asic::work_tx::{
+            pack_work_tx_words, WorkTxError, WorkTxExpectedLen, WorkTxKind,
+        };
+
+        let bm1387 = WorkDispatcher::typed_fpga_work_tx_kind(DispatchWriteChip::Bm1387, 2)
+            .expect("BM1387 4-slot FIFO");
+        assert_eq!(
+            bm1387,
+            WorkTxKind::FpgaMidstateFifo {
+                chip_id: 0x1387,
+                midstate_slots: 4,
+            }
+        );
+        assert_eq!(bm1387.expected_len(), WorkTxExpectedLen::FifoWords(36));
+        assert_eq!(pack_work_tx_words(bm1387, &[0u32; 36]).unwrap().len(), 36);
+        assert!(matches!(
+            pack_work_tx_words(bm1387, &[0u32; 20]),
+            Err(WorkTxError::LengthMismatch { actual: 20, .. })
+        ));
+
+        let bm1398_four = WorkDispatcher::typed_fpga_work_tx_kind(DispatchWriteChip::Bm1398, 2)
+            .expect("BM1398 4-slot");
+        let bm1398_eight = WorkDispatcher::typed_fpga_work_tx_kind(DispatchWriteChip::Bm1398, 3)
+            .expect("BM1398 8-slot");
+        assert_eq!(bm1398_four.expected_len(), WorkTxExpectedLen::FifoWords(36));
+        assert_eq!(
+            bm1398_eight.expected_len(),
+            WorkTxExpectedLen::FifoWords(68)
+        );
+        assert!(pack_work_tx_words(bm1398_eight, &[0u32; 36]).is_err());
+
+        assert!(WorkDispatcher::typed_fpga_work_tx_kind(DispatchWriteChip::Bm1387, 3).is_err());
+        assert_eq!(
+            dcentrald_asic::work_tx::fpga_work_tx_kind(0xFFFF, 4),
+            Err(WorkTxError::UnknownChip { chip_id: 0xFFFF })
+        );
+    }
+
+    #[test]
+    fn ticket_mask_policy_computes_without_hardware_write() {
+        let s9 = WorkDispatcher::ticket_mask_policy_for_dispatch(DispatchWriteChip::Bm1387, 256)
+            .expect("BM1387 ticket-mask policy");
+        assert_eq!(s9.mask, 0x0000_00FF);
+        assert_eq!(s9.register, dcentrald_common::TICKET_MASK_REG_BM1387);
+
+        let s19 = WorkDispatcher::ticket_mask_policy_for_dispatch(DispatchWriteChip::Bm1398, 256)
+            .expect("BM1398 ticket-mask policy");
+        assert_eq!(s19.mask, 0x0000_00FF);
+        assert_eq!(s19.register, dcentrald_common::TICKET_MASK_REG_BM1397PLUS);
+
+        let s21 = WorkDispatcher::ticket_mask_policy_for_dispatch(DispatchWriteChip::Bm1368, 128)
+            .expect("BM1368 ticket-mask policy");
+        assert_eq!(s21.mask, 0x0000_007F);
+
+        assert_eq!(
+            dcentrald_common::compute_ticket_mask_policy(0xFFFF, 256),
+            Err(dcentrald_common::TicketMaskPolicyError::UnknownChip { chip_id: 0xFFFF })
+        );
+
+        let source = include_str!("work_dispatcher.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("work-dispatcher test boundary missing")];
+        assert!(
+            !production.contains("set_ticket_mask"),
+            "dispatcher must not write ticket-mask hardware this campaign"
+        );
+        assert!(
+            production.contains("compute_ticket_mask_policy"),
+            "dispatcher ticket-mask helper must call the compute-only policy fn"
+        );
+    }
+
+    #[test]
     fn chain_frequency_limits_use_most_restrictive_active_source() {
         let mut limits = ChainFrequencyLimits::default();
         assert_eq!(limits.effective_ceiling(), None);
@@ -4730,6 +5033,22 @@ mod tests {
 
         assert!(limits.set(FrequencyLimitSource::AutotunerThermal, None));
         assert_eq!(limits.effective_ceiling(), Some(650));
+    }
+
+    #[test]
+    fn bad_chip_ceiling_is_decrease_only() {
+        let mut limits = ChainFrequencyLimits::default();
+        assert!(limits.set(FrequencyLimitSource::BadChip, Some(400)));
+        assert_eq!(limits.effective_ceiling(), Some(400));
+        assert!(
+            !limits.set(FrequencyLimitSource::BadChip, Some(500)),
+            "live nameplate must not raise an existing BadChip ceiling"
+        );
+        assert_eq!(limits.effective_ceiling(), Some(400));
+        assert!(limits.set(FrequencyLimitSource::BadChip, Some(375)));
+        assert_eq!(limits.effective_ceiling(), Some(375));
+        assert!(limits.set(FrequencyLimitSource::BadChip, None));
+        assert_eq!(limits.effective_ceiling(), None);
     }
 
     #[test]

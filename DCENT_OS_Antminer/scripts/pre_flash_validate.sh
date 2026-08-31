@@ -26,7 +26,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-. "$SCRIPT_DIR/lib/am3_geometry.sh"
+AM3_GEOMETRY_HELPER=${AM3_GEOMETRY_HELPER:-"$SCRIPT_DIR/lib/am3_geometry.sh"}
 ZYNQ_GEOMETRY_HELPER="$SCRIPT_DIR/lib/sysupgrade_zynq_geometry.sh"
 [ -r "$ZYNQ_GEOMETRY_HELPER" ] || {
     echo "FAIL: canonical Zynq geometry helper is missing: $ZYNQ_GEOMETRY_HELPER" >&2
@@ -44,7 +44,8 @@ ARCHIVE_ADMISSION_HELPER="$SCRIPT_DIR/lib/sysupgrade_archive_admission.sh"
 MANIFEST_JSON_HELPER="$SCRIPT_DIR/lib/sysupgrade_manifest_json.py"
 [ -r "$ARCHIVE_ADMISSION_HELPER" ] || fail "canonical sysupgrade archive-admission helper is missing: $ARCHIVE_ADMISSION_HELPER"
 [ -r "$MANIFEST_JSON_HELPER" ] || fail "canonical semantic manifest helper is missing: $MANIFEST_JSON_HELPER"
-command -v python3 >/dev/null 2>&1 || fail "python3 is required for semantic manifest admission"
+PYTHON3=${PYTHON3:-python3}
+command -v "$PYTHON3" >/dev/null 2>&1 || fail "python3 is required for semantic manifest admission"
 # shellcheck source=lib/sysupgrade_archive_admission.sh
 . "$ARCHIVE_ADMISSION_HELPER"
 command -v dcent_sysupgrade_archive_admit >/dev/null 2>&1 \
@@ -128,11 +129,13 @@ validate_board_payload_profile() {
     kernel_size=$5
 
     case "$board" in
-        # Every Amlogic package emitted by the current Buildroot targets uses
-        # the same host-driven rootfs-window payload contract.  This gate is
-        # deliberately capability-scoped: admitting the package shape does
-        # not authorize a live NAND write or weaken per-board identity gates.
-        am3-s19jpro-aml|am3-s19jproplus|am3-s19k|am3-s19xp|am3-s19jxp|am3-s21|am3-s21pro|am3-s21xp|am3-t21)
+        # Amlogic targets with an evidence-backed host-driven rootfs-window
+        # contract. Package-shape admission still does not authorize a write.
+        am3-s19jpro-aml|am3-s19jproplus|am3-s19k|am3-s21|am3-s21pro)
+            [ -r "$AM3_GEOMETRY_HELPER" ] \
+                || fail "canonical AM3 geometry helper is missing: $AM3_GEOMETRY_HELPER"
+            # shellcheck source=/dev/null
+            . "$AM3_GEOMETRY_HELPER"
             ROOT_MAGIC=$(payload_magic "$root_path")
             KERNEL_MAGIC=$(payload_magic "$kernel_path")
             [ "$ROOT_MAGIC" = "27051956" ] || fail "AM3 root payload is not a uImage (magic=$ROOT_MAGIC)"
@@ -141,6 +144,13 @@ validate_board_payload_profile() {
             [ "$root_size" -le "$DCENT_AM3_ROOTFS_WINDOW_DEC" ] \
                 || fail "AM3 root payload exceeds am3 rootfs window (${root_size}B > ${DCENT_AM3_ROOTFS_WINDOW_DEC}B)"
             pass "AM3 root payload fits am3 rootfs window (${root_size}B <= ${DCENT_AM3_ROOTFS_WINDOW_DEC}B)"
+            ;;
+        am3-s19xp|am3-s19jxp|am3-s21xp|am3-t21)
+            ROOT_MAGIC=$(payload_magic "$root_path")
+            KERNEL_MAGIC=$(payload_magic "$kernel_path")
+            [ "$ROOT_MAGIC" = "27051956" ] || fail "$board root payload is not a uImage (magic=$ROOT_MAGIC)"
+            [ "$KERNEL_MAGIC" = "27051956" ] || fail "$board kernel payload is not a uImage (magic=$KERNEL_MAGIC)"
+            pass "$board package uImage magic valid; no storage window or flash authority implied"
             ;;
         am1-s9|am2-s19j|am2-s19jpro|am2-s19pro|am2-s17p)
             ROOT_MAGIC=$(payload_magic "$root_path")
@@ -254,7 +264,7 @@ validate_package_only() {
     pass "SHA256SUMS verifies kernel/root/METADATA"
 
     MANIFEST="$SUP_DIR/MANIFEST.json"
-    python3 "$MANIFEST_JSON_HELPER" validate "$MANIFEST" \
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" validate "$MANIFEST" \
         || fail "MANIFEST.json failed semantic/canonical JSON admission"
     for authority_key in schema manifest_profile product package_type installable artifact_maturity board board_target version; do
         [ "$(manifest_key_count "$MANIFEST" "$authority_key")" = "1" ] \
@@ -315,8 +325,17 @@ validate_package_only() {
         || fail "MANIFEST.json product must be DCENT_OS"
     [ "$(manifest_string_field package_type "$MANIFEST" || echo)" = "sysupgrade" ] \
         || fail "MANIFEST.json package_type must be sysupgrade"
-    [ "$(manifest_boolean_field installable "$MANIFEST" || echo)" = "true" ] \
-        || fail "MANIFEST.json must declare JSON boolean installable=true"
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" verify-package-authority "$MANIFEST" "$EXPECTED_BOARD" \
+        || fail "MANIFEST.json package authority is inconsistent with $EXPECTED_BOARD"
+    PACKAGE_INSTALLABLE=$(manifest_boolean_field installable "$MANIFEST" || echo)
+    case "$PACKAGE_INSTALLABLE" in
+        true|false) ;;
+        *) fail "MANIFEST.json installable must be one exact JSON boolean" ;;
+    esac
+    if is_truthy "${DCENT_REQUIRE_INSTALLABLE_PACKAGE:-0}" && \
+       [ "$PACKAGE_INSTALLABLE" != true ]; then
+        fail "caller requires installable=true; inspection-only package is not install authority"
+    fi
     [ "$(manifest_string_field artifact_maturity "$MANIFEST" || echo)" = "experimental" ] \
         || fail "MANIFEST.json artifact_maturity must be experimental"
     MANIFEST_VERSION=$(manifest_string_field version "$MANIFEST" || echo)
@@ -325,7 +344,7 @@ validate_package_only() {
     MANIFEST_VERSION_TRIMMED=$(printf '%s' "$MANIFEST_VERSION" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ "$MANIFEST_VERSION" = "$MANIFEST_VERSION_TRIMMED" ] \
         || fail "MANIFEST.json version must not contain surrounding whitespace"
-    pass "MANIFEST.json carries the versioned typed sysupgrade authority contract"
+    pass "MANIFEST.json carries a typed install or package-only denial contract"
 
     [ "$(manifest_string_field board "$MANIFEST" || echo)" = "$EXPECTED_BOARD" ] \
         || fail "MANIFEST.json board does not match $EXPECTED_BOARD"
@@ -346,13 +365,13 @@ validate_package_only() {
     ROOT_SHA=$(sha256sum "$SUP_DIR/root" | awk '{ print $1 }')
     METADATA_SHA=$(sha256sum "$SUP_DIR/METADATA" | awk '{ print $1 }')
     METADATA_SIZE=$(stat -c%s "$SUP_DIR/METADATA" 2>/dev/null || stat -f%z "$SUP_DIR/METADATA" 2>/dev/null || echo 0)
-    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" kernel \
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" kernel \
         "$EXPECTED_PREFIX/kernel" "$KERNEL_SIZE" "$KERNEL_SHA" \
         || fail "MANIFEST.json kernel payload object does not match the exact file"
-    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" rootfs \
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" rootfs \
         "$EXPECTED_PREFIX/root" "$ROOT_SIZE" "$ROOT_SHA" \
         || fail "MANIFEST.json rootfs payload object does not match the exact file"
-    python3 "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" metadata \
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" verify-payload "$MANIFEST" metadata \
         "$EXPECTED_PREFIX/METADATA" "$METADATA_SIZE" "$METADATA_SHA" \
         || fail "MANIFEST.json metadata payload object does not match the exact file"
     pass "MANIFEST.json payload paths/sizes/hashes match actual files"
@@ -755,7 +774,7 @@ gate_8a_package_signed() {
         rm -rf "$SIG_TMPDIR"
         fail "8a/8 MANIFEST.json is missing"
     }
-    python3 "$MANIFEST_JSON_HELPER" validate "$G8A_MANIFEST" || {
+    "$PYTHON3" "$MANIFEST_JSON_HELPER" validate "$G8A_MANIFEST" || {
         rm -rf "$SIG_TMPDIR"
         fail "8a/8 manifest failed semantic/canonical JSON admission"
     }

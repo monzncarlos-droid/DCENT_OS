@@ -115,7 +115,9 @@ nerdoctaxe-gamma = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", 
 # upstream (probe fails => "assuming non-QX board" => clamp to 495 MHz /
 # 1150 mV). We ship the clamped envelope until that probe is wired, so this
 # target mines at the conservative operating point, not the nominal 777 MHz.
-nerdqx           = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
+# `temp-tmp451` wires the identity mux (GPIO2/GPIO3 at 0x4C). A positive
+# probe raises the clamped 495 MHz / 1150 mV envelope to nominal 777 / 1200.
+nerdqx           = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302", "temp-tmp451"]
 # NerdHaxe-γ — 6x BM1370, 4-phase TPS53647 (120 A).
 nerdhaxe-gamma   = ["pins-nerd", "display-none", "dcentaxe-hal/power-tps5364x", "dcentaxe-hal/fan-emc2302"]
 # NerdEKO — 12x BM1370 on a 6-phase TPS53667 (240 A). The largest board in the
@@ -291,3 +293,4 @@ asic-kf1950 = ["dcentaxe-asic/asic-kf1950", "dcentaxe-mining/asic-kf1950"]
 
 [build-dependencies]
 embuild = "0.33"
+serde_json = "1"

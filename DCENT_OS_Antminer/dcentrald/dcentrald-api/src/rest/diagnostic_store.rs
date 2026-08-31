@@ -232,6 +232,10 @@ mod tests {
     const REST_SOURCE: &str = include_str!("../rest.rs");
     const LATE_SOURCE: &str = include_str!("late.rs");
     const DIAGNOSTICS_SOURCE: &str = include_str!("../../../dcentrald-diagnostics/src/lib.rs");
+    const I2C_HAL_SOURCE: &str = include_str!("../../../dcentrald-hal/src/i2c.rs");
+    const WORK_DISPATCHER_SOURCE: &str = include_str!("../../../dcentrald/src/work_dispatcher.rs");
+    const DAEMON_SOURCE: &str = include_str!("../../../dcentrald/src/daemon.rs");
+    const SERIAL_MINING_SOURCE: &str = include_str!("../../../dcentrald/src/serial_mining.rs");
 
     #[tokio::test]
     async fn busy_owner_rejects_without_queueing_or_running_the_operation() {
@@ -302,7 +306,7 @@ mod tests {
 
         let timed_marker = "persist_snapshot_artifact(test_id, report, |generator, report|";
         let timed_call = REST_SOURCE
-            .find(&timed_marker)
+            .find(timed_marker)
             .expect("timed HashReport persistence call");
         let timed_end = (timed_call + 800).min(REST_SOURCE.len());
         assert!(REST_SOURCE[timed_call..timed_end].contains(".await"));
@@ -360,6 +364,75 @@ mod tests {
             board_persist < board_publish,
             "BoardHealth must not emit lifecycle completion before durable persistence"
         );
+        let network_start = LATE_SOURCE
+            .find("pub(super) async fn get_diag_network(")
+            .expect("bounded network diagnostic route");
+        let network_end = LATE_SOURCE[network_start..]
+            .find("pub(super) async fn get_diag_psu(")
+            .map(|offset| network_start + offset)
+            .expect("bounded network route boundary");
+        let network_route = &LATE_SOURCE[network_start..network_end];
+        let bounded_probe = network_route
+            .find("run_network_diagnostic(NetworkProbeInput")
+            .expect("network route must use the bounded probe owner");
+        let publish = network_route
+            .find(".publish_network_test_telemetry(telemetry)")
+            .expect("network route must publish a typed lifecycle snapshot");
+        assert!(bounded_probe < publish);
+        assert!(network_route.contains("cached_pool_status:"));
+        assert!(network_route.contains("cached_pool_connected,"));
+        assert!(!network_route.contains("TcpStream"));
+
+        let psu_start = network_end;
+        let psu_end = LATE_SOURCE[psu_start..]
+            .find("pub(super) async fn get_diag_fpga(")
+            .map(|offset| psu_start + offset)
+            .expect("PSU route boundary");
+        let psu_route = &LATE_SOURCE[psu_start..psu_end];
+        assert!(psu_route.contains("live_power.timestamp_ms > 0"));
+        assert!(psu_route.contains(".publish_psu_probe_telemetry(UnattestedPsuTelemetry"));
+        assert!(psu_route.contains(".publish_psu_probe_unavailable("));
+        assert!(!psu_route.contains("I2cBus"));
+        assert!(!psu_route.contains("Pmbus"));
+
+        let fpga_start = psu_end;
+        let fpga_end = LATE_SOURCE[fpga_start..]
+            .find("async fn get_diag_fpga_recovery(")
+            .map(|offset| fpga_start + offset)
+            .expect("FPGA route boundary");
+        let fpga_route = &LATE_SOURCE[fpga_start..fpga_end];
+        let retained_read = fpga_route
+            .find(".fpga_status_rx")
+            .expect("FPGA route must clone the retained owner snapshot");
+        let publish = fpga_route
+            .find(".publish_fpga_status_runtime_telemetry(telemetry.clone())")
+            .expect("FPGA route must publish typed retained telemetry");
+        assert!(retained_read < publish);
+        assert!(fpga_route.contains(".publish_fpga_status_unavailable("));
+        assert!(fpga_route.contains("hardware_access_attempted"));
+        assert!(!fpga_route.contains("Command::new(\"devmem\")"));
+        assert!(!fpga_route.contains("FpgaChain::open"));
+        assert!(!fpga_route.contains("UioDevice"));
+
+        let capture_start = WORK_DISPATCHER_SOURCE
+            .find("fn capture_fpga_runtime_telemetry(")
+            .expect("FPGA owner capture function");
+        let capture_end = WORK_DISPATCHER_SOURCE[capture_start..]
+            .find("fn publish_fpga_runtime_telemetry(")
+            .map(|offset| capture_start + offset)
+            .expect("FPGA owner capture boundary");
+        let capture = &WORK_DISPATCHER_SOURCE[capture_start..capture_end];
+        assert!(capture.contains("self.i2c_active.load(Ordering::Acquire)"));
+        assert!(capture.contains("read_cmd_status()"));
+        assert!(capture.contains("read_work_tx_status()"));
+        assert!(capture.contains("read_work_rx_status()"));
+        assert!(!capture.contains("REG_CMD_RX_FIFO"));
+        assert!(!capture.contains("REG_WORK_RX_FIFO"));
+        assert!(!capture.contains(".write_"));
+        assert!(DAEMON_SOURCE.contains("watch::channel(None::<"));
+        assert!(DAEMON_SOURCE.contains("fpga_status_rx: Some(fpga_status_rx)"));
+        assert!(DAEMON_SOURCE.contains("dispatcher.set_fpga_status_tx(fpga_status_tx)"));
+
         let asic_start = LATE_SOURCE
             .find("pub(super) async fn get_diag_asic_comm(")
             .expect("passive ASIC communication route");
@@ -373,6 +446,48 @@ mod tests {
         assert!(asic_route.contains(".publish_asic_comm_snapshot(snapshot.clone())"));
         assert!(!asic_route.contains("send_command("));
         assert!(!asic_route.contains("AsicCommTest {"));
+
+        let i2c_start = LATE_SOURCE
+            .find("fn map_i2c_observed_operation(")
+            .expect("passive I2C retained-observation adapter");
+        let i2c_end = LATE_SOURCE[i2c_start..]
+            .find("pub(super) fn build_diag_failure_modes_response()")
+            .map(|offset| i2c_start + offset)
+            .expect("passive I2C route boundary");
+        let i2c_route = &LATE_SOURCE[i2c_start..i2c_end];
+        assert!(i2c_route.contains("state.i2c_observation_readers.lock()"));
+        assert!(i2c_route.contains("let snapshot = reader.snapshot();"));
+        assert!(i2c_route.contains(".publish_i2c_runtime_telemetry(telemetry.clone())"));
+        assert!(i2c_route.contains(".publish_i2c_observations_unavailable("));
+        assert!(i2c_route.contains("\"scan_performed\": false"));
+        assert!(i2c_route.contains("\"absence_inference_authorized\": false"));
+        for forbidden in [
+            ".read_bytes(",
+            ".write_read(",
+            "I2cBus::",
+            "spawn_i2c_service",
+            "Command::new(",
+            "tokio::spawn",
+        ] {
+            assert!(
+                !i2c_route.contains(forbidden),
+                "I2C observation route must not contain active operation `{forbidden}`"
+            );
+        }
+
+        assert!(I2C_HAL_SOURCE.contains("pub fn observation_reader(&self)"));
+        assert!(I2C_HAL_SOURCE.contains("let observation_operation = observable_operation(&req);"));
+        assert!(I2C_HAL_SOURCE.contains("if result.is_ok()"));
+        assert!(
+            I2C_HAL_SOURCE.contains("record_successful_observation(addr, observation_operation)")
+        );
+        assert!(!I2C_HAL_SOURCE.contains("I2cRequest::Scan"));
+        assert!(I2C_HAL_SOURCE.contains("I2cRequest::Pic16Admission { .. }"));
+        assert!(I2C_HAL_SOURCE.contains("| I2cRequest::Pic16HeartbeatRound { .. }"));
+        assert!(DAEMON_SOURCE.contains("i2c_svc.observation_reader()"));
+        assert!(DAEMON_SOURCE.contains("existing.bus() != reader.bus()"));
+        assert!(SERIAL_MINING_SOURCE
+            .contains(".map(dcentrald_hal::i2c::I2cServiceHandle::observation_reader)"));
 
         assert!(STORE_SOURCE.contains("static DIAGNOSTIC_READ_OWNER:"));
         assert!(STORE_SOURCE.contains("async fn load_snapshot_artifact("));

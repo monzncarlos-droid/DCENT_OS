@@ -542,28 +542,29 @@ pub enum SupervisorPlatform {
     Unknown,
 }
 
-impl SupervisorPlatform {
-    /// Map a `/etc/dcentos/board_target`-style marker to a platform family.
-    /// Conservative: anything unrecognized maps to [`Unknown`], which is
-    /// never default-on.
-    pub fn from_board_target(marker: &str) -> Self {
-        let m = marker.trim().to_ascii_lowercase();
-        // S9 SE (Ctrl_C43 / BM1393) is not classic S9. Prefix `am1` /
-        // substring `s9` would otherwise inherit Am1S9 tach/FanFailure.
-        let compact = m.replace([' ', '-', '_'], "");
-        if compact.contains("s9se") {
-            SupervisorPlatform::Unknown
-        } else if m.starts_with("am1") || m.contains("s9") {
-            SupervisorPlatform::Am1S9
-        } else if m.starts_with("am2") || m.contains("zynq") || m.contains("xil") {
-            SupervisorPlatform::Am2Zynq
-        } else if m.starts_with("am3-bb") || m.contains("beaglebone") || m.contains("am335") {
-            SupervisorPlatform::Am3Bb
-        } else if m.starts_with("am3") || m.contains("aml") {
-            SupervisorPlatform::Am3Aml
-        } else {
-            SupervisorPlatform::Unknown
+impl From<dcentrald_common::board_desc::SupervisorClass> for SupervisorPlatform {
+    fn from(class: dcentrald_common::board_desc::SupervisorClass) -> Self {
+        use dcentrald_common::board_desc::SupervisorClass;
+
+        match class {
+            SupervisorClass::Am1S9 => Self::Am1S9,
+            SupervisorClass::Am2Zynq => Self::Am2Zynq,
+            SupervisorClass::Am3Aml => Self::Am3Aml,
+            SupervisorClass::Am3Bb => Self::Am3Bb,
+            SupervisorClass::Unclassified => Self::Unknown,
         }
+    }
+}
+
+impl SupervisorPlatform {
+    /// Resolve a `/etc/dcentos/board_target` marker through the exact board
+    /// registry and its single-source alias table.
+    ///
+    /// An unregistered marker, or a registered row without an executable
+    /// mining lane, maps to [`Unknown`]. In particular, sibling names and SoC
+    /// substrings cannot inherit another board's thermal assumptions.
+    pub fn from_board_target(marker: &str) -> Self {
+        dcentrald_common::board_desc::BoardDesc::supervisor_class_for_target(marker).into()
     }
 }
 
@@ -656,6 +657,19 @@ pub struct ThermalSupervisor {
     /// Seconds since the most recent profile step (drives ATM post-ramp
     /// grace).
     secs_since_last_step: u32,
+    /// Same fail-closed arming as [`crate::controller::ThermalController`].
+    immersion_active: bool,
+    immersion_temp_offset_c: u8,
+}
+
+/// Offset + 90 °C-clamped supervisor thresholds (immersion bar).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SupervisorThresholds {
+    pub board_target_c: f32,
+    pub board_hot_c: f32,
+    pub board_panic_c: f32,
+    pub chip_hot_c: f32,
+    pub chip_panic_c: f32,
 }
 
 impl ThermalSupervisor {
@@ -666,6 +680,53 @@ impl ThermalSupervisor {
             boards: HashMap::new(),
             uptime_secs: 0,
             secs_since_last_step: u32::MAX, // start fully cooled-down
+            immersion_active: false,
+            immersion_temp_offset_c: 0,
+        }
+    }
+
+    /// Arm immersion the same way the PID controller does. Default-off:
+    /// air-cooled units stay on raw thresholds.
+    pub fn enable_immersion(
+        &mut self,
+        config: &crate::immersion::ImmersionConfig,
+        platform_looks_air_cooled: bool,
+    ) -> crate::immersion::ImmersionDecision {
+        let decision = config.decide(platform_looks_air_cooled);
+        self.immersion_active = decision.fans_bypassed();
+        self.immersion_temp_offset_c = if self.immersion_active {
+            config.immersion_temp_offset_c
+        } else {
+            0
+        };
+        decision
+    }
+
+    /// Board/chip target/hot/panic after immersion offset, clamped to the
+    /// residential 90 °C ceiling. Air-cooled / offset-0 is the raw config.
+    pub fn effective_thresholds(&self) -> SupervisorThresholds {
+        let ceiling = crate::controller::ABSOLUTE_DANGEROUS_CEILING_C as f32;
+        if !self.immersion_active || self.immersion_temp_offset_c == 0 {
+            return SupervisorThresholds {
+                board_target_c: self.config.board_target_c,
+                board_hot_c: self.config.board_hot_c,
+                board_panic_c: self.config.board_panic_c,
+                chip_hot_c: self.config.chip_hot_c,
+                chip_panic_c: self.config.chip_panic_c,
+            };
+        }
+        let offset = self.immersion_temp_offset_c as f32;
+        let board_panic = (self.config.board_panic_c + offset).min(ceiling);
+        let chip_panic = (self.config.chip_panic_c + offset).min(ceiling);
+        let board_hot = (self.config.board_hot_c + offset).min(board_panic - 1.0);
+        let chip_hot = (self.config.chip_hot_c + offset).min(chip_panic - 1.0);
+        let board_target = (self.config.board_target_c + offset).min(board_hot - 1.0);
+        SupervisorThresholds {
+            board_target_c: board_target,
+            board_hot_c: board_hot,
+            board_panic_c: board_panic,
+            chip_hot_c: chip_hot,
+            chip_panic_c: chip_panic,
         }
     }
 
@@ -846,6 +907,7 @@ impl ThermalSupervisor {
         // false for the empty-vec shape so it produces NoOp instead of a cool verdict.
         let mut max_board_was_cool = !sample.board_sensors.is_empty();
         let mut any_above_target = false;
+        let th = self.effective_thresholds();
         for board in &sample.board_sensors {
             let chain_id = board.chain_id;
             let bs = self.boards.entry(chain_id).or_default();
@@ -1034,9 +1096,10 @@ impl ThermalSupervisor {
                 bs.chip_imbalance_flagged = false;
             }
 
-            // Panic thresholds — power off this board. Uses the raw finite max
-            // (F-thermal-1) so a dropped-as-"liar" sensor at panic level still fires.
-            if raw_finite_pcb_max >= self.config.board_panic_c {
+            // Panic / hot / target use immersion-shifted thresholds (90 °C
+            // clamp after offset). Raw sensor values still feed the compare
+            // so a liar-dropped sensor at panic still fires (F-thermal-1).
+            if raw_finite_pcb_max >= th.board_panic_c {
                 if board.powered_on {
                     bs.ever_thermal_off = true;
                     actions.push(SupervisorAction::RequestBoardPowerOff {
@@ -1049,7 +1112,7 @@ impl ThermalSupervisor {
                 any_above_target = true;
                 continue;
             }
-            if raw_finite_chip_max >= self.config.chip_panic_c {
+            if raw_finite_chip_max >= th.chip_panic_c {
                 if board.powered_on {
                     bs.ever_thermal_off = true;
                     actions.push(SupervisorAction::RequestBoardPowerOff {
@@ -1065,10 +1128,10 @@ impl ThermalSupervisor {
 
             // Hot — request fans toward home cap (NOT 100%) + ATM step
             // down.
-            let hot = board_max >= self.config.board_hot_c || chip_max >= self.config.chip_hot_c;
+            let hot = board_max >= th.board_hot_c || chip_max >= th.chip_hot_c;
             if hot {
                 actions.push(SupervisorAction::RequestFansMax {
-                    reason: if board_max >= self.config.board_hot_c {
+                    reason: if board_max >= th.board_hot_c {
                         ThermalReason::BoardHot
                     } else {
                         ThermalReason::ChipHot
@@ -1078,7 +1141,7 @@ impl ThermalSupervisor {
                     && self.secs_since_last_step >= self.config.atm_post_ramp_grace_secs
                 {
                     actions.push(SupervisorAction::RequestProfileStepDown {
-                        reason: if chip_max >= self.config.chip_hot_c {
+                        reason: if chip_max >= th.chip_hot_c {
                             ThermalReason::ChipHot
                         } else {
                             ThermalReason::BoardHot
@@ -1092,17 +1155,16 @@ impl ThermalSupervisor {
             }
 
             // Above target but below hot — curve.
-            if board_max >= self.config.board_target_c {
+            if board_max >= th.board_target_c {
                 any_above_target = true;
                 max_board_was_cool = false;
             }
 
             // Recovery: powered-off board returning to cool band.
             if !board.powered_on && bs.ever_thermal_off && self.config.overtemp_auto_recovery {
-                let cool_enough = board_max
-                    < self.config.board_hot_c - self.config.atm_temp_window_c
+                let cool_enough = board_max < th.board_hot_c - self.config.atm_temp_window_c
                     && (valid_chip.is_empty()
-                        || chip_max < self.config.chip_hot_c - self.config.atm_chip_temp_window_c);
+                        || chip_max < th.chip_hot_c - self.config.atm_chip_temp_window_c);
                 if cool_enough {
                     if bs.recovery_attempts < self.config.max_reboot {
                         bs.recovery_attempts += 1;
@@ -1994,38 +2056,61 @@ mod tests {
         }
     }
 
-    // -- THERMAL-8: board_target marker maps to the right platform family --
+    // -- THERMAL-8: board_target marker maps through the exact registry --
     #[test]
     fn supervisor_platform_from_board_target_classifies() {
+        use dcentrald_common::board_desc::BoardDesc;
         use SupervisorPlatform::*;
+
         assert_eq!(SupervisorPlatform::from_board_target("am1-s9"), Am1S9);
-        assert_eq!(SupervisorPlatform::from_board_target("S9"), Am1S9);
         assert_eq!(
-            SupervisorPlatform::from_board_target("am2-s19jpro"),
+            SupervisorPlatform::from_board_target("am2-s19jpro-zynq"),
             Am2Zynq
         );
-        assert_eq!(
-            SupervisorPlatform::from_board_target("zynq-bm3-am2"),
-            Am2Zynq
-        );
-        assert_eq!(SupervisorPlatform::from_board_target("xil"), Am2Zynq);
         // am3-bb must classify as BB, NOT generic am3-aml (more-specific first).
         assert_eq!(
             SupervisorPlatform::from_board_target("am3-bb-s19jpro"),
             Am3Bb
         );
-        assert_eq!(SupervisorPlatform::from_board_target("am3-aml"), Am3Aml);
-        assert_eq!(
-            SupervisorPlatform::from_board_target("amlogic-a113d"),
-            Am3Aml
-        );
-        assert_eq!(
-            SupervisorPlatform::from_board_target("something-else"),
-            Unknown
-        );
-        // S9 SE is not classic S9 — do not inherit Am1S9 FanFailure/tach.
-        assert_eq!(SupervisorPlatform::from_board_target("am1-s9se"), Unknown);
-        assert_eq!(SupervisorPlatform::from_board_target("Antminer S9 SE"), Unknown);
+        assert_eq!(SupervisorPlatform::from_board_target("am3-s21"), Am3Aml);
+
+        for desc in BoardDesc::all_registered() {
+            assert_eq!(
+                SupervisorPlatform::from_board_target(desc.board_target),
+                SupervisorPlatform::from(desc.supervisor_class),
+                "{} must mirror its exact registry supervisor class",
+                desc.board_target
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_platform_from_board_target_fails_closed_on_siblings_and_substrings() {
+        use SupervisorPlatform::Unknown;
+
+        for marker in [
+            "am1-s9se",
+            "am1-s9i",
+            "am1-s9j",
+            "am1-s11",
+            "am1-s15",
+            "am1-t15",
+            "am1-t9plus",
+            "S9",
+            "Antminer S9 SE",
+            "zynq-bm3-am2",
+            "xil",
+            "am3-aml",
+            "amlogic-a113d",
+            "beaglebone",
+            "something-else",
+        ] {
+            assert_eq!(
+                SupervisorPlatform::from_board_target(marker),
+                Unknown,
+                "{marker:?} must not inherit another board's thermal lane"
+            );
+        }
     }
 
     // -- THERMAL-9: passing the FULL per-fan RPM vector avoids the spurious
@@ -2778,5 +2863,113 @@ mod tests {
             let out = filter_actions_for_declared_medium(declared, cuts.clone());
             assert_eq!(out, cuts, "declared {declared:?}: hash cuts must survive");
         }
+    }
+
+    #[test]
+    fn daemon_arms_supervisor_immersion_with_controller() {
+        let daemon = include_str!("../../dcentrald/src/daemon.rs");
+        assert!(
+            daemon.contains("sup.enable_immersion("),
+            "daemon must arm supervisor immersion with the same config as the controller"
+        );
+        assert!(
+            daemon.contains("&thermal_immersion_cfg"),
+            "supervisor immersion must consume the production [thermal.immersion] capture"
+        );
+    }
+
+    #[test]
+    fn immersion_offset_shifts_panic_and_clamps_to_90c() {
+        let mut s = ThermalSupervisor::new(cfg_enabled());
+        let air = s.effective_thresholds();
+        assert_eq!(air.board_panic_c, 70.0);
+        assert_eq!(air.chip_panic_c, 100.0);
+
+        let cfg = crate::immersion::ImmersionConfig {
+            enabled: true,
+            acknowledge_air_cooled_override: false,
+            immersion_temp_offset_c: 10,
+        };
+        assert_eq!(
+            s.enable_immersion(&cfg, false),
+            crate::immersion::ImmersionDecision::Activated
+        );
+        let wet = s.effective_thresholds();
+        assert_eq!(wet.board_panic_c, 80.0);
+        assert_eq!(wet.chip_panic_c, 90.0, "chip panic 100+10 must clamp to 90");
+        assert!(wet.board_hot_c < wet.board_panic_c);
+        assert!(wet.board_target_c < wet.board_hot_c);
+        assert!(wet.chip_hot_c < wet.chip_panic_c);
+    }
+
+    #[test]
+    fn immersion_offset_does_not_trip_air_cooled_panic_at_75c() {
+        let mut s = ThermalSupervisor::new(cfg_enabled());
+        let sample = tick(
+            vec![board(0, vec![75.0, 75.0], vec![80.0])],
+            vec![1000],
+            30,
+            5,
+        );
+        let air = s.tick(&sample);
+        assert!(
+            air.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestBoardPowerOff {
+                    reason: ThermalReason::BoardPanic,
+                    ..
+                }
+            )),
+            "75 °C must panic at air-cooled 70 °C: {air:?}"
+        );
+
+        let mut s = ThermalSupervisor::new(cfg_enabled());
+        s.enable_immersion(
+            &crate::immersion::ImmersionConfig {
+                enabled: true,
+                acknowledge_air_cooled_override: false,
+                immersion_temp_offset_c: 10,
+            },
+            false,
+        );
+        let wet = s.tick(&sample);
+        assert!(
+            !wet.iter().any(|a| matches!(
+                a,
+                SupervisorAction::RequestBoardPowerOff {
+                    reason: ThermalReason::BoardPanic,
+                    ..
+                }
+            )),
+            "75 °C must not panic after +10 °C immersion offset: {wet:?}"
+        );
+    }
+
+    #[test]
+    fn immersion_still_panics_at_90c_ceiling() {
+        let mut s = ThermalSupervisor::new(cfg_enabled());
+        s.enable_immersion(
+            &crate::immersion::ImmersionConfig {
+                enabled: true,
+                acknowledge_air_cooled_override: false,
+                immersion_temp_offset_c: 20,
+            },
+            false,
+        );
+        let th = s.effective_thresholds();
+        assert_eq!(th.board_panic_c, 90.0);
+        let sample = tick(
+            vec![board(0, vec![91.0, 91.0], vec![91.0])],
+            vec![1000],
+            30,
+            5,
+        );
+        let actions = s.tick(&sample);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SupervisorAction::RequestBoardPowerOff { .. })),
+            "91 °C must still cut hash at the 90 °C ceiling: {actions:?}"
+        );
     }
 }

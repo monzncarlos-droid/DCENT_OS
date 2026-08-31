@@ -6,22 +6,35 @@
 // em-dash + "standby (assumed)" and the calculator's "(live)" tag is suppressed
 // unless the watts came from measured telemetry.
 
+import { readFileSync } from 'node:fs';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
 // EarningsPage polls /api/perf/efficiency and (via useNetworkContext)
 // /api/network/block. Both are wrapped in try/catch, so rejecting keeps the
 // component on its null-telemetry render path — exactly the state under test.
+// Donation fetch is resolved at the firmware default (2%), never 0%.
 vi.mock('../../api/client', () => ({
   api: {
     getPerfEfficiency: vi.fn().mockRejectedValue(new Error('no perf endpoint')),
     getNetworkBlock: vi.fn().mockRejectedValue(new Error('no network block')),
+    getDonationConfig: vi.fn().mockResolvedValue({ enabled: true, percent: 2 }),
   },
 }));
 
 import { EarningsPage } from './EarningsPage';
 import { useMinerStore } from '../../store/miner';
 import type { StatusResponse, StatsResponse } from '../../api/types';
+import {
+  applyTakeRates,
+  donationTakePercent,
+  DEFAULT_DONATION_PERCENT,
+  estimateDailyProfit,
+  seasonalHeatCredit,
+} from '../../utils/thermal';
+
+const earningsSrc = readFileSync('src/components/standard/EarningsPage.tsx', 'utf8');
 
 function setStore(opts: {
   status: Partial<StatusResponse> | null;
@@ -128,5 +141,108 @@ describe('EarningsPage — STD-A-09 Power Draw honesty', () => {
     render(<EarningsPage />);
 
     expect(screen.getByTestId('efficiency-jth-value').textContent).toContain('33.5 J/TH');
+  });
+});
+
+describe('EarningsPage — donation + pool fee net vs gross', () => {
+  it('defaults unknown donation to 2%, never 0%', () => {
+    expect(DEFAULT_DONATION_PERCENT).toBe(2);
+    expect(donationTakePercent(null)).toBe(2);
+    expect(donationTakePercent(undefined)).toBe(2);
+    expect(donationTakePercent({ enabled: false, percent: 2 })).toBe(0);
+    expect(donationTakePercent({ enabled: true, percent: 2 })).toBe(2);
+  });
+
+  it('subtracts donation then pool fee from gross sats and does not reduce electricity', () => {
+    const difficulty = 1e14;
+    const hashrateGhs = 100_000;
+    const watts = 1350;
+    const btcPrice = 100_000;
+    const kwh = 0.12;
+    const gross = estimateDailyProfit(hashrateGhs, watts, btcPrice, kwh, difficulty);
+    const net = estimateDailyProfit(hashrateGhs, watts, btcPrice, kwh, difficulty, {
+      donationPercent: 2,
+      poolFeePercent: 1,
+    });
+    const taken = applyTakeRates(gross.grossSats, 2, 1);
+
+    expect(gross.sats).toBe(gross.grossSats);
+    expect(net.grossSats).toBe(gross.grossSats);
+    expect(net.sats).toBe(taken.netSats);
+    expect(net.sats).toBe(Math.round(gross.grossSats * 0.98 * 0.99));
+    expect(net.sats).toBeLessThan(net.grossSats);
+    expect(net.revenue).toBeLessThan(net.grossRevenue);
+    expect(net.cost).toBe(gross.cost);
+    expect(net.profit).toBeCloseTo(net.revenue - net.cost, 10);
+    expect(net.donationPercent).toBe(2);
+    expect(net.poolFeePercent).toBe(1);
+  });
+
+  it('labels gross vs net and never presents 0% as the donation default', () => {
+    setStore({ status: { hashrate_ghs: 0, uptime_s: 0 }, stats: null });
+    render(<EarningsPage />);
+
+    expect(screen.getByTestId('earnings-net-sats').textContent).toMatch(/Net Sats/i);
+    expect(screen.getByTestId('earnings-gross-sats').textContent).toMatch(/Gross/i);
+    expect(screen.getByTestId('earnings-net-revenue').textContent).toMatch(/Net BTC Revenue/i);
+    expect(screen.getByTestId('earnings-net-btc-profit').textContent).toMatch(/heat-credit is not included/i);
+    expect(screen.getByTestId('earnings-donation-rate')).toBeTruthy();
+    expect(screen.getByLabelText('Donation percent used in net earnings (firmware setting)')).toBeTruthy();
+    expect(earningsSrc).toContain('DEFAULT_DONATION_PERCENT');
+    expect(earningsSrc).not.toMatch(/donationPercent.*=\s*0\b/);
+  });
+});
+
+describe('EarningsPage — seasonal heat-credit is optional and not Bitcoin', () => {
+  it('keeps heat-credit out of BTC profit math', () => {
+    const difficulty = 1e14;
+    const btc = estimateDailyProfit(100_000, 1350, 100_000, 0.12, difficulty, {
+      donationPercent: 2,
+      poolFeePercent: 1,
+    });
+    const heat = seasonalHeatCredit({
+      wall_watts: 1350,
+      displaced_fraction: 0.85,
+      heating_season_active: 7 / 12,
+      kwh_rate: 0.12,
+    });
+    expect(heat).toBeGreaterThan(0);
+    expect(btc.profit).toBeCloseTo(btc.revenue - btc.cost, 10);
+    expect(btc.profit + heat).not.toBe(btc.profit);
+    expect('heatCredit' in btc).toBe(false);
+  });
+
+  it('renders heat-credit as an optional USD estimate, never as sats', () => {
+    setStore({
+      status: { hashrate_ghs: 100_000, uptime_s: 3600 },
+      stats: {
+        power: {
+          wall_watts: 1350,
+          source: 'pmbus',
+          source_detail: 'pmbus_measured',
+          live_power_available: true,
+        },
+      },
+    });
+    render(<EarningsPage />);
+
+    const credit = screen.getByTestId('seasonal-heat-credit');
+    expect(credit.textContent).toMatch(/OPTIONAL estimate — not Bitcoin/i);
+    expect(credit.textContent).toMatch(/Off/i);
+    expect(screen.getByTestId('seasonal-heat-credit-optional-label').textContent).toMatch(/never added to BTC earnings/i);
+    expect(screen.getByTestId('bitcoin-net-excludes-heat-credit').textContent).toMatch(/never mixed into sats/i);
+
+    const netProfit = screen.getByTestId('earnings-net-btc-profit').textContent ?? '';
+    expect(netProfit).not.toMatch(/heat-credit \+/i);
+
+    fireEvent.click(screen.getByLabelText('Include optional seasonal heat-credit estimate'));
+    expect(screen.getByTestId('seasonal-heat-credit').textContent).toMatch(/\$/);
+    expect(screen.getByTestId('seasonal-heat-credit').textContent).not.toMatch(/sats/i);
+  });
+
+  it('does not compute heat-credit from the standby 25 W assumption', () => {
+    expect(earningsSrc).toContain('wattsFromTelemetry ? wallWatts : 0');
+    expect(earningsSrc).toContain('heat-credit stays $0 rather than using standby watts');
+    expect(earningsSrc).not.toContain('estimateHeatingOffset(effectiveWatts');
   });
 });

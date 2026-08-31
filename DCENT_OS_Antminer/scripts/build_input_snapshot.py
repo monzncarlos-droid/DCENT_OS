@@ -404,7 +404,9 @@ def _load_selection_policy(
     blocked = module.BLOCKED_BUILD_INPUT_TARGETS.get(target)
     if blocked is not None:
         fail(blocked)
-    if target == "am2-s17pro" and payload_root is not None:
+    if target in ("am2-s17pro", "am2-s17plus", "am2-t17", "am2-t17plus") and (
+        payload_root is not None
+    ):
         try:
             evidence = module.discover_am2_s17_donor(payload_root)
         except module.ClosureError as error:

@@ -5,6 +5,12 @@ use std::time::Duration;
 /// Returning `false` preserves the current call-site contract while ensuring
 /// recovery code cannot create an unresolved session and then falsely claim a
 /// restart was scheduled.
+///
+/// NOTE (2026-08-16): the durable mutation-disposition journal
+/// (`dcentrald_common::mutation_disposition`) now exists and gates startup
+/// admission, but a clean/absent journal is still NOT a typed SafeOff receipt
+/// — process exit is not rail-cut evidence — so automatic restart REMAINS
+/// refused and this function keeps returning `false`.
 pub(crate) fn schedule_daemon_restart(reason: &str, delay: Duration) -> bool {
     tracing::error!(
         reason,

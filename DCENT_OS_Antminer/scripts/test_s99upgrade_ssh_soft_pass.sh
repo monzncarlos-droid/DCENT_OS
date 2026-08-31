@@ -85,27 +85,30 @@ make_fw_shims() {
     cat >"$shim_dir/fw_printenv" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$S99_TEST_WORK/fw_printenv.log"
-if [ "${1:-}" = "upgrade_stage" ]; then
-    if [ -f "$S99_TEST_WORK/upgrade_stage.present" ]; then
-        echo "upgrade_stage=1"
-        exit 0
-    fi
-    exit 1
-fi
+[ "${1:-}" = -c ] || exit 96
+[ "${2:-}" = "$S99_TEST_WORK/fw_env.config" ] || exit 97
+shift 2
 echo "firmware=1"
-if [ -f "$S99_TEST_WORK/upgrade_stage.present" ]; then
+if [ "$(cat "$S99_TEST_WORK/state")" = old ]; then
     echo "upgrade_stage=1"
+    echo "first_boot=yes"
 fi
-echo "first_boot=yes"
+echo "bootdelay=3"
 exit 0
 EOF
 
     cat >"$shim_dir/fw_setenv" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$S99_TEST_WORK/fw_setenv.log"
-if [ "${1:-}" = "upgrade_stage" ]; then
-    rm -f "$S99_TEST_WORK/upgrade_stage.present"
-fi
+[ "${1:-}" = -c ] || exit 96
+[ "${2:-}" = "$S99_TEST_WORK/fw_env.config" ] || exit 97
+shift 2
+[ "${1:-}" = --script ] || exit 98
+[ "${2:-}" = - ] || exit 99
+[ "$#" -eq 2 ] || exit 95
+cat > "$S99_TEST_WORK/fw_setenv.stdin"
+cmp -s "$S99_TEST_WORK/expected-stdin" "$S99_TEST_WORK/fw_setenv.stdin" || exit 94
+printf '%s\n' desired > "$S99_TEST_WORK/state"
 exit 0
 EOF
 
@@ -129,8 +132,13 @@ run_case() {
     : > "$work/mtd4"
     : > "$work/fw_env.config"
     : > "$work/dcentrald"
-    : > "$work/upgrade_stage.present"
+    printf '%s\n' old > "$work/state"
+    printf '%s\n' 'first_boot=' 'upgrade_stage=' > "$work/expected-stdin"
     : > "$work/fw_setenv.log"
+    printf '%s\n' dcent-s99upgrade-offline-test-v1 >"$work/offline.marker"
+    cat >"$work/uboot-env-admission.sh" <<'EOF'
+dcent_zynq_uboot_env_admit() { [ "$#" -eq 4 ]; }
+EOF
     chmod 0755 "$work/dcentrald"
 
     case "$mode" in
@@ -162,6 +170,11 @@ run_case() {
     S99_TEST_PID="$ALIVE_PID" \
     DCENTOS_MTD4_NODE="$work/mtd4" \
     DCENTOS_FW_ENV_CONFIG="$work/fw_env.config" \
+    DCENTOS_S99_OFFLINE_TEST=1 \
+    DCENTOS_S99_OFFLINE_MARKER="$work/offline.marker" \
+    DCENTOS_UBOOT_ENV_ADMISSION_HELPER="$work/uboot-env-admission.sh" \
+    DCENTOS_UBOOT_ENV_PROC_MTD="$work/proc-mtd" \
+    DCENTOS_UBOOT_ENV_SYSFS_MTD_ROOT="$work/sys-class-mtd" \
     DCENTOS_DCENTRALD_BIN="$work/dcentrald" \
     DCENTOS_UPGRADE_COMMIT_MARKER="$work/commit-marker" \
     DCENTOS_BOOT_SUCCESS_WINDOW_S=1 \
@@ -206,9 +219,13 @@ run_case() {
 
     case "$expected_marker" in
         committed)
-            grep -Fx "upgrade_stage" "$work/fw_setenv.log" >/dev/null || {
+            grep -Fx -- "-c $work/fw_env.config --script -" "$work/fw_setenv.log" >/dev/null || {
                 cat "$out" >&2
-                echo "FAIL: $label did not clear upgrade_stage" >&2
+                echo "FAIL: $label did not use the one-store commit" >&2
+                exit 1
+            }
+            cmp -s "$work/expected-stdin" "$work/fw_setenv.stdin" || {
+                echo "FAIL: $label did not consume first_boot= then upgrade_stage=" >&2
                 exit 1
             }
             ;;

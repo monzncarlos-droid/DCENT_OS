@@ -68,7 +68,8 @@ impl DvfsOptimizer {
                 let hashrate = crate::chip_geometry::chip_hashrate_ghs_for_chip(
                     self.power_model.chip_id(),
                     max_stable_mhz,
-                );
+                )
+                .unwrap_or(0.0);
                 let hashrate_ths = hashrate / 1000.0;
                 let efficiency = if hashrate_ths > 0.0 {
                     power / hashrate_ths

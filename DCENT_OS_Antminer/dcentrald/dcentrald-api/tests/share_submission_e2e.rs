@@ -72,6 +72,7 @@
 //! task and the client task don't deadlock on the single-threaded runtime.
 
 #![cfg(unix)]
+#![allow(clippy::doc_lazy_continuation)]
 
 use std::time::Duration;
 

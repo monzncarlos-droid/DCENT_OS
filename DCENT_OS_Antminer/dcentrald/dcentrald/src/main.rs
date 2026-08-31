@@ -21,6 +21,7 @@
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod am1_t15;
 mod am2_bm1362_serial_admission;
@@ -51,11 +52,13 @@ mod restart;
 mod runtime;
 mod runtime_execution;
 mod runtime_policy;
+mod s17_hybrid_admission;
+mod s17_hybrid_mining;
 mod s19j_hybrid_admission;
 mod s19j_hybrid_mining;
 mod s19j_tap_mining;
+mod s19k_endurance;
 mod serial_mining;
-mod s19k_braiins_wire_try;
 #[cfg(feature = "sim-hal")]
 mod sim_runtime;
 mod solar;
@@ -72,12 +75,20 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::DcentraldConfig;
+use crate::config::{load_error_is_definitely_absent, DcentraldConfig};
 use crate::daemon::Daemon;
 use crate::logging::init_logging;
+use crate::s17_hybrid_mining::S17HybridMiner;
 use crate::s19j_hybrid_mining::S19jHybridMiner;
 use crate::s19j_tap_mining::S19jTapMiner;
-use crate::serial_mining::SerialMiner;
+use crate::serial_mining::{
+    s19k_arm_permanent_pdeathsig_from_env, s19k_complete_daemon_pre_runtime_bootstrap,
+    s19k_consume_guarded_completion_from_cli, s19k_durable_replace_from_cli,
+    s19k_guarded_unlink_ephemeral_hardlink_from_cli, s19k_publish_ephemeral_journal_from_cli,
+    s19k_track1_startup_barrier_and_acquire_j3, S19kPreRuntimeBootstrapRole,
+    S19kPreRuntimeBootstrapState, S19kStockHandoffIdentity, S19kTrack1J3Lease,
+    S19kTrack1ReceiptAuthority, SerialMiner,
+};
 
 /// Default configuration file path (persistent storage).
 const DEFAULT_CONFIG_PATH: &str = "/data/dcentrald.toml";
@@ -192,6 +203,27 @@ fn is_s19j_am2_board_target(board_target: &str) -> bool {
     board_target == "am2-s19j" || board_target.starts_with("am2-s19jpro")
 }
 
+/// Auto-route classifier for the S17 hybrid lane (2026-08-27 promotion).
+///
+/// Exact board-target tokens only — never an `am2-*` prefix (ADR-0013 §6):
+/// `am2-s17p` covers S17 and S17 Pro (post-build stamp), with the historical
+/// `am2-s17` spelling admitted; the plus/T variants each promote their own
+/// registered descriptor. BM1362 targets never match here, and the two hybrid
+/// lanes' token sets are disjoint by construction.
+fn classify_s17_hybrid_auto(platform: &str, board_target: &str) -> bool {
+    let platform = platform.trim();
+    let board_target = board_target.trim();
+    matches!(platform, "zynq-bm3-am2") && is_s17_am2_board_target(board_target)
+}
+
+fn is_s17_am2_board_target(board_target: &str) -> bool {
+    let board_target = board_target.trim();
+    matches!(
+        board_target,
+        "am2-s17p" | "am2-s17" | "am2-s17plus" | "am2-t17" | "am2-t17plus"
+    )
+}
+
 /// R1 (2026-05-17): compute the am2 low-idle fan command tuple for the
 /// management-only park paths.
 ///
@@ -278,12 +310,18 @@ const KNOWN_CLI_BOOL_FLAGS: &[&str] = &[
     "--get-fan",
     "--allow-loud",
     "--s19j-hybrid",
+    "--s17-hybrid",
     "--serial-mining",
     "--tap-mode",
     "--stratum-proxy",
     "--am3-bb-mining",
     "--stock-fpga",
     "--safe-off",
+    "--s19k-track1-recovery-safeoff",
+    "--s19k-install-custody-safeoff",
+    "--s19k-track1-no-work",
+    "--s19k-track1-bounded-work-proof",
+    "--s19k-track1-endurance-work-proof",
 ];
 const KNOWN_CLI_VALUE_FLAGS: &[&str] = &[
     "--set-fan",
@@ -292,6 +330,37 @@ const KNOWN_CLI_VALUE_FLAGS: &[&str] = &[
     "--dwell-ms",
     "--config",
     "--verify-bundle",
+    "--s19k-bosminer-pid",
+    "--s19k-bosminer-start",
+    "--s19k-bosminer-ppid",
+    "--s19k-bosminer-pgrp",
+    "--s19k-bosminer-session",
+    "--s19k-bosminer-exe",
+    "--s19k-bosminer-cmdline-sha256",
+    "--s19k-bosminer-cmdline-bytes",
+    "--s19k-bos-tools-pid",
+    "--s19k-bos-tools-start",
+    "--s19k-bos-tools-ppid",
+    "--s19k-bos-tools-pgrp",
+    "--s19k-bos-tools-session",
+    "--s19k-bos-tools-exe",
+    "--s19k-bos-tools-cmdline-sha256",
+    "--s19k-bos-tools-cmdline-bytes",
+    "--s19k-track1-runtime-active",
+    "--s19k-stock-owner-retained-receipt",
+    "--s19k-track1-journal-source",
+    "--s19k-track1-journal-destination",
+    "--s19k-track1-guarded-unlink-scratch",
+    "--s19k-track1-guarded-unlink-canonical",
+    "--s19k-track1-guarded-unlink-claim",
+    "--s19k-track1-guarded-unlink-completion",
+    "--s19k-track1-consume-completion",
+    "--s19k-track1-durable-replace-source",
+    "--s19k-track1-durable-replace-destination",
+    "--s19k-track1-durable-replace-old-sha256",
+    "--s19k-track1-durable-replace-old-bytes",
+    "--s19k-track1-durable-replace-new-sha256",
+    "--s19k-track1-durable-replace-new-bytes",
 ];
 
 /// Pure detector for **unrecognized** `-`/`--` flags.
@@ -338,6 +407,89 @@ fn unrecognized_cli_flags(args: &[String]) -> Vec<String> {
     out
 }
 
+fn single_cli_value(args: &[String], flag: &str) -> Result<Option<String>> {
+    let mut values = args
+        .windows(2)
+        .filter(|window| window[0] == flag)
+        .map(|window| window[1].clone());
+    let value = values.next();
+    anyhow::ensure!(values.next().is_none(), "{flag} may be supplied only once");
+    if args.last().map(String::as_str) == Some(flag) {
+        anyhow::bail!("{flag} requires a value");
+    }
+    Ok(value)
+}
+
+fn parse_s19k_stock_handoff_cli(args: &[String]) -> Result<Option<S19kStockHandoffIdentity>> {
+    const FLAGS: [&str; 16] = [
+        "--s19k-bos-tools-pid",
+        "--s19k-bos-tools-start",
+        "--s19k-bos-tools-ppid",
+        "--s19k-bos-tools-pgrp",
+        "--s19k-bos-tools-session",
+        "--s19k-bos-tools-exe",
+        "--s19k-bos-tools-cmdline-sha256",
+        "--s19k-bos-tools-cmdline-bytes",
+        "--s19k-bosminer-pid",
+        "--s19k-bosminer-start",
+        "--s19k-bosminer-ppid",
+        "--s19k-bosminer-pgrp",
+        "--s19k-bosminer-session",
+        "--s19k-bosminer-exe",
+        "--s19k-bosminer-cmdline-sha256",
+        "--s19k-bosminer-cmdline-bytes",
+    ];
+    let values = FLAGS
+        .iter()
+        .map(|flag| single_cli_value(args, flag))
+        .collect::<Result<Vec<_>>>()?;
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        values.iter().all(Option::is_some),
+        "S19k stock handoff requires the complete supervisor+child process-tree CLI tuple"
+    );
+    let values = values
+        .into_iter()
+        .map(|value| value.expect("complete tuple checked above"))
+        .collect::<Vec<_>>();
+    Ok(Some(S19kStockHandoffIdentity::from_cli(
+        &values[0],
+        &values[1],
+        &values[2],
+        &values[3],
+        &values[4],
+        &values[5],
+        &values[6],
+        &values[7],
+        &values[8],
+        &values[9],
+        &values[10],
+        &values[11],
+        &values[12],
+        &values[13],
+        &values[14],
+        &values[15],
+    )?))
+}
+
+fn parse_s19k_track1_receipt_authority_cli(
+    args: &[String],
+) -> Result<Option<S19kTrack1ReceiptAuthority>> {
+    let active = single_cli_value(args, "--s19k-track1-runtime-active")?;
+    let retained = single_cli_value(args, "--s19k-stock-owner-retained-receipt")?;
+    match (active, retained) {
+        (None, None) => Ok(None),
+        (Some(active), Some(retained)) => Ok(Some(S19kTrack1ReceiptAuthority::from_cli(
+            &active, &retained,
+        )?)),
+        _ => anyhow::bail!(
+            "S19k Track-1 receipt authority requires both runtime_active and retained-receipt paths"
+        ),
+    }
+}
+
 /// Concise usage for the `--help` one-shot. Lists the safety-relevant
 /// read-only fan one-shots first (an operator reaching for `--help` on a
 /// fragile home unit must see these), then the bring-up modes, and is
@@ -359,7 +511,17 @@ fn cli_help_text() -> String {
          \x20                       SIGTERM (clamped to {cap} unless --allow-loud). Required on AM2:\n\
          \x20                       the board reverts fans to full speed if nothing keeps commanding them.\n\
          \x20 --fan-sweep <list>    diagnostic fan-PWM sweep (e.g. 0,5,10,15,20,25,30); [--dwell-ms N]\n\
-         \x20 --allow-loud          permit --set-fan/--fan-sweep above the {cap} home cap (explicit override)\n\
+         \x20 --allow-loud          explicit authority for fan one-shots or S19k Track-1 PWM above the {cap} home cap\n\
+         \x20 --s19k-track1-recovery-safeoff\n\
+         \x20                       ephemeral config-bound checked reset+S19k power-cut receipt; runner recovery only\n\
+         \x20 --s19k-install-custody-safeoff\n\
+         \x20                       exact receipt-bound stock custody transfer directly to checked GPIO437 SafeOff; no pool, UART, reset, ASIC, or mining work\n\
+         \x20 --s19k-track1-no-work\n\
+         \x20                       exact receipt-bound S19k handoff/enumeration mode; pool jobs discarded and UART work refused\n\
+         \x20 --s19k-track1-bounded-work-proof\n\
+         \x20                       exact receipt-bound S19k work proof; every admitted TX/RX is logged and the run closes after one accepted share per required UART or 600s\n\
+         \x20 --s19k-track1-endurance-work-proof\n\
+         \x20                       exact receipt-bound S19k 24h endurance proof; hash-chained minute segments require off-target collector acknowledgements and fail closed by 26h\n\
          \n\
          BRING-UP MODES (start a daemon):\n\
          \x20 (default)             auto-detect; am2/XIL auto-routes to --s19j-hybrid\n\
@@ -370,7 +532,8 @@ fn cli_help_text() -> String {
          \x20 --stratum-proxy       Stratum V1 byte-relay only (zero HW access)\n\
          \x20 --stock-fpga          stock-Bitmain FPGA bitstream mode\n\
          \n\
-         Docs + recovery: https://d-central.tech  |  config: /data/dcentrald.toml\n",
+         Docs + recovery: https://d-central.tech  |  config: /data/dcentrald.toml\n\
+         Fund / Donate / Support: https://d-central.tech/fund/\n",
         ver = env!("CARGO_PKG_VERSION"),
         cap = dcentrald_hal::fan::PWM_SAFETY_MAX,
     )
@@ -1251,17 +1414,19 @@ enum RuntimeDispatchKind {
     StratumProxy,
     Tap,
     S19jHybrid,
+    S17Hybrid,
     Serial,
     StockFpga,
     StandardDaemon,
 }
 
 impl RuntimeDispatchKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Am3BeagleBone,
         Self::StratumProxy,
         Self::Tap,
         Self::S19jHybrid,
+        Self::S17Hybrid,
         Self::Serial,
         Self::StockFpga,
         Self::StandardDaemon,
@@ -1273,6 +1438,7 @@ impl RuntimeDispatchKind {
             Self::StratumProxy => "stratum-proxy",
             Self::Tap => "tap",
             Self::S19jHybrid => "s19j-hybrid",
+            Self::S17Hybrid => "s17-hybrid",
             Self::Serial => "serial",
             Self::StockFpga => "stock-fpga",
             Self::StandardDaemon => "standard-daemon",
@@ -1300,6 +1466,14 @@ impl RuntimeDispatchKind {
                 Some(ChainTransportKind::ZynqHybrid),
                 Some(WorkEngineKind::SerialWork),
             ),
+            // 2026-08-27 S17 hybrid promotion (antminer17-unlock-armada): the
+            // BM1397 engine owns the same transport/work facets as the BM1362
+            // hybrid; the protocol admission below is what keeps the two
+            // engines disjoint.
+            Self::S17Hybrid => (
+                Some(ChainTransportKind::ZynqHybrid),
+                Some(WorkEngineKind::SerialWork),
+            ),
             // Native serial is also an explicit AM2 diagnostic route, so its
             // work engine is exact while its carrier transport is intentionally
             // unresolved here. Existing AM2 lab admission remains downstream.
@@ -1322,6 +1496,7 @@ impl RuntimeDispatchKind {
             Self::Am3BeagleBone | Self::Tap | Self::S19jHybrid => {
                 Some(AsicProtocolIdentity::Bm1362)
             }
+            Self::S17Hybrid => Some(AsicProtocolIdentity::Bm1397),
             Self::StratumProxy | Self::Serial | Self::StockFpga | Self::StandardDaemon => None,
         }
     }
@@ -1410,6 +1585,7 @@ fn selected_runtime_dispatch(
     stratum_proxy: bool,
     tap: bool,
     s19j_hybrid: bool,
+    s17_hybrid: bool,
     serial: bool,
     stock_fpga: bool,
 ) -> RuntimeDispatchKind {
@@ -1421,6 +1597,8 @@ fn selected_runtime_dispatch(
         RuntimeDispatchKind::Tap
     } else if s19j_hybrid {
         RuntimeDispatchKind::S19jHybrid
+    } else if s17_hybrid {
+        RuntimeDispatchKind::S17Hybrid
     } else if serial {
         RuntimeDispatchKind::Serial
     } else if stock_fpga {
@@ -1495,6 +1673,24 @@ fn admit_board_desc_runtime_dispatch(
             dispatch.label()
         ));
     };
+    // Track-1 Braiins leftover (live401-408): Serial + BM1366 on am3-s19k.
+    // BoardDesc is SerialWork; SerialMiner still refuses native cold-init.
+    // live409 parked this path and never reached WORK #1.
+    if board_desc.board_target == "am3-s19k"
+        && dispatch == RuntimeDispatchKind::Serial
+        && configured_asic_protocol == Some(dcentrald_common::AsicProtocolIdentity::Bm1366)
+    {
+        let asic_protocol_admission = board_desc.admit_asic_protocol(
+            configured_asic_protocol,
+            dcentrald_common::AsicProtocolIdentity::Bm1366,
+        )?;
+        return Ok(RuntimeDispatchAdmission::Compatible {
+            dispatch,
+            board_target: board_desc.board_target,
+            asic_protocol: Some(asic_protocol_admission),
+        });
+    }
+
     if board_desc.work_engine == WorkEngineKind::ManagementOnly {
         return Err(format!(
             "BoardDesc {} is management-only but runtime dispatch {} would own mining chain/work",
@@ -1599,6 +1795,32 @@ mod board_desc_runtime_dispatch_tests {
         "../../../br2_external_dcentos/board/zynq/am2-s19pro/rootfs-overlay/etc/init.d/S82dcentrald"
     );
 
+    #[test]
+    fn s19k_one_shot_track1_trials_exit_instead_of_management_only_park() {
+        // Attempt-9 contract (2026-08-28): after a typed serial failure
+        // disposition, the one-shot Track-1 authorities (no-work,
+        // bounded-work proof, endurance proof) must return the error for
+        // wrapper closeout instead of falling through to
+        // enter_management_only — the park deadlocked the live bounded
+        // wrapper for 26+ minutes until an ungraceful kill and the printed
+        // restore.
+        let marker =
+            "enter_management_only(\"serial\", e, shutdown_token.clone(), None).await";
+        let call = MAIN_SOURCE
+            .find(marker)
+            .expect("the serial management-only call must remain present");
+        let gate = MAIN_SOURCE[..call]
+            .rfind("if s19k_track1_no_work")
+            .expect("the one-shot Track-1 exit gate must precede the park");
+        let between = &MAIN_SOURCE[gate..call];
+        assert!(
+            between.contains("s19k_track1_bounded_work_proof")
+                && between.contains("s19k_track1_endurance_work_proof")
+                && between.contains("return Err(e.context("),
+            "all three one-shot authorities must exit before the park"
+        );
+    }
+
     fn future_desc(
         board_target: &'static str,
         chain_transport: dcentrald_common::ChainTransportKind,
@@ -1646,31 +1868,35 @@ mod board_desc_runtime_dispatch_tests {
     #[test]
     fn board_desc_dispatch_priority_matches_the_runtime_branch_order() {
         assert_eq!(
-            selected_runtime_dispatch(true, true, true, true, true, true),
+            selected_runtime_dispatch(true, true, true, true, true, true, true),
             RuntimeDispatchKind::Am3BeagleBone
         );
         assert_eq!(
-            selected_runtime_dispatch(false, true, true, true, true, true),
+            selected_runtime_dispatch(false, true, true, true, true, true, true),
             RuntimeDispatchKind::StratumProxy
         );
         assert_eq!(
-            selected_runtime_dispatch(false, false, true, true, true, true),
+            selected_runtime_dispatch(false, false, true, true, true, true, true),
             RuntimeDispatchKind::Tap
         );
         assert_eq!(
-            selected_runtime_dispatch(false, false, false, true, true, true),
+            selected_runtime_dispatch(false, false, false, true, true, true, true),
             RuntimeDispatchKind::S19jHybrid
         );
         assert_eq!(
-            selected_runtime_dispatch(false, false, false, false, true, true),
+            selected_runtime_dispatch(false, false, false, false, true, true, true),
+            RuntimeDispatchKind::S17Hybrid
+        );
+        assert_eq!(
+            selected_runtime_dispatch(false, false, false, false, false, true, true),
             RuntimeDispatchKind::Serial
         );
         assert_eq!(
-            selected_runtime_dispatch(false, false, false, false, false, true),
+            selected_runtime_dispatch(false, false, false, false, false, false, true),
             RuntimeDispatchKind::StockFpga
         );
         assert_eq!(
-            selected_runtime_dispatch(false, false, false, false, false, false),
+            selected_runtime_dispatch(false, false, false, false, false, false, false),
             RuntimeDispatchKind::StandardDaemon
         );
     }
@@ -1744,6 +1970,14 @@ mod board_desc_runtime_dispatch_tests {
                     );
                     continue;
                 }
+                if board_desc.board_target == "am3-s19k" && dispatch == RuntimeDispatchKind::Serial
+                {
+                    assert!(
+                        result.is_ok(),
+                        "am3-s19k serial BM1366 is Track-1 leftover, not native"
+                    );
+                    continue;
+                }
                 if board_desc.work_engine == WorkEngineKind::ManagementOnly {
                     assert!(
                         result.is_err(),
@@ -1772,6 +2006,19 @@ mod board_desc_runtime_dispatch_tests {
                                 && board_desc.work_engine == WorkEngineKind::SerialWork
                                 && board_desc.asic_protocol
                                     == dcentrald_common::AsicProtocolIdentity::Bm1362,
+                            "{}",
+                            board_desc.board_target
+                        );
+                    }
+                    RuntimeDispatchKind::S17Hybrid => {
+                        // 2026-08-27 promotion: the BM1397 hybrid engine admits
+                        // exactly the four promoted S17-family rows.
+                        assert_eq!(
+                            result.is_ok(),
+                            board_desc.chain_transport == ChainTransportKind::ZynqHybrid
+                                && board_desc.work_engine == WorkEngineKind::SerialWork
+                                && board_desc.asic_protocol
+                                    == dcentrald_common::AsicProtocolIdentity::Bm1397,
                             "{}",
                             board_desc.board_target
                         );
@@ -1810,6 +2057,35 @@ mod board_desc_runtime_dispatch_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn am3_s19k_serial_bm1366_is_track1_leftover_not_native() {
+        use dcentrald_common::{AsicProtocolIdentity, BoardDesc, WorkEngineKind};
+
+        let desc = BoardDesc::lookup("am3-s19k").unwrap();
+        assert_eq!(desc.work_engine, WorkEngineKind::SerialWork);
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(desc),
+            RuntimeDispatchKind::Serial,
+            true,
+            Some(AsicProtocolIdentity::Bm1366),
+        )
+        .is_ok());
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(desc),
+            RuntimeDispatchKind::Serial,
+            true,
+            Some(AsicProtocolIdentity::Bm1368),
+        )
+        .is_err());
+        assert!(admit_board_desc_runtime_dispatch(
+            Some(desc),
+            RuntimeDispatchKind::Am3BeagleBone,
+            true,
+            Some(AsicProtocolIdentity::Bm1366),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2119,6 +2395,115 @@ mod board_desc_runtime_dispatch_tests {
             .is_err());
     }
 
+    /// 2026-08-27 S17 promotion: the four BM1397 targets admit the S17Hybrid
+    /// dispatch end-to-end (work facet + exact protocol proof), and the two
+    /// hybrid engines stay disjoint in BOTH directions.
+    #[test]
+    fn s17_bm1397_targets_admit_the_s17_hybrid_engine_only() {
+        use dcentrald_common::AsicProtocolIdentity;
+
+        for target in s17_hybrid_admission::S17_HYBRID_BOARD_TARGETS {
+            let desc = dcentrald_common::BoardDesc::lookup(target).unwrap();
+            let admission = admit_board_desc_runtime_dispatch(
+                Some(desc),
+                RuntimeDispatchKind::S17Hybrid,
+                true,
+                Some(AsicProtocolIdentity::Bm1397),
+            )
+            .unwrap_or_else(|error| panic!("{target} must admit the S17 hybrid engine: {error}"));
+            // The minted proof is exactly Bm1397 (no Bm1362 laundering).
+            admission
+                .require_asic_protocol(
+                    RuntimeDispatchKind::S17Hybrid,
+                    target,
+                    AsicProtocolIdentity::Bm1397,
+                )
+                .unwrap_or_else(|error| panic!("{target}: {error}"));
+
+            // Cross-engine refusal: a BM1397 board never enters the BM1362
+            // engine, even with its own protocol configured.
+            assert!(
+                admit_board_desc_runtime_dispatch(
+                    Some(desc),
+                    RuntimeDispatchKind::S19jHybrid,
+                    true,
+                    Some(AsicProtocolIdentity::Bm1397),
+                )
+                .is_err(),
+                "{target} must not enter the BM1362 hybrid engine"
+            );
+        }
+    }
+
+    /// The BM1362 reference board and the BM1398 management-only board can
+    /// never enter the BM1397 hybrid engine.
+    #[test]
+    fn bm1362_and_bm1398_boards_can_never_enter_the_bm1397_hybrid_engine() {
+        use dcentrald_common::AsicProtocolIdentity;
+
+        for (target, protocol) in [
+            ("am2-s19j", AsicProtocolIdentity::Bm1362),
+            ("am2-s19pro", AsicProtocolIdentity::Bm1398),
+        ] {
+            let desc = dcentrald_common::BoardDesc::lookup(target).unwrap();
+            for configured in [Some(protocol), Some(AsicProtocolIdentity::Bm1397), None] {
+                assert!(
+                    admit_board_desc_runtime_dispatch(
+                        Some(desc),
+                        RuntimeDispatchKind::S17Hybrid,
+                        true,
+                        configured,
+                    )
+                    .is_err(),
+                    "{target} must not enter the BM1397 hybrid engine (configured {configured:?})"
+                );
+            }
+        }
+    }
+
+    /// The S17 auto-router matches only the exact promoted token set and only
+    /// on the am2 platform (ADR-0013 §6: never a family prefix).
+    #[test]
+    fn s17_hybrid_auto_route_matches_only_exact_promoted_tokens() {
+        for board_target in [
+            "am2-s17p",
+            "am2-s17",
+            "am2-s17plus",
+            "am2-t17",
+            "am2-t17plus",
+        ] {
+            assert!(
+                classify_s17_hybrid_auto("zynq-bm3-am2", board_target),
+                "{board_target} must auto-route"
+            );
+            assert!(
+                !classify_s17_hybrid_auto("zynq-bm3-am1", board_target),
+                "{board_target} on a non-am2 platform must not auto-route"
+            );
+        }
+        for non_target in [
+            "am2-s19j",
+            "am2-s19jpro-zynq",
+            "am2-s17e",
+            "am2-t17e",
+            "am2-t19",
+            "am2-s19",
+            "",
+        ] {
+            assert!(
+                !classify_s17_hybrid_auto("zynq-bm3-am2", non_target),
+                "{non_target:?} must never auto-route into the S17 lane"
+            );
+        }
+        // The two hybrid lanes' token sets are disjoint (no ambiguous auto).
+        for board_target in ["am2-s19j", "am2-s19jpro", "am2-s19jpro-zynq"] {
+            assert!(!is_s17_am2_board_target(board_target));
+        }
+        for board_target in ["am2-s17p", "am2-s17plus", "am2-t17", "am2-t17plus"] {
+            assert!(!is_s19j_am2_board_target(board_target));
+        }
+    }
+
     #[test]
     fn non_bm1362_am2_launchers_never_inject_the_bm1362_hybrid_recipe() {
         for (name, source) in [
@@ -2165,7 +2550,7 @@ mod board_desc_runtime_dispatch_tests {
 
     #[test]
     fn board_desc_dispatch_has_one_consumer_before_every_mining_engine_constructor() {
-        let run_signature = ["async fn run_", "main() -> Result<()> {"].concat();
+        let run_signature = ["async fn run_", "main("].concat();
         let run_end_marker = ["// `spawn_proxy_mode_api` ", "moved"].concat();
         let run_start = MAIN_SOURCE.find(&run_signature).unwrap();
         let run_end = MAIN_SOURCE[run_start..]
@@ -2185,6 +2570,7 @@ mod board_desc_runtime_dispatch_tests {
             "run_am3_bb_mining(",
             "S19jTapMiner::new(",
             "S19jHybridMiner::new(",
+            "S17HybridMiner::new(",
             "SerialMiner::new(",
             "Daemon::new(",
         ] {
@@ -2340,7 +2726,151 @@ fn install_cut_hash_on_crash_panic_hook() {
     }));
 }
 
+/// Single-chokepoint fail-closed adjudication of the durable hardware
+/// mutation-disposition journal, executed in `run_main` immediately BEFORE the
+/// runtime-arm dispatch branch so that NO mining arm — `run_am3_bb_mining`,
+/// `S19jHybridMiner`, `SerialMiner`, tap, stock-fpga, or the standard
+/// `Daemon` path — can construct hardware or assert PWR_CONTROL while a prior
+/// session's Mutated/Quarantined fabric disposition is unresolved. The
+/// standard `Daemon::init` gate stays in place as defense-in-depth for the
+/// passthrough path; this chokepoint is what closes the fail-open gap on the
+/// arms launched directly from `run_main` (am2 hybrid / native serial /
+/// am3-bb), which never enter `Daemon::init`.
+///
+/// Semantics mirror the `Daemon::init` gate exactly:
+/// - absent journal => Resolved => admit with zero side effects (a clean
+///   session stays byte-identical to today);
+/// - a same-boot record whose every entry is Clean or carries a typed SafeOff
+///   receipt => Resolved => durably remove it (removal failure stays
+///   fail-closed, mirroring the thermal-lockout removal contract);
+/// - Unresolved (foreign boot id, or a receipt-less non-Clean entry) or
+///   Unreadable (any IO/parse problem) => refuse to start, naming the
+///   unresolved fabric. A false refusal is acceptable; a false admit is the
+///   cardinal failure.
+///
+/// No terminal safe-off latch is issued here: at this pre-dispatch point no
+/// I2C service, rail owner, or watchdog exists yet, so there is nothing to
+/// latch — the refusal happens strictly BEFORE any hardware authority is
+/// constructed. A Resolved journal is NOT a typed SafeOff receipt: it never
+/// authorizes skipping the shell session latch (`dcentrald-session-latch.sh`)
+/// and never re-enables automatic restart (`restart.rs` keeps returning
+/// false).
+fn adjudicate_mutation_disposition_before_runtime_arm_dispatch() -> Result<()> {
+    use dcentrald_common::mutation_disposition::{
+        admit_hardware_after_mutation_adjudication, clear_mutation_disposition,
+        load_and_adjudicate_mutation_disposition,
+    };
+    let journal_path = crate::daemon::terminal_mutation_disposition_path();
+    let adjudication = load_and_adjudicate_mutation_disposition(
+        &journal_path,
+        &crate::daemon::current_boot_id_token(),
+    );
+    match admit_hardware_after_mutation_adjudication(&adjudication) {
+        Ok(admission) => {
+            if let Some(resolved_record) = adjudication.resolved_record() {
+                let clearance = admission.into_clearance().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resolved mutation-disposition journal did not carry path-bound clear authority"
+                    )
+                })?;
+                if let Err(remove_error) = clear_mutation_disposition(clearance) {
+                    error!(
+                        ?resolved_record,
+                        path = %journal_path.display(),
+                        error = %remove_error,
+                        "Mutation-disposition resolution was accepted but durable journal removal failed before runtime-arm dispatch; remaining fail-closed"
+                    );
+                    anyhow::bail!(
+                        "mutation-disposition journal removal was not durably proven: {remove_error}"
+                    );
+                }
+                info!(
+                    ?resolved_record,
+                    path = %journal_path.display(),
+                    "Resolved mutation-disposition journal (clean or typed-SafeOff-receipted same-boot record) removed before runtime-arm dispatch"
+                );
+            }
+            Ok(())
+        }
+        Err(refusal) => {
+            error!(
+                path = %journal_path.display(),
+                refusal = %refusal,
+                "Durable mutation-disposition journal refuses hardware admission before runtime-arm dispatch; no mining arm may construct hardware or assert PWR_CONTROL until an operator resolves or clears the journal"
+            );
+            anyhow::bail!(
+                "mutation-disposition journal refuses hardware admission before runtime-arm dispatch: {refusal}"
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    // Track-1 bootstrap is the first executable action. Publisher and daemon
+    // roles arm permanent PDEATHSIG=SIGKILL and bind the exact wrapper lifetime
+    // before the panic hook, Tokio construction, config, logging, or hardware.
+    // The daemon additionally completes J0->C1->J1->ACTIVE->J2/release and the
+    // held-FIFO token/EOF proof synchronously before runtime construction.
+    let mut s19k_track1_j3_lease: Option<S19kTrack1J3Lease> = None;
+    if let Some(bootstrap) = s19k_arm_permanent_pdeathsig_from_env()? {
+        let args = std::env::args().collect::<Vec<_>>();
+        match bootstrap.role() {
+            S19kPreRuntimeBootstrapRole::Publisher => {
+                anyhow::ensure!(
+                    matches!(bootstrap, S19kPreRuntimeBootstrapState::LiveParent(_)),
+                    "S19k journal publisher lost its exact wrapper before publication"
+                );
+                if args.len() == 5
+                    && args[1] == "--s19k-track1-journal-source"
+                    && args[3] == "--s19k-track1-journal-destination"
+                {
+                    s19k_publish_ephemeral_journal_from_cli(&args[2], &args[4])?;
+                } else if args.len() == 9
+                    && args[1] == "--s19k-track1-guarded-unlink-scratch"
+                    && args[3] == "--s19k-track1-guarded-unlink-canonical"
+                    && args[5] == "--s19k-track1-guarded-unlink-claim"
+                    && args[7] == "--s19k-track1-guarded-unlink-completion"
+                {
+                    s19k_guarded_unlink_ephemeral_hardlink_from_cli(
+                        &args[2], &args[4], &args[6], &args[8],
+                    )?;
+                } else if args.len() == 5
+                    && args[1] == "--s19k-track1-consume-completion"
+                    && args[3] == "--s19k-track1-guarded-unlink-canonical"
+                {
+                    s19k_consume_guarded_completion_from_cli(&args[2], &args[4])?;
+                } else if args.len() == 13
+                    && args[1] == "--s19k-track1-durable-replace-source"
+                    && args[3] == "--s19k-track1-durable-replace-destination"
+                    && args[5] == "--s19k-track1-durable-replace-old-sha256"
+                    && args[7] == "--s19k-track1-durable-replace-old-bytes"
+                    && args[9] == "--s19k-track1-durable-replace-new-sha256"
+                    && args[11] == "--s19k-track1-durable-replace-new-bytes"
+                {
+                    s19k_durable_replace_from_cli(
+                        &args[2], &args[4], &args[6], &args[8], &args[10], &args[12],
+                    )?;
+                } else {
+                    anyhow::bail!(
+                        "S19k publisher requires exactly one ordered journal-publication or guarded-unlink operation"
+                    );
+                }
+                return Ok(());
+            }
+            S19kPreRuntimeBootstrapRole::Daemon => {
+                let identity = parse_s19k_stock_handoff_cli(&args)?.context(
+                    "S19k pre-runtime daemon bootstrap lacks the complete stock tree tuple",
+                )?;
+                let authority = parse_s19k_track1_receipt_authority_cli(&args)?.context(
+                    "S19k pre-runtime daemon bootstrap lacks the receipt authority tuple",
+                )?;
+                s19k_complete_daemon_pre_runtime_bootstrap(&authority, &identity, bootstrap)?;
+                s19k_track1_j3_lease = Some(s19k_track1_startup_barrier_and_acquire_j3(
+                    &authority, &identity,
+                )?);
+            }
+        }
+    }
     // W24-CRASH-1 (w24-thermal-safety F-1): install the cut-hash-on-crash
     // backstop BEFORE the tokio runtime starts. The release profile sets
     // `panic = "abort"` (see `Cargo.toml [profile.release]`), so on a Rust
@@ -2367,10 +2897,10 @@ fn main() -> Result<()> {
         builder.max_blocking_threads(n);
     }
     let runtime = builder.build()?;
-    runtime.block_on(run_main())
+    runtime.block_on(run_main(s19k_track1_j3_lease))
 }
 
-async fn run_main() -> Result<()> {
+async fn run_main(mut s19k_track1_j3_lease: Option<S19kTrack1J3Lease>) -> Result<()> {
     // Parse command-line arguments
     let args: Vec<String> = std::env::args().collect();
 
@@ -2421,6 +2951,101 @@ async fn run_main() -> Result<()> {
         eprintln!();
         eprintln!("{}", cli_help_text());
         std::process::exit(2);
+    }
+    let s19k_journal_source = single_cli_value(&args, "--s19k-track1-journal-source")?;
+    let s19k_journal_destination = single_cli_value(&args, "--s19k-track1-journal-destination")?;
+    match (s19k_journal_source, s19k_journal_destination) {
+        (None, None) => {}
+        (Some(_), Some(_)) => anyhow::bail!(
+            "S19k journal publication was not completed by the pre-panic PDEATHSIG bootstrap"
+        ),
+        _ => anyhow::bail!("S19k startup journal publication requires both source and destination"),
+    }
+    let s19k_stock_handoff_identity = parse_s19k_stock_handoff_cli(&args)?;
+    let s19k_track1_receipt_authority = parse_s19k_track1_receipt_authority_cli(&args)?;
+    let s19k_track1_no_work = args.iter().any(|arg| arg == "--s19k-track1-no-work");
+    let s19k_install_custody_safeoff = args
+        .iter()
+        .any(|arg| arg == "--s19k-install-custody-safeoff");
+    let s19k_track1_bounded_work_proof = args
+        .iter()
+        .any(|arg| arg == "--s19k-track1-bounded-work-proof");
+    let s19k_track1_endurance_work_proof = args
+        .iter()
+        .any(|arg| arg == "--s19k-track1-endurance-work-proof");
+    anyhow::ensure!(
+        s19k_stock_handoff_identity.is_some() == s19k_track1_receipt_authority.is_some(),
+        "S19k Track-1 stock handoff and content-bound receipt authority must be supplied together"
+    );
+    anyhow::ensure!(
+        s19k_stock_handoff_identity.is_some() == s19k_track1_j3_lease.is_some(),
+        "S19k Track-1 CLI authority and pre-runtime J3 all-thread lease must be supplied together"
+    );
+    anyhow::ensure!(
+        !s19k_track1_no_work || s19k_stock_handoff_identity.is_some(),
+        "--s19k-track1-no-work requires the complete S19k Track-1 custody/receipt authority"
+    );
+    anyhow::ensure!(
+        !s19k_install_custody_safeoff || s19k_stock_handoff_identity.is_some(),
+        "--s19k-install-custody-safeoff requires the complete S19k Track-1 custody/receipt authority"
+    );
+    anyhow::ensure!(
+        !s19k_track1_bounded_work_proof || s19k_stock_handoff_identity.is_some(),
+        "--s19k-track1-bounded-work-proof requires the complete S19k Track-1 custody/receipt authority"
+    );
+    anyhow::ensure!(
+        !s19k_track1_endurance_work_proof || s19k_stock_handoff_identity.is_some(),
+        "--s19k-track1-endurance-work-proof requires the complete S19k Track-1 custody/receipt authority"
+    );
+    anyhow::ensure!(
+        usize::from(s19k_install_custody_safeoff)
+            + usize::from(s19k_track1_no_work)
+            + usize::from(s19k_track1_bounded_work_proof)
+            + usize::from(s19k_track1_endurance_work_proof)
+            <= 1,
+        "S19k install-custody-safeoff, no-work, bounded-work-proof, and endurance-work-proof authorities are mutually exclusive"
+    );
+    if let (Some(identity), Some(authority), Some(lease)) = (
+        s19k_stock_handoff_identity.as_ref(),
+        s19k_track1_receipt_authority.as_ref(),
+        s19k_track1_j3_lease.as_ref(),
+    ) {
+        // The lease was acquired before Tokio construction. Rebind it to the
+        // independently re-parsed CLI/runtime authority before config load.
+        lease.require_context(authority, identity)?;
+        lease.require_install_custody_safeoff_policy(s19k_install_custody_safeoff)?;
+        lease.require_no_work_policy(s19k_track1_no_work)?;
+        lease.require_bounded_work_proof_policy(s19k_track1_bounded_work_proof)?;
+        lease.require_endurance_work_proof_policy(s19k_track1_endurance_work_proof)?;
+    }
+    let s19k_track1_recovery_safeoff_mode = args
+        .iter()
+        .any(|arg| arg == "--s19k-track1-recovery-safeoff");
+    if s19k_install_custody_safeoff {
+        anyhow::ensure!(
+            args.iter().any(|arg| arg == "--serial-mining"),
+            "--s19k-install-custody-safeoff requires --serial-mining"
+        );
+        for incompatible in [
+            "--set-fan",
+            "--hold-fan",
+            "--get-fan",
+            "--fan-sweep",
+            "--safe-off",
+            "--s19k-track1-recovery-safeoff",
+            "--verify-bundle",
+            "--s19j-hybrid",
+            "--s17-hybrid",
+            "--tap-mode",
+            "--stratum-proxy",
+            "--am3-bb-mining",
+            "--stock-fpga",
+        ] {
+            anyhow::ensure!(
+                !args.iter().any(|arg| arg == incompatible),
+                "--s19k-install-custody-safeoff is incompatible with {incompatible}"
+            );
+        }
     }
 
     // R2 (2026-05-17): `--set-fan <PWM>` one-shot. This MUST run BEFORE config
@@ -2489,7 +3114,17 @@ async fn run_main() -> Result<()> {
 
     let stock_fpga_mode = args.iter().any(|a| a == "--stock-fpga");
     let serial_mining_mode = args.iter().any(|a| a == "--serial-mining");
+    let explicit_loud_fan_authority = args.iter().any(|a| a == "--allow-loud");
+    anyhow::ensure!(
+        s19k_stock_handoff_identity.is_none() || serial_mining_mode,
+        "S19k stock custody handoff identity requires --serial-mining"
+    );
     let s19j_hybrid_cli = args.iter().any(|a| a == "--s19j-hybrid");
+    // S17-family (BM1397) hybrid lane, 2026-08-27 promotion
+    // (`2026-08-27-antminer17-unlock-armada`). Mirrors the S19j shape: explicit
+    // `--s17-hybrid`, or auto-route from the exact promoted board-target tokens
+    // when the operator did not request another bring-up path.
+    let s17_hybrid_cli = args.iter().any(|a| a == "--s17-hybrid");
     // Phase 6 Option 3: tap mode. bosminer owns PIC/PSU/ASIC state — dcentrald
     // only dispatches work to the FPGA. Defensive alternative to --s19j-hybrid
     // while PIC 0x86 + PSU framing are unresolved.
@@ -2519,9 +3154,25 @@ async fn run_main() -> Result<()> {
         platform_identity.platform_marker(),
         platform_identity.board_target(),
     );
+    // The S17 lane auto-routes from the same platform identity; the two token
+    // sets are disjoint, so at most one of the two auto flags can be true.
+    let auto_s17_hybrid = classify_s17_hybrid_auto(
+        platform_identity.platform_marker(),
+        platform_identity.board_target(),
+    );
+    anyhow::ensure!(
+        !(auto_hybrid && auto_s17_hybrid),
+        "board target matched both the BM1362 and BM1397 hybrid auto-routes; \
+         refusing ambiguous promotion"
+    );
+    anyhow::ensure!(
+        !(s19j_hybrid_cli && s17_hybrid_cli),
+        "--s19j-hybrid and --s17-hybrid are mutually exclusive engines"
+    );
     let explicit_non_hybrid_mode =
         stock_fpga_mode || serial_mining_mode || tap_mode || stratum_proxy_mode || am3_bb_mode;
     let s19j_hybrid_mode = s19j_hybrid_cli || (auto_hybrid && !explicit_non_hybrid_mode);
+    let s17_hybrid_mode = s17_hybrid_cli || (auto_s17_hybrid && !explicit_non_hybrid_mode);
 
     // Find --config <path> argument
     let config_path = args
@@ -2545,7 +3196,13 @@ async fn run_main() -> Result<()> {
     let (mut config, resolved_config_path) = match DcentraldConfig::load(&config_path) {
         Ok(cfg) => (cfg, config_path.clone()),
         Err(primary_err) => {
-            if std::path::Path::new(&config_path).exists() {
+            // Only an exact NotFound from the bounded/no-follow loader grants
+            // fallback authority. `Path::exists()` follows symlinks and turns a
+            // dangling primary symlink into false, which previously made an
+            // unsafe PRESENT primary look absent and could activate the baked
+            // fallback. Permission, type, size, symlink, parse, validation, and
+            // every other indeterminate error remain management-only.
+            if !load_error_is_definitely_absent(&primary_err) {
                 eprintln!(
                     "dcentrald: config at {} is PRESENT but INVALID ({:#}) — NOT reverting to the baked default; entering MANAGEMENT-ONLY with safe defaults (mining disabled)",
                     config_path, primary_err
@@ -2577,6 +3234,32 @@ async fn run_main() -> Result<()> {
             }
         }
     };
+    if s19k_track1_recovery_safeoff_mode {
+        if s19k_stock_handoff_identity.is_some() || serial_mining_mode {
+            eprintln!("dcentrald: S19k Track-1 recovery SafeOff refuses mining/handoff flags");
+            std::process::exit(2);
+        }
+        match crate::serial_mining::s19k_track1_recovery_safeoff(&config) {
+            Ok(receipt) => {
+                println!("{receipt}");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("dcentrald: S19k Track-1 recovery SafeOff failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !s19k_install_custody_safeoff || config.s19k_install_custody_pool_free(),
+        "S19k install-custody-safeoff requires mining disabled and every primary, failover, SV2, donation, disconnect, and job-declaration route absent"
+    );
+    anyhow::ensure!(
+        s19k_stock_handoff_identity.is_none()
+            || config.mining_start_enabled()
+            || s19k_install_custody_safeoff,
+        "S19k stock custody handoff identity cannot be supplied to an idle/API-only config"
+    );
     platform_identity.apply_config_platform_declaration(&config.platform);
     crate::daemon::exercise_s19k_nopic_config_admission(&platform_identity, &config);
 
@@ -2599,10 +3282,6 @@ async fn run_main() -> Result<()> {
     if let Err(e) = init_logging(&config.general.log_level) {
         eprintln!("dcentrald: logging init failed ({e:#}) — continuing without configured logging");
     }
-
-    // Braiins Track-1 mining-off wire try: env-gated, after logging so
-    // S19K_BRAIINS_WIRE_TRY lines are visible. Does not flip engine CURRENT.
-    crate::s19k_braiins_wire_try::maybe_run_s19k_braiins_wire_try(&platform_identity, &config);
 
     // W1.4: install the process-wide log-tail mask flag from [logging].
     // Default (true) masks wallet addresses on `/api/debug/log` responses.
@@ -2776,13 +3455,10 @@ async fn run_main() -> Result<()> {
         shutdown_token_signal.cancel();
     });
 
-    // Supremacy S5.1: gRPC server scaffold. Spawn alongside REST/CGMiner when
-    // `[api.grpc] enabled = true`. Default OFF — scaffold-priority; most
-    // handlers return UNIMPLEMENTED until wired to live state. GetConstraints
-    // is the one real handler (returns BM1362 envelope with home-mode fan
-    // cap + 14500 mV am2 voltage cap). The task runs detached: an error from
-    // tonic only kills the gRPC listener, never the daemon, mirroring the
-    // existing REST `spawn_proxy_mode_api` semantics.
+    // Default-off gRPC telemetry/control server. Reads use daemon snapshots;
+    // writes use the installed delegate to the same safety-gated REST handlers.
+    // Server admission refuses a release image without a valid root-only token
+    // and refuses unauthenticated non-loopback development binds.
     if config.api.grpc.enabled {
         let grpc_addr_str = format!("{}:{}", config.api.grpc.bind, config.api.grpc.port);
         match grpc_addr_str.parse::<std::net::SocketAddr>() {
@@ -2810,16 +3486,23 @@ async fn run_main() -> Result<()> {
                             .map(str::to_string)
                     })
                     .unwrap_or_default();
+                let grpc_reflection_enabled = config.api.grpc.reflection;
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        dcentrald_api_grpc::serve(addr, home_mode, grpc_chip_family).await
+                    if let Err(err) = dcentrald_api_grpc::serve(
+                        addr,
+                        home_mode,
+                        grpc_chip_family,
+                        grpc_reflection_enabled,
+                    )
+                    .await
                     {
                         error!(error = %err, "dcentrald-api-grpc server exited with error");
                     }
                 });
                 info!(
                     addr = %grpc_addr_str,
-                    "spawned dcentrald-api-grpc scaffold server (S5.1 — most RPCs return UNIMPLEMENTED)"
+                    reflection = grpc_reflection_enabled,
+                    "scheduled dcentrald-api-grpc startup (listener admission runs inside task)"
                 );
             }
             Err(err) => {
@@ -2886,6 +3569,7 @@ async fn run_main() -> Result<()> {
         stratum_proxy_mode,
         tap_mode,
         s19j_hybrid_mode,
+        s17_hybrid_mode,
         serial_mining_mode,
         stock_fpga_mode,
     );
@@ -2893,18 +3577,30 @@ async fn run_main() -> Result<()> {
     let (
         runtime_dispatch_admission,
         mut s19j_hybrid_route_admission,
+        mut s17_hybrid_route_admission,
         mut am2_bm1362_serial_route_admission,
     ) = match configured_asic_protocol_identity(&config).and_then(|configured_asic_protocol| {
         let runtime_admission = admit_board_desc_runtime_dispatch(
             runtime_board_desc,
             runtime_dispatch,
-            config.mining_start_enabled(),
+            config.mining_start_enabled() || s19k_install_custody_safeoff,
             configured_asic_protocol,
         )?;
         let hybrid_route_admission = if runtime_dispatch == RuntimeDispatchKind::S19jHybrid
             && config.mining_start_enabled()
         {
             Some(s19j_hybrid_admission::admit_s19j_hybrid_route(
+                &platform_identity,
+                runtime_dispatch,
+                configured_asic_protocol,
+            )?)
+        } else {
+            None
+        };
+        let s17_hybrid_route_admission = if runtime_dispatch == RuntimeDispatchKind::S17Hybrid
+            && config.mining_start_enabled()
+        {
+            Some(s17_hybrid_admission::admit_s17_hybrid_route(
                 &platform_identity,
                 runtime_dispatch,
                 configured_asic_protocol,
@@ -2927,22 +3623,30 @@ async fn run_main() -> Result<()> {
         Ok((
             runtime_admission,
             hybrid_route_admission,
+            s17_hybrid_route_admission,
             am2_bm1362_serial_route_admission,
         ))
     }) {
-        Ok((admission, hybrid_route_admission, am2_bm1362_serial_route_admission)) => {
+        Ok((
+            admission,
+            hybrid_route_admission,
+            s17_hybrid_route_admission,
+            am2_bm1362_serial_route_admission,
+        )) => {
             info!(
                 board_target = %td003_board_target.trim(),
                 board_desc_registered = runtime_board_desc.is_some(),
                 dispatch = runtime_dispatch.label(),
                 admission = ?admission,
                 hybrid_route_admitted = hybrid_route_admission.is_some(),
+                s17_hybrid_route_admitted = s17_hybrid_route_admission.is_some(),
                 am2_bm1362_serial_route_admitted = am2_bm1362_serial_route_admission.is_some(),
                 "BoardDesc runtime transport/work/ASIC-protocol admission evaluated"
             );
             (
                 admission,
                 hybrid_route_admission,
+                s17_hybrid_route_admission,
                 am2_bm1362_serial_route_admission,
             )
         }
@@ -2975,6 +3679,17 @@ async fn run_main() -> Result<()> {
             .await;
         }
     };
+
+    // SINGLE-CHOKEPOINT mutation-disposition gate (2026-08-16): adjudicate the
+    // durable journal HERE, before the runtime-arm dispatch branch below, so
+    // every current and future arm — am3-bb, stratum-proxy, tap, s19j-hybrid,
+    // serial, stock-fpga, and the standard Daemon path — is structurally
+    // covered before any of them can construct hardware or assert
+    // PWR_CONTROL. Fail-closed: Unresolved/Unreadable refuses startup. A
+    // clean/absent journal admits with zero side effects (byte-identical
+    // clean session). The Daemon::init gate remains as defense-in-depth for
+    // the standard path.
+    adjudicate_mutation_disposition_before_runtime_arm_dispatch()?;
 
     if am3_bb_mode {
         // Phase C: AM335x BeagleBone S19j Pro (S19J_IO_BOARD_V2_0) mining.
@@ -3097,14 +3812,23 @@ async fn run_main() -> Result<()> {
             };
 
         let mining_shutdown = shutdown_token.child_token();
-        match am3_bb_mining::run_am3_bb_mining(
+        let am3_bb_run_result = am3_bb_mining::run_am3_bb_mining(
             config,
             mining_shutdown.clone(),
             safety_admission,
             miner_state_tx,
         )
-        .await
-        {
+        .await;
+        // CONTROLLED-teardown journaling (2026-08-16): the am3-bb engine has
+        // finished its own typed closeout (never from a panic/unwind path —
+        // panic=abort routes through the panic hook, not here). Durably
+        // journal any Mutated/Quarantined fabric disposition the run left
+        // behind so the NEXT boot's chokepoint gate refuses admission. A
+        // clean roster journals nothing (byte-identical clean session).
+        crate::daemon::persist_unresolved_mutation_dispositions(
+            &crate::daemon::terminal_mutation_disposition_path(),
+        );
+        match am3_bb_run_result {
             Ok(()) => {
                 info!("dcentrald (am3-bb) stopped cleanly");
                 Ok(())
@@ -3390,7 +4114,18 @@ async fn run_main() -> Result<()> {
         let mut miner = S19jHybridMiner::new(config, mining_shutdown.clone(), safety_admission)?
             .with_state_tx(miner_state_tx);
 
-        match miner.run().await {
+        let hybrid_run_result = miner.run().await;
+        // CONTROLLED-teardown journaling (2026-08-16): the hybrid engine has
+        // completed its own typed closeout/safe-off arms (never a
+        // panic/unwind path — panic=abort routes through the panic hook, not
+        // here). Durably journal any Mutated/Quarantined fabric disposition
+        // (this arm registers the EEPROM 0x50-0x57 denylist fabric) so the
+        // NEXT boot's chokepoint gate refuses admission. A clean roster
+        // journals nothing (byte-identical clean session).
+        crate::daemon::persist_unresolved_mutation_dispositions(
+            &crate::daemon::terminal_mutation_disposition_path(),
+        );
+        match hybrid_run_result {
             Ok(()) => {
                 info!("dcentrald (s19j hybrid) stopped cleanly");
                 Ok(())
@@ -3413,6 +4148,147 @@ async fn run_main() -> Result<()> {
                 enter_management_only("s19j-hybrid", e, shutdown_token.clone(), None).await
             }
         }
+    } else if s17_hybrid_mode {
+        // S17-family (BM1397) hybrid mining: 2026-08-27 promotion
+        // (`2026-08-27-antminer17-unlock-armada`, agent B1). Mirrors the S19j
+        // hybrid launcher shape: minimal AppState so :8080/:4028 stay reachable,
+        // management-only park when mining cannot start, and the pre-bench
+        // energize gate adjudicated BEFORE the watchdog is armed so a refusal
+        // parks safely instead of arming-and-reboot-looping.
+        info!("Entering S17 HYBRID mining mode (--s17-hybrid)");
+        let (_runtime_health_tx, runtime_health_rx) =
+            tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
+                dcentrald_api::RuntimeHealthMode::Hybrid,
+            ));
+        let (miner_state_tx, miner_state_rx) = tokio::sync::watch::channel(
+            dcentrald_api::MinerState::empty(dcentrald_api::OperatingMode::Standard),
+        );
+        if !config.mining_start_enabled() {
+            let _api_handles =
+                crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                    config.clone(),
+                    dcentrald_api::RuntimeHealthMode::Hybrid,
+                    Some(runtime_health_rx),
+                    Some(miner_state_rx),
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                    shutdown_token.clone(),
+                )
+                .await?;
+            return enter_management_only_idle(
+                "s17-hybrid",
+                config.mining.enabled,
+                config.has_configured_pool(),
+                shutdown_token.clone(),
+            )
+            .await;
+        }
+
+        // Pre-bench energize gate (fail-closed): no live S17-family unit has
+        // run this engine. A refusal keeps the API/dashboard alive, arms no
+        // watchdog, and touches no hardware.
+        if let Err(recipe_error) = s17_hybrid_mining::adjudicate_s17_energize_gate() {
+            warn!(
+                %recipe_error,
+                "s17-hybrid pre-bench energize gate refused; parking management-only"
+            );
+            let _api_handles =
+                crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                    config.clone(),
+                    dcentrald_api::RuntimeHealthMode::Hybrid,
+                    Some(runtime_health_rx),
+                    Some(miner_state_rx),
+                    dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                    shutdown_token.clone(),
+                )
+                .await?;
+            return enter_management_only(
+                "s17-hybrid-energize-gate",
+                recipe_error,
+                shutdown_token.clone(),
+                None,
+            )
+            .await;
+        }
+
+        let mining_shutdown = shutdown_token.child_token();
+        let route_admission = s17_hybrid_route_admission.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "s17-hybrid reached hardware construction without one-shot route admission"
+            )
+        })?;
+        let safety_admission = match s17_hybrid_mining::S17HybridSafetyAdmission::start(
+            &config,
+            runtime_dispatch_admission,
+            route_admission,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if crate::runtime::safety_watchdog::is_watchdog_reset_pending(&error) {
+                    error!(
+                        %error,
+                        "s17-hybrid watchdog admission is reset-pending; refusing stable management-only operation"
+                    );
+                    return Err(error.context(
+                        "s17-hybrid watchdog admission faulted/reset_pending before API startup",
+                    ));
+                }
+                let _api_handles =
+                    crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                        config.clone(),
+                        dcentrald_api::RuntimeHealthMode::Hybrid,
+                        Some(runtime_health_rx),
+                        Some(miner_state_rx),
+                        dcentrald_hal::platform::HardwareMutationGate::new_closed(),
+                        shutdown_token.clone(),
+                    )
+                    .await?;
+                return enter_management_only(
+                    "s17-hybrid-watchdog-admission",
+                    error,
+                    shutdown_token.clone(),
+                    None,
+                )
+                .await;
+            }
+        };
+        let api_mutation_gate = safety_admission.hardware_mutation_gate();
+        let _api_handles =
+            crate::runtime::api::spawn_proxy_mode_api_with_state_and_hardware_mutation_gate(
+                config.clone(),
+                dcentrald_api::RuntimeHealthMode::Hybrid,
+                Some(runtime_health_rx),
+                Some(miner_state_rx),
+                api_mutation_gate,
+                shutdown_token.clone(),
+            )
+            .await?;
+        let mut miner = S17HybridMiner::new(config, mining_shutdown.clone(), safety_admission)?
+            .with_state_tx(miner_state_tx);
+
+        let hybrid_run_result = miner.run().await;
+        crate::daemon::persist_unresolved_mutation_dispositions(
+            &crate::daemon::terminal_mutation_disposition_path(),
+        );
+        match hybrid_run_result {
+            Ok(()) => {
+                info!("dcentrald (s17 hybrid) stopped cleanly");
+                Ok(())
+            }
+            // Desk promotion: there is no live-proven terminal safe-off receipt
+            // for the BM1397 engine yet, so any run error refuses stable
+            // management-only operation (the S19j terminal-safe-off carve-out
+            // is BM1362-specific and must not be inherited by prefix).
+            Err(e) => {
+                mining_shutdown.cancel();
+                error!(
+                    %e,
+                    "s17-hybrid run ended without a live-proven terminal disposition; refusing stable management-only operation"
+                );
+                Err(e.context("s17-hybrid terminal disposition is unproven (desk promotion)"))
+            }
+        }
     } else if serial_mining_mode {
         if auto_hybrid
             && detected_platform.starts_with("zynq-bm3-am2")
@@ -3427,7 +4303,11 @@ async fn run_main() -> Result<()> {
         }
         // Serial UART mining path — direct ASIC communication via /dev/ttyS*
         // Used for S19j Pro (BM1362) and other UART-based platforms
-        if !config.mining_start_enabled() {
+        if !config.mining_start_enabled() && !s19k_install_custody_safeoff {
+            anyhow::ensure!(
+                s19k_track1_j3_lease.is_none(),
+                "S19k Track-1 J3 lease refuses an idle/API-only lifetime; exiting returns the uncommitted ptrace lease to stock"
+            );
             info!(
                 mining_enabled = config.mining.enabled,
                 pool_configured = config.has_configured_pool(),
@@ -3451,14 +4331,28 @@ async fn run_main() -> Result<()> {
 
         info!("Entering SERIAL mining mode (--serial-mining)");
         let mining_shutdown = shutdown_token.child_token();
+        let s19k_track1_launch = s19k_stock_handoff_identity.is_some();
         let mut miner = match SerialMiner::new(
             config.clone(),
             mining_shutdown.clone(),
+            explicit_loud_fan_authority,
+            s19k_install_custody_safeoff,
+            s19k_track1_no_work,
+            s19k_track1_bounded_work_proof,
+            s19k_track1_endurance_work_proof,
+            s19k_stock_handoff_identity,
+            s19k_track1_receipt_authority,
+            s19k_track1_j3_lease.take(),
             runtime_dispatch_admission,
             am2_bm1362_serial_route_admission.take(),
         ) {
             Ok(miner) => miner,
             Err(error) => {
+                if s19k_track1_launch {
+                    return Err(error.context(
+                        "S19k Track-1 construction refused after J3 acquisition; exiting returns the uncommitted ptrace lease to stock",
+                    ));
+                }
                 let (_runtime_health_tx, runtime_health_rx) =
                     tokio::sync::watch::channel(dcentrald_api::RuntimeHealthSnapshot::for_mode(
                         dcentrald_api::RuntimeHealthMode::Native,
@@ -3482,7 +4376,17 @@ async fn run_main() -> Result<()> {
             }
         };
 
-        match miner.run().await {
+        let serial_run_result = miner.run().await;
+        // CONTROLLED-teardown journaling (2026-08-16): SerialMiner has
+        // completed its own voltage-cut/teardown (never a panic/unwind path —
+        // panic=abort routes through the panic hook, not here). Durably
+        // journal any Mutated/Quarantined fabric disposition the run left
+        // behind so the NEXT boot's chokepoint gate refuses admission. A
+        // clean roster journals nothing (byte-identical clean session).
+        crate::daemon::persist_unresolved_mutation_dispositions(
+            &crate::daemon::terminal_mutation_disposition_path(),
+        );
+        match serial_run_result {
             Ok(()) => {
                 info!("dcentrald (serial) stopped cleanly");
                 Ok(())
@@ -3509,6 +4413,15 @@ async fn run_main() -> Result<()> {
                             "serial run failed before the AM2 energizing boundary and closed with positive never-energized/watchdog evidence"
                         );
                     }
+                    Some(serial_mining::SerialFailureDisposition::StockOwnerRetainedClosed) => {
+                        error!(
+                            %e,
+                            "S19k Track-1 refused before route/process/GPIO handoff and positively closed its watchdog with the exact stock owner retained; exiting so external custody remains unresolved (no automatic receipt cleanup is authorized)"
+                        );
+                        return Err(e.context(
+                            "S19k stock owner retained after pre-handoff refusal; external runner custody must remain until separately audited cleanup",
+                        ));
+                    }
                     Some(serial_mining::SerialFailureDisposition::TerminalSafeOffClosed) => {
                         info!(
                             %e,
@@ -3524,6 +4437,26 @@ async fn run_main() -> Result<()> {
                             e.context("serial terminal disposition is reset-pending or unproven")
                         );
                     }
+                }
+                // S19k Track-1 one-shot trial routes (no-work, bounded-work
+                // proof, endurance proof) must never park in management-only
+                // after a typed failure disposition: the wrapper's closeout
+                // chain waits for process exit, and the park deadlocks it
+                // (live attempt 9, 2026-08-28: bounded mining-init failure
+                // parked 26+ minutes until an ungraceful wrapper kill and the
+                // printed restore). The typed disposition above already
+                // minted its receipts; exit so the wrapper's normal SIGCHLD
+                // closeout proceeds. Every other serial route keeps the
+                // management-only behavior byte-for-byte.
+                if s19k_install_custody_safeoff
+                    || s19k_track1_no_work
+                    || s19k_track1_bounded_work_proof
+                    || s19k_track1_endurance_work_proof
+                {
+                    return Err(e.context(
+                        "S19k Track-1 one-shot trial ended with a typed disposition; \
+                         exiting for wrapper closeout instead of a management-only park",
+                    ));
                 }
                 enter_management_only("serial", e, shutdown_token.clone(), None).await
             }
@@ -4386,6 +5319,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn s19k_track1_bootstrap_precedes_panic_hook_and_tokio() {
+        let main_start = MAIN_RS
+            .find("fn main() -> Result<()> {")
+            .expect("main function missing");
+        let main_tail = &MAIN_RS[main_start..];
+        let pdeath = main_tail
+            .find("s19k_arm_permanent_pdeathsig_from_env()?")
+            .expect("S19k permanent PDEATHSIG bootstrap missing from main");
+        let synchronous_chain = main_tail
+            .find("s19k_complete_daemon_pre_runtime_bootstrap(&authority, &identity, bootstrap)?")
+            .expect("S19k synchronous C1/J1/FIFO bootstrap missing from main");
+        let j3 = main_tail
+            .find("s19k_track1_startup_barrier_and_acquire_j3(")
+            .expect("S19k pre-runtime J3 acquisition missing from main");
+        let panic_hook = main_tail
+            .find("install_cut_hash_on_crash_panic_hook();")
+            .expect("panic hook call missing from main");
+        let tokio = main_tail
+            .find("tokio::runtime::Builder::new_multi_thread()")
+            .expect("Tokio builder missing from main");
+        assert!(pdeath < synchronous_chain);
+        assert!(synchronous_chain < j3);
+        assert!(j3 < panic_hook);
+        assert!(panic_hook < tokio);
+    }
+
     /// WATCHDOG (2026-06-28): every mining entry path that bypasses
     /// `Daemon::run()` (`--s19j-hybrid`, `--serial-mining`, `--am3-bb-mining`,
     /// `--stock-fpga`) MUST
@@ -4539,6 +5499,12 @@ mod tests {
                     "Some(serial_mining::SerialFailureDisposition::NeverEnergizedClosed)"
                 )
                 && MAIN_RS.contains(
+                    "Some(serial_mining::SerialFailureDisposition::StockOwnerRetainedClosed)"
+                )
+                && MAIN_RS.contains(
+                    "external runner custody must remain until separately audited cleanup"
+                )
+                && MAIN_RS.contains(
                     "Some(serial_mining::SerialFailureDisposition::TerminalSafeOffClosed)"
                 )
                 && MAIN_RS.contains("enter_management_only(\"serial\", e, shutdown_token.clone(), None)"),
@@ -4645,7 +5611,7 @@ mod tests {
     #[test]
     fn f5_fresh_unit_gate_precedes_miner_run() {
         let run_start = MAIN_RS
-            .find("async fn run_main() -> Result<()> {")
+            .find("async fn run_main(mut s19k_track1_j3_lease: Option<S19kTrack1J3Lease>) -> Result<()> {")
             .expect("run_main entry missing");
         let tests_start = MAIN_RS[run_start..]
             .find("#[cfg(test)]")
@@ -4796,7 +5762,7 @@ mod tests {
             );
         }
         let serial_call = MAIN_RS
-            .find("let mut miner = SerialMiner::new(")
+            .find("let mut miner = match SerialMiner::new(")
             .expect("F1-B: serial miner construction missing");
         assert!(
             MAIN_RS[serial_call..].contains("mining_shutdown.clone(),"),
@@ -5319,6 +6285,22 @@ mod tests {
         );
     }
 
+    /// HARD RULE: every DCENT_ open-source surface must point operators at
+    /// https://d-central.tech/fund/ (Stripe + BTCPay). `dcentrald --help`
+    /// is the CLI footer; do not drop the canonical URL from this string.
+    #[test]
+    fn cli_help_text_includes_canonical_fund_url() {
+        let help = crate::cli_help_text();
+        assert!(
+            help.contains("https://d-central.tech/fund/"),
+            "dcentrald --help must include the canonical Fund URL; got:\n{help}"
+        );
+        assert!(
+            help.contains("Fund / Donate / Support"),
+            "dcentrald --help footer must label the Fund/Donate/Support affordance; got:\n{help}"
+        );
+    }
+
     /// Structural pin: the `wants_cli_info` match must run BEFORE the
     /// `--set-fan` one-shot, config load, logging, AND mode routing, and
     /// must `std::process::exit(0)` — so `dcentrald --help` can never
@@ -5409,6 +6391,86 @@ mod tests {
         );
         // A bare `-` (e.g. stdin sentinel) is NOT treated as a flag typo.
         assert_eq!(unrecognized_cli_flags(&s(&["dcentrald", "-"])), empty);
+    }
+
+    #[test]
+    fn serial_allow_loud_is_explicitly_threaded_into_track1_owner() {
+        let source = include_str!("main.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production main source");
+        let authority = source
+            .find("let explicit_loud_fan_authority = args.iter().any(|a| a == \"--allow-loud\");")
+            .expect("explicit CLI loud-fan authority capture");
+        let serial = source
+            .find("let mut miner = match SerialMiner::new(")
+            .expect("serial miner constructor");
+        let constructor = &source[serial..];
+        assert!(authority < serial);
+        assert!(constructor.contains("explicit_loud_fan_authority,"));
+        assert!(crate::cli_help_text().contains("S19k Track-1 PWM"));
+        assert!(crate::cli_help_text().contains("https://d-central.tech/fund/"));
+    }
+
+    #[test]
+    fn s19k_stock_handoff_cli_requires_one_complete_exact_tree() {
+        use super::parse_s19k_stock_handoff_cli;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        assert!(parse_s19k_stock_handoff_cli(&s(&["dcentrald"]))
+            .unwrap()
+            .is_none());
+        let exact = s(&[
+            "dcentrald",
+            "--s19k-bos-tools-pid",
+            "1458",
+            "--s19k-bos-tools-start",
+            "1251",
+            "--s19k-bos-tools-ppid",
+            "1",
+            "--s19k-bos-tools-pgrp",
+            "1457",
+            "--s19k-bos-tools-session",
+            "1457",
+            "--s19k-bos-tools-exe",
+            "/usr/bin/bos-tools",
+            "--s19k-bos-tools-cmdline-sha256",
+            "2e8273fd19bccb1b1744b2f26f48825aae6de73e55be9919a472d0a953cfac52",
+            "--s19k-bos-tools-cmdline-bytes",
+            "68",
+            "--s19k-bosminer-pid",
+            "9495",
+            "--s19k-bosminer-start",
+            "1044815",
+            "--s19k-bosminer-ppid",
+            "1458",
+            "--s19k-bosminer-pgrp",
+            "1457",
+            "--s19k-bosminer-session",
+            "1457",
+            "--s19k-bosminer-exe",
+            "/usr/bin/bosminer",
+            "--s19k-bosminer-cmdline-sha256",
+            "465804a74a48655761ec62edfd4e08659b6fcaf7486e475260c1e490f2e9d3d3",
+            "--s19k-bosminer-cmdline-bytes",
+            "32",
+        ]);
+        assert!(parse_s19k_stock_handoff_cli(&exact).unwrap().is_some());
+        assert!(
+            parse_s19k_stock_handoff_cli(&s(&["dcentrald", "--s19k-bosminer-pid", "9495",]))
+                .is_err()
+        );
+        let mut duplicate = exact.clone();
+        duplicate.extend(s(&["--s19k-bosminer-pid", "9496"]));
+        assert!(parse_s19k_stock_handoff_cli(&duplicate).is_err());
+        let mut invalid_parent = exact;
+        let index = invalid_parent
+            .iter()
+            .position(|arg| arg == "--s19k-bosminer-ppid")
+            .unwrap()
+            + 1;
+        invalid_parent[index] = "1".to_string();
+        assert!(parse_s19k_stock_handoff_cli(&invalid_parent).is_err());
     }
 
     /// Drift guard: every `== "--…"` / `== "-x"` flag literal the parser

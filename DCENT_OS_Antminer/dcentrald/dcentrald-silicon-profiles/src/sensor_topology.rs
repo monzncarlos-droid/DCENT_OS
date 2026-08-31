@@ -328,16 +328,40 @@ fn spec_from_switch(
     provenance: DescriptorProvenance,
     sku: &str,
 ) -> Result<SensorSpec, SensorTopologyError> {
-    let position = SensorPosition::parse(&s.x, &s.y).ok_or_else(|| SensorTopologyError {
+    // v1.22.0-corpus entries carry quadrant placement labels + a chip
+    // anchor. The v1.24.0 H6HB70801 new-format bank carries a `channal`
+    // number instead of x/y and mostly omits the anchor — that row is
+    // excluded from this thermal model (see `SENSOR_MODEL_EXCLUDED_SKUS`)
+    // and reaching this arm without labels is a fail-closed error, never
+    // a guessed position.
+    let (x, y) = match (&s.x, &s.y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            return Err(SensorTopologyError {
+                sku: sku.to_string(),
+                detail: format!(
+                    "switch-sensor entry has no quadrant position labels \
+                     (x={:?} y={:?}, channal={:?}) — the v1.24.0 H6-format \
+                     bank is not representable in the v1.22.0 sensor model",
+                    s.x, s.y, s.channal
+                ),
+            })
+        }
+    };
+    let anchor = s.anchor_asic.ok_or_else(|| SensorTopologyError {
         sku: sku.to_string(),
-        detail: format!("unparseable switch-sensor position x={:?} y={:?}", s.x, s.y),
+        detail: "switch-sensor entry has no anchor_asic".to_string(),
+    })?;
+    let position = SensorPosition::parse(x, y).ok_or_else(|| SensorTopologyError {
+        sku: sku.to_string(),
+        detail: format!("unparseable switch-sensor position x={x:?} y={y:?}"),
     })?;
     Ok(SensorSpec {
         device: s.device.clone(),
         site: SensorSite::Hashboard,
         transport: SensorTransport::I2cMuxed {
             i2c_addr: s.i2c_addr,
-            anchor_asic: s.anchor_asic,
+            anchor_asic: anchor,
             power_by_ctrlboard: s.power_by_ctrlboard,
         },
         index: s.index,
@@ -385,6 +409,20 @@ struct SensorRegistry {
     by_sku: HashMap<String, usize>,
 }
 
+/// SKUs whose registry rows exist but are **excluded from this thermal
+/// model** because their sensor bank is not representable in the
+/// v1.22.0-corpus schema this module is built on (quadrant placement
+/// labels + chip anchors + LM75A-only device domain).
+///
+/// `H6HB70801` (v1.24.0 delta) is the only such row today: its 7-entry
+/// switch bank is addressed by explicit I²C-switch **channel** with no
+/// placement labels and mixes in TMP451 devices (see
+/// `hashboard_topology` module docs §"v1.24.0 delta"). Its sensor data
+/// is preserved verbatim in the topology registry; modelling it here is
+/// thermal-model work, deliberately not part of the roster-completion
+/// lane. Pinned by `h6hb70801_is_excluded_from_the_thermal_model`.
+const SENSOR_MODEL_EXCLUDED_SKUS: &[&str] = &["H6HB70801"];
+
 fn sensor_registry() -> &'static SensorRegistry {
     static REGISTRY: OnceLock<SensorRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
@@ -393,6 +431,7 @@ fn sensor_registry() -> &'static SensorRegistry {
         // condition (same posture as `hashboard_topology::registry`).
         let topologies: Vec<SkuSensorTopology> = all_descriptors()
             .iter()
+            .filter(|d| !SENSOR_MODEL_EXCLUDED_SKUS.contains(&d.sku.as_str()))
             .map(|d| {
                 try_build_sensor_topology(d)
                     .expect("pinned hashboard_topology corpus must yield a sensor topology")
@@ -407,8 +446,9 @@ fn sensor_registry() -> &'static SensorRegistry {
     })
 }
 
-/// Sensor topologies for all registry rows (50 as of the v1.22.0 import),
-/// sorted by SKU.
+/// Sensor topologies for all representable registry rows (50 v1.22.0 +
+/// 10 v1.24.0 delta = 60; `H6HB70801` excluded — see
+/// [`SENSOR_MODEL_EXCLUDED_SKUS`]), sorted by SKU.
 pub fn all_sensor_topologies() -> &'static [SkuSensorTopology] {
     &sensor_registry().topologies
 }
@@ -798,15 +838,19 @@ mod tests {
     }
 
     #[test]
-    fn registry_yields_topology_for_every_sku() {
-        assert_eq!(all_sensor_topologies().len(), 50);
+    fn registry_yields_topology_for_every_representable_sku() {
+        // 50 v1.22.0 + 10 v1.24.0 delta rows; H6HB70801 is excluded (its
+        // channel-addressed bank has no quadrant labels — see
+        // `h6hb70801_is_excluded_from_the_thermal_model`).
+        assert_eq!(all_sensor_topologies().len(), 60);
         for t in all_sensor_topologies() {
             assert!(
                 sensor_topology_for_sku(&t.sku).is_some(),
                 "{} must resolve",
                 t.sku
             );
-            // Every board declares at least the 4-sensor direct bank.
+            // Every representable board declares at least the 4-sensor
+            // direct bank.
             assert!(t.expected_per_hashboard() >= 4, "{}", t.sku);
         }
         assert!(sensor_topology_for_sku("NOT-A-SKU").is_none());
@@ -818,14 +862,26 @@ mod tests {
             .iter()
             .filter(|t| t.expected_muxed_per_hashboard() > 0)
             .collect();
-        assert_eq!(with_mux.len(), 9, "9 of 50 boards carry the mux bank");
+        // 9 of 50 v1.22.0 boards + the 4 v1.24.0 delta rows with the same
+        // bank shape (A3HB70505, M1HB70602, A3HB70608, A3HB70609).
+        assert_eq!(
+            with_mux.len(),
+            13,
+            "13 of 60 representable boards carry the mux bank"
+        );
         let total: u16 = with_mux
             .iter()
             .map(|t| t.expected_muxed_per_hashboard())
             .sum();
-        assert_eq!(total, 36, "36 muxed entries corpus-wide");
+        assert_eq!(total, 52, "52 muxed entries corpus-wide");
         for t in &with_mux {
-            assert!(t.sku.starts_with("A3HB"), "{}", t.sku);
+            // M1HB70602 (S21 XP Immersion) is the first non-A3HB-prefixed
+            // mux-bank board in the corpus.
+            assert!(
+                t.sku.starts_with("A3HB") || t.sku == "M1HB70602",
+                "{}",
+                t.sku
+            );
             assert_eq!(t.expected_muxed_per_hashboard(), 4, "{}", t.sku);
             // Mux bank shares one address behind the switch...
             for s in t.muxed_sensors() {
@@ -841,17 +897,50 @@ mod tests {
 
     #[test]
     fn provenance_travels_with_every_spec() {
+        let mut v122 = 0;
+        let mut v124 = 0;
         for t in all_sensor_topologies() {
-            assert_eq!(t.provenance, DescriptorProvenance::DeskJigDbExperimental);
+            let expected = match t.provenance {
+                DescriptorProvenance::DeskJigDbExperimental => {
+                    v122 += 1;
+                    t.provenance
+                }
+                DescriptorProvenance::DeskJigDbV124Experimental => {
+                    v124 += 1;
+                    t.provenance
+                }
+                other => panic!("{}: unexpected provenance {other:?}", t.sku),
+            };
             for s in &t.sensors {
-                assert_eq!(
-                    s.provenance,
-                    DescriptorProvenance::DeskJigDbExperimental,
-                    "{}",
-                    t.sku
-                );
+                assert_eq!(s.provenance, expected, "{}", t.sku);
             }
         }
+        assert_eq!(v122, 50);
+        assert_eq!(v124, 10);
+    }
+
+    /// The v1.24.0 `H6HB70801` row exists in the topology registry but its
+    /// channel-addressed sensor bank (no quadrant labels, TMP451 devices,
+    /// `channal` numbers) is NOT representable in this v1.22.0-corpus
+    /// thermal model — so it is excluded, fail-closed, with its data
+    /// preserved verbatim upstream. If the model ever grows
+    /// channel/label-free sensor support, this test (and
+    /// [`SENSOR_MODEL_EXCLUDED_SKUS`]) must be retired together.
+    #[test]
+    fn h6hb70801_is_excluded_from_the_thermal_model() {
+        assert!(crate::hashboard_topology::descriptor_by_sku("H6HB70801").is_some());
+        assert_eq!(sensor_topology_for_sku("H6HB70801"), None);
+        // And the exclusion is justified: building its topology fails
+        // closed on the missing placement labels, not silently.
+        let d = crate::hashboard_topology::descriptor_by_sku("H6HB70801").unwrap();
+        let err = try_build_sensor_topology(d).expect_err("H6 bank must not be representable");
+        assert!(
+            err.detail.contains("no quadrant position labels"),
+            "unexpected error: {err}"
+        );
+        // The excluded set is exactly this one SKU — anything else failing
+        // to build would have panicked the registry constructor above.
+        assert_eq!(SENSOR_MODEL_EXCLUDED_SKUS, &["H6HB70801"]);
     }
 
     #[test]

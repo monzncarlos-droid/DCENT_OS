@@ -69,6 +69,34 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         artifact_filename: "dcentos-unit.tar",
         install_contract: ArtifactInstallContract::ManagedS9Install,
     },
+    // 2026-08-29 packaging-lane wave: the S9 SE research-shell
+    // artifact. The BoardDesc row stays fail-closed (install authorization
+    // Denied, BM1393 scaffold refuses every mutating operation) — this
+    // claim makes the defconfig a first-class build lane, NOT an install
+    // tier promotion.
+    PrimaryArtifactProducer {
+        board_target: "am1-s9se",
+        build_target: "am1-s9se",
+        defconfig: "dcentos_am1-s9se_defconfig",
+        overlay: "board/zynq/am1-s9se",
+        package_validated: false,
+        artifact_filename: "dcentos-sysupgrade-am1-s9se.tar",
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
+    },
+    // 2026-08-29 packaging-lane wave: the S9k research-shell
+    // artifact. The BoardDesc row stays fail-closed (install authorization
+    // Denied, BM1393 scaffold refuses every mutating operation) — this
+    // claim makes the defconfig a first-class build lane, NOT an install
+    // tier promotion.
+    PrimaryArtifactProducer {
+        board_target: "am1-s9k",
+        build_target: "am1-s9k",
+        defconfig: "dcentos_am1-s9k_defconfig",
+        overlay: "board/zynq/am1-s9k",
+        package_validated: false,
+        artifact_filename: "dcentos-sysupgrade-am1-s9k.tar",
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
+    },
     PrimaryArtifactProducer {
         board_target: "am2-s19j",
         build_target: "am2-s19jpro",
@@ -94,6 +122,37 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         overlay: "board/zynq/am2-s17pro",
         package_validated: true,
         artifact_filename: "dcentos-sysupgrade-am2-s17pro.tar",
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
+    },
+    // 2026-08-27 unlock-armada (B2 board dirs, C1 convergence inventory
+    // claim): the three 17-series sibling overlays ship the same
+    // package_only_denied contract as am2-s17p — desk-validated sysupgrade
+    // wrappers, no device/flash authority.
+    PrimaryArtifactProducer {
+        board_target: "am2-s17plus",
+        build_target: "am2-s17plus",
+        defconfig: "dcentos_am2_s17plus_defconfig",
+        overlay: "board/zynq/am2-s17plus",
+        package_validated: true,
+        artifact_filename: "dcentos-sysupgrade-am2-s17plus.tar",
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
+    },
+    PrimaryArtifactProducer {
+        board_target: "am2-t17",
+        build_target: "am2-t17",
+        defconfig: "dcentos_am2_t17_defconfig",
+        overlay: "board/zynq/am2-t17",
+        package_validated: true,
+        artifact_filename: "dcentos-sysupgrade-am2-t17.tar",
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
+    },
+    PrimaryArtifactProducer {
+        board_target: "am2-t17plus",
+        build_target: "am2-t17plus",
+        defconfig: "dcentos_am2_t17plus_defconfig",
+        overlay: "board/zynq/am2-t17plus",
+        package_validated: true,
+        artifact_filename: "dcentos-sysupgrade-am2-t17plus.tar",
         install_contract: ArtifactInstallContract::PackageOnlyDenied,
     },
     PrimaryArtifactProducer {
@@ -139,7 +198,7 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         overlay: "board/amlogic/am3-s21xp",
         package_validated: true,
         artifact_filename: "dcentos-sysupgrade-am3-s21xp.tar",
-        install_contract: ArtifactInstallContract::GuardedAmlogicRootfsWindow,
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
     },
     PrimaryArtifactProducer {
         board_target: "am3-t21",
@@ -148,7 +207,7 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         overlay: "board/amlogic/am3-t21",
         package_validated: true,
         artifact_filename: "dcentos-sysupgrade-am3-t21.tar",
-        install_contract: ArtifactInstallContract::GuardedAmlogicRootfsWindow,
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
     },
     PrimaryArtifactProducer {
         board_target: "am3-s19k",
@@ -166,7 +225,7 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         overlay: "board/amlogic/am3-s19xp",
         package_validated: true,
         artifact_filename: "dcentos-sysupgrade-am3-s19xp.tar",
-        install_contract: ArtifactInstallContract::GuardedAmlogicRootfsWindow,
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
     },
     PrimaryArtifactProducer {
         board_target: "am3-s19jxp",
@@ -175,7 +234,7 @@ pub const PRIMARY_ARTIFACT_PRODUCERS: &[PrimaryArtifactProducer] = &[
         overlay: "board/amlogic/am3-s19jxp",
         package_validated: true,
         artifact_filename: "dcentos-sysupgrade-am3-s19jxp.tar",
-        install_contract: ArtifactInstallContract::GuardedAmlogicRootfsWindow,
+        install_contract: ArtifactInstallContract::PackageOnlyDenied,
     },
     PrimaryArtifactProducer {
         board_target: "am3-s19jproplus",
@@ -230,7 +289,10 @@ pub fn artifact_producer_manifest_json() -> String {
 mod tests {
     use super::*;
     use crate::board_desc::{BoardDesc, BoardFamily};
-    use dcent_schema::hardware::{ArtifactKind, UpdateMechanism};
+    use dcent_schema::hardware::{
+        ArtifactKind, ImplementationMaturity, InstallAuthorization, StorageTopology,
+        UpdateMechanism,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -319,17 +381,41 @@ mod tests {
                         board.enablement.artifact_kind,
                         ArtifactKind::SysupgradeBundle
                     );
-                    assert_eq!(
-                        board.enablement.install_authorization,
-                        dcent_schema::hardware::InstallAuthorization::Denied
-                    );
                     match board.family {
-                        BoardFamily::Amlogic => assert_eq!(
-                            board.enablement.update_mechanism,
-                            UpdateMechanism::HostRootfsWindow
-                        ),
+                        BoardFamily::Amlogic => {
+                            assert_eq!(board.enablement.storage_topology, StorageTopology::Unknown);
+                            assert_eq!(board.enablement.update_mechanism, UpdateMechanism::None);
+                            assert_eq!(
+                                board.enablement.install_authorization,
+                                InstallAuthorization::Denied
+                            );
+                            assert_eq!(
+                                board.enablement.update_maturity,
+                                ImplementationMaturity::NotImplemented
+                            );
+                            assert!(!board.enablement.allows_persistent_update());
+                        }
                         BoardFamily::Zynq => {
-                            assert_eq!(producer.board_target, "am2-s17p");
+                            // 2026-08-27 armada (C1): the package-only Zynq
+                            // lane covers the four 17-series siblings
+                            // (am2-s17p plus B2's three shipped boards).
+                            assert!(
+                                matches!(
+                                    producer.board_target,
+                                    "am2-s17p"
+                                        | "am2-s17plus"
+                                        | "am2-t17"
+                                        | "am2-t17plus"
+                                        | "am1-s9se"
+                                        | "am1-s9k"
+                                ),
+                                "unexpected Zynq package-only producer {}",
+                                producer.board_target
+                            );
+                            assert_eq!(
+                                board.enablement.install_authorization,
+                                InstallAuthorization::Denied
+                            );
                             assert_eq!(
                                 board.enablement.update_mechanism,
                                 UpdateMechanism::ZynqUbiFwSetenv
@@ -412,26 +498,15 @@ mod tests {
                 .unwrap_or_else(|error| panic!("read {}: {error}", post_image.display()));
             let shared_amlogic =
                 include_str!("../../../br2_external_dcentos/board/amlogic/am3-s21/post-image.sh");
-            let metadata_source = if producer.install_contract
-                == ArtifactInstallContract::GuardedAmlogicRootfsWindow
-                && source.lines().any(|line| {
-                    line.trim_start().starts_with("exec ") && line.contains("am3-s21/post-image.sh")
-                }) {
+            let metadata_source = if source.lines().any(|line| {
+                line.trim_start().starts_with("exec ") && line.contains("am3-s21/post-image.sh")
+            }) {
                 shared_amlogic
             } else {
                 source.as_str()
             };
             if producer.install_contract == ArtifactInstallContract::PackageOnlyDenied {
-                let denial_source = if board.family == BoardFamily::Amlogic {
-                    assert!(
-                        source.contains("am3-s21/post-image.sh"),
-                        "{} must delegate to the shared A113D packager",
-                        producer.board_target
-                    );
-                    shared_amlogic
-                } else {
-                    source.as_str()
-                };
+                let denial_source = metadata_source;
                 assert!(denial_source.contains("DCENT_TOOLBOX_INSTALL_MODE=package_only_denied"));
                 assert!(denial_source.contains("DCENT_PACKAGE_INSTALLABLE=false"));
                 assert!(denial_source.contains("DCENT_TOOLBOX_INSTALL_COMMAND="));
@@ -471,7 +546,7 @@ mod tests {
                 });
             let shared_dynamic = matches!(
                 producer.board_target,
-                "am3-s21" | "am3-s19xp" | "am3-s19jxp" | "am3-s19jproplus"
+                "am3-s21" | "am3-s19jproplus"
             )
                 && actual
                     == "DCENT_TOOLBOX_INSTALL_COMMAND=\"dcent install <ip> -f ${OUTPUT_BASENAME} --artifact-dir <restore_verified_dir>\"";

@@ -16,6 +16,7 @@ libc = "0.2"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 uuid.workspace = true
 askama.workspace = true
 thiserror.workspace = true
@@ -28,6 +29,10 @@ tokio-util.workspace = true
 # the admit_work_dispatch admission gate; this feature ships only the pure
 # parser/grader (no hardware, no work dispatch).
 pattern-selftest = []
+
+# Pure exact-hash AMTC Config.ini -> FactoryTestPlan evidence importer.
+# Implies only the offline pattern data model; adds no daemon/API/TestType/device path.
+factory-test-plan = ["pattern-selftest", "dep:sha2"]
 
 # W4.7 lint inheritance (DCENT_DevOps + DCENT_QA, 2026-05-07).
 # CLEAN CRATE: zero unwrap/expect/panic in src/ at audit time. Inherit the

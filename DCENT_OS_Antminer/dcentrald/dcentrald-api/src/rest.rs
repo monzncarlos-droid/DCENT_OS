@@ -75,7 +75,10 @@ use dcentrald_diagnostics::snapshot::{
     SnapshotChain, SnapshotChipHealth, SnapshotContext, SnapshotHistorySample, SnapshotProfile,
     SnapshotProfileChip,
 };
-use dcentrald_diagnostics::troubleshoot::{AsicCommChainSnapshot, AsicCommSnapshot};
+use dcentrald_diagnostics::troubleshoot::{
+    AsicCommChainSnapshot, AsicCommSnapshot, NetworkProbeStageTelemetry, NetworkProbeStatus,
+    UnattestedNetworkTelemetry, UnattestedPsuTelemetry,
+};
 use dcentrald_diagnostics::{
     DiagnosticJobConfig, HashReportJobConfig, TestResult, TestStatus, TestType,
 };
@@ -103,7 +106,7 @@ use error_response::{
     api_error, normalize_api_error_response, pool_validation_error, ConfigPersistenceError,
 };
 use network_diagnostic::{
-    run_network_diagnostic, NetworkProbeError, NetworkProbeInput, ProbeStatus,
+    run_network_diagnostic, NetworkProbeError, NetworkProbeInput, ProbeStageOutcome, ProbeStatus,
 };
 
 const MCP_HTTP_PATH: &str = "/mcp";
@@ -647,7 +650,7 @@ fn build_power_targeting_state(
     build_power_targeting_state_from_configured(read_configured_power_target(mode), projection)
 }
 
-fn chip_type_to_chip_id(chip_type: &str) -> Option<u16> {
+pub(crate) fn chip_type_to_chip_id(chip_type: &str) -> Option<u16> {
     match chip_type.trim().to_ascii_uppercase().as_str() {
         "BM1387" => Some(0x1387),
         "BM1397" => Some(0x1397),
@@ -2113,14 +2116,22 @@ fn eth0_ipv4() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
+    // Single source for 4028 / fleet identity: `/etc/hostname`.
+    // `[general].hostname` in TOML defaults to this file when unset
+    // (`dcentrald::config::default_hostname`); operator POST writes both.
     std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "dcentos".to_string())
         .trim()
         .to_string()
 }
 
-fn fleet_model_label(hw: &crate::HardwareInfo) -> String {
+/// Hardware MODEL label for fleet/pyasic surfaces.
+///
+/// Prefers canonical [`MinerProfile::name`] (e.g. `Antminer S19j Pro`) over a
+/// chip-typed fallback like `Antminer (BM1362)`. Hashboard type is used only
+/// when no profile exists; unknown chips stay honest as `Antminer (<chip>)`.
+pub(crate) fn fleet_model_label(hw: &crate::HardwareInfo) -> String {
     if let Some(profile) = chip_type_to_chip_id(&hw.chip_type).and_then(MinerProfile::for_chip) {
         return profile.name.to_string();
     }
@@ -2138,6 +2149,32 @@ fn fleet_model_label(hw: &crate::HardwareInfo) -> String {
     }
 
     "Antminer (unknown ASIC)".to_string()
+}
+
+#[cfg(test)]
+mod fleet_model_label_tests {
+    use super::*;
+
+    fn hw(chip_type: &str) -> crate::HardwareInfo {
+        crate::HardwareInfo {
+            chip_type: chip_type.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fleet_model_label_prefers_miner_profile_name_over_chip_typed() {
+        assert_eq!(fleet_model_label(&hw("BM1362")), "Antminer S19j Pro");
+        assert_ne!(fleet_model_label(&hw("BM1362")), "Antminer (BM1362)");
+        assert_eq!(fleet_model_label(&hw("bm1362")), "Antminer S19j Pro");
+        assert_eq!(fleet_model_label(&hw("BM1387")), "Antminer S9");
+    }
+
+    #[test]
+    fn fleet_model_label_unknown_chip_stays_honest_chip_typed_fallback() {
+        assert_eq!(fleet_model_label(&hw("BM9999")), "Antminer (BM9999)");
+        assert_eq!(fleet_model_label(&hw("")), "Antminer (unknown ASIC)");
+    }
 }
 
 fn fleet_status_for_miner(miner: &crate::MinerState) -> FleetMinerStatus {
@@ -2798,17 +2835,15 @@ fn swarm_discovery(ipv4: &str) -> SwarmDiscoveryInfo {
 
 /// P2-5 truth-contract: the swarm capabilities this node honestly advertises.
 ///
-/// `target_temp_control` is **false**. Although `dcentrald-thermal` defines a
-/// `HeaterController` PID (room-temp setpoint → power), it is **not instantiated
-/// or run anywhere in the daemon** (its `compute_adjustment`/`set_target_watts`/
-/// `effective_target_watts` are only called inside `heater.rs` itself), and there
-/// is **no REST endpoint to set a room-temperature setpoint** (only observed-temp
-/// inputs via `POST /api/home/room-temp` and `/api/swarm/room-temp`). With no
-/// live closed-loop controller and no setpoint, the node cannot drive a room to a
-/// target temperature, so advertising the capability would be a truth-contract
-/// violation. `room_temp_input` (observed temp) and `target_watts_control` (power
-/// target via `POST /api/home/target`, read by the thermal/autotuner loop) ARE
-/// wired, so they stay true.
+/// `target_temp_control` is **false**. `HeaterController` now produces a
+/// power-domain watt command (`next_watt_command` / night-adjusted setpoint),
+/// but it is still **not instantiated as a room-temp closed loop** in the
+/// daemon — there is no REST endpoint to set a room-temperature setpoint
+/// (only observed-temp inputs via `POST /api/home/room-temp` and
+/// `/api/swarm/room-temp`). Heater/Power watt targeting uses
+/// `TuneTarget::Power` + the watt PID, not room-temp chase. Advertising
+/// `target_temp_control` would be a truth-contract violation.
+/// `room_temp_input` and `target_watts_control` stay true.
 ///
 /// Do NOT flip `target_temp_control` back to true without first wiring a live
 /// closed-loop room-temp controller AND a setpoint endpoint — and that controller
@@ -3053,6 +3088,7 @@ pub(crate) fn apply_home_night_mode_to_table(
     end_hour: u8,
     max_fan_pwm: u8,
     power_reduction_pct: u8,
+    max_frequency_mhz: u16,
 ) {
     let mode = table
         .entry("mode".to_string())
@@ -3076,6 +3112,10 @@ pub(crate) fn apply_home_night_mode_to_table(
                 nm_table.insert(
                     "power_reduction_pct".into(),
                     toml::Value::Integer(power_reduction_pct as i64),
+                );
+                nm_table.insert(
+                    "max_frequency_mhz".into(),
+                    toml::Value::Integer(max_frequency_mhz as i64),
                 );
             }
         }
@@ -4030,6 +4070,16 @@ const API_COMPATIBILITY_DCENT_ROUTES: &[ApiCompatibilityRouteEntry] = &[
         provenance: "mounted in rest::build_router and backed by dcentrald-api-types::power_profile_preset",
         unsupported_fields: &["live_profile_application"],
         limitations: &["Static preset catalog only; does not apply frequency, voltage, or power settings."],
+    },
+    ApiCompatibilityRouteEntry {
+        method: "GET",
+        path: "/api/autotune/presets",
+        support: "implemented_catalog",
+        mutates: false,
+        compatibility: &["VNish-shaped operator tooling", "DCENT dashboard"],
+        provenance: "alias of /api/profiles/presets; VNish 1.2.7 OpenAPI GET /api/v1/autotune/presets",
+        unsupported_fields: &["live_profile_application", "tune_settings"],
+        limitations: &["Read-only catalog alias; does not enable the autotuner or apply per-chip maps."],
     },
     ApiCompatibilityRouteEntry {
         method: "PUT",
@@ -6621,6 +6671,9 @@ pub fn build_router() -> Router<Arc<AppState>> {
         .route("/api/cgminer/catalog", get(get_cgminer_catalog))
         //  W2: power-profile preset catalog (read-only).
         .route("/api/profiles/presets", get(get_profile_presets))
+        // VNish-shaped alias: wattage preset catalog (read-only, does not
+        // enable the autotuner). Same payload as /api/profiles/presets.
+        .route("/api/autotune/presets", get(get_profile_presets))
         //  W3: thermal-sensor topology catalog (read-only).
         .route(
             "/api/hardware/thermal/sensors",
@@ -7845,6 +7898,7 @@ pub struct NightModeRequest {
     pub end_hour: Option<u8>,
     pub max_fan_pwm: Option<u8>,
     pub power_reduction_pct: Option<u8>,
+    pub max_frequency_mhz: Option<u16>,
 }
 
 /// Request body for debug register write.
@@ -8038,6 +8092,68 @@ fn classify_thermal_posture(
     }
 }
 
+/// Add logical-serial observability only when a publisher supplied it.
+///
+/// Keeping this as a conditional top-level extension preserves the legacy
+/// `/api/status` and `/api/stats` shapes for every non-serial platform. The
+/// endpoint records themselves intentionally carry no physical-board identity.
+fn extend_serial_observability(response: &mut serde_json::Value, miner: &crate::MinerState) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    if !miner.serial_endpoints.is_empty() {
+        object.insert(
+            "serial_endpoints".to_string(),
+            serde_json::json!(&miner.serial_endpoints),
+        );
+    }
+    if let Some(scope) = miner.chains_scope.as_ref() {
+        object.insert("chains_scope".to_string(), serde_json::json!(scope));
+    }
+}
+
+#[cfg(test)]
+mod serial_observability_tests {
+    use super::*;
+
+    #[test]
+    fn non_serial_status_and_stats_shapes_remain_unchanged() {
+        let miner = crate::MinerState::empty(crate::OperatingMode::Standard);
+        let mut response = serde_json::json!({ "chains": [] });
+        extend_serial_observability(&mut response, &miner);
+
+        assert!(response.get("serial_endpoints").is_none());
+        assert!(response.get("chains_scope").is_none());
+    }
+
+    #[test]
+    fn logical_serial_observability_is_an_additive_top_level_extension() {
+        let mut miner = crate::MinerState::empty(crate::OperatingMode::Standard);
+        miner.chains_scope = Some(crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME.to_string());
+        miner.serial_endpoints = vec![crate::SerialEndpointState {
+            logical_path: "/dev/ttyS1".to_string(),
+            open_state: "open".to_string(),
+            parser_state: "synchronized".to_string(),
+            ..Default::default()
+        }];
+        let mut response = serde_json::json!({ "chains": [{ "id": 0 }] });
+        extend_serial_observability(&mut response, &miner);
+
+        assert_eq!(
+            response["chains_scope"],
+            crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME
+        );
+        assert_eq!(
+            response["serial_endpoints"][0]["logical_path"],
+            "/dev/ttyS1"
+        );
+        assert!(response["serial_endpoints"][0]
+            .get("physical_slot")
+            .is_none());
+        assert_eq!(response["chains"][0]["id"], 0);
+    }
+}
+
 /// GET /api/status -- Overall miner status.
 ///
 /// Polled by dashboard every 5 seconds. Returns hashrate, temperatures,
@@ -8135,7 +8251,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         donation_transparency_from_table(donation, miner.pool.donating)
     };
 
-    Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "hashrate_ghs": miner.hashrate_ghs,
         "hashrate_5s_ghs": miner.hashrate_5s_ghs,
         // W6.3 dashboard surface — nominal vs effective TH/s.
@@ -8216,7 +8332,9 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // RE-013: transparent donation surface (primary + visible Braiins
         // fallback worker). Open-source devfee transparency.
         "donation": donation_block,
-    }))
+    });
+    extend_serial_observability(&mut response, &miner);
+    Json(response)
 }
 
 /// GET /api/fleet/miners -- Minimal local fleet inventory.
@@ -8712,7 +8830,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // fetched — never fabricated).
     let network_difficulty = cached_network_difficulty();
 
-    Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "hashrate_ghs": miner.hashrate_ghs,
         "hashrate_ths": miner.hashrate_ghs / 1000.0,
         "accepted": miner.accepted,
@@ -8805,8 +8923,9 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         },
         "share_efficiency": miner.pool.share_efficiency,
         "tuning_status": "unavailable",
-    }))
-    .into_response()
+    });
+    extend_serial_observability(&mut response, &miner);
+    Json(response).into_response()
 }
 
 /// GET /api/pools -- Pool configuration and status.

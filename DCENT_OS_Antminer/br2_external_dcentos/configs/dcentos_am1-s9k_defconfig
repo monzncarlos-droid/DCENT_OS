@@ -1,0 +1,60 @@
+# DCENTos Hacker Shell - Buildroot defconfig for Antminer S9k (Zynq am1).
+# D-Central Technologies, 2026.
+#
+# 2026-08-29 S9k/S9 SE packaging-lane wave — the 2026-08-28 full-line
+# campaign's missing S9k install artifact. Same am1 Zynq board
+# infrastructure as dcentos_s9_defconfig (see that file for the layering
+# explanation); the per-board post-image.sh produces the package-only
+# sysupgrade tarball. The BoardDesc row stays fail-closed (install
+# authorization Denied; the BM1393 scaffold refuses every mutating
+# operation): this is a RESEARCH-SHELL artifact, not an install tier.
+
+# =============================================================================
+# Target Architecture: ARM Cortex-A9 (Zynq).
+# =============================================================================
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_FPU_VFPV3D16=y
+
+# =============================================================================
+# Toolchain: Linaro GCC 7.2.1-2017.11 (am1 Zynq standard).
+# =============================================================================
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://releases.linaro.org/components/toolchain/binaries/7.2-2017.11/arm-linux-gnueabihf/gcc-linaro-7.2.1-2017.11-x86_64_arm-linux-gnueabihf.tar.xz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_7=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_10=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+BR2_TOOLCHAIN_EXTERNAL_FORTRAN=y
+BR2_TOOLCHAIN_EXTERNAL_OPENMP=y
+
+# =============================================================================
+# Filesystem: dual output, same as am1-s9.
+# =============================================================================
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS_BS_1024K=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
+# BR2_PACKAGE_EUDEV_ENABLE_HWDB is not set
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="96M"
+
+# =============================================================================
+# Per-product identity.
+# =============================================================================
+BR2_TARGET_GENERIC_HOSTNAME="dcentos"
+BR2_TARGET_GENERIC_ISSUE="DCENTos Hacker Shell v0.1 — D-Central Technologies (am1-s9k)"
+
+# =============================================================================
+# Overlay and Scripts — shared zynq infra + the per-board post-image.
+# =============================================================================
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_DCENTOS_PATH)/board/common/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/rootfs-overlay $(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am1-s9k/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/post-build.sh $(BR2_EXTERNAL_DCENTOS_PATH)/board/common/prune-runtime-research-tools.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/am1-s9k/post-image.sh"
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_DCENTOS_PATH)/board/zynq/busybox.config"

@@ -1,0 +1,13 @@
+[package]
+name = "s19k-stage1-authorizer"
+version.workspace = true
+edition = "2021"
+description = "Bounded detached Ed25519 verifier for the S19k stage-1 transaction"
+license = "GPL-3.0"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
+

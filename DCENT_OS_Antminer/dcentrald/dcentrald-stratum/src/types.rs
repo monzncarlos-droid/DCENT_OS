@@ -641,7 +641,7 @@ pub struct StratumConfig {
     /// ticket-mask substitute, or a runtime floor after the handshake.
     pub suggest_difficulty: Option<u64>,
 
-    /// Informational-only flag (does NOT control whether the ASICs keep
+    /// Legacy V1 **log-note** flag (does NOT control whether the ASICs keep
     /// hashing). When `true`, the V1 client emits a log note that the chips are
     /// continuing to hash the last job while the pool reconnects.
     ///
@@ -652,9 +652,16 @@ pub struct StratumConfig {
     /// REGARDLESS of this flag. Setting it `false` does not stop hashing on
     /// pool loss — it only suppresses the `info!` note in `v1/client.rs`.
     ///
-    /// Decade backlog **P2-8**: use [`HASH_ON_DISCONNECT_CUTS_ASIC_HASH`] and
-    /// [`hash_on_disconnect_semantics`] when product copy or UI needs honest
-    /// labels — never imply this flag powers ASICs off.
+    /// **This is not a LuxOS `hash_on_disconnect` clone.** LuxOS-style work-cut
+    /// (`hash_on_disconnect=false` / ePIC `idle_on_connection_lost`) is
+    /// [`HashOnDisconnectPolicy::StopOnDisconnect`], which this bool does not
+    /// select. Product copy must use [`HashOnDisconnectPolicy`] (three
+    /// behaviors) plus [`HASH_ON_DISCONNECT_CUTS_ASIC_HASH`] /
+    /// [`hash_on_disconnect_semantics`] — never imply this flag powers ASICs
+    /// off or matches LuxOS.
+    ///
+    /// V1 mining policy is always [`HashOnDisconnectPolicy::KeepLastJob`]
+    /// (disconnect-while-hashing). See [`StratumConfig::hash_on_disconnect_policy`].
     ///
     /// The real "don't spin hot forever" backstop is thermal supervision (the
     /// PID/threshold loop), NOT pool connection state — chips hashing stale
@@ -696,17 +703,125 @@ fn default_true() -> bool {
 ///
 /// Same-pool reconnect keeps the last job active regardless of the flag; only
 /// a pool *switch* flushes the dispatcher. Product/UI must not claim this
-/// boolean is a power-off or safety stop.
+/// boolean is a power-off or safety stop, a LuxOS work-cut knob, or
+/// [`HashOnDisconnectPolicy::StopOnDisconnect`].
 pub const HASH_ON_DISCONNECT_CUTS_ASIC_HASH: bool = false;
 
-/// Stable semantics label for `hash_on_disconnect` (config field name kept).
+/// OCEAN DATUM / DATUM Gateway is **not** implemented in DCENT_OS.
+///
+/// There is no DATUM client, gateway, or job-declaration-as-DATUM in this
+/// crate. SV2 Job Declaration `probe_once` is opt-in, not DATUM. Product
+/// copy must not claim "DATUM Yes" (`CLAIM_UNSAFE`). Selecting
+/// `protocol = "datum"` is refused fail-closed by [`refuse_datum_protocol`].
+pub const DATUM_PROTOCOL_SUPPORTED: bool = false;
+
+/// Stable semantics label for the legacy `hash_on_disconnect` **bool**
+/// (config field name kept). The bool is log-note-only; the operator-facing
+/// trichotomy lives on [`HashOnDisconnectPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashOnDisconnectSemantics {
     /// Flag only controls whether the reconnect path emits an informational log.
     LogNoteOnly,
 }
 
-/// Documented behavior of [`StratumConfig::hash_on_disconnect`].
+/// Three hash-on-disconnect behaviors. DCENT does **not** ship a single
+/// LuxOS-equivalent knob.
+///
+/// | Variant | Product name | What DCENT does |
+/// |---|---|---|
+/// | [`KeepLastJob`] | disconnect-while-hashing | **V1 default.** ASICs keep hashing the last job. Does **not** cut hash as a safety stop. |
+/// | [`StopOnDisconnect`] | stop-on-disconnect | LuxOS-style work-cut / ePIC idle. **Not** what the V1 bool does. Serial AM2 `enabled=false` can terminal-cut after a committed UART job. |
+/// | [`PoolRequested`] | (future) pool-requested | Not implemented. Refused fail-closed. |
+///
+/// Default is [`KeepLastJob`] so V1 mining defaults do not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HashOnDisconnectPolicy {
+    /// V1: keep hashing the last job across a same-pool disconnect.
+    /// Does **not** cut hash as a safety stop. Thermal supervisor is the
+    /// backstop, not pool reachability.
+    #[default]
+    KeepLastJob,
+    /// Named LuxOS-style work-cut (`hash_on_disconnect=false` on LuxOS,
+    /// ePIC `idle_on_connection_lost`). The V1 `hash_on_disconnect` bool
+    /// does **not** implement this. Selecting it does not change V1 mining.
+    StopOnDisconnect,
+    /// Future: honor a pool-requested idle/cut. Not implemented.
+    PoolRequested,
+}
+
+impl std::fmt::Display for HashOnDisconnectPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeepLastJob => write!(f, "keep_last_job"),
+            Self::StopOnDisconnect => write!(f, "stop_on_disconnect"),
+            Self::PoolRequested => write!(f, "pool_requested"),
+        }
+    }
+}
+
+impl HashOnDisconnectPolicy {
+    /// V1 mining policy. Always [`KeepLastJob`] — the historical bool does
+    /// not select work-cut on the V1 client.
+    pub fn v1_mining_default() -> Self {
+        Self::KeepLastJob
+    }
+
+    /// Map the legacy V1 `hash_on_disconnect` bool onto the policy enum
+    /// without changing mining: both `true` and `false` are [`KeepLastJob`].
+    /// `false` only suppresses the reconnect log note.
+    pub fn from_legacy_v1_flag(_enabled: bool) -> Self {
+        Self::KeepLastJob
+    }
+
+    /// True only for the named LuxOS-style work-cut. V1 never returns this
+    /// from [`from_legacy_v1_flag`].
+    pub fn is_luxos_style_work_cut(self) -> bool {
+        matches!(self, Self::StopOnDisconnect)
+    }
+
+    /// API / dashboard copy. Do not print this as a LuxOS-equivalent badge.
+    pub fn api_label(self) -> &'static str {
+        match self {
+            Self::KeepLastJob => {
+                "keep_last_job (V1 disconnect-while-hashing; does not cut hash as a safety stop)"
+            }
+            Self::StopOnDisconnect => {
+                "stop_on_disconnect (LuxOS-style work-cut; NOT what the V1 hash_on_disconnect flag does)"
+            }
+            Self::PoolRequested => {
+                "pool_requested (future pool-requested idle; not implemented)"
+            }
+        }
+    }
+
+    /// Fail-closed for the unimplemented future variant. [`KeepLastJob`] and
+    /// [`StopOnDisconnect`] are nameable; [`PoolRequested`] is refused.
+    pub fn refuse_unimplemented(self) -> Result<(), &'static str> {
+        match self {
+            Self::KeepLastJob | Self::StopOnDisconnect => Ok(()),
+            Self::PoolRequested => Err(
+                "hash_on_disconnect.policy=pool_requested is not implemented \
+                 (future pool-requested idle). V1 default is keep_last_job; \
+                 LuxOS-style work-cut is stop_on_disconnect and is NOT what \
+                 the V1 hash_on_disconnect bool does",
+            ),
+        }
+    }
+}
+
+impl StratumConfig {
+    /// Honest V1 policy: always [`HashOnDisconnectPolicy::KeepLastJob`].
+    ///
+    /// The legacy [`StratumConfig::hash_on_disconnect`] bool is log-note-only
+    /// ([`hash_on_disconnect_semantics`]). It does not select
+    /// [`HashOnDisconnectPolicy::StopOnDisconnect`].
+    pub fn hash_on_disconnect_policy(&self) -> HashOnDisconnectPolicy {
+        HashOnDisconnectPolicy::from_legacy_v1_flag(self.hash_on_disconnect)
+    }
+}
+
+/// Documented behavior of the legacy [`StratumConfig::hash_on_disconnect`] bool.
 pub fn hash_on_disconnect_semantics() -> HashOnDisconnectSemantics {
     // Compile-time honesty: if someone flips the constant without wiring cut
     // behavior, tests fail. Today the constant is always false.
@@ -716,6 +831,25 @@ pub fn hash_on_disconnect_semantics() -> HashOnDisconnectSemantics {
     // moment anyone flips the constant.
     const _: () = assert!(!HASH_ON_DISCONNECT_CUTS_ASIC_HASH);
     HashOnDisconnectSemantics::LogNoteOnly
+}
+
+/// Refuse OCEAN DATUM as a pool protocol. DATUM is absent from DCENT_OS;
+/// advertising it is `CLAIM_UNSAFE`.
+pub fn refuse_datum_protocol(protocol: Option<&str>) -> Result<(), String> {
+    const _: () = assert!(!DATUM_PROTOCOL_SUPPORTED);
+    let p = protocol.unwrap_or("").trim().to_ascii_lowercase();
+    if p.is_empty() {
+        return Ok(());
+    }
+    if p == "datum" || p.starts_with("datum+") || p.starts_with("datum:") {
+        return Err(
+            "DATUM is not implemented in DCENT_OS (CLAIM_UNSAFE if advertised). \
+             There is no DATUM client, gateway, or job-declaration-as-DATUM. \
+             Use protocol sv1/v1, sv2/v2, or auto."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub fn default_version_rolling_mask() -> u32 {
@@ -1242,6 +1376,91 @@ mod tests {
             hash_on_disconnect_semantics(),
             HashOnDisconnectSemantics::LogNoteOnly
         );
+    }
+
+    #[test]
+    fn hash_on_disconnect_policy_default_is_v1_keep_last_job() {
+        // DESK_NOW rank 12: exposing the trichotomy must not change V1 mining.
+        assert_eq!(
+            HashOnDisconnectPolicy::default(),
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert_eq!(
+            HashOnDisconnectPolicy::v1_mining_default(),
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert_eq!(
+            HashOnDisconnectPolicy::from_legacy_v1_flag(true),
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert_eq!(
+            HashOnDisconnectPolicy::from_legacy_v1_flag(false),
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert!(!HashOnDisconnectPolicy::KeepLastJob.is_luxos_style_work_cut());
+        assert!(HashOnDisconnectPolicy::StopOnDisconnect.is_luxos_style_work_cut());
+        assert!(!HashOnDisconnectPolicy::PoolRequested.is_luxos_style_work_cut());
+        HashOnDisconnectPolicy::KeepLastJob
+            .refuse_unimplemented()
+            .expect("keep_last_job is the shipped V1 policy");
+        HashOnDisconnectPolicy::StopOnDisconnect
+            .refuse_unimplemented()
+            .expect("stop_on_disconnect is nameable (LuxOS-style; not V1)");
+        let err = HashOnDisconnectPolicy::PoolRequested
+            .refuse_unimplemented()
+            .expect_err("pool_requested must fail closed");
+        assert!(err.contains("not implemented"));
+        assert!(HashOnDisconnectPolicy::KeepLastJob
+            .api_label()
+            .contains("does not cut hash"));
+        assert!(HashOnDisconnectPolicy::StopOnDisconnect
+            .api_label()
+            .contains("NOT what the V1"));
+        assert_eq!(
+            format!("{}", HashOnDisconnectPolicy::KeepLastJob),
+            "keep_last_job"
+        );
+        assert_eq!(
+            format!("{}", HashOnDisconnectPolicy::StopOnDisconnect),
+            "stop_on_disconnect"
+        );
+        assert_eq!(
+            format!("{}", HashOnDisconnectPolicy::PoolRequested),
+            "pool_requested"
+        );
+    }
+
+    #[test]
+    fn hash_on_disconnect_policy_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<HashOnDisconnectPolicy>("\"keep_last_job\"").unwrap(),
+            HashOnDisconnectPolicy::KeepLastJob
+        );
+        assert_eq!(
+            serde_json::from_str::<HashOnDisconnectPolicy>("\"stop_on_disconnect\"").unwrap(),
+            HashOnDisconnectPolicy::StopOnDisconnect
+        );
+        assert_eq!(
+            serde_json::from_str::<HashOnDisconnectPolicy>("\"pool_requested\"").unwrap(),
+            HashOnDisconnectPolicy::PoolRequested
+        );
+        assert!(serde_json::from_str::<HashOnDisconnectPolicy>("\"true\"").is_err());
+        assert!(serde_json::from_str::<HashOnDisconnectPolicy>("true").is_err());
+    }
+
+    #[test]
+    fn datum_protocol_is_absent_and_refused() {
+        assert!(!DATUM_PROTOCOL_SUPPORTED);
+        refuse_datum_protocol(None).expect("absent protocol is not DATUM");
+        refuse_datum_protocol(Some("sv1")).unwrap();
+        refuse_datum_protocol(Some("sv2")).unwrap();
+        refuse_datum_protocol(Some("auto")).unwrap();
+        let err = refuse_datum_protocol(Some("datum")).expect_err("datum refused");
+        assert!(err.contains("not implemented"));
+        assert!(err.contains("CLAIM_UNSAFE"));
+        assert!(refuse_datum_protocol(Some("DATUM")).is_err());
+        assert!(refuse_datum_protocol(Some("datum+tcp")).is_err());
+        assert!(refuse_datum_protocol(Some("datum:ocean")).is_err());
     }
 
     #[test]

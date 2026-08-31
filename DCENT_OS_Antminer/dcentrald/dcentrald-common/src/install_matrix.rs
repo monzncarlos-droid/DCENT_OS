@@ -225,12 +225,20 @@ mod tests {
                 "{} must remain lab-only or denied",
                 row.board_target
             );
-            assert_eq!(
-                row.enablement.storage_topology,
-                StorageTopology::SingleSlot,
-                "{}",
-                row.board_target
-            );
+            if matches!(
+                row.board_target,
+                "am3-s19xp" | "am3-s19jxp" | "am3-s21xp" | "am3-t21"
+            ) {
+                assert_eq!(row.enablement.storage_topology, StorageTopology::Unknown);
+                assert_eq!(row.enablement.update_mechanism, UpdateMechanism::None);
+            } else {
+                assert_eq!(
+                    row.enablement.storage_topology,
+                    StorageTopology::SingleSlot,
+                    "{}",
+                    row.board_target
+                );
+            }
             assert_eq!(row.chain_transport, ChainTransportKind::Serial);
         }
     }
@@ -362,7 +370,11 @@ mod tests {
 
     #[test]
     fn metadata_only_targets_have_no_artifact_or_install_lane() {
-        for target in ["am2-s17plus", "am2-t17", "am2-t17plus", "am2-t19"] {
+        // 2026-08-27 armada (C1): am2-s17plus/am2-t17/am2-t17plus left this
+        // set when B2 shipped their package-only board lanes (defconfig +
+        // sysupgrade tar + package_only_denied contract); am2-t19 stays
+        // metadata-only.
+        for target in ["am2-t19"] {
             let row = install_matrix()
                 .into_iter()
                 .find(|row| row.board_target == target)
@@ -389,8 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_a113d_s19xp_package_has_guarded_lab_install_authority() {
-        for target in ["am3-s19xp", "am3-s19jxp", "am3-s19jproplus"] {
+    fn exact_a113d_s19jproplus_package_has_guarded_lab_install_authority() {
+        for target in ["am3-s19jproplus"] {
             let row = install_matrix()
                 .into_iter()
                 .find(|row| row.board_target == target)
@@ -418,6 +430,63 @@ mod tests {
             assert!(row.persistent_update_allowed, "{target}");
             assert!(!row.product_install_allowed, "{target}");
         }
+    }
+
+    #[test]
+    fn x19_aml_packages_grant_no_persistent_writer_authority() {
+        for target in ["am3-s19xp", "am3-s19jxp"] {
+            let row = install_matrix()
+                .into_iter()
+                .find(|row| row.board_target == target)
+                .unwrap_or_else(|| panic!("missing X19 AML target {target}"));
+            assert_eq!(
+                row.enablement.update_maturity,
+                ImplementationMaturity::NotImplemented,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.install_authorization,
+                InstallAuthorization::Denied,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.artifact_kind,
+                ArtifactKind::SysupgradeBundle,
+                "{target}"
+            );
+            assert_eq!(
+                row.enablement.artifact_maturity,
+                ArtifactMaturity::Experimental,
+                "{target}"
+            );
+            assert!(!row.persistent_update_allowed, "{target}");
+            assert!(!row.product_install_allowed, "{target}");
+        }
+    }
+
+    #[test]
+    fn t21_package_evidence_grants_no_persistent_writer_authority() {
+        let row = install_matrix()
+            .into_iter()
+            .find(|row| row.board_target == "am3-t21")
+            .expect("missing T21 package-evidence target");
+        assert_eq!(
+            row.enablement.update_maturity,
+            ImplementationMaturity::NotImplemented
+        );
+        assert_eq!(
+            row.enablement.install_authorization,
+            InstallAuthorization::Denied
+        );
+        assert_eq!(row.enablement.storage_topology, StorageTopology::Unknown);
+        assert_eq!(row.enablement.update_mechanism, UpdateMechanism::None);
+        assert_eq!(row.enablement.artifact_kind, ArtifactKind::SysupgradeBundle);
+        assert_eq!(
+            row.enablement.artifact_maturity,
+            ArtifactMaturity::Experimental
+        );
+        assert!(!row.persistent_update_allowed);
+        assert!(!row.product_install_allowed);
     }
 
     #[test]

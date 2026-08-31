@@ -206,6 +206,18 @@ export function AboutPage() {
           </div>
         </div>
       </AboutCard>
+
+      <footer style={{ marginTop: 16, fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+        <a
+          href="https://d-central.tech/fund/go?source=dcent_os&placement=about_footer"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: 'var(--accent, #FAA500)', fontWeight: 600 }}
+        >
+          Fund the Sovereign Stack
+        </a>
+        {' '}— Bitcoin or card
+      </footer>
     </div>
   );
 }

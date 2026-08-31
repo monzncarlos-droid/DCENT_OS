@@ -100,3 +100,67 @@ async fn v1_client_serializes_submits_and_records_pool_acceptance() {
     assert_eq!(stats.shares_accepted, 1);
     assert_eq!(stats.shares_rejected, 0);
 }
+
+#[tokio::test]
+async fn v1_client_flushes_submit_and_clean_disconnects_on_share_channel_close() {
+    let (addr, pool) = MockV1Pool::spawn().await.expect("spawn V1 loopback pool");
+    let (job_tx, mut job_rx) = mpsc::channel(8);
+    let (share_tx, share_rx) = mpsc::channel(8);
+    let (status_tx, _status_rx) = mpsc::channel(32);
+    let client = StratumV1Client::new(
+        test_config(MockV1PoolHandle::url(addr)),
+        job_tx,
+        share_rx,
+        status_tx,
+    );
+
+    // `run()` returns only on clean-stop (share channel closed). Do not abort.
+    let client_task = tokio::spawn(client.run());
+    let job = tokio::time::timeout(Duration::from_secs(2), job_rx.recv())
+        .await
+        .expect("job timeout")
+        .expect("mock pool job");
+
+    share_tx
+        .send(ValidShare {
+            work_generation: job.work_generation,
+            worker_name: "dcent.sim.worker".to_string(),
+            job_id: job.job_id,
+            extranonce2: "00000000".to_string(),
+            ntime: format!("{:08x}", job.ntime),
+            nonce: "00000002".to_string(),
+            version_bits: None,
+            version: job.version,
+            achieved_difficulty: Some(1.0),
+        })
+        .await
+        .expect("queue share for clean-stop flush");
+
+    // Closing the share channel is the daemon clean-stop signal. The client
+    // must flush the submit, wait for the pool ACK, FIN the write half, and
+    // return without reconnecting.
+    drop(share_tx);
+
+    tokio::time::timeout(Duration::from_secs(3), client_task)
+        .await
+        .expect("clean-stop client must exit after share-channel close")
+        .expect("client task");
+
+    assert_eq!(pool.accepted_shares(), 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pool.clean_eof_disconnects() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pool must see a clean FIN, not a TCP RST");
+    let authorize_count = pool
+        .requests()
+        .iter()
+        .filter(|request| request.contains("\"method\":\"mining.authorize\""))
+        .count();
+    assert_eq!(
+        authorize_count, 1,
+        "clean-stop must not reconnect and re-authorize"
+    );
+}

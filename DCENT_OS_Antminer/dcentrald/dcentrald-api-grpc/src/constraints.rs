@@ -1,5 +1,4 @@
-//! TunerConstraints builder — the one real (non-stub) handler in the
-//! Supremacy S5.1 scaffold.
+//! `TunerConstraints` builders backed by the silicon-profile catalog.
 //!
 //! Pulls frequency envelope from `dcentrald-silicon-profiles` (BM1362 default)
 //! and clamps voltage / fan envelopes via the LOAD-BEARING SUPREMACY rules:

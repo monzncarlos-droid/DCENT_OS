@@ -57,8 +57,8 @@ pub enum EepromRecord {
     /// the preamble + raw payload only.
     X19Plain(X19PlainRecord),
     /// Exact BHB428xx BM1362 SKUs, XXTEA-encrypted with explicit PT1/PT2;
-    /// marketing-model binding unresolved.
-    /// + sensor rows. Raw deployed-page decryption lives in
+    /// marketing-model binding unresolved, plus sensor rows. Raw deployed-page
+    /// decryption lives in
     /// [`crate::deployed_eeprom`].
     X19J(X19JRecord),
     /// BHB56xxx / BHB68xxx (BM1366/BM1368), EDF v5 header with XXTEA
@@ -858,29 +858,29 @@ pub const BHB_SKU_CATALOG: &[BhbSkuCatalogEntry] = &[
     BhbSkuCatalogEntry {
         pattern: "BHB68603",
         chip_family: "BM1368",
-        model_family: "S21 / S21+ / T21",
+        model_family: "Antminer S21",
         eeprom_variant: "edf_v5_xxtea_key1",
         confidence: "high",
-        source: " lines 539-540; wave6-vnish-decrypted/BHB_INVENTORY.md",
-        note: "BHB68603 is documented as S21-class BM1368, not the broad BM1370 fallback.",
+        source: "bosminer model-list.json SHA256 c79f56e2d2a3f1e593b21d8a79a5364b2997e76f09b2ee9167fac64d1bf7dfe0; epic-eeprom-matched-samples-20.json SHA256 958a3a3ab8269dd3ebfd684b600c3e3ed9f325e3177f7fcd817ee495b1264909 page SHA256 83baae35cd70f069f55f89290ccdf25db35e3f09a04b6a6d6d31ae15a12f4bdf",
+        note: "The product map assigns BHB68603 only to S21/BM1368; the separate 256-byte ePIC fixture page proves format 5 / XXTEA key slot 1 and decoded board name. It is not an authenticated live-board capture.",
     },
     BhbSkuCatalogEntry {
         pattern: "BHB68603-",
         chip_family: "BM1368",
-        model_family: "S21 / S21+ / T21",
-        eeprom_variant: "edf_v5_xxtea_key1",
-        confidence: "high",
-        source: " lines 539-540; wave6-vnish-decrypted/BHB_INVENTORY.md",
-        note: "BHB68603- follows the documented BHB68603 BM1368 family.",
+        model_family: "Antminer S21",
+        eeprom_variant: "unknown_no_held_page",
+        confidence: "medium",
+        source: "held bosminer model-list.json SHA256 c79f56e2d2a3f1e593b21d8a79a5364b2997e76f09b2ee9167fac64d1bf7dfe0",
+        note: "The exact held product map assigns BHB68603- only to S21/BM1368. No held BHB68603- EEPROM page proves a cipher or record variant, so decoding remains unadmitted.",
     },
     BhbSkuCatalogEntry {
         pattern: "BHB68606",
         chip_family: "BM1368",
-        model_family: "S21 / S21+",
+        model_family: "Antminer S21",
         eeprom_variant: "edf_v5_xxtea_key1",
         confidence: "high",
-        source: " lines 539-540; wave6-vnish-decrypted/BHB_INVENTORY.md",
-        note: "BHB68606 is documented as S21-class BM1368, not the broad BM1370 fallback.",
+        source: "bosminer model-list.json SHA256 c79f56e2d2a3f1e593b21d8a79a5364b2997e76f09b2ee9167fac64d1bf7dfe0; epic-eeprom-matched-samples-20.json SHA256 958a3a3ab8269dd3ebfd684b600c3e3ed9f325e3177f7fcd817ee495b1264909 page SHA256 4d62362c012bbd2ac1446f189b931c8bdb11d16c1512d207bf96d1bfb5cd08c5",
+        note: "The product map assigns BHB68606 only to S21/BM1368; the separate 256-byte ePIC fixture page proves format 5 / XXTEA key slot 1 and decoded board name. It is not an authenticated live-board capture.",
     },
     // ------------------------------------------------------------------
     // UB-26 (2026-08-03): the six remaining EXACT `BHB68xxx` rows.
@@ -1531,11 +1531,36 @@ mod tests {
 
     #[test]
     fn bhb_sku_catalog_pins_documented_bhb686_to_bm1368() {
-        for sku in ["BHB68603", "BHB68606"] {
+        for sku in ["BHB68603", "BHB68603-", "BHB68606"] {
             let entry = catalog_entry_for_sku(sku).expect("BHB686 exact catalog entry");
             assert_eq!(entry.chip_family, "BM1368");
+            assert_eq!(entry.model_family, "Antminer S21");
+            assert!(entry
+                .source
+                .contains("c79f56e2d2a3f1e593b21d8a79a5364b2997e76f09b2ee9167fac64d1bf7dfe0"));
+        }
+        assert_eq!(
+            catalog_entry_for_sku("BHB68603-")
+                .expect("BHB68603- exact catalog entry")
+                .eeprom_variant,
+            "unknown_no_held_page"
+        );
+        for (sku, page_sha256) in [
+            (
+                "BHB68603",
+                "83baae35cd70f069f55f89290ccdf25db35e3f09a04b6a6d6d31ae15a12f4bdf",
+            ),
+            (
+                "BHB68606",
+                "4d62362c012bbd2ac1446f189b931c8bdb11d16c1512d207bf96d1bfb5cd08c5",
+            ),
+        ] {
+            let entry = catalog_entry_for_sku(sku).expect("held BHB686 fixture row");
             assert_eq!(entry.eeprom_variant, "edf_v5_xxtea_key1");
-            assert!(entry.note.contains("not the broad BM1370 fallback"));
+            assert!(entry.source.contains(page_sha256));
+            assert!(entry
+                .note
+                .contains("not an authenticated live-board capture"));
         }
     }
 
@@ -1686,7 +1711,7 @@ mod tests {
         assert_eq!(report.metadata.chip_family.as_deref(), Some("BM1368"));
         assert_eq!(
             report.metadata.model_family.as_deref(),
-            Some("S21 / S21+ / T21")
+            Some("Antminer S21")
         );
         assert_eq!(report.metadata.eeprom_format.as_deref(), Some("edf_v5"));
         assert_eq!(report.metadata.cipher.as_deref(), Some("xxtea"));

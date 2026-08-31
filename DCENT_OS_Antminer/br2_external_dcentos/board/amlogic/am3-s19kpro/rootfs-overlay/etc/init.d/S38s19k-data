@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 D-Central Technologies <dev@d-central.tech>
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Own the exact persistent S19k /data mount before network and postboot state.
+
+NAME=s19k-persistent-data
+HELPER=/usr/sbin/dcent-s19k-data-mount
+RELEASE_MARKER=/etc/dcentos/release-image
+
+start() {
+    printf 'Starting %s: ' "$NAME"
+    if [ ! -f "$RELEASE_MARKER" ]; then
+        echo "SKIP (dev/lab image)"
+        return 0
+    fi
+    if [ ! -x "$HELPER" ]; then
+        echo "BLOCKED (helper missing)"
+        return 1
+    fi
+    if "$HELPER" start >/dev/null; then
+        echo "OK (exact mtd4/UBI overlay mounted at /data)"
+        return 0
+    fi
+    echo "BLOCKED (persistent /data identity or mount refused)"
+    return 1
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) : ;;
+    status) "$HELPER" verify ;;
+    *)
+        echo "Usage: $0 {start|stop|status}" >&2
+        exit 2
+        ;;
+esac

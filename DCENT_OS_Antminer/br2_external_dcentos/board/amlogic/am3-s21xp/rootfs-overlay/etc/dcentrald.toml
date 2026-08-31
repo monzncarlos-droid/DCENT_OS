@@ -1,16 +1,14 @@
 # DCENT_OS dcentrald config for Antminer S21 XP (Amlogic A113D)
-# BUILD-CLEAN SCAFFOLD (Wave I Lane B, 2026-05-19) — NO live BM1370 unit on the
-# bench. Like the S21 Pro variant, this exists so a future S21 XP lands on the
-# BM1370 silicon profile (bm1370.rs: 3 nm) rather than the base-S21 BM1368
-# route. The chip identity is the load-bearing fix.
-# Platform: Amlogic A113D (aarch64), NoPic (TAS5782M DAC, kernel-managed).
+# Package-only management identity. Exact production evidence refutes the
+# shared base-S21 ttyS4/NoPic route; model/HAL/install gates refuse execution.
+# Platform: Amlogic A113D (aarch64); production PIC/PSU protocols unresolved.
 #
 # TODO-confirm (live unit needed): S21 XP PSU class may differ from S21 Pro.
-# serial_chip_count below follows the retained S21 XP scaffold geometry
-# (~230 chips), not the S21 Pro 195-chip layout. Confirm against a real S21 XP
-# EEPROM before any flash.
+# serial_chip_count below follows the exact held A3HB70501 geometry (91 chips
+# per hashboard), not the S21 Pro 65-chip hashboard layout. Confirm the complete
+# carrier/PSU tuple against a real S21 XP before any flash.
 #
-# Fresh images stay dashboard-ready and idle until mining is explicitly enabled.
+# This image is management-only; model/HAL gates refuse hardware construction.
 
 [general]
 hostname = "dcent-s21xp"
@@ -25,23 +23,25 @@ protocol = "sv1"
 [mining]
 enabled = false
 model = "s21xp"
-# BM1370 sweet-spot cold-boot defaults (bm1370.rs Step -2). The autotuner ramps
-# toward nameplate (Step 0: 525 MHz / 13.8 V) when opted in.
+# Schema placeholders only; no S21 XP tuning authority is admitted.
 frequency_mhz = 480
 voltage_mv = 13400
 version_rolling = true
 passthrough = false
 suggest_difficulty = 8192
-serial_device = "/dev/ttyS2"
-serial_chip_count = 230
+serial_chip_count = 91
 serial_chip_type = "BM1370"
+
+[platform]
+target = "am3-aml-s21xp"
+board_target = "am3-s21xp"
 
 [power]
 mode = "bypass"
 target_watts = 3500
 
 [power.psu_override]
-enabled = true
+enabled = false
 model = "APW12"
 voltage_v = 14.0
 
@@ -68,20 +68,13 @@ password = "x"
 cycle_duration_s = 3600
 
 [watchdog]
-# Autonomous crash-recovery for the NoPic Amlogic family. Unlike am2/S9 there is
-# NO PIC/dsPIC hardware heartbeat backstop, so a silent (non-panicking) daemon
-# hang would otherwise leave the boards energized indefinitely (thermal risk on a
-# home space heater). The kicker opens /dev/watchdog AFTER hardware init (the
-# bring-up window can't trip it) and degrades gracefully (warns + continues) if
-# the SoC watchdog is unavailable or the timeout can't be set. Matches the proven
-# zynq/am1 production config; restores the struct default (enabled=true) these
-# overlays previously overrode.
-enabled = true
+# No S21 XP hardware watchdog, PIC heartbeat, or rail-cut composition is admitted.
+enabled = false
 timeout_s = 30
 kick_interval_s = 5
 
 [hash_on_disconnect]
-enabled = true
+enabled = false
 
 [mode]
 active = "standard"

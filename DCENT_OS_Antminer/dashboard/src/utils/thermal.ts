@@ -411,17 +411,148 @@ export function estimateDailyCost(watts: number, electricityRate: number): numbe
   return (watts * 24) / 1000 * electricityRate;
 }
 
+/** Firmware default donation when config has not been read. Never treat unknown as 0%. */
+export const DEFAULT_DONATION_PERCENT = 2;
+
+const POOL_FEE_STORAGE_KEY = 'dcentos-earnings-pool-fee-percent';
+const POOL_FEE_MAX_PERCENT = 10;
+
+export function clampDonationPercent(percent: number): number {
+  if (!Number.isFinite(percent)) return DEFAULT_DONATION_PERCENT;
+  return Math.max(0, Math.min(5, percent));
+}
+
+export function clampPoolFeePercent(percent: number): number {
+  if (!Number.isFinite(percent)) return 0;
+  return Math.max(0, Math.min(POOL_FEE_MAX_PERCENT, percent));
+}
+
+/**
+ * Effective donation take-rate for earnings math.
+ * Unknown/missing config → 2% (daemon default). Operator-disabled → 0.
+ * Explicit 0% while still enabled is operator choice, not a product default.
+ */
+export function donationTakePercent(
+  config: { enabled?: boolean; percent?: number } | null | undefined,
+): number {
+  if (config == null) return DEFAULT_DONATION_PERCENT;
+  if (config.enabled === false) return 0;
+  return clampDonationPercent(
+    config.percent == null ? DEFAULT_DONATION_PERCENT : config.percent,
+  );
+}
+
+export function loadPoolFeePercent(): number {
+  try {
+    if (typeof localStorage === 'undefined') return 0;
+    const raw = localStorage.getItem(POOL_FEE_STORAGE_KEY);
+    if (raw == null || raw === '') return 0;
+    return clampPoolFeePercent(Number(raw));
+  } catch {
+    return 0;
+  }
+}
+
+export function persistPoolFeePercent(percent: number): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(POOL_FEE_STORAGE_KEY, String(clampPoolFeePercent(percent)));
+  } catch {
+    /* ignore quota / private-mode */
+  }
+}
+
+export interface EarningsTakeRates {
+  /** 0–5, already effective (0 if the operator disabled donation). */
+  donationPercent?: number;
+  /** 0–10 operator-entered pool fee. Unknown → 0; do not invent a pool's rate. */
+  poolFeePercent?: number;
+}
+
+export interface TakeRateBreakdown {
+  grossSats: number;
+  netSats: number;
+  donationSats: number;
+  poolFeeSats: number;
+}
+
+/**
+ * Operator BTC after donation time-slice then pool fee.
+ * Electricity is NOT reduced — the donation window still draws wall power.
+ */
+export function applyTakeRates(
+  grossSats: number,
+  donationPercent: number,
+  poolFeePercent: number,
+): TakeRateBreakdown {
+  const gross = Number.isFinite(grossSats) && grossSats > 0 ? grossSats : 0;
+  const donation = Number.isFinite(donationPercent)
+    ? Math.max(0, Math.min(5, donationPercent))
+    : 0;
+  const poolFee = Number.isFinite(poolFeePercent)
+    ? Math.max(0, Math.min(POOL_FEE_MAX_PERCENT, poolFeePercent))
+    : 0;
+  if (gross <= 0) {
+    return { grossSats: 0, netSats: 0, donationSats: 0, poolFeeSats: 0 };
+  }
+  const donationSats = gross * (donation / 100);
+  const afterDonation = gross - donationSats;
+  const poolFeeSats = afterDonation * (poolFee / 100);
+  return {
+    grossSats: gross,
+    netSats: Math.round(afterDonation - poolFeeSats),
+    donationSats: Math.round(donationSats),
+    poolFeeSats: Math.round(poolFeeSats),
+  };
+}
+
+export interface DailyProfitEstimate {
+  /** Net operator sats (backward-compatible field). */
+  sats: number;
+  grossSats: number;
+  /** Net USD revenue after donation + pool fee. Heat-credit is NOT included. */
+  revenue: number;
+  grossRevenue: number;
+  cost: number;
+  /** Net BTC revenue minus electricity. Heat-credit is NOT included. */
+  profit: number;
+  donationPercent: number;
+  poolFeePercent: number;
+  donationSats: number;
+  poolFeeSats: number;
+}
+
 export function estimateDailyProfit(
   hashrateGhs: number,
   watts: number,
   btcPrice: number,
   electricityRate: number,
   networkDifficulty: number | null | undefined,
-): { sats: number; revenue: number; cost: number; profit: number } {
-  const sats = estimateDailySats(hashrateGhs, networkDifficulty);
-  const revenue = (sats / 100000000) * btcPrice;
+  takeRates?: EarningsTakeRates,
+): DailyProfitEstimate {
+  const grossSats = estimateDailySats(hashrateGhs, networkDifficulty);
+  const donationPercent = Number.isFinite(takeRates?.donationPercent)
+    ? Math.max(0, Math.min(5, takeRates!.donationPercent as number))
+    : 0;
+  const poolFeePercent = Number.isFinite(takeRates?.poolFeePercent)
+    ? Math.max(0, Math.min(POOL_FEE_MAX_PERCENT, takeRates!.poolFeePercent as number))
+    : 0;
+  const taken = applyTakeRates(grossSats, donationPercent, poolFeePercent);
+  const grossRevenue = (grossSats / 100_000_000) * btcPrice;
+  const revenue = (taken.netSats / 100_000_000) * btcPrice;
   const cost = estimateDailyCost(watts, electricityRate);
-  return { sats, revenue, cost, profit: revenue - cost };
+  return {
+    sats: taken.netSats,
+    grossSats,
+    revenue,
+    grossRevenue,
+    cost,
+    profit: revenue - cost,
+    donationPercent,
+    poolFeePercent,
+    donationSats: taken.donationSats,
+    poolFeeSats: taken.poolFeeSats,
+  };
 }
 
 // ─── W8.3: Halving-Aware Projections ───────────────────────────

@@ -90,12 +90,12 @@ impl ShareDedup {
     }
 }
 
-fn build_validation_header(work: &MiningWork, version: u32, nonce: u32) -> [u8; 80] {
+fn build_validation_header(work: &MiningWork, version: u32, ntime: u32, nonce: u32) -> [u8; 80] {
     let mut header = [0u8; 80];
     header[0..4].copy_from_slice(&version.to_le_bytes());
     header[4..36].copy_from_slice(&work.prev_block_hash);
     header[36..68].copy_from_slice(&work.merkle_root);
-    header[68..72].copy_from_slice(&work.ntime.to_le_bytes());
+    header[68..72].copy_from_slice(&ntime.to_le_bytes());
     header[72..76].copy_from_slice(&work.nbits.to_le_bytes());
     header[76..80].copy_from_slice(&nonce.to_le_bytes());
     header
@@ -121,10 +121,11 @@ fn reverse_validation_words(header: &[u8; 80]) -> [u8; 80] {
 fn validate_work_header(
     work: &MiningWork,
     version: u32,
+    ntime: u32,
     nonce: u32,
     warn_on_reversed: bool,
 ) -> ([u8; 80], f64, bool) {
-    let mut header = build_validation_header(work, version, nonce);
+    let mut header = build_validation_header(work, version, ntime, nonce);
     // P1 Scrypt seam: validation dispatches on the work's algorithm. Sha256d is
     // byte-identical to the pre-seam call; Scrypt1024 fails closed (0.0, false)
     // so a Scrypt-stamped work unit can never mint a share until P2.
@@ -951,7 +952,7 @@ impl MiningDispatcher {
         apply_hardware_fn: &mut H,
     ) where
         F: FnMut(&MiningWork, u8) -> Result<(), String>,
-        G: FnMut() -> Vec<(u8, u32, u32, u8)>,
+        G: FnMut() -> Vec<(u8, u32, u32, u32, u8)>,
         H: FnMut(Option<f64>, Option<u32>),
     {
         if !self.initialized {
@@ -984,8 +985,8 @@ impl MiningDispatcher {
 
             // Step 2: Process ASIC responses (nonces)
             let results = process_work_fn();
-            for (job_id, nonce, rolled_version, asic_nr) in results {
-                self.handle_nonce(job_id, nonce, rolled_version, asic_nr);
+            for (job_id, nonce, rolled_version, rolled_ntime, asic_nr) in results {
+                self.handle_nonce(job_id, nonce, rolled_version, rolled_ntime, asic_nr);
             }
             self.retire_expired_jobs();
 
@@ -1087,7 +1088,7 @@ impl MiningDispatcher {
         mut apply_hardware_fn: H,
     ) where
         F: FnMut(&MiningWork, u8) -> Result<(), String>,
-        G: FnMut() -> Vec<(u8, u32, u32, u8)>,
+        G: FnMut() -> Vec<(u8, u32, u32, u32, u8)>,
         H: FnMut(Option<f64>, Option<u32>),
     {
         loop {
@@ -1553,6 +1554,7 @@ impl MiningDispatcher {
         skip_idx: Option<usize>,
         nonce: u32,
         rolled_version: u32,
+        rolled_ntime: u32,
         n_slots: u64,
     ) -> Option<(usize, WorkItem, u32, f64, bool)> {
         let step = self.config.job_id_step as usize;
@@ -1580,8 +1582,15 @@ impl MiningDispatcher {
                 }
 
                 let alt_version = self.actual_version_for(alt, rolled_version);
+                // An on-chip ntime roll applies whichever slot actually hashed
+                // the nonce — 0 keeps the alt work's own ntime.
+                let alt_ntime = if rolled_ntime != 0 {
+                    rolled_ntime
+                } else {
+                    alt.work.ntime
+                };
                 let (_alt_header, alt_diff, alt_meets_pool_target) =
-                    validate_work_header(&alt.work, alt_version, nonce, false);
+                    validate_work_header(&alt.work, alt_version, alt_ntime, nonce, false);
                 // Classify against the ticket the ALT work was dispatched under,
                 // not the live stats ticket (which a vardiff raise moved).
                 if alt_diff >= alt.ticket_difficulty {
@@ -1615,6 +1624,7 @@ impl MiningDispatcher {
         asic_nr: u8,
         nonce: u32,
         rolled_version: u32,
+        rolled_ntime: u32,
         midstate_mode: bool,
     ) {
         let pool_index = item.pool_index;
@@ -1662,10 +1672,17 @@ impl MiningDispatcher {
             }
 
             let version_bits = Self::share_version_bits(&item, actual_version);
+            // A recovered share must submit the ROLLED ntime the chip hashed,
+            // not the slot's dispatch-time ntime.
+            let share_ntime = if rolled_ntime != 0 {
+                format!("{:08x}", rolled_ntime)
+            } else {
+                item.ntime_hex.clone()
+            };
             let share = ShareSubmission {
                 job_id: item.stratum_job_id,
                 extranonce2: item.extranonce2,
-                ntime: item.ntime_hex,
+                ntime: share_ntime,
                 nonce: format!("{:08x}", nonce),
                 version: actual_version,
                 version_bits,
@@ -1692,7 +1709,14 @@ impl MiningDispatcher {
     ///
     /// Validates the nonce against the originating pool's difficulty target and,
     /// if valid, sends a share submission to that pool's Stratum client thread.
-    fn handle_nonce(&mut self, job_id: u8, nonce: u32, rolled_version: u32, asic_nr: u8) {
+    fn handle_nonce(
+        &mut self,
+        job_id: u8,
+        nonce: u32,
+        rolled_version: u32,
+        rolled_ntime: u32,
+        asic_nr: u8,
+    ) {
         self.stats.nonces_found += 1;
 
         // Look up the work item
@@ -1711,8 +1735,14 @@ impl MiningDispatcher {
 
         if let Some(ref item) = self.active_jobs[idx] {
             if item.dispatched_at.elapsed().as_secs() > MAX_WORK_AGE_SECS {
-                if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) =
-                    self.find_recovery_candidate(Some(idx), nonce, rolled_version, n_slots)
+                if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) = self
+                    .find_recovery_candidate(
+                        Some(idx),
+                        nonce,
+                        rolled_version,
+                        rolled_ntime,
+                        n_slots,
+                    )
                 {
                     Self::handle_recovered_nonce(
                         &mut self.stats,
@@ -1727,6 +1757,7 @@ impl MiningDispatcher {
                         asic_nr,
                         nonce,
                         rolled_version,
+                        rolled_ntime,
                         midstate_mode,
                     );
                     return;
@@ -1741,8 +1772,8 @@ impl MiningDispatcher {
         }
 
         if !self.valid_jobs[idx] {
-            if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) =
-                self.find_recovery_candidate(Some(idx), nonce, rolled_version, n_slots)
+            if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) = self
+                .find_recovery_candidate(Some(idx), nonce, rolled_version, rolled_ntime, n_slots)
             {
                 Self::handle_recovered_nonce(
                     &mut self.stats,
@@ -1757,6 +1788,7 @@ impl MiningDispatcher {
                     asic_nr,
                     nonce,
                     rolled_version,
+                    rolled_ntime,
                     midstate_mode,
                 );
                 return;
@@ -1768,8 +1800,14 @@ impl MiningDispatcher {
         let item = match &self.active_jobs[idx] {
             Some(item) => item,
             None => {
-                if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) =
-                    self.find_recovery_candidate(Some(idx), nonce, rolled_version, n_slots)
+                if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) = self
+                    .find_recovery_candidate(
+                        Some(idx),
+                        nonce,
+                        rolled_version,
+                        rolled_ntime,
+                        n_slots,
+                    )
                 {
                     Self::handle_recovered_nonce(
                         &mut self.stats,
@@ -1784,6 +1822,7 @@ impl MiningDispatcher {
                         asic_nr,
                         nonce,
                         rolled_version,
+                        rolled_ntime,
                         midstate_mode,
                     );
                     return;
@@ -1794,8 +1833,8 @@ impl MiningDispatcher {
         };
 
         if self.dispatch_seq > item.dispatch_seq + max_age_seq {
-            if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) =
-                self.find_recovery_candidate(Some(idx), nonce, rolled_version, n_slots)
+            if let Some((slot, alt, alt_version, alt_diff, alt_meets_pool_target)) = self
+                .find_recovery_candidate(Some(idx), nonce, rolled_version, rolled_ntime, n_slots)
             {
                 Self::handle_recovered_nonce(
                     &mut self.stats,
@@ -1810,6 +1849,7 @@ impl MiningDispatcher {
                     asic_nr,
                     nonce,
                     rolled_version,
+                    rolled_ntime,
                     midstate_mode,
                 );
                 return;
@@ -1832,6 +1872,14 @@ impl MiningDispatcher {
         //   BM1397 (midstate_mode=true): midstate_index (0-3) -> increment_bitmask N times
         //   BM1366/68/70 (midstate_mode=false): ASIC-returned rolled version bits -> merge
         let actual_version = self.actual_version_for(item, rolled_version);
+        // Chains whose ASICs roll ntime on-die (Avalon A3197S class) report the
+        // absolute rolled ntime; 0 means the driver has no roll information and
+        // the dispatched job ntime is what the chip hashed.
+        let actual_ntime = if rolled_ntime != 0 {
+            rolled_ntime
+        } else {
+            item.work.ntime
+        };
 
         // Full 80-byte header SHA256d validation (matching ESP-Miner's test_nonce_value).
         //
@@ -1853,6 +1901,7 @@ impl MiningDispatcher {
         let (_header, achieved_diff, meets_pool_target) = validate_work_header(
             &item.work,
             actual_version,
+            actual_ntime,
             nonce,
             self.stats.nonces_found <= 5,
         );
@@ -1907,10 +1956,17 @@ impl MiningDispatcher {
 
             let version_bits = Self::share_version_bits(item, actual_version);
 
+            // The submitted ntime must be the ROLLED value the chip actually
+            // hashed, or the pool rejects an otherwise-valid share.
+            let share_ntime = if rolled_ntime != 0 {
+                format!("{:08x}", rolled_ntime)
+            } else {
+                item.ntime_hex.clone()
+            };
             let share = ShareSubmission {
                 job_id: item.stratum_job_id.clone(),
                 extranonce2: item.extranonce2.clone(),
-                ntime: item.ntime_hex.clone(),
+                ntime: share_ntime,
                 nonce: format!("{:08x}", nonce),
                 version: actual_version,
                 version_bits,
@@ -1954,7 +2010,7 @@ impl MiningDispatcher {
             // UART frame misalignment or job-slot aliasing can cause the job_id
             // to map to the wrong slot. Scanning all slots recovers these nonces.
             let recovered = self
-                .find_recovery_candidate(Some(idx), nonce, rolled_version, n_slots)
+                .find_recovery_candidate(Some(idx), nonce, rolled_version, rolled_ntime, n_slots)
                 .map(
                     |(slot, alt, alt_version, alt_diff, alt_meets_pool_target)| {
                         Self::handle_recovered_nonce(
@@ -1970,6 +2026,7 @@ impl MiningDispatcher {
                             asic_nr,
                             nonce,
                             rolled_version,
+                            rolled_ntime,
                             midstate_mode,
                         );
                     },
@@ -2073,6 +2130,10 @@ mod tests {
             nbits: 0x1d00ffff,
             extranonce2: "00".into(),
             share_target: [0xFFu8; 32],
+            coinbase: Vec::new(),
+            merkle_branches: Vec::new(),
+            nonce2_offset: 0,
+            nonce2_size: 0,
             algorithm: PowAlgorithm::Sha256d,
         }
     }
@@ -2128,6 +2189,53 @@ mod tests {
     }
 
     #[test]
+    fn rolled_ntime_submits_the_rolled_value_not_the_dispatch_ntime() {
+        // P0-2 regression pin: chains whose ASICs roll ntime on-die (Avalon
+        // A3197S class) report the absolute rolled ntime. The share must be
+        // built AND submitted with that value — submitting the dispatch-time
+        // ntime gets an otherwise-valid share rejected by the pool.
+        let (mut dispatcher, _event_tx, share_rx) = make_single_pool_dispatcher();
+        dispatcher.stats.ticket_difficulty = 0.0;
+        insert_test_item(&mut dispatcher, 0, "rolled-ntime-job", 0, 1);
+        dispatcher.dispatch_seq = 2;
+
+        let rolled = 0x6651_1236u32; // base + rolls, as the chip hashed it
+        dispatcher.handle_nonce(0x00, 0x1234_5678, 0, rolled, 0);
+
+        assert_eq!(
+            dispatcher.stats.accepted, 1,
+            "rolled-ntime share must accept"
+        );
+        match share_rx.try_recv().unwrap() {
+            MiningEvent::SubmitShare(share) => {
+                assert_eq!(share.ntime, format!("{rolled:08x}"));
+            }
+            other => panic!("expected a share, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_rolled_ntime_falls_back_to_the_dispatch_ntime() {
+        // BM-family drivers report no ntime roll information (0 sentinel); the
+        // share must then carry the dispatched ntime exactly as before.
+        let (mut dispatcher, _event_tx, share_rx) = make_single_pool_dispatcher();
+        dispatcher.stats.ticket_difficulty = 0.0;
+        let mut item = make_test_item("unrolled-job", 0, 0, 1);
+        item.ntime_hex = "66511234".into();
+        dispatcher.active_jobs[0] = Some(item);
+        dispatcher.valid_jobs[0] = true;
+        dispatcher.dispatch_seq = 2;
+
+        dispatcher.handle_nonce(0x00, 0x1234_5678, 0, 0, 0);
+
+        assert_eq!(dispatcher.stats.accepted, 1);
+        match share_rx.try_recv().unwrap() {
+            MiningEvent::SubmitShare(share) => assert_eq!(share.ntime, "66511234"),
+            other => panic!("expected a share, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_recovery_runs_for_empty_primary_slot() {
         let (event_tx, event_rx) = mpsc::channel();
         let (share_tx, share_rx) = mpsc::channel();
@@ -2165,7 +2273,7 @@ mod tests {
         // BM1368 can return an extracted ID such as 0x08 while the conservative
         // +16 dispatch path has only slot 0 active. Recovery must scan live
         // slots before dropping the nonce as stale/unknown.
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert_eq!(dispatcher.stats.accepted, 1);
@@ -2186,7 +2294,7 @@ mod tests {
         insert_test_item(&mut dispatcher, 8, "stale-job", 0, 0);
         dispatcher.valid_jobs[8] = false;
 
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert_eq!(dispatcher.stats.accepted, 1);
@@ -2207,7 +2315,7 @@ mod tests {
         dispatcher.active_jobs[8].as_mut().unwrap().dispatched_at =
             Instant::now() - Duration::from_secs(MAX_WORK_AGE_SECS + 1);
 
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert_eq!(dispatcher.stats.accepted, 1);
@@ -2227,7 +2335,7 @@ mod tests {
         insert_test_item(&mut dispatcher, 8, "overwritten-job", 0, 0);
         dispatcher.dispatch_seq = 20;
 
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert_eq!(dispatcher.stats.accepted, 1);
@@ -2247,7 +2355,7 @@ mod tests {
         insert_test_item(&mut dispatcher, 16, "pool-b-job", 1, 1);
         dispatcher.dispatch_seq = 1;
 
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert!(share_rx_a.try_recv().is_err());
@@ -2270,7 +2378,7 @@ mod tests {
         insert_test_item(&mut dispatcher, 0x10, "wrapped-job", 0, 1);
         dispatcher.dispatch_seq = 1;
 
-        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0);
+        dispatcher.handle_nonce(0x08, 0x12345678, 0, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         match share_rx.try_recv().unwrap() {
@@ -2515,6 +2623,10 @@ mod tests {
                 nbits: 0,
                 extranonce2: "00".into(),
                 share_target: [0xFFu8; 32],
+                coinbase: Vec::new(),
+                merkle_branches: Vec::new(),
+                nonce2_offset: 0,
+                nonce2_size: 0,
                 algorithm: PowAlgorithm::Sha256d,
             },
             dispatched_at: Instant::now(),
@@ -2544,6 +2656,10 @@ mod tests {
                 nbits: 0,
                 extranonce2: "00".into(),
                 share_target: [0xFFu8; 32],
+                coinbase: Vec::new(),
+                merkle_branches: Vec::new(),
+                nonce2_offset: 0,
+                nonce2_size: 0,
                 algorithm: PowAlgorithm::Sha256d,
             },
             dispatched_at: Instant::now(),
@@ -3345,7 +3461,7 @@ mod tests {
             .ticket_difficulty = f64::MAX;
         dispatcher.dispatch_seq = 1;
 
-        dispatcher.handle_nonce(0, 0x0000_0001, 0, 0);
+        dispatcher.handle_nonce(0, 0x0000_0001, 0, 0, 0);
 
         assert_eq!(
             dispatcher.stats.rejected, 1,
@@ -3381,7 +3497,7 @@ mod tests {
         // Vardiff RAISE lands after dispatch, before the pipeline flushes.
         dispatcher.stats.ticket_difficulty = f64::MAX;
 
-        dispatcher.handle_nonce(0, 0x0000_0001, 0, 0);
+        dispatcher.handle_nonce(0, 0x0000_0001, 0, 0, 0);
 
         assert_eq!(
             dispatcher.stats.filtered, 1,
@@ -3409,9 +3525,9 @@ mod tests {
         dispatcher.dispatch_seq = 1;
 
         // First arrival: submitted.
-        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0, 0);
         // Second identical (job_id, nonce, asic_nr) arrival: dropped.
-        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0, 0);
 
         assert_eq!(
             dispatcher.stats.accepted, 1,
@@ -3491,7 +3607,7 @@ mod tests {
             0,
             "test vector must be out-of-mask"
         );
-        dispatcher.handle_nonce(0, 0x1111_2222, rolled_outside, 0);
+        dispatcher.handle_nonce(0, 0x1111_2222, rolled_outside, 0, 0);
 
         assert_eq!(
             dispatcher.stats.out_of_mask_dropped, 1,
@@ -3523,7 +3639,7 @@ mod tests {
         // rolled_version stays WITHIN the negotiated sub-mask.
         let rolled_inside = 0x0000_4000u32;
         assert_eq!(rolled_inside & !narrow, 0, "test vector must be in-mask");
-        dispatcher.handle_nonce(0, 0x1111_2222, rolled_inside, 0);
+        dispatcher.handle_nonce(0, 0x1111_2222, rolled_inside, 0, 0);
 
         assert_eq!(
             dispatcher.stats.out_of_mask_dropped, 0,
@@ -3569,7 +3685,7 @@ mod tests {
         assert_ne!(rolled_outside & !narrow, 0, "vector must be out-of-mask");
 
         // job_id 0x08 maps to an EMPTY slot → recovery scans and finds slot 0.
-        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_outside, 0);
+        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_outside, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1, "recovery must run");
         assert_eq!(
@@ -3617,7 +3733,7 @@ mod tests {
 
         let rolled_inside = 0x0000_4000u32; // within the narrow mask
         assert_eq!(rolled_inside & !narrow, 0, "vector must be in-mask");
-        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_inside, 0);
+        dispatcher.handle_nonce(0x08, 0x1111_2222, rolled_inside, 0, 0);
 
         assert_eq!(dispatcher.stats.slot_recoveries, 1);
         assert_eq!(dispatcher.stats.out_of_mask_dropped, 0);
@@ -3802,13 +3918,14 @@ mod tests {
         item.work.algorithm = PowAlgorithm::Scrypt1024;
         item.work.share_target = [0xFFu8; 32]; // loosest — everything "meets" it
         item.ticket_difficulty = 0.0;
-        let expected_header = build_validation_header(&item.work, item.work.version, 0x1234_5678);
+        let expected_header =
+            build_validation_header(&item.work, item.work.version, item.work.ntime, 0x1234_5678);
         dispatcher.active_jobs[0] = Some(item);
         dispatcher.valid_jobs[0] = true;
         dispatcher.dispatch_seq = 1;
         dispatcher.stats.ticket_difficulty = 0.0;
 
-        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0, 0);
 
         assert!(
             share_rx.try_recv().is_ok(),
@@ -3852,7 +3969,7 @@ mod tests {
         dispatcher.dispatch_seq = 1;
         dispatcher.stats.ticket_difficulty = 0.0;
 
-        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0);
+        dispatcher.handle_nonce(0, 0x1234_5678, 0, 0, 0);
 
         assert!(share_rx.try_recv().is_err());
         assert_eq!(dispatcher.stats.accepted, 0);

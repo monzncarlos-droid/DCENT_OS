@@ -22,6 +22,11 @@
 # Per-product identity.
 # =============================================================================
 BR2_TARGET_GENERIC_HOSTNAME="dcentos-s19k"
+# Persistent-image evidence compares two complete clean-build tar outputs.
+BR2_REPRODUCIBLE=y
+# The release image owns mtd4 `overlay` as persistent /data. Pin the one tool
+# used by that owner; its helper never formats media or creates a UBI volume.
+BR2_PACKAGE_MTD_UBIATTACH=y
 BR2_TARGET_GENERIC_ISSUE="DCENTos for S19K Pro (am3-aml NoPic) — D-Central Technologies"
 
 # =============================================================================

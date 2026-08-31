@@ -243,6 +243,8 @@ mod tests {
                 errors: 1,
                 status: "Mining".to_string(),
             }],
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: dcentrald_api::FanState {
                 pwm: 30,
                 rpm: 2_400,

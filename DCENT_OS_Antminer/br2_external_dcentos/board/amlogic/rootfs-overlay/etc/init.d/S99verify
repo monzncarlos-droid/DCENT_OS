@@ -23,17 +23,27 @@
 #   V3  dashboard-served       : Dashboard HTTP root on :80 or :8080.
 #   V4  dcentrald-running      : pgrep dcentrald + process age > 30 s
 #                                (proves stable ownership during this window).
-#   V5  psu-engaged            : per-family rail-enable GPIO asserted (HIGH)
-#                                when mining is enabled; de-asserted (LOW) is
-#                                valid for management-only quiet idle.
-#                                  zynq am2 / am2-*: gpio907.
+#   V5  psu-engaged            : per-family rail-enable GPIO observed
+#                                (report-only; S99verify never drives the pin).
+#                                gpio437 polarity is BOARD_TARGET SCOPED:
+#                                  am3-s19k / am3-s19kpro / am3-aml-s19kpro
+#                                    : software 0=ON, 1=OFF
+#                                  S21-class NoPic (am3-s21 / am3-s21pro /
+#                                    am3-s21xp / am3-s19jpro-aml)
+#                                    : software 1=ON / SafeOff=0
+#                                Never one Amlogic pin polarity. Do not claim
+#                                VerifiedRailCut. Software SafeOff-on-stop
+#                                remains receipt=None.
+#                                  zynq am2 / am2-*: gpio907 (1=asserted).
 #                                  am3-bb*       : gpio59 (S19J_IO_BOARD_V2_0).
-#                                  am3-aml*      : gpio437 (Amlogic A113D PWR_EN).
+#                                  am3-aml*      : gpio437 (board_target above).
 #                                  cv1835*       : /etc/dcentos/rail_gpio (TBD).
 #   V6  pic-fw-validated       : daemon-published voltage-controller proof.
 #                                  zynq am2 / am3-bb: dsPIC fw whitelist
 #                                    {0x82,0x89,0x8A,0xB9,0xFE}, reject 0x86.
-#                                  am3-aml*: skipped (TAS5782M NoPic).
+#                                  am3-aml: board_target scoped — S21-class
+#                                    TAS5782M skip; S19k-class NoPic skip
+#                                    (NOT TAS5782M); unknown target FAIL.
 #                                  cv1835*: PIC1704 @ 0x20 classify
 #                                    bootloader (0xCC) vs application (0x60).
 #   V7  chain-yield-acceptable : per-family floor from
@@ -467,6 +477,69 @@ check_dcentrald_running() {
     emit_check V4 true "dcentrald PID $pid alive (age unknown)"
 }
 
+# gpio437 polarity is BOARD_TARGET SCOPED. Observe-only: never write sysfs.
+# Prints: s19k-0on | s21-1on | unknown
+gpio437_polarity_scope() {
+    bt=$1
+    case "$bt" in
+        am3-s19k|am3-s19kpro|am3-aml-s19kpro) echo "s19k-0on" ;;
+        am3-s21|am3-s21pro|am3-s21xp|am3-s19jpro-aml) echo "s21-1on" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Map an observed 0/1 to software engaged|safeoff|unknown for one board_target.
+gpio437_software_state() {
+    bt=$1
+    val=$2
+    scope=$(gpio437_polarity_scope "$bt")
+    case "$scope" in
+        s19k-0on)
+            if [ "$val" = "0" ]; then echo engaged
+            elif [ "$val" = "1" ]; then echo safeoff
+            else echo unknown
+            fi
+            ;;
+        s21-1on)
+            if [ "$val" = "1" ]; then echo engaged
+            elif [ "$val" = "0" ]; then echo safeoff
+            else echo unknown
+            fi
+            ;;
+        *) echo unknown ;;
+    esac
+}
+
+# Report-only software SafeOff-on-stop. Does not drive gpio437.
+# receipt=None; never VerifiedRailCut.
+report_software_safeoff_on_stop() {
+    detect_platform
+    bt=$(read_config_str "$BOARD_TARGET_FILE" "unknown")
+    observed=""
+    if [ -r /sys/class/gpio/gpio437/value ]; then
+        observed=$(cat /sys/class/gpio/gpio437/value 2>/dev/null | tr -dc '01')
+    fi
+    state=$(gpio437_software_state "$bt" "$observed")
+    scope=$(gpio437_polarity_scope "$bt")
+    STOP_JSON=/tmp/s99verify-stop.json
+    cat > "$STOP_JSON" <<EOF
+{
+  "event": "software-safeoff-on-stop",
+  "board_target": "$bt",
+  "board_family": "$BOARD_FAMILY",
+  "platform": "$PLATFORM",
+  "gpio": 437,
+  "polarity_scope": "$scope",
+  "observed_value": ${observed:-null},
+  "software_state": "$state",
+  "receipt": null,
+  "verified_rail_cut": false,
+  "note": "report-only; S99verify does not drive gpio437"
+}
+EOF
+    logline "software SafeOff-on-stop report-only gpio437 observed=${observed:-unread} state=$state scope=$scope receipt=None (not VerifiedRailCut); $STOP_JSON"
+}
+
 # V5: per-family rail-enable GPIO.
 check_rail_gpio() {
     rail_gpio=""
@@ -486,7 +559,24 @@ check_rail_gpio() {
     fi
     val=""
     if [ -r /sys/class/gpio/gpio${rail_gpio}/value ]; then
-        val=$(cat /sys/class/gpio/gpio${rail_gpio}/value 2>/dev/null)
+        val=$(cat /sys/class/gpio/gpio${rail_gpio}/value 2>/dev/null | tr -dc '01')
+    fi
+    bt=${board_target:-unknown}
+    if [ "$PLATFORM" = "am3-aml" ]; then
+        scope=$(gpio437_polarity_scope "$bt")
+        state=$(gpio437_software_state "$bt" "$val")
+        if [ "$scope" = "unknown" ]; then
+            emit_check V5 false "gpio437 polarity unknown for board_target=$bt; refuse universal Amlogic polarity; observed=${val:-unread} (not VerifiedRailCut)"
+            return
+        fi
+        if [ "$state" = "engaged" ]; then
+            emit_check V5 true "gpio437 software-engaged (observed=$val, $scope, board_target=$bt); not VerifiedRailCut"
+        elif [ "$state" = "safeoff" ]; then
+            emit_check V5 false "gpio437 software-SafeOff (observed=$val, $scope, board_target=$bt); not VerifiedRailCut"
+        else
+            emit_check V5 false "gpio437 not exported or unreadable [board_target=$bt $scope]; not VerifiedRailCut"
+        fi
+        return
     fi
     if [ "$val" = "1" ]; then
         emit_check V5 true "gpio${rail_gpio} PWR_CONTROL asserted (1) [platform=$PLATFORM]"
@@ -505,9 +595,22 @@ check_rail_gpio() {
 check_pic_fw() {
     case "$PLATFORM" in
         am3-aml)
-            # Amlogic S21 / S19j Pro Amlogic uses TAS5782M audio DACs for
-            # voltage (NoPic). No PIC to verify; supervisor handles voltage.
-            emit_check V6 true "NoPic platform (am3-aml: TAS5782M audio DAC voltage) - V6 skipped"
+            # Not every am3-aml board is TAS5782M. S21-class NoPic uses the
+            # audio DAC; S19k-class is NoPic via gpio437 0=ON. Unknown
+            # board_target must not inherit either skip.
+            bt=${board_target:-unknown}
+            scope=$(gpio437_polarity_scope "$bt")
+            case "$scope" in
+                s21-1on)
+                    emit_check V6 true "NoPic platform (board_target=$bt: TAS5782M audio DAC voltage) - V6 skipped"
+                    ;;
+                s19k-0on)
+                    emit_check V6 true "NoPic platform (board_target=$bt: S19k-class, not TAS5782M) - V6 skipped"
+                    ;;
+                *)
+                    emit_check V6 false "am3-aml V6 refused: board_target=$bt is not a TAS5782M or S19k NoPic identity (not all am3-aml = TAS5782M)"
+                    ;;
+            esac
             return
             ;;
         cv1835)
@@ -963,7 +1066,9 @@ case "$1" in
         run_verify
         ;;
     stop)
-        # No long-running state to tear down.
+        # Report-only software SafeOff-on-stop. Do not drive gpio437.
+        # receipt=None; never VerifiedRailCut.
+        report_software_safeoff_on_stop
         ;;
     restart)
         run_verify

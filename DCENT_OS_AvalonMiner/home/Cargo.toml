@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "dcentaxe-nano3s",
+    "dcentaxe-nano3s-hal",
+    "dcentaxe-nano3s-asic",
+]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0"
+repository = "https://github.com/d-central"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "ioctl"] }
+
+# Shared protocol crate (mm_pkg + aup + ascset + transport)
+dcent-avalon-proto = { path = "../../shared/dcent-avalon-proto" }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"

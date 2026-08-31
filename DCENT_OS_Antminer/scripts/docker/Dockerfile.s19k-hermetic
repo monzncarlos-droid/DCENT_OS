@@ -1,0 +1,89 @@
+# S19k persistent-image source materializer and offline A/B builder candidate.
+#
+# Both parent images are immutable registry digests. This file still requires a
+# clean signed source commit and a separately retained image-inspection receipt
+# before its resulting image can be selected by the production producer.
+
+FROM node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node_runtime
+
+FROM rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        bc \
+        binutils \
+        bison \
+        build-essential \
+        bzip2 \
+        ca-certificates \
+        cpio \
+        curl \
+        debianutils \
+        device-tree-compiler \
+        diffutils \
+        fakeroot \
+        file \
+        findutils \
+        flex \
+        gawk \
+        git \
+        gzip \
+        libncurses-dev \
+        libssl-dev \
+        make \
+        patch \
+        perl \
+        pkg-config \
+        python3 \
+        python3-cryptography \
+        rsync \
+        sed \
+        squashfs-tools \
+        tar \
+        u-boot-tools \
+        unzip \
+        wget \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --fail --show-error --location \
+        https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+        --output /tmp/zig-linux-x86_64-0.13.0.tar.xz \
+    && echo "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  /tmp/zig-linux-x86_64-0.13.0.tar.xz" \
+        | sha256sum --check --strict \
+    && mkdir /opt/zig \
+    && tar -xJf /tmp/zig-linux-x86_64-0.13.0.tar.xz \
+        -C /opt/zig --strip-components=1 \
+    && rm /tmp/zig-linux-x86_64-0.13.0.tar.xz
+
+# The offline build cannot ask rustup for target components.  Bake and verify
+# the exact AArch64 musl std component while this image itself is being built.
+RUN rustup target add aarch64-unknown-linux-musl \
+    && test "$(rustup target list --installed | grep -Fxc 'aarch64-unknown-linux-musl')" = "1"
+
+COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && test "$(rustc -vV | sed -n 's/^release: //p')" = "1.90.0" \
+    && test "$(node --version)" = "v22.23.2" \
+    && test "$(npm --version)" = "10.9.8" \
+    && test "$(/opt/zig/zig version)" = "0.13.0" \
+    && git --version \
+    && make --version | head -n 1 \
+    && python3 --version
+
+ENV PATH="/usr/local/cargo/bin:/opt/zig:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+LABEL org.dcentral.dcentos.s19k-hermetic-builder="candidate-v1" \
+      org.dcentral.dcentos.authority="build-only-no-release-install-or-flash-authority" \
+      org.dcentral.dcentos.rust-base="rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207" \
+      org.dcentral.dcentos.node-base="node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5" \
+      org.dcentral.dcentos.rust-target="aarch64-unknown-linux-musl" \
+      org.dcentral.dcentos.zig-version="0.13.0"
+
+WORKDIR /dcent

@@ -110,6 +110,9 @@ class AmlogicNativePackageTargetsTest(unittest.TestCase):
         self.assertIn("am3-s19xp)", post_image)
         self.assertIn("am3-s19jxp)", post_image)
         self.assertIn("am3-s19jproplus)", post_image)
+        self.assertGreaterEqual(post_image.count("PACKAGE_INSTALL_AUTHORIZED=0"), 2)
+        self.assertIn("DCENT_TOOLBOX_INSTALL_MODE=package_only_denied", post_image)
+        self.assertIn("DCENT_PACKAGE_INSTALLABLE=false", post_image)
         self.assertIn('PACKAGE_POSTURE="exact-runtime Experimental host rootfs-window target"', post_image)
         self.assertIn("DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab", post_image)
         self.assertIn("DCENT_PACKAGE_INSTALLABLE=true", post_image)
@@ -118,20 +121,17 @@ class AmlogicNativePackageTargetsTest(unittest.TestCase):
         self.assertIn('"installable": ${installable}', helper)
         self.assertIn('install_command_json="\\"${install_command}\\""', helper)
 
-    def test_native_rootfs_extractor_has_exact_s19xp_target(self) -> None:
+    def test_native_rootfs_extractor_refuses_x19xp_package_only_targets(self) -> None:
         extractor = (PROJECT / "scripts" / "build_amlogic_native_install.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("s19xp)", extractor)
-        self.assertIn('BOARD_PKG_NAME="am3-s19xp"', extractor)
-        self.assertIn('TAR_NAME="dcentos-sysupgrade-am3-s19xp.tar"', extractor)
-        self.assertIn('ROOT_MEMBER="sysupgrade-am3-s19xp/root"', extractor)
-        self.assertIn('BIN_NAME="dcentos-amlogic-s19xp.bin"', extractor)
-        self.assertIn("s19jxp|s19j-xp)", extractor)
-        self.assertIn('BOARD_PKG_NAME="am3-s19jxp"', extractor)
-        self.assertIn('TAR_NAME="dcentos-sysupgrade-am3-s19jxp.tar"', extractor)
-        self.assertIn('ROOT_MEMBER="sysupgrade-am3-s19jxp/root"', extractor)
-        self.assertIn('BIN_NAME="dcentos-amlogic-s19jxp.bin"', extractor)
+        self.assertIn("s19xp|s19jxp|s19j-xp)", extractor)
+        self.assertIn("NOT-IMPLEMENTED package-only targets; native install extraction is refused", extractor)
+        self.assertIn("DCENT_REQUIRE_INSTALLABLE_PACKAGE=1", extractor)
+        self.assertNotIn('BOARD_PKG_NAME="am3-s19xp"', extractor)
+        self.assertNotIn('BOARD_PKG_NAME="am3-s19jxp"', extractor)
+        self.assertNotIn('BIN_NAME="dcentos-amlogic-s19xp.bin"', extractor)
+        self.assertNotIn('BIN_NAME="dcentos-amlogic-s19jxp.bin"', extractor)
 
     def test_s19xp_exact_asic_model_and_td003_gate_are_registered(self) -> None:
         model_source = (
@@ -173,8 +173,9 @@ class AmlogicNativePackageTargetsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Antminer S19 (88) | s19-88 | BM1398", amlogic_re)
         self.assertIn("Antminer S19 (126) | s19-126 | BM1398", amlogic_re)
-        self.assertIn('(\"BHB42801\", \"BM1362\", 88, Some(\"Antminer S19 (88)\")', hashboard_catalog)
-        self.assertIn('Some(\"Antminer S19 (126)\")', hashboard_catalog)
+        self.assertIn('(\"BHB42801\", \"BM1362\", 88, None, 1, true)', hashboard_catalog)
+        self.assertNotIn('Some(\"Antminer S19 (88)\")', hashboard_catalog)
+        self.assertNotIn('Some(\"Antminer S19 (126)\")', hashboard_catalog)
         configs = PROJECT / "br2_external_dcentos" / "configs"
         self.assertFalse((configs / "dcentos_am3_s19_88_defconfig").exists())
         self.assertFalse((configs / "dcentos_am3_s19_126_defconfig").exists())

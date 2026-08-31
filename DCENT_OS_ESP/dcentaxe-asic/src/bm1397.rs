@@ -954,6 +954,9 @@ impl super::AsicDriver for BM1397 {
             job_id: rx_job_id,
             nonce,
             rolled_version: rx_midstate_index as u32, // caller must compute actual version
+            // BM1397 rolls midstates on-chip, not ntime — consumers use the
+            // job ntime (0 sentinel).
+            rolled_ntime: 0,
             asic_nr,
             timestamp_us: crate::common::now_us(),
         }])

@@ -559,6 +559,130 @@ impl Default for TunerMode {
     }
 }
 
+/// Night-hour cut applied to the Power-mode watt setpoint.
+///
+/// Copied from `[mode.home.night_mode]` when the daemon starts the tuner.
+/// `enabled = false` (default) leaves `target_watts` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NightPowerPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_night_start_hour")]
+    pub start_hour: u8,
+    #[serde(default = "default_night_end_hour")]
+    pub end_hour: u8,
+    #[serde(default = "default_night_power_reduction_pct")]
+    pub power_reduction_pct: u8,
+    #[serde(default)]
+    pub timezone_offset_hours: i8,
+}
+
+impl Default for NightPowerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_hour: default_night_start_hour(),
+            end_hour: default_night_end_hour(),
+            power_reduction_pct: default_night_power_reduction_pct(),
+            timezone_offset_hours: 0,
+        }
+    }
+}
+
+impl NightPowerPolicy {
+    pub fn from_home_night_mode(
+        enabled: bool,
+        start_hour: u8,
+        end_hour: u8,
+        power_reduction_pct: u8,
+        timezone_offset_hours: i8,
+    ) -> Self {
+        Self {
+            enabled,
+            start_hour,
+            end_hour,
+            power_reduction_pct,
+            timezone_offset_hours,
+        }
+    }
+
+    /// True when the live tuner policy matches the persisted home night fields.
+    pub fn matches_saved(
+        &self,
+        enabled: bool,
+        start_hour: u8,
+        end_hour: u8,
+        power_reduction_pct: u8,
+    ) -> bool {
+        self.enabled == enabled
+            && self.start_hour == start_hour
+            && self.end_hour == end_hour
+            && self.power_reduction_pct == power_reduction_pct
+    }
+}
+
+/// GET `/api/home/night-mode` runtime-adoption truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NightModeReadTruth {
+    pub runtime_adopted: bool,
+    pub saved_only: bool,
+    pub pending_restart: bool,
+    pub runtime_source: &'static str,
+}
+
+/// Compare persisted `[mode.home.night_mode]` to the live tuner policy.
+///
+/// GET must call this — do not hard-code `runtimeAdopted: false`.
+pub fn night_mode_read_truth(
+    saved_enabled: bool,
+    saved_start_hour: u8,
+    saved_end_hour: u8,
+    saved_power_reduction_pct: u8,
+    live: Option<&NightPowerPolicy>,
+) -> NightModeReadTruth {
+    match live {
+        Some(policy)
+            if policy.matches_saved(
+                saved_enabled,
+                saved_start_hour,
+                saved_end_hour,
+                saved_power_reduction_pct,
+            ) =>
+        {
+            NightModeReadTruth {
+                runtime_adopted: true,
+                saved_only: false,
+                pending_restart: false,
+                runtime_source: "autotuner.night_power",
+            }
+        }
+        Some(_) => NightModeReadTruth {
+            runtime_adopted: false,
+            saved_only: true,
+            pending_restart: true,
+            runtime_source: "autotuner.night_power",
+        },
+        None => NightModeReadTruth {
+            runtime_adopted: false,
+            saved_only: true,
+            pending_restart: false,
+            runtime_source: "none",
+        },
+    }
+}
+
+fn default_night_start_hour() -> u8 {
+    22
+}
+
+fn default_night_end_hour() -> u8 {
+    7
+}
+
+fn default_night_power_reduction_pct() -> u8 {
+    40
+}
+
 /// Auto-tuner configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoTunerConfig {
@@ -678,6 +802,11 @@ pub struct AutoTunerConfig {
     /// Clamped to ABSOLUTE_MAX_WATTS (1800) for residential safety.
     #[serde(default)]
     pub target_watts: u32,
+
+    /// Home night-mode cut applied to `target_watts` in Power mode.
+    /// Seeded from `[mode.home.night_mode]` at tuner spawn. Default-off.
+    #[serde(default)]
+    pub night_power: NightPowerPolicy,
 
     /// Operator/API power step for DPS target changes.
     #[serde(default = "default_power_step_w")]
@@ -970,6 +1099,7 @@ impl Default for AutoTunerConfig {
             min_voltage_mv: default_min_voltage(),
             voltage_margin_mv: default_voltage_margin(),
             target_watts: 0,
+            night_power: NightPowerPolicy::default(),
             power_step_w: default_power_step_w(),
             thermal_hysteresis_c: default_thermal_hysteresis(),
             min_hashrate_ratio: default_min_hashrate_ratio(),
@@ -1933,6 +2063,41 @@ mod tests {
         assert!(config.validate().is_ok());
         assert!(!config.enabled);
         assert!(!config.voltage_optimization);
+    }
+
+    #[test]
+    fn night_mode_read_truth_reflects_live_tuner_policy() {
+        let live = NightPowerPolicy::from_home_night_mode(true, 22, 7, 40, 0);
+        let adopted = night_mode_read_truth(true, 22, 7, 40, Some(&live));
+        assert!(adopted.runtime_adopted);
+        assert!(!adopted.saved_only);
+        assert_eq!(adopted.runtime_source, "autotuner.night_power");
+
+        let mismatch = night_mode_read_truth(true, 22, 7, 50, Some(&live));
+        assert!(!mismatch.runtime_adopted);
+        assert!(mismatch.pending_restart);
+
+        let none = night_mode_read_truth(true, 22, 7, 40, None);
+        assert!(!none.runtime_adopted);
+        assert!(none.saved_only);
+        assert_eq!(none.runtime_source, "none");
+    }
+
+    #[test]
+    fn get_home_night_mode_uses_night_mode_read_truth() {
+        let rest = include_str!("../../dcentrald-api/src/rest/late.rs");
+        assert!(
+            rest.contains("dcentrald_autotuner::night_mode_read_truth("),
+            "GET /api/home/night-mode must use the live-tuner truth helper"
+        );
+        assert!(
+            rest.contains("autotuner_status_rx.borrow().night_power"),
+            "GET must read live night_power from AutotunerRuntimeStatus"
+        );
+        assert!(
+            !rest.contains("\"runtimeSource\": \"thermal.night_mode\""),
+            "GET must not hard-code thermal.night_mode as the watt-policy source"
+        );
     }
 
     /// W1.3 — `TuneTarget::default()` must be `Efficiency`, not `Hashrate`.

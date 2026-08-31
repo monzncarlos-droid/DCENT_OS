@@ -659,6 +659,9 @@ impl super::AsicDriver for BM1370 {
             job_id,
             nonce,
             rolled_version: version_bits,
+            // BM1370 rolls version on-chip, not ntime — consumers use the job
+            // ntime (0 sentinel).
+            rolled_ntime: 0,
             asic_nr,
             timestamp_us: crate::common::now_us(),
         }])

@@ -1,0 +1,50 @@
+[package]
+name = "dcent-avalon-k210-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-only"
+description = "Fail-closed no_std policy core for the DCENT_OS Avalon K210 lane"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+safe-idle-sentinel = []
+phase-a = []
+renode-console = []
+
+[[bin]]
+name = "dcent-k210-safe-idle-sentinel"
+path = "src/bin/safe_idle_sentinel.rs"
+required-features = ["safe-idle-sentinel"]
+test = false
+bench = false
+
+[[bin]]
+name = "dcent-k210-safe-idle-runtime"
+path = "src/bin/safe_idle_runtime.rs"
+required-features = ["phase-a"]
+test = false
+bench = false
+
+[[bin]]
+name = "dcent-k210-renode-console"
+path = "src/bin/renode_console.rs"
+required-features = ["renode-console"]
+test = false
+bench = false
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

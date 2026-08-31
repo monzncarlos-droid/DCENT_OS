@@ -2275,6 +2275,17 @@
 }
 .mode-basic .night-mode-save { margin-top: 0; }
 
+.mode-basic .heater-mode-tiles-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mode-basic .quiet-night-ceilings {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
 /* ── CircuitWarning — class-ified, UNSCOPED so it renders identically in
  * Standard mode too (the component is shared with StandardDashboard; its
  * prop/markup API is frozen — only the chrome moved off inline styles).

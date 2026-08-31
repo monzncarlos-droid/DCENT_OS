@@ -61,11 +61,13 @@ impl PatternFormat {
         }
     }
 
-    /// Select the on-disk format from the ASIC family string (proven mapping).
-    pub fn for_family(family: &str) -> Self {
+    /// Select the on-disk format only for families with proven held mappings.
+    /// Unknown families fail closed instead of inheriting BM1368's layout.
+    pub fn try_for_family(family: &str) -> Option<Self> {
         match family.trim() {
-            "BM1362" | "BM1366" => Self::Wide48,
-            _ => Self::Compact12,
+            "BM1362" | "BM1366" => Some(Self::Wide48),
+            "BM1368" => Some(Self::Compact12),
+            _ => None,
         }
     }
 }
@@ -187,9 +189,8 @@ pub struct FamilyTestStandard {
     pub pattern_number: u8,
     /// Minimum nonces a core must return to be graded good.
     pub least_nonce_per_core: u16,
-    /// Factory `Invalid_Core_Number` tolerance (exposed as data; the exact chip
-    /// verdict formula is not decompiled — grade at the core level, not by asserting
-    /// a chip verdict from this alone).
+    /// Raw factory `Invalid_Core_Number` field. Its exact semantics and chip-verdict
+    /// formula are not decompiled; do not label it a tolerance or mint a verdict.
     pub invalid_core_number: u16,
     /// Factory `Most_HW_Num` hardware-error ceiling (exposed as data).
     pub most_hw_num: u16,
@@ -370,10 +371,24 @@ mod tests {
         assert_eq!(family_test_standard("BM1366").map(|s| s.asic_num), Some(77));
         assert_eq!(family_test_standard("BM9999"), None);
         assert_eq!(
-            PatternFormat::for_family("BM1368"),
-            PatternFormat::Compact12
+            PatternFormat::try_for_family("BM1368"),
+            Some(PatternFormat::Compact12)
         );
-        assert_eq!(PatternFormat::for_family("BM1362"), PatternFormat::Wide48);
+        assert_eq!(
+            PatternFormat::try_for_family("BM1362"),
+            Some(PatternFormat::Wide48)
+        );
+        assert_eq!(
+            PatternFormat::try_for_family("BM1366"),
+            Some(PatternFormat::Wide48)
+        );
+        for unproven in ["BM1398", "BM1387", "BM9999", "", "bm1368"] {
+            assert_eq!(
+                PatternFormat::try_for_family(unproven),
+                None,
+                "{unproven:?} must not inherit a factory record layout"
+            );
+        }
     }
 
     #[test]

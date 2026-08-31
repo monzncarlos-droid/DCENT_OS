@@ -75,10 +75,42 @@ MIN_HEALTHY_UPTIME_S=${DCENTOS_BOOT_SUCCESS_WINDOW_S:-25}
 # not persistent — the U-Boot upgrade_stage env is the durable truth).
 UPGRADE_COMMIT_MARKER=${DCENTOS_UPGRADE_COMMIT_MARKER:-/tmp/dcentos-upgrade-committed}
 
-# Test hooks default to the production locations. Host-side rollback tests use
-# them to run the real start path without touching /dev or /etc.
-MTD4_NODE=${DCENTOS_MTD4_NODE:-/dev/mtd4}
-FW_ENV_CONFIG=${DCENTOS_FW_ENV_CONFIG:-/etc/fw_env.config}
+# U-Boot environment evidence is canonical in production. Only the explicit,
+# marker-guarded offline test harness may redirect these sources.
+MTD4_NODE=/dev/mtd4
+FW_ENV_CONFIG=/etc/fw_env.config
+UBOOT_ENV_PROC_MTD=/proc/mtd
+UBOOT_ENV_SYSFS_MTD_ROOT=/sys/class/mtd
+UBOOT_ENV_ADMISSION_HELPER=/usr/libexec/dcentos/sysupgrade-uboot-env-admission.sh
+if [ "${DCENTOS_S99_OFFLINE_TEST:-0}" = 1 ]; then
+    SCRIPT_REALPATH=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+    if [ "$SCRIPT_REALPATH" = /etc/init.d/S99upgrade ]; then
+        echo "S99upgrade: refusing offline evidence overrides on the deployed init script" >&2
+        exit 1
+    fi
+    if [ -z "${DCENTOS_S99_OFFLINE_MARKER:-}" ] ||
+       [ ! -f "$DCENTOS_S99_OFFLINE_MARKER" ] ||
+       [ "$(cat "$DCENTOS_S99_OFFLINE_MARKER" 2>/dev/null)" != dcent-s99upgrade-offline-test-v1 ]; then
+        echo "S99upgrade: invalid offline test marker" >&2
+        exit 1
+    fi
+    MTD4_NODE=${DCENTOS_MTD4_NODE:-$MTD4_NODE}
+    FW_ENV_CONFIG=${DCENTOS_FW_ENV_CONFIG:-$FW_ENV_CONFIG}
+    UBOOT_ENV_PROC_MTD=${DCENTOS_UBOOT_ENV_PROC_MTD:-$UBOOT_ENV_PROC_MTD}
+    UBOOT_ENV_SYSFS_MTD_ROOT=${DCENTOS_UBOOT_ENV_SYSFS_MTD_ROOT:-$UBOOT_ENV_SYSFS_MTD_ROOT}
+    UBOOT_ENV_ADMISSION_HELPER=${DCENTOS_UBOOT_ENV_ADMISSION_HELPER:-$UBOOT_ENV_ADMISSION_HELPER}
+fi
+
+UBOOT_ENV_ADMISSION_READY=0
+if [ -r "$UBOOT_ENV_ADMISSION_HELPER" ]; then
+    # shellcheck source=/usr/libexec/dcentos/sysupgrade-uboot-env-admission.sh
+    if . "$UBOOT_ENV_ADMISSION_HELPER" &&
+       command -v dcent_zynq_uboot_env_admit >/dev/null 2>&1; then
+        UBOOT_ENV_ADMISSION_READY=1
+    fi
+fi
+
+# Remaining test hooks do not redirect U-Boot evidence or mutation targets.
 DCENTRALD_BIN=${DCENTOS_DCENTRALD_BIN:-/usr/local/bin/dcentrald}
 DCENTOS_CONFIG_DIR=${DCENTOS_CONFIG_DIR:-/etc/dcentos}
 DROPBEAR_DEFAULTS=${DCENTOS_DROPBEAR_DEFAULTS:-/etc/default/dropbear}
@@ -330,21 +362,62 @@ case "$1" in
             exit 0
         fi
 
-        # Detect whether U-Boot has upgrade_stage set, using the redundant-env-
-        # aware fw_printenv (the clear/verify path already uses it) instead of a
-        # raw single-copy `dd if=/dev/mtd4 count=1` that reads ONLY redundant copy
-        # A and can miss/misread the active copy B on weak-ECC mtd4 (A1d-4). Fail
-        # SAFE: if fw_printenv / fw_env.config is unavailable, do NOT exit early —
-        # fall through to the health gate (a needless run just finds upgrade_stage
-        # already absent and is harmless), never silently skip the gate.
-        if command -v fw_printenv >/dev/null 2>&1; then
-            if ! fw_printenv upgrade_stage >/dev/null 2>&1; then
-                # fw_printenv ran and upgrade_stage is not present -> normal boot.
-                exit 0
-            fi
-            # upgrade_stage present -> run health checks below.
+        if [ "$UBOOT_ENV_ADMISSION_READY" != 1 ] ||
+           ! dcent_zynq_uboot_env_admit \
+                "$FW_ENV_CONFIG" "$UBOOT_ENV_PROC_MTD" \
+                "$UBOOT_ENV_SYSFS_MTD_ROOT" "$MTD4_NODE"; then
+            echo "  *** ERROR: canonical U-Boot environment admission failed ***"
+            echo "  *** no environment tool was invoked; slot remains uncommitted ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
         fi
-        # (tooling absent OR upgrade_stage present) -> run the health gate.
+
+        # Detect upgrade_stage from one full, CRC-valid redundant-environment
+        # snapshot. A keyed fw_printenv failure is ambiguous: it can mean an
+        # absent key, unreadable copies, Bad CRC, or a tool/config failure.
+        # Only a successful full snapshot with exactly zero upgrade_stage keys
+        # proves a normal boot. Exactly one non-empty value enters the health
+        # gate; every other state is blocked without mutating the environment.
+        if ! command -v fw_printenv >/dev/null 2>&1; then
+            echo "  *** ERROR: fw_printenv missing - cannot classify upgrade_stage ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        STAGE_SNAPSHOT_RC=0
+        STAGE_SNAPSHOT=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || STAGE_SNAPSHOT_RC=$?
+        if [ "$STAGE_SNAPSHOT_RC" -ne 0 ]; then
+            echo "  *** ERROR: could not read a CRC-valid current U-Boot environment ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        case "$STAGE_SNAPSHOT" in
+            *"Bad CRC"*|*"bad CRC"*|*"using default environment"*)
+                echo "  *** ERROR: current U-Boot env reads Bad CRC / default ***"
+                echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+                exit 0
+                ;;
+        esac
+        STAGE_VALUES=$(printf '%s\n' "$STAGE_SNAPSHOT" | sed -n 's/^upgrade_stage=//p')
+        STAGE_COUNT=$(printf '%s\n' "$STAGE_SNAPSHOT" |
+            sed -n 's/^upgrade_stage=//p' | wc -l | tr -d '[:space:]')
+        case "$STAGE_COUNT" in
+            0)
+                # CRC-valid exact absence is the only normal-boot shortcut.
+                exit 0
+                ;;
+            1)
+                if [ -z "$STAGE_VALUES" ]; then
+                    echo "  *** ERROR: upgrade_stage is present with an empty value ***"
+                    echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+                    exit 0
+                fi
+                ;;
+            *)
+                echo "  *** ERROR: duplicate upgrade_stage records in U-Boot environment ***"
+                echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+                exit 0
+                ;;
+        esac
 
         echo "Upgrade detected (upgrade_stage set) - running health checks before committing..."
         check_health
@@ -376,87 +449,43 @@ case "$1" in
             echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
             exit 0
         fi
-        if [ ! -f "$FW_ENV_CONFIG" ]; then
-            echo "  *** ERROR: /etc/fw_env.config missing - fw_setenv has no MTD map ***"
+        if ! dcent_zynq_uboot_env_admit \
+            "$FW_ENV_CONFIG" "$UBOOT_ENV_PROC_MTD" \
+            "$UBOOT_ENV_SYSFS_MTD_ROOT" "$MTD4_NODE"; then
+            echo "  *** ERROR: U-Boot environment identity changed before commit ***"
+            echo "  *** no commit read/write attempted; slot remains uncommitted ***"
             echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
             exit 0
         fi
 
-        # ====================================================================
-        # COMMIT THE SLOT — clear upgrade_stage (and first_boot) reliably.
+        # Commit both recovery variables with one redundant-environment store.
+        # The script input uses libubootenv's `name=` deletion form and places
+        # upgrade_stage last: it is the commit key consumed by U-Boot. Splitting
+        # these deletes across stores can re-read an older redundant copy between
+        # calls and resurrect upgrade_stage on weak-ECC NAND.
         #
-        # BUG 2 ROOT CAUSE (live .100 S9, 2026-06-05): the previous code ran
-        # TWO separate `fw_setenv` calls (`upgrade_stage` then `first_boot`)
-        # and read back only ONCE. On the weak-ECC pl35x-nand mtd4 (the kernel
-        # warns "ECC too weak") this failed two ways:
-        #   (a) Two-call sequence resurrects the var. Each fw_setenv is a full
-        #       read-modify-erase-write-flip of a redundant copy. If the FIRST
-        #       call's freshly-written copy reads back CRC-bad (weak ECC can't
-        #       correct the new page), libubootenv silently falls back to the
-        #       OTHER (older) copy on the next access. The SECOND call
-        #       (`first_boot`) then reads that stale copy — which STILL has
-        #       upgrade_stage — edits first_boot, and re-persists it.
-        #       fw_setenv returned 0 both times, so the old "OK: committed"
-        #       message printed, yet the read-back showed upgrade_stage present.
-        #   (b) A single bad block / transient weak-ECC write lands corrupt and
-        #       is dropped on read.
-        #
-        # FIX (NEVER raw nandwrite mtd4 — load-bearing
-        # feedback_am2_uboot_env_flip_must_use_fw_setenv): mirror the PROVEN
-        # sysupgrade write path —
-        #   1. clear each var with the BARE form `fw_setenv <key>` (no value,
-        #      NO --script). See BUG 4 below: on this libubootenv build the
-        #      `--script -` here-doc with a bare key does NOT delete the var —
-        #      it sets `upgrade_stage=0`, which is NOT permanent (U-Boot
-        #      auto_recovery increments 0 -> 1 -> revert on the next two power
-        #      cycles). Only the bare `fw_setenv upgrade_stage` form actually
-        #      DELETES the key (proven live), and an ABSENT key is what makes a
-        #      slot permanent.
-        #   2. SETTLE + sync first — the early-boot NAND is still under
-        #      concurrent flash I/O when S99 runs; a fw_setenv issued into that
-        #      contention lands corrupt on weak-ECC mtd4 and the verify fails.
-        #      The same write succeeds once the bus is idle (proven live). So we
-        #      `sync` and pause before the first attempt and back off between
-        #      retries.
-        #   3. RETRY the whole clear up to N times with increasing backoff — a
-        #      weak-ECC write that lands in a bad page often succeeds on a later
-        #      attempt (libubootenv erases + rewrites the obsolete copy each
-        #      time);
-        #   4. VERIFY with a FRESH fw_printenv after EACH attempt; success only
-        #      when upgrade_stage is actually ABSENT (grep for `^upgrade_stage=`
-        #      finds NOTHING — a remaining `upgrade_stage=0` line is a FAILURE,
-        #      not a success) AND the env is CRC-valid;
-        #   5. FAIL LOUDLY + write the `blocked` marker if every attempt fails,
-        #      so U-Boot safely reverts to the known-good slot rather than the
-        #      install falsely advertising a committed (but not-cleared) slot.
-        # The env offsets (0x0 / 0x20000) and ENV_SIZE (0x20000) are confirmed
-        # correct against a real mtd4 dump (CRC32 over data[5:0x20000] matches
-        # both redundant copies) — the failure was the write/verify logic, not
-        # the geometry.
-        #
-        # BUG 4 ROOT CAUSE ( STABILIZE, 2026-06-05): the previous code used
-        # `fw_setenv --script -` with bare keys `upgrade_stage` / `first_boot`.
-        # In --script mode a line that is JUST a key (no whitespace, no value)
-        # is interpreted by this libubootenv as "set key to empty", and on the
-        # readback the var serializes as `upgrade_stage=0` (U-Boot reads the
-        # empty/zero value), NOT as absent. The old verify only grepped for
-        # `^upgrade_stage=` to detect a STILL-FULL value, so `upgrade_stage=0`
-        # ALSO matched and was (correctly) treated as failure — but the script
-        # had no path that ever produced an ABSENT key, so commits looped to the
-        # retry cap and `blocked` even when the write "worked". The bare-form
-        # `fw_setenv upgrade_stage` (no --script) is the documented delete and
-        # leaves the key ABSENT, which is what U-Boot needs to skip auto-recovery
-        # permanently.
-        # ====================================================================
+        # Every attempt is classified from a fresh, full, CRC-valid snapshot:
+        #   desired: both keys absent and every retained byte equals pre-commit;
+        #   old:     byte-for-byte equal to the exact pre-commit snapshot;
+        #   other:   mixed/drifted/duplicated/unreadable, requiring manual repair.
+        # A late nonzero fw_setenv status cannot overrule proven desired state.
+        # Retry is safe only from proven old state. Never raw-write mtd4.
         FW_COMMIT_RETRIES=${DCENTOS_FW_COMMIT_RETRIES:-5}
         # Settle the NAND before the first write and back off between retries so
         # the env flip lands after early-boot flash I/O quiets (proven live).
         FW_COMMIT_SETTLE_S=${DCENTOS_FW_COMMIT_SETTLE_S:-3}
 
-        # Pre-flight: refuse to write into an already-broken env. If the current
-        # env reads Bad CRC / default, a write could land in an indeterminate
-        # state; fail closed and let U-Boot revert to the known-good slot.
-        PRECHK=$(fw_printenv 2>&1)
+        # Pre-flight binds the exact old transaction tuple after health checks:
+        # one firmware selector, one non-empty stage, and first_boot=yes. It also
+        # rejects malformed or duplicate variables anywhere in the environment.
+        PRECHK_RC=0
+        PRECHK=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || PRECHK_RC=$?
+        if [ "$PRECHK_RC" -ne 0 ]; then
+            echo "  *** ERROR: pre-commit U-Boot environment read failed ***"
+            echo "  *** Refusing to fw_setenv; slot remains uncommitted ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
         case "$PRECHK" in
             *"Bad CRC"*|*"bad CRC"*|*"using default environment"*)
                 echo "  *** ERROR: current U-Boot env reads Bad CRC / default ***"
@@ -466,6 +495,43 @@ case "$1" in
                 exit 0
                 ;;
         esac
+        if ! printf '%s\n' "$PRECHK" | awk -F= '
+            index($0, "=") < 2 { exit 1 }
+            {
+                name = substr($0, 1, index($0, "=") - 1)
+                if (seen[name]++) exit 1
+            }
+        '; then
+            echo "  *** ERROR: pre-commit U-Boot environment is malformed or duplicated ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        PRECHK_FIRMWARE=$(printf '%s\n' "$PRECHK" | sed -n 's/^firmware=//p')
+        PRECHK_STAGE=$(printf '%s\n' "$PRECHK" | sed -n 's/^upgrade_stage=//p')
+        PRECHK_FIRST_BOOT=$(printf '%s\n' "$PRECHK" | sed -n 's/^first_boot=//p')
+        case "$PRECHK_FIRMWARE" in
+            1|2) ;;
+            *)
+                echo "  *** ERROR: pre-commit firmware must be exactly one selector (1 or 2) ***"
+                echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+                exit 0
+                ;;
+        esac
+        if [ -z "$PRECHK_STAGE" ]; then
+            echo "  *** ERROR: pre-commit upgrade_stage must be present and non-empty ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        if [ "$PRECHK_FIRST_BOOT" != yes ]; then
+            echo "  *** ERROR: pre-commit first_boot must be exactly yes ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+            exit 0
+        fi
+        # Removing only the transaction keys yields the sole admissible desired
+        # snapshot. Exact comparison preserves firmware and every unrelated
+        # variable, including order and values.
+        PRECHK_RETAINED=$(printf '%s\n' "$PRECHK" |
+            sed -e '/^first_boot=/d' -e '/^upgrade_stage=/d')
 
         # Let early-boot NAND I/O drain before the first env flip. `sync` flushes
         # any pending writeback; the settle pause lets the controller go idle so
@@ -475,56 +541,53 @@ case "$1" in
         sleep "$FW_COMMIT_SETTLE_S"
 
         COMMIT_OK=0
+        COMMIT_MANUAL=0
         ATTEMPT=1
         while [ "$ATTEMPT" -le "$FW_COMMIT_RETRIES" ]; do
-            # BARE form (NO --script): `fw_setenv <key>` with no value DELETES
-            # the key, leaving it ABSENT in the redundant copies. This is the
-            # only form proven to make the slot permanent (BUG 4 above). Clear
-            # upgrade_stage FIRST (the one U-Boot acts on), then first_boot.
-            # Each call is its own redundant-copy flip; we re-verify from a
-            # FRESH read after BOTH so a stale-copy fallback can't hide a
-            # remaining upgrade_stage.
-            fw_setenv upgrade_stage 2>/dev/null
-            SET_RC_A=$?
-            fw_setenv first_boot 2>/dev/null
-            SET_RC_B=$?
-            SET_RC=$(( SET_RC_A | SET_RC_B ))
+            # Exactly one redundant-copy store per attempt. Commit key last.
+            printf '%s\n' 'first_boot=' 'upgrade_stage=' | fw_setenv -c "$FW_ENV_CONFIG" --script -
+            SET_RC=$?
 
             # Flush + brief settle so the verify reads the just-written pages,
             # not cached state.
             sync 2>/dev/null || true
 
-            # Verify the clear directly from flash (re-reads + re-validates the
-            # redundant copies, exactly as U-Boot does on the next boot). Success
-            # requires upgrade_stage to be ABSENT — a lingering `upgrade_stage=0`
-            # is NOT permanent and counts as failure.
-            VERIFY=$(fw_printenv 2>&1)
-            STILL_PRESENT=1
-            case "$VERIFY" in
-                *"Bad CRC"*|*"bad CRC"*|*"using default environment"*)
-                    # Env unreadable after the write - treat as failure, retry.
-                    STILL_PRESENT=1
-                    ;;
-                *)
-                    # Match the key whether it carries a value (`upgrade_stage=1`)
-                    # OR is the non-permanent zero/empty form (`upgrade_stage=0`,
-                    # `upgrade_stage=`). ANY surviving `upgrade_stage=` line means
-                    # the key is still present and the slot is NOT committed.
-                    if printf '%s\n' "$VERIFY" | grep -q '^upgrade_stage='; then
-                        STILL_PRESENT=1
-                    else
-                        STILL_PRESENT=0
-                    fi
-                    ;;
-            esac
+            # Verify from a fresh full read. Desired state wins even if
+            # fw_setenv reported a late failure after completing the store.
+            VERIFY_RC=0
+            VERIFY=$(fw_printenv -c "$FW_ENV_CONFIG" 2>&1) || VERIFY_RC=$?
+            VERIFY_VALID=0
+            if [ "$VERIFY_RC" -eq 0 ]; then
+                case "$VERIFY" in
+                    *"Bad CRC"*|*"bad CRC"*|*"using default environment"*) ;;
+                    *)
+                        if printf '%s\n' "$VERIFY" | awk -F= '
+                            index($0, "=") < 2 { exit 1 }
+                            {
+                                name = substr($0, 1, index($0, "=") - 1)
+                                if (seen[name]++) exit 1
+                            }
+                        '; then
+                            VERIFY_VALID=1
+                        fi
+                        ;;
+                esac
+            fi
 
-            if [ "$SET_RC" -eq 0 ] && [ "$STILL_PRESENT" -eq 0 ]; then
+            if [ "$VERIFY_VALID" -eq 1 ] && [ "$VERIFY" = "$PRECHK_RETAINED" ]; then
                 COMMIT_OK=1
-                echo "  OK: firmware committed via fw_setenv bare-delete (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}, CRC-valid env, upgrade_stage ABSENT)"
+                echo "  OK: firmware committed via one fw_setenv store (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}, CRC-valid exact readback)"
                 break
             fi
 
-            echo "  [retry] fw_setenv clear not yet confirmed (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}: set_rc=${SET_RC}, upgrade_stage_still_present=${STILL_PRESENT}) - weak-ECC mtd4 retry"
+            if [ "$VERIFY_VALID" -ne 1 ] || [ "$VERIFY" != "$PRECHK" ]; then
+                COMMIT_MANUAL=1
+                echo "  *** ERROR: commit readback is unreadable, mixed, duplicated, or drifted ***"
+                echo "  *** Manual resolution required; refusing another environment store ***"
+                break
+            fi
+
+            echo "  [retry] exact old environment still present (attempt ${ATTEMPT}/${FW_COMMIT_RETRIES}: set_rc=${SET_RC}) - weak-ECC mtd4 retry"
             ATTEMPT=$((ATTEMPT + 1))
             # Backoff grows with the attempt number so a busy NAND gets more
             # idle time on each retry.
@@ -534,8 +597,11 @@ case "$1" in
 
         if [ "$COMMIT_OK" -eq 1 ]; then
             echo "committed" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
+        elif [ "$COMMIT_MANUAL" -eq 1 ]; then
+            echo "  *** Slot commit is blocked pending manual U-Boot environment resolution. ***"
+            echo "blocked" > "$UPGRADE_COMMIT_MARKER" 2>/dev/null || true
         else
-            echo "  *** ERROR: upgrade_stage could NOT be cleared after ${FW_COMMIT_RETRIES} fw_setenv attempts ***"
+            echo "  *** ERROR: upgrade_stage could NOT be cleared after ${FW_COMMIT_RETRIES} proven-old retries ***"
             echo "  *** (weak-ECC pl35x-nand mtd4 - DO NOT raw-nandwrite, load-bearing rule) ***"
             echo "  *** Slot remains uncommitted. Use the platform recovery runbook; ***"
             echo "  *** do not assume automatic rollback unless proven for this lane. ***"

@@ -332,6 +332,7 @@ enum WatchdogTeardownAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchdogComposition {
     NoPicSerial,
+    S19kTrack1Serial,
     Am2Bm1362Serial,
     HybridAm2,
     Am3Bb,
@@ -342,18 +343,21 @@ enum WatchdogComposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SerialWatchdogComposition {
     NoPic,
+    S19kTrack1,
     Am2Bm1362,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoPicSerialThreadSlot {
     SerialIo,
+    Track1SafetySampler,
 }
 
 impl FixedThreadSlot for NoPicSerialThreadSlot {
     fn name(self) -> &'static str {
         match self {
             Self::SerialIo => "s19j-serial-io",
+            Self::Track1SafetySampler => "s19k-track1-safety",
         }
     }
 }
@@ -384,6 +388,11 @@ pub(crate) enum SerialWatchdogRouteAdmission {
         actor_owner: ThreadRosterOwner<NoPicSerialThreadSlot>,
         actor_expectation: ThreadRosterExpectation<NoPicSerialThreadSlot>,
     },
+    S19kTrack1 {
+        scope: WatchdogRunScope,
+        actor_owner: ThreadRosterOwner<NoPicSerialThreadSlot>,
+        actor_expectation: ThreadRosterExpectation<NoPicSerialThreadSlot>,
+    },
     Am2Bm1362 {
         scope: WatchdogRunScope,
         actor_owner: ThreadRosterOwner<Am2SerialThreadSlot>,
@@ -405,8 +414,30 @@ impl SerialWatchdogRouteAdmission {
                 actor_owner,
                 actor_expectation,
             } => Ok((scope, actor_owner, actor_expectation)),
+            Self::S19kTrack1 { .. } => {
+                anyhow::bail!("S19k Track-1 watchdog admission requires its exact consumer")
+            }
             Self::Am2Bm1362 { .. } => {
                 anyhow::bail!("AM2 serial watchdog admission cannot authorize NoPic actors")
+            }
+        }
+    }
+
+    pub(crate) fn into_s19k_track1_parts(
+        self,
+    ) -> Result<(
+        WatchdogRunScope,
+        ThreadRosterOwner<NoPicSerialThreadSlot>,
+        ThreadRosterExpectation<NoPicSerialThreadSlot>,
+    )> {
+        match self {
+            Self::S19kTrack1 {
+                scope,
+                actor_owner,
+                actor_expectation,
+            } => Ok((scope, actor_owner, actor_expectation)),
+            Self::NoPic { .. } | Self::Am2Bm1362 { .. } => {
+                anyhow::bail!("non-Track-1 watchdog admission cannot authorize S19k actors")
             }
         }
     }
@@ -424,7 +455,7 @@ impl SerialWatchdogRouteAdmission {
                 actor_owner,
                 actor_expectation,
             } => Ok((scope, actor_owner, actor_expectation)),
-            Self::NoPic { .. } => {
+            Self::NoPic { .. } | Self::S19kTrack1 { .. } => {
                 anyhow::bail!("NoPic serial watchdog admission cannot authorize AM2 actors")
             }
         }
@@ -519,6 +550,17 @@ pub(crate) struct Am3BbNeverEnergized {
 /// inspection stay beside the watchdog owner; the serial engine may only move
 /// or destroy the token at its physical energization boundary.
 pub(crate) struct Am2NeverEnergized {
+    run_scope: WatchdogRunScope,
+}
+
+/// Opaque, one-shot proof that this exact S19k Track-1 watchdog run has not
+/// claimed a hardware route or crossed the stock-process handoff boundary.
+///
+/// Track-1 inherits rails that stock bosminer already owns, so calling this
+/// evidence "never energized" would be false.  It authorizes magic-close only
+/// while the watchdog composition is still unclaimed; a route claim destroys
+/// the pre-handoff condition even if no GPIO write has occurred yet.
+pub(crate) struct S19kTrack1NeverHandoff {
     run_scope: WatchdogRunScope,
 }
 
@@ -660,6 +702,7 @@ fn require_software_safe_off(
 #[derive(Clone, Copy)]
 enum ExactSerialManifestRoute {
     NoPic,
+    S19kTrack1,
     Am2Bm1362,
 }
 
@@ -670,6 +713,7 @@ fn validate_exact_serial_domain_pair(
 ) -> Result<WatchdogRunScope> {
     let route_matches = match route {
         ExactSerialManifestRoute::NoPic => serial.is_nopic() && api.is_nopic(),
+        ExactSerialManifestRoute::S19kTrack1 => serial.is_s19k_track1() && api.is_s19k_track1(),
         ExactSerialManifestRoute::Am2Bm1362 => serial.is_am2_bm1362() && api.is_am2_bm1362(),
     };
     if !route_matches {
@@ -747,6 +791,11 @@ impl NoPicWatchdogShutdownManifest {
                 self.actors.joined(NoPicSerialThreadSlot::SerialIo),
                 "NoPic admitted runtime requires the exact joined serial-I/O slot"
             );
+            anyhow::ensure!(
+                self.actors
+                    .topology_not_applicable(NoPicSerialThreadSlot::Track1SafetySampler),
+                "native NoPic closeout must exclude the S19k Track-1 safety sampler"
+            );
         } else {
             anyhow::ensure!(
                 self.actors.joined(NoPicSerialThreadSlot::SerialIo)
@@ -754,6 +803,14 @@ impl NoPicWatchdogShutdownManifest {
                         .actors
                         .not_started_before_runtime_admission(NoPicSerialThreadSlot::SerialIo),
                 "NoPic pre-runtime closeout requires joined or explicit not-reached serial-I/O evidence"
+            );
+            anyhow::ensure!(
+                self.actors.not_started_before_runtime_admission(
+                    NoPicSerialThreadSlot::Track1SafetySampler
+                ) || self
+                    .actors
+                    .topology_not_applicable(NoPicSerialThreadSlot::Track1SafetySampler),
+                "NoPic pre-runtime closeout lacks Track-1 sampler exclusion evidence"
             );
         }
         require_software_safe_off("NoPic checked power-off", self.safe_off.power())?;
@@ -764,6 +821,109 @@ impl NoPicWatchdogShutdownManifest {
         anyhow::ensure!(
             self.teardown.same_teardown_budget(&self.teardown_disarm),
             "NoPic closeout evidence belongs to another teardown budget"
+        );
+        Ok((scope, self.teardown_disarm))
+    }
+}
+
+/// Exact move-only S19k Track-1 closeout roster. Track-1 adopts already
+/// energized rails and therefore has a typed physical terminal receipt. The
+/// ordinary Track-1 contract is three checked reset assertions followed by the
+/// fixed-polarity GPIO437 cut; install custody is the distinct checked
+/// GPIO437-only contract. Neither can substitute a generic NoPic PSU receipt.
+pub(crate) struct S19kTrack1WatchdogShutdownManifest {
+    serial_execution: crate::serial_mining::SerialExecutionDomainCloseout,
+    api_mutation: crate::serial_mining::ApiMutationDomainCloseout,
+    actors: ThreadRosterQuiescenceReceipt<NoPicSerialThreadSlot>,
+    safe_off: crate::serial_mining::S19kTrack1TerminalSafeOffReceipt,
+    teardown: crate::serial_mining::ExactSerialTeardownReceipt,
+    teardown_disarm: TeardownDisarmAuthority,
+}
+
+impl S19kTrack1WatchdogShutdownManifest {
+    pub(crate) fn new(
+        serial_execution: crate::serial_mining::SerialExecutionDomainCloseout,
+        api_mutation: crate::serial_mining::ApiMutationDomainCloseout,
+        actors: ThreadRosterQuiescenceReceipt<NoPicSerialThreadSlot>,
+        safe_off: crate::serial_mining::S19kTrack1TerminalSafeOffReceipt,
+        teardown: crate::serial_mining::ExactSerialTeardownReceipt,
+        teardown_disarm: TeardownDisarmAuthority,
+    ) -> Self {
+        Self {
+            serial_execution,
+            api_mutation,
+            actors,
+            safe_off,
+            teardown,
+            teardown_disarm,
+        }
+    }
+
+    fn into_validated_parts(self) -> Result<(WatchdogRunScope, TeardownDisarmAuthority)> {
+        let scope = validate_exact_serial_domain_pair(
+            ExactSerialManifestRoute::S19kTrack1,
+            &self.serial_execution,
+            &self.api_mutation,
+        )?;
+        require_mutation_barrier(
+            "S19k Track-1 serial-execution domain",
+            &self.serial_execution,
+        )?;
+        require_mutation_barrier("S19k Track-1 API-mutation domain", &self.api_mutation)?;
+        if let Some(fabric) = self.safe_off.management_fabric() {
+            require_mutation_barrier("S19k Track-1 terminal management-fabric barrier", fabric)?;
+        }
+        anyhow::ensure!(
+            self.serial_execution.authorizes_nopic_actors(&self.actors),
+            "S19k Track-1 actor receipt was not issued by this watchdog route scope"
+        );
+        if self.serial_execution.nopic_runtime_actors_were_admitted() {
+            anyhow::ensure!(
+                self.actors.joined(NoPicSerialThreadSlot::SerialIo),
+                "S19k Track-1 closeout requires the joined serial-I/O actor"
+            );
+            anyhow::ensure!(
+                self.actors
+                    .joined(NoPicSerialThreadSlot::Track1SafetySampler),
+                "S19k Track-1 closeout requires the joined thermal/tach safety sampler"
+            );
+            anyhow::ensure!(
+                self.safe_off.management_fabric().is_some(),
+                "S19k Track-1 admitted runtime requires a closed management-fabric receipt"
+            );
+        } else {
+            anyhow::ensure!(
+                self.actors.joined(NoPicSerialThreadSlot::SerialIo)
+                    || self
+                        .actors
+                        .not_started_before_runtime_admission(NoPicSerialThreadSlot::SerialIo),
+                "S19k Track-1 pre-runtime closeout lacks serial-I/O not-reached evidence"
+            );
+            anyhow::ensure!(
+                self.actors
+                    .joined(NoPicSerialThreadSlot::Track1SafetySampler)
+                    || self.actors.not_started_before_runtime_admission(
+                        NoPicSerialThreadSlot::Track1SafetySampler
+                    ),
+                "S19k Track-1 pre-runtime closeout lacks safety-sampler not-reached evidence"
+            );
+            anyhow::ensure!(
+                self.safe_off.management_fabric().is_some()
+                    || self.safe_off.management_fabric_never_opened(),
+                "S19k Track-1 pre-runtime management-fabric closeout is unresolved"
+            );
+        }
+        anyhow::ensure!(
+            self.safe_off.has_exact_checked_physical_safeoff(),
+            "S19k Track-1 terminal receipt lacks an exact typed checked physical SafeOff"
+        );
+        anyhow::ensure!(
+            self.safe_off.same_teardown_budget(&self.teardown_disarm),
+            "S19k Track-1 checked safe-off evidence belongs to another teardown budget"
+        );
+        anyhow::ensure!(
+            self.teardown.same_teardown_budget(&self.teardown_disarm),
+            "S19k Track-1 closeout timing belongs to another teardown budget"
         );
         Ok((scope, self.teardown_disarm))
     }
@@ -1092,6 +1252,17 @@ impl WatchdogDisarmPermit {
         })
     }
 
+    pub(crate) fn from_s19k_track1_manifest(
+        manifest: S19kTrack1WatchdogShutdownManifest,
+    ) -> Result<Self> {
+        let (scope, teardown) = manifest.into_validated_parts()?;
+        Ok(Self {
+            scope,
+            composition: WatchdogComposition::S19kTrack1Serial,
+            teardown: WatchdogTeardownAuthority::Absolute(teardown),
+        })
+    }
+
     pub(crate) fn from_am2_serial_manifest(
         manifest: Am2SerialWatchdogShutdownManifest,
     ) -> Result<Self> {
@@ -1386,12 +1557,24 @@ impl SafetyWatchdogOwner {
     ) -> Result<SerialWatchdogRouteAdmission> {
         match route {
             SerialWatchdogComposition::NoPic => {
-                let (actor_owner, actor_expectation) =
-                    issue_thread_roster([ThreadSlotDeclaration::conditional(
-                        NoPicSerialThreadSlot::SerialIo,
-                    )])?;
+                let (actor_owner, actor_expectation) = issue_thread_roster([
+                    ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::SerialIo),
+                    ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::Track1SafetySampler),
+                ])?;
                 let scope = self.claim_composition(WatchdogComposition::NoPicSerial)?;
                 Ok(SerialWatchdogRouteAdmission::NoPic {
+                    scope,
+                    actor_owner,
+                    actor_expectation,
+                })
+            }
+            SerialWatchdogComposition::S19kTrack1 => {
+                let (actor_owner, actor_expectation) = issue_thread_roster([
+                    ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::SerialIo),
+                    ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::Track1SafetySampler),
+                ])?;
+                let scope = self.claim_composition(WatchdogComposition::S19kTrack1Serial)?;
+                Ok(SerialWatchdogRouteAdmission::S19kTrack1 {
                     scope,
                     actor_owner,
                     actor_expectation,
@@ -1411,6 +1594,27 @@ impl SafetyWatchdogOwner {
                 })
             }
         }
+    }
+
+    /// Exact Track-1 claim with no fallible conversion after composition is
+    /// committed.  Thread-roster construction happens first; `claim_composition`
+    /// is the final fallible operation and mutates only on success.  This lets
+    /// callers retain `S19kTrack1NeverHandoff` for a clean magic-close on every
+    /// returned error, then cross directly into the terminal signal boundary
+    /// after `Ok` without another fallible ownership conversion.
+    pub(crate) fn claim_s19k_track1_route_scope(
+        &mut self,
+    ) -> Result<(
+        WatchdogRunScope,
+        ThreadRosterOwner<NoPicSerialThreadSlot>,
+        ThreadRosterExpectation<NoPicSerialThreadSlot>,
+    )> {
+        let (actor_owner, actor_expectation) = issue_thread_roster([
+            ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::SerialIo),
+            ThreadSlotDeclaration::conditional(NoPicSerialThreadSlot::Track1SafetySampler),
+        ])?;
+        let scope = self.claim_composition(WatchdogComposition::S19kTrack1Serial)?;
+        Ok((scope, actor_owner, actor_expectation))
     }
 
     pub(crate) fn claim_hybrid_route_scope(&mut self) -> Result<HybridWatchdogRouteScope> {
@@ -1451,6 +1655,25 @@ impl SafetyWatchdogOwner {
         }
         self.never_energized_issued = true;
         Ok(Am2NeverEnergized {
+            run_scope: self.run_scope.clone(),
+        })
+    }
+
+    /// Issue the sole S19k Track-1 pre-handoff close capability for this run.
+    /// It is deliberately available only before any watchdog composition is
+    /// claimed, so a failed watchdog-SLA check can leave stock bosminer and the
+    /// inherited rail state untouched.
+    pub(crate) fn issue_s19k_track1_never_handoff(&mut self) -> Result<S19kTrack1NeverHandoff> {
+        if self.composition.is_some() {
+            anyhow::bail!(
+                "S19k Track-1 never-handoff authority requires an unclaimed watchdog route"
+            );
+        }
+        if self.never_energized_issued {
+            anyhow::bail!("S19k Track-1 never-handoff authority was already issued");
+        }
+        self.never_energized_issued = true;
+        Ok(S19kTrack1NeverHandoff {
             run_scope: self.run_scope.clone(),
         })
     }
@@ -1635,7 +1858,9 @@ impl SafetyWatchdogOwner {
         anyhow::ensure!(
             !matches!(
                 self.composition,
-                Some(WatchdogComposition::NoPicSerial) | Some(WatchdogComposition::Am2Bm1362Serial)
+                Some(WatchdogComposition::NoPicSerial)
+                    | Some(WatchdogComposition::S19kTrack1Serial)
+                    | Some(WatchdogComposition::Am2Bm1362Serial)
             ),
             "exact serial watchdog Mining admission requires typed runtime-actor authority"
         );
@@ -1680,6 +1905,10 @@ impl SafetyWatchdogOwner {
             Some(WatchdogComposition::NoPicSerial) => anyhow::ensure!(
                 admission.is_nopic(),
                 "NoPic watchdog cannot enter Mining with AM2 actor admission"
+            ),
+            Some(WatchdogComposition::S19kTrack1Serial) => anyhow::ensure!(
+                admission.is_s19k_track1(),
+                "S19k Track-1 watchdog requires its distinct serial actor admission"
             ),
             Some(WatchdogComposition::Am2Bm1362Serial) => anyhow::ensure!(
                 admission.is_am2_bm1362(),
@@ -1867,6 +2096,48 @@ impl SafetyWatchdogOwner {
             ),
             Err(_) => anyhow::bail!(
                 "timed out after requesting pre-energization watchdog Disarm; magic-close outcome is unknown"
+            ),
+        }
+        self.command_tx.take();
+        self.join_worker(timeout).await?;
+        Ok(WatchdogCloseoutReceipt::magic_close_write_completed_and_worker_exit_observed())
+    }
+
+    /// Cleanly close an armed Track-1 watchdog after an SLA refusal while the
+    /// exact stock owner still owns the inherited rails.  This is intentionally
+    /// distinct from terminal SafeOff: it performs no reset/GPIO mutation and
+    /// is invalid after even a route claim.
+    pub(crate) async fn disarm_s19k_track1_never_handoff(
+        mut self,
+        evidence: S19kTrack1NeverHandoff,
+        timeout: Duration,
+    ) -> Result<WatchdogCloseoutReceipt> {
+        if !evidence.run_scope.same_run(&self.run_scope) {
+            anyhow::bail!("S19k Track-1 pre-handoff evidence belongs to another watchdog/run");
+        }
+        if self.composition.is_some() {
+            anyhow::bail!("S19k Track-1 pre-handoff disarm requires an unclaimed watchdog route");
+        }
+        self.feed_owner.close_terminal();
+        let tx = self
+            .command_tx
+            .as_ref()
+            .context("watchdog was not armed by this daemon")?;
+        let (reply, receipt) = oneshot::channel();
+        tx.send(WatchdogCommand::DisarmNeverEnergized { reply })
+            .map_err(|_| {
+                anyhow::anyhow!("watchdog command channel closed before S19k pre-handoff Disarm")
+            })?;
+        match tokio::time::timeout(timeout, receipt).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(reason))) => {
+                anyhow::bail!("watchdog refused S19k pre-handoff Disarm: {reason}")
+            }
+            Ok(Err(_)) => anyhow::bail!(
+                "watchdog worker exited without an S19k pre-handoff magic-close receipt"
+            ),
+            Err(_) => anyhow::bail!(
+                "timed out after requesting S19k pre-handoff watchdog Disarm; magic-close outcome is unknown"
             ),
         }
         self.command_tx.take();
@@ -2538,7 +2809,11 @@ mod tests {
             "WatchdogCloseoutReceipt",
             "::magic_close_write_completed_and_worker_exit_observed()"
         );
-        assert_eq!(production.matches(owner_mint).count(), 3);
+        assert_eq!(
+            production.matches(owner_mint).count(),
+            4,
+            "AM2 never-energized, S19k never-handoff, AM3-BB never-energized, and terminal disarm are the only receipt minters"
+        );
 
         for (name, source) in [
             ("serial", include_str!("../serial_mining.rs")),
@@ -3295,6 +3570,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s19k_never_handoff_evidence_cleanly_closes_before_route_claim() {
+        let state = Arc::new(FakeState::default());
+        let (mut owner, _) = fake_owner(Arc::clone(&state), Duration::from_secs(30)).await;
+        let never_handoff = owner.issue_s19k_track1_never_handoff().unwrap();
+        let _receipt = owner
+            .disarm_s19k_track1_never_handoff(never_handoff, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(state.events.lock().unwrap().contains(&"magic-close"));
+        assert_eq!(state.drops_armed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn s19k_never_handoff_evidence_from_another_run_is_rejected() {
+        let mut old_owner = SafetyWatchdogOwner::inert_for_pre_hardware_test();
+        let stale = old_owner.issue_s19k_track1_never_handoff().unwrap();
+        drop(old_owner);
+
+        let state = Arc::new(FakeState::default());
+        let (current_owner, _) = fake_owner(Arc::clone(&state), Duration::from_secs(30)).await;
+        let error = current_owner
+            .disarm_s19k_track1_never_handoff(stale, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another watchdog/run"));
+        assert!(!state.events.lock().unwrap().contains(&"magic-close"));
+    }
+
+    #[tokio::test]
+    async fn s19k_never_handoff_evidence_is_invalid_after_route_claim() {
+        let state = Arc::new(FakeState::default());
+        let (mut owner, _) = fake_owner(Arc::clone(&state), Duration::from_secs(30)).await;
+        let never_handoff = owner.issue_s19k_track1_never_handoff().unwrap();
+        owner
+            .claim_serial_route_scope(SerialWatchdogComposition::S19kTrack1)
+            .unwrap();
+        let error = owner
+            .disarm_s19k_track1_never_handoff(never_handoff, DEFAULT_WATCHDOG_STOP_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unclaimed watchdog route"));
+        assert!(!state.events.lock().unwrap().contains(&"magic-close"));
+    }
+
+    #[tokio::test]
     async fn never_energized_evidence_from_another_run_is_rejected() {
         let mut old_owner = SafetyWatchdogOwner::inert_for_pre_hardware_test();
         old_owner
@@ -3577,12 +3897,25 @@ mod tests {
         am3_owner.claim_am3_bb_route_scope().unwrap();
         assert!(am3_owner.issue_am3_bb_never_energized().is_ok());
         assert!(am3_owner.issue_am3_bb_never_energized().is_err());
+
+        let mut s19k_owner = SafetyWatchdogOwner::inert_for_pre_hardware_test();
+        assert!(s19k_owner.issue_s19k_track1_never_handoff().is_ok());
+        assert!(s19k_owner.issue_s19k_track1_never_handoff().is_err());
+
+        let mut claimed_s19k_owner = SafetyWatchdogOwner::inert_for_pre_hardware_test();
+        claimed_s19k_owner
+            .claim_serial_route_scope(SerialWatchdogComposition::S19kTrack1)
+            .unwrap();
+        assert!(claimed_s19k_owner
+            .issue_s19k_track1_never_handoff()
+            .is_err());
     }
 
     #[tokio::test]
     async fn exact_serial_compositions_reject_untyped_mining_admission() {
         for route in [
             SerialWatchdogComposition::NoPic,
+            SerialWatchdogComposition::S19kTrack1,
             SerialWatchdogComposition::Am2Bm1362,
         ] {
             let mut owner = SafetyWatchdogOwner::inert_for_pre_hardware_test();
@@ -3606,6 +3939,13 @@ mod tests {
         let worker_shutdown = shutdown.clone();
         let mut actors = actor_owner.activate(shutdown);
         actors
+            .resolve_conditional(
+                NoPicSerialThreadSlot::Track1SafetySampler,
+                false,
+                "native NoPic topology excludes the S19k Track-1 sampler",
+            )
+            .unwrap();
+        actors
             .reserve(NoPicSerialThreadSlot::SerialIo)
             .unwrap()
             .attach(std::thread::spawn(move || {
@@ -3621,6 +3961,7 @@ mod tests {
 
         assert!(receipt.authorizes(&actor_expectation));
         assert!(receipt.joined(NoPicSerialThreadSlot::SerialIo));
+        assert!(receipt.not_applicable(NoPicSerialThreadSlot::Track1SafetySampler));
         let (_foreign_owner, foreign_expectation) =
             issue_thread_roster([ThreadSlotDeclaration::required(
                 NoPicSerialThreadSlot::SerialIo,

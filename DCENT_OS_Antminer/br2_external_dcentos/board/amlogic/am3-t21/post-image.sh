@@ -1,19 +1,20 @@
 #!/bin/sh
 #
-# DCENTos post-image script — am3-t21 (T21 Amlogic NoPic variant)
+# DCENTos post-image script — am3-t21 (T21 Amlogic scaffold)
 # D-Central Technologies, Phase 4B (2026-05-15)
 #
 # Sibling of board/amlogic/am3-s21/post-image.sh. Same overlay-on-overlay
 # pattern, same aarch64 toolchain, same uImage+CPIO sysupgrade-shaped tar.
-# T21 is structurally an S21 derivative; product identity is the only
-# meaningful difference vs S21.
+# This retains the T21 package shape only. Mining/controller authority remains
+# management-only until exact T21 initialization evidence is implemented.
 #
 # Produces dcentos-sysupgrade-am3-t21.tar with the "sysupgrade-am3-t21/"
-# prefix for host-driven package validation and rootfs-window install
-# planning.
+# prefix for inner package-format validation only. It grants no install,
+# update, raw-NAND, or recovery authority.
 #
 # CRITICAL — :
-#   BOARD_NAME must be "am3-t21" here. Wrong name = brick on flash.
+#   BOARD_NAME remains exact so package evidence cannot be mistaken for a
+#   sibling target. No flash path consumes this non-installable recipe.
 #
 set -e
 
@@ -103,7 +104,10 @@ echo "  SHA256: ${ROOTFS_SHA256}"
 PROJECT_ROOT="$(cd "${BR2_EXTERNAL_DCENTOS_PATH}/.." && pwd)"
 REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
 . "${PROJECT_ROOT}/scripts/lib/sysupgrade_package_common.sh"
-. "${PROJECT_ROOT}/scripts/lib/am3_geometry.sh"
+T21_PACKAGE_ROOTFS_MAX_BYTES=41943040
+
+# Build-resource ceiling only. This is not a T21 MTD size, offset, or writable
+# window and must never be imported by an installer or recovery tool.
 
 case "$ROOTFS_SIZE" in
     ''|*[!0-9]*)
@@ -111,11 +115,11 @@ case "$ROOTFS_SIZE" in
         exit 1
         ;;
 esac
-if [ "$ROOTFS_SIZE" -gt "$DCENT_AM3_ROOTFS_WINDOW_DEC" ]; then
-    echo "ERROR: rootfs uImage exceeds Amlogic rootfs window: ${ROOTFS_SIZE} > ${DCENT_AM3_ROOTFS_WINDOW_DEC}" >&2
+if [ "$ROOTFS_SIZE" -gt "$T21_PACKAGE_ROOTFS_MAX_BYTES" ]; then
+    echo "ERROR: rootfs uImage exceeds the package-format ceiling: ${ROOTFS_SIZE} > ${T21_PACKAGE_ROOTFS_MAX_BYTES}" >&2
     exit 1
 fi
-echo "Rootfs window: ${ROOTFS_SIZE} <= ${DCENT_AM3_ROOTFS_WINDOW_DEC} bytes"
+echo "Package rootfs ceiling: ${ROOTFS_SIZE} <= ${T21_PACKAGE_ROOTFS_MAX_BYTES} bytes"
 
 read_first_nonempty_line() {
     sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/!{p;q;}' "$1"
@@ -182,9 +186,9 @@ DCENT_OS
 D-Central Technologies
 Build: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 Board: ${BOARD_NAME}
-Kernel: Amlogic 4.9.113 (am3-aml / T21 NoPic)
+Kernel: Amlogic 4.9.113 (am3-aml / T21 scaffold)
 Rootfs: DCENTos (Buildroot, uImage-wrapped gzip CPIO)
-Install contract: host-driven rootfs-window only; target-side AM3 sysupgrade unsupported
+Install contract: package-format validation only; installation and update denied
 EOF
 METADATA_SHA256=$(sha256sum "$SUP_DIR/METADATA" | awk '{print $1}')
 METADATA_SIZE=$(stat -c%s "$SUP_DIR/METADATA")
@@ -223,8 +227,8 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
     }
   },
   "toolbox": {
-    "install_command": "dcent install <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>",
-    "update_command": "dcent install <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>",
+    "install_command": null,
+    "update_command": null,
     "upload_endpoint": null,
     "board_target_header": null,
     "requires_inactive_slot": false
@@ -232,16 +236,16 @@ cat > "$SUP_DIR/MANIFEST.json" << EOF
 }
 EOF
 
-# Final manifest/signature rewrite through shared AM2/AM3 helper.
-DCENT_TOOLBOX_INSTALL_COMMAND="dcent install <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"
-# OTA fleet form of the SAME guarded route (toolbox 2026-08-15: the fleet OTA
-# rail accepts the amlogic_rootfs_window method; identical root SSH +
-# restore-verified + signed-package gates; write+readback, NO auto-reboot).
-DCENT_TOOLBOX_UPDATE_COMMAND="dcent ota update-fleet <ip> -f dcentos-sysupgrade-am3-t21.tar --artifact-dir <restore_verified_dir>"
+# Final manifest/signature rewrite through the shared helper. This is an inner
+# packaging-validation artifact only: no T21 NAND geometry, recovery offset,
+# or install/rollback route has been proven.
+DCENT_TOOLBOX_INSTALL_COMMAND=""
+DCENT_TOOLBOX_UPDATE_COMMAND=""
 DCENT_TOOLBOX_REQUIRES_INACTIVE_SLOT=false
-DCENT_TOOLBOX_INSTALL_MODE=host_driven_rootfs_window_lab
+DCENT_TOOLBOX_INSTALL_MODE=package_only_denied
 DCENT_TARGET_SIDE_SYSUPGRADE=false
-DCENT_PACKAGE_STATUS=host_driven_only
+DCENT_PACKAGE_INSTALLABLE=false
+DCENT_PACKAGE_STATUS=unvalidated_package_only
 dcent_stage_release_key
 dcent_write_sysupgrade_manifest
 dcent_sign_sysupgrade_manifest
@@ -261,7 +265,7 @@ tar tf "$OUTPUT_TAR" | sed 's/^/  /'
 cat > "${BINARIES_DIR}/BUILD_INFO.txt" << EOF
 === DCENTos am3-t21 Build Info ===
 Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-Board:      ${BOARD_NAME} (T21 Amlogic am3-aml NoPic variant)
+Board:      ${BOARD_NAME} (T21 Amlogic am3-aml scaffold)
 Board family: ${BOARD_FAMILY}
 
 Sysupgrade tarball:
@@ -278,13 +282,8 @@ Rootfs (uImage-wrapped gzip CPIO): uImage_rootfs.bin
   SHA256: ${ROOTFS_SHA256}
 
 Install contract:
-  Host-driven rootfs-window package only. Target-side AM3 sysupgrade is not
-  validated or claimed by this package.
-  scripts/build_amlogic_native_install.sh --variant t21 (not yet shipped)
-  output/dcentos-amlogic-t21.bin
-  mtd=${DCENT_AM3_ROOTFS_MTD}
-  rootfs_offset=${DCENT_AM3_ROOTFS_OFFSET_HEX}
-  rootfs_window=${DCENT_AM3_ROOTFS_WINDOW_HEX}
+  Package-format validation only. No T21 persistent-write geometry, installer,
+  recovery flag, rollback route, or target-side sysupgrade is claimed.
 
 Target fleet:
   (no live T21 unit yet)

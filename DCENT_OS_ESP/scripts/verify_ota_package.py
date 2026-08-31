@@ -13,15 +13,24 @@ import sys
 import tempfile
 from pathlib import Path
 
+from hardware_evidence import production_claim_errors, sha256_file
+from promotion_candidate import CandidateError, load_descriptor, require_valid_descriptor
+
 ED25519_SPKI_DER_PREFIX = bytes.fromhex("302a300506032b6570032100")
 SIGNATURE_ALGORITHM = "ed25519"
+ROOT = Path(__file__).resolve().parents[1]
+TARGET_MATRIX_PATH = ROOT / "esp-targets.json"
+HARDWARE_EVIDENCE_INDEX_PATH = ROOT / "hardware-evidence" / "index.json"
+with TARGET_MATRIX_PATH.open(encoding="utf-8") as target_matrix_handle:
+    TARGET_MATRIX = json.load(target_matrix_handle)
+    TARGETS_BY_BOARD = {
+        target["board_target"]: target
+        for target in TARGET_MATRIX["targets"]
+    }
 PUBLIC_TARGET_DEVICE_MODELS = {
-    "bitaxe-max": "max",
-    "bitaxe-ultra": "ultra",
-    "bitaxe-supra": "supra",
-    "bitaxe-gamma": "gamma",
-    "bitaxe-hex-ultra": "hexultra",
-    "bitaxe-hex-supra": "suprahex",
+    board_target: target["device_model"]
+    for board_target, target in TARGETS_BY_BOARD.items()
+    if target["package_policy"] == "public"
 }
 
 
@@ -49,7 +58,7 @@ def parse_int(value: str) -> int:
 
 def read_partition_table(path: Path) -> dict[str, tuple[int, int]]:
     result: dict[str, tuple[int, int]] = {}
-    with path.open(encoding="ascii") as handle:
+    with path.open(encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -204,14 +213,56 @@ def verify_factory_flash_map(
             require(slice_data == update_data, f"update payload bytes do not match factory image at 0x{update_offset:x}")
 
 
-def verify_public_target_binding(manifest: dict, allow_internal_targets: bool) -> None:
+def verify_public_target_binding(
+    manifest: dict,
+    allow_internal_targets: bool,
+    candidate_descriptor: dict | None = None,
+    candidate_descriptor_path: Path | None = None,
+) -> None:
     board_target = str(manifest.get("boardTarget") or "").strip()
     device_model = str(manifest.get("deviceModel") or "").strip().lower()
     require(board_target, "manifest boardTarget is required")
     require(device_model, "manifest deviceModel is required")
 
-    expected_model = PUBLIC_TARGET_DEVICE_MODELS.get(board_target)
-    if expected_model is None:
+    registered_target = TARGETS_BY_BOARD.get(board_target)
+    require(
+        registered_target is not None,
+        f"manifest boardTarget {board_target!r} is not in esp-targets.json",
+    )
+    if candidate_descriptor is not None:
+        require(candidate_descriptor_path is not None, "candidate descriptor path is required")
+        require(
+            candidate_descriptor.get("board_target") == board_target,
+            "promotion candidate board target does not match the package",
+        )
+        target = candidate_descriptor["registry_row"]
+        require(manifest.get("promotionState") == "qualification", "candidate package must use promotionState=qualification")
+        require(manifest.get("qualificationOnly") is True, "candidate package must be qualification-only")
+        require(
+            manifest.get("promotionCandidateId") == candidate_descriptor.get("candidate_id"),
+            "manifest promotionCandidateId does not match the descriptor",
+        )
+        require(
+            manifest.get("promotionCandidateDescriptorSha256")
+            == sha256_file(candidate_descriptor_path),
+            "manifest promotion candidate descriptor SHA-256 mismatch",
+        )
+        require(
+            manifest.get("version")
+            == (candidate_descriptor.get("source") or {}).get("firmware_version"),
+            "candidate package version does not match the descriptor",
+        )
+    else:
+        target = registered_target
+        require(manifest.get("promotionState") == "registry", "registry package must use promotionState=registry")
+        require(manifest.get("qualificationOnly") is False, "registry package cannot be qualification-only")
+        require(manifest.get("promotionCandidateId") is None, "registry package cannot name a promotion candidate")
+        require(
+            manifest.get("promotionCandidateDescriptorSha256") is None,
+            "registry package cannot bind a promotion candidate descriptor",
+        )
+
+    if candidate_descriptor is None and target["package_policy"] != "public":
         require(
             allow_internal_targets,
             (
@@ -220,7 +271,7 @@ def verify_public_target_binding(manifest: dict, allow_internal_targets: bool) -
                 "only for lab/internal packages"
             ),
         )
-        return
+    expected_model = target["device_model"]
     require(
         device_model == expected_model,
         (
@@ -228,6 +279,48 @@ def verify_public_target_binding(manifest: dict, allow_internal_targets: bool) -
             f"{board_target!r} (expected {expected_model!r})"
         ),
     )
+    metadata_bindings = {
+        "hardwareFamily": "hardware_family",
+        "supportTier": "support_tier",
+        "evidenceLevel": "evidence_level",
+        "runtimeMode": "runtime_mode",
+        "installPolicy": "install_policy",
+        "packagePolicy": "package_policy",
+        "flashLayout": "flash_layout",
+        "productionBlockers": "blockers",
+    }
+    for manifest_field, target_field in metadata_bindings.items():
+        require(
+            manifest.get(manifest_field) == target[target_field],
+            (
+                f"manifest {manifest_field} does not match esp-targets.json for "
+                f"{board_target!r}"
+            ),
+        )
+
+    require(
+        manifest.get("promotionReceiptId") == target.get("promotion_receipt_id"),
+        f"manifest promotionReceiptId does not match the authoritative row for {board_target!r}",
+    )
+    if candidate_descriptor is None:
+        evidence_index_bytes = HARDWARE_EVIDENCE_INDEX_PATH.read_bytes()
+        evidence_index = json.loads(evidence_index_bytes.decode("utf-8"))
+        authority_errors = production_claim_errors(TARGET_MATRIX, evidence_index, ROOT)
+        require(
+            not authority_errors,
+            "hardware evidence authority is invalid: " + "; ".join(authority_errors),
+        )
+        require(
+            manifest.get("hardwareEvidenceIndexSha256")
+            == hashlib.sha256(evidence_index_bytes).hexdigest(),
+            "manifest hardwareEvidenceIndexSha256 does not match retained evidence index",
+        )
+    else:
+        evidence_sha = str(manifest.get("hardwareEvidenceIndexSha256") or "")
+        require(
+            len(evidence_sha) == 64 and all(char in "0123456789abcdef" for char in evidence_sha),
+            "candidate manifest hardwareEvidenceIndexSha256 must be lowercase hex",
+        )
 
 
 def verify_signature_metadata(
@@ -299,6 +392,9 @@ def verify_manifest(
     partitions_csv: Path | None,
     allow_internal_targets: bool = False,
     strict_public: bool = False,
+    allow_qualification_candidate: bool = False,
+    candidate_path: Path | None = None,
+    candidate_admission_mode: bool = False,
 ) -> None:
     manifest_path = manifest_path.resolve()
     base = manifest_path.parent.resolve()
@@ -311,7 +407,40 @@ def verify_manifest(
         manifest.get("packageType") == "esp32-factory-and-ota-bundle",
         "manifest packageType mismatch",
     )
-    verify_public_target_binding(manifest, allow_internal_targets)
+    qualification = manifest.get("promotionState") == "qualification"
+    if qualification:
+        require(
+            allow_qualification_candidate,
+            "qualification candidate packages are non-publishable; pass --allow-qualification-candidate",
+        )
+        require(candidate_path is not None, "qualification candidate verification requires --candidate")
+        candidate_path = candidate_path.resolve()
+        try:
+            candidate_descriptor = load_descriptor(candidate_path)
+            require_valid_descriptor(
+                candidate_descriptor,
+                TARGET_MATRIX,
+                sha256_file(TARGET_MATRIX_PATH),
+                require_current_registry=not candidate_admission_mode,
+            )
+        except CandidateError as exc:
+            fail(f"invalid promotion candidate descriptor: {exc}")
+        if candidate_admission_mode:
+            require(
+                TARGETS_BY_BOARD.get(candidate_descriptor["board_target"])
+                == candidate_descriptor.get("registry_row"),
+                "admission-mode registry row is not identical to the promotion candidate",
+            )
+    else:
+        require(not allow_qualification_candidate, "--allow-qualification-candidate requires a qualification package")
+        require(candidate_path is None, "--candidate is only valid for a qualification package")
+        candidate_descriptor = None
+    verify_public_target_binding(
+        manifest,
+        allow_internal_targets,
+        candidate_descriptor,
+        candidate_path,
+    )
     require(manifest.get("version"), "manifest version is required")
     require(
         (manifest.get("ota") or {}).get("updateFitsSlot") is True,
@@ -327,19 +456,38 @@ def verify_manifest(
         require(len(update_data) <= int(slot_size), "update payload exceeds manifest OTA slot size")
 
     partitions = read_partition_table(partitions_csv.resolve()) if partitions_csv and partitions_csv.is_file() else None
+    if partitions is not None:
+        expected_slot_size = 0x400000 if manifest["flashLayout"] == "n16r8" else 0x300000
+        require("ota_0" in partitions, "partition table is missing ota_0")
+        require(
+            partitions["ota_0"][1] == expected_slot_size,
+            f"partition table does not match registered {manifest['flashLayout']} flash layout",
+        )
+        require(
+            int((manifest.get("ota") or {}).get("slotSize") or 0) == expected_slot_size,
+            "manifest OTA slot size does not match registered flash layout",
+        )
     verify_factory_flash_map(manifest, factory_data, update_data, update_sha, partitions)
 
     ota_signature = str(manifest.get("otaSignature") or "")
     bundle_signature = str(manifest.get("signature") or "")
-    verify_signature_metadata(manifest, public_key_hex, require_signatures, ota_signature, bundle_signature)
-    warn_unsigned_public_target(
+    effective_require_signatures = require_signatures or qualification
+    verify_signature_metadata(
         manifest,
-        manifest_path.name,
         public_key_hex,
-        require_signatures,
+        effective_require_signatures,
         ota_signature,
-        strict_public,
+        bundle_signature,
     )
+    if not qualification:
+        warn_unsigned_public_target(
+            manifest,
+            manifest_path.name,
+            public_key_hex,
+            require_signatures,
+            ota_signature,
+            strict_public,
+        )
     if public_key_hex and ota_signature:
         verify_ed25519(
             public_key_hex,
@@ -365,6 +513,16 @@ def main(argv: list[str]) -> int:
         "--partitions-csv",
         default=os.environ.get("DCENT_PARTITIONS_CSV", str(Path(__file__).resolve().parents[1] / "partitions.csv")),
         help="Partition table used to verify factory flash-map offsets and OTA slot size",
+    )
+    parser.add_argument(
+        "--allow-qualification-candidate",
+        action="store_true",
+        help="Explicitly verify a signed, non-publishable qualification package",
+    )
+    parser.add_argument(
+        "--candidate",
+        type=Path,
+        help="Promotion candidate descriptor required with --allow-qualification-candidate",
     )
     parser.add_argument(
         "--require-signatures",
@@ -398,6 +556,8 @@ def main(argv: list[str]) -> int:
         Path(args.partitions_csv) if args.partitions_csv else None,
         args.allow_internal_target,
         args.strict_public,
+        args.allow_qualification_candidate,
+        args.candidate,
     )
     print(f"OTA package verification passed: {Path(manifest).resolve()}")
     return 0

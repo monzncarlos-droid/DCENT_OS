@@ -226,10 +226,8 @@ pub const BOSMINER_AM3_CHIP_DISPATCH_1366_MOVZ_INSN: u32 = 0x5282_6CCA;
 pub const BOSMINER_AM3_CHIP_DISPATCH_1362_MOVZ_INSN: u32 = 0x5282_6C48;
 pub const BOSMINER_BM1366_CHIP_ID: u16 = 0x1366;
 pub const BOSMINER_AM3_CHIP_DISPATCH_IDS: [u16; 4] = [0x1362, 0x1366, 0x1368, 0x1370];
-pub const BOSMINER_BM1366_RS: &str =
-    "open/bosminer/bosminer-am2-s17/src/hashchain/bm1366.rs";
-pub const BOSMINER_BM136X_RS: &str =
-    "open/bosminer/bosminer-am2-s17/src/hashchain/bm136x.rs";
+pub const BOSMINER_BM1366_RS: &str = "open/bosminer/bosminer-am2-s17/src/hashchain/bm1366.rs";
+pub const BOSMINER_BM136X_RS: &str = "open/bosminer/bosminer-am2-s17/src/hashchain/bm136x.rs";
 pub const BOSMINER_HASHCHAIN_RS: &str = "open/bosminer/bosminer-am2-s17/src/hashchain.rs";
 /// rustc `hashchain.rs:298` log: setting ticket mask / discovered chips.
 pub const BOSMINER_HASHCHAIN_TICKET_LINE: u16 = 298;
@@ -239,7 +237,8 @@ pub const BOSMINER_FACTORY_CLONE_FN_VA: u64 = 0x0087_5F54;
 pub const BOSMINER_WORK_RESP_PARSE_FN_VA: u64 = 0x0091_C0A0;
 /// `u64 >> 0x28` is frame byte 5 of the 8-byte payload = job_id (ESP body[5]).
 pub const BOSMINER_WORK_RESP_JOB_SHIFT: u32 = 0x28;
-/// engine+0x88: nonce-word transform called after bswap32 of payload[0:4].
+/// engine+0x88: chip/core attribution callback called after bswap32 of
+/// payload[0:4]. BM1366 resolves this slot to `FUN_009256ac`.
 pub const BOSMINER_ENGINE_NONCE_FN_OFF: usize = 0x88;
 /// Pack-caller `LSL X1,X9,X10` @ `0x91c00c` — second arg is `1<<log`.
 pub const BOSMINER_PACK_CALLER_LSL_COUNT_VA: u64 = 0x0091_C00C;
@@ -291,15 +290,19 @@ pub const BOSMINER_WORK_RESP_NOT_WORK_MSG_LEN: u32 = 0x18;
 pub const BOSMINER_WORK_RESP_NOT_WORK_LINE: u16 = 319;
 pub const BOSMINER_WORK_RESP_NOT_WORK_COL: u16 = 9;
 pub const BOSMINER_WORK_RESP_NOT_WORK_LOC_VA: u64 = 0x019C_A208;
-/// PIC driver filename — not the engine+0x88 nonce-fn pointer.
+/// PIC driver filename — not the engine+0x88 attribution callback pointer.
 pub const BOSMINER_PIC0X88_RS: &str =
     "open/bosminer/bosminer-am2-s17/src/hardware/hashboard/power/antminer/pic0x88.rs";
-/// `MOV X22,X0` — BLR return is the nonce word on the +0x80==1 path.
+/// `MOV X22,X0` — first half of the BLR attribution tuple: encoded chip
+/// address, later passed to `FUN_00bf3264`.
 pub const BOSMINER_WORK_RESP_SAVE_X0_VA: u64 = 0x0091_C0F4;
 pub const BOSMINER_WORK_RESP_SAVE_X0_INSN: u32 = 0xAA00_03F6;
-/// `MOV X1,X22` before `BL` into the divider (`0xbf3268`).
+/// `MOV X1,X22` before `BL` into the encoded-address divider (`0xbf3264`).
 pub const BOSMINER_WORK_RESP_MOV_X1_NONCE_VA: u64 = 0x0091_C120;
 pub const BOSMINER_WORK_RESP_MOV_X1_NONCE_INSN: u32 = 0xAA16_03E1;
+/// Original LE-loaded payload low32 is stored separately at WorkResponse+0x30.
+pub const BOSMINER_WORK_RESP_STORE_RAW_NONCE_VA: u64 = 0x0091_C140;
+pub const BOSMINER_WORK_RESP_STORE_RAW_NONCE_INSN: u32 = 0xB900_3278;
 /// rustc `fn(u32)->u32 { x }` is a lone `RET`. First LOAD has this many
 /// RET-only sites / DATA u64 pointers to them — not a unique +0x88 name.
 pub const BOSMINER_RET_ONLY_SITES: usize = 269;
@@ -523,11 +526,7 @@ pub const BOSMINER_HASHMAP_STR88_INSN: [u32; 11] = [
 /// Three HashMap-shaped inits: `ADD #0xA8` / `ADD #0xC0` then `STR X20,[X19,#0x88]`.
 pub const BOSMINER_HASHMAP_STR88_FAMILY_HITS: usize = 3;
 pub const BOSMINER_HASHMAP_STR88_FAMILY_STRIDE: u64 = 0x8B8;
-pub const BOSMINER_HASHMAP_STR88_FAMILY_VA: [u64; 3] = [
-    0x008D_1340,
-    0x008D_1BF8,
-    0x008D_24B0,
-];
+pub const BOSMINER_HASHMAP_STR88_FAMILY_VA: [u64; 3] = [0x008D_1340, 0x008D_1BF8, 0x008D_24B0];
 pub const BOSMINER_HASHMAP_STR88_FAMILY_INSN: u32 = 0xF900_4674;
 pub const BOSMINER_HASHMAP_STR88_ADD_A8_BEFORE: u64 = 0x1C0;
 pub const BOSMINER_HASHMAP_STR88_ADD_C0_BEFORE: u64 = 0x1B0;
@@ -1207,8 +1206,7 @@ pub const BOSMINER_FACTORY4_REGISTRY_WRAP_DEST_VA: u64 = 0x0090_4674;
 pub const BOSMINER_FACTORY4_REGISTRY_WRAP_DEST_INSN: u32 = 0x910D_C3F3;
 /// : FUN_008d684c is `command.rs:700` async poll. +0xC8 tags are
 /// rustc Future states, not HashChain Running/Starting.
-pub const BOSMINER_HAL_COMMAND_RS: &str =
-    "/build/source/open/bosminer/bosminer-hal/src/command.rs";
+pub const BOSMINER_HAL_COMMAND_RS: &str = "/build/source/open/bosminer/bosminer-hal/src/command.rs";
 pub const BOSMINER_HAL_COMMAND_RS_LEN: usize = 55;
 pub const BOSMINER_C8_ASYNC_FN_LINE: u16 = 700;
 pub const BOSMINER_C8_ASYNC_FN_COL: u16 = 51;
@@ -1553,7 +1551,8 @@ pub const BOSMINER_WORKPAIR_110_ADD_INSN: u32 = 0x9103_6084;
 pub const BOSMINER_WORKPAIR_RET_VA: u64 = 0x00BF_7568;
 pub const BOSMINER_WORKPAIR_RET_INSN: u32 = 0xD65F_03C0;
 pub const BOSMINER_WORKPAIR_C0D4AC_BL_HITS: usize = 0;
-/// : FUN_00836934 (AM2 set-baud) aliases X10=X19 then stores usize 0x10
+///  correction: the ticket-mask future `FUN_00836934` aliases X10=X19
+/// then stores usize 0x10
 /// at obj+0x230. After RET, the same async jump-table state calls
 /// `(+0x238).vtable[+0x40](+0x230)` with that usize as X0.
 /// hashchain.rs:323:73 after RET is the async-resume pad, not the STR site.
@@ -1586,8 +1585,7 @@ pub const BOSMINER_HASHCHAIN_TICKET_ADD_VA: u64 = 0x0083_800C;
 pub const BOSMINER_HASHCHAIN_TICKET_ADD_INSN: u32 = 0x9113_C042;
 pub const BOSMINER_HASHCHAIN_TICKET_BL_VA: u64 = 0x0083_8014;
 pub const BOSMINER_HASHCHAIN_TICKET_BL_INSN: u32 = 0x97F0_6DA7;
-pub const BOSMINER_HASHCHAIN_TICKET_LOG: &str =
-    "Setting ticket mask register for difficulty";
+pub const BOSMINER_HASHCHAIN_TICKET_LOG: &str = "Setting ticket mask register for difficulty";
 /// : +0x230/+0x238 is a rust fat pointer (data, vtable).
 /// Clone path: `memcpy(dst, src, 0x230)` (`FUN_00bc8fe0`) then `STR` X0/X1
 /// pair at +0x230/+0x238. Jump-table calls: X0=data, X9=vtable, BLR [X9,slot].
@@ -1870,12 +1868,8 @@ pub const BOSMINER_FN831668_RET_VA: u64 = 0x0083_1724;
 pub const BOSMINER_FN831668_BL_HITS: usize = 6;
 pub const BOSMINER_FN831D18_HC68_HITS: usize = 4;
 pub const BOSMINER_FN831D18_HC68_ADD_INSN: u32 = 0x9101_A260;
-pub const BOSMINER_FN831D18_HC68_VAS: [u64; 4] = [
-    0x0083_8700,
-    0x0083_89CC,
-    0x0083_8AC4,
-    0x0083_8B58,
-];
+pub const BOSMINER_FN831D18_HC68_VAS: [u64; 4] =
+    [0x0083_8700, 0x0083_89CC, 0x0083_8AC4, 0x0083_8B58];
 pub const BOSMINER_DROP_SIB_BODY_LOC_HITS: usize = 0;
 /// : `FUN_0011f2764` is a **refcount helper**: `CBZ X1,RET`;
 /// `LDXR W8,[X0]`; old==0 → `STXR #1`; else `W2=1e9` + `BL 0x44e4a0`.
@@ -1949,8 +1943,7 @@ pub const BOSMINER_PARK_1226_ADRP_INSN: u32 = 0xD000_4521;
 pub const BOSMINER_PARK_1226_ADD_VA: u64 = 0x0121_E614;
 pub const BOSMINER_PARK_1226_ADD_INSN: u32 = 0x9131_C021;
 pub const BOSMINER_PARK_1226_LOC_VA: u64 = 0x01AC_4C70;
-pub const BOSMINER_PARK_RS_SUFFIX: &str =
-    "parking_lot_core-0.9.10/src/parking_lot.rs";
+pub const BOSMINER_PARK_RS_SUFFIX: &str = "parking_lot_core-0.9.10/src/parking_lot.rs";
 /// : fat-slot +0x28 BLR is the **only** `+0x238/+0x230/+0x28/BLR`
 /// sequence in the jump table. X0 = fat data (`+0x230`); **no X1 write**
 /// in the prelude window — `(&self) -> (X0,X1)` Future. Pair stored at
@@ -2202,12 +2195,8 @@ pub const BOSMINER_HW200_COL: u16 = 14;
 /// frame. Inner `BL 0x128ea88` is the rustc backtrace helper
 /// (`RUST_LIB_BACKTRACE`, 171 BLs) — not a type name.
 pub const BOSMINER_SLOT50_CONV_BL_HITS: usize = 4;
-pub const BOSMINER_SLOT50_CONV_BL_VAS: [u64; 4] = [
-    0x0083_7740,
-    0x0083_7768,
-    0x0083_78B4,
-    0x0083_A770,
-];
+pub const BOSMINER_SLOT50_CONV_BL_VAS: [u64; 4] =
+    [0x0083_7740, 0x0083_7768, 0x0083_78B4, 0x0083_A770];
 pub const BOSMINER_SLOT50_CONV_JT160_HITS: usize = 3;
 pub const BOSMINER_SLOT50_CONV_ARM2_BL_VA: u64 = 0x0083_7768;
 pub const BOSMINER_SLOT50_CONV_ARM2_BL_INSN: u32 = 0x97EF_52D7;
@@ -2388,18 +2377,9 @@ pub const BOSMINER_9247B0_RET_VA: u64 = 0x0092_4814;
 pub const BOSMINER_9247B0_RET_INSN: u32 = 0xD65F_03C0;
 pub const BOSMINER_9247B0_BL_HITS: usize = 4;
 pub const BOSMINER_9247B0_ADD10_CALLERS: usize = 3;
-pub const BOSMINER_9247B0_BL_VAS: [u64; 4] = [
-    0x0092_4320,
-    0x0092_4570,
-    0x0092_463C,
-    0x0092_6034,
-];
+pub const BOSMINER_9247B0_BL_VAS: [u64; 4] = [0x0092_4320, 0x0092_4570, 0x0092_463C, 0x0092_6034];
 pub const BOSMINER_9247B0_CALLER_ADD10_INSN: u32 = 0x9100_4000;
-pub const BOSMINER_9247B0_CALLER_ADD10_VAS: [u64; 3] = [
-    0x0092_456C,
-    0x0092_4638,
-    0x0092_6030,
-];
+pub const BOSMINER_9247B0_CALLER_ADD10_VAS: [u64; 3] = [0x0092_456C, 0x0092_4638, 0x0092_6030];
 /// : `FUN_0092462c` last-weak deallocs a **0x30**/8 object
 /// (`MOVZ W1,#0x30` @ `0x924680`). **81** exclusive first-LOAD BLs —
 /// a shared drop, not HashChain-unique. One JT site passes `SP+#0x270`
@@ -2667,14 +2647,12 @@ pub const BOSMINER_ACQUIRE_POLL_LOC493_COL: u32 = 9;
 pub const BOSMINER_ACQUIRE_POLL_COOP_LOC_VA: u64 = 0x01AC_3610;
 pub const BOSMINER_ACQUIRE_POLL_COOP_LINE: u32 = 345;
 pub const BOSMINER_ACQUIRE_POLL_COOP_COL: u32 = 13;
-pub const BOSMINER_BATCH_SEMAPHORE_RS: &str =
-    "tokio-1.45.1/src/sync/batch_semaphore.rs";
+pub const BOSMINER_BATCH_SEMAPHORE_RS: &str = "tokio-1.45.1/src/sync/batch_semaphore.rs";
 pub const BOSMINER_COOP_MOD_RS: &str = "tokio-1.45.1/src/task/coop/mod.rs";
 /// Byte offset of that 16-byte Q (first 8 = nonce fn ptr).
 pub const BOSMINER_CLONE_Q88_OFF: usize = 136;
 /// `bosminer-units` count→log (`FUN_0125fc94`).
-pub const BOSMINER_MIDSTATE_COUNT_RS: &str =
-    "open/bosminer/bosminer-units/src/midstate_count.rs";
+pub const BOSMINER_MIDSTATE_COUNT_RS: &str = "open/bosminer/bosminer-units/src/midstate_count.rs";
 pub const BOSMINER_MIDSTATE_COUNT_FN_VA: u64 = 0x0125_FC94;
 ///  encoder-body hunt (first LOAD).
 pub const BOSMINER_REV_W0_RET_HITS: usize = 0;
@@ -3084,10 +3062,10 @@ pub const BOSMINER_STRB_WZR_228_HC_HITS: usize = 0;
 pub const BOSMINER_SLOT_SET_FN_VA: u64 = 0x0120_0524;
 pub const BOSMINER_SLOT_SET_BL_HITS: usize = 358;
 pub const BOSMINER_SLOT_SET_ENTRY_INSN: u32 = 0xA9BE_57FE;
-/// `FUN_00836934` AM2 set-baud `STRB WZR [X10,#0x228]`.
-pub const BOSMINER_AM2_BAUD_STRB_228_VA: u64 = 0x0083_6C20;
-pub const BOSMINER_AM2_BAUD_STRB_228_INSN: u32 = 0x3908_A15F;
-pub const BOSMINER_AM2_BAUD_STRB_FN_VA: u64 = 0x0083_6934;
+/// `FUN_00836934` ticket-mask-future `STRB WZR [X10,#0x228]`.
+pub const BOSMINER_TICKET_MASK_STRB_228_VA: u64 = 0x0083_6C20;
+pub const BOSMINER_TICKET_MASK_STRB_228_INSN: u32 = 0x3908_A15F;
+pub const BOSMINER_TICKET_MASK_STRB_FN_VA: u64 = 0x0083_6934;
 /// `BL FUN_005f4a78` then `STR X/W/B #0x228` (`Xn!=SP`) before `RET` = 3; 0 HashChain.
 pub const BOSMINER_POST_ALLOC_STR228_NONSP_HITS: usize = 3;
 pub const BOSMINER_POST_ALLOC_STR228_HC_HITS: usize = 0;
@@ -3154,12 +3132,7 @@ pub const BOSMINER_OUTER_BOX_ALLOC_BL_INSN: u32 = 0x97F4_A496;
 pub const BOSMINER_OUTER_BOX_MEMCPY_180_INSN: u32 = 0x5280_3002;
 pub const BOSMINER_OUTER_BOX_STR228_HITS: usize = 0;
 pub const BOSMINER_OUTER_BOX_180_HITS: usize = 4;
-pub const BOSMINER_OUTER_BOX_FNS: [u64; 4] = [
-    0x008C_B778,
-    0x008C_B8B4,
-    0x008C_B9F0,
-    0x008C_BB2C,
-];
+pub const BOSMINER_OUTER_BOX_FNS: [u64; 4] = [0x008C_B778, 0x008C_B8B4, 0x008C_B9F0, 0x008C_BB2C];
 /// Vtable `PTR_thunk_FUN_008e7454` at `0x19c6b50` = thunk `0x84ca74`.
 pub const BOSMINER_OUTER_VT_VA: u64 = 0x019C_6B50;
 pub const BOSMINER_OUTER_VT_THUNK: u64 = 0x0084_CA74;
@@ -3277,12 +3250,12 @@ pub const BOSMINER_STR260_HITS: usize = 52;
 pub const BOSMINER_STR260_XZR_HITS: usize = 8;
 pub const BOSMINER_STR260_CLONE_HITS: usize = 9;
 pub const BOSMINER_STR260_MOVZ300_NEAR_HITS: usize = 0;
-/// `FUN_00836934` `STR #0x260` stores baud-Future fn-ptr `FUN_0089b720`.
-pub const BOSMINER_BAUD260_VA: u64 = 0x0083_6C34;
-pub const BOSMINER_BAUD260_INSN: u32 = 0xF901_3148;
-pub const BOSMINER_BAUD260_FN_VA: u64 = 0x0089_B720;
-pub const BOSMINER_BAUD260_ADRP_INSN: u32 = 0xB000_0328;
-pub const BOSMINER_BAUD260_ADD_INSN: u32 = 0x911C_8108;
+/// `FUN_00836934` ticket-mask future stores fn-ptr `FUN_0089b720` at `+0x260`.
+pub const BOSMINER_TICKET_MASK260_VA: u64 = 0x0083_6C34;
+pub const BOSMINER_TICKET_MASK260_INSN: u32 = 0xF901_3148;
+pub const BOSMINER_TICKET_MASK260_FN_VA: u64 = 0x0089_B720;
+pub const BOSMINER_TICKET_MASK260_ADRP_INSN: u32 = 0xB000_0328;
+pub const BOSMINER_TICKET_MASK260_ADD_INSN: u32 = 0x911C_8108;
 /// `FUN_00705464` builds the 0x3c0 parent: `+0x3b0` = source*, `+0x2e0` = HashChain*.
 pub const BOSMINER_PARENT3C0_FN_VA: u64 = 0x0070_5464;
 pub const BOSMINER_PARENT3C0_ENTRY_INSN: u32 = 0xA9BA_7BFD;
@@ -3734,9 +3707,19 @@ pub fn refuse_bip320_strip_as_braiins_fill_ver0(base_version: u32, uart_vbits: u
 }
 
 /// Production `serial_rolled_version` must OR packed ver0 before BIP320 strip.
-pub fn admit_s19k_production_rolled_version_is_midstate0_or(
-    src: &str,
-) -> Result<(), &'static str> {
+///
+/// The pinned fact is the helper CALL with exactly `(entry.version,
+/// version_bits_raw)` — never the source's line wrapping. Rustfmt may keep
+/// the call on one line or wrap it with a trailing comma, so both sides are
+/// whitespace-squashed before matching and a pure formatting pass on
+/// `serial_mining.rs` can never break this pin. This is the root cause of
+/// the 2026-08-17..19 "unchanged dirty S19k failure": the pin matched the
+/// exact single-line byte string `s19k_braiins_midstate0_version(
+/// entry.version, version_bits_raw)` and broke when the dirty worktree
+/// wrapped the identical call across lines. The closing paren stays tight
+/// in both accepted spellings, so a third argument or a substituted input
+/// is still refused.
+pub fn admit_s19k_production_rolled_version_is_midstate0_or(src: &str) -> Result<(), &'static str> {
     let Some(fn_start) = src.find("fn serial_rolled_version(") else {
         return Err("serial_rolled_version missing");
     };
@@ -3744,16 +3727,24 @@ pub fn admit_s19k_production_rolled_version_is_midstate0_or(
         .split("fn serial_build_header(")
         .next()
         .ok_or("serial_rolled_version window missing")?;
-    let Some(or_at) = rolled.find("s19k_braiins_midstate0_version(entry.version, version_bits_raw)")
-    else {
+    let squashed: String = rolled.split_whitespace().collect();
+    let call_one_line = "s19k_braiins_midstate0_version(entry.version,version_bits_raw)";
+    let call_wrapped = "s19k_braiins_midstate0_version(entry.version,version_bits_raw,)";
+    let or_at = squashed
+        .find(call_one_line)
+        .or_else(|| squashed.find(call_wrapped));
+    let Some(or_at) = or_at else {
+        if squashed.contains("s19k_braiins_midstate0_version") {
+            return Err("midstate0 OR call must take exactly (entry.version, version_bits_raw)");
+        }
         return Err("BM1366 serial_rolled_version must call midstate0 OR");
     };
-    if let Some(recon_at) = rolled.find("bip320_reconstruct_rolled_version") {
+    if let Some(recon_at) = squashed.find("bip320_reconstruct_rolled_version") {
         if or_at > recon_at {
             return Err("midstate0 OR must run before BIP320 reconstruct");
         }
     }
-    if !rolled.contains("if is_bm1366") {
+    if !squashed.contains("ifis_bm1366") {
         return Err("BM1366 packed-ver0 arm missing");
     }
     Ok(())
@@ -3861,7 +3852,8 @@ pub fn admit_s19k_ghidra_pack_body_matches_production() -> Result<(), &'static s
 /// First-LOAD paint of `FUN_0091beb4`. Does not name a rust method.
 pub fn admit_bosminer_91beb4_pack_body_elf(blob: &[u8]) -> Result<(), &'static str> {
     let word = |va: u64| engine88_le_u32(blob, va);
-    if word(BOSMINER_PACK_FN_VA).ok_or("bosminer shorter than packer SUB")? != BOSMINER_PACK_FN_SUB_INSN
+    if word(BOSMINER_PACK_FN_VA).ok_or("bosminer shorter than packer SUB")?
+        != BOSMINER_PACK_FN_SUB_INSN
     {
         return Err("FUN_0091beb4 entry is not SUB SP,#0x40");
     }
@@ -3995,7 +3987,8 @@ pub fn admit_bosminer_bm136x_rs_36_is_not_pack() -> Result<(), &'static str> {
 }
 
 pub fn admit_bosminer_bm13xx_broadcast_assert() -> Result<(), &'static str> {
-    if BOSMINER_BM13XX_BROADCAST_ASSERT_MSG.len() != usize::from(BOSMINER_BM13XX_BROADCAST_ASSERT_LEN)
+    if BOSMINER_BM13XX_BROADCAST_ASSERT_MSG.len()
+        != usize::from(BOSMINER_BM13XX_BROADCAST_ASSERT_LEN)
     {
         return Err("broadcast assert message length is not 0x2E");
     }
@@ -4048,9 +4041,7 @@ pub fn refuse_workpair_as_pack56_type() -> Result<(), &'static str> {
 }
 
 pub fn refuse_chipparams_as_pack56_type() -> Result<(), &'static str> {
-    Err(
-        "bosminer_hal::command ChipParams is command.rs:594 tracing; not FUN_0091beb4 0x56 pack",
-    )
+    Err("bosminer_hal::command ChipParams is command.rs:594 tracing; not FUN_0091beb4 0x56 pack")
 }
 
 pub fn refuse_hal_io_as_pack56_type() -> Result<(), &'static str> {
@@ -4248,7 +4239,10 @@ pub fn refuse_bm1366_exclusive_uart_registry_size() -> Result<(), &'static str> 
 }
 
 /// UART job_id inputs. Encoder body at engine+0x90 is still unnamed.
-pub fn s19k_braiins_uart_job_id_inputs(work_id: u64, midstate_log: u32) -> Result<(u64, u32), &'static str> {
+pub fn s19k_braiins_uart_job_id_inputs(
+    work_id: u64,
+    midstate_log: u32,
+) -> Result<(u64, u32), &'static str> {
     let n = s19k_braiins_midstate_count_from_log(midstate_log)?;
     Ok((work_id, n))
 }
@@ -4287,6 +4281,1210 @@ pub fn s19k_braiins_fill_job_id(work_id: u8) -> u8 {
         .expect("fill midstates=1 ⇒ log 0 ⇒ every u8 work_id fits the 256-slot UART registry")
 }
 
+/// ESP-Miner `bm1366.c` command/job opcodes. There is no work-abort /
+/// invalidate command. The only job UART is `TYPE_JOB | CMD_WRITE` (0x21).
+pub const S19K_ESP_BM1366_CMD_SETADDRESS: u8 = 0x00;
+pub const S19K_ESP_BM1366_CMD_WRITE: u8 = 0x01;
+pub const S19K_ESP_BM1366_CMD_READ: u8 = 0x02;
+pub const S19K_ESP_BM1366_CMD_INACTIVE: u8 = 0x03;
+pub const S19K_ESP_BM1366_TYPE_JOB: u8 = 0x20;
+pub const S19K_ESP_BM1366_TYPE_CMD: u8 = 0x40;
+pub const S19K_ESP_BM1366_JOB_WRITE: u8 = S19K_ESP_BM1366_TYPE_JOB | S19K_ESP_BM1366_CMD_WRITE;
+pub const S19K_ESP_BM1366_JOB_ID_STEP: u8 = 8;
+pub const S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP: u8 = 0x80;
+pub const S19K_EXPERIMENTAL_POST_CLEAN_JOB_ENV: &str =
+    "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP";
+
+/// Held ESP + Braiins census: no leftover-safe abort opcode exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kWorkReplaceCensus {
+    pub esp_has_abort_opcode: bool,
+    pub esp_replace_is_type_job: bool,
+    pub bosminer_clean_is_uart_abort: bool,
+    pub live414_same_id_resumed_shares: bool,
+    pub getaddress_is_safe_midrun: bool,
+}
+
+pub fn s19k_work_replace_census() -> S19kWorkReplaceCensus {
+    S19kWorkReplaceCensus {
+        esp_has_abort_opcode: false,
+        esp_replace_is_type_job: true,
+        bosminer_clean_is_uart_abort: false,
+        live414_same_id_resumed_shares: false,
+        getaddress_is_safe_midrun: false,
+    }
+}
+
+pub fn admit_s19k_no_held_uart_abort_opcode() -> Result<(), &'static str> {
+    let c = s19k_work_replace_census();
+    if c.esp_has_abort_opcode {
+        return Err("ESP BM1366 command list has no abort/invalidate opcode");
+    }
+    if !c.esp_replace_is_type_job {
+        return Err("ESP replace is a new TYPE_JOB write, not a distinct opcode");
+    }
+    if c.bosminer_clean_is_uart_abort {
+        return Err("Ghidra has_been_cleaned is software template reuse, not UART abort");
+    }
+    if c.live414_same_id_resumed_shares {
+        return Err("live414 same-ID 21 36 resend did not resume SHARE");
+    }
+    if c.getaddress_is_safe_midrun {
+        return Err("mid-run GetAddress is refused (live415)");
+    }
+    if S19K_ESP_BM1366_JOB_WRITE != JOB_CMD_TYPE {
+        return Err("ESP TYPE_JOB|CMD_WRITE must be the shipped 0x21 job type");
+    }
+    Ok(())
+}
+
+/// Pin the held ESP-Miner BM1366 C: four CMD_* values, TYPE_JOB, no abort
+/// string, `send_work` emits only TYPE_JOB, job_id steps by 8.
+pub fn admit_s19k_esp_bm1366_has_no_work_abort_opcode(
+    src: &str,
+    jobs: &str,
+) -> Result<(), &'static str> {
+    let lower = src.to_ascii_lowercase();
+    if lower.contains("abort") || src.contains("invalidate") {
+        return Err("ESP bm1366.c must not name a work-abort/invalidate opcode");
+    }
+    if !src.contains("#define CMD_SETADDRESS 0x00") {
+        return Err("ESP BM1366 CMD_SETADDRESS must stay 0x00");
+    }
+    if !src.contains("#define CMD_WRITE 0x01") {
+        return Err("ESP BM1366 CMD_WRITE must stay 0x01");
+    }
+    if !src.contains("#define CMD_READ 0x02") {
+        return Err("ESP BM1366 CMD_READ must stay 0x02");
+    }
+    if !src.contains("#define CMD_INACTIVE 0x03") {
+        return Err("ESP BM1366 CMD_INACTIVE must stay 0x03");
+    }
+    if !src.contains("#define TYPE_JOB 0x20") {
+        return Err("ESP BM1366 TYPE_JOB must stay 0x20");
+    }
+    if !src.contains("id = (id + 8) % 128") {
+        return Err("ESP BM1366_send_work must step job_id by 8");
+    }
+    let start = src
+        .find("void BM1366_send_work")
+        .ok_or("missing BM1366_send_work")?;
+    let send = src.get(start..start.saturating_add(1800)).unwrap_or("");
+    if !send.contains("_send_BM1366((TYPE_JOB | GROUP_SINGLE | CMD_WRITE)") {
+        return Err("BM1366_send_work must emit TYPE_JOB|CMD_WRITE only");
+    }
+    if send.contains("CMD_INACTIVE") || send.contains("CMD_SETADDRESS") {
+        return Err("BM1366_send_work must not emit INACTIVE/GetAddress");
+    }
+    if jobs.to_ascii_lowercase().contains("abort") {
+        return Err("ESP create_jobs_task must not abort ASIC work on clean_jobs");
+    }
+    if !jobs.contains("if (!current_mining_notification->clean_jobs)") {
+        return Err("ESP clean_jobs only gates immediate generate_work");
+    }
+    Ok(())
+}
+
+pub fn refuse_s19k_cmd_inactive_as_midrun_work_replace() -> Result<(), &'static str> {
+    Err("CMD_INACTIVE is ESP enum/init, not a leftover-safe mid-run work-replace")
+}
+
+pub fn refuse_s19k_esp_job_step8_as_track1_fill() -> Result<(), &'static str> {
+    Err("ESP job_id += 8 is not Braiins fill job_id = work_id; Track-1 first-load shares are sequential")
+}
+
+/// Leftover-safe experimental job_id after a mid-run clean: XOR 0x80 so
+/// leftover RX bytes miss the new tickets. Generation 0 (no mid-run clean)
+/// stays fill identity. Not `slot<<3`. Not GetAddress.
+pub fn s19k_experimental_post_clean_job_id(work_id: u8, midrun_clean_generation: u32) -> u8 {
+    let fill = s19k_braiins_fill_job_id(work_id);
+    if midrun_clean_generation == 0 {
+        fill
+    } else {
+        fill ^ S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP
+    }
+}
+
+/// Production default is fill identity. The flip is env-gated and experimental.
+pub fn s19k_track1_fill_job_id(
+    work_id: u8,
+    midrun_clean_generation: u32,
+    experimental_flip: bool,
+) -> u8 {
+    if experimental_flip {
+        s19k_experimental_post_clean_job_id(work_id, midrun_clean_generation)
+    } else {
+        s19k_braiins_fill_job_id(work_id)
+    }
+}
+
+pub fn s19k_experimental_post_clean_flip_enabled_from_env(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+///  RE: BM1366 `TYPE=2 (command) / GROUP_ALL / CMD=3` Chain Inactive
+/// broadcast body (preamble + CRC5 are added by the HAL at send time).
+/// Evidence:  ("CMD = 3:
+/// chain Inactive", no response) and ESP-Miner `_send_chain_inactive()`
+/// which builds exactly this command.
+pub const S19K_BM1366_CHAIN_INACTIVE_BODY: [u8; 4] = [0x53, 0x05, 0x00, 0x00];
+
+/// ESP-Miner evidence wire for [`S19K_BM1366_CHAIN_INACTIVE_BODY`]:
+/// `55 AA 53 05 00 00 03` (CRC5 = 0x03). ESP-Miner sends this once during
+/// init, before chip addressing; it is the only documented chip-side work
+/// invalidation in the BM1366 protocol.
+pub const S19K_BM1366_CHAIN_INACTIVE_WIRE: [u8; 7] = [0x55, 0xAA, 0x53, 0x05, 0x00, 0x00, 0x03];
+
+pub fn admit_s19k_bm1366_chain_inactive_wire_evidence(
+    body: &[u8; 4],
+    wire: &[u8; 7],
+) -> Result<(), &'static str> {
+    if body != &S19K_BM1366_CHAIN_INACTIVE_BODY {
+        return Err("chain-inactive body must be 53 05 00 00");
+    }
+    if wire != &S19K_BM1366_CHAIN_INACTIVE_WIRE {
+        return Err("chain-inactive evidence wire must be 55 AA 53 05 00 00 03");
+    }
+    if &wire[2..6] != body {
+        return Err("evidence wire must embed the body between preamble and CRC5");
+    }
+    Ok(())
+}
+
+pub fn s19k_experimental_post_clean_chain_inactive_enabled_from_env(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// live431: leftover_hit=4 on a retired 21 36 wire, leftover_header=0,
+/// meets=0. That is the only evidence that admits the experimental
+/// Chain Inactive env on the next soak. Production refill stays identity.
+pub const S19K_LIVE431_LEFTOVER_HIT: u32 = 4;
+pub const S19K_LIVE431_LEFTOVER_HEADER: u32 = 0;
+pub const S19K_LIVE431_MEETS: u32 = 0;
+pub const S19K_LIVE431_LEFTOVER_NONCE: u32 = 0x3C6C_D199;
+
+/// live436 wrap-retire leftover BEFORE the first mid-run clean.
+/// leftover_hit=3 leftover_header=0 at wrap_rx=4 with funnel unarmed.
+/// Session-start NEW BLOCK is not a clean. First mid-run clean admits
+/// leftover-admitted Chain Inactive (env ON). Not occupied-slot replace.
+pub const S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT: u32 = 3;
+pub const S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER: u32 = 0;
+pub const S19K_LIVE436_WRAP_RETIRE_MEETS: u32 = 0;
+pub const S19K_LIVE436_WRAP_RETIRE_CLEANS: u32 = 0;
+
+pub fn s19k_leftover_hit_admits_experimental_inactive(
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+) -> bool {
+    // live439 leftover_hit=216 leftover_header=1: leftover_header is
+    // remapped leftover and must not veto 21 36 wire leftover. leftover_
+    // header-only (leftover_hit=0) still refuses (live438 leftover_header=3).
+    let _ = leftover_header;
+    leftover_hit > 0 && meets == 0
+}
+
+/// Occupied-slot replace is proven only after leftover-admitted inactive
+/// ran and new-target meets outnumber leftover 21 36 hits.
+/// live431 leftover_hit=4 meets=0 is admit-for-inactive, not replace.
+/// live433 leftover_hit=0 meets=0 inactive=0 is measurement, not replace.
+pub fn s19k_leftover_hit_vs_meets_replace_proven(
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+    leftover_admitted_inactive_queued: bool,
+) -> bool {
+    leftover_admitted_inactive_queued && leftover_header == 0 && meets > leftover_hit
+}
+
+/// Replace bar after leftover-admitted inactive. Pre-flush leftover_hit
+/// (live431=4) only admits the flush. Post-flush leftover/meets must be
+/// a new measurement — mixing them is not replace proof.
+pub fn s19k_post_inactive_replace_proven(
+    leftover_at_inactive: Option<u32>,
+    leftover_hit_after: u32,
+    leftover_header_after: u32,
+    meets_after: u32,
+) -> bool {
+    matches!(leftover_at_inactive, Some(hit) if hit > 0)
+        && leftover_header_after == 0
+        && meets_after > leftover_hit_after
+}
+
+/// live438: leftover-admitted CMD=3 reset leftover_hit. leftover_hit=0
+/// after that reset with meets=0 is the flush measurement, not replace.
+/// leftover_header after flush is remapped leftover, not 21 36 leftover_hit.
+pub fn s19k_post_inactive_flush_measured_not_replace(
+    leftover_at_inactive: Option<u32>,
+    leftover_hit_after: u32,
+    leftover_header_after: u32,
+    meets_after: u32,
+) -> bool {
+    let _ = leftover_header_after;
+    matches!(leftover_at_inactive, Some(hit) if hit > 0)
+        && leftover_hit_after == 0
+        && meets_after == 0
+}
+
+/// leftover-admit flush measurement and occupied-slot replace cannot
+/// both be true. live438 leftover_hit=0 meets=0 is flush only.
+pub fn s19k_flush_measured_is_not_replace(flush_measured: bool, replace_proven: bool) -> bool {
+    !(flush_measured && replace_proven)
+}
+
+/// leftover_header is remapped leftover that did **not** hash a retired
+/// 21 36 wire. live438 leftover_header=3 leftover_hit=0 after leftover-
+/// admit. It must not increment leftover_hit and must not leftover-admit
+/// a second Chain Inactive.
+pub fn s19k_leftover_header_is_not_tx_leftover(
+    retired_header_meets: bool,
+    retired_tx_meets: bool,
+) -> bool {
+    retired_header_meets && !retired_tx_meets
+}
+
+/// After leftover-admit leftover_at Some, leftover_hit hunts wrap-4 leftover
+/// `55 AA 21 36` across every fill job_id. live448 leftover_hit=0 leftover_
+/// header=8: remapped leftover_header climbed while wrap-4 leftover TX sat
+/// on other job_ids than the remapped retry_slots. leftover_header-only
+/// still refuses a second CMD=3.
+pub fn s19k_leftover_hit_slots_after_leftover_admit(
+    leftover_at: Option<u32>,
+    retry_slots: &[u8],
+) -> Vec<u8> {
+    if leftover_at.is_some_and(|hit| hit > 0) {
+        (0u8..=255).collect()
+    } else {
+        retry_slots.to_vec()
+    }
+}
+
+pub fn s19k_append_unique_share_targets(dst: &mut Vec<[u8; 32]>, src: &[[u8; 32]]) {
+    for t in src {
+        if !dst.iter().any(|x| x == t) {
+            dst.push(*t);
+        }
+    }
+}
+
+/// leftover_header-only after leftover-admit cannot leftover-admit again.
+/// leftover_hit wire leftover still admits even if leftover_header>0.
+pub fn s19k_leftover_header_admits_second_cmd3(
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+) -> bool {
+    leftover_header > 0
+        && leftover_hit == 0
+        && s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets)
+}
+
+pub fn refuse_s19k_live438_header_leftover_as_second_cmd3() -> Result<(), &'static str> {
+    if s19k_leftover_header_admits_second_cmd3(0, 3, 0) {
+        return Err("live438 leftover_header=3 leftover_hit=0 must not leftover-admit again");
+    }
+    let plan = s19k_plan_post_clean_uart_replace(true, true, true, 0, 3, 0);
+    if plan.chain_inactive || plan.job_flip {
+        return Err("post-flush leftover_header must not queue a second CMD=3 or job flip");
+    }
+    if s19k_leftover_header_is_not_tx_leftover(true, true) {
+        return Err("header leftover requires retired_tx_meets=false");
+    }
+    if !s19k_leftover_header_is_not_tx_leftover(true, false) {
+        return Err("retired_header_meets && !retired_tx_meets is leftover_header");
+    }
+    Err("live438 leftover_header after leftover-admit is remapped leftover, not a second CMD=3")
+}
+
+pub fn refuse_s19k_live438_post_flush_leftover0_as_replace() -> Result<(), &'static str> {
+    if s19k_post_inactive_replace_proven(
+        Some(crate::s19k_braiins_chain_discover::S19K_LIVE438_WRAP4_ADMIT_LEFTOVER_HIT),
+        crate::s19k_braiins_chain_discover::S19K_LIVE438_POST_FLUSH_LEFTOVER_HIT,
+        3,
+        crate::s19k_braiins_chain_discover::S19K_LIVE438_POST_FLUSH_MEETS,
+    ) {
+        return Err("live438 leftover_hit=0 leftover_header=3 meets=0 must not be replace");
+    }
+    if !s19k_post_inactive_flush_measured_not_replace(
+        Some(crate::s19k_braiins_chain_discover::S19K_LIVE438_WRAP4_ADMIT_LEFTOVER_HIT),
+        crate::s19k_braiins_chain_discover::S19K_LIVE438_POST_FLUSH_LEFTOVER_HIT,
+        3,
+        crate::s19k_braiins_chain_discover::S19K_LIVE438_POST_FLUSH_MEETS,
+    ) {
+        return Err("live438 leftover_hit=0 after leftover-admit is flush measurement");
+    }
+    if !s19k_flush_measured_is_not_replace(true, false) {
+        return Err("flush measurement must not count as replace");
+    }
+    Err(
+        "live438 leftover_hit=0 after leftover-admitted CMD=3 is flush measurement, not meets>leftover replace",
+    )
+}
+
+pub fn admit_s19k_second_clean_plans_from_pre_reset_leftover() -> Result<(), &'static str> {
+    let mut funnel = crate::S19kCleanFunnel::default();
+    funnel.on_clean();
+    funnel.leftover_hit = S19K_LIVE431_LEFTOVER_HIT;
+    funnel.leftover_header = S19K_LIVE431_LEFTOVER_HEADER;
+    funnel.meets = S19K_LIVE431_MEETS;
+    let (hit, header, meets) = funnel.snapshot_for_post_clean_plan();
+    funnel.on_clean();
+    if funnel.leftover_hit != 0 || funnel.meets != 0 {
+        return Err("on_clean must wipe leftover/meets before the new generation");
+    }
+    let plan = s19k_plan_post_clean_uart_replace(true, true, true, hit, header, meets);
+    if !plan.chain_inactive || !plan.job_flip {
+        return Err("second clean must plan from pre-reset leftover_hit=4, not post-reset 0");
+    }
+    funnel.on_leftover_admitted_inactive();
+    if funnel.leftover_hit != 0 || funnel.meets != 0 || funnel.cleans != 2 {
+        return Err("post-inactive reset must wipe leftover/meets and not increment cleans");
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(hit, header, meets, true) {
+        return Err("pre-flush leftover_hit=4 / meets=0 is not the post-inactive replace bar");
+    }
+    if !s19k_post_inactive_replace_proven(Some(hit), 0, 0, 5) {
+        return Err("post-inactive meets>leftover is the occupied-slot replace bar");
+    }
+    if s19k_post_inactive_replace_proven(None, 0, 0, 5) {
+        return Err("meets without leftover-admitted inactive is not replace");
+    }
+    Ok(())
+}
+
+pub fn admit_s19k_live431_leftover_vs_meets_unproven() -> Result<(), &'static str> {
+    if s19k_leftover_hit_vs_meets_replace_proven(
+        S19K_LIVE431_LEFTOVER_HIT,
+        S19K_LIVE431_LEFTOVER_HEADER,
+        S19K_LIVE431_MEETS,
+        false,
+    ) {
+        return Err(
+            "live431 leftover_hit=4 meets=0 without leftover-admitted inactive is not replace",
+        );
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(4, 0, 0, true) {
+        return Err("live431 meets=0 stays unproven even if inactive had queued");
+    }
+    if !s19k_leftover_hit_vs_meets_replace_proven(1, 0, 4, true) {
+        return Err("meets>leftover after leftover-admitted inactive is the replace bar");
+    }
+    Ok(())
+}
+
+pub fn admit_s19k_live433_leftover_vs_meets_unproven() -> Result<(), &'static str> {
+    if s19k_leftover_hit_vs_meets_replace_proven(0, 0, 0, false) {
+        return Err("live433 leftover_hit=0 meets=0 inactive=0 is not occupied-slot replace");
+    }
+    Ok(())
+}
+
+/// live436 wrap-retire leftover_hit=3 / header=0 / meets=0 is the same
+/// leftover-admit bar as live431 leftover_hit=4, but it is measured
+/// **before** the first pool clean (funnel unarmed). Session-start
+/// clean still stays identity (midrun_clean=false).
+pub fn admit_s19k_live436_wrap_retire_leftover_admits_first_clean_inactive(
+) -> Result<(), &'static str> {
+    if S19K_LIVE436_WRAP_RETIRE_CLEANS != 0 {
+        return Err("live436 wrap-retire leftover is before the first mid-run clean");
+    }
+    if S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT != 3 {
+        return Err("live436 wrap-retire leftover_hit must stay 3");
+    }
+    if S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER != 0 {
+        return Err("live436 leftover_header must stay 0 (21 36 wire, not header)");
+    }
+    if S19K_LIVE436_WRAP_RETIRE_MEETS != 0 {
+        return Err("live436 first-fill meets stay funnel-only so leftover-admit is not blocked");
+    }
+    if !s19k_leftover_hit_admits_experimental_inactive(
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT,
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER,
+        S19K_LIVE436_WRAP_RETIRE_MEETS,
+    ) {
+        return Err(
+            "live436 wrap-retire leftover_hit=3 / header=0 / meets=0 admits experimental inactive",
+        );
+    }
+    let session = s19k_plan_post_clean_uart_replace(false, true, true, 3, 0, 0);
+    if session.chain_inactive || session.job_flip {
+        return Err("session-start leftover_hit=3 must not queue inactive (live432 class)");
+    }
+    let first = s19k_plan_post_clean_uart_replace(true, true, true, 3, 0, 0);
+    if !first.chain_inactive || !first.job_flip {
+        return Err(
+            "first mid-run clean with wrap-retire leftover_hit=3 must leftover-admit flip+inactive",
+        );
+    }
+    let production = s19k_plan_post_clean_uart_replace(true, false, false, 3, 0, 0);
+    if production.chain_inactive || production.job_flip {
+        return Err("production first clean stays identity refill");
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(3, 0, 0, first.chain_inactive) {
+        return Err("wrap-retire leftover-admitted inactive is not occupied-slot replace");
+    }
+    Ok(())
+}
+
+pub fn admit_s19k_live431_leftover_admits_experimental_inactive() -> Result<(), &'static str> {
+    if S19K_LIVE431_LEFTOVER_HIT != 4 {
+        return Err("live431 leftover_hit must stay 4");
+    }
+    if S19K_LIVE431_LEFTOVER_HEADER != 0 {
+        return Err("live431 leftover_header must stay 0 (21 36 wire, not header)");
+    }
+    if S19K_LIVE431_MEETS != 0 {
+        return Err("live431 meets must stay 0 (occupied-slot replace unproven)");
+    }
+    if S19K_LIVE431_LEFTOVER_NONCE != 0x3C6C_D199 {
+        return Err("live431 leftover dump nonce must stay 0x3C6CD199");
+    }
+    if !s19k_leftover_hit_admits_experimental_inactive(
+        S19K_LIVE431_LEFTOVER_HIT,
+        S19K_LIVE431_LEFTOVER_HEADER,
+        S19K_LIVE431_MEETS,
+    ) {
+        return Err("live431 leftover_hit=4 / header=0 / meets=0 admits experimental inactive");
+    }
+    Ok(())
+}
+
+/// One leftover-safe UART step after a mid-run clean. There is no held
+/// job-abort opcode; Chain Inactive is the only documented chip-side flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S19kPostCleanUartOp {
+    ChainInactive,
+    IdentityRefill,
+}
+
+/// Ordered leftover-safe UART replace plan. Production is identity 21 36
+/// refill only. Chain Inactive / job-id XOR stay experimental default-OFF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kPostCleanUartReplacePlan {
+    pub chain_inactive: bool,
+    pub job_flip: bool,
+    pub refill: bool,
+}
+
+impl S19kPostCleanUartReplacePlan {
+    pub fn ops(self) -> impl Iterator<Item = S19kPostCleanUartOp> {
+        [
+            self.chain_inactive
+                .then_some(S19kPostCleanUartOp::ChainInactive),
+            self.refill.then_some(S19kPostCleanUartOp::IdentityRefill),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// Plan leftover-safe UART after a mid-run clean.
+///
+/// Held ESP + `bm1366_protocol.md`: TYPE_JOB + four CMD_* only. CMD=3 is
+/// Chain Inactive (`55 AA 53 05 00 00 03`). No abort/invalidate opcode.
+/// `midrun_clean == false` emits no extra UART (session-start first-fill).
+/// live431 leftover_hit is measured **after** the first mid-run clean;
+/// env-ON alone must not queue inactive **or XOR 0x80** on leftover_hit=0
+/// (live432 first-clean inactive class).
+pub fn s19k_plan_post_clean_uart_replace(
+    midrun_clean: bool,
+    experimental_chain_inactive: bool,
+    experimental_job_flip: bool,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+) -> S19kPostCleanUartReplacePlan {
+    if !midrun_clean {
+        return S19kPostCleanUartReplacePlan {
+            chain_inactive: false,
+            job_flip: false,
+            refill: false,
+        };
+    }
+    let leftover_admitted =
+        s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets);
+    S19kPostCleanUartReplacePlan {
+        chain_inactive: experimental_chain_inactive && leftover_admitted,
+        job_flip: experimental_job_flip && leftover_admitted,
+        refill: true,
+    }
+}
+
+/// live432 first-clean inactive at leftover_hit=0. XOR 0x80 is the same
+/// class: leftover-safe host mapping only after leftover_hit admits.
+pub fn admit_s19k_job_flip_is_leftover_admitted() -> Result<(), &'static str> {
+    let first = s19k_plan_post_clean_uart_replace(true, true, true, 0, 0, 0);
+    if first.job_flip || first.chain_inactive {
+        return Err("first clean leftover_hit=0 must not flip or inactive (live432 class)");
+    }
+    if !first.refill {
+        return Err("first clean still identity-refills");
+    }
+    let admitted = s19k_plan_post_clean_uart_replace(true, true, true, 4, 0, 0);
+    if !admitted.job_flip || !admitted.chain_inactive {
+        return Err("live431 leftover_hit=4 / header=0 / meets=0 admits flip+inactive");
+    }
+    let production = s19k_plan_post_clean_uart_replace(true, false, false, 4, 0, 0);
+    if production.job_flip || production.chain_inactive {
+        return Err("production post-clean stays identity refill");
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(4, 0, 0, admitted.chain_inactive) {
+        return Err("leftover-admitted flip+inactive is not occupied-slot replace proof");
+    }
+    Ok(())
+}
+
+/// live428/430/434 MULTI died wrap-4 before a live leftover measurement.
+/// Production does nothing extra (fill identity continues). Experimental
+/// wrap-4 early leftover-safe is due only while RX is still live and
+/// leftover-admit has not set leftover_at. Session-start funnel `cleans=1`
+/// is not leftover-admit (live446 leftover_hit=20 leftover_at=None).
+pub const S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN_ENV: &str =
+    "DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN";
+
+pub fn s19k_experimental_wrap4_early_clean_enabled_from_env(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+pub fn s19k_wrap4_early_leftover_safe_due(
+    wrap_rx: u64,
+    leftover_at: Option<u32>,
+    rx_dead: bool,
+) -> bool {
+    wrap_rx >= 4 && leftover_at.is_none() && !rx_dead
+}
+
+/// IMPLEMENTED_EXPERIMENTAL wrap-4 leftover-safe step.
+/// Production (`experimental=false`) is empty — fill identity continues.
+/// First due snapshot/arm is `refill=true` (no extra abort opcode).
+/// Chain Inactive only after leftover_hit admits (same bar as post-clean).
+pub fn s19k_plan_wrap4_early_leftover_safe(
+    wrap_rx: u64,
+    leftover_at: Option<u32>,
+    rx_dead: bool,
+    experimental: bool,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+    already_snapshotted: bool,
+) -> S19kPostCleanUartReplacePlan {
+    if !experimental || !s19k_wrap4_early_leftover_safe_due(wrap_rx, leftover_at, rx_dead) {
+        return S19kPostCleanUartReplacePlan {
+            chain_inactive: false,
+            job_flip: false,
+            refill: false,
+        };
+    }
+    if !already_snapshotted {
+        // live437: leftover_hit=4 leftover_header=0 at snapshot. Waiting a
+        // second tick let leftover_header climb (retired history after
+        // on_clean) and blocked leftover-admit. Same-tick admit uses the
+        // wrap-retire leftover bar, not the post-arm header leftover.
+        let leftover_admitted =
+            s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets);
+        return S19kPostCleanUartReplacePlan {
+            chain_inactive: leftover_admitted,
+            job_flip: false,
+            refill: true,
+        };
+    }
+    s19k_plan_post_clean_uart_replace(true, true, false, leftover_hit, leftover_header, meets)
+}
+
+pub fn admit_s19k_live434_wrap4_early_clean_was_due() -> Result<(), &'static str> {
+    if !s19k_wrap4_early_leftover_safe_due(4, None, false) {
+        return Err("live434 wrap_rx=4 leftover_at=None with RX live admits wrap-4 early clean");
+    }
+    if s19k_wrap4_early_leftover_safe_due(4, None, true) {
+        return Err("wrap-4 early clean must not fire after RX death");
+    }
+    if s19k_wrap4_early_leftover_safe_due(3, None, false) {
+        return Err("wrap-3 is not wrap-4 early clean");
+    }
+    if s19k_wrap4_early_leftover_safe_due(4, Some(1), false) {
+        return Err("wrap-4 early must not fire after leftover-admit leftover_at");
+    }
+    let production = s19k_plan_wrap4_early_leftover_safe(4, None, false, false, 0, 0, 0, false);
+    if production.refill || production.chain_inactive {
+        return Err("production wrap-4 stays fill-identity (no extra UART)");
+    }
+    let first = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 0, 0, 0, false);
+    if !first.refill || first.chain_inactive {
+        return Err("experimental first wrap-4 step is identity snapshot, not inactive");
+    }
+    let after = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 4, 0, 0, true);
+    if !after.chain_inactive {
+        return Err("leftover-admitted wrap-4 may queue experimental inactive");
+    }
+    let header_only = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 0, 5, 0, true);
+    if header_only.chain_inactive {
+        return Err("leftover_header-only after snapshot must not leftover-admit");
+    }
+    let live439_wire = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 4, 5, 0, true);
+    if !live439_wire.chain_inactive {
+        return Err("leftover_hit wire leftover must leftover-admit even if leftover_header>0");
+    }
+    Ok(())
+}
+
+/// live436 leftover_hit=3 leftover_header=0 at wrap_rx=4 with RX live.
+/// Experimental wrap-4 first tick is snapshot only. Second tick leftover-
+/// admits Chain Inactive. Production (`experimental=false`) stays empty.
+pub fn admit_s19k_live436_leftover3_wrap4_early_admits_inactive() -> Result<(), &'static str> {
+    if !s19k_experimental_wrap4_early_clean_enabled_from_env(Some("1")) {
+        return Err("wrap-4 early env 1 must enable the experimental path");
+    }
+    if s19k_experimental_wrap4_early_clean_enabled_from_env(None) {
+        return Err("production wrap-4 early stays default OFF");
+    }
+    if s19k_experimental_wrap4_early_clean_enabled_from_env(Some("0")) {
+        return Err("wrap-4 early env 0 is off");
+    }
+    let first = s19k_plan_wrap4_early_leftover_safe(
+        4,
+        None,
+        false,
+        true,
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT,
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER,
+        S19K_LIVE436_WRAP_RETIRE_MEETS,
+        false,
+    );
+    if !first.refill || !first.chain_inactive {
+        return Err("live436 leftover_hit=3 wrap-4 first tick leftover-admits same tick (live437 header climb)");
+    }
+    let after = s19k_plan_wrap4_early_leftover_safe(
+        4,
+        None,
+        false,
+        true,
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HIT,
+        S19K_LIVE436_WRAP_RETIRE_LEFTOVER_HEADER,
+        S19K_LIVE436_WRAP_RETIRE_MEETS,
+        true,
+    );
+    if !after.chain_inactive || after.job_flip {
+        return Err("live436 leftover_hit=3 at wrap-4 leftover-admits inactive only (no flip)");
+    }
+    let production = s19k_plan_wrap4_early_leftover_safe(4, None, false, false, 3, 0, 0, true);
+    if production.refill || production.chain_inactive {
+        return Err("production wrap-4 stays fill-identity even with leftover_hit=3");
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(3, 0, 0, after.chain_inactive) {
+        return Err("wrap-4 leftover-admitted inactive is not occupied-slot replace");
+    }
+    Ok(())
+}
+
+/// live437 wrap-4 snapshot leftover_hit=4 leftover_header=0. Waiting for
+/// the next tick let leftover_header climb to 5 and refused leftover-admit.
+pub fn admit_s19k_live437_wrap4_same_tick_admits_before_header_climb() -> Result<(), &'static str> {
+    let snap = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 4, 0, 0, false);
+    if !snap.refill || !snap.chain_inactive {
+        return Err(
+            "live437 leftover_hit=4 leftover_header=0 must leftover-admit on the snapshot tick",
+        );
+    }
+    let header_only = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 0, 5, 0, true);
+    if header_only.chain_inactive {
+        return Err("leftover_header-only after funnel arm must not leftover-admit");
+    }
+    let later = s19k_plan_wrap4_early_leftover_safe(4, None, false, true, 4, 5, 0, true);
+    if !later.chain_inactive {
+        return Err("live439 leftover_hit=4 leftover_header=5 must leftover-admit (wire leftover)");
+    }
+    Ok(())
+}
+
+/// Production wrap-4 leftover-admit must log the snapshot leftover_hit
+/// (`admit_hit`) before `on_leftover_admitted_inactive` wipes it to 0.
+pub fn admit_s19k_production_wrap4_logs_snapshot_leftover(src: &str) -> Result<(), &'static str> {
+    let start = src
+        .find("if wrap4_plan.chain_inactive {")
+        .ok_or("production must keep the wrap-4 chain-inactive planner arm")?;
+    let tail = &src[start..];
+    let end = tail
+        .find("if s19k_wrap5_leftover_snapshot_due(")
+        .ok_or("wrap-4 chain-inactive planner arm must precede the wrap-5 snapshot arm")?;
+    let arm: String = tail[..end]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+
+    let snapshot = arm
+        .find("letadmit_hit=clean_funnel.leftover_hit;")
+        .ok_or("wrap-4 leftover-admit must snapshot leftover_hit before the post-flush wipe")?;
+    let wipe = arm
+        .find("clean_funnel.on_leftover_admitted_inactive();")
+        .ok_or("wrap-4 leftover-admit must mark the funnel after snapshotting leftover_hit")?;
+    if snapshot > wipe {
+        return Err("wrap-4 leftover-admit must snapshot leftover_hit before the post-flush wipe");
+    }
+
+    let queue = arm
+        .find("push_front(SerialQueuedTx::control(S19K_BM1366_CHAIN_INACTIVE_BODY.to_vec()")
+        .ok_or(
+            "wrap-4 leftover-admit must queue typed control 53 05 00 00 after the funnel wipe",
+        )?;
+    if queue < wipe {
+        return Err("wrap-4 leftover-admit must queue 53 05 00 00 after the funnel wipe");
+    }
+
+    let log = arm
+        .find("S19kwrap-4leftover-admittedchain-inactive(experimental)")
+        .ok_or("wrap-4 leftover-admit must log the experimental CMD=3 queue")?;
+    if log < queue {
+        return Err("wrap-4 leftover-admit must log only after queuing 53 05 00 00");
+    }
+    if !arm[..log].contains("leftover_hit=admit_hit,") {
+        return Err("wrap-4 leftover-admit log must print admit_hit, not the wiped 0");
+    }
+    Ok(())
+}
+
+/// live441 leftover-admit leftover_hit=4 leftover_at=4 leftover_header=0;
+/// MULTI died wrap_rx=6 leftover_hit=0 leftover_header=4 before wrap-7
+/// snapshot was due. Snapshot POST-admit outstanding 21 36 at wrap_rx>=5
+/// so leftover_hit can re-accumulate during wrap 5 while still hashing.
+/// leftover-readmit still requires leftover_hit>0 (leftover_header-only refuses).
+pub fn s19k_wrap5_leftover_snapshot_due(
+    wrap_rx: u64,
+    leftover_at_inactive: Option<u32>,
+    already_snapshotted: bool,
+    rx_dead: bool,
+    experimental: bool,
+) -> bool {
+    experimental
+        && !already_snapshotted
+        && !rx_dead
+        && wrap_rx >= 5
+        && matches!(leftover_at_inactive, Some(hit) if hit > 0)
+}
+
+/// live441 wrap-6 death after leftover-admit left leftover-readmit at
+/// wrap_rx>=7 unqueued. After wrap-5 POST-admit snapshot, leftover-readmit
+/// as soon as leftover_hit admits (wrap_rx>=5) so the second CMD=3 can
+/// fire before wrap-6 MULTI death. leftover_header-only still refuses.
+pub fn s19k_wrap5_leftover_readmit_due(
+    wrap_rx: u64,
+    leftover_at_inactive: Option<u32>,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+    already_readmitted: bool,
+    rx_dead: bool,
+    experimental: bool,
+) -> bool {
+    experimental
+        && !already_readmitted
+        && !rx_dead
+        && wrap_rx >= 5
+        && matches!(leftover_at_inactive, Some(hit) if hit > 0)
+        && s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets)
+}
+
+/// live441 wrap_rx=6 leftover_at=4 leftover_hit=0 leftover_header=4:
+/// wrap-5 would have snapshotted POST-admit 21 36; leftover-readmit
+/// still refuses header-only until leftover_hit re-accumulates.
+pub fn admit_s19k_live441_wrap5_snapshots_before_wrap6_death() -> Result<(), &'static str> {
+    if s19k_wrap5_leftover_snapshot_due(5, Some(4), false, false, false) {
+        return Err("production wrap-5 leftover snapshot stays default OFF");
+    }
+    if s19k_wrap5_leftover_snapshot_due(4, Some(4), false, false, true) {
+        return Err("wrap-4 is leftover-admit, not wrap-5 leftover snapshot");
+    }
+    if s19k_wrap5_leftover_snapshot_due(5, None, false, false, true) {
+        return Err("wrap-5 leftover snapshot requires a prior leftover-admit");
+    }
+    if !s19k_wrap5_leftover_snapshot_due(5, Some(4), false, false, true) {
+        return Err("live441 wrap_rx=5 leftover_at=4 must snapshot POST-admit 21 36");
+    }
+    if s19k_wrap5_leftover_readmit_due(5, Some(4), 0, 4, 0, false, false, true) {
+        return Err("live441 leftover_hit=0 leftover_header=4 must not leftover-readmit");
+    }
+    if !s19k_wrap5_leftover_readmit_due(5, Some(4), 4, 0, 0, false, false, true) {
+        return Err("after wrap-5 snapshot leftover_hit re-accumulation leftover-readmits");
+    }
+    if s19k_wrap7_leftover_snapshot_due(6, Some(4), false, false, true) {
+        return Err("wrap-6 is still not wrap-7 leftover snapshot");
+    }
+    Ok(())
+}
+
+/// Production wrap-5 leftover snapshot must log and queue leftover-readmit.
+pub fn admit_s19k_production_wrap5_snapshot_logs_and_queues(src: &str) -> Result<(), &'static str> {
+    if !src.contains("s19k_wrap5_leftover_snapshot_due(") {
+        return Err("production must call wrap-5 leftover snapshot due");
+    }
+    if !src.contains("S19k wrap-5 leftover snapshot (experimental)") {
+        return Err("wrap-5 leftover snapshot must log the POST-admit retired store");
+    }
+    if !src.contains("s19k_wrap5_leftover_readmit_due(") {
+        return Err("production must call wrap-5 leftover-readmit due");
+    }
+    if !src.contains("S19k wrap-5 leftover-readmit chain-inactive (experimental)") {
+        return Err("wrap-5 leftover-readmit must log the experimental CMD=3 queue");
+    }
+    if !src.contains("wrap5_leftover_readmitted") {
+        return Err("wrap-5 leftover-readmit must not consume wrap-7 leftover-readmit");
+    }
+    if src
+        .matches("retired_s19k_history.merge_from(&work_history)")
+        .count()
+        < 2
+    {
+        return Err("wrap-5 leftover snapshot must merge POST-admit history into wrap-4 leftover share_targets (live448 leftover_hit=0 leftover_header=8)");
+    }
+    if src
+        .matches("retired_s19k_tx.merge_from(&outstanding_s19k_tx)")
+        .count()
+        < 2
+    {
+        return Err("wrap-4/wrap-5 leftover snapshot must merge outstanding into retired generations (live443 clone() leftover_hit=0)");
+    }
+    if !src.contains("s19k_retired_generation_tx_meets_any_share_target") {
+        return Err("leftover_hit must compact-TX-meet wrap-4 leftover 21 36 against retired share_target (live444 leftover_header=4 leftover_hit=0)");
+    }
+    Ok(())
+}
+
+/// live440 leftover_hit=0 leftover_header=3 wrap_rx=7 leftover-readmit refuse.
+/// leftover_hit wire leftover still leftover-readmits.
+pub fn admit_s19k_live440_header_only_refuses_leftover_hit_still_admits() -> Result<(), &'static str>
+{
+    if s19k_leftover_header_admits_second_cmd3(0, 3, 0) {
+        return Err("live440 leftover_header=3 leftover_hit=0 must not leftover-admit again");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, Some(1), 0, 3, 0, false, false, true) {
+        return Err("live440 leftover_header-only must not wrap-7 leftover-readmit");
+    }
+    if !s19k_leftover_hit_admits_experimental_inactive(4, 3, 0) {
+        return Err("leftover_hit wire leftover still admits even if leftover_header>0");
+    }
+    if !s19k_wrap5_leftover_readmit_due(5, Some(3), 4, 4, 0, false, false, true) {
+        return Err("after leftover-admit leftover_hit re-accumulation leftover-readmits");
+    }
+    if s19k_wrap5_leftover_readmit_due(5, Some(3), 0, 4, 0, false, false, true) {
+        return Err("live444 leftover_header=4 leftover_hit=0 must not wrap-5 leftover-readmit");
+    }
+    if s19k_leftover_hit_slots_after_leftover_admit(None, &[7]).as_slice() != [7] {
+        return Err("before leftover-admit leftover_hit hunts retry_slots only");
+    }
+    if s19k_leftover_hit_slots_after_leftover_admit(Some(1), &[7]).len() != 256 {
+        return Err(
+            "after leftover-admit leftover_hit hunts wrap-4 leftover 21 36 on every job_id",
+        );
+    }
+    Ok(())
+}
+
+/// live440 leftover-admit flushed leftover_hit. wrap-7 leftover-readmit
+/// hunted the **pre-admit** retired 21 36 store, so leftover_hit stayed 0
+/// leftover_header=3. Snapshot POST-admit outstanding 21 36 into retired
+/// at wrap_rx>=7 so leftover_hit can re-accumulate from wrap-retire leftover.
+/// leftover-readmit still requires leftover_hit>0 (leftover_header-only refuses).
+pub fn s19k_wrap7_leftover_snapshot_due(
+    wrap_rx: u64,
+    leftover_at_inactive: Option<u32>,
+    already_snapshotted: bool,
+    rx_dead: bool,
+    experimental: bool,
+) -> bool {
+    experimental
+        && !already_snapshotted
+        && !rx_dead
+        && wrap_rx >= 7
+        && matches!(leftover_at_inactive, Some(hit) if hit > 0)
+}
+
+/// live447 wrap-5 leftover-readmit leftover_hit=1 leftover_header=0 wrap_rx=5;
+/// leftover_hit re-accumulated to 185 leftover_header=2 leftover_at=9 wrap_rx=6
+/// before MULTI death. wrap-7 leftover-readmit requires wrap_rx>=7 so it never
+/// queued. wrap-6 leftover-readmit is the leftover-safe second CMD=3 while RX
+/// is still in the wrap-6 window. leftover_header-only still refuses.
+pub fn s19k_wrap6_leftover_readmit_due(
+    wrap_rx: u64,
+    leftover_at_inactive: Option<u32>,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+    already_readmitted: bool,
+    rx_dead: bool,
+    experimental: bool,
+) -> bool {
+    experimental
+        && !already_readmitted
+        && !rx_dead
+        && wrap_rx >= 6
+        && matches!(leftover_at_inactive, Some(hit) if hit > 0)
+        && s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets)
+}
+
+/// live439 wrap-7 still hashed after leftover-admit, then leftover_hit
+/// re-accumulated (216) with leftover_header=1 after a second identity
+/// clean. wrap-4 due requires leftover_at=None so it cannot leftover-admit
+/// again. Experimental wrap-7 leftover-readmit is the leftover-safe second
+/// flush at wrap_rx>=7.
+pub fn s19k_wrap7_leftover_readmit_due(
+    wrap_rx: u64,
+    leftover_at_inactive: Option<u32>,
+    leftover_hit: u32,
+    leftover_header: u32,
+    meets: u32,
+    already_readmitted: bool,
+    rx_dead: bool,
+    experimental: bool,
+) -> bool {
+    experimental
+        && !already_readmitted
+        && !rx_dead
+        && wrap_rx >= 7
+        && matches!(leftover_at_inactive, Some(hit) if hit > 0)
+        && s19k_leftover_hit_admits_experimental_inactive(leftover_hit, leftover_header, meets)
+}
+
+/// live439 leftover_hit=216 leftover_header=1 at wrap_rx=7 after
+/// leftover-admit leftover_at=2. leftover_header must not veto.
+pub fn admit_s19k_live439_wrap7_leftover_readmit() -> Result<(), &'static str> {
+    if s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, false, false, false) {
+        return Err("production wrap-7 leftover-readmit stays default OFF");
+    }
+    if s19k_wrap7_leftover_readmit_due(6, Some(2), 216, 1, 0, false, false, true) {
+        return Err("wrap-6 is not wrap-7 leftover-readmit");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, None, 216, 1, 0, false, false, true) {
+        return Err("wrap-7 leftover-readmit requires a prior leftover-admit flush");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, Some(2), 0, 3, 0, false, false, true) {
+        return Err("live438 leftover_header-only after flush must not wrap-7 leftover-readmit");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, true, false, true) {
+        return Err("wrap-7 leftover-readmit is once per soak");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, false, true, true) {
+        return Err("wrap-7 leftover-readmit must not fire after RX death");
+    }
+    if !s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, false, false, true) {
+        return Err("live439 leftover_hit=216 leftover_header=1 at wrap_rx=7 leftover-readmits");
+    }
+    if s19k_leftover_hit_vs_meets_replace_proven(216, 1, 0, true) {
+        return Err("wrap-7 leftover-readmit is not occupied-slot replace");
+    }
+    Ok(())
+}
+
+/// live440 wrap_rx=7 leftover_at=1 leftover_hit=0 leftover_header=3:
+/// snapshot POST-admit 21 36; leftover-readmit still refuses header-only.
+pub fn admit_s19k_live440_wrap7_snapshots_post_admit_store() -> Result<(), &'static str> {
+    if s19k_wrap7_leftover_snapshot_due(7, Some(1), false, false, false) {
+        return Err("production wrap-7 leftover snapshot stays default OFF");
+    }
+    if s19k_wrap7_leftover_snapshot_due(6, Some(1), false, false, true) {
+        return Err("wrap-6 is not wrap-7 leftover snapshot");
+    }
+    if s19k_wrap7_leftover_snapshot_due(7, None, false, false, true) {
+        return Err("wrap-7 leftover snapshot requires a prior leftover-admit");
+    }
+    if !s19k_wrap7_leftover_snapshot_due(7, Some(1), false, false, true) {
+        return Err("live440 wrap_rx=7 leftover_at=1 must snapshot POST-admit 21 36");
+    }
+    if s19k_wrap7_leftover_readmit_due(7, Some(1), 0, 3, 0, false, false, true) {
+        return Err("live440 leftover_hit=0 leftover_header=3 must not leftover-readmit");
+    }
+    if !s19k_wrap7_leftover_readmit_due(7, Some(1), 4, 0, 0, false, false, true) {
+        return Err("after wrap-7 snapshot leftover_hit re-accumulation leftover-readmits");
+    }
+    Ok(())
+}
+
+/// Production wrap-7 leftover-readmit must log admit_hit and queue CMD=3.
+pub fn admit_s19k_production_wrap7_readmit_logs_and_queues(src: &str) -> Result<(), &'static str> {
+    if !src.contains("s19k_wrap7_leftover_readmit_due(") {
+        return Err("production must call wrap-7 leftover-readmit due");
+    }
+    if !src.contains("S19k wrap-7 leftover-readmit chain-inactive (experimental)") {
+        return Err("wrap-7 leftover-readmit must log the experimental CMD=3 queue");
+    }
+    if !src.contains("wrap7_leftover_readmitted") {
+        return Err("wrap-7 leftover-readmit must be once per soak");
+    }
+    if !src.contains("s19k_wrap7_leftover_snapshot_due(") {
+        return Err("wrap-7 leftover-readmit must snapshot POST-admit 21 36 first");
+    }
+    if !src.contains("S19k wrap-7 leftover snapshot (experimental)") {
+        return Err("wrap-7 leftover snapshot must log the POST-admit retired store");
+    }
+    Ok(())
+}
+
+/// Held `.88` bosminer.unpacked: first `53 05 00 00` sits between
+/// `52 05 00 00` and `54 05 00 00`. Sequential words, not `55 AA 53 05`.
+pub const S19K_BOSMINER_53050000_NEIGHBOR: &[u8] = &[
+    0x52, 0x05, 0x00, 0x00, 0x53, 0x05, 0x00, 0x00, 0x54, 0x05, 0x00, 0x00,
+];
+
+pub fn refuse_s19k_bosminer_53050000_as_chain_inactive_template() -> Result<(), &'static str> {
+    if S19K_BOSMINER_53050000_NEIGHBOR
+        .windows(6)
+        .any(|w| w == [0x55, 0xAA, 0x53, 0x05, 0x00, 0x00])
+    {
+        return Err("neighbor slice must not contain a framed CMD=3");
+    }
+    if S19K_BOSMINER_53050000_NEIGHBOR[4] != 0x53 || S19K_BOSMINER_53050000_NEIGHBOR[0] != 0x52 {
+        return Err("held neighbor is the incrementing 0x52/0x53/0x54 word table");
+    }
+    Err("bosminer 53 05 00 00 is a sequential table, not Chain Inactive UART")
+}
+
+/// AMTC S19k jig logs "Set chain inactive" then "Set asic address" — init
+/// set-address, same as ESP. Not a mid-run leftover-safe abort.
+pub fn refuse_s19k_jig_chain_inactive_log_as_midrun_abort() -> Result<(), &'static str> {
+    Err("jig Set chain inactive is init/set-address; no 55 AA 21 36 job abort")
+}
+
+pub fn admit_s19k_live437_launch_wrap4_early_is_experimental(
+    src: &str,
+) -> Result<(), &'static str> {
+    let active = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !active.contains("DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN=1") {
+        return Err("live437 must export WRAP4_EARLY_CLEAN=1");
+    }
+    if !active.contains("DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE=1") {
+        return Err("live437 leftover-admit still needs the inactive env");
+    }
+    if !src.contains("kill \"$OWNED\"") {
+        return Err("live437 must kill only its owned pid");
+    }
+    Ok(())
+}
+
+/// Pin held protocol.md: CMD=3 chain Inactive is the only chip-side flush;
+/// the document does not name a job abort.
+pub fn admit_s19k_held_protocol_has_no_job_abort_opcode(src: &str) -> Result<(), &'static str> {
+    let lower = src.to_ascii_lowercase();
+    if lower.contains("abort") || lower.contains("invalidate") {
+        return Err("held bm1366_protocol.md must not name a job abort/invalidate opcode");
+    }
+    if !src.contains("CMD = 3: chain Inactive") {
+        return Err("held protocol.md must keep CMD = 3: chain Inactive");
+    }
+    if !src.contains("CMD = 0: set Chip Address")
+        || !src.contains("CMD = 1: write Register")
+        || !src.contains("CMD = 2: read Register")
+    {
+        return Err("held protocol.md must keep the four TYPE=2 CMD values");
+    }
+    if !src.contains("CMD = 1: send Job") {
+        return Err("held protocol.md must keep TYPE=1 CMD=1 send Job");
+    }
+    Ok(())
+}
+
+/// Production default stays fill-identity re-fill. The post-clean
+/// chain-inactive broadcast is a live-discriminator tool: only a dominant
+/// `leftover_hit` funnel result (chips still hashing pre-clean generations)
+/// justifies flushing chip work state on a mid-run clean.
+pub fn refuse_s19k_post_clean_chain_inactive_as_production() -> Result<(), &'static str> {
+    Err(
+        "DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE is experimental; \
+         CMD=3 is init/set-address (ESP/Bitmain), not a proven leftover-safe \
+         mid-run abort; production re-fill stays fill identity",
+    )
+}
+
+pub fn refuse_s19k_experimental_job_flip_as_chip_work_replace() -> Result<(), &'static str> {
+    Err("XOR 0x80 is leftover-safe host mapping + implicit 21 36 overwrite; not a proven chip abort")
+}
+
+pub fn refuse_s19k_experimental_job_flip_as_production() -> Result<(), &'static str> {
+    Err("DCENT_S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP is experimental; production fill stays work_id")
+}
+
+/// Held AMTC S19k jig has no Closed11d job prefix (no UART abort job either).
+pub fn s19k_jig_closed11d_prefix_hits(blob: &[u8]) -> usize {
+    blob.windows(4)
+        .filter(|w| w == &[JOB_PREAMBLE_0, JOB_PREAMBLE_1, JOB_CMD_TYPE, JOB_LEN_FIELD])
+        .count()
+}
+
+pub fn admit_s19k_jig_has_no_closed11d_job(blob: &[u8]) -> Result<(), &'static str> {
+    if s19k_jig_closed11d_prefix_hits(blob) != 0 {
+        return Err("held S19k jig must not contain 55 AA 21 36");
+    }
+    Ok(())
+}
+
+pub fn refuse_s19k_jig_libc_abort_as_work_replace(blob: &[u8]) -> Result<(), &'static str> {
+    let Some(off) = blob.windows(5).position(|w| w == b"abort") else {
+        return Err("jig ELF should import libc abort");
+    };
+    let lo = off.saturating_sub(24);
+    let hi = (off + 24).min(blob.len());
+    let win = &blob[lo..hi];
+    if win.windows(5).any(|w| w == b"stdin") || win.windows(7).any(|w| w == b"putchar") {
+        return Err("jig abort is libc abort next to stdin/putchar; not a BM1366 work-replace");
+    }
+    let _ = off;
+    Err("jig abort string is not a documented work-replace opcode")
+}
+
+/// Production serial_mining must keep the flip env-gated and default off.
+pub fn admit_s19k_production_post_clean_job_flip_is_env_gated(
+    src: &str,
+) -> Result<(), &'static str> {
+    if !src.contains("s19k_track1_fill_job_id") {
+        return Err("serial_mining must assign Track-1 job_id via s19k_track1_fill_job_id");
+    }
+    if !src.contains("DCENT_S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP") {
+        return Err("serial_mining must name the experimental post-clean job-flip env");
+    }
+    if !src.contains("s19k_experimental_post_clean_flip_enabled_from_env") {
+        return Err("serial_mining must parse the flip env through the shipped helper");
+    }
+    Ok(())
+}
+
+/// : production serial_mining must keep the post-clean
+/// chain-inactive broadcast env-gated, default off, queued after the
+/// clean-block queue clear, and dispatched through the serial actor.
+pub fn admit_s19k_production_post_clean_chain_inactive_is_env_gated(
+    src: &str,
+) -> Result<(), &'static str> {
+    if !src.contains("DCENT_S19K_EXPERIMENTAL_POST_CLEAN_CHAIN_INACTIVE") {
+        return Err("serial_mining must name the experimental post-clean chain-inactive env");
+    }
+    if !src.contains("s19k_experimental_post_clean_chain_inactive_enabled_from_env") {
+        return Err("serial_mining must parse the chain-inactive env through the shipped helper");
+    }
+    if !src.contains("actor_send_chain_inactive_bm1366") {
+        return Err(
+            "serial actor must dispatch the chain-inactive sentinel via actor_send_chain_inactive_bm1366",
+        );
+    }
+    let clear_at = src
+        .find("flush stale work")
+        .ok_or("serial_mining clean block must keep the queue clear marker")?;
+    let queued_at = src
+        .find("S19k post-clean chain-inactive broadcast queued")
+        .ok_or("serial_mining must log the queued post-clean chain-inactive broadcast")?;
+    if queued_at < clear_at {
+        return Err("chain-inactive sentinel must be queued after the clean-block queue clear");
+    }
+    if !src.contains("clean_funnel.leftover_hit") {
+        return Err("planner must see leftover_hit from the funnel, not env alone");
+    }
+    if !src.contains("s19k_leftover_hit_admits_experimental_inactive")
+        && !src.contains("leftover_hit,")
+    {
+        return Err("post-clean inactive must be leftover-admitted");
+    }
+    Ok(())
+}
+
 /// Shipped fill TX must encode `work_id`, not stock `slot<<3`.
 pub fn admit_bosminer_fill_path_job_id_is_work_id_shl_log() -> Result<(), &'static str> {
     if s19k_braiins_fill_midstate_log() != 0 {
@@ -4318,10 +5516,7 @@ pub fn refuse_bf3264_as_engine_nonce_fn() -> Result<(), &'static str> {
 }
 
 /// `FUN_00bf3264`: `(nonce_fn_low & 0xff) / *divisor`. Panics if divisor is 0.
-pub fn s19k_braiins_work_resp_index(
-    nonce_fn_low: u64,
-    divisor: u64,
-) -> Result<u64, &'static str> {
+pub fn s19k_braiins_work_resp_index(nonce_fn_low: u64, divisor: u64) -> Result<u64, &'static str> {
     if divisor == 0 {
         return Err("FUN_00bf3264 panics when *param_4 == 0");
     }
@@ -4984,15 +6179,16 @@ pub fn refuse_wzr_228_stores_as_hashchain() -> Result<(), &'static str> {
     Err("7 STR XZR + 1 STR WZR + 16 STRB WZR at #0x228; 0 windows have +0x19c/+0x11F0")
 }
 
-/// `FUN_00836934` `STRB WZR #0x228` is AM2 set-baud, not HashChain Default.
-pub fn refuse_836c20_as_hashchain_228() -> Result<(), &'static str> {
-    if BOSMINER_AM2_BAUD_STRB_228_INSN != 0x3908_A15F {
+/// `FUN_00836934` `STRB WZR #0x228` belongs to the ticket-mask future, not a
+/// HashChain Default initializer.
+pub fn refuse_ticket_mask_836c20_as_hashchain_228() -> Result<(), &'static str> {
+    if BOSMINER_TICKET_MASK_STRB_228_INSN != 0x3908_A15F {
         return Ok(());
     }
-    if BOSMINER_AM2_BAUD_STRB_FN_VA != 0x0083_6934 {
+    if BOSMINER_TICKET_MASK_STRB_FN_VA != 0x0083_6934 {
         return Ok(());
     }
-    Err("FUN_00836934 AM2 set-baud STRB WZR [X10,#0x228]; not HashChain")
+    Err("FUN_00836934 ticket-mask STRB WZR [X10,#0x228]; not HashChain Default")
 }
 
 /// Post-alloc `STR #0x228` sites are String/BTree helpers, not HashChain.
@@ -5520,18 +6716,18 @@ pub fn admit_bosminer_705800_boxes_300_from_parent_3b0() -> Result<(), &'static 
     Ok(())
 }
 
-/// `FUN_00836934` `STR #0x260` is a baud-Future fn-ptr, not HashChain*.
+/// `FUN_00836934` `STR #0x260` is a ticket-mask-future fn-ptr, not HashChain*.
 pub fn refuse_836c34_str260_as_hashchain() -> Result<(), &'static str> {
-    if BOSMINER_BAUD260_INSN != 0xF901_3148 {
+    if BOSMINER_TICKET_MASK260_INSN != 0xF901_3148 {
         return Ok(());
     }
-    if BOSMINER_BAUD260_FN_VA != 0x0089_B720 {
+    if BOSMINER_TICKET_MASK260_FN_VA != 0x0089_B720 {
         return Ok(());
     }
-    if BOSMINER_BAUD260_ADRP_INSN != 0xB000_0328 {
+    if BOSMINER_TICKET_MASK260_ADRP_INSN != 0xB000_0328 {
         return Ok(());
     }
-    Err("FUN_00836934 STR X8,[X10,#0x260] is ADRP+ADD FUN_0089b720 (set-baud Future)")
+    Err("FUN_00836934 STR X8,[X10,#0x260] is ADRP+ADD FUN_0089b720 (ticket-mask Future)")
 }
 
 /// Boxing the 0x300 container does not mint HashChain `+0x228`.
@@ -5978,9 +7174,10 @@ pub fn refuse_sp1640_clone_as_named_div_integer() -> Result<(), &'static str> {
     Err("FUN_0087fb4c clones X24 (factory X1) onto SP+0x1640; copies chip_id +0x19c; not a named *(+0x11F0) store")
 }
 
-/// DCENT `asic_index_from_nonce_be` is `(nonce>>17)&0xff / 2`, not FUN_00bf3264.
+/// ESP/AMTC `asic_index_from_nonce_be` is `(nonce>>17)&0xff / 2`, not the
+/// Braiins BM1366 callback plus `FUN_00bf3264` path.
 pub fn refuse_asic_index_from_nonce_be_as_bf3264() -> Result<(), &'static str> {
-    Err("asic_index_from_nonce_be uses nonce bits 17..24 / interval 2; FUN_00bf3264 divides (+0x88_low & 0xff) by *Worker+0x11c0")
+    Err("ESP/AMTC bits17..24 attribution is not Braiins BM1366 FUN_009256ac + FUN_00bf3264")
 }
 
 /// RX inverse + registry fit names the TX formula. Pointer body still unnamed.
@@ -5989,7 +7186,7 @@ pub fn admit_bosminer_uart_job_id_is_work_id_shl_log() -> Result<(), &'static st
         return Err("FUN_0091c0a0 job byte is u64>>0x28");
     }
     if BOSMINER_ENGINE_NONCE_FN_OFF != 0x88 {
-        return Err("engine+0x88 is the work-response nonce transform");
+        return Err("engine+0x88 is the work-response attribution callback");
     }
     if BOSMINER_PACK_CALLER_LSL_COUNT_INSN != 0x9ACA_2121 {
         return Err("pack-caller second arg is LSL X1,X9,X10 (1<<log)");
@@ -6032,42 +7229,24 @@ pub fn s19k_braiins_uart_nonce_arg_from_payload8(payload_le: u64) -> u32 {
     (payload_le as u32).swap_bytes()
 }
 
-/// Fill share nonce after REV. `blr [Worker,#0x88]` body is still unnamed
-/// (factory `FUN_00876ca8` only clones X1; no `REV W0,W0;RET` in first LOAD).
-/// : parse **captures X0 after BLR** (`MOV X22,X0`) as the nonce and
-/// feeds it to the divider (`MOV X1,X22`). rustc identity is a lone `RET`
-/// (269 sites / 220 DATA ptrs) so the callee stays unnamed. Identity on the
-/// REV argument is still the strongest offline fill mapping.
-/// : this identity is only defined for
-/// [`BOSMINER_WORK_TYPE_VERSION_ROLLING`] (`engine+0x80 == 1`). Midstates
-/// work-type panics at `bm1398_6x.rs:344`.
+/// Canonical callback nonce word after `REV`. This compatibility helper is
+/// identity because its input is already the BE interpretation of UART bytes,
+/// not because engine+0x88 returns a nonce. BM1366 engine+0x88 is the
+/// attribution callback `FUN_009256ac`; `FUN_0091c0a0` stores the original
+/// LE-loaded payload low32 separately at WorkResponse+0x30.
 pub fn s19k_braiins_fill_nonce_word(uart_nonce_be: u32) -> u32 {
     uart_nonce_be
 }
 
-/// Parse uses the +0x88 BLR return as the nonce word (fill path +0x80==1).
+/// Retired inference kept as an explicit refusal for callers/tests that still
+/// treat the +0x88 BLR return as a nonce word.
 pub fn admit_bosminer_work_resp_blr_return_is_nonce() -> Result<(), &'static str> {
-    if BOSMINER_WORK_RESP_SAVE_X0_INSN != 0xAA00_03F6 {
-        return Err("MOV X22,X0 after BLR");
-    }
-    if BOSMINER_WORK_RESP_MOV_X1_NONCE_INSN != 0xAA16_03E1 {
-        return Err("MOV X1,X22 feeds divider the BLR return");
-    }
-    if BOSMINER_WORK_RESP_PLUS80_LDRB_INSN != 0x3942_02A8 {
-        return Err("LDRB [X21,#0x80] after BLR");
-    }
-    if BOSMINER_WORK_RESP_PLUS80_CMP1_INSN != 0x7100_051F {
-        return Err("CMP +0x80,#1");
-    }
-    if BOSMINER_WORK_RESP_PLUS80_BNE_TARGET != 0x0091_C1B0 {
-        return Err("+0x80!=1 target is 0x91c1b0");
-    }
-    Ok(())
+    Err("BM1366 +0x88 returns (encoded chip address, core); raw nonce is stored at WorkResponse+0x30")
 }
 
-/// `+0x80 != 1` is a panic/ADRP path, not a second nonce transform.
+/// `+0x80 != 1` is a panic/ADRP path, not a second response callback.
 pub fn refuse_plus80_ne1_as_alt_nonce_transform() -> Result<(), &'static str> {
-    Err("FUN_0091c0a0 +0x80!=1 branches to 0x91c1b0 ADRP/panic, not another nonce transform")
+    Err("FUN_0091c0a0 +0x80!=1 branches to 0x91c1b0 ADRP/panic, not another response callback")
 }
 
 /// : `LDRB [X21,#0x80]; CMP #1` is the `bm1398_6x.rs:344` work-type tag.
@@ -6103,9 +7282,7 @@ pub fn admit_bosminer_plus80_is_work_type_tag() -> Result<(), &'static str> {
 }
 
 /// Fill RX is only defined for version-rolling work-type `1`.
-pub fn refuse_midstates_work_type_on_braiins_fill_rx(
-    work_type: u8,
-) -> Result<(), &'static str> {
+pub fn refuse_midstates_work_type_on_braiins_fill_rx(work_type: u8) -> Result<(), &'static str> {
     if work_type != BOSMINER_WORK_TYPE_VERSION_ROLLING {
         return Err("bm1398_6x.rs:344 BUG: Midstates work type in version-rolling mode");
     }
@@ -6114,7 +7291,7 @@ pub fn refuse_midstates_work_type_on_braiins_fill_rx(
 
 /// `pic0x88.rs` is an AM2 PIC firmware module, not engine+0x88.
 pub fn refuse_pic0x88_as_engine_plus88() -> Result<(), &'static str> {
-    Err("pic0x88.rs is AM2 PIC firmware; engine+0x88 is bm1398_6x nonce-fn ptr")
+    Err("pic0x88.rs is AM2 PIC firmware; BM1366 engine+0x88 is an attribution callback")
 }
 
 /// AM3 `LDRB [X0,#0x80]` is Future poll, not this work-type tag.
@@ -6147,9 +7324,7 @@ pub fn admit_bosminer_plus80_is_verwidth_tag() -> Result<(), &'static str> {
     if BOSMINER_VERWIDTH_CMP_INSN != 0x7100_051F {
         return Err("entry+4 is CMP #1");
     }
-    if BOSMINER_ENGINE_MIDSTATE_COUNT_OFF
-        != BOSMINER_ENGINE_VERWIDTH_SELF_OFF + 0x18
-    {
+    if BOSMINER_ENGINE_MIDSTATE_COUNT_OFF != BOSMINER_ENGINE_VERWIDTH_SELF_OFF + 0x18 {
         return Err("count at engine+0x78 = verwidth+0x18");
     }
     Ok(())
@@ -6545,8 +7720,11 @@ pub fn admit_bosminer_e02c_is_0x2a0_vtable_method(blob: &[u8]) -> Result<(), &'s
         if slot != BOSMINER_PROD_FN_VA {
             return Err("vtable method 0 is not FUN_0087e02c");
         }
-        let size = e02c_le_u64(blob, BOSMINER_E02C_VTABLE_VA[i] - BOSMINER_E02C_SIZE_BEFORE_SLOT)
-            .ok_or("bosminer shorter than e02c type size")?;
+        let size = e02c_le_u64(
+            blob,
+            BOSMINER_E02C_VTABLE_VA[i] - BOSMINER_E02C_SIZE_BEFORE_SLOT,
+        )
+        .ok_or("bosminer shorter than e02c type size")?;
         if size != BOSMINER_E02C_TYPE_SIZE as u64 {
             return Err("vtable size word is not 0x2a0");
         }
@@ -6669,7 +7847,7 @@ pub fn refuse_hashmap_plus88_as_engine_nonce_fn() -> Result<(), &'static str> {
         return Ok(());
     }
     Err(
-        "FUN_008787a8 walks self+0xC0 / +0xA8; method-0 LDR [map,#0x88] is not engine+0x88 nonce .text",
+        "FUN_008787a8 walks self+0xC0 / +0xA8; method-0 LDR [map,#0x88] is not the BM1366 attribution callback",
     )
 }
 
@@ -6895,9 +8073,7 @@ pub fn admit_bosminer_hashmap_x20_is_result_ok(blob: &[u8]) -> Result<(), &'stat
 
 /// `ADD X20,X19,#0x88` does not reach the family `STR`.
 pub fn refuse_hashmap_x20_as_dest_plus88_addr() -> Result<(), &'static str> {
-    Err(
-        "ADD X20,X19,#0x88 is overwritten; STR path is TBZ->LDP [SP,#0x118] after BL FUN_00861090",
-    )
+    Err("ADD X20,X19,#0x88 is overwritten; STR path is TBZ->LDP [SP,#0x118] after BL FUN_00861090")
 }
 
 /// `ADD X20,X19,#0x90` is on the TBZ-not-taken skip path.
@@ -7446,8 +8622,8 @@ pub fn admit_bosminer_fill_plus88_template_is_spawn_x24(blob: &[u8]) -> Result<(
     if sret != BOSMINER_SPAWN_SRET_ADD_INSN {
         return Err("0x87e144 is not ADD X8,SP,#0x68");
     }
-    let blr = engine88_le_u32(blob, BOSMINER_SPAWN_BLR_VA)
-        .ok_or("bosminer shorter than BLR X23")?;
+    let blr =
+        engine88_le_u32(blob, BOSMINER_SPAWN_BLR_VA).ok_or("bosminer shorter than BLR X23")?;
     if blr != BOSMINER_SPAWN_BLR_INSN {
         return Err("0x87e15c is not BLR X23");
     }
@@ -7551,8 +8727,8 @@ pub fn admit_bosminer_spawn_x23_is_payload_qword0(blob: &[u8]) -> Result<(), &'s
     if BOSMINER_SPAWN_MISS_PAYLOAD0_VA < 0x0178_EB88 {
         return Err("miss payload[0] typeinfo must be second LOAD");
     }
-    let tbz = engine88_le_u32(blob, BOSMINER_SPAWN_TBZ_VA)
-        .ok_or("bosminer shorter than TBZ W0,#0")?;
+    let tbz =
+        engine88_le_u32(blob, BOSMINER_SPAWN_TBZ_VA).ok_or("bosminer shorter than TBZ W0,#0")?;
     if tbz != BOSMINER_SPAWN_TBZ_INSN {
         return Err("0x87e08c is not TBZ W0,#0");
     }
@@ -7954,13 +9130,10 @@ pub fn refuse_ca00_as_factory4_type_tag() -> Result<(), &'static str> {
 
 /// Both worker_new monomorphs memcpy `#0x1a8` through `FUN_00bc8fe0`.
 pub fn admit_bosminer_worker_new_copy1a8_shared(blob: &[u8]) -> Result<(), &'static str> {
-    if BOSMINER_WORKER_NEW_FACTORY4_COPY1A8_VA
-        != BOSMINER_FACTORY4_WORKER_NEW_VA + 0x25C
-    {
+    if BOSMINER_WORKER_NEW_FACTORY4_COPY1A8_VA != BOSMINER_FACTORY4_WORKER_NEW_VA + 0x25C {
         return Err("factory4 #0x1a8 is worker_new+0x25c");
     }
-    if BOSMINER_WORKER_NEW_876_COPY1A8_VA != BOSMINER_FACTORY_876_WORKER_NEW_VA + 0x15C
-    {
+    if BOSMINER_WORKER_NEW_876_COPY1A8_VA != BOSMINER_FACTORY_876_WORKER_NEW_VA + 0x15C {
         return Err("876 #0x1a8 is worker_new+0x15c");
     }
     if BOSMINER_WORKER_NEW_876_MEMCPY_BL_VA
@@ -8188,8 +9361,8 @@ pub fn admit_bosminer_876_tail_15f8_is_arg0(blob: &[u8]) -> Result<(), &'static 
     if z != BOSMINER_WORKER_NEW_FACTORY4_MOVZ_1209_INSN {
         return Err("0x904e6c is not MOVZ W9,#0x1209");
     }
-    let cmp = engine88_le_u32(blob, BOSMINER_AF08_CMP_VA)
-        .ok_or("bosminer shorter than 0x2faf08 CMP")?;
+    let cmp =
+        engine88_le_u32(blob, BOSMINER_AF08_CMP_VA).ok_or("bosminer shorter than 0x2faf08 CMP")?;
     if cmp != BOSMINER_AF08_CMP_INSN {
         return Err("0xbc00b4 is not CMP X1,X8");
     }
@@ -8255,13 +9428,13 @@ pub fn admit_bosminer_factory_x23_is_self_and_bf33a4_is_70_box(
     if fr != BOSMINER_BF33A4_FRAME_INSN {
         return Err("0xbf33a4 is not SUB SP,#0x80");
     }
-    let sz = engine88_le_u32(blob, BOSMINER_BF33A4_SIZE_VA)
-        .ok_or("bosminer shorter than MOVZ #0x70")?;
+    let sz =
+        engine88_le_u32(blob, BOSMINER_BF33A4_SIZE_VA).ok_or("bosminer shorter than MOVZ #0x70")?;
     if sz != BOSMINER_BF33A4_SIZE_INSN {
         return Err("0xbf33e4 is not MOVZ W0,#0x70");
     }
-    let al = engine88_le_u32(blob, BOSMINER_BF33A4_ALIGN_VA)
-        .ok_or("bosminer shorter than MOVZ #8")?;
+    let al =
+        engine88_le_u32(blob, BOSMINER_BF33A4_ALIGN_VA).ok_or("bosminer shorter than MOVZ #8")?;
     if al != BOSMINER_BF33A4_ALIGN_INSN {
         return Err("0xbf33e8 is not MOVZ W1,#8");
     }
@@ -8313,9 +9486,7 @@ pub fn refuse_bf33a4_as_identity() -> Result<(), &'static str> {
 }
 
 /// 0x70 box fields: +0x10=X3, +0x18=W4, +0x20=self, +0x48=(X8,0), +0x60=(X1,X2); Q0 at +0.
-pub fn admit_bosminer_bf33a4_box_fields_and_1208_header(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_bf33a4_box_fields_and_1208_header(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_BF33A4_BL_HITS != 6 {
         return Err("FUN_00bf33a4 has 6 BL callers");
     }
@@ -8609,8 +9780,8 @@ pub fn admit_bosminer_887c34_is_98_box_and_q2_is_zero_shuffle(
     if BOSMINER_BBD3DC_BL_HITS != 11 {
         return Err("FUN_00bbd3dc has 11 BL callers");
     }
-    let fr = engine88_le_u32(blob, BOSMINER_887C34_FN_VA)
-        .ok_or("bosminer shorter than FUN_00887c34")?;
+    let fr =
+        engine88_le_u32(blob, BOSMINER_887C34_FN_VA).ok_or("bosminer shorter than FUN_00887c34")?;
     if fr != BOSMINER_887C34_FRAME_INSN {
         return Err("0x887c34 is not SUB SP,#0xb0");
     }
@@ -8634,8 +9805,8 @@ pub fn admit_bosminer_887c34_is_98_box_and_q2_is_zero_shuffle(
     if mv != BOSMINER_887C34_MOV_X1_X0_INSN {
         return Err("0x887cdc is not MOV X1,X0");
     }
-    let rt = engine88_le_u32(blob, BOSMINER_887C34_RET_VA)
-        .ok_or("bosminer shorter than 887c34 RET")?;
+    let rt =
+        engine88_le_u32(blob, BOSMINER_887C34_RET_VA).ok_or("bosminer shorter than 887c34 RET")?;
     if rt != BOSMINER_887C34_RET_INSN {
         return Err("0x887ce4 is not RET");
     }
@@ -8664,8 +9835,8 @@ pub fn admit_bosminer_887c34_is_98_box_and_q2_is_zero_shuffle(
     if se != BOSMINER_FACTORY4_STR_EC8_FROM600_INSN {
         return Err("0x904ab0 is not STR X8,[SP,#0xec8]");
     }
-    let z8 = engine88_le_u32(blob, BOSMINER_876_XZR_VA)
-        .ok_or("bosminer shorter than 876 MOV X0,XZR")?;
+    let z8 =
+        engine88_le_u32(blob, BOSMINER_876_XZR_VA).ok_or("bosminer shorter than 876 MOV X0,XZR")?;
     if z8 != BOSMINER_876_XZR_INSN {
         return Err("0x9036d0 is not MOV X0,XZR");
     }
@@ -8679,8 +9850,8 @@ pub fn admit_bosminer_887c34_is_98_box_and_q2_is_zero_shuffle(
     if s5 != BOSMINER_876_STR5E0_INSN {
         return Err("0x9036e8 is not STR X0,[SP,#0x5e0]");
     }
-    let cl = engine88_le_u32(blob, BOSMINER_BBD3DC_FN_VA)
-        .ok_or("bosminer shorter than FUN_00bbd3dc")?;
+    let cl =
+        engine88_le_u32(blob, BOSMINER_BBD3DC_FN_VA).ok_or("bosminer shorter than FUN_00bbd3dc")?;
     if cl != BOSMINER_BBD3DC_LDR_INSN {
         return Err("0xbbd3dc is not LDR X0,[X0]");
     }
@@ -8699,8 +9870,8 @@ pub fn admit_bosminer_887c34_is_98_box_and_q2_is_zero_shuffle(
     if l1 != BOSMINER_BBD3DC_LDAXR1_INSN {
         return Err("0xbbd3f8 is not LDAXR X1,[X8]");
     }
-    let cr = engine88_le_u32(blob, BOSMINER_BBD3DC_RET_VA)
-        .ok_or("bosminer shorter than bbd3dc RET")?;
+    let cr =
+        engine88_le_u32(blob, BOSMINER_BBD3DC_RET_VA).ok_or("bosminer shorter than bbd3dc RET")?;
     if cr != BOSMINER_BBD3DC_RET_INSN {
         return Err("0xbbd408 is not RET");
     }
@@ -8823,8 +9994,7 @@ pub fn refuse_98_arg58_as_7byte_prefix() -> Result<(), &'static str> {
 pub fn admit_bosminer_1af_prefix_unwritten_and_8_is_layout_align(
     blob: &[u8],
 ) -> Result<(), &'static str> {
-    if BOSMINER_FACTORY4_BLOB_SLOT - BOSMINER_FACTORY4_ARC_SLOT != BOSMINER_FACTORY4_ARC_BLOB_GAP
-    {
+    if BOSMINER_FACTORY4_BLOB_SLOT - BOSMINER_FACTORY4_ARC_SLOT != BOSMINER_FACTORY4_ARC_BLOB_GAP {
         return Err("factory4 Arc #0x840 is 0x20 before blob #0x860");
     }
     if BOSMINER_FACTORY4_BLOB860_STR_HITS != 0 {
@@ -8884,9 +10054,7 @@ pub fn refuse_factory4_prefix_as_887c34_arc() -> Result<(), &'static str> {
 
 /// The three usize 8s are Layout.align, not Vec capacity.
 pub fn refuse_8_as_vec_capacity() -> Result<(), &'static str> {
-    Err(
-        "STP XZR,X8 at +0x18/+0x38 and +0x60=0/+0x68=8 are Layout {size:0, align:8}, not Vec cap",
-    )
+    Err("STP XZR,X8 at +0x18/+0x38 and +0x60=0/+0x68=8 are Layout {size:0, align:8}, not Vec cap")
 }
 
 /// 0x1af is 7-byte padding after the u8 at +0x1208 plus the 0x1a8 payload at +0x1210.
@@ -9094,8 +10262,8 @@ pub fn admit_bosminer_c8_is_state_tag_and_1a8_is_registry(blob: &[u8]) -> Result
     if d4 != BOSMINER_FACTORY4_REGISTRY_WRAP_DEST_INSN {
         return Err("0x904674 is not ADD X19,SP,#0x370");
     }
-    let src = engine88_le_u32(blob, BOSMINER_876_1A8_SRC_VA)
-        .ok_or("bosminer shorter than 0x1a8 src")?;
+    let src =
+        engine88_le_u32(blob, BOSMINER_876_1A8_SRC_VA).ok_or("bosminer shorter than 0x1a8 src")?;
     if src != BOSMINER_876_1A8_SRC_INSN {
         return Err("0x1a8 memcpy src is the Registry wrap dest SP+#0x350");
     }
@@ -9121,9 +10289,7 @@ pub fn bosminer_c8_async_tag_name(tag: u8) -> Option<&'static str> {
 }
 
 /// +0xC8 tags 1/2/3 are rustc async poll states of `command.rs:700`.
-pub fn admit_bosminer_c8_tags_are_command_rs_async_poll(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_c8_tags_are_command_rs_async_poll(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_HAL_COMMAND_RS.len() != BOSMINER_HAL_COMMAND_RS_LEN {
         return Err("command.rs path length drifted");
     }
@@ -9139,7 +10305,9 @@ pub fn admit_bosminer_c8_tags_are_command_rs_async_poll(
     if BOSMINER_ASYNC_PANIC_MSG.len() != BOSMINER_ASYNC_PANIC_MSG_LEN {
         return Err("panicked-resume panic string length drifted");
     }
-    if BOSMINER_C8_TAG_COMPLETED != 1 || BOSMINER_C8_TAG_PANICKED != 2 || BOSMINER_C8_TAG_SUSPENDED != 3
+    if BOSMINER_C8_TAG_COMPLETED != 1
+        || BOSMINER_C8_TAG_PANICKED != 2
+        || BOSMINER_C8_TAG_SUSPENDED != 3
     {
         return Err("async tag values drifted");
     }
@@ -9198,18 +10366,18 @@ pub fn admit_bosminer_c8_tags_are_command_rs_async_poll(
     if ret1 != BOSMINER_C8_PENDING_RET_INSN {
         return Err("0x8d69e0 is not MOVZ W0,#1 before SET3 Suspended");
     }
-    let set1 = engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET1_VA)
-        .ok_or("bosminer shorter than SET1")?;
+    let set1 =
+        engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET1_VA).ok_or("bosminer shorter than SET1")?;
     if set1 != BOSMINER_HASHCHAIN_C8_SET1_INSN {
         return Err("0x8d69bc is not MOVZ W8,#1 (Completed)");
     }
-    let set2 = engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET2_VA)
-        .ok_or("bosminer shorter than SET2")?;
+    let set2 =
+        engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET2_VA).ok_or("bosminer shorter than SET2")?;
     if set2 != BOSMINER_HASHCHAIN_C8_SET2_INSN {
         return Err("0x8d6a84 is not MOVZ W8,#2 (Panicked)");
     }
-    let set3 = engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET3_VA)
-        .ok_or("bosminer shorter than SET3")?;
+    let set3 =
+        engine88_le_u32(blob, BOSMINER_HASHCHAIN_C8_SET3_VA).ok_or("bosminer shorter than SET3")?;
     if set3 != BOSMINER_HASHCHAIN_C8_SET3_INSN {
         return Err("0x8d69dc is not MOVZ W8,#3 (Suspended)");
     }
@@ -9306,18 +10474,15 @@ pub fn refuse_c8_async_as_named_write_register() -> Result<(), &'static str> {
 pub fn admit_bosminer_plus230_is_ctx_ptr_and_1a8_wrap_fields(
     blob: &[u8],
 ) -> Result<(), &'static str> {
-    if BOSMINER_C8_FUTURE_OFF_BM1366 + BOSMINER_WORKER_NEW_ARG1_C8
-        != BOSMINER_C8_FUT_PLUS_C8_BM1366
+    if BOSMINER_C8_FUTURE_OFF_BM1366 + BOSMINER_WORKER_NEW_ARG1_C8 != BOSMINER_C8_FUT_PLUS_C8_BM1366
     {
         return Err("0x30+0xC8 must be caller +0xF8");
     }
-    if BOSMINER_C8_FUTURE_OFF_BM136X + BOSMINER_WORKER_NEW_ARG1_C8
-        != BOSMINER_C8_FUT_PLUS_C8_BM136X
+    if BOSMINER_C8_FUTURE_OFF_BM136X + BOSMINER_WORKER_NEW_ARG1_C8 != BOSMINER_C8_FUT_PLUS_C8_BM136X
     {
         return Err("0x70+0xC8 must be caller +0x138");
     }
-    if BOSMINER_C8_FUTURE_OFF_BM1397 + BOSMINER_WORKER_NEW_ARG1_C8
-        != BOSMINER_C8_FUT_PLUS_C8_BM1397
+    if BOSMINER_C8_FUTURE_OFF_BM1397 + BOSMINER_WORKER_NEW_ARG1_C8 != BOSMINER_C8_FUT_PLUS_C8_BM1397
     {
         return Err("0x18+0xC8 must be caller +0xE0");
     }
@@ -9428,9 +10593,7 @@ pub fn refuse_plus230_as_vtable_or_1a8_end_as_interior() -> Result<(), &'static 
 }
 
 /// HashChain+0x230 is constructed as usize 0x10; wrap +0x118/+0x168 are 32 B SIMD copies.
-pub fn admit_bosminer_plus230_init_usize10_and_wrap_simd(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_plus230_init_usize10_and_wrap_simd(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_HC_PLUS230_INIT_LINE != 323 || BOSMINER_HC_PLUS230_INIT_COL != 73 {
         return Err("hashchain.rs:323:73 loc drifted");
     }
@@ -9501,8 +10664,8 @@ pub fn admit_bosminer_plus230_init_usize10_and_wrap_simd(
     if stp168 != BOSMINER_WRAP_SIMD_168_STP_INSN {
         return Err("0xbf7998 is not STP Q [X9,#0] (dest+0x168)");
     }
-    let p158 = engine88_le_u32(blob, BOSMINER_WRAP_STP158_VA)
-        .ok_or("bosminer shorter than STP #0x158")?;
+    let p158 =
+        engine88_le_u32(blob, BOSMINER_WRAP_STP158_VA).ok_or("bosminer shorter than STP #0x158")?;
     if p158 != BOSMINER_WRAP_STP158_INSN {
         return Err("0xbf7960 is not STP X21,X20,[X23,#0x158]");
     }
@@ -9703,13 +10866,10 @@ pub fn admit_bosminer_c0d4ac_is_48_and_37_split_fpga_uart_wrap(
     if BOSMINER_C0D4AC_SIZE != 0x48 {
         return Err("c0d4ac object size must stay 0x48");
     }
-    if BOSMINER_C0D4AC_FPGA_SECOND_DEST - BOSMINER_C0D4AC_FPGA_FIRST_DEST
-        != BOSMINER_C0D4AC_SIZE
-    {
+    if BOSMINER_C0D4AC_FPGA_SECOND_DEST - BOSMINER_C0D4AC_FPGA_FIRST_DEST != BOSMINER_C0D4AC_SIZE {
         return Err("FPGA dest stride 0x110-0xc8 must be 0x48");
     }
-    if BOSMINER_C0D4AC_FPGA_LAST_DEST - BOSMINER_C0D4AC_FPGA_FIRST_DEST
-        != BOSMINER_C0D4AC_SIZE * 5
+    if BOSMINER_C0D4AC_FPGA_LAST_DEST - BOSMINER_C0D4AC_FPGA_FIRST_DEST != BOSMINER_C0D4AC_SIZE * 5
     {
         return Err("FPGA last dest 0x230 must be first+5*0x48");
     }
@@ -9948,8 +11108,8 @@ pub fn admit_bosminer_c0d4ac_is_copy_and_workpair_is_wrap_sibling(
     if ret != BOSMINER_WORKPAIR_RET_INSN {
         return Err("0xbf7568 is not workpair RET");
     }
-    let wrap = engine88_le_u32(blob, BOSMINER_WRAP_FN_START_VA)
-        .ok_or("bosminer shorter than wrap STP")?;
+    let wrap =
+        engine88_le_u32(blob, BOSMINER_WRAP_FN_START_VA).ok_or("bosminer shorter than wrap STP")?;
     if wrap != 0xA9BA_7BFD {
         return Err("0xbf7798 is not wrap STP prologue");
     }
@@ -9958,8 +11118,8 @@ pub fn admit_bosminer_c0d4ac_is_copy_and_workpair_is_wrap_sibling(
     if sw != BOSMINER_C0D4E0_LDRB_INSN {
         return Err("0xc0d4e0 is not LDRB swap start");
     }
-    let sbl = engine88_le_u32(blob, BOSMINER_C0D4E0_BL_VA)
-        .ok_or("bosminer shorter than 0xc0d4e0 BL")?;
+    let sbl =
+        engine88_le_u32(blob, BOSMINER_C0D4E0_BL_VA).ok_or("bosminer shorter than 0xc0d4e0 BL")?;
     if sbl != BOSMINER_C0D4E0_BL_INSN {
         return Err("0x4238a0 is not the unique BL 0xc0d4e0");
     }
@@ -9993,8 +11153,8 @@ pub fn admit_bosminer_230_is_vt40_x0_and_poll_stores_fut40(
     if BOSMINER_HASHCHAIN_TICKET_ADRP_VA <= BOSMINER_HC_PLUS230_CONSUMER_BLR_VA {
         return Err("ticket-mask :298 must be a later jump-table state than the +0x230 BLR");
     }
-    if BOSMINER_AM2_BAUD_STRB_FN_VA != 0x0083_6934 {
-        return Err("FUN_00836934 set-baud constructor VA drifted");
+    if BOSMINER_TICKET_MASK_STRB_FN_VA != 0x0083_6934 {
+        return Err("FUN_00836934 ticket-mask future VA drifted");
     }
     if BOSMINER_C8_FUT10_STR_VA != BOSMINER_POLL_FUT40_STR_VA
         || BOSMINER_C8_FUT10_STR_INSN != BOSMINER_POLL_FUT40_STR_INSN
@@ -10021,8 +11181,8 @@ pub fn admit_bosminer_230_is_vt40_x0_and_poll_stores_fut40(
     if ret != BOSMINER_HC_PLUS230_RET_INSN {
         return Err("0x836ca8 is not RET");
     }
-    let br = engine88_le_u32(blob, BOSMINER_JUMP_TABLE_BR_VA)
-        .ok_or("bosminer shorter than BR X10")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_JUMP_TABLE_BR_VA).ok_or("bosminer shorter than BR X10")?;
     if br != BOSMINER_JUMP_TABLE_BR_INSN {
         return Err("0x836e78 is not BR X10 jump table");
     }
@@ -10106,8 +11266,7 @@ pub fn admit_bosminer_238_is_fat_vtable_and_clone_installs_pair(
     if BOSMINER_HC_PLUS230_VT_OFF != 0x40 {
         return Err("Wave-195 slot +0x40 must remain one of the 7");
     }
-    let blr = engine88_le_u32(blob, BOSMINER_FAT_BLR_VA)
-        .ok_or("bosminer shorter than BLR X23")?;
+    let blr = engine88_le_u32(blob, BOSMINER_FAT_BLR_VA).ok_or("bosminer shorter than BLR X23")?;
     if blr != BOSMINER_FAT_BLR_INSN {
         return Err("0x835308 is not BLR X23");
     }
@@ -10341,26 +11500,23 @@ pub fn admit_bosminer_fat_pairs_are_dyn_future_poll18_not_cmd700(
         if ldr != BOSMINER_DYN_FUT_POLL18_INSN {
             return Err("a dyn-poll site is not LDR X9,[X1,#0x18]");
         }
-        let nxt = engine88_le_u32(blob, va + 4)
-            .ok_or("bosminer shorter than dyn poll +4")?;
+        let nxt = engine88_le_u32(blob, va + 4).ok_or("bosminer shorter than dyn poll +4")?;
         let (sret_off, mov_off, blr_off) = if nxt == BOSMINER_DYN_FUT_SRET_INSN {
             (4, 8, 12)
         } else {
             // +0x28 join inserts LDUR between LDR and ADD
             (8, 12, 16)
         };
-        let sret = engine88_le_u32(blob, va + sret_off)
-            .ok_or("bosminer shorter than dyn poll sret")?;
+        let sret =
+            engine88_le_u32(blob, va + sret_off).ok_or("bosminer shorter than dyn poll sret")?;
         if sret != BOSMINER_DYN_FUT_SRET_INSN {
             return Err("dyn-poll site is not ADD X8,SP,#0x160");
         }
-        let mv = engine88_le_u32(blob, va + mov_off)
-            .ok_or("bosminer shorter than dyn poll MOV")?;
+        let mv = engine88_le_u32(blob, va + mov_off).ok_or("bosminer shorter than dyn poll MOV")?;
         if mv != BOSMINER_DYN_FUT_CX_MOV_INSN {
             return Err("dyn-poll site is not MOV X1,X21");
         }
-        let br = engine88_le_u32(blob, va + blr_off)
-            .ok_or("bosminer shorter than dyn poll BLR")?;
+        let br = engine88_le_u32(blob, va + blr_off).ok_or("bosminer shorter than dyn poll BLR")?;
         if br != BOSMINER_DYN_FUT_BLR_INSN {
             return Err("dyn-poll site is not BLR X9");
         }
@@ -10396,9 +11552,7 @@ pub fn refuse_fat_pairs_as_result_or_cmd700_poll() -> Result<(), &'static str> {
 }
 
 /// Poll sret is 0x20 B; word0==9 is Pending; Ready T is 24 B at +0x168.
-pub fn admit_bosminer_poll_sret20_pending9_t_at_168(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_poll_sret20_pending9_t_at_168(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_POLL_PENDING_TAG != 9 {
         return Err("Poll Pending tag must stay 9");
     }
@@ -10444,8 +11598,7 @@ pub fn admit_bosminer_poll_sret20_pending9_t_at_168(
     if t170 != BOSMINER_POLL_T170_Q_INSN {
         return Err("0x83710c is not LDR Q0,[SP,#0x170]");
     }
-    let mz = engine88_le_u32(blob, 0x0083_6F84)
-        .ok_or("bosminer shorter than Pending MOVZ #9")?;
+    let mz = engine88_le_u32(blob, 0x0083_6F84).ok_or("bosminer shorter than Pending MOVZ #9")?;
     if mz != BOSMINER_POLL_PENDING_MOVZ9_INSN {
         return Err("0x836f84 is not MOVZ W8,#9");
     }
@@ -10469,9 +11622,7 @@ pub fn s19k_bosminer_poll_word0_arm(tag: u64) -> &'static str {
 }
 
 /// Pending==9 writes outer sret and RETs; Ready==8 continues; other packages T and RETs.
-pub fn admit_bosminer_poll_tag8_ok_tag9_pending_ret(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_poll_tag8_ok_tag9_pending_ret(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_POLL_READY_OK_TAG != 8 {
         return Err("Ready-continue tag must stay 8");
     }
@@ -10653,9 +11804,7 @@ pub fn s19k_bosminer_831314_tag_arm(tag: u8) -> &'static str {
 }
 
 /// `FUN_00831314` is a +0x10-tag drop dispatcher; 2 BLs both pass X22.
-pub fn admit_bosminer_831314_is_tag10_drop_dispatcher(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_831314_is_tag10_drop_dispatcher(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FN831314_VA != BOSMINER_SLOT28_PRELUDE_BL_TARGET {
         return Err("831314 VA must stay the +0x28 prelude BL target");
     }
@@ -10688,8 +11837,8 @@ pub fn admit_bosminer_831314_is_tag10_drop_dispatcher(
     if s19k_bosminer_831314_tag_arm(0) != "ret_noop" {
         return Err("other-tag arm");
     }
-    let ent = engine88_le_u32(blob, BOSMINER_FN831314_VA)
-        .ok_or("bosminer shorter than 831314 entry")?;
+    let ent =
+        engine88_le_u32(blob, BOSMINER_FN831314_VA).ok_or("bosminer shorter than 831314 entry")?;
     if ent != BOSMINER_FN831314_ENTRY_INSN {
         return Err("0x831314 is not STR X30,[SP,#-0x20]!");
     }
@@ -10703,13 +11852,13 @@ pub fn admit_bosminer_831314_is_tag10_drop_dispatcher(
     if ldb != BOSMINER_FN831314_LDRB10_INSN {
         return Err("0x83131c is not LDRB [X0,#0x10]");
     }
-    let c4 = engine88_le_u32(blob, BOSMINER_FN831314_CMP4_VA)
-        .ok_or("bosminer shorter than CMP #4")?;
+    let c4 =
+        engine88_le_u32(blob, BOSMINER_FN831314_CMP4_VA).ok_or("bosminer shorter than CMP #4")?;
     if c4 != BOSMINER_FN831314_CMP4_INSN {
         return Err("0x831320 is not CMP W8,#4");
     }
-    let c3 = engine88_le_u32(blob, BOSMINER_FN831314_CMP3_VA)
-        .ok_or("bosminer shorter than CMP #3")?;
+    let c3 =
+        engine88_le_u32(blob, BOSMINER_FN831314_CMP3_VA).ok_or("bosminer shorter than CMP #3")?;
     if c3 != BOSMINER_FN831314_CMP3_INSN {
         return Err("0x831328 is not CMP W8,#3");
     }
@@ -10775,9 +11924,7 @@ pub fn s19k_bosminer_drop_sib_tag_off(fn_va: u64) -> Option<u16> {
 }
 
 /// 831d18 / 831668 are isomorphic drop helpers at different field offsets.
-pub fn admit_bosminer_831d18_831668_are_drop_siblings(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_831d18_831668_are_drop_siblings(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FN831D18_VA != BOSMINER_FN831314_TAG46_TARGET {
         return Err("831d18 must stay the tag4/6 tail target");
     }
@@ -10918,26 +12065,25 @@ pub fn admit_bosminer_11f2764_is_refcount_helper_jt68_from_240(
     if BOSMINER_FN11F26F8_TO_764_DELTA != 0x6C {
         return Err("11f26f8 must stay 0x6c before 11f2764");
     }
-    if BOSMINER_F11F26F8_FN_VA + u64::from(BOSMINER_FN11F26F8_TO_764_DELTA)
-        != BOSMINER_FN11F2764_VA
+    if BOSMINER_F11F26F8_FN_VA + u64::from(BOSMINER_FN11F26F8_TO_764_DELTA) != BOSMINER_FN11F2764_VA
     {
         return Err("11f26f8+0x6c must be 11f2764");
     }
     if BOSMINER_JT_PLUS108_OFF != 0x108 {
         return Err("+0x108 tag off drifted");
     }
-    let cbz = engine88_le_u32(blob, BOSMINER_FN11F2764_VA)
-        .ok_or("bosminer shorter than 11f2764 CBZ")?;
+    let cbz =
+        engine88_le_u32(blob, BOSMINER_FN11F2764_VA).ok_or("bosminer shorter than 11f2764 CBZ")?;
     if cbz != BOSMINER_FN11F2764_CBZ_INSN {
         return Err("0x11f2764 is not CBZ X1,RET");
     }
-    let ldx = engine88_le_u32(blob, BOSMINER_FN11F2764_LDXR_VA)
-        .ok_or("bosminer shorter than LDXR")?;
+    let ldx =
+        engine88_le_u32(blob, BOSMINER_FN11F2764_LDXR_VA).ok_or("bosminer shorter than LDXR")?;
     if ldx != BOSMINER_FN11F2764_LDXR_INSN {
         return Err("0x11f2770 is not LDXR W8,[X0]");
     }
-    let cbnz = engine88_le_u32(blob, BOSMINER_FN11F2764_CBNZ0_VA)
-        .ok_or("bosminer shorter than CBNZ")?;
+    let cbnz =
+        engine88_le_u32(blob, BOSMINER_FN11F2764_CBNZ0_VA).ok_or("bosminer shorter than CBNZ")?;
     if cbnz != BOSMINER_FN11F2764_CBNZ0_INSN {
         return Err("0x11f277c is not CBNZ W8,overflow");
     }
@@ -10946,8 +12092,8 @@ pub fn admit_bosminer_11f2764_is_refcount_helper_jt68_from_240(
     if mz1 != BOSMINER_FN11F2764_STXR1_MOVZ_INSN {
         return Err("0x11f2780 is not MOVZ W8,#1");
     }
-    let stxr = engine88_le_u32(blob, BOSMINER_FN11F2764_STXR_VA)
-        .ok_or("bosminer shorter than STXR")?;
+    let stxr =
+        engine88_le_u32(blob, BOSMINER_FN11F2764_STXR_VA).ok_or("bosminer shorter than STXR")?;
     if stxr != BOSMINER_FN11F2764_STXR_INSN {
         return Err("0x11f2784 is not STXR");
     }
@@ -11002,9 +12148,7 @@ pub fn s19k_bosminer_121e588_tls_off() -> u16 {
 }
 
 /// `FUN_0121e588` is parking_lot TLS get; 11f2764 is not Arc inc/drop.
-pub fn admit_bosminer_121e588_is_parking_lot_tls(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_121e588_is_parking_lot_tls(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FN121E588_TLS_OFF != 0x280 {
         return Err("TLS offset must stay 0x280");
     }
@@ -11033,8 +12177,8 @@ pub fn admit_bosminer_121e588_is_parking_lot_tls(
     if mv != BOSMINER_FN121E588_MOV_X19_INSN {
         return Err("0x121e594 is not MOV X19,X0");
     }
-    let mz = engine88_le_u32(blob, BOSMINER_FN121E588_MOVZ_VA)
-        .ok_or("bosminer shorter than MOVZ X0")?;
+    let mz =
+        engine88_le_u32(blob, BOSMINER_FN121E588_MOVZ_VA).ok_or("bosminer shorter than MOVZ X0")?;
     if mz != BOSMINER_FN121E588_MOVZ_INSN {
         return Err("0x121e59c is not MOVZ X0,#0,LSL#16");
     }
@@ -11058,13 +12202,13 @@ pub fn admit_bosminer_121e588_is_parking_lot_tls(
     if ldr != BOSMINER_FN121E588_LDR_INSN {
         return Err("0x121e5b4 is not LDR X9,[X20],#8");
     }
-    let c1 = engine88_le_u32(blob, BOSMINER_FN121E588_CMP1_VA)
-        .ok_or("bosminer shorter than CMP #1")?;
+    let c1 =
+        engine88_le_u32(blob, BOSMINER_FN121E588_CMP1_VA).ok_or("bosminer shorter than CMP #1")?;
     if c1 != BOSMINER_FN121E588_CMP1_INSN {
         return Err("0x121e5b8 is not CMP X9,#1");
     }
-    let c2 = engine88_le_u32(blob, BOSMINER_FN121E588_CMP2_VA)
-        .ok_or("bosminer shorter than CMP #2")?;
+    let c2 =
+        engine88_le_u32(blob, BOSMINER_FN121E588_CMP2_VA).ok_or("bosminer shorter than CMP #2")?;
     if c2 != BOSMINER_FN121E588_CMP2_INSN {
         return Err("0x121e5c0 is not CMP X9,#2");
     }
@@ -11104,9 +12248,7 @@ pub fn s19k_bosminer_slot28_extra_x1() -> bool {
 }
 
 /// +0x28 BLR is the unique zero-arg fat Future call in the jump table.
-pub fn admit_bosminer_slot28_is_zero_arg_fat_future(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_slot28_is_zero_arg_fat_future(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FAT_SLOT28_PATTERN_HITS != 1 {
         return Err("fat+0x28 pattern must stay unique in the jump table");
     }
@@ -11145,8 +12287,8 @@ pub fn admit_bosminer_slot28_is_zero_arg_fat_future(
     if mth != BOSMINER_VT_SLOT_28_LDR_INSN {
         return Err("0x8389f8 is not LDR X8,[X9,#0x28]");
     }
-    let br = engine88_le_u32(blob, BOSMINER_FAT_SLOT28_BLR_VA)
-        .ok_or("bosminer shorter than BLR X8")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_FAT_SLOT28_BLR_VA).ok_or("bosminer shorter than BLR X8")?;
     if br != BOSMINER_FAT_SLOT28_BLR_INSN {
         return Err("0x8389fc is not BLR X8");
     }
@@ -11176,9 +12318,7 @@ pub fn s19k_bosminer_slot30_extra_x1() -> bool {
 }
 
 /// +0x30 BLR is the unique X1-taking fat Future call in the jump table.
-pub fn admit_bosminer_slot30_is_x1_arg_fat_future(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_slot30_is_x1_arg_fat_future(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FAT_SLOT30_PATTERN_HITS != 1 {
         return Err("fat+0x30 pattern must stay unique in the jump table");
     }
@@ -11228,8 +12368,8 @@ pub fn admit_bosminer_slot30_is_x1_arg_fat_future(
     if mth != BOSMINER_VT_SLOT_30_LDR_INSN {
         return Err("0x837bc8 is not LDR X8,[X9,#0x30]");
     }
-    let br = engine88_le_u32(blob, BOSMINER_FAT_SLOT30_BLR_VA)
-        .ok_or("bosminer shorter than BLR X8")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_FAT_SLOT30_BLR_VA).ok_or("bosminer shorter than BLR X8")?;
     if br != BOSMINER_FAT_SLOT30_BLR_INSN {
         return Err("0x837bcc is not BLR X8");
     }
@@ -11269,9 +12409,7 @@ pub fn s19k_bosminer_frame10_str_hits() -> usize {
 }
 
 /// Slot +0x30 X1 is poll-self frame+0x10 (construct-time capture).
-pub fn admit_bosminer_slot30_x1_is_poll_self_frame10(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_slot30_x1_is_poll_self_frame10(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FRAME10_STR_HITS != 0 {
         return Err("jump-table must keep 0 STR [X19,#0x10]");
     }
@@ -11294,8 +12432,8 @@ pub fn admit_bosminer_slot30_x1_is_poll_self_frame10(
     if slf != BOSMINER_JT_POLL_X19_MOV_INSN {
         return Err("0x836e74 is not MOV X19,X0");
     }
-    let br = engine88_le_u32(blob, BOSMINER_JUMP_TABLE_BR_VA)
-        .ok_or("bosminer shorter than BR X10")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_JUMP_TABLE_BR_VA).ok_or("bosminer shorter than BR X10")?;
     if br != BOSMINER_JUMP_TABLE_BR_INSN {
         return Err("0x836e78 is not BR X10");
     }
@@ -11400,8 +12538,8 @@ pub fn admit_bosminer_slot38_is_zero_arg_family_b_fat_future(
     if mth != BOSMINER_VT_SLOT_38_LDR_INSN {
         return Err("0x837668 is not LDR X8,[X9,#0x38]");
     }
-    let br = engine88_le_u32(blob, BOSMINER_FAT_SLOT38_BLR_VA)
-        .ok_or("bosminer shorter than BLR X8")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_FAT_SLOT38_BLR_VA).ok_or("bosminer shorter than BLR X8")?;
     if br != BOSMINER_FAT_SLOT38_BLR_INSN {
         return Err("0x83766c is not BLR X8");
     }
@@ -11576,8 +12714,8 @@ pub fn admit_bosminer_slot48_is_zero_arg_immediate_fat_future(
     if mth != BOSMINER_VT_SLOT_48_LDR_INSN {
         return Err("0x83862c is not LDR X8,[X9,#0x48]");
     }
-    let br = engine88_le_u32(blob, BOSMINER_FAT_SLOT48_BLR_VA)
-        .ok_or("bosminer shorter than BLR")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_FAT_SLOT48_BLR_VA).ok_or("bosminer shorter than BLR")?;
     if br != BOSMINER_FAT_SLOT48_BLR_INSN {
         return Err("0x838630 is not BLR X8");
     }
@@ -11607,9 +12745,7 @@ pub fn s19k_bosminer_slot78_extra_x1() -> bool {
 }
 
 /// +0x78 BLR is the unique Family-B fat Future with LDP prelude.
-pub fn admit_bosminer_slot78_is_ldp_family_b_fat_future(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_slot78_is_ldp_family_b_fat_future(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FAT_SLOT78_PATTERN_HITS != 1 {
         return Err("fat+0x78 pattern must stay unique");
     }
@@ -11648,8 +12784,8 @@ pub fn admit_bosminer_slot78_is_ldp_family_b_fat_future(
     if mth != BOSMINER_VT_SLOT_78_LDR_INSN {
         return Err("0x837dd8 is not LDR X8,[X9,#0x78]");
     }
-    let br = engine88_le_u32(blob, BOSMINER_FAT_SLOT78_BLR_VA)
-        .ok_or("bosminer shorter than BLR")?;
+    let br =
+        engine88_le_u32(blob, BOSMINER_FAT_SLOT78_BLR_VA).ok_or("bosminer shorter than BLR")?;
     if br != BOSMINER_FAT_SLOT78_BLR_INSN {
         return Err("0x837ddc is not BLR X8");
     }
@@ -11689,9 +12825,7 @@ pub fn s19k_bosminer_future18_jt_str_hits() -> usize {
 }
 
 /// Future+0x18 is the construct-time fat-host pointer consumed by +0x40.
-pub fn admit_bosminer_future18_is_construct_time_fat_host(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_future18_is_construct_time_fat_host(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FUTURE18_JT_STR_HITS != 0 {
         return Err("jump-table must keep 0 STR [X19,#0x18]");
     }
@@ -11817,9 +12951,7 @@ pub fn s19k_bosminer_clone_x0_is_future18() -> bool {
 }
 
 /// Clone fills its own SP+#8 template: X0→+0x18, 0→+0x21, W1→+0x22.
-pub fn admit_bosminer_clone_fills_sp8_x0_as_future18(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_clone_fills_sp8_x0_as_future18(blob: &[u8]) -> Result<(), &'static str> {
     if !s19k_bosminer_clone_x0_is_future18() {
         return Err("SP+#0x20 must be template+0x18");
     }
@@ -11882,9 +13014,7 @@ pub fn s19k_bosminer_slot50_is_poll_tag9() -> bool {
 }
 
 /// Fat-slot +0x50 is the unique sret method: host from frame+0x30, X1 from +0x38.
-pub fn admit_bosminer_slot50_is_sret_host30_x1_38(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_slot50_is_sret_host30_x1_38(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_FAT_SLOT50_PATTERN_HITS != 0 {
         return Err("+0x50 exact fat pattern hits must stay 0");
     }
@@ -12006,7 +13136,7 @@ pub fn admit_bosminer_owner260_drop_has_fat230() -> Result<(), &'static str> {
 /// 0x260 owner is not HashChain and not a named Hashboard type.
 pub fn refuse_owner260_as_hashchain_or_named_hashboard() -> Result<(), &'static str> {
     Err(
-        "0x260 owner drop is FUN_00873d10 (vtable 0x19c1798): LDR +0x240 then fat pair +0x238/+0x230. Unique boxer at 0x87e394 MOVZ #0x260/#0x10, ADD #0x798, STP (box, vt) at [X20,#0x10]. Not HashChain — FUN_00836934 STR #0x260 is the baud-Future fn-ptr field, so HashChain is larger than 0x260. Adjacent strings Hashboard / : not present and hardware.rs:200:14 are a panic/log loc (BL 0x4536b0), not a rust type name",
+        "0x260 owner drop is FUN_00873d10 (vtable 0x19c1798): LDR +0x240 then fat pair +0x238/+0x230. Unique boxer at 0x87e394 MOVZ #0x260/#0x10, ADD #0x798, STP (box, vt) at [X20,#0x10]. Not HashChain — FUN_00836934 STR #0x260 is the ticket-mask-Future fn-ptr field, so HashChain is larger than 0x260. Adjacent strings Hashboard / : not present and hardware.rs:200:14 are a panic/log loc (BL 0x4536b0), not a rust type name",
     )
 }
 
@@ -12016,9 +13146,7 @@ pub fn s19k_bosminer_40c2c4_bl_hits() -> usize {
 }
 
 /// FUN_0040c2c4 has 4 BLs; three jump-table arms pass SP+#0x160.
-pub fn admit_bosminer_40c2c4_has_4_bls_three_jt160(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_40c2c4_has_4_bls_three_jt160(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_SLOT50_CONV_BL_HITS != 4 {
         return Err("0x40c2c4 BL census must stay 4");
     }
@@ -12083,9 +13211,7 @@ pub fn s19k_bosminer_future10_is_context() -> bool {
 }
 
 /// First explicit Future+0x10 writer is poll-time copy of Future+0x48.
-pub fn admit_bosminer_future10_writer_is_poll_copy48(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_future10_writer_is_poll_copy48(blob: &[u8]) -> Result<(), &'static str> {
     if s19k_bosminer_future10_is_context() {
         return Err("Future+0x10 must not be claimed as Context");
     }
@@ -12155,9 +13281,7 @@ pub fn s19k_bosminer_mutex_lock_poll_bl_hits() -> usize {
 }
 
 /// Future+0x48 is an inlined tokio-1.45.1 Mutex::lock future.
-pub fn admit_bosminer_future48_is_tokio_mutex_lock(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_future48_is_tokio_mutex_lock(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_MUTEX_LOCK_POLL_BL_HITS != 9 {
         return Err("0x834f34 BL census must stay 9");
     }
@@ -12271,9 +13395,7 @@ pub fn s19k_bosminer_host240_ctor70_str_hits() -> usize {
 }
 
 /// Fat-host +0x240 is a pointer to a 0x70 heap object; Mutex is at +0x28.
-pub fn admit_bosminer_host240_is_70_ptr_mutex_at_28(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_host240_is_70_ptr_mutex_at_28(blob: &[u8]) -> Result<(), &'static str> {
     if s19k_bosminer_host240_is_mutex() {
         return Err("host+0x240 must not be claimed as the Mutex");
     }
@@ -12379,9 +13501,7 @@ pub fn s19k_bosminer_host248_is_arc() -> bool {
 }
 
 /// +0x10 is the common projection; +0x28 is lock-construct-only; +0x248 sibling.
-pub fn admit_bosminer_host240_plus10_is_common_proj(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_host240_plus10_is_common_proj(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_HOST240_ADD10_HITS != 12 {
         return Err("JT +0x10 projection census must stay 12");
     }
@@ -12427,8 +13547,8 @@ pub fn admit_bosminer_host240_plus10_is_common_proj(
     if alt_st != BOSMINER_HOST240_ALT48_STR_INSN {
         return Err("0x837174 is not STR [X19,#0x48]");
     }
-    let join = engine88_le_u32(blob, BOSMINER_FUTURE10_JOIN_B_VA)
-        .ok_or("bosminer shorter than join B")?;
+    let join =
+        engine88_le_u32(blob, BOSMINER_FUTURE10_JOIN_B_VA).ok_or("bosminer shorter than join B")?;
     if join != BOSMINER_FUTURE10_JOIN_B_INSN {
         return Err("0x837178 is not B 0x8372e8");
     }
@@ -12547,9 +13667,7 @@ pub fn s19k_bosminer_9247b0_elem_is_mutex() -> bool {
 }
 
 /// *248 last-weak inner is 0x30; lock() &self stays on the 0x70 *240 object.
-pub fn admit_bosminer_host248_inner_is_30_not_70(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_host248_inner_is_30_not_70(blob: &[u8]) -> Result<(), &'static str> {
     if s19k_bosminer_9247b0_elem_is_mutex() {
         return Err("0x9247b0 elements must not be claimed as Mutex");
     }
@@ -13075,9 +14193,7 @@ pub fn s19k_bosminer_hashmap_v_type_named() -> bool {
 }
 
 /// HashMap `V` is 0x18 with spawn fn at +0 and factory method at +8.
-pub fn admit_bosminer_hashmap_v_is_18_spawn0_factory8(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_hashmap_v_is_18_spawn0_factory8(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_HASHMAP_INSERT_VALUE_SIZE != 0x18 {
         return Err("HashMap V size must stay 0x18");
     }
@@ -13181,8 +14297,8 @@ pub fn admit_bosminer_hashmap_v_is_18_spawn0_factory8(
     if BOSMINER_VT0_RET_INSN != 0xD65F_03C0 {
         return Err("vt0 RET word");
     }
-    let tbnz = engine88_le_u32(blob, BOSMINER_SPAWN_TBZ_VA)
-        .ok_or("bosminer shorter than spawn TBNZ")?;
+    let tbnz =
+        engine88_le_u32(blob, BOSMINER_SPAWN_TBZ_VA).ok_or("bosminer shorter than spawn TBNZ")?;
     if tbnz != BOSMINER_SPAWN_TBZ_INSN {
         return Err("0x87e08c is not TBNZ W0,#0");
     }
@@ -13206,8 +14322,8 @@ pub fn admit_bosminer_hashmap_v_is_18_spawn0_factory8(
     if t3 != BOSMINER_THIRD_GET_TBZ_INSN {
         return Err("0x8371fc is not TBZ W0");
     }
-    let cbz = engine88_le_u32(blob, BOSMINER_SRET18_Q0_CBZ_VA)
-        .ok_or("bosminer shorter than sret CBZ")?;
+    let cbz =
+        engine88_le_u32(blob, BOSMINER_SRET18_Q0_CBZ_VA).ok_or("bosminer shorter than sret CBZ")?;
     if cbz != BOSMINER_SRET18_Q0_CBZ_INSN {
         return Err("0x87e164 is not CBZ X19");
     }
@@ -13232,9 +14348,7 @@ pub fn refuse_sret18_as_hashmap_v_or_named_result() -> Result<(), &'static str> 
 }
 
 /// : HashMap `V` is the 7-key chip-id factory tuple, not a rustc type name.
-pub fn admit_bosminer_hashmap_v_is_chipid_factory_tuple(
-    blob: &[u8],
-) -> Result<(), &'static str> {
+pub fn admit_bosminer_hashmap_v_is_chipid_factory_tuple(blob: &[u8]) -> Result<(), &'static str> {
     if BOSMINER_HASHMAP_V_SIZE != 0x18 {
         return Err("HashMap V size must stay 0x18");
     }
@@ -13262,8 +14376,7 @@ pub fn admit_bosminer_hashmap_v_is_chipid_factory_tuple(
     if BOSMINER_HASHMAP_V_KEY_OFF != 0 || BOSMINER_HASHMAP_V_VALUE_OFF != 8 {
         return Err("K at slot+0, V at slot+8");
     }
-    if BOSMINER_HASHMAP_V_KEYS != [0x1362, 0x1366, 0x1368, 0x1370, 0x1398, 0x1396, 0x1397]
-    {
+    if BOSMINER_HASHMAP_V_KEYS != [0x1362, 0x1366, 0x1368, 0x1370, 0x1398, 0x1396, 0x1397] {
         return Err("slot-order chip ids drifted");
     }
     if !BOSMINER_HASHMAP_V_KEYS.contains(&BOSMINER_BM1366_CHIP_ID) {
@@ -13498,7 +14611,10 @@ pub fn s19k_braiins_uart_version_mask_from_log(midstate_log: u32) -> Result<u16,
 
 /// Bosminer UART WorkResponse version field: `bswap16(payload[6:8]) & ((1<<log)-1)`.
 /// Does **not** replace ESP/BIP320 `version_be << 13` share reconstruct.
-pub fn s19k_braiins_uart_version_bits(version_be: u16, midstate_log: u32) -> Result<u16, &'static str> {
+pub fn s19k_braiins_uart_version_bits(
+    version_be: u16,
+    midstate_log: u32,
+) -> Result<u16, &'static str> {
     Ok(version_be & s19k_braiins_uart_version_mask_from_log(midstate_log)?)
 }
 
@@ -14014,6 +15130,8 @@ pub fn refuse_2a70_early_ldr_as_oneshr_consumer() -> Result<(), &'static str> {
     Err("LDR #0x2a70 X6 is before oneshr STR; stack slot reused, not 1>>log")
 }
 
+/// Legacy function name: validates the parser's REV-before-BLR sequence, not
+/// a nonce transform. BM1366's BLR return is an attribution tuple.
 pub fn admit_bosminer_work_resp_rev_then_nonce_fn() -> Result<(), &'static str> {
     if BOSMINER_WORK_RESP_LDR88_INSN != 0xF940_4428 {
         return Err("LDR X8,[X1,#0x88] before REV");
@@ -14025,7 +15143,7 @@ pub fn admit_bosminer_work_resp_rev_then_nonce_fn() -> Result<(), &'static str> 
         return Err("BLR X8 after REV");
     }
     if BOSMINER_ENGINE_NONCE_FN_OFF != 0x88 {
-        return Err("nonce transform is engine+0x88");
+        return Err("attribution callback is engine+0x88");
     }
     if s19k_braiins_uart_nonce_arg_from_payload8(0x0000_0000_DDCC_BBAA) != 0xAABB_CCDD {
         return Err("payload low32 REV is from_be nonce word");
@@ -14036,10 +15154,11 @@ pub fn admit_bosminer_work_resp_rev_then_nonce_fn() -> Result<(), &'static str> 
     Ok(())
 }
 
-/// +0x88 is not a 2-insn `REV W0,W0; RET` (0 hits in first LOAD).
+/// +0x88 is not a 2-insn `REV W0,W0; RET`; BM1366 resolves to the recovered
+/// multi-instruction attribution callback.
 pub fn refuse_rev_w0_ret_as_engine_nonce_fn() -> Result<(), &'static str> {
     if BOSMINER_REV_W0_RET_HITS == 0 {
-        return Err("no REV W0,W0;RET in first LOAD; +0x88 callee unnamed (caller already REVs)");
+        return Err("no REV W0,W0;RET in first LOAD; BM1366 +0x88 is FUN_009256ac attribution");
     }
     Ok(())
 }
@@ -14063,7 +15182,9 @@ pub fn refuse_unlocated_engine_job_id_fn_as_named_encoder() -> Result<(), &'stat
 /// `0xE0000020` in Worker::new is a tracing FieldSet mask, not registry_size=32.
 pub fn refuse_worker_ctor_e0000020_as_registry_size(word: u32) -> Result<(), &'static str> {
     if word == BOSMINER_WORKER_CTOR_TRACE_MASK {
-        return Err("Worker ctor 0xE0000020 is movz#0x20+movk#0xe000 tracing mask, not registry_size");
+        return Err(
+            "Worker ctor 0xE0000020 is movz#0x20+movk#0xe000 tracing mask, not registry_size",
+        );
     }
     Ok(())
 }
@@ -14217,9 +15338,7 @@ pub const BOSMINER_FAILED_SEND_WORK_OFF: u64 = 0x00F2_3802;
 pub const BOSMINER_FAILED_SEND_WORK_JOB_IMM_XREFS: usize = 0;
 
 pub fn refuse_failed_send_work_xrefs_as_job_length() -> Result<(), &'static str> {
-    Err(
-        "bosminer Failed-to-send-work xrefs have 0 job-size MOVZ immediates; T1 stays open",
-    )
+    Err("bosminer Failed-to-send-work xrefs have 0 job-size MOVZ immediates; T1 stays open")
 }
 
 /// : GetAddress / chain-inactive are packed, not 7-byte rodata.
@@ -14234,9 +15353,7 @@ pub fn refuse_missing_getaddress_literal_as_job_length() -> Result<(), &'static 
 
 /// Wrap a queued `send_work` body (`21 36 …`) as the 88-byte on-wire frame.
 /// Refuses the live-miss `21 56` length field. Used by mining-on first-frame log.
-pub fn reconstruct_s19k_send_work_wire(
-    body: &[u8],
-) -> Result<[u8; JOB_WIRE_TOTAL], &'static str> {
+pub fn reconstruct_s19k_send_work_wire(body: &[u8]) -> Result<[u8; JOB_WIRE_TOTAL], &'static str> {
     if body.len() != MINING_ON_SEND_WORK_BODY_LEN {
         return Err("send_work body must be 0x54 bytes");
     }
@@ -14409,6 +15526,96 @@ pub fn pack_s19k_braiins_ghidra_job_body_with_vbits(
     let ver0 = s19k_braiins_midstate0_version(version, version_bits_base);
     body[80..84].copy_from_slice(&ver0.to_le_bytes());
     body
+}
+
+/// Inverse of [`pack_s19k_braiins_ghidra_job_body_with_vbits`].
+/// Fields are in the same domain the packer accepted (WorkBuilder merkle /
+/// already-reversed prev, integer ntime/nbits, packed ver0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S19kBraiinsGhidraJobFields {
+    pub job_id: u8,
+    pub nbits: u32,
+    pub ntime: u32,
+    pub merkle_root: [u8; 32],
+    pub prev_block_hash: [u8; 32],
+    pub packed_ver0: u32,
+}
+
+pub fn unpack_s19k_braiins_ghidra_job_body(
+    body: &[u8],
+) -> Result<S19kBraiinsGhidraJobFields, &'static str> {
+    if body.len() != MINING_ON_SEND_WORK_BODY_LEN {
+        return Err("send_work body must be 0x54 bytes");
+    }
+    if body[0] != JOB_CMD_TYPE {
+        return Err("send_work body must start with type 0x21");
+    }
+    admit_job_length_field(body[1])?;
+    let mut merkle_wr = [0u8; 32];
+    let mut prev_wr = [0u8; 32];
+    merkle_wr.copy_from_slice(&body[16..48]);
+    prev_wr.copy_from_slice(&body[48..80]);
+    let mut nbits = [0u8; 4];
+    let mut ntime = [0u8; 4];
+    let mut ver0 = [0u8; 4];
+    nbits.copy_from_slice(&body[8..12]);
+    ntime.copy_from_slice(&body[12..16]);
+    ver0.copy_from_slice(&body[80..84]);
+    Ok(S19kBraiinsGhidraJobFields {
+        job_id: body[2],
+        nbits: u32::from_le_bytes(nbits),
+        ntime: u32::from_le_bytes(ntime),
+        merkle_root: reverse_32bit_words(&merkle_wr),
+        prev_block_hash: reverse_32bit_words(&prev_wr),
+        packed_ver0: u32::from_le_bytes(ver0),
+    })
+}
+
+/// Unpack a Closed11d 88-byte wire (`55 AA 21 36 …` + CRC).
+pub fn unpack_s19k_braiins_ghidra_job_wire(
+    wire: &[u8],
+) -> Result<S19kBraiinsGhidraJobFields, &'static str> {
+    if wire.len() != JOB_WIRE_TOTAL {
+        return Err("Closed11d wire must be 88 bytes");
+    }
+    if wire[0] != JOB_PREAMBLE_0 || wire[1] != JOB_PREAMBLE_1 {
+        return Err("wire must start with 55 AA");
+    }
+    unpack_s19k_braiins_ghidra_job_body(&wire[2..2 + MINING_ON_SEND_WORK_BODY_LEN])
+}
+
+/// Parse compact `tx_wire` hex from a post-clean dump or a spaced
+/// `FULL FRAME ON WIRE` log line. ASCII whitespace is ignored so either
+/// form (`55AA…` or `55 AA …`) unpacks.
+pub fn parse_s19k_compact_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut hi: Option<u8> = None;
+    for &b in hex.as_bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let nibble = hex_nibble(b)?;
+        match hi.take() {
+            None => hi = Some(nibble),
+            Some(high) => out.push((high << 4) | nibble),
+        }
+    }
+    if hi.is_some() {
+        return Err("compact hex must be a non-empty even-length string");
+    }
+    if out.is_empty() {
+        return Err("compact hex must be a non-empty even-length string");
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, &'static str> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("compact hex contains a non-hex digit"),
+    }
 }
 
 /// Full 88-byte on-wire frame (`55 AA 21 36 …` + CRC16-ITU-T).
@@ -14614,22 +15821,10 @@ mod tests {
         let ntime = 0x5F5E_1000;
         let nbits = 0x1707_A30A;
 
-        let wire = build_s19k_braiins_mining_on_work_wire(
-            work_id,
-            version,
-            prev,
-            merkle,
-            ntime,
-            nbits,
-        );
-        let body = build_s19k_braiins_mining_on_work_body(
-            work_id,
-            version,
-            prev,
-            merkle,
-            ntime,
-            nbits,
-        );
+        let wire =
+            build_s19k_braiins_mining_on_work_wire(work_id, version, prev, merkle, ntime, nbits);
+        let body =
+            build_s19k_braiins_mining_on_work_body(work_id, version, prev, merkle, ntime, nbits);
         assert_eq!(wire.len(), 0x58);
         assert_eq!(&wire[0..4], &[0x55, 0xAA, 0x21, 0x36]);
         assert_ne!(wire[3], 0x56);
@@ -14653,9 +15848,82 @@ mod tests {
         let crc = crc16_itu_t(&body);
         assert_eq!(wire[86], (crc >> 8) as u8);
         assert_eq!(wire[87], (crc & 0xff) as u8);
-        let hex: String = wire.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        let hex: String = wire
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!("S19K_CLOSED_WIRE {hex}");
-        eprintln!("S19K_SEND_WORK_BODY_PREFIX {:02X} {:02X} {:02X} {:02X}", body[0], body[1], body[2], body[3]);
+        eprintln!(
+            "S19K_SEND_WORK_BODY_PREFIX {:02X} {:02X} {:02X} {:02X}",
+            body[0], body[1], body[2], body[3]
+        );
+    }
+
+    #[test]
+    fn s19k_ghidra_job_unpack_is_pack_inverse() {
+        let work_id = 2u8;
+        let version = 0x2000_0000u32;
+        let mut prev = [0u8; 32];
+        prev[0] = 0x11;
+        prev[31] = 0x22;
+        let mut merkle = [0u8; 32];
+        merkle[0] = 0x33;
+        merkle[27] = 0x44;
+        merkle[28] = 0x55;
+        merkle[31] = 0x66;
+        let ntime = 0x5F5E_1000;
+        let nbits = 0x1707_A30A;
+        let wire =
+            build_s19k_braiins_mining_on_work_wire(work_id, version, prev, merkle, ntime, nbits);
+        let compact: String = wire.iter().map(|b| format!("{b:02X}")).collect();
+        let parsed = parse_s19k_compact_hex(&compact).expect("compact hex");
+        let fields = unpack_s19k_braiins_ghidra_job_wire(&parsed).expect("unpack");
+        assert_eq!(fields.job_id, work_id);
+        assert_eq!(fields.nbits, nbits);
+        assert_eq!(fields.ntime, ntime);
+        assert_eq!(fields.merkle_root, merkle);
+        assert_eq!(fields.prev_block_hash, prev);
+        assert_eq!(
+            fields.packed_ver0,
+            s19k_braiins_midstate0_version(version, 0)
+        );
+        assert!(parse_s19k_compact_hex("").is_err());
+        assert!(parse_s19k_compact_hex("21").is_ok());
+        assert!(parse_s19k_compact_hex("2").is_err());
+        assert_eq!(
+            parse_s19k_compact_hex("21 36").expect("spaced hex"),
+            vec![0x21, 0x36]
+        );
+        assert!(unpack_s19k_braiins_ghidra_job_wire(&[0u8; 10]).is_err());
+    }
+
+    /// live412 logged one `FULL FRAME ON WIRE` — the first-fill slot-0 TX,
+    /// not SHARE #1's extra2=08 slot. Unpack that exact dump and pin it to
+    /// RAW_NOTIFY[0] (`…8bd0`). Post-clean frames were never logged
+    /// (`total_work <= 1` gate); this is the held on-wire evidence.
+    #[test]
+    fn s19k_live412_captured_first_frame_is_8bd0_job0() {
+        const LIVE412_FIRST_FRAME: &str = "55 AA 21 36 00 01 00 00 00 00 3D 35 02 17 \
+B0 57 82 6A 76 F5 EF 1D 69 B7 B2 8E 1B A6 BC 50 CA 98 F0 6C 93 96 28 A6 8F 12 33 \
+DD E7 92 4A 00 85 62 E9 03 00 00 00 00 00 00 00 00 B4 80 01 00 FB 21 BE DB 9E E1 \
+B3 5D 1B 45 6F A0 34 33 F6 96 9E 84 1B 98 00 00 00 20 64 C2";
+        let parsed = parse_s19k_compact_hex(LIVE412_FIRST_FRAME).expect("live412 spaced dump");
+        assert_eq!(parsed.len(), JOB_WIRE_TOTAL);
+        let fields = unpack_s19k_braiins_ghidra_job_wire(&parsed).expect("unpack live412 frame");
+        assert_eq!(fields.job_id, 0);
+        assert_eq!(fields.ntime, 0x6A82_57B0);
+        assert_eq!(fields.nbits, 0x1702_353D);
+        assert_eq!(fields.packed_ver0, 0x2000_0000);
+        // WorkBuilder prev = per-word endian reverse of the logged stratum prev.
+        assert_eq!(
+            fields.prev_block_hash,
+            [
+                0x9E, 0x84, 0x1B, 0x98, 0x34, 0x33, 0xF6, 0x96, 0x1B, 0x45, 0x6F, 0xA0, 0x9E, 0xE1,
+                0xB3, 0x5D, 0xFB, 0x21, 0xBE, 0xDB, 0xB4, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -14759,7 +16027,11 @@ mod tests {
             let o = (va - 0x400_000) as usize;
             buf[o..o + 4].copy_from_slice(&insn.to_le_bytes());
         };
-        putp(&mut pack_blob, BOSMINER_PACK_FN_VA, BOSMINER_PACK_FN_SUB_INSN);
+        putp(
+            &mut pack_blob,
+            BOSMINER_PACK_FN_VA,
+            BOSMINER_PACK_FN_SUB_INSN,
+        );
         putp(
             &mut pack_blob,
             BOSMINER_PACK_FN_MOVZ56_VA,
@@ -14838,6 +16110,53 @@ mod tests {
         );
         let serial = include_str!("../../dcentrald/src/serial_mining.rs");
         assert!(admit_s19k_production_rolled_version_is_midstate0_or(serial).is_ok());
+        // The midstate0-OR pin tolerates rustfmt's two canonical spellings
+        // (single line, or wrapped with a trailing comma) but still refuses
+        // argument drift. This pins the fix for the 2026-08-17..19 "unchanged
+        // dirty S19k failure": the old pin matched only the exact single-line
+        // byte string, so a pure formatting wrap of the identical production
+        // call in the dirty worktree broke it.
+        let one_line = "fn serial_rolled_version() -> Option<u32> {
+            if is_bm1366 {
+                return Some(s19k_braiins_midstate0_version(entry.version, version_bits_raw));
+            }
+            let (rolled_version, vbits_delta) =
+                dcentrald_asic::bm1362::bip320_reconstruct_rolled_version(
+                    entry.version,
+                    version_bits_raw,
+                );
+            rolled_version
+        }";
+        let wrapped = "fn serial_rolled_version() -> Option<u32> {
+            if is_bm1366 {
+                return Some(s19k_braiins_midstate0_version(
+                    entry.version,
+                    version_bits_raw,
+                ));
+            }
+            let (rolled_version, vbits_delta) =
+                dcentrald_asic::bm1362::bip320_reconstruct_rolled_version(
+                    entry.version,
+                    version_bits_raw,
+                );
+            rolled_version
+        }";
+        assert!(admit_s19k_production_rolled_version_is_midstate0_or(one_line).is_ok());
+        assert!(admit_s19k_production_rolled_version_is_midstate0_or(wrapped).is_ok());
+        let wrong_args = "fn serial_rolled_version() -> Option<u32> {
+            if is_bm1366 {
+                return Some(s19k_braiins_midstate0_version(entry.version, 0));
+            }
+            rolled_version
+        }";
+        assert!(admit_s19k_production_rolled_version_is_midstate0_or(wrong_args).is_err());
+        let strip_regression = "fn serial_rolled_version() -> Option<u32> {
+            if is_bm1366 {
+                return Some(entry.version & !0x1FFF_E000);
+            }
+            rolled_version
+        }";
+        assert!(admit_s19k_production_rolled_version_is_midstate0_or(strip_regression).is_err());
         let rolled = pack_s19k_braiins_ghidra_job_body_with_vbits(
             0x10,
             0x2000_0000,
@@ -14871,19 +16190,17 @@ mod tests {
         assert!(refuse_bosminer_pack_caller_engine_plus_0x90_as_nbits().is_err());
         let mut job_obj = [0u8; BOSMINER_JOB_SIZE];
         job_obj[0x78..0x7c].copy_from_slice(&0x1707_A30Au32.to_le_bytes());
-        assert_eq!(s19k_braiins_job_nbits_from_object(&job_obj).unwrap(), 0x1707_A30A);
-        assert!(s19k_braiins_job_nbits_from_object(&[0u8; 8]).is_err());
-        let wire = build_s19k_braiins_mining_on_work_wire(
-            0x10,
-            0x2000_0000,
-            [0u8; 32],
-            [0u8; 32],
-            0,
-            0,
+        assert_eq!(
+            s19k_braiins_job_nbits_from_object(&job_obj).unwrap(),
+            0x1707_A30A
         );
+        assert!(s19k_braiins_job_nbits_from_object(&[0u8; 8]).is_err());
+        let wire =
+            build_s19k_braiins_mining_on_work_wire(0x10, 0x2000_0000, [0u8; 32], [0u8; 32], 0, 0);
         // work_id 0x10 encodes as 0x10 at fill log 0 (identity), not 0x10 meaning slot 2.
         assert_eq!(&wire[0..6], &[0x55, 0xAA, 0x21, 0x36, 0x10, 0x01]);
-        let wire2 = build_s19k_braiins_mining_on_work_wire(2, 0x2000_0000, [0u8; 32], [0u8; 32], 0, 0);
+        let wire2 =
+            build_s19k_braiins_mining_on_work_wire(2, 0x2000_0000, [0u8; 32], [0u8; 32], 0, 0);
         assert_eq!(&wire2[0..6], &[0x55, 0xAA, 0x21, 0x36, 0x02, 0x01]);
         assert_ne!(&wire[10..14], &[0xF3, 0xF2, 0xF1, 0xF0]);
         assert_eq!(BOSMINER_BM136X_PACKED_STRUCT_OFF, 0x00F2_56E0);
@@ -14939,14 +16256,8 @@ mod tests {
         assert_eq!(BOSMINER_55AA5205_HITS, 0);
         assert_eq!(BOSMINER_55AA5305_HITS, 0);
         assert!(refuse_missing_getaddress_literal_as_job_length().is_err());
-        let body = build_s19k_braiins_mining_on_work_body(
-            0x10,
-            0x2000_0000,
-            [0u8; 32],
-            [0u8; 32],
-            0,
-            0,
-        );
+        let body =
+            build_s19k_braiins_mining_on_work_body(0x10, 0x2000_0000, [0u8; 32], [0u8; 32], 0, 0);
         let wire = reconstruct_s19k_send_work_wire(&body).unwrap();
         assert_eq!(&wire[0..4], &CLOSED_11D_PREFIX);
         assert_eq!(wire.len(), 0x58);
@@ -14966,10 +16277,7 @@ mod tests {
         assert!(refuse_bosminer_pack_caller_engine_plus_0x90_as_nbits().is_err());
         assert_eq!(BOSMINER_JOB_NBITS_GETTER_INSN, 0xB940_7800);
         assert_eq!(BOSMINER_JOB_NBITS_VTABLE_HITS, 2);
-        assert_eq!(
-            BOSMINER_STRATUM_V2_JOB_VTABLE_VA + 0x90,
-            0x01A1_2268
-        );
+        assert_eq!(BOSMINER_STRATUM_V2_JOB_VTABLE_VA + 0x90, 0x01A1_2268);
         let mut job_obj = [0u8; BOSMINER_JOB_SIZE];
         job_obj[BOSMINER_JOB_NBITS_OFF..BOSMINER_JOB_NBITS_OFF + 4]
             .copy_from_slice(&0x1A44_B9F6u32.to_le_bytes());
@@ -15022,14 +16330,8 @@ mod tests {
         assert_eq!(BOSMINER_WORK_ID_STP_VA, 0x00BF_6454);
         assert_eq!(BOSMINER_WORK_ID_STP_INSN, 0xA903_DB68);
         assert!(!BOSMINER_REGISTRY_SIZE_KNOWN);
-        assert_eq!(
-            s19k_braiins_uart_job_id_inputs(7, 0).unwrap(),
-            (7, 1)
-        );
-        assert_eq!(
-            s19k_braiins_uart_job_id_inputs(7, 3).unwrap(),
-            (7, 8)
-        );
+        assert_eq!(s19k_braiins_uart_job_id_inputs(7, 0).unwrap(), (7, 1));
+        assert_eq!(s19k_braiins_uart_job_id_inputs(7, 3).unwrap(), (7, 8));
         assert!(s19k_braiins_uart_job_id_inputs(7, 4).is_err());
         assert!(refuse_slot_shl_3_as_offline_proven_braiins_uart_job_id().is_err());
     }
@@ -15083,10 +16385,7 @@ mod tests {
         assert_eq!(BOSMINER_AM3_CHIP_DISPATCH_FN_VA, 0x008D_6CF0);
         assert_eq!(BOSMINER_AM3_CHIP_DISPATCH_1366_MOVZ_VA, 0x008D_6D14);
         assert_eq!(BOSMINER_AM3_CHIP_DISPATCH_IDS[1], 0x1366);
-        assert_eq!(
-            s19k_braiins_uart_registry_size_from_log(0).unwrap(),
-            0x100
-        );
+        assert_eq!(s19k_braiins_uart_registry_size_from_log(0).unwrap(), 0x100);
         assert!(BOSMINER_BM1366_RS.contains("bm1366.rs"));
         assert!(BOSMINER_BM136X_RS.contains("bm136x.rs"));
         assert_eq!(BOSMINER_HASHCHAIN_TICKET_LINE, 298);
@@ -15099,8 +16398,8 @@ mod tests {
         use crate::s19k_bm1366_wire_b::{
             admit_bosminer_uart_relay_pack_matches_public_chip0, pack_uart_relay,
             pack_uart_relay_braiins, refuse_uart_relay_without_nonce_gap_field,
-            BOSMINER_UART_RELAY_PACK_FN_VA, BOSMINER_UART_RELAY_REV16_INSN,
-            UART_RELAY_CHIP0_DIST, UART_RELAY_CHIP0_PUBLIC,
+            BOSMINER_UART_RELAY_PACK_FN_VA, BOSMINER_UART_RELAY_REV16_INSN, UART_RELAY_CHIP0_DIST,
+            UART_RELAY_CHIP0_PUBLIC,
         };
         assert!(admit_bosminer_uart_relay_pack_matches_public_chip0().is_ok());
         assert!(refuse_uart_relay_without_nonce_gap_field().is_err());
@@ -15132,10 +16431,7 @@ mod tests {
         assert_eq!(s19k_braiins_uart_job_id(7, 3).unwrap(), 0x38);
         assert_eq!(s19k_braiins_uart_job_id(31, 3).unwrap(), 0xF8);
         assert!(s19k_braiins_uart_job_id(32, 3).is_err());
-        assert_eq!(
-            s19k_braiins_uart_work_id_from_rx_job_byte(7, 0).unwrap(),
-            7
-        );
+        assert_eq!(s19k_braiins_uart_work_id_from_rx_job_byte(7, 0).unwrap(), 7);
         assert_eq!(
             s19k_braiins_uart_work_id_from_rx_job_byte(0x38, 3).unwrap(),
             7
@@ -15215,9 +16511,298 @@ mod tests {
             "BM1366+passthrough must use the 256-slot fill cursor, not step-8"
         );
         assert!(
-            serial.contains("hunt_s19k_bm1366_fill_from_tagged_slot"),
-            "fill RX must hunt tagged body against the sent job-id slot"
+            serial.contains("hunt_s19k_bm1366_fill_from_admitted_tx_path"),
+            "fill RX must bind tagged body to a path that received the sent work"
         );
+        assert!(admit_s19k_no_held_uart_abort_opcode().is_ok());
+        let esp_bm1366 =
+            include_str!("../../../../../");
+        let esp_jobs = include_str!(
+            "../../../../../"
+        );
+        assert!(admit_s19k_esp_bm1366_has_no_work_abort_opcode(esp_bm1366, esp_jobs).is_ok());
+        assert!(refuse_s19k_cmd_inactive_as_midrun_work_replace().is_err());
+        assert!(refuse_s19k_esp_job_step8_as_track1_fill().is_err());
+        assert!(refuse_s19k_experimental_job_flip_as_chip_work_replace().is_err());
+        assert!(refuse_s19k_experimental_job_flip_as_production().is_err());
+        assert_eq!(s19k_track1_fill_job_id(2, 0, true), 2);
+        assert_eq!(s19k_track1_fill_job_id(2, 1, false), 2);
+        assert_eq!(
+            s19k_track1_fill_job_id(2, 1, true),
+            2 ^ S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP
+        );
+        assert_ne!(s19k_track1_fill_job_id(2, 1, true), 2u8 << 3);
+        assert!(!s19k_experimental_post_clean_flip_enabled_from_env(None));
+        assert!(!s19k_experimental_post_clean_flip_enabled_from_env(Some(
+            "0"
+        )));
+        assert!(s19k_experimental_post_clean_flip_enabled_from_env(Some(
+            "1"
+        )));
+        assert!(admit_s19k_production_post_clean_job_flip_is_env_gated(serial).is_ok());
+        assert!(admit_s19k_production_post_clean_job_flip_is_env_gated("no flip").is_err());
+    }
+
+    #[test]
+    fn wave425_post_clean_chain_inactive_is_env_gated_evidence_pinned() {
+        let serial = include_str!("../../dcentrald/src/serial_mining.rs");
+        // Evidence pins: BM1366 protocol CMD=3 chain inactive, ESP-Miner
+        // _send_chain_inactive wire 55 AA 53 05 00 00 03.
+        assert!(admit_s19k_bm1366_chain_inactive_wire_evidence(
+            &S19K_BM1366_CHAIN_INACTIVE_BODY,
+            &S19K_BM1366_CHAIN_INACTIVE_WIRE,
+        )
+        .is_ok());
+        assert!(admit_s19k_bm1366_chain_inactive_wire_evidence(
+            &[0x53, 0x05, 0x00, 0x01],
+            &S19K_BM1366_CHAIN_INACTIVE_WIRE,
+        )
+        .is_err());
+        assert!(admit_s19k_bm1366_chain_inactive_wire_evidence(
+            &S19K_BM1366_CHAIN_INACTIVE_BODY,
+            &[0x55, 0xAA, 0x53, 0x05, 0x00, 0x00, 0x04],
+        )
+        .is_err());
+        // Env gate mirrors the flip gate: default off, "1" only.
+        assert!(!s19k_experimental_post_clean_chain_inactive_enabled_from_env(None));
+        assert!(!s19k_experimental_post_clean_chain_inactive_enabled_from_env(Some("0")));
+        assert!(s19k_experimental_post_clean_chain_inactive_enabled_from_env(Some("1")));
+        assert!(admit_s19k_live431_leftover_admits_experimental_inactive().is_ok());
+        assert!(admit_s19k_live436_wrap_retire_leftover_admits_first_clean_inactive().is_ok());
+        assert!(admit_s19k_live436_leftover3_wrap4_early_admits_inactive().is_ok());
+        assert!(admit_s19k_live437_wrap4_same_tick_admits_before_header_climb().is_ok());
+        assert!(s19k_post_inactive_flush_measured_not_replace(
+            Some(6),
+            0,
+            3,
+            0
+        ));
+        assert!(!s19k_post_inactive_replace_proven(Some(6), 0, 3, 0));
+        assert!(s19k_flush_measured_is_not_replace(true, false));
+        assert!(!s19k_flush_measured_is_not_replace(true, true));
+        assert!(refuse_s19k_live438_post_flush_leftover0_as_replace().is_err());
+        assert!(s19k_leftover_header_is_not_tx_leftover(true, false));
+        assert!(!s19k_leftover_header_is_not_tx_leftover(true, true));
+        assert!(!s19k_leftover_header_admits_second_cmd3(0, 3, 0));
+        assert!(refuse_s19k_live438_header_leftover_as_second_cmd3().is_err());
+        assert_eq!(
+            admit_s19k_production_wrap4_logs_snapshot_leftover(serial),
+            Ok(())
+        );
+        const LIVE437: &str = include_str!(
+            "../../../../../"
+        );
+        assert_eq!(
+            admit_s19k_live437_launch_wrap4_early_is_experimental(LIVE437),
+            Ok(())
+        );
+        const LIVE436: &str = include_str!(
+            "../../../../../"
+        );
+        assert!(LIVE436.contains("unset DCENT_S19K_EXPERIMENTAL_WRAP4_EARLY_CLEAN"));
+        assert!(!s19k_experimental_wrap4_early_clean_enabled_from_env(None));
+        assert!(crate::admit_s19k_wrap4_snapshot_preserves_wrap_retire_leftover().is_ok());
+        assert!(s19k_leftover_hit_admits_experimental_inactive(4, 0, 0));
+        assert!(s19k_leftover_hit_admits_experimental_inactive(3, 0, 0));
+        assert!(!s19k_leftover_hit_admits_experimental_inactive(0, 0, 0));
+        assert!(!s19k_leftover_hit_admits_experimental_inactive(0, 6, 0));
+        assert!(s19k_leftover_hit_admits_experimental_inactive(216, 1, 0));
+        assert!(!s19k_leftover_hit_admits_experimental_inactive(216, 1, 1));
+        assert!(admit_s19k_live439_wrap7_leftover_readmit().is_ok());
+        assert!(admit_s19k_live440_wrap7_snapshots_post_admit_store().is_ok());
+        assert!(admit_s19k_live440_header_only_refuses_leftover_hit_still_admits().is_ok());
+        assert!(admit_s19k_live441_wrap5_snapshots_before_wrap6_death().is_ok());
+        assert_eq!(
+            admit_s19k_production_wrap7_readmit_logs_and_queues(serial),
+            Ok(())
+        );
+        assert_eq!(
+            admit_s19k_production_wrap5_snapshot_logs_and_queues(serial),
+            Ok(())
+        );
+        assert!(refuse_s19k_bosminer_53050000_as_chain_inactive_template().is_err());
+        assert!(refuse_s19k_jig_chain_inactive_log_as_midrun_abort().is_err());
+        assert!(admit_s19k_live431_leftover_vs_meets_unproven().is_ok());
+        assert!(admit_s19k_live433_leftover_vs_meets_unproven().is_ok());
+        assert!(!s19k_leftover_hit_vs_meets_replace_proven(4, 0, 0, false));
+        assert!(!s19k_leftover_hit_vs_meets_replace_proven(4, 0, 0, true));
+        assert!(!s19k_leftover_hit_vs_meets_replace_proven(0, 0, 0, false));
+        assert!(s19k_leftover_hit_vs_meets_replace_proven(1, 0, 4, true));
+        // Production stays fill identity re-fill; leftover_hit=4 only
+        // admits the experimental env, not production default.
+        assert!(refuse_s19k_post_clean_chain_inactive_as_production().is_err());
+        // The prior pin still holds: CMD_INACTIVE is not THE mid-run
+        // work-replace;  only ships it as an experimental flush.
+        assert!(refuse_s19k_cmd_inactive_as_midrun_work_replace().is_err());
+        assert!(admit_s19k_production_post_clean_chain_inactive_is_env_gated(serial).is_ok());
+        assert!(
+            admit_s19k_production_post_clean_chain_inactive_is_env_gated("no inactive").is_err()
+        );
+    }
+
+    #[test]
+    fn s19k_live439_planner_numbers_drive_shipped_helpers() {
+        let admit_wire = s19k_leftover_hit_admits_experimental_inactive(216, 1, 0);
+        let refuse_header = s19k_leftover_hit_admits_experimental_inactive(0, 3, 0);
+        let readmit = s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, false, false, true);
+        let production =
+            s19k_wrap7_leftover_readmit_due(7, Some(2), 216, 1, 0, false, false, false);
+        eprintln!("leftover_admit(216,1,0)={admit_wire}");
+        eprintln!("leftover_admit(0,3,0)={refuse_header}");
+        eprintln!("wrap7_readmit(exp=true,wrap_rx=7,leftover_at=2,216,1,0)={readmit}");
+        eprintln!("wrap7_readmit(exp=false)={production}");
+        assert!(
+            admit_wire,
+            "live439 leftover_hit=216 leftover_header=1 must leftover-admit"
+        );
+        assert!(!refuse_header, "live438 leftover_header-only must refuse");
+        assert!(readmit, "live439 wrap-7 leftover-readmit must fire");
+        assert!(!production, "production wrap-7 leftover-readmit stays OFF");
+        assert_eq!(admit_s19k_live439_wrap7_leftover_readmit(), Ok(()));
+        let live440_refuse =
+            s19k_wrap7_leftover_readmit_due(7, Some(1), 0, 3, 0, false, false, true);
+        let live440_snap = s19k_wrap7_leftover_snapshot_due(7, Some(1), false, false, true);
+        eprintln!("live440_wrap7_readmit(0,3,0)={live440_refuse}");
+        eprintln!("live440_wrap7_snapshot={live440_snap}");
+        assert!(
+            !live440_refuse,
+            "live440 leftover_header-only must refuse leftover-readmit"
+        );
+        assert!(
+            live440_snap,
+            "live440 wrap_rx=7 leftover_at=1 must snapshot POST-admit 21 36"
+        );
+        assert_eq!(
+            admit_s19k_live440_wrap7_snapshots_post_admit_store(),
+            Ok(())
+        );
+        let live441_wrap5 = s19k_wrap5_leftover_snapshot_due(5, Some(4), false, false, true);
+        let live441_wrap5_header =
+            s19k_wrap5_leftover_readmit_due(5, Some(4), 0, 4, 0, false, false, true);
+        let live441_wrap5_hit =
+            s19k_wrap5_leftover_readmit_due(5, Some(4), 4, 0, 0, false, false, true);
+        eprintln!("live441_wrap5_snapshot={live441_wrap5}");
+        eprintln!("live441_wrap5_readmit_header_only={live441_wrap5_header}");
+        eprintln!("live441_wrap5_readmit_hit={live441_wrap5_hit}");
+        assert!(
+            live441_wrap5,
+            "live441 wrap_rx=5 leftover_at=4 must snapshot"
+        );
+        assert!(
+            !live441_wrap5_header,
+            "live441 leftover_header-only must refuse wrap-5 leftover-readmit"
+        );
+        assert!(
+            live441_wrap5_hit,
+            "after wrap-5 snapshot leftover_hit leftover-readmits"
+        );
+        assert_eq!(
+            admit_s19k_live441_wrap5_snapshots_before_wrap6_death(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn s19k_plan_post_clean_uart_replace_is_identity_unless_env_gates() {
+        let protocol =
+            include_str!("../../../../../");
+        assert!(admit_s19k_held_protocol_has_no_job_abort_opcode(protocol).is_ok());
+        let session = s19k_plan_post_clean_uart_replace(false, true, true, 4, 0, 0);
+        assert!(!session.chain_inactive);
+        assert!(!session.job_flip);
+        assert!(!session.refill);
+        assert_eq!(session.ops().count(), 0);
+
+        let production = s19k_plan_post_clean_uart_replace(true, false, false, 4, 0, 0);
+        assert!(!production.chain_inactive);
+        assert!(!production.job_flip);
+        assert!(production.refill);
+        assert_eq!(
+            production.ops().collect::<Vec<_>>(),
+            vec![S19kPostCleanUartOp::IdentityRefill]
+        );
+
+        let first_clean = s19k_plan_post_clean_uart_replace(true, true, true, 0, 0, 0);
+        assert!(!first_clean.chain_inactive);
+        assert!(!first_clean.job_flip);
+        assert!(first_clean.refill);
+        assert!(admit_s19k_job_flip_is_leftover_admitted().is_ok());
+        assert!(admit_s19k_second_clean_plans_from_pre_reset_leftover().is_ok());
+
+        let both = s19k_plan_post_clean_uart_replace(true, true, true, 4, 0, 0);
+        assert!(both.chain_inactive);
+        assert!(both.job_flip);
+        assert_eq!(
+            both.ops().collect::<Vec<_>>(),
+            vec![
+                S19kPostCleanUartOp::ChainInactive,
+                S19kPostCleanUartOp::IdentityRefill
+            ]
+        );
+
+        let serial = include_str!("../../dcentrald/src/serial_mining.rs");
+        assert!(
+            serial.contains("s19k_plan_post_clean_uart_replace("),
+            "serial_mining must execute the leftover-safe UART replace planner"
+        );
+        assert!(
+            serial.contains("post_clean_uart.chain_inactive"),
+            "post-clean chain-inactive must come from the planner, not a raw env bool"
+        );
+        assert!(!s19k_experimental_wrap4_early_clean_enabled_from_env(None));
+        assert!(s19k_experimental_wrap4_early_clean_enabled_from_env(Some(
+            "1"
+        )));
+        assert!(admit_s19k_live434_wrap4_early_clean_was_due().is_ok());
+        assert!(
+            serial.contains("s19k_plan_wrap4_early_leftover_safe("),
+            "serial_mining must call the wrap-4 early leftover-safe planner"
+        );
+        assert!(
+            serial.contains("s19k_track1_clean_after_rx_death_silent"),
+            "mid-run clean must snapshot clean-after-RX-death from per-port silence"
+        );
+        assert!(
+            serial.contains("s19k_post_inactive_replace_proven("),
+            "funnel must print leftover-vs-meets replace_proven from the live helper"
+        );
+    }
+
+    #[test]
+    fn s19k_experimental_post_clean_replace_is_shipped_21_36_with_flipped_id() {
+        let mut merkle = [0u8; 32];
+        merkle[0] = 0xAB;
+        let mut prev = [0u8; 32];
+        prev[0] = 0xCD;
+        let work_id = 5u8;
+        let asic = s19k_experimental_post_clean_job_id(work_id, 1);
+        assert_eq!(asic, work_id ^ S19K_EXPERIMENTAL_POST_CLEAN_JOB_FLIP);
+        assert_ne!(asic, work_id);
+        let wire = build_s19k_braiins_mining_on_work_wire(
+            asic,
+            0x2000_0000,
+            prev,
+            merkle,
+            0x6A82_57B0,
+            0x1702_353D,
+        );
+        assert_eq!(&wire[0..4], &CLOSED_11D_PREFIX);
+        let fields = unpack_s19k_braiins_ghidra_job_wire(&wire).expect("unpack");
+        assert_eq!(fields.job_id, asic);
+        assert_eq!(fields.merkle_root, merkle);
+        assert_eq!(fields.prev_block_hash, prev);
+        assert_ne!(fields.job_id, work_id);
+    }
+
+    #[test]
+    fn s19k_jig_elf_has_no_closed11d_job_and_libc_abort_is_not_replace() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../");
+        let blob = std::fs::read(&path).expect("held S19k jig ELF");
+        assert!(admit_s19k_jig_has_no_closed11d_job(&blob).is_ok());
+        assert_eq!(s19k_jig_closed11d_prefix_hits(&blob), 0);
+        assert!(refuse_s19k_jig_libc_abort_as_work_replace(&blob).is_err());
+        assert!(admit_s19k_jig_has_no_closed11d_job(&[0x55, 0xAA, 0x21, 0x36]).is_err());
     }
 
     #[test]
@@ -15559,7 +17144,7 @@ mod tests {
         assert!(refuse_stp_xzr_as_hashchain_228_default().is_err());
         assert!(refuse_1200524_as_memset().is_err());
         assert!(refuse_wzr_228_stores_as_hashchain().is_err());
-        assert!(refuse_836c20_as_hashchain_228().is_err());
+        assert!(refuse_ticket_mask_836c20_as_hashchain_228().is_err());
         assert_eq!(BOSMINER_STP_XZR_220_228_NONSP_HITS, 0);
         assert_eq!(BOSMINER_STUR_XZR_228_HITS, 0);
         assert_eq!(BOSMINER_STR_XZR_228_NONSP_HITS, 7);
@@ -15572,8 +17157,8 @@ mod tests {
         assert_eq!(BOSMINER_SLOT_SET_FN_VA, 0x0120_0524);
         assert_eq!(BOSMINER_SLOT_SET_BL_HITS, 358);
         assert_eq!(BOSMINER_SLOT_SET_ENTRY_INSN, 0xA9BE_57FE);
-        assert_eq!(BOSMINER_AM2_BAUD_STRB_228_INSN, 0x3908_A15F);
-        assert_eq!(BOSMINER_AM2_BAUD_STRB_FN_VA, 0x0083_6934);
+        assert_eq!(BOSMINER_TICKET_MASK_STRB_228_INSN, 0x3908_A15F);
+        assert_eq!(BOSMINER_TICKET_MASK_STRB_FN_VA, 0x0083_6934);
     }
 
     #[test]
@@ -15793,11 +17378,11 @@ mod tests {
         assert_eq!(BOSMINER_STR260_XZR_HITS, 8);
         assert_eq!(BOSMINER_STR260_CLONE_HITS, 9);
         assert_eq!(BOSMINER_STR260_MOVZ300_NEAR_HITS, 0);
-        assert_eq!(BOSMINER_BAUD260_VA, 0x0083_6C34);
-        assert_eq!(BOSMINER_BAUD260_INSN, 0xF901_3148);
-        assert_eq!(BOSMINER_BAUD260_FN_VA, 0x0089_B720);
-        assert_eq!(BOSMINER_BAUD260_ADRP_INSN, 0xB000_0328);
-        assert_eq!(BOSMINER_BAUD260_ADD_INSN, 0x911C_8108);
+        assert_eq!(BOSMINER_TICKET_MASK260_VA, 0x0083_6C34);
+        assert_eq!(BOSMINER_TICKET_MASK260_INSN, 0xF901_3148);
+        assert_eq!(BOSMINER_TICKET_MASK260_FN_VA, 0x0089_B720);
+        assert_eq!(BOSMINER_TICKET_MASK260_ADRP_INSN, 0xB000_0328);
+        assert_eq!(BOSMINER_TICKET_MASK260_ADD_INSN, 0x911C_8108);
     }
 
     #[test]
@@ -16148,15 +17733,16 @@ mod tests {
     }
 
     #[test]
-    fn wave109_fill_nonce_is_rev_identity_not_low8_div() {
+    fn wave109_bm1366_callback_is_attribution_raw_nonce_is_separate() {
         assert!(admit_bosminer_work_resp_rev_then_nonce_fn().is_ok());
-        assert!(admit_bosminer_work_resp_blr_return_is_nonce().is_ok());
+        assert!(admit_bosminer_work_resp_blr_return_is_nonce().is_err());
         assert!(refuse_plus80_ne1_as_alt_nonce_transform().is_err());
         assert!(refuse_ret_only_as_named_plus88().is_err());
         assert!(admit_bosminer_1366_factory_is_876ca8().is_ok());
         assert!(admit_bosminer_clone_copies_plus88_qword().is_ok());
         assert!(refuse_work_resp_low8_div_as_pool_nonce().is_err());
         assert_eq!(BOSMINER_WORK_RESP_SAVE_X0_INSN, 0xAA00_03F6);
+        assert_eq!(BOSMINER_WORK_RESP_STORE_RAW_NONCE_INSN, 0xB900_3278);
         assert_eq!(BOSMINER_WORK_RESP_MOV_X1_NONCE_INSN, 0xAA16_03E1);
         assert_eq!(BOSMINER_WORK_RESP_PLUS80_LDRB_INSN, 0x3942_02A8);
         assert_eq!(BOSMINER_RET_ONLY_SITES, 269);
@@ -16164,7 +17750,8 @@ mod tests {
         assert_eq!(BOSMINER_WORK_RESP_BLR_INSN, 0xD63F_0100);
         let mut prod = vec![
             0u8;
-            (BOSMINER_ENGINE88_MOVZ4_VA[5] + BOSMINER_ENGINE88_MOVZ_TO_STR80
+            (BOSMINER_ENGINE88_MOVZ4_VA[5]
+                + BOSMINER_ENGINE88_MOVZ_TO_STR80
                 + BOSMINER_ENGINE88_STR80_TO_STR88
                 - 0x400_000
                 + 4) as usize
@@ -16206,10 +17793,7 @@ mod tests {
         assert_eq!(BOSMINER_FILL_TYPE1_COINSTALLED_88_HITS, 0);
         assert_eq!(BOSMINER_FILL_TYPE1_WIDE_STRB80_STR88_HITS, 0);
         assert_eq!(BOSMINER_BM1366_FACTORY_STR88_IN_FIRST_800, 0);
-        let mut clone_blob = vec![
-            0u8;
-            (BOSMINER_FACTORY_CLONE_BL_VA[4] - 0x400_000 + 4) as usize
-        ];
+        let mut clone_blob = vec![0u8; (BOSMINER_FACTORY_CLONE_BL_VA[4] - 0x400_000 + 4) as usize];
         let putc = |buf: &mut [u8], va: u64, insn: u32| {
             let o = (va - 0x400_000) as usize;
             buf[o..o + 4].copy_from_slice(&insn.to_le_bytes());
@@ -16236,11 +17820,7 @@ mod tests {
         );
         for i in 0..BOSMINER_FACTORY_CLONE_BL_HITS {
             let bl_va = BOSMINER_FACTORY_CLONE_BL_VA[i];
-            putc(
-                &mut clone_blob,
-                bl_va,
-                BOSMINER_FACTORY_CLONE_BL_INSN[i],
-            );
+            putc(&mut clone_blob, bl_va, BOSMINER_FACTORY_CLONE_BL_INSN[i]);
             putc(
                 &mut clone_blob,
                 bl_va - BOSMINER_FACTORY_X1_SAVE_TO_CLONE_BL,
@@ -16336,10 +17916,7 @@ mod tests {
             BOSMINER_PROD_CALL_X1_MOV_INSN,
             BOSMINER_FACTORY_X1_FROM_X24_INSN
         );
-        assert_ne!(
-            BOSMINER_PREP_Q88_STUR_INSN,
-            BOSMINER_CLONE_STUR_Q88_INSN
-        );
+        assert_ne!(BOSMINER_PREP_Q88_STUR_INSN, BOSMINER_CLONE_STUR_Q88_INSN);
         putp(
             &mut prep_blob,
             BOSMINER_WRAP_CLONE_DEST_MOV_VA,
@@ -16419,11 +17996,7 @@ mod tests {
             BOSMINER_CTX_290_THEN_88_VA,
             BOSMINER_CTX_290_THEN_88_INSN,
         );
-        putp(
-            &mut prep_blob,
-            BOSMINER_SP88_LDR_VA,
-            BOSMINER_SP88_LDR_INSN,
-        );
+        putp(&mut prep_blob, BOSMINER_SP88_LDR_VA, BOSMINER_SP88_LDR_INSN);
         assert!(admit_bosminer_ctx_290_then_88(&prep_blob).is_ok());
         assert!(refuse_ctx_self_plus88_as_method0_load().is_err());
         assert_eq!(BOSMINER_CTX_290_LDR_INSN, 0xF941_4AC9);
@@ -16640,8 +18213,7 @@ mod tests {
         );
         putp(
             &mut prep_blob,
-            BOSMINER_HASHMAP_STR88_SLICE10_REST_VA
-                - BOSMINER_HASHMAP_STR88_SLICE10_REST_ADD_BEFORE,
+            BOSMINER_HASHMAP_STR88_SLICE10_REST_VA - BOSMINER_HASHMAP_STR88_SLICE10_REST_ADD_BEFORE,
             BOSMINER_SLICE10_ADD_INSN,
         );
         assert!(admit_bosminer_hashmap_helper_ok_is_b8_clone(&prep_blob).is_ok());
@@ -17414,11 +18986,7 @@ mod tests {
             BOSMINER_WORKER_NEW_FACTORY4_MOVZ_1209_VA,
             BOSMINER_WORKER_NEW_FACTORY4_MOVZ_1209_INSN,
         );
-        putp(
-            &mut prep_blob,
-            BOSMINER_AF08_CMP_VA,
-            BOSMINER_AF08_CMP_INSN,
-        );
+        putp(&mut prep_blob, BOSMINER_AF08_CMP_VA, BOSMINER_AF08_CMP_INSN);
         putp(
             &mut prep_blob,
             BOSMINER_AF08_CLASS11_VA,
@@ -17773,11 +19341,7 @@ mod tests {
             BOSMINER_FACTORY4_STR_EC8_FROM600_VA,
             BOSMINER_FACTORY4_STR_EC8_FROM600_INSN,
         );
-        putp(
-            &mut prep_blob,
-            BOSMINER_876_XZR_VA,
-            BOSMINER_876_XZR_INSN,
-        );
+        putp(&mut prep_blob, BOSMINER_876_XZR_VA, BOSMINER_876_XZR_INSN);
         putp(
             &mut prep_blob,
             BOSMINER_876_887C34_BL_VA,
@@ -18225,8 +19789,16 @@ mod tests {
             BOSMINER_BM136X_FIELDSET_MSG_LEN
         );
         assert!(BOSMINER_C8_POLL_BM1397_RS.ends_with("hashchain/bm1397.rs"));
-        putp(&mut prep_blob, BOSMINER_C8_CTX8_LDR_VA, BOSMINER_C8_CTX8_LDR_INSN);
-        putp(&mut prep_blob, BOSMINER_C8_FUT_ZERO_VA, BOSMINER_C8_FUT_ZERO_INSN);
+        putp(
+            &mut prep_blob,
+            BOSMINER_C8_CTX8_LDR_VA,
+            BOSMINER_C8_CTX8_LDR_INSN,
+        );
+        putp(
+            &mut prep_blob,
+            BOSMINER_C8_FUT_ZERO_VA,
+            BOSMINER_C8_FUT_ZERO_INSN,
+        );
         putp(
             &mut prep_blob,
             BOSMINER_C8_FUT_IMM_STR_VA,
@@ -18237,7 +19809,11 @@ mod tests {
             BOSMINER_C8_STATE_ZERO_F8_VA,
             BOSMINER_C8_STATE_ZERO_F8_INSN,
         );
-        putp(&mut prep_blob, BOSMINER_C8_FUT10_STR_VA, BOSMINER_C8_FUT10_STR_INSN);
+        putp(
+            &mut prep_blob,
+            BOSMINER_C8_FUT10_STR_VA,
+            BOSMINER_C8_FUT10_STR_INSN,
+        );
         putp(
             &mut prep_blob,
             BOSMINER_C8_STATE_ZERO_138_VA,
@@ -18434,11 +20010,7 @@ mod tests {
             BOSMINER_SYSNOW_W0_VA,
             BOSMINER_SYSNOW_W0_INSN,
         );
-        putp(
-            &mut prep_blob,
-            BOSMINER_SYSNOW_B_VA,
-            BOSMINER_SYSNOW_B_INSN,
-        );
+        putp(&mut prep_blob, BOSMINER_SYSNOW_B_VA, BOSMINER_SYSNOW_B_INSN);
         putp(
             &mut prep_blob,
             BOSMINER_TIMESPEC_1E9_MOVZ_VA,
@@ -18589,14 +20161,16 @@ mod tests {
             BOSMINER_METRICS_223_BL_INSN,
         );
         assert!(
-            admit_bosminer_230_owner_nests_command_647_and_48_not_stop_watch(&prep_blob)
-                .is_ok()
+            admit_bosminer_230_owner_nests_command_647_and_48_not_stop_watch(&prep_blob).is_ok()
         );
         assert!(refuse_c0d4ac_as_metrics_stop_watch_or_hashes_time_mean().is_err());
         assert_eq!(BOSMINER_HC_PLUS230_NESTED_CMD_LINE, 647);
         assert_eq!(BOSMINER_METRICS_223_LINE, 223);
         assert_eq!(BOSMINER_HASHES_TIME_MEAN_ELEMENTS, 2);
-        assert_ne!(BOSMINER_METRICS_223_BL_TGT, BOSMINER_REGISTRY_1E9_INIT_FN_VA);
+        assert_ne!(
+            BOSMINER_METRICS_223_BL_TGT,
+            BOSMINER_REGISTRY_1E9_INIT_FN_VA
+        );
         assert!(BOSMINER_METRICS_RS.ends_with("metrics.rs"));
         assert_eq!(BOSMINER_METRICS_STOP_WATCH, "stop_watch");
         assert!(BOSMINER_HC_PLUS230_NESTED_CMD_RS.ends_with("command.rs"));
@@ -18615,11 +20189,7 @@ mod tests {
             BOSMINER_WORKPAIR_RET_VA,
             BOSMINER_WORKPAIR_RET_INSN,
         );
-        putp(
-            &mut prep_blob,
-            BOSMINER_WRAP_FN_START_VA,
-            0xA9BA_7BFD,
-        );
+        putp(&mut prep_blob, BOSMINER_WRAP_FN_START_VA, 0xA9BA_7BFD);
         putp(
             &mut prep_blob,
             BOSMINER_C0D4E0_SWAP_FN_VA,
@@ -18703,11 +20273,7 @@ mod tests {
         assert!(BOSMINER_HASHCHAIN_TICKET_ADRP_VA > BOSMINER_HC_PLUS230_CONSUMER_BLR_VA);
         assert_eq!(BOSMINER_C8_FUT10_STR_VA, BOSMINER_POLL_FUT40_STR_VA);
         assert!(BOSMINER_HASHCHAIN_TICKET_LOG.contains("ticket mask"));
-        putp(
-            &mut prep_blob,
-            BOSMINER_FAT_BLR_VA,
-            BOSMINER_FAT_BLR_INSN,
-        );
+        putp(&mut prep_blob, BOSMINER_FAT_BLR_VA, BOSMINER_FAT_BLR_INSN);
         putp(
             &mut prep_blob,
             BOSMINER_FAT_MOV_X24_X0_VA,
@@ -18930,7 +20496,11 @@ mod tests {
             BOSMINER_POLL_T170_VA,
             BOSMINER_POLL_T170_Q_INSN,
         );
-        putp(&mut prep_blob, 0x0083_6F84, BOSMINER_POLL_PENDING_MOVZ9_INSN);
+        putp(
+            &mut prep_blob,
+            0x0083_6F84,
+            BOSMINER_POLL_PENDING_MOVZ9_INSN,
+        );
         assert!(admit_bosminer_poll_sret20_pending9_t_at_168(&prep_blob).is_ok());
         assert!(refuse_poll_unit_or_pending0_or_named_slot_methods().is_err());
         assert_eq!(BOSMINER_POLL_PENDING_TAG, 9);
@@ -19147,8 +20717,14 @@ mod tests {
         }
         assert!(admit_bosminer_831d18_831668_are_drop_siblings(&prep_blob).is_ok());
         assert!(refuse_drop_sibs_as_one_fn_or_named_slot_or_arc().is_err());
-        assert_eq!(s19k_bosminer_drop_sib_tag_off(BOSMINER_FN831D18_VA), Some(0x19));
-        assert_eq!(s19k_bosminer_drop_sib_tag_off(BOSMINER_FN831668_VA), Some(0x70));
+        assert_eq!(
+            s19k_bosminer_drop_sib_tag_off(BOSMINER_FN831D18_VA),
+            Some(0x19)
+        );
+        assert_eq!(
+            s19k_bosminer_drop_sib_tag_off(BOSMINER_FN831668_VA),
+            Some(0x70)
+        );
         assert_eq!(BOSMINER_FN831D18_BL_HITS, 12);
         assert_eq!(BOSMINER_FN831668_BL_HITS, 6);
         assert_eq!(BOSMINER_FN831D18_HC68_HITS, 4);
@@ -20263,7 +21839,10 @@ mod tests {
         assert_eq!(BOSMINER_BM1398_6X_RS.len(), 48);
         assert!(BOSMINER_BM1398_6X_RS.ends_with("bm1398_6x.rs"));
         assert!(BOSMINER_PIC0X88_RS.ends_with("pic0x88.rs"));
-        assert_ne!(BOSMINER_AM3_INIT_TAG80_INSN, BOSMINER_WORK_RESP_PLUS80_LDRB_INSN);
+        assert_ne!(
+            BOSMINER_AM3_INIT_TAG80_INSN,
+            BOSMINER_WORK_RESP_PLUS80_LDRB_INSN
+        );
         assert_eq!(BOSMINER_AM3_INIT_TAG80_INSN, 0x3942_0008);
         assert!(admit_s19k_bosminer_layouts().is_ok());
     }
@@ -20299,10 +21878,7 @@ mod tests {
         assert_eq!(BOSMINER_FACTORY_X1_FROM_X24_INSN, 0xAA18_03E1);
         assert_eq!(BOSMINER_HC290_STR_INSN, 0xF901_4AFA);
         assert_eq!(BOSMINER_BM1366_STR88_RESULT_INSN, 0xF900_4660);
-        assert_eq!(
-            s19k_braiins_fill_nonce_word(0xAABB_CCDD),
-            0xAABB_CCDD
-        );
+        assert_eq!(s19k_braiins_fill_nonce_word(0xAABB_CCDD), 0xAABB_CCDD);
     }
 
     #[test]

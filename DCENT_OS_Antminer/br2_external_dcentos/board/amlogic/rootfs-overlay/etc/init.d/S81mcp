@@ -43,7 +43,8 @@ case "$1" in
     start)
         if [ -f "$RELEASE_MARKER" ]; then
             echo "  [SKIP] MCP server: PRODUCTION/RELEASE image — raw-HW MCP endpoint not auto-started (SW-05)."
-            echo "         Start manually over authenticated SSH if required: $0 start-force"
+            echo "         Mint a write token first: python3 $DAEMON --mint-token"
+            echo "         Then start manually over authenticated SSH: $0 start-force"
             exit 0
         fi
         do_start

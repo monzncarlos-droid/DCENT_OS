@@ -1,0 +1,6 @@
+profile=stock-coexistence
+dcentrald_installed=1
+dcentrald_autostart=0
+stock_owner=btcminer
+stock_chain_device=/dev/ttyS1
+dcentrald_transport=mm_pkg_sysv_unsupported_on_nano3_stock

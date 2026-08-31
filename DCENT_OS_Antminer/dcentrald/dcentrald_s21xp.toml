@@ -1,6 +1,7 @@
 # DCENT_OS dcentrald config for Antminer S21 XP (BM1370 family)
-# Initial warm-init validation template for Amlogic NoPic serial mining.
-# Adjust serial_device and pool settings before use.
+# Management-only identity/geometry template. Exact production evidence refutes
+# the shared base-S21 ttyS4/NoPic inheritance; no operator opt-in can make this
+# file a runnable S21 XP platform until the model/HAL admission is implemented.
 
 [general]
 hostname = "dcent-s21xp"
@@ -21,9 +22,7 @@ version_rolling = true
 passthrough = false
 suggest_difficulty = 8192
 
-# Pick the ttyS device for the populated board on the target unit.
-serial_device = "/dev/ttyS2"
-serial_chip_count = 230
+serial_chip_count = 91
 serial_chip_type = "BM1370"
 
 [power]
@@ -31,7 +30,7 @@ mode = "bypass"
 target_watts = 1500
 
 [power.psu_override]
-enabled = true
+enabled = false
 model = "APW12"
 voltage_v = 14.0
 
@@ -61,7 +60,7 @@ cycle_duration_s = 3600
 enabled = false
 
 [hash_on_disconnect]
-enabled = true
+enabled = false
 
 [mode]
 active = "standard"

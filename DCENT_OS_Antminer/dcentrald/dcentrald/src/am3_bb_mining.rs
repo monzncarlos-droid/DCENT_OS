@@ -3509,50 +3509,8 @@ fn am3_bb_dspic_init_one(
         "am3-bb: LuxOS-trace dsPIC init starting"
     );
 
-    let reset_ack = am3_bb_dspic_command(
-        i2c,
-        chain_idx,
-        addr,
-        I2cMutationLabel::Recovery,
-        AM3_BB_DSPIC_RESET_FRAME,
-        2,
-        50,
-        20,
-        "framed parser reset",
-    )?;
-    if reset_ack.first().copied() != Some(0x07) {
-        warn!(
-            chain = chain_idx,
-            addr = format_args!("0x{:02X}", addr),
-            reply = format_args!("{:02X?}", reset_ack),
-            "am3-bb: dsPIC reset echo mismatch; treating this chain controller as absent"
-        );
-        return Ok(None);
-    }
-    thread::sleep(Duration::from_millis(500));
-
-    let jump_ack = am3_bb_dspic_command(
-        i2c,
-        chain_idx,
-        addr,
-        I2cMutationLabel::Recovery,
-        AM3_BB_DSPIC_JUMP_FRAME,
-        2,
-        50,
-        20,
-        "jump-to-app",
-    )?;
-    if jump_ack.first().copied() != Some(0x06) {
-        warn!(
-            chain = chain_idx,
-            addr = format_args!("0x{:02X}", addr),
-            reply = format_args!("{:02X?}", jump_ack),
-            "am3-bb: dsPIC jump echo mismatch; treating this chain controller as absent"
-        );
-        return Ok(None);
-    }
-    thread::sleep(Duration::from_millis(400));
-
+    // Coordinator 2026-08-19: GET_VERSION first. JUMP only if not already
+    // fw=0x89 app. NEVER PIC/dsPIC RESET 0x07 on S19j Pro (0x89 FRAMED → 0x82 BARE).
     let version = am3_bb_dspic_command(
         i2c,
         chain_idx,
@@ -3574,14 +3532,58 @@ fn am3_bb_dspic_init_one(
         return Ok(None);
     };
     if fw != 0x89 {
-        warn!(
-            chain = chain_idx,
-            addr = format_args!("0x{:02X}", addr),
-            firmware = format_args!("0x{:02X}", fw),
-            reply = format_args!("{:02X?}", version),
-            "am3-bb: dsPIC firmware is not the LuxOS-traced fw=0x89 path; skipping controller"
-        );
-        return Ok(None);
+        // Bootloader or unexpected app: JUMP to app, never RESET 0x07.
+        let jump_ack = am3_bb_dspic_command(
+            i2c,
+            chain_idx,
+            addr,
+            I2cMutationLabel::Recovery,
+            AM3_BB_DSPIC_JUMP_FRAME,
+            2,
+            50,
+            20,
+            "jump-to-app",
+        )?;
+        if jump_ack.first().copied() != Some(0x06) {
+            warn!(
+                chain = chain_idx,
+                addr = format_args!("0x{:02X}", addr),
+                reply = format_args!("{:02X?}", jump_ack),
+                "am3-bb: dsPIC jump echo mismatch; treating this chain controller as absent"
+            );
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(400));
+        let version = am3_bb_dspic_command(
+            i2c,
+            chain_idx,
+            addr,
+            I2cMutationLabel::QueryPrelude,
+            AM3_BB_DSPIC_GET_VERSION_FRAME,
+            5,
+            135,
+            20,
+            "get-version-after-jump",
+        )?;
+        let Some(fw_after) = version.get(2).copied() else {
+            warn!(
+                chain = chain_idx,
+                addr = format_args!("0x{:02X}", addr),
+                reply = format_args!("{:02X?}", version),
+                "am3-bb: dsPIC version reply too short after JUMP"
+            );
+            return Ok(None);
+        };
+        if fw_after != 0x89 {
+            warn!(
+                chain = chain_idx,
+                addr = format_args!("0x{:02X}", addr),
+                firmware = format_args!("0x{:02X}", fw_after),
+                reply = format_args!("{:02X?}", version),
+                "am3-bb: dsPIC firmware is not the LuxOS-traced fw=0x89 path; skipping controller"
+            );
+            return Ok(None);
+        }
     }
 
     i2c.disable_dspic_voltage(addr, I2cDspicDisableProtocol::VnishPaddedFramed)
@@ -3700,8 +3702,6 @@ fn am3_bb_dspic_init_one(
         chain = chain_idx,
         addr = format_args!("0x{:02X}", addr),
         firmware = format_args!("0x{:02X}", fw),
-        reset_ack = format_args!("{:02X?}", reset_ack),
-        jump_ack = format_args!("{:02X?}", jump_ack),
         version = format_args!("{:02X?}", version),
         disable_ack = format_args!("{:02X?}", disable_ack),
         enable_ack = format_args!("{:02X?}", enable_ack),
@@ -3711,7 +3711,7 @@ fn am3_bb_dspic_init_one(
         voltage_after_set = format_args!("{:02X?}", voltage_after_set),
         voltage_after = format_args!("{:02X?}", voltage_after),
         heartbeat_after = format_args!("{:02X?}", heartbeat_after),
-        "am3-bb: LuxOS-trace dsPIC init complete"
+        "am3-bb: GET_VERSION-first dsPIC init complete (no RESET 0x07)"
     );
 
     Ok(Some(fw))
@@ -7130,12 +7130,24 @@ fn run_started_mining_loop<U: ChainUart>(
     let status_state_tx = state_tx.clone();
     let status_shutdown = stratum_tasks_shutdown.clone();
     let status_publisher_closed = publisher_closed.clone();
+    let alert_bind = crate::runtime::notifications::MiningAlertMonitorBind::from_config(config);
+    let alert_webhook =
+        crate::runtime::notifications::RuntimeWebhookConfig::from(config.webhook.clone());
+    let alert_miner_name = config.general.hostname.clone();
     stratum_tasks.spawn_status(async move {
         const DIFF1_HASHES: f64 = 4_294_967_296.0;
         let started = Instant::now();
         let mut accepted_difficulty_sum = 0.0_f64;
         let mut recent_accepted = VecDeque::<(Instant, f64)>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Rank-19: MiningAlertMonitor on the am3-bb path. Daemon::run already
+        // owns one; hybrid is a sibling file. Default-OFF webhook dispatch.
+        let mut alert_monitor = crate::runtime::notifications::MiningAlertMonitor::new();
+        let alert_tx = crate::runtime::notifications::spawn_alert_event_dispatcher(
+            alert_webhook,
+            alert_miner_name,
+            status_shutdown.clone(),
+        );
         loop {
             tokio::select! {
                 biased;
@@ -7165,6 +7177,21 @@ fn run_started_mining_loop<U: ChainUart>(
                         state.hashrate_ghs = lifetime_ghs;
                         state.hashrate_5s_ghs = recent_ghs;
                     });
+                    let health_state = status_state_tx.borrow().clone();
+                    let snap = crate::runtime::notifications::mining_health_snapshot_from_state(
+                        &health_state,
+                        &alert_bind,
+                    );
+                    for event in alert_monitor.evaluate(&snap, Instant::now()) {
+                        let event_name = event.event_name();
+                        if let Err(err) = alert_tx.try_send(event) {
+                            tracing::debug!(
+                                event = event_name,
+                                error = %err,
+                                "am3-bb mining-health alert dropped (alert channel full or closed)"
+                            );
+                        }
+                    }
                 }
                 status = status_rx.recv() => {
                     let Some(st) = status else { break; };
@@ -9627,6 +9654,23 @@ mod tests {
             AM3_BB_DSPIC_RESET_FRAME,
             &[0x55, 0xAA, 0x04, 0x07, 0x00, 0x0B]
         );
+        // Historical LuxOS bytes stay pinned. Production init must never send them.
+        let src = include_str!("am3_bb_mining.rs");
+        let start = src
+            .find("fn am3_bb_dspic_init_one")
+            .expect("am3_bb_dspic_init_one");
+        let body = &src[start..start + 4500];
+        assert!(
+            !body.contains("AM3_BB_DSPIC_RESET_FRAME"),
+            "S19j Pro / AM3-BB init must not send PIC RESET 0x07"
+        );
+        let get = body
+            .find("AM3_BB_DSPIC_GET_VERSION_FRAME")
+            .expect("GET_VERSION first");
+        let jump = body.find("AM3_BB_DSPIC_JUMP_FRAME");
+        if let Some(jump) = jump {
+            assert!(get < jump, "GET_VERSION must precede JUMP");
+        }
         assert_eq!(
             AM3_BB_DSPIC_JUMP_FRAME,
             &[0x55, 0xAA, 0x04, 0x06, 0x00, 0x0A]

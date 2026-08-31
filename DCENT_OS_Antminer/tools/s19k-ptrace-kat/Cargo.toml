@@ -1,0 +1,19 @@
+[workspace]
+members = ["tracer", "fixture"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+libc = "=0.2.189"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = "symbols"

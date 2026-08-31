@@ -18,6 +18,41 @@ SCRIPT="$0"
 SESSION_LATCH_HELPER="/usr/libexec/dcentos/dcentrald-session-latch.sh"
 BOARD_SETUP="/etc/init.d/S37board_setup"
 OPERATION_LOCK="/run/dcentos/dcentrald-lifecycle-operation.lock"
+MUTATION_POLICY_FILE="/etc/dcentos/mutation_policy"
+MUTATION_POLICY_HELPER="/usr/libexec/dcentos/mutation-policy.sh"
+
+require_runtime_authority() {
+    IMAGE_PLATFORM=$(cat /etc/dcentos/platform 2>/dev/null || true)
+    IMAGE_TARGET=$(cat /etc/dcentos/board_target 2>/dev/null || true)
+    case "$IMAGE_PLATFORM:$IMAGE_TARGET" in
+        am3-aml-s19k:*|*:am3-s19k|*:am3-s19kpro|*:am3-aml-s19kpro)
+            if [ ! -r "$MUTATION_POLICY_HELPER" ]; then
+                echo "  [FAIL] S19k mutation-policy helper is missing; refusing hardware lifecycle action"
+                return 1
+            fi
+            . "$MUTATION_POLICY_HELPER"
+            if ! dcent_mutation_policy_has "$MUTATION_POLICY_FILE" daemon-hardware; then
+                echo "  [FAIL] S19k daemon-hardware capability is missing or insecure; refusing hardware lifecycle action"
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+    if [ -e "$MUTATION_POLICY_FILE" ]; then
+        MUTATION_POLICY=$(cat "$MUTATION_POLICY_FILE" 2>/dev/null || true)
+        [ "$MUTATION_POLICY" = hardware-enabled ] || {
+            echo "  [FAIL] mutation_policy=$MUTATION_POLICY; refusing hardware lifecycle action"
+            return 1
+        }
+    fi
+    case "$IMAGE_PLATFORM:$IMAGE_TARGET" in
+        am3-aml-t21:*|*:am3-t21|am3-aml-s21xp:*|*:am3-s21xp|\
+        am3-aml-s19xp:*|*:am3-s19xp|am3-aml-s19jxp:*|*:am3-s19jxp)
+            echo "  [FAIL] target remains management-only; refusing hardware lifecycle action"
+            return 1
+            ;;
+    esac
+}
 
 acquire_operation_lock() {
     mkdir -p /run/dcentos 2>/dev/null || return 1
@@ -51,7 +86,8 @@ detect_platform() {
         am3-aml-s21:am3-s21|\
         am3-aml-s21pro:am3-s21pro|\
         am3-aml-s21xp:am3-s21xp|\
-        am3-aml-t21:am3-t21)
+        am3-aml-s19xp:am3-s19xp|\
+        am3-aml-s19jxp:am3-s19jxp)
             echo "amlogic"
             return
             ;;
@@ -225,6 +261,12 @@ emergency_hardware_safe_state() {
             ;;
     esac
 }
+
+case "$1" in
+    start|stop|restart|safety)
+        require_runtime_authority || exit 1
+        ;;
+esac
 
 case "$1" in
     start)

@@ -16,6 +16,7 @@ pub(crate) struct HomeNightModeView {
     pub end_hour: u8,
     pub max_fan_pwm: u8,
     pub power_reduction_pct: u8,
+    pub max_frequency_mhz: u16,
     pub schema_source: &'static str,
 }
 
@@ -36,6 +37,10 @@ fn home_night_mode_from_value(nm: &toml::Table, schema_source: &'static str) -> 
             .get("power_reduction_pct")
             .and_then(|v| v.as_integer())
             .unwrap_or(40) as u8,
+        max_frequency_mhz: nm
+            .get("max_frequency_mhz")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(400) as u16,
         schema_source,
     }
 }
@@ -65,7 +70,40 @@ pub(crate) fn read_home_night_mode_from_table(table: &toml::Table) -> HomeNightM
         end_hour: 7,
         max_fan_pwm: 30,
         power_reduction_pct: 40,
+        max_frequency_mhz: 400,
         schema_source: "defaults",
+    }
+}
+
+/// Fields written by POST `/api/home/night-mode`. Omitted request fields keep
+/// the persisted `[mode.home.night_mode]` value (schema defaults only on a
+/// first write). PWM is decrease-clamped to the home safety cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HomeNightModeWrite {
+    pub start_hour: u8,
+    pub end_hour: u8,
+    pub max_fan_pwm: u8,
+    pub power_reduction_pct: u8,
+    pub max_frequency_mhz: u16,
+}
+
+pub(crate) fn resolve_home_night_mode_write(
+    start_hour: Option<u8>,
+    end_hour: Option<u8>,
+    max_fan_pwm: Option<u8>,
+    power_reduction_pct: Option<u8>,
+    max_frequency_mhz: Option<u16>,
+    existing: HomeNightModeView,
+    pwm_safety_cap: u8,
+) -> HomeNightModeWrite {
+    HomeNightModeWrite {
+        start_hour: start_hour.unwrap_or(existing.start_hour),
+        end_hour: end_hour.unwrap_or(existing.end_hour),
+        max_fan_pwm: max_fan_pwm
+            .unwrap_or(existing.max_fan_pwm)
+            .min(pwm_safety_cap),
+        power_reduction_pct: power_reduction_pct.unwrap_or(existing.power_reduction_pct),
+        max_frequency_mhz: max_frequency_mhz.unwrap_or(existing.max_frequency_mhz),
     }
 }
 
@@ -601,7 +639,7 @@ require_token = true
 
         // Note: no [home] section present yet — the helper must create it without
         // dropping the baked sections (the exact fresh-install danger case).
-        apply_home_night_mode_to_table(&mut table, true, 22, 7, 30, 40);
+        apply_home_night_mode_to_table(&mut table, true, 22, 7, 30, 40, 400);
 
         let nm = table
             .get("mode")
@@ -619,6 +657,7 @@ require_token = true
             nm.get("power_reduction_pct").unwrap().as_integer(),
             Some(40)
         );
+        assert_eq!(nm.get("max_frequency_mhz").unwrap().as_integer(), Some(400));
         assert!(
             table.get("home").is_none(),
             "night-mode writes must not create strict-reload-breaking legacy [home]"
@@ -651,6 +690,95 @@ require_token = true
                 .and_then(|a| a.get("require_token"))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn resolve_home_night_mode_write_preserves_omitted_fan_and_frequency() {
+        let existing = HomeNightModeView {
+            enabled: true,
+            start_hour: 21,
+            end_hour: 6,
+            max_fan_pwm: 20,
+            power_reduction_pct: 35,
+            max_frequency_mhz: 350,
+            schema_source: "mode.home.night_mode",
+        };
+        let omitted = resolve_home_night_mode_write(
+            None,
+            None,
+            None,
+            None,
+            None,
+            existing,
+            dcentrald_hal::fan::PWM_SAFETY_MAX,
+        );
+        assert_eq!(omitted.start_hour, 21);
+        assert_eq!(omitted.end_hour, 6);
+        assert_eq!(omitted.max_fan_pwm, 20);
+        assert_eq!(omitted.power_reduction_pct, 35);
+        assert_eq!(omitted.max_frequency_mhz, 350);
+        let explicit = resolve_home_night_mode_write(
+            Some(22),
+            Some(7),
+            Some(80),
+            Some(40),
+            Some(320),
+            existing,
+            dcentrald_hal::fan::PWM_SAFETY_MAX,
+        );
+        assert_eq!(explicit.max_fan_pwm, 30, "PWM-30 safety cap");
+        assert_eq!(explicit.max_frequency_mhz, 320);
+        let defaults = resolve_home_night_mode_write(
+            None,
+            None,
+            None,
+            None,
+            None,
+            HomeNightModeView {
+                enabled: false,
+                start_hour: 22,
+                end_hour: 7,
+                max_fan_pwm: 30,
+                power_reduction_pct: 40,
+                max_frequency_mhz: 400,
+                schema_source: "defaults",
+            },
+            dcentrald_hal::fan::PWM_SAFETY_MAX,
+        );
+        assert_eq!(defaults.max_frequency_mhz, 400);
+
+        let mut table = toml::Table::new();
+        apply_home_night_mode_to_table(&mut table, true, 21, 6, 20, 35, 350);
+        let persisted = read_home_night_mode_from_table(&table);
+        let hours_only = resolve_home_night_mode_write(
+            Some(22),
+            Some(7),
+            None,
+            Some(40),
+            None,
+            persisted,
+            dcentrald_hal::fan::PWM_SAFETY_MAX,
+        );
+        apply_home_night_mode_to_table(
+            &mut table,
+            true,
+            hours_only.start_hour,
+            hours_only.end_hour,
+            hours_only.max_fan_pwm,
+            hours_only.power_reduction_pct,
+            hours_only.max_frequency_mhz,
+        );
+        let after = read_home_night_mode_from_table(&table);
+        assert_eq!(after.start_hour, 22);
+        assert_eq!(after.max_fan_pwm, 20);
+        assert_eq!(after.max_frequency_mhz, 350);
+        assert_eq!(after.power_reduction_pct, 40);
+
+        let source = include_str!("late.rs");
+        assert!(
+            source.contains("resolve_home_night_mode_write("),
+            "POST /api/home/night-mode must resolve omitted fields from persisted night mode"
         );
     }
 
@@ -2513,6 +2641,8 @@ end_hour = 5
                     status: "Alive".to_string(),
                 },
             ],
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 30,
                 rpm: 2_400,
@@ -2620,6 +2750,8 @@ end_hour = 5
             accepted: 0,
             rejected: 0,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 10,
                 rpm: 0,
@@ -2709,6 +2841,8 @@ end_hour = 5
             accepted: 7,
             rejected: 1,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 30,
                 rpm: 2_400,
@@ -2880,6 +3014,8 @@ end_hour = 5
             accepted: 9,
             rejected: 1,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 30,
                 rpm: 2_400,
@@ -2972,6 +3108,8 @@ end_hour = 5
             accepted: 0,
             rejected: 0,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 10,
                 rpm: 0,
@@ -3041,6 +3179,11 @@ end_hour = 5
             version_bits: Some("20000000".to_string()),
             version: Some(0x2000_0000),
             protocol_meta_present: true,
+            serial_logical_path: None,
+            serial_attribution: None,
+            serial_chip_addr: None,
+            serial_asic_index: None,
+            serial_core_id: None,
         });
 
         assert_eq!(body["timestamp_ms"].as_u64(), Some(123_456));
@@ -3051,6 +3194,25 @@ end_hour = 5
         assert!(body.get("timestampMs").is_none());
         assert!(body.get("jobId").is_none());
         assert!(body.get("targetDifficulty").is_none());
+    }
+
+    #[test]
+    fn recent_share_event_response_carries_correlated_serial_origin() {
+        let body = recent_share_event_response_json(&crate::RecentShareEvent {
+            result: "accepted".to_string(),
+            serial_logical_path: Some("ttyS2".to_string()),
+            serial_attribution: Some("Shift3".to_string()),
+            serial_chip_addr: Some(0x30),
+            serial_asic_index: Some(6),
+            serial_core_id: Some(11),
+            ..Default::default()
+        });
+
+        assert_eq!(body["serial_logical_path"], "ttyS2");
+        assert_eq!(body["serial_attribution"], "Shift3");
+        assert_eq!(body["serial_chip_addr"], 0x30);
+        assert_eq!(body["serial_asic_index"], 6);
+        assert_eq!(body["serial_core_id"], 11);
     }
 
     #[test]
@@ -3411,16 +3573,17 @@ end_hour = 5
     // password in cleartext (set => placeholder, unset => empty).
     #[test]
     fn mqtt_config_response_masks_password() {
-        let mut cfg = MqttConfigPayload::default();
-        cfg.broker = "mqtt://broker.local:1883".into();
-        cfg.password = "supersecret".into();
+        let cfg = MqttConfigPayload {
+            broker: "mqtt://broker.local:1883".into(),
+            password: "supersecret".into(),
+            ..MqttConfigPayload::default()
+        };
         let resp = mqtt_config_response(cfg);
         assert_eq!(resp.password, SECRET_REDACTION_PLACEHOLDER);
         // broker (non-secret) is preserved verbatim.
         assert_eq!(resp.broker, "mqtt://broker.local:1883");
 
-        let mut unset = MqttConfigPayload::default();
-        unset.password = String::new();
+        let unset = MqttConfigPayload::default();
         assert_eq!(mqtt_config_response(unset).password, "");
     }
 
@@ -5794,12 +5957,12 @@ end_hour = 5
         let snapshot = build_mining_pipeline_snapshot_response(None, 456_000, 5_000);
 
         assert_eq!(snapshot.generated_at_ms, 456_000);
-        assert_eq!(snapshot.publisher_enabled, false);
-        assert_eq!(snapshot.snapshot_available, false);
-        assert_eq!(snapshot.read_only, true);
-        assert_eq!(snapshot.control_actions, false);
-        assert_eq!(snapshot.hardware_writes, false);
-        assert_eq!(snapshot.filesystem_mutation, false);
+        assert!(!snapshot.publisher_enabled);
+        assert!(!snapshot.snapshot_available);
+        assert!(snapshot.read_only);
+        assert!(!snapshot.control_actions);
+        assert!(!snapshot.hardware_writes);
+        assert!(!snapshot.filesystem_mutation);
         assert_eq!(snapshot.publisher_last_update_ms, None);
         assert_eq!(snapshot.source, "disabled_pipeline_snapshot_gate");
     }
@@ -5817,13 +5980,13 @@ end_hour = 5
         let snapshot = build_mining_pipeline_snapshot_response(Some(&rx), 104_000, 5_000);
 
         assert_eq!(snapshot.generated_at_ms, 104_000);
-        assert_eq!(snapshot.publisher_enabled, true);
-        assert_eq!(snapshot.snapshot_available, true);
+        assert!(snapshot.publisher_enabled);
+        assert!(snapshot.snapshot_available);
         assert_eq!(snapshot.snapshot_age_ms, Some(4_000));
-        assert_eq!(snapshot.read_only, true);
-        assert_eq!(snapshot.control_actions, false);
-        assert_eq!(snapshot.hardware_writes, false);
-        assert_eq!(snapshot.filesystem_mutation, false);
+        assert!(snapshot.read_only);
+        assert!(!snapshot.control_actions);
+        assert!(!snapshot.hardware_writes);
+        assert!(!snapshot.filesystem_mutation);
         assert_eq!(snapshot.source, "test_publisher");
     }
 
@@ -8288,11 +8451,9 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
     let measured_wall_watts = measured_wall_watts_for_unprovenanced_surface(&power_projection);
     let profile = chip_type_to_chip_id(&hw.chip_type).and_then(MinerProfile::for_chip);
     let device_model = profile.map(|p| p.name).unwrap_or("Antminer");
-    let model_label = if hw.chip_type.trim().is_empty() {
-        "Antminer (unknown ASIC)".to_string()
-    } else {
-        format!("Antminer ({})", hw.chip_type)
-    };
+    // Prefer MinerProfile::name (e.g. "Antminer S19j Pro") over chip-typed
+    // "Antminer (BM1362)" so pyasic/hass-miner classify the hardware model.
+    let model_label = fleet_model_label(&hw);
     let dcent_swarm = dcent_swarm_info(
         &state,
         &miner,
@@ -8399,7 +8560,19 @@ pub(super) async fn get_system_info(State(state): State<Arc<AppState>>) -> impl 
         // "am3-bb" / "unknown") for deterministic dashboard capability gating.
         "platform_key": platform_key,
         "field_sources": {
-            "model": if hw.chip_type.trim().is_empty() { "unknown" } else { "hardware_info.chip_type" },
+            "model": if profile.is_some() {
+                "MinerProfile::name"
+            } else if hw
+                .hb_type
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "hardware_info.hb_type"
+            } else if hw.chip_type.trim().is_empty() {
+                "unknown"
+            } else {
+                "hardware_info.chip_type"
+            },
             "chip_type": if hw.chip_type.trim().is_empty() { "unknown" } else { "hardware_info.chip_type" },
             "power": if measured_wall_watts > 0.0 { "measured_power.wall_watts" } else { "unavailable_or_modeled_power_suppressed" },
             "temp": "first_active_chain.temp_c",
@@ -8569,6 +8742,11 @@ pub(super) fn recent_share_event_response_row(
         version_bits: event.version_bits.clone(),
         version: event.version,
         protocol_meta_present: event.protocol_meta_present,
+        serial_logical_path: event.serial_logical_path.clone(),
+        serial_attribution: event.serial_attribution.clone(),
+        serial_chip_addr: event.serial_chip_addr,
+        serial_asic_index: event.serial_asic_index,
+        serial_core_id: event.serial_core_id,
     }
 }
 
@@ -14994,13 +15172,40 @@ pub(super) async fn get_home_history(State(state): State<Arc<AppState>>) -> impl
     history_response(read_history_data(&state))
 }
 
+/// Live authoritative wall watts from the daemon power watch, with the
+/// provenance label — or `None` when no control-authoritative watt sample
+/// source is reachable.
+///
+/// Same bar as the tuner watt PID
+/// (`PowerAuthorityKind::is_control_authoritative`): only PMBus / ADC /
+/// wall-calibrated samples count. Estimate-only watts publish nothing —
+/// closing a watt loop on the controller's own feed-forward is the refused
+/// tautology. `timestamp_ms == 0` means the watch never had a producer at
+/// all, which is exactly the serial `serial_mining` path today: it creates
+/// the channel but has no PMBus/ADC/wall-calibrated watt reader, so watts
+/// there must surface as savedOnly-with-truth, never as adopted.
+fn authoritative_wall_watts_from_power_watch(
+    live: &dcentrald_autotuner::LivePowerEstimate,
+) -> Option<(u32, &'static str)> {
+    if live.timestamp_ms == 0 {
+        return None;
+    }
+    let authority =
+        dcentrald_autotuner::PowerAuthorityKind::from_source(&live.source, live.calibrated);
+    if !authority.is_control_authoritative() {
+        return None;
+    }
+    (live.wall_watts.is_finite() && live.wall_watts > 0.0)
+        .then(|| (live.wall_watts as u32, authority.as_str()))
+}
+
 /// GET /api/home/night-mode -- Night mode configuration.
 ///
 /// Reads the [mode.home.night_mode] section from the config file, with a
 /// read-only fallback for legacy [home.night_mode].
 /// Returns the current configuration including whether night mode
 /// is currently active based on the system clock.
-pub(super) async fn get_home_night_mode(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(super) async fn get_home_night_mode(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config_path = if std::path::Path::new("/data/dcentrald.toml").exists() {
         "/data/dcentrald.toml"
     } else {
@@ -15019,7 +15224,80 @@ pub(super) async fn get_home_night_mode(State(_state): State<Arc<AppState>>) -> 
         end_hour: 7,
         max_fan_pwm: 30,
         power_reduction_pct: 40,
+        max_frequency_mhz: 400,
         schema_source: "defaults",
+    });
+
+    let live = state.autotuner_status_rx.borrow().night_power.clone();
+    let truth = dcentrald_autotuner::night_mode_read_truth(
+        view.enabled,
+        view.start_hour,
+        view.end_hour,
+        view.power_reduction_pct,
+        live.as_ref(),
+    );
+    let serial_snap = state.serial_live_mhz_tx.as_ref().map(|tx| *tx.borrow());
+    let serial_mhz = dcentrald_common::night_power::serial_live_mhz_from_watch(serial_snap);
+    let serial_home = state.home_night_fan_tx.as_ref().map(|tx| *tx.borrow());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let serial_desired = match (serial_snap, serial_home) {
+        (Some(snap), Some(home)) if snap.nameplate_mhz > 0 => Some(
+            dcentrald_common::night_power::serial_night_power_desired_at(
+                snap.nameplate_mhz,
+                snap.thermal,
+                home,
+                now_secs,
+                snap.timezone_offset_hours,
+            ),
+        ),
+        _ => None,
+    };
+    let serial_truth = dcentrald_common::night_power::serial_night_power_read_truth(
+        truth.runtime_adopted,
+        serial_mhz,
+        serial_desired,
+    );
+    // Watt-domain honesty: desired watts from the runtime nameplate plus the
+    // saved window; the sample only appears when a control-authoritative
+    // source produced it. Serial has no such source in-tree (its power watch
+    // has no producer), so watts surface as savedOnly-with-truth there —
+    // `runtimeAdopted` never flips on a serial watt claim.
+    let serial_desired_watts = match (serial_snap, serial_home) {
+        (Some(snap), Some(home)) if snap.nameplate_watts > 0 => Some(
+            dcentrald_common::night_power::serial_night_power_desired_watts_at(
+                snap.nameplate_watts,
+                snap.thermal,
+                home,
+                now_secs,
+                snap.timezone_offset_hours,
+            ),
+        ),
+        _ => None,
+    };
+    let live_power = state.power_rx.borrow().clone();
+    let serial_watt_sample = authoritative_wall_watts_from_power_watch(&live_power);
+    let watt_truth = dcentrald_common::night_power::serial_night_watt_read_truth(
+        truth.runtime_adopted,
+        serial_watt_sample.map(|(watts, _)| watts),
+        serial_desired_watts,
+    );
+    let active = live.as_ref().map(|policy| {
+        let hour = dcentrald_common::night_power::local_hour_from_unix_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            policy.timezone_offset_hours,
+        );
+        policy.enabled
+            && dcentrald_common::night_power::night_hours_active(
+                hour,
+                policy.start_hour,
+                policy.end_hour,
+            )
     });
 
     Json(serde_json::json!({
@@ -15028,23 +15306,83 @@ pub(super) async fn get_home_night_mode(State(_state): State<Arc<AppState>>) -> 
         "end_hour": view.end_hour,
         "max_fan_pwm": view.max_fan_pwm,
         "power_reduction_pct": view.power_reduction_pct,
-        "active": false,
-        "activeKnown": false,
-        "activeSource": "unavailable_saved_only",
+        "max_frequency_mhz": view.max_frequency_mhz,
+        "active": active.unwrap_or(false),
+        "activeKnown": active.is_some(),
+        "activeSource": if active.is_some() { "autotuner.night_power" } else { "unavailable" },
         "schemaSource": view.schema_source,
-        "runtimeSource": "thermal.night_mode",
-        "runtimeAdopted": false,
-        "pendingRestart": false,
-        "savedOnly": view.schema_source != "defaults",
+        "runtimeSource": truth.runtime_source,
+        "runtimeAdopted": serial_truth.runtime_adopted,
+        "serialFrequencyAdopted": serial_truth.serial_frequency_adopted,
+        "serialNightPowerMhz": serial_truth.serial_night_power_mhz,
+        "serialNightPowerDesiredMhz": serial_truth.serial_night_power_desired_mhz,
+        "serialNightPowerPending": serial_truth.serial_night_power_pending,
+        "serialWattSampleWatts": watt_truth.serial_watt_sample_watts,
+        "serialWattSampleSource": serial_watt_sample
+            .map(|(_, source)| source)
+            .unwrap_or("unavailable"),
+        "serialNightPowerDesiredWatts": watt_truth.serial_night_power_desired_watts,
+        "serialNightPowerWattsPending": watt_truth.serial_night_power_pending,
+        "serialWattSavedOnly": watt_truth.saved_only,
+        "pendingRestart": serial_truth.saved_only,
+        "savedOnly": serial_truth.saved_only,
     }))
 }
 
-/// POST /api/home/night-mode -- Update night mode configuration.
-///
-/// Writes night mode settings to the daemon-owned [mode.home.night_mode]
-/// section of the config. The response deliberately reports saved-only truth:
-/// the current live thermal loop enforces `thermal.night_mode`, not this saved
-/// Home-mode schema.
+struct NightPowerDispatch {
+    runtime_adopted: bool,
+    applied_runtime: bool,
+    runtime_source: &'static str,
+    message: String,
+}
+
+async fn dispatch_night_power_policy(
+    state: &AppState,
+    policy: dcentrald_autotuner::NightPowerPolicy,
+) -> NightPowerDispatch {
+    let Some(tx) = &state.autotuner_command_tx else {
+        return NightPowerDispatch {
+            runtime_adopted: false,
+            applied_runtime: false,
+            runtime_source: "none",
+            message: "night mode saved; live autotuner command channel is not available"
+                .to_string(),
+        };
+    };
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let command = dcentrald_autotuner::AutoTunerCommand::ApplyNightPowerPolicy { policy, ack_tx };
+    if tx.send(command).await.is_err() {
+        return NightPowerDispatch {
+            runtime_adopted: false,
+            applied_runtime: false,
+            runtime_source: "none",
+            message: "night mode saved; live autotuner command channel is closed".to_string(),
+        };
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx).await {
+        Ok(Ok(result)) => NightPowerDispatch {
+            runtime_adopted: true,
+            applied_runtime: result.applied_runtime,
+            runtime_source: "autotuner.night_power",
+            message: result.message,
+        },
+        Ok(Err(_)) => NightPowerDispatch {
+            runtime_adopted: false,
+            applied_runtime: false,
+            runtime_source: "none",
+            message: "night mode saved; autotuner closed before acknowledgement".to_string(),
+        },
+        Err(_) => NightPowerDispatch {
+            runtime_adopted: true,
+            applied_runtime: false,
+            runtime_source: "autotuner.night_power",
+            message: "night policy sent to the live tuner; acknowledgement timed out".to_string(),
+        },
+    }
+}
+
+/// POST /api/home/night-mode -- persist `[mode.home.night_mode]` and adopt
+/// it on a running Power-mode tuner when the live command channel exists.
 pub(super) async fn post_home_night_mode(
     State(state): State<Arc<AppState>>,
     Json(body): Json<NightModeRequest>,
@@ -15066,32 +15404,6 @@ pub(super) async fn post_home_night_mode(
         return response;
     }
 
-    let start_hour = body.start_hour.unwrap_or(22);
-    let end_hour = body.end_hour.unwrap_or(7);
-    let max_fan_pwm = body
-        .max_fan_pwm
-        .unwrap_or(30)
-        .min(dcentrald_hal::fan::PWM_SAFETY_MAX);
-    let power_reduction_pct = body.power_reduction_pct.unwrap_or(40);
-
-    tracing::info!(
-        enabled = body.enabled,
-        start = start_hour,
-        end = end_hour,
-        max_fan_pwm,
-        power_reduction_pct,
-        "Night mode configuration update"
-    );
-
-    // Validate hour ranges
-    if start_hour > 23 || end_hour > 23 {
-        return Json(serde_json::json!({
-            "status": "error",
-            "message": "Hours must be 0-23",
-        }))
-        .into_response();
-    }
-
     // CFG-1/CFG-2: same hardened read-modify-write as the home power-target
     // handler — load the FULL effective config (baked `/etc` merged when `/data`
     // is absent), mutate ONLY `[mode.home.night_mode]`, write atomically to the
@@ -15099,7 +15411,7 @@ pub(super) async fn post_home_night_mode(
     // `[home]`-only file that shadows every other baked section. The dead
     // `if/else` (both arms identical) is removed.
     let config_path = get_writable_config_path();
-    let write_result = (|| -> std::result::Result<(), String> {
+    let write_result = (|| -> std::result::Result<HomeNightModeWrite, String> {
         // RELIAB-2b: serialize load→modify→write (lost-update guard). Scoped to
         // this synchronous closure so it drops before any `.await`.
         let _cfg_write_guard = crate::atomic_io::config_write_lock();
@@ -15110,39 +15422,147 @@ pub(super) async fn post_home_night_mode(
                 .map_err(|e| format!("Failed to create config directory: {}", e))?;
         }
 
+        let existing = read_home_night_mode_from_table(&table);
+        let write = resolve_home_night_mode_write(
+            body.start_hour,
+            body.end_hour,
+            body.max_fan_pwm,
+            body.power_reduction_pct,
+            body.max_frequency_mhz,
+            existing,
+            dcentrald_hal::fan::PWM_SAFETY_MAX,
+        );
+        if write.start_hour > 23 || write.end_hour > 23 {
+            return Err("Hours must be 0-23".to_string());
+        }
+
         apply_home_night_mode_to_table(
             &mut table,
             body.enabled,
-            start_hour,
-            end_hour,
-            max_fan_pwm,
-            power_reduction_pct,
+            write.start_hour,
+            write.end_hour,
+            write.max_fan_pwm,
+            write.power_reduction_pct,
+            write.max_frequency_mhz,
         );
 
         let output =
             toml::to_string_pretty(&table).map_err(|e| format!("Serialize error: {}", e))?;
         atomic_write(config_path, output).map_err(|e| format!("Write error: {}", e))?;
-        Ok(())
+        Ok(write)
     })();
 
     match write_result {
-        Ok(()) => {
+        Ok(write) => {
             tracing::info!(
-                "Night mode config saved to disk — thermal loop will apply on next tick"
+                enabled = body.enabled,
+                start = write.start_hour,
+                end = write.end_hour,
+                max_fan_pwm = write.max_fan_pwm,
+                power_reduction_pct = write.power_reduction_pct,
+                max_frequency_mhz = write.max_frequency_mhz,
+                "Night mode configuration update"
+            );
+            let policy = dcentrald_autotuner::NightPowerPolicy::from_home_night_mode(
+                body.enabled,
+                write.start_hour,
+                write.end_hour,
+                write.power_reduction_pct,
+                0,
+            );
+            if let Some(tx) = state.home_night_fan_tx.as_ref() {
+                let _ = tx.send(
+                    dcentrald_common::night_power::NightFanWindow::new(
+                        body.enabled,
+                        write.start_hour,
+                        write.end_hour,
+                        write.max_fan_pwm,
+                    )
+                    .with_max_frequency(write.max_frequency_mhz)
+                    .with_power_reduction(write.power_reduction_pct),
+                );
+            }
+            let runtime = dispatch_night_power_policy(state.as_ref(), policy).await;
+            let serial_snap = state.serial_live_mhz_tx.as_ref().map(|tx| *tx.borrow());
+            let serial_mhz = dcentrald_common::night_power::serial_live_mhz_from_watch(serial_snap);
+            let serial_home = state.home_night_fan_tx.as_ref().map(|tx| *tx.borrow());
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let serial_desired = match (serial_snap, serial_home) {
+                (Some(snap), Some(home)) if snap.nameplate_mhz > 0 => Some(
+                    dcentrald_common::night_power::serial_night_power_desired_at(
+                        snap.nameplate_mhz,
+                        snap.thermal,
+                        home,
+                        now_secs,
+                        snap.timezone_offset_hours,
+                    ),
+                ),
+                _ => None,
+            };
+            let serial_truth = dcentrald_common::night_power::serial_night_power_read_truth(
+                runtime.runtime_adopted,
+                serial_mhz,
+                serial_desired,
+            );
+            // Watt-domain honesty, same as GET: the just-saved window feeds
+            // desired watts; the sample stays None unless a
+            // control-authoritative source produced it. No PLL/watt actuation
+            // is triggered by POST — pending is the honest state.
+            let serial_desired_watts = match (serial_snap, serial_home) {
+                (Some(snap), Some(home)) if snap.nameplate_watts > 0 => Some(
+                    dcentrald_common::night_power::serial_night_power_desired_watts_at(
+                        snap.nameplate_watts,
+                        snap.thermal,
+                        home,
+                        now_secs,
+                        snap.timezone_offset_hours,
+                    ),
+                ),
+                _ => None,
+            };
+            let live_power = state.power_rx.borrow().clone();
+            let serial_watt_sample = authoritative_wall_watts_from_power_watch(&live_power);
+            let watt_truth = dcentrald_common::night_power::serial_night_watt_read_truth(
+                runtime.runtime_adopted,
+                serial_watt_sample.map(|(watts, _)| watts),
+                serial_desired_watts,
+            );
+            tracing::info!(
+                runtime_adopted = serial_truth.runtime_adopted,
+                serial_frequency_adopted = serial_truth.serial_frequency_adopted,
+                serial_watt_saved_only = watt_truth.saved_only,
+                applied_runtime = runtime.applied_runtime,
+                "Night mode config saved; live tuner/serial dispatch result"
             );
             Json(serde_json::json!({
                 "status": "ok",
-                "message": "Night mode configuration saved only; live thermal enforcement still uses thermal.night_mode",
+                "message": runtime.message,
                 "enabled": body.enabled,
-                "start_hour": start_hour,
-                "end_hour": end_hour,
-                "max_fan_pwm": max_fan_pwm,
-                "power_reduction_pct": power_reduction_pct,
+                "start_hour": write.start_hour,
+                "end_hour": write.end_hour,
+                "max_fan_pwm": write.max_fan_pwm,
+                "power_reduction_pct": write.power_reduction_pct,
+                "max_frequency_mhz": write.max_frequency_mhz,
                 "schemaSource": "mode.home.night_mode",
-                "runtimeSource": "thermal.night_mode",
-                "runtimeAdopted": false,
-                "pendingRestart": false,
-                "savedOnly": true,
+                "runtimeSource": runtime.runtime_source,
+                "runtimeAdopted": serial_truth.runtime_adopted,
+                "serialFrequencyAdopted": serial_truth.serial_frequency_adopted,
+                "serialNightPowerMhz": serial_truth.serial_night_power_mhz,
+                "serialNightPowerDesiredMhz": serial_truth.serial_night_power_desired_mhz,
+                "serialNightPowerPending": serial_truth.serial_night_power_pending,
+                "serialWattSampleWatts": watt_truth.serial_watt_sample_watts,
+                "serialWattSampleSource": serial_watt_sample
+                    .map(|(_, source)| source)
+                    .unwrap_or("unavailable"),
+                "serialNightPowerDesiredWatts": watt_truth.serial_night_power_desired_watts,
+                "serialNightPowerWattsPending": watt_truth.serial_night_power_pending,
+                "serialWattSavedOnly": watt_truth.saved_only,
+                "appliedRuntime": runtime.applied_runtime || serial_truth.serial_frequency_adopted,
+                "pendingRestart": serial_truth.saved_only,
+                "savedOnly": serial_truth.saved_only,
             }))
             .into_response()
         }
@@ -16609,6 +17029,28 @@ pub(super) async fn get_diag_recent_reports(
 /// zero-queue bounded subprocess owner. Pool connectivity remains an explicitly
 /// labeled cached runtime observation; this endpoint does not claim an NTP or
 /// live pool-connect probe.
+fn diagnostic_network_probe_status(status: ProbeStatus) -> NetworkProbeStatus {
+    match status {
+        ProbeStatus::Ok => NetworkProbeStatus::Ok,
+        ProbeStatus::Skipped => NetworkProbeStatus::Skipped,
+        ProbeStatus::Busy => NetworkProbeStatus::Busy,
+        ProbeStatus::SpawnError => NetworkProbeStatus::SpawnError,
+        ProbeStatus::NonZeroExit => NetworkProbeStatus::NonZeroExit,
+        ProbeStatus::Timeout => NetworkProbeStatus::Timeout,
+        ProbeStatus::Cancelled => NetworkProbeStatus::Cancelled,
+        ProbeStatus::OutputTooLarge => NetworkProbeStatus::OutputTooLarge,
+        ProbeStatus::InvalidOutput => NetworkProbeStatus::InvalidOutput,
+        ProbeStatus::WorkerError => NetworkProbeStatus::WorkerError,
+    }
+}
+
+fn diagnostic_network_probe_stage(stage: &ProbeStageOutcome) -> NetworkProbeStageTelemetry {
+    NetworkProbeStageTelemetry {
+        status: diagnostic_network_probe_status(stage.status),
+        detail: stage.detail.clone(),
+    }
+}
+
 pub(super) async fn get_diag_network(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let miner = state.state_rx.borrow().clone();
     let pool_host = diagnostic_pool_dns_host(&miner.pool.url);
@@ -16665,27 +17107,60 @@ pub(super) async fn get_diag_network(State(state): State<Arc<AppState>>) -> impl
             .ok()
             .and_then(|result| result.ok())
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
+            .filter(|value| !value.is_empty());
         let carrier = carrier
             .ok()
             .and_then(|result| result.ok())
-            .map(|value| value.trim() == "1")
-            .unwrap_or(false);
+            .and_then(|value| match value.trim() {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            });
         (mac, carrier)
     } else {
-        ("unknown".to_string(), false)
+        (None, None)
     };
     let cached_pool_connected = is_pool_connected(&miner.pool.status);
+    let captured_at_ms = unix_now_ms();
+    let telemetry = UnattestedNetworkTelemetry {
+        telemetry_source: "bounded REST network diagnostic".to_string(),
+        captured_at_ms,
+        interface: probe.interface.clone(),
+        ip_cidr: probe.ip_cidr.clone(),
+        ip_address: probe.ip_address.clone(),
+        mac: mac.clone(),
+        link_up: carrier,
+        gateway: probe.gateway.clone(),
+        gateway_reachable: probe.gateway_reachable,
+        dns_test_host: pool_host.clone(),
+        dns_ok: probe.dns_ok,
+        cached_pool_status: (!miner.pool.status.trim().is_empty())
+            .then(|| miner.pool.status.clone()),
+        cached_pool_connected,
+        ip_address_probe: diagnostic_network_probe_stage(&probe.ip_address_probe),
+        route_probe: diagnostic_network_probe_stage(&probe.route_probe),
+        gateway_probe: diagnostic_network_probe_stage(&probe.gateway_probe),
+        dns_probe: diagnostic_network_probe_stage(&probe.dns_probe),
+    };
+    let test_id = match state
+        .diagnostic_service
+        .lock()
+        .await
+        .publish_network_test_telemetry(telemetry)
+    {
+        Ok(test_id) => test_id,
+        Err(error) => return report_storage_error_response(&error),
+    };
 
     Json(serde_json::json!({
+        "test_id": test_id,
         "status": "ok",
         "ethernet": {
-            "mac": mac,
+            "mac": mac.unwrap_or_else(|| "unknown".to_string()),
             "ip": probe.ip_cidr.clone().unwrap_or_else(|| "unknown".to_string()),
             "ip_address": probe.ip_address.clone().unwrap_or_else(|| "unknown".to_string()),
             "interface": probe.interface.clone().unwrap_or_else(|| "unknown".to_string()),
-            "link_up": carrier,
+            "link_up": carrier.unwrap_or(false),
             "gateway": probe.gateway.clone().unwrap_or_else(|| "unknown".to_string()),
         },
         "gateway_reachable": probe.gateway_reachable.unwrap_or(false),
@@ -16718,12 +17193,43 @@ pub(super) async fn get_diag_psu(State(state): State<Arc<AppState>>) -> impl Int
     let miner = state.state_rx.borrow().clone();
     let live_power = state.power_rx.borrow().clone();
     let projection = project_power_telemetry(&live_power, &miner, &hw);
+    let psu_detected = hw
+        .psu_model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty());
+    let test_id = {
+        let mut diagnostics = state.diagnostic_service.lock().await;
+        let result = if projection.live_power_available && live_power.timestamp_ms > 0 {
+            diagnostics.publish_psu_probe_telemetry(UnattestedPsuTelemetry {
+                telemetry_source: "daemon power_rx retained sample".to_string(),
+                captured_at_ms: live_power.timestamp_ms,
+                detected: Some(psu_detected),
+                vin_v: None,
+                vout_v: None,
+                iout_a: None,
+                board_power_w: Some(f64::from(projection.board_watts)),
+                wall_power_w: Some(f64::from(projection.wall_watts)),
+                efficiency_pct: None,
+                temp_c: None,
+                fan_rpm: None,
+                faults: None,
+                status_word: None,
+                calibrated: Some(projection.calibrated),
+            })
+        } else {
+            diagnostics.publish_psu_probe_unavailable(
+                "runtime has no positive timestamped power_rx sample; static model fallback is not PSU telemetry",
+            )
+        };
+        match result {
+            Ok(test_id) => test_id,
+            Err(error) => return report_storage_error_response(&error),
+        }
+    };
 
     Json(serde_json::json!({
-        "detected": hw
-            .psu_model
-            .as_deref()
-            .is_some_and(|model| !model.trim().is_empty()),
+        "test_id": test_id,
+        "detected": psu_detected,
         "model": hw.psu_model,
         "fw_version": hw.psu_fw_version,
         "transport": "daemon_snapshot",
@@ -16747,27 +17253,46 @@ pub(super) async fn get_diag_psu(State(state): State<Arc<AppState>>) -> impl Int
         "hardware_bus_access_attempted": false,
         "message": "This diagnostic consumes the mining runtime's published power snapshot and never opens a parallel PSU transport. Voltage/current/controller state remain unavailable until the runtime publishes them.",
     }))
+    .into_response()
 }
 
-/// GET /api/diagnostics/troubleshoot/fpga -- Daemon-owned chain snapshot.
-///
-/// Raw FPGA register fields remain unavailable in the normal runtime.
+/// GET /api/diagnostics/troubleshoot/fpga -- Runtime-owner retained snapshot.
 pub(super) async fn get_diag_fpga(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let miner = state.state_rx.borrow().clone();
+    let fpga = state
+        .fpga_status_rx
+        .as_ref()
+        .and_then(|receiver| receiver.borrow().clone());
+    let test_id = {
+        let mut diagnostics = state.diagnostic_service.lock().await;
+        let result = if let Some(telemetry) = fpga.as_ref() {
+            diagnostics.publish_fpga_status_runtime_telemetry(telemetry.clone())
+        } else {
+            diagnostics.publish_fpga_status_unavailable(
+                "runtime has not published an FPGA register snapshot on this execution path",
+            )
+        };
+        match result {
+            Ok(test_id) => test_id,
+            Err(error) => return report_storage_error_response(&error),
+        }
+    };
+    let snapshot_available = fpga.is_some();
+    let telemetry_source = fpga
+        .as_ref()
+        .map(|snapshot| snapshot.telemetry_source.clone())
+        .unwrap_or_else(|| "unavailable".to_string());
     Json(serde_json::json!({
-        "status": "snapshot_only",
-        "source": "daemon_runtime_snapshot",
+        "test_id": test_id,
+        "status": if snapshot_available { "retained_runtime_snapshot" } else { "unavailable" },
+        "source": telemetry_source,
+        "fpga": fpga,
         "chains": miner.chains,
         "fans": miner.fans,
         "hardware_access_attempted": false,
-        "unsupported_fields": [
-            "raw_fpga_version",
-            "raw_fpga_build_id",
-            "raw_fpga_control_register",
-            "raw_gpio_registers"
-        ],
-        "message": "Raw FPGA diagnostics are unavailable until the engine publishes a typed register snapshot.",
+        "message": "This endpoint only clones the mining runtime owner's retained FPGA status registers. It performs no MMIO, UIO, devmem, FIFO, GPIO, or device access and grants no health/pass verdict.",
     }))
+    .into_response()
 }
 
 #[cfg(feature = "recovery-tool")]
@@ -16924,19 +17449,133 @@ pub(super) async fn get_diag_asic_comm(State(state): State<Arc<AppState>>) -> im
     .into_response()
 }
 
-/// GET /api/diagnostics/troubleshoot/i2c-scan -- Retired scan compatibility surface.
-pub(super) async fn get_diag_i2c_scan(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "status": "unavailable",
-            "operation": "i2c_topology_scan",
-            "devices": [],
-            "found_count": 0,
-            "hardware_access_attempted": false,
-            "message": "Live scans are retired because they bypass the daemon's serialized bus owner. Consume a daemon-owned topology snapshot when available.",
-        })),
+fn map_i2c_observed_operation(
+    operation: dcentrald_hal::i2c::I2cObservedOperation,
+) -> (
+    dcentrald_diagnostics::troubleshoot::I2cObservedOperationKind,
+    dcentrald_diagnostics::troubleshoot::I2cObservedEndpointRole,
+) {
+    use dcentrald_diagnostics::troubleshoot::{
+        I2cObservedEndpointRole as Role, I2cObservedOperationKind as Kind,
+    };
+    use dcentrald_hal::i2c::I2cObservedOperation as HalOperation;
+
+    match operation {
+        HalOperation::PicHeartbeat => (Kind::PicHeartbeat, Role::ControllerProtocolEndpoint),
+        HalOperation::PicVoltageCommand => {
+            (Kind::PicVoltageCommand, Role::ControllerProtocolEndpoint)
+        }
+        HalOperation::PicSafeOff => (Kind::PicSafeOff, Role::ControllerProtocolEndpoint),
+        HalOperation::DspicVoltageCommand => {
+            (Kind::DspicVoltageCommand, Role::ControllerProtocolEndpoint)
+        }
+        HalOperation::PicBootloaderStateRead => (
+            Kind::PicBootloaderStateRead,
+            Role::ControllerProtocolEndpoint,
+        ),
+        HalOperation::GenericWrite => (Kind::GenericWrite, Role::UnclassifiedEndpoint),
+        HalOperation::GenericBytewiseWrite => {
+            (Kind::GenericBytewiseWrite, Role::UnclassifiedEndpoint)
+        }
+        HalOperation::GenericRead => (Kind::GenericRead, Role::UnclassifiedEndpoint),
+        HalOperation::HashboardEepromRead => {
+            (Kind::HashboardEepromRead, Role::HashboardEepromEndpoint)
+        }
+        HalOperation::Lm75TemperatureRead => {
+            (Kind::Lm75TemperatureRead, Role::TemperatureSensorEndpoint)
+        }
+        HalOperation::GenericWriteRead => (Kind::GenericWriteRead, Role::UnclassifiedEndpoint),
+        HalOperation::CompoundTransaction => {
+            (Kind::CompoundTransaction, Role::UnclassifiedEndpoint)
+        }
+    }
+}
+
+fn retained_i2c_telemetry(
+    readers: &[dcentrald_hal::i2c::I2cObservationReader],
+) -> Option<dcentrald_diagnostics::troubleshoot::RuntimeOwnedI2cTelemetry> {
+    use dcentrald_diagnostics::troubleshoot::RuntimeOwnedI2cEndpointObservation;
+
+    // A replacement service lifetime for the same bus supersedes older
+    // retained evidence. Keep the newest positive observation for each exact
+    // bus/address key; never add counts across service lifetimes.
+    let mut endpoints = std::collections::BTreeMap::new();
+    for reader in readers {
+        let snapshot = reader.snapshot();
+        for endpoint in snapshot.endpoints {
+            let (operation, endpoint_role) =
+                map_i2c_observed_operation(endpoint.last_successful_operation);
+            let observation = RuntimeOwnedI2cEndpointObservation {
+                bus: snapshot.bus,
+                address: endpoint.address,
+                operation,
+                endpoint_role,
+                observed_at_ms: endpoint.last_observed_at_ms,
+                successful_operation_count: endpoint.successful_operation_count,
+            };
+            endpoints
+                .entry((snapshot.bus, endpoint.address))
+                .and_modify(|current: &mut RuntimeOwnedI2cEndpointObservation| {
+                    if observation.observed_at_ms > current.observed_at_ms {
+                        *current = observation.clone();
+                    }
+                })
+                .or_insert(observation);
+        }
+    }
+    let endpoints: Vec<_> = endpoints.into_values().collect();
+    let captured_at_ms = endpoints
+        .iter()
+        .map(|endpoint| endpoint.observed_at_ms)
+        .max()?;
+    Some(
+        dcentrald_diagnostics::troubleshoot::RuntimeOwnedI2cTelemetry {
+            telemetry_source: "dcentrald_hal::i2c::I2cServiceHandle retained success ledger"
+                .to_string(),
+            captured_at_ms,
+            endpoints,
+        },
     )
+}
+
+/// GET /api/diagnostics/troubleshoot/i2c-scan -- Passive retained observations.
+pub(super) async fn get_diag_i2c_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (readers, unavailable_reason) = match state.i2c_observation_readers.lock() {
+        Ok(readers) => (
+            readers.clone(),
+            "runtime has no retained successful endpoint operation from a serialized I2C owner",
+        ),
+        Err(_) => (
+            Vec::new(),
+            "serialized I2C observation-reader registry is unavailable",
+        ),
+    };
+    let telemetry = retained_i2c_telemetry(&readers);
+    let test_id = {
+        let mut diagnostics = state.diagnostic_service.lock().await;
+        let result = if let Some(telemetry) = telemetry.as_ref() {
+            diagnostics.publish_i2c_runtime_telemetry(telemetry.clone())
+        } else {
+            diagnostics.publish_i2c_observations_unavailable(unavailable_reason)
+        };
+        match result {
+            Ok(test_id) => test_id,
+            Err(error) => return report_storage_error_response(&error),
+        }
+    };
+
+    Json(serde_json::json!({
+        "test_id": test_id,
+        "status": if telemetry.is_some() { "retained_runtime_observations" } else { "unavailable" },
+        "operation": "i2c_endpoint_observations",
+        "coverage": "successful_runtime_operations_only",
+        "scan_performed": false,
+        "absence_inference_authorized": false,
+        "hardware_access_attempted": false,
+        "telemetry": telemetry,
+        "message": "This endpoint only clones positive observations retained by serialized runtime I2C owners. Unlisted addresses are unknown, not absent; no device identity, health, or pass verdict is implied.",
+    }))
+    .into_response()
 }
 
 // ───  W1: Failure-mode catalog (api-types) ──────────────────────
@@ -20794,13 +21433,22 @@ pub(super) fn is_same_origin_setup_headers(headers: &HeaderMap) -> bool {
         Some(host) => host,
         None => return false,
     };
+    if !crate::csrf_allowlist::host_header_is_allowed(host) {
+        return false;
+    }
 
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        return header_origin_host(origin) == host;
+        return crate::csrf_allowlist::origin_matches_allowed_host(
+            header_origin_host(origin),
+            host,
+        );
     }
 
     if let Some(referer) = headers.get("referer").and_then(|v| v.to_str().ok()) {
-        return header_origin_host(referer) == host;
+        return crate::csrf_allowlist::origin_matches_allowed_host(
+            header_origin_host(referer),
+            host,
+        );
     }
 
     if let Some(fetch_site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
@@ -22107,7 +22755,7 @@ pub(crate) async fn post_led_locate(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "LED engine not available",
-                "detail": "GPIO controller not initialized (running on non-S9 hardware?)",
+                "detail": "No LED backend (AXI GPIO and sysfs status-LED probe both empty)",
             })),
         )
             .into_response()
@@ -22414,7 +23062,9 @@ pub(super) fn build_prometheus_snapshot(
     mqtt_integration_up: Option<bool>,
     webhook_integration_up: Option<bool>,
 ) -> dcentrald_api_types::prometheus_metrics::PrometheusSnapshot {
-    use dcentrald_api_types::prometheus_metrics::{ChainMetric, FanMetric, PrometheusSnapshot};
+    use dcentrald_api_types::prometheus_metrics::{
+        ChainMetric, FanMetric, PrometheusSnapshot, SerialEndpointMetric,
+    };
     let power_projection = project_power_telemetry(power, miner, hardware);
 
     // Per-fan: prefer the detailed per-fan readings; fall back to the
@@ -22483,6 +23133,28 @@ pub(super) fn build_prometheus_snapshot(
                 errors: c.errors as u64,
             })
             .collect(),
+        serial_endpoints: miner
+            .serial_endpoints
+            .iter()
+            .map(|endpoint| SerialEndpointMetric {
+                logical_path: endpoint.logical_path.clone(),
+                open_state: endpoint.open_state.clone(),
+                tx_role: endpoint.tx_role.clone(),
+                tx_active: endpoint.tx_active,
+                getaddress_responses: endpoint.getaddress_responses,
+                complete_77_at_work_baud: endpoint.complete_77_at_work_baud,
+                work_frames_committed: endpoint.work_frames_committed,
+                rx_wire_bytes: endpoint.rx_wire_bytes,
+                rx_frames: endpoint.rx_frames,
+                crc_rejected_frames: endpoint.crc_rejected_frames,
+                buffered_rx_bytes: endpoint.buffered_rx_bytes,
+                valid_job_nonce_observations: endpoint.valid_job_nonce_observations,
+                last_frame_rx_age_s: endpoint.last_frame_rx_age_s,
+                last_valid_job_nonce_age_s: endpoint.last_valid_job_nonce_age_s,
+                parser_state: endpoint.parser_state.clone(),
+            })
+            .collect(),
+        chains_scope: miner.chains_scope.clone(),
         fans,
         // W17 fleet/Grafana parity — surface the W9/W15 autotuner-silicon +
         // Wave-G chip-imbalance telemetry on the Prometheus consumer too (the
@@ -23989,6 +24661,8 @@ mod group_b_monitoring_profiles_tests {
             accepted: 0,
             rejected: 0,
             chains: Vec::new(),
+            serial_endpoints: Vec::new(),
+            chains_scope: None,
             fans: crate::FanState {
                 pwm: 0,
                 rpm: 0,
@@ -24529,6 +25203,52 @@ mod group_b_monitoring_profiles_tests {
     // ── P2-6 §4.C: fleet-grade {pool,worker} labels + integration health ──
 
     #[test]
+    fn prometheus_snapshot_propagates_logical_serial_observability_only() {
+        let mut miner = minimal_miner_state();
+        miner.chains_scope = Some(crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME.to_string());
+        miner.serial_endpoints = vec![crate::SerialEndpointState {
+            logical_path: "/dev/ttyS3".to_string(),
+            open_state: "open".to_string(),
+            tx_role: "work_tx".to_string(),
+            tx_active: true,
+            getaddress_responses: 77,
+            complete_77_at_work_baud: true,
+            work_frames_committed: 12,
+            rx_wire_bytes: 900,
+            rx_frames: 8,
+            crc_rejected_frames: 1,
+            buffered_rx_bytes: 2,
+            valid_job_nonce_observations: 3,
+            last_frame_rx_age_s: Some(1),
+            last_valid_job_nonce_age_s: Some(4),
+            parser_state: "synchronized".to_string(),
+        }];
+        let snapshot = build_prometheus_snapshot(
+            &miner,
+            &dcentrald_autotuner::LivePowerEstimate::default(),
+            &crate::HardwareInfo::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            snapshot.chains_scope.as_deref(),
+            Some(crate::CHAINS_SCOPE_AGGREGATE_SERIAL_RUNTIME)
+        );
+        assert_eq!(snapshot.serial_endpoints.len(), 1);
+        assert_eq!(snapshot.serial_endpoints[0].logical_path, "/dev/ttyS3");
+        assert_eq!(snapshot.serial_endpoints[0].work_frames_committed, 12);
+        let body = snapshot.to_exposition();
+        assert!(body
+            .contains("dcentrald_serial_endpoint_rx_frames_total{logical_path=\"/dev/ttyS3\"} 8"));
+        assert!(!body.contains("physical_slot"));
+    }
+
+    #[test]
     fn p2_6_snapshot_surfaces_pool_worker_donation_from_miner_state() {
         // The rest.rs wiring must lift pool URL + worker + donating from the
         // live MinerState into the per-pool labeled counters + donation gauge.
@@ -24770,11 +25490,9 @@ mod p2_5_target_temp_control_tests {
     use super::*;
 
     /// P2-5 regression: the swarm node must NOT advertise `target_temp_control`
-    /// while no live room-temp PID + setpoint endpoint exist. The
-    /// `HeaterController` PID in `dcentrald-thermal` is defined but never
-    /// instantiated/run, and there is no REST surface to set a room-temp
-    /// setpoint — so the capability is honestly false. If someone re-wires a
-    /// live closed-loop controller they should update this test deliberately.
+    /// while no live room-temp PID + setpoint endpoint exist. Heater watt
+    /// commands exist, but there is still no REST surface to set a room-temp
+    /// setpoint — so the capability stays honestly false.
     #[test]
     fn swarm_capabilities_do_not_advertise_unwired_target_temp_control() {
         let caps = swarm_node_capabilities(true);
@@ -24833,5 +25551,93 @@ mod setup_circuit_validation_tests {
         // Half-specified AC pair is rejected (self-contained pairing guard).
         assert!(validate_setup_circuit("grid", Some(120), None).is_err());
         assert!(validate_setup_circuit("grid", None, Some(15)).is_err());
+    }
+
+    #[test]
+    fn night_mode_watt_sample_requires_control_authoritative_source() {
+        // No producer on the power watch — exactly the serial `serial_mining`
+        // path today: the channel exists but nothing publishes, so
+        // timestamp_ms stays 0 and watts must surface as unavailable.
+        assert_eq!(
+            authoritative_wall_watts_from_power_watch(
+                &dcentrald_autotuner::LivePowerEstimate::default()
+            ),
+            None
+        );
+
+        // Estimate-only watts never populate the sample: closing a watt loop
+        // on the controller's own feed-forward is the refused tautology.
+        let estimated = dcentrald_autotuner::LivePowerEstimate {
+            board_watts: 900.0,
+            wall_watts: 960.0,
+            source: "estimated".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(authoritative_wall_watts_from_power_watch(&estimated), None);
+
+        let curtailed = dcentrald_autotuner::LivePowerEstimate {
+            wall_watts: 25.0,
+            source: "curtailment".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(authoritative_wall_watts_from_power_watch(&curtailed), None);
+
+        // Unknown source with a timestamp is still unavailable.
+        let unknown = dcentrald_autotuner::LivePowerEstimate {
+            wall_watts: 900.0,
+            source: "guessed".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(authoritative_wall_watts_from_power_watch(&unknown), None);
+
+        // PMBus telemetry closes (carries the provenance label).
+        let pmbus = dcentrald_autotuner::LivePowerEstimate {
+            board_watts: 1_000.0,
+            wall_watts: 1_080.0,
+            source: "pmbus".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(
+            authoritative_wall_watts_from_power_watch(&pmbus),
+            Some((1_080, "pmbus"))
+        );
+
+        // Platform ADC closes.
+        let adc = dcentrald_autotuner::LivePowerEstimate {
+            wall_watts: 960.0,
+            source: "adc".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(
+            authoritative_wall_watts_from_power_watch(&adc),
+            Some((960, "adc"))
+        );
+
+        // A wall-meter-calibrated estimate closes (persisted external anchor).
+        let wall_calibrated = dcentrald_autotuner::LivePowerEstimate {
+            wall_watts: 970.0,
+            source: "estimated".to_string(),
+            calibrated: true,
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(
+            authoritative_wall_watts_from_power_watch(&wall_calibrated),
+            Some((970, "wall_calibrated_estimate"))
+        );
+
+        // A non-finite wall reading is not a watt sample.
+        let nan = dcentrald_autotuner::LivePowerEstimate {
+            wall_watts: f64::NAN,
+            source: "pmbus".to_string(),
+            timestamp_ms: 1_000,
+            ..dcentrald_autotuner::LivePowerEstimate::default()
+        };
+        assert_eq!(authoritative_wall_watts_from_power_watch(&nan), None);
     }
 }
